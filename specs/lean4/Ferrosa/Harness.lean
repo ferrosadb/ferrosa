@@ -48,7 +48,10 @@ def cross3 (xs : List α) (ys : List β) (zs : List γ) (f : α → β → γ �
 
 def show1 {α : Type} [Repr α] (a : α) : String := s!"{repr a}"
 
-/-! ## 1. `commitlog/segment.rs` — the `UnsafeCell` borrowing discipline -/
+/-! ## 1. `commitlog/segment.rs` — the `UnsafeCell` borrowing discipline
+
+The commit log's `UnsafeCell` hands out shared and mutable borrows from a state machine, and the obligation is that no reachable state holds a writer and a reader at once. `borrowClosure` enumerates every state reachable from `free` to depth four under both operations, so the space is finite and written out rather than bounded by argument. `wellFormed` is the predicate under test; `twoMutableBorrows` runs it over the closure and names the offending state instead of returning a boolean.
+-/
 
 /-- Reachable borrow states from `free`, to depth `fuel`, under both borrow operations. -/
 def borrowClosure (fuel : Nat) : List Buf :=
@@ -89,7 +92,10 @@ def mutationExcludesReaders : Check :=
      [("free grants exactly one writer",
         (borrowMut .free).isSome && (borrowMut ((borrowMut .free).getD .free)).isNone)])
 
-/-! ## 2. `store.rs` — a reference may not be used past its owner -/
+/-! ## 2. `store.rs` — a reference may not be used past its owner
+
+A reference is usable only while its owner is alive, and the lifetimes, the instants and the pairing between them are enumerated so that every case tested is one written in the source. `referenceUse` crosses eight lifetimes with themselves and seven instants — 448 cases — and checks that a usable reference implies a live owner. `staticLifetime` adds the boundary: a `'static` reference is usable at four and not at five or six, so a static lifetime does not outlive the region.
+-/
 
 def lives : List Life := (List.range 6).map (fun d => ⟨0, some d⟩) ++ [⟨0, none⟩, ⟨1, some 1⟩]
 
@@ -106,7 +112,10 @@ def staticLifetime : Check :=
      ("use at 5 is the violation", !usableAt ⟨0, some 5⟩ ⟨0, none⟩ 5),
      ("use at 6 is the violation", !usableAt ⟨0, some 5⟩ ⟨0, none⟩ 6)]
 
-/-! ## 3. mmap — the truncation contract, which lives in safe code -/
+/-! ## 3. mmap — the truncation contract, which lives in safe code
+
+The truncation contract is checked here because it lives in safe code and therefore sits outside the `unsafe` blocks the rest of the harness audits: a read is legal only below both the mapping length and the current file length. `truncationContract` crosses three mapping lengths, four file lengths and eight offsets. `truncationIsUnreadable` takes the sharper form — the same offset read before and after a shrink to one byte below it — and `sliceOutlivesMapping` covers a slice derived from a mapping that is then dropped.
+-/
 
 def mappings : List Nat := [0, 1024, 4096]
 def fileLens : List Nat := [0, 1024, 4096, 8192]
@@ -132,7 +141,10 @@ def sliceOutlivesMapping : Check :=
      ("mapping dropped at 1", !usableAt ⟨0, some 1⟩ ⟨0, none⟩ 10),
      ("mapping dropped at 9", !usableAt ⟨0, some 9⟩ ⟨0, none⟩ 10)]
 
-/-! ## 4. `direct.rs` — layout agreement in the aligned allocator -/
+/-! ## 4. `direct.rs` — layout agreement in the aligned allocator
+
+A block must be freed with the layout it was allocated with, or the allocator files it under a size class that no longer matches its shape and corrupts the heap. `layoutAgreement` crosses five block shapes with themselves — 25 cases — and asserts `deallocMatches` agrees with equality on every pair. A layout compared too loosely shows up as a pair the predicate accepts and equality rejects.
+-/
 
 def blocks : List Block := [⟨1, 1⟩, ⟨512, 512⟩, ⟨4096, 512⟩, ⟨4096, 4096⟩, ⟨8192, 4096⟩]
 
@@ -141,7 +153,10 @@ def layoutAgreement : Check :=
     "dealloc accepts a block exactly when the layout matches the one it was allocated with"
     (cross blocks blocks fun a b => (s!"{show1 a} vs {show1 b}", deallocMatches a b == (a == b)))
 
-/-! ## 5. libc — an out-parameter exists only after success -/
+/-! ## 5. libc — an out-parameter exists only after success
+
+A libc call writes its out-parameter only on success, so reading one after a failure reads whatever the caller's storage happened to hold. `syscalls` covers three successes — including the full 32-bit range — and three failures, and `outParamExistence` asserts the out-parameter is present exactly for the successful calls. The errno carried by a failure is checked to imply nothing readable.
+-/
 
 def syscalls : List Syscall := [.ok 0, .ok 1024, .ok 4_294_967_295, .failed 1, .failed 22, .failed 75]
 
@@ -151,7 +166,10 @@ def outParamExistence : Check :=
     (syscalls.map fun s =>
       (show1 s, (outParam s).isSome == (match s with | .ok _ => true | .failed _ => false)))
 
-/-! ## 6. `unsafe impl Send`/`Sync` — the marker is a claim about access intervals -/
+/-! ## 6. `unsafe impl Send`/`Sync` — the marker is a claim about access intervals
+
+A `Send` or `Sync` marker asserts that concurrent access is safe, and that assertion is a claim about which intervals overlap rather than about the type's fields. `accessPairs` enumerates seven access intervals with and without writes, and `markerSoundness` checks `safeConcurrently` against the intervals being disjoint or neither of them writing. `overlappingWritersAreNeverSafe` states the same thing as an exclusion: two writers on overlapping intervals are unsafe whatever thread ids the model is given.
+-/
 
 def accessPairs : List Access :=
   [⟨0, 0, 10, true⟩, ⟨0, 0, 10, false⟩, ⟨1, 5, 15, true⟩, ⟨1, 5, 15, false⟩,
@@ -170,7 +188,10 @@ def overlappingWritersAreNeverSafe : Check :=
       (s!"threads {a.thread}/{b.thread} over {a.start}-{a.stop}",
         !(safeConcurrently a b && a.writes && b.writes && !(disjoint a b))))
 
-/-! ## 7. `asc.rs` — an FFI handle is valid only inside a live context -/
+/-! ## 7. `asc.rs` — an FFI handle is valid only inside a live context
+
+The accelerator FFI hands out handles as raw integers, so nothing in the type system stops one being used after the context that owns it is dropped. `contexts` holds the four states of two contexts, live and dead for each id, and `handleValidity` crosses them with three candidate handles, one of which names no context at all. `handleValid` must agree with the conjunction of matching the context id and that context being live.
+-/
 
 def contexts : List Ctx := [⟨7, true⟩, ⟨7, false⟩, ⟨8, true⟩, ⟨8, false⟩]
 

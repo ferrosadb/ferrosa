@@ -16,7 +16,12 @@ import Ferrosa.Accord.Strict
 
 namespace Ferrosa.Accord
 
-/-! ## A minimal reader for the dialect the generator writes -/
+/-! ## A minimal reader for the dialect the generator writes
+
+  The reader takes the part of EDN the Elle generator emits, vectors, maps and bare atoms, and
+  turns a file into a syntax tree without a Clojure runtime or a JSON parser. Input outside that
+  subset is refused rather than guessed at, so a file that parses is a file that was read whole.
+-/
 
 inductive Sexp where
   | atom (s : String)
@@ -86,7 +91,14 @@ def parseAll (s : String) : List Sexp :=
 
 end Edn
 
-/-! ## From S-expressions to histories -/
+/-! ## From S-expressions to histories
+
+  A parsed event becomes an `Ev` and a file becomes the `History` that `Accord/Serializable.lean`
+  scores. Two limitations arrive with the format: the EDN carries no transaction id, so one is
+  synthesised from the process and the invoke ordinal and must stay unique across processes or two
+  clients' transactions would collapse into one; and invoke and complete times are recorded as
+  zero, so a parsed history can be judged serializable but never strictly serializable.
+-/
 
 namespace Edn
 

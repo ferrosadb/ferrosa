@@ -24,7 +24,15 @@ namespace Ferrosa.Sql.Index
 
 open Ferrosa.Ledger
 
-/-! ## Global cost: one node for equality, all nodes for range -/
+/-! ## Global cost: one node for equality, all nodes for range
+
+An equality probe names one value, that value belongs to one partition, and only that partition can
+hold a matching row, so the lookup contacts one node however large the table is. A range probe names a
+set of values, and a hash sends adjacent values to different partitions — with three nodes, two
+neighbouring keys already land apart — so the cost is one contact per node. The bound a client can rely
+on is therefore a shape: constant for equality, linear in the node count for range.
+
+-/
 
 /-- Which node serves a value under a hash-partitioned index. -/
 def nodeOf (nodes key : Nat) : Nat := key % nodes
@@ -52,7 +60,15 @@ theorem only_equality_is_constant (nodes : Nat) (h : 1 < nodes) :
   simp [equalityNodeContacts, rangeNodeContacts]
   omega
 
-/-! ## Local cost: one record, not a scan -/
+/-! ## Local cost: one record, not a scan
+
+An index probe reads the one record its entry names, so the cost does not grow with the table and it
+beats a full scan as soon as the table holds more than one row. A range probe reads every matching row
+plus the walk that found them, so its cost grows with the number of matches and no constant bound
+covers it. The same distinction appears in the node count and in the record count, and only the second
+is what a client feels on a single-row lookup.
+
+-/
 
 /-- Records read by an index probe: the one the entry names. -/
 def indexLookupReads : Nat := 1
@@ -82,7 +98,15 @@ theorem a_range_probe_is_not_constant (hits : Nat) (h : 1 < hits) :
   simp [indexLookupReads, rangeLookupReads]
   omega
 
-/-! ## Index maintenance must be inside the atomic boundary -/
+/-! ## Index maintenance must be inside the atomic boundary
+
+If the row write and the index write are separate steps, a crash between them leaves the two sides
+disagreeing: a row with no entry is invisible to the index, and an entry with no row is a lookup that
+finds an identifier and then fails. Neither state can be repaired by reading, because nothing records
+that the other half is missing. Maintaining both sides in one step keeps them in agreement from any
+state that had it, which is why the fix belongs inside the row write's atomic boundary.
+
+-/
 
 /-- An indexed table: the rows, and the index entries. -/
 structure Indexed where
@@ -120,7 +144,16 @@ theorem atomic_maintenance_preserves_consistency (x : Indexed) (k : Nat)
   unfold Indexed.consistent Indexed.insertBoth at *
   rw [h]
 
-/-! ## The ledger -/
+/-! ## The ledger
+
+Five obligations are listed against the declaration that decides each, and one is red: the index and
+the table can diverge, because maintenance runs as a separate step from the row write, so a lookup can
+miss a committed row or find one that is gone. `scatter_gather_is_the_accepted_shape` records the one
+deliberate departure — a range lookup at one hop per node, chosen over the `O(1)` claim a
+hash-partitioned index cannot deliver — and it counts as met because the cost is the stated one.
+`sql_index_has_one_red_item` pins the red count so a CI check can require it to fall and never to rise.
+
+-/
 
 /-- A range lookup costs one round trip per node. -/
 def scatterGatherHops (nodes : Nat) : Nat := nodes

@@ -71,7 +71,13 @@ inductive Reach : Accord → Prop where
   | init : Reach init
   | step : Reach s → Step s s' → Reach s'
 
-/-! ## The one invariant that can fail: apply order -/
+/-! ## The one invariant that can fail: apply order
+
+  Commit accepts any HLC with no reference to the datacenter's watermark, so a transaction can be
+  committed at a timestamp the datacenter has already applied past. The apply order then disagrees
+  with commit-timestamp order: transaction 1 is committed at HLC 5 and applied, transaction 2 is
+  committed at HLC 3 and applied after it.
+-/
 
 /-- Commit timestamp of `t`, if it is in the buffer. -/
 def tsOf (s : Accord) (t : Nat) : Option Nat :=
@@ -120,7 +126,15 @@ theorem apply_order_violation :
   refine ⟨s4, h4, ?_, by simp [s4]⟩
   simp [appliedOutOfOrder, tsOf, s4, s3]
 
-/-! ## The three invariants that cannot fail, and what that means for the audit -/
+/-! ## The three invariants that cannot fail, and what that means for the audit
+
+  The other named invariants hold because nothing in the module can violate them, and an invariant
+  that cannot fail checks nothing. `pendingConfig` is never assigned, so the DC-swap drain has an
+  antecedent that never holds; the applied set only ever gains committed transactions, so applying
+  twice is not expressible; and commit and abort guard on each other's set, so their exclusion is a
+  property of the guards. The per-DC Raft layer is a stub for the same reason: no action advances a
+  commit index, so no Raft property of the composition is checked.
+-/
 
 /-- **I-30 is vacuous**: no action of the module assigns `pendingConfig`. -/
 theorem swap_dc_antecedent_never_holds :

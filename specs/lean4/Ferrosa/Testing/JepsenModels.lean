@@ -23,7 +23,10 @@ namespace Ferrosa.Testing.Models
 
 open Ferrosa Ferrosa.Ledger Ferrosa.Accord
 
-/-! ## Histories -/
+/-! ## Histories
+
+A history is a list of operations, each with the outcome the client saw and the interval over which it ran. `Outcome` keeps four cases rather than two because `fail` and `info` may or may not have taken effect while `pending` may take effect at any point after its invocation, and `ok` must match the observation exactly. `linearizableB` searches the permutations that respect `rtChain` and replays each through `runAll`, branching wherever an indeterminate outcome leaves the state open.
+-/
 
 /-- What the client observed. -/
 inductive Outcome where
@@ -65,7 +68,10 @@ def linearizableB {α σ : Type} (step : σ → α → Outcome → List (σ × B
     (h : List (Op α)) : Bool :=
   (perms h).any (fun ord => rtChain ord && runAll step init ord)
 
-/-! ## The counter model -/
+/-! ## The counter model
+
+The counter is the register-shaped model, and both queue models reuse `linearizableB` unchanged: `add` sums, `read` returns the running total, and concurrent adds carry no ordering constraint between them. The theorems are the ported cases of `counter_test.clj`, each a concrete history decided rather than argued, so a change to `ctrStep` that made `fail` or `pending` mean no effect would turn one of them red. `counter_cannot_start_at_one` is the negative case: a fresh counter that reads 1 is rejected outright.
+-/
 
 inductive CtrOp where
   | add (n : Nat)
@@ -118,7 +124,10 @@ theorem an_acknowledged_add_is_visible_to_a_later_read :
     counterLinearizable [cAdd 0 2 (.ok 0) 1, cRead 1 2 3] = true
       ∧ counterLinearizable [cAdd 0 2 (.ok 0) 1, cRead 1 0 3] = false := by native_decide
 
-/-! ## The unordered queue model -/
+/-! ## The unordered queue model
+
+An unordered queue lets a dequeue take any value present, which is the weakest queue semantics a system could offer and therefore the one a permissive checker drifts towards. The ported cases cover what `queue-test` asserts: a dequeue needs a matching enqueue, and a value cannot be handed out more times than it was put in. `queueStep` keeps the indeterminate-outcome branches too, so a pending enqueue may or may not have happened.
+-/
 
 inductive QOp where
   | enqueue (v : Nat)
@@ -167,7 +176,10 @@ theorem a_queue_cannot_hand_out_more_than_it_was_given :
     queueLinearizable
       [qOk (.enqueue 1) 1, ⟨.dequeue 1, .ok 1, 2, 3⟩, ⟨.dequeue 1, .ok 1, 4, 5⟩] = false := by native_decide
 
-/-! ## The total (FIFO) queue model -/
+/-! ## The total (FIFO) queue model
+
+A total queue adds one constraint to the unordered model: a dequeue takes the head, so the enqueue order becomes observable. The two models are proved to disagree on one history, which is what makes the choice of model part of the test rather than a detail of it. `overlapping_enqueues_leave_the_fifo_order_free` sets the limit on what that can conclude — when the enqueues overlap, either order fits and the model convicts nothing.
+-/
 
 /-- A total queue: an enqueue appends, a dequeue must take the head. -/
 def totalQueueStep (q : List Nat) : QOp → Outcome → List (List Nat × Bool)

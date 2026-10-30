@@ -16,7 +16,12 @@ import Ferrosa.Accord.History
 
 namespace Ferrosa.Accord
 
-/-! ## Indexing a transaction list by position -/
+/-! ## Indexing a transaction list by position
+
+  A candidate order is judged by position: which transaction came first, and whether the clock
+  agrees with that ranking. Indexing the list once with its positions supplies the comparison the
+  real-time condition needs, without re-scanning the order for each pair.
+-/
 
 def idxFrom : Nat → List TxnId → List (Nat × TxnId)
   | _, [] => []
@@ -25,7 +30,13 @@ def idxFrom : Nat → List TxnId → List (Nat × TxnId)
 def findTxn (txns : List TxnRec) (id : TxnId) : Option TxnRec :=
   txns.find? (fun r => r.id == id)
 
-/-! ## Replaying a candidate order, and rejecting a history that names a transaction it never ran -/
+/-! ## Replaying a candidate order, and rejecting a history that names a transaction it never ran
+
+  A candidate order is replayed from the empty database and every transaction's observed read
+  results must match what the replay produces; nothing weaker than exact reproduction counts. A
+  history naming a transaction it never ran is judged not serializable rather than left undecided,
+  so the checker answers for every input it is given.
+-/
 
 /-- Replay `order` from the empty database; every transaction's observed read
     results must match.  `false` on a dangling id, which keeps the checker
@@ -50,7 +61,13 @@ def coversAll (txns : List TxnRec) (order : List TxnId) : Bool :=
 def serializableBy (txns : List TxnRec) (order : List TxnId) : Bool :=
   coversAll txns order && orderOk txns order
 
-/-! ## Real time, as the condition that separates strict from plain -/
+/-! ## Real time, as the condition that separates strict from plain
+
+  For a transaction placed earlier in the order, no later one may have completed before it was
+  invoked, and that is the one condition separating strict serializability from serializability. A
+  client sees the violation as a value that travels backwards in wall-clock time: an order exists,
+  it is not the order the client lived through.
+-/
 
 /-- The strict-serializability side condition: for `a` earlier than `b` in the
     order, `b` must not have completed before `a` was invoked. -/
@@ -66,7 +83,13 @@ def realTimeOk (txns : List TxnRec) (order : List TxnId) : Bool :=
 def strictlySerializableBy (txns : List TxnRec) (order : List TxnId) : Bool :=
   serializableBy txns order && realTimeOk txns order
 
-/-! ## Search over orders (the Jepsen fallback) -/
+/-! ## Search over orders (the Jepsen fallback)
+
+  The search enumerates every permutation of the committed transactions and accepts the history if
+  any one replays correctly, which is the Jepsen driver's own fallback rather than a proof
+  strategy. It is factorial in the number of transactions, so it suits a history of tens of them;
+  the protocol arguments elsewhere exhibit the order instead of searching for it.
+-/
 
 def inserts {α : Type} (x : α) : List α → List (List α)
   | [] => [[x]]
@@ -84,7 +107,12 @@ def strictlySerializableB (h : History) : Bool :=
   let txns := h.committed
   (perms (txns.map TxnRec.id)).any (fun order => strictlySerializableBy txns order)
 
-/-! ## The same statements as `Prop`s, for the proofs -/
+/-! ## The same statements as `Prop`s, for the proofs
+
+  The Boolean checkers answer whether one given order works, and these two predicates say that some
+  order does, which is the form the safety proofs consume. Strictness implies serializability
+  through the same witness, and an empty history satisfies both.
+-/
 
 def Serializable (h : History) : Prop :=
   ∃ order, serializableBy h.committed order = true
@@ -151,7 +179,13 @@ def hReadYourWritesBroken : History := ⟨[
   invEv 0 1 [.append 0 1, .read 0] 0,
   okEv 0 1 [.append 0 1, .read 0] [[]] 0 10]⟩
 
-/-! ### Five small histories, each naming the property it demonstrates -/
+/-! ### Five small histories, each naming the property it demonstrates
+
+  Each history is small enough to decide and is named for what it demonstrates: a fresh read, a
+  stale read that is serializable but not strict, a value nothing ever wrote, and a transaction that
+  once observed its own append and once did not. The red cases are the shapes a run takes when a
+  guarantee is broken.
+-/
 
 /-- A write followed by a read that observes it is strictly serializable: the order
     that runs the write first reproduces the read and respects the clock. -/

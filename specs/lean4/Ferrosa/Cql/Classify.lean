@@ -89,7 +89,18 @@ def planFor (cl : ConsistencyLevel) (s : Strategy) (localDc : DcId) : AckPlan :=
   | .one | .two | .three | .all =>
       { total := blockFor cl s.globalRf, perDc := [] }
 
-/-! ### The plan's properties, and where the code's plan differs -/
+/-! ### The plan's properties, and where the code's plan differs
+
+A keyspace holding a single replica needs one acknowledgement at any level that applies to it, a
+local level names exactly one datacenter, and `QUORUM` on a network-topology keyspace is a quorum in
+every datacenter rather than a global majority. The last of those is where the implementation and
+this plan part: `code_plan_agrees_only_for_odd_dc_rf` shows the two agree on `{3,3}`, but that on
+`{2,2}` the code asks for three of four where the plan asks for four, and that on the odd factors the
+code constrains only the total and not where the acknowledgements sit. A user whose per-datacenter
+replication factors are even can therefore have a `QUORUM` write acknowledged without a majority in
+one datacenter, and a `LOCAL_QUORUM` read there afterward will not see it.
+
+-/
 
 /-- A keyspace holding one replica needs one acknowledgement at `ONE`, so the
     level adds nothing to what the topology already requires. -/
@@ -168,7 +179,16 @@ theorem resolveCl_of_some (dflt cl : ConsistencyLevel) (stmt : Statement) :
 theorem resolveCl_of_none (dflt : ConsistencyLevel) (stmt : Statement) :
     resolveCl dflt ⟨stmt, none⟩ = dflt := rfl
 
-/-! ## What a run of statements between `BEGIN` and `COMMIT` touches -/
+/-! ## What a run of statements between `BEGIN` and `COMMIT` touches
+
+A run between `BEGIN` and `COMMIT` is summarised by the keys it reads, the keys it writes, and how
+many conditions it tests. A conditional statement reads the keys it compares against and contributes
+exactly one condition, and a group of statements tests a condition exactly when one of its members
+does, so the summary can be read off the statements without executing them. That is what makes a
+transaction containing any conditional statement not blind: it needs a read phase before its writes
+can be acknowledged, and `Ferrosa/Cql/Lwt.lean` supplies the protocol side of the same claim.
+
+-/
 
 structure TxnShape where
   reads : List Key

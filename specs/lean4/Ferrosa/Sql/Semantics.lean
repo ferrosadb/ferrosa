@@ -25,7 +25,15 @@ open Ferrosa.Ledger
 /-- A SQL value. `none` is NULL — a value, not an absence. -/
 abbrev SqlVal := Option Nat
 
-/-! ## NULL is a value, so a comparison can be neither true nor false -/
+/-! ## NULL is a value, so a comparison can be neither true nor false
+
+Because a NULL is stored here rather than left absent, `b <> v` translated as compare-and-negate admits
+a row whose column is NULL, while SQL's three-valued logic excludes it because the predicate is
+UNKNOWN. `null_passes_a_naive_not_equal` gives the divergence and `the_two_agree_without_nulls` shows
+the two agree whenever no NULL is involved, which is why a test suite that never writes NULL finds
+nothing. A client sees rows in its result set that its own `WHERE` clause excludes.
+
+-/
 
 /-- The obvious translation of `b <> v`: compare and negate. -/
 def notEqNaive (b : SqlVal) (v : Nat) : Bool := !(b == some v)
@@ -47,7 +55,16 @@ theorem null_passes_a_naive_not_equal :
 theorem the_two_agree_without_nulls :
     notEqNaive (some 6) 5 = notEqStd (some 6) 5 := by decide
 
-/-! ## What a crash in the middle of a transaction leaves behind -/
+/-! ## What a crash in the middle of a transaction leaves behind
+
+A crash partway through a multi-statement transaction leaves a strict, non-empty prefix applied:
+neither "the transaction did not happen" nor "it happened", and SQL promises only those two.
+`status_is_not_a_durability_claim` adds that the session's `InTransaction` status says nothing about
+what reached the log, so the client is told it is inside a transaction whose earlier half may already
+be lost. Reconnecting finds some of the statements applied and the rest gone, with nothing recording
+which.
+
+-/
 
 /-- A transaction as the surface accepts it: statements in order, and how many of them are
     durable at the moment of the crash. -/
@@ -70,7 +87,16 @@ theorem commit_is_not_atomic_across_statements :
 theorem status_is_not_a_durability_claim :
     (⟨[1, 2], 1⟩ : Txn).applied.length < 2 := by decide
 
-/-! ## What the aggregate functions return when there are no rows -/
+/-! ## What the aggregate functions return when there are no rows
+
+SQL's aggregates have defined answers for the empty set, and a translation built on an accumulator that
+starts at zero gives a different one: `SUM` over no rows is NULL, not `0`, so a dashboard that adds the
+result to a running total treats "no data" as "zero" without noticing. `COUNT(*)` counts rows and
+`COUNT(col)` skips the rows where the column is NULL, so the two differ exactly on those rows. The sum
+agrees as soon as a row is present and the two counts agree as soon as no row is NULL, which is why a
+test suite loaded with ordinary data finds neither divergence.
+
+-/
 
 /-- The obvious accumulator. -/
 def sumNaive (xs : List Nat) : SqlVal := some (xs.foldl (· + ·) 0)
@@ -99,7 +125,15 @@ def countCol (rows : List (List SqlVal)) (i : Nat) : Nat :=
 theorem count_star_and_count_col_disagree :
     countStar [[none], [some 1]] = 2 ∧ countCol [[none], [some 1]] 0 = 1 := by decide
 
-/-! ## What a sequence has to be, and what it may skip -/
+/-! ## What a sequence has to be, and what it may skip
+
+A sequence value only has to be monotone, and gaps are legal in SQL, so a value consumed by a
+transaction that never committed leaves the sequence correct and the count of issued values larger than
+the count of rows. `a_sequence_must_not_decrease` is the property that does have to hold. The
+consequence is a division of labour: the commitlog hazard of a replayed counter mutation is real, but it
+lands on `COUNTER` and not on `SERIAL`, so a gap in a `SERIAL` column is not a defect to be repaired.
+
+-/
 
 /-- A sequence value only has to be monotone; gaps are legal in SQL. -/
 def monotone (xs : List Nat) : Bool := xs.zip xs.tail |>.all fun p => p.1 ≤ p.2
@@ -113,7 +147,15 @@ theorem sequence_need_only_be_monotone :
 /-- And a sequence that goes backwards is not: this is the property to hold. -/
 theorem a_sequence_must_not_decrease : monotone [3, 1] = false := by decide
 
-/-! ## The ledger -/
+/-! ## The ledger
+
+Six obligations the SQL surface carries are listed against the declaration that decides each, and three
+are red: multi-statement atomicity, three-valued logic, and `SUM` over the empty set. The three that
+hold are per-partition atomicity of a single statement, the `COUNT(*)`/`COUNT(col)` difference on NULL,
+and monotone sequences. `sql_has_three_red_items` pins the count, and a driver relying on any of the red
+three is handed an answer SQL would not have given.
+
+-/
 
 def ledger : List SpecItem := [
   ⟨"a single statement is atomic",

@@ -17,7 +17,13 @@ import Ferrosa.Accord.Protocol
 
 namespace Ferrosa.Accord
 
-/-! ## §6.1: the acceptor's two ballot numbers -/
+/-! ## §6.1: the acceptor's two ballot numbers
+
+  An acceptor keeps two ballots: the one it has promised not to undercut, and the one the value it
+  holds was accepted at. They are separate facts, and recovery reads the second, proposing the value
+  accepted at the highest accepted ballot seen anywhere. Conflating them lets a Prepare relabel a
+  stale value as freshly accepted, which is how an acknowledged commit is lost.
+-/
 
 /-- `promBallot` is what the acceptor promises not to undercut;
     `accBallot`/`accVal` are what it actually accepted.  These are distinct

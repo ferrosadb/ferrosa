@@ -45,7 +45,10 @@ open Ferrosa.Ledger
 
 set_option maxRecDepth 8000
 
-/-! ## The registry: every area ledger, named once -/
+/-! ## The registry: every area ledger, named once
+
+`Area` pairs a module key with its ledger and the function that prints it, so one entry carries both what is counted and what appears in the output. `areas` is the only enumeration of the area ledgers: `printAllLedgers` walks it and `ledgerTotal` sums it, so the printed set and the counted set cannot drift apart. `Ferrosa/Cql/AggregateObligations.lean` predates the shared ledger types and carries its own copy, so `cqlAggregateLedger` maps it into the common shape and that module counts like every other area.
+-/
 
 /-- One area ledger: its module key, the ledger itself, and how to print it. -/
 structure Area where
@@ -127,7 +130,10 @@ theorem area_keys_are_distinct : (areas.map (·.key)).Nodup := by decide
     failure rather than a quietly smaller registry. -/
 theorem registered_ledger_count : areas.length = 21 := by decide
 
-/-! ## The total, derived -/
+/-! ## The total, derived
+
+`ledgerTotal` is the sum of the registered ledgers' red counts and contains no literal term, so there is nothing for it to fall out of step with and `ledgerTotal_is_the_registry_sum` records only its definition. The pin at fifty-nine guards the opposite failure: dropping a whole ledger from `areas` shrinks the total without changing any local count. `ledgerTotal_pinned` makes that a build failure rather than a quieter number.
+-/
 
 /-- The number of red items across the corpus: the sum of the registered ledgers' `redCount`.
     There is no literal term here. -/
@@ -148,7 +154,10 @@ def printAllLedgers : IO Unit := do
     a.print
     IO.println ""
 
-/-! ## The classification rows -/
+/-! ## The classification rows
+
+`Item` says an obligation has no code path at all, and `Other` says it is one of the other kinds of not-proved with `why` naming which — a requirement no implementation can meet, a missing proof of behaviour that may well be right, a claim needing measurement, inherited protocol behaviour, an undecided design, or an item since closed. Both lists name an exact `SpecItem.name` rather than describing one, so a renamed item breaks the build instead of silently unmatching. What the rows claim is then checked against the registered ledgers rather than asserted here.
+-/
 
 /-- Absent: no code path, no format field, no plan node. -/
 structure Item where
@@ -297,7 +306,10 @@ def discharged : List Discharged := [
    "Ferrosa.Sql.Index", "a range lookup on an indexed column costs one round trip per node, which is accepted"⟩
 ]
 
-/-! ## The checks -/
+/-! ## The checks
+
+`rows` is the concatenation of the broken, unimplemented and non-defect classifications, and every theorem under this heading is a statement about that list. `resolves` answers whether a `(ledger, item)` pair names a real item satisfying a predicate, and `resolves_spec` turns a `true` into a witness in the registry so a failure names the row rather than returning a boolean. The three directions are `every_classified_row_is_red`, `every_red_is_classified_exactly_once` and `per_area_counts`: nothing classifies a met item, no red goes unclassified, and no area's row count disagrees with its red count.
+-/
 
 /-- The (ledger, item) pairs the classification claims to cover. -/
 def rows : List (String × String) :=
@@ -373,7 +385,10 @@ theorem nothing_discharged_is_still_classified :
 /-- The totals agree, which is now a consequence of (a), (b) and (c) rather than a coincidence. -/
 theorem rows_are_the_ledger_reds : rows.length = ledgerTotal := by decide
 
-/-! ## The pinned counts -/
+/-! ## The pinned counts
+
+Three counts are pinned because each is somewhere the bookkeeping could drift silently: the items with no code path at all, the entries that are not defects, and the comparison of live defects in `Ferrosa/Broken.lean` against everything else. `every_ledger_item_is_classified` closes the loop, making the three list lengths sum to `ledgerTotal` so the partition and the total cannot disagree. The last of the three is the one that has moved: live defects outnumber the rest only since the memory specs added their reds.
+-/
 
 /-- **Every red item in every ledger appears here or in `Broken.broken`, exactly once.** -/
 theorem every_ledger_item_is_classified :

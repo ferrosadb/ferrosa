@@ -24,7 +24,14 @@ open Ferrosa.Ledger
 
 abbrev Val := Nat
 
-/-! ## The observable cell -/
+/-! ## The observable cell
+
+A cell is reduced to what a reader can see: a write timestamp, whether it is a tombstone, and a value. The
+local deletion time and the TTL are deliberately absent, because they decide *when* a cell is visible rather
+than *which* cell wins — resolution and expiry are separate questions with separate answers. Keeping the
+merge on this three-field record is what makes the tie-breaks statable, and what keeps the expiry machinery
+out of the conflict rule.
+-/
 
 /-- What a reader can see of a cell: the write timestamp, whether it is a tombstone, and
     the value. `ldt` and the TTL are deliberately absent — they change *when* the cell is
@@ -120,7 +127,14 @@ theorem merge_converges_on_collisions :
       ∧ Obs.merge ⟨5, false, 1⟩ ⟨5, false, 2⟩ = Obs.merge ⟨5, false, 2⟩ ⟨5, false, 1⟩ := by
   decide
 
-/-! ## TTL -/
+/-! ## TTL
+
+A local deletion time is computed once, at write time, from the write timestamp, and stored with the cell;
+expiry is then a comparison of the reader's clock against that stored number. A replica never recomputes it,
+so a wrong clock on one node cannot make the same cell expire at a different moment for different readers.
+The number that goes on the wire is the number every node compares against, which is why a cell with a TTL
+disappears at its deletion second across the cluster rather than per replica.
+-/
 
 /-- A cell written with a TTL: the local deletion time is computed once, at write time,
     from the write timestamp. `ttl_ldt` is the value that goes on the wire. -/
@@ -165,7 +179,15 @@ theorem ldt_overflows_before_2038_reachable_now :
       ∧ expiredSigned 1800000000 (toI32 (1800000000 + 500000000)) = true := by
   decide
 
-/-! ## Purge and resurrection -/
+/-! ## Purge and resurrection
+
+A tombstone can be discarded once the grace window has elapsed and every replica holds it, and discarding it
+earlier can undo the delete permanently. The no-purge state is safe and unbounded — absence is monotone
+because the tombstone keeps winning against any value it dominates — so purging is what bounds storage, at
+the price of a precondition that has to hold on every replica rather than only on the clock. Getting that
+precondition wrong has one consequence: a value a replica never deleted comes back on the next read repair,
+and no tombstone is left to beat it.
+-/
 
 /-- Discard a tombstone that is older than the grace period. -/
 def RowState.purgeOldTombstone (now grace : Nat) : RowState → RowState
@@ -221,9 +243,15 @@ theorem purge_requires_all_replicas_applied (old : Obs) (tomb : Obs) (h : old.ts
   · rw [hvis] at htb; exact Bool.noConfusion htb
   · omega
 
-/-! ## The ledger -/
+/-! ### Resurrection is an ordering bug, and the purge precondition is what forbids it
 
-/-! ### Resurrection is an ordering bug, and the purge precondition is what forbids it -/
+A tombstone shadows every value at or below its timestamp whichever arrives first, so the only way deleted
+data returns is for the tombstone to be gone before a replica that still holds the value is read. That makes
+resurrection an ordering failure rather than a lost update, and it is why purge waits for both conditions at
+once: the grace window elapsed and every replica holding the tombstone. With no purge at all the property
+holds for free; the red item is the state where `gc_grace` is consulted alone, which is what an operator gets
+if the purge path checks the clock and nothing else.
+-/
 
 /-- **A tombstone shadows every value at or below its timestamp**, whoever arrives first. -/
 theorem a_tombstone_shadows_every_value_at_or_below_its_timestamp
@@ -251,6 +279,15 @@ theorem purging_needs_the_grace_window_and_propagation :
 theorem purging_before_propagation_lets_a_stale_value_win :
     ([] : List Obs) ++ [⟨50, false, 7⟩] = [⟨50, false, 7⟩]
       ∧ (⟨50, false, 7⟩ : Obs).merge ⟨50, false, 7⟩ = ⟨50, false, 7⟩ := by decide
+
+/-! ## The ledger
+
+Every claim about deletes and expiry is listed here with the theorem that supports it, and the four red items
+are listed with equal prominence: commutativity is checked on the colliding cases rather than proved in
+general, a stored `i32` deletion time wraps, the purge path checks neither precondition, and `gc_grace` has no
+purge path behind it. A reader of the table can see exactly what a delete promises today and where the promise
+stops. The count is pinned, so closing a red item without a table update fails the build.
+-/
 
 def ledger : List SpecItem := [
   ⟨"a newer write beats an older one",

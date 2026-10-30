@@ -27,7 +27,15 @@ open Ferrosa.Ledger
 abbrev Triple := Nat × Nat × Nat
 abbrev Graph := List Triple
 
-/-! ## A triple stored twice counts twice -/
+/-! ## A triple stored twice counts twice
+
+A graph is a bag of triples, so a repeated triple is a second row and a solution joining on it comes
+back four times rather than once — the counts a client sees depend on how the data arrived. Adding a
+triple never removes a match, which is what lets ingested data be applied without re-running the
+query. Removing one is the case that needs re-evaluation: a match that a duplicate elsewhere still
+justified is no longer justified.
+
+-/
 
 /-- How many times a triple occurs in the graph. -/
 def multiplicity (g : Graph) (s p o : Nat) : Nat := g.countP fun t => t == (s, p, o)
@@ -54,7 +62,15 @@ theorem deleting_a_triple_can_remove_a_match :
     multiplicity [(1, 2, 3), (1, 2, 3)] 1 2 3 = 2
       ∧ multiplicity [(1, 2, 3)] 1 2 3 = 1 := by decide
 
-/-! ## A path query returns pairs, not walks -/
+/-! ## A path query returns pairs, not walks
+
+`p+` is a set of pairs, so two nodes joined by a path must appear once however many paths connect
+them. An expansion that follows every path without remembering where it has been returns a row per
+walk instead: on a two-node cycle that is three rows for two pairs. On a self-loop nothing stops the
+walk but the fuel bound, and a bound is not a semantics — a client counting results over a cyclic
+graph gets a number that depends on the graph's shape rather than on the distinct pairs.
+
+-/
 
 /-- Successors of a node. -/
 def succs (g : List (Nat × Nat)) (n : Nat) : List Nat :=
@@ -81,7 +97,15 @@ theorem closure_without_a_visited_set_duplicates_pairs :
 theorem a_self_loop_diverges_without_fuel :
     expandNoVisited [(0, 0)] 3 [0] = [0, 0, 0] := by decide
 
-/-! ## A quoted triple has to keep its own identity in the store -/
+/-! ## A quoted triple has to keep its own identity in the store
+
+A quoted triple and an IRI are different terms, and a store that keys both by a number has to keep
+them apart. The packing used here does not: `Term.quoted 1 2 3` and the IRI `1002003` land on the same
+store key, so a lookup for that IRI returns rows that must not match, and the client can neither see
+them nor exclude them. `two_terms_share_a_store_key` states the collision on the store rather than on
+the encoding, which is where a query meets it.
+
+-/
 
 /-- A term: an IRI, or a quoted triple (RDF-star). -/
 inductive Term where
@@ -106,7 +130,15 @@ theorem two_terms_share_a_store_key :
     ∃ (a b : Term), a ≠ b ∧ encode a = encode b :=
   ⟨Term.quoted 1 2 3, Term.iri 1002003, by decide, by decide⟩
 
-/-! ## The ledger -/
+/-! ## The ledger
+
+Six obligations of the SPARQL surface are listed against the declaration that decides each, and three
+are red: `p+` returning a row per path, a quoted triple sharing a store key with an IRI, and `OPTIONAL`
+scoping having no representation in the plan types at all. Bag semantics, incremental ingestion and the
+re-evaluation a delete needs are the three that hold, each naming the theorem that shows it.
+`sparql_has_three_red_items` pins the count so a CI check can require it to fall and never to rise.
+
+-/
 
 def ledger : List SpecItem := [
   ⟨"triple multiplicity is preserved (bag semantics)",

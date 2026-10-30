@@ -24,7 +24,15 @@ open Ferrosa
     end and does not otherwise import the accord layer. -/
 abbrev Val := Nat
 
-/-! ## A set is a membership predicate; a list is a sequence -/
+/-! ## A set is a membership predicate; a list is a sequence
+
+A set is modelled by what can be asked of it — whether a value is in it — so two sets that answer the
+same way for every value are the same value, and no replica can be holding a different one. A list is
+a sequence, so order and multiplicity are both observable and two replicas can hold the same elements
+in a different order. That difference is the whole subject of what follows: the same merge rule is
+safe for one representation and lossy for the other.
+
+-/
 
 /-- A set, as a characteristic function.  Membership is the only observable, which
     is what makes a set's merge a union rather than a choice. -/
@@ -40,7 +48,16 @@ abbrev ListVal := List Val
 
 def listSnoc (l : ListVal) (v : Val) : ListVal := l ++ [v]
 
-/-! ## Adds commute; appends do not -/
+/-! ## Adds commute; appends do not
+
+The order in which two concurrent adds reach a set does not matter, and adding the same value twice
+leaves the set as it was, so last-write-wins over sets keeps both elements and a retried add is
+harmless. Appending has neither property: `listSnoc_not_comm` exhibits a list where `1` then `2` and
+`2` then `1` are different results. A merge that is correct for one collection type is therefore
+wrong for the other, which is why the type of the column decides what an unread merge of two writes
+can preserve.
+
+-/
 
 /-- **Set adds commute** — the whole reason a set survives last-write-wins. -/
 theorem setAdd_comm (s : SetVal) (a b : Val) : setAdd (setAdd s a) b = setAdd (setAdd s b) a := by
@@ -66,7 +83,16 @@ theorem listSnoc_not_comm :
     ∃ (l : ListVal) (a b : Val), listSnoc (listSnoc l a) b ≠ listSnoc (listSnoc l b) a := by
   exact ⟨[], 1, 2, by decide⟩
 
-/-! ## Last-write-wins loses an element of a list -/
+/-! ## Last-write-wins loses an element of a list
+
+The merge the storage layer performs for a plain column keeps the later value and discards the
+earlier one, and for two concurrent appends to the same list that means one of them disappears.
+`list_lww_loses_an_element` states the count: the merge keeps one element where serial execution
+keeps two, so a client holding two acknowledgements sees one of its two writes. The same two appends
+as a set lose nothing in either order, which is what `set_lww_loses_nothing` records — the loss is a
+property of the column's type under this merge, not of the merge alone.
+
+-/
 
 /-- The merge the storage layer performs for a plain column: the higher timestamp
     wins, and the other value is gone.  Modelled as "the later one is kept". -/
@@ -97,7 +123,18 @@ theorem set_lww_loses_nothing :
   by_cases h1 : (w == 1) = true <;> by_cases h2 : (w == 2) = true <;>
     simp_all [beq_iff_eq, Bool.or_comm]
 
-/-! ## The classifier is blind to the assignment terms -/
+/-! ## The classifier is blind to the assignment terms
+
+An `UPDATE` that appends to a collection is taken for a blind write by the front-end classifier, and
+the read it needs to compute the new value is never scheduled. `collection_append_classified_blind`
+and `collection_append_must_read` state the two halves — blind by classification, unexecutable
+without a read — and `blind_classification_is_term_blind` puts them into the single statement that
+there is a write the fast path accepts and cannot perform. `Stmt.blindSem` is the rule the planner
+owes, refusing the fast path whenever an assignment reads its own column, while
+`blindSem_accepts_scalar` shows a plain scalar assignment still qualifies so ordinary writes keep the
+shortcut.
+
+-/
 
 /-- Does any assignment read its own column (`c = c + …`, `c = c - …`)? -/
 def Stmt.readsOwnColumn : Stmt → Bool

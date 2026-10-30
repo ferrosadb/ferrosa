@@ -21,7 +21,13 @@ namespace Ferrosa.Topology.DcQuorum
 
 open Ferrosa
 
-/-! ## The rule, transcribed from `dc_quorum.rs` -/
+/-! ## The rule, transcribed from `dc_quorum.rs`
+
+  A DC_QUORUM write is acknowledged only when the origin datacenter reached a majority of its own
+  replicas, a strict majority of configured datacenters each reached theirs, and a quorum of all
+  configured replicas answered. A DC_QUORUM read asks for the origin's majority alone, which makes
+  the read the cheaper path and the one that can miss a write committed elsewhere.
+-/
 
 /-- Configured replicas per datacenter, indexed by datacenter (`dc_replication_factors`). -/
 abbrev Rfs := List Nat
@@ -67,7 +73,13 @@ def write (rfs : Rfs) (origin : Nat) (cnt : Nat → Nat) (total : Nat) : Bool :=
 /-- A DC_QUORUM read: `local_progress(…).satisfied()`, the origin's majority alone. -/
 def read (rfs : Rfs) (origin : Nat) (cnt : Nat → Nat) : Bool := originGate rfs origin cnt
 
-/-! ## Acknowledgement sets, and what it means for two of them to share a replica -/
+/-! ## Acknowledgement sets, and what it means for two of them to share a replica
+
+  A verdict is computed from an actual acknowledgement set rather than an abstract count, so a
+  partition can be described by which replicas answered and the three gates judged against that. A
+  shared replica between two such sets is the property every safety theorem here rests on: it is
+  what a partition cannot supply twice.
+-/
 
 /-- The replicas of each datacenter that acknowledged, as a set over that datacenter's universe. -/
 abbrev Acks := Nat → SetU
@@ -90,7 +102,13 @@ def readOf (rfs : Rfs) (origin : Nat) (A : Acks) : Bool := read rfs origin (coun
 def SharesReplica (rfs : Rfs) (A B : Acks) : Prop :=
   ∃ d i, d < rfs.length ∧ i < rfOf rfs d ∧ A d i = true ∧ B d i = true
 
-/-! ## The code's majority test is `IsQuorum` -/
+/-! ## The code's majority test is `IsQuorum`
+
+  The comparison `count > rf / 2` the code performs is exactly a strict majority of the
+  datacenter's own replica universe, so the arithmetic gate and the abstract quorum predicate the
+  intersection lemmas use are one condition. Nothing has to be assumed about how the count was
+  obtained, and a majority is never zero acknowledgements.
+-/
 
 /-- `count > rf / 2` is exactly a strict majority of the datacenter's universe. -/
 theorem dcMajority_count_iff (rf : Nat) (s : SetU) :
@@ -103,7 +121,13 @@ theorem dcMajority_pos {rf c : Nat} (h : dcMajority rf c = true) : 0 < c := by
   simp only [dcMajority, decide_eq_true_eq] at h
   omega
 
-/-! ## Gate 2: two passing writes share a datacenter, then a replica -/
+/-! ## Gate 2: two passing writes share a datacenter, then a replica
+
+  Two writes that pass the datacenter gate overlap in at least one datacenter where both hold a
+  majority, because two strict majorities of the same set of datacenters must intersect. The step
+  from a shared datacenter to a shared replica is the same counting argument one level down. This
+  gate alone, of the three, is enough to stop a partition admitting two writes.
+-/
 
 /-- **Two writes that pass the datacenter gate share a datacenter where both hold a majority.**
     Two strict majorities of the eligible datacenters overlap — the counting lemma one level up. -/
@@ -151,7 +175,13 @@ theorem no_partition_admits_two_dc_quorum_writes {rfs : Rfs} {oA oB : Nat} {A B 
   obtain ⟨d, i, hd, hi, hAi, hBi⟩ := dc_quorum_writes_share_a_replica hA hB
   exact hdisj d i hd hi ⟨hAi, hBi⟩
 
-/-! ## Gate 3: a node quorum intersects any node quorum -/
+/-! ## Gate 3: a node quorum intersects any node quorum
+
+  A quorum of the configured replicas intersects any other such quorum, wherever their
+  acknowledgements landed across the datacenters, and the sum identity here is the induction that
+  shows it. Because this is Cassandra's own `QUORUM` rule, a DC_QUORUM write and a plain QUORUM
+  write on the same keyspace cannot succeed on disjoint replicas either.
+-/
 
 /-- Replicas of `d` acknowledged by both sets. -/
 def common (rfs : Rfs) (A B : Acks) (d : Nat) : Nat :=
@@ -212,7 +242,13 @@ theorem dc_quorum_and_cassandra_quorum_writes_share_a_replica {rfs : Rfs} {o : N
     SharesReplica rfs A B :=
   node_gate_forces_a_shared_replica (dc_quorum_write_is_a_cassandra_quorum_write hA) hB
 
-/-! ## What a local read sees, and what it is blind to -/
+/-! ## What a local read sees, and what it is blind to
+
+  A read in the write's origin datacenter always sees it, since the read waits for the same
+  majority the write needed there. A read in any other datacenter waits only for its own majority,
+  so a write replicated through a third datacenter can be invisible to it. That is the accepted
+  cost of a hop-free read, and it reaches the client as a stale answer rather than a lost one.
+-/
 
 /-- **A local read sees every write that reached a majority of the reader's datacenter.** -/
 theorem a_local_read_sees_every_write_that_reached_its_datacenter {rfs : Rfs} {r : Nat}
@@ -246,7 +282,13 @@ theorem a_read_in_another_datacenter_can_miss_a_dc_quorum_write :
     decide_eq_true_eq] at hW hR
   omega
 
-/-! ## Monotonicity: a verdict is never revoked -/
+/-! ## Monotonicity: a verdict is never revoked
+
+  The coordinator's counters only grow, so a late, slow or duplicated reply can turn an unmet
+  verdict into a met one and never the reverse. For a client this is what makes a retry safe: a
+  write still in flight becomes acknowledged as further replicas answer, and an acknowledged write
+  is never taken back.
+-/
 
 /-- A weaker filter keeps at least as many elements. -/
 theorem filter_length_mono (l : List Nat) {p q : Nat → Bool} (h : ∀ a, p a = true → q a = true) :
@@ -281,7 +323,13 @@ theorem write_is_monotone {rfs : Rfs} {o : Nat} {c c' : Nat → Nat} {t t' : Nat
   have ho := hc o
   refine ⟨⟨⟨h.1.1.1, by omega⟩, by omega⟩, by omega⟩
 
-/-! ## The denominator is configuration -/
+/-! ## The denominator is configuration
+
+  Every gate counts against configured replication factors, never against the replicas that happen
+  to be reachable, so a partition can shrink the acknowledgements and not the bar. A majority of
+  datacenters that never answer blocks every write whatever the answering ones hold, which is what
+  keeps the requirement fixed under failure instead of letting it relax.
+-/
 
 /-- The eligible datacenters that answered at all. -/
 def reached (rfs : Rfs) (cnt : Nat → Nat) : List Nat := (eligibleDcs rfs).filter fun d => 0 < cnt d
@@ -302,7 +350,13 @@ theorem a_dark_majority_of_datacenters_blocks_every_write {rfs : Rfs} {o : Nat}
     omega
   simp [write, hgate]
 
-/-! ## An `rf = 0` datacenter is inert -/
+/-! ## An `rf = 0` datacenter is inert
+
+  A datacenter configured with no replicas changes no verdict: it adds nothing to the datacenter
+  denominator, nothing to the replica total, and casts no vote, so an operator may list a future DC
+  without moving anyone's thresholds. An origin configured that way fails closed instead, refusing
+  the read rather than admitting it against an empty majority.
+-/
 
 /-- A datacenter index past the end of the configured list has replication factor
     zero, which is the arithmetic behind "an unconfigured datacenter holds no

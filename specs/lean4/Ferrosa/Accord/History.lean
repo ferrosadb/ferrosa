@@ -20,7 +20,14 @@ abbrev TxnId := Nat
 abbrev Key := Nat
 abbrev Val := Nat
 
-/-! ## Timestamps, and the order their fields are compared in -/
+/-! ## Timestamps, and the order their fields are compared in
+
+  The commit timestamp has four fields and their order is the comparison order: `epoch`, then
+  `time`, then `seq`, then `node`. Two transactions proposed by different nodes in the same
+  nanosecond therefore still have a decided order, and a replica counter-proposing a timestamp
+  bumps `seq` past the one it rejected, so the proposal it saw is strictly superseded rather than
+  tied with.
+-/
 
 /-- The four-field commit timestamp.  Field order is significant: it *is* the
     comparison order (`epoch`, then `time`, then `seq`, then `node`). -/
@@ -67,7 +74,13 @@ theorem distinct_nodes_ordered (e t s n₁ n₂ : Nat) (h : n₁ ≠ n₂) :
 
 end Ts
 
-/-! ## Transactions, the ops inside them, and when two of them conflict -/
+/-! ## Transactions, the ops inside them, and when two of them conflict
+
+  A transaction is an ordered list of reads and appends executed against a per-key append list, so
+  read-your-writes inside one transaction follows from the model rather than from a separate rule.
+  Read results are not stored with the transaction: they are what the history observed, and the
+  checker compares against them. Two transactions conflict when they touch a common key.
+-/
 
 /-- One operation inside a transaction (the `list-append` op set of Elle's
     check, plus the intra-transaction order the real transaction has). -/
@@ -99,7 +112,13 @@ def Txn.readKeys (t : Txn) : List Key :=
 def Txn.conflicts (a b : Txn) : Bool :=
   a.keys.any (fun k => b.keys.contains k)
 
-/-! ## The keyspace an op list is executed against -/
+/-! ## The keyspace an op list is executed against
+
+  The database is one append list per key, and an op list runs against it in order, carrying the
+  state forward so a read sees every append the same transaction already made. Keeping the state
+  and the read results as two views of one pass is what lets the checker compare a client's
+  observations without storing them in the transaction.
+-/
 
 /-- A database: one append-list per key. -/
 abbrev State := Key → List Val
@@ -152,7 +171,12 @@ theorem State.runOps_read_only (s : State) (ops : List Op)
       subst hk
       simp [State.runOps, State.step, ih _ (fun o ho => h o (by simp [ho]))]
 
-/-! ### Appends are what move the state -/
+/-! ### Appends are what move the state
+
+  Reads do not change the keyspace, so a read-only op list leaves the database exactly as it found
+  it and an append is the only op whose effect a later reader can observe. Appending a value makes
+  it the last element of that key's list, which is the observation a subsequent read returns.
+-/
 
 /-- Appending `v` to `k` makes `v` the last element of that key's list. -/
 theorem State.runOps_append_visible (s : State) (ops : List Op) (k : Key) (v : Val)
@@ -160,7 +184,13 @@ theorem State.runOps_append_visible (s : State) (ops : List Op) (k : Key) (v : V
   subst h
   simp [State.runOps, State.step]
 
-/-! ## Histories, in the shape the Jepsen driver records -/
+/-! ## Histories, in the shape the Jepsen driver records
+
+  A history is a list of events, each an invoke, an ok, an info or a fail for a transaction on a
+  process, carrying the read results the client observed. The committed set takes the first `ok`
+  event per transaction, deliberately: an `info` transaction may or may not have executed and a
+  `fail` one must not have written, so neither belongs in the serial order a checker searches.
+-/
 
 inductive EvKind where
   | invoke

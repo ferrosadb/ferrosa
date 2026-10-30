@@ -41,7 +41,16 @@ inductive IdxStatus where
 def selectIndexReady (replicas : List Node) (st : Node → IdxStatus) : List Node :=
   replicas.filter (fun r => st r == .ready) ++ replicas.filter (fun r => !(st r == .ready))
 
-/-! ## What the reordering does and does not promise -/
+/-! ## What the reordering does and does not promise
+
+The coordinator moves replicas whose index build has finished to the front and changes nothing else:
+every replica it was given comes back, including those still building, which `reorder_never_filters`
+states as membership in the result. When nobody has finished, the order is returned unchanged, so
+nothing in the response tells the client that the answer may be incomplete — `preference_is_not_completeness`
+is that gap as a theorem. The one case where the result is complete is a set of replicas that are all
+ready, which confines the gap to the degraded case rather than the fast path.
+
+-/
 
 /-- **The selection never filters.**  Stated as membership, which is what "never
     filters" means: a replica is in the selection exactly when it is in the input,
@@ -89,7 +98,16 @@ theorem all_ready_is_complete (replicas : List Node) :
   unfold Complete selectIndexReady
   simp [List.filter]
 
-/-! ## The history this ordering admits, and the one it does not -/
+/-! ## The history this ordering admits, and the one it does not
+
+A committed write followed by an indexed read on a replica whose build is still running produces a
+history with no serial explanation: the read has to sit after the write and does not see it, which
+`indexed_read_can_be_stale` records. The same two events with the row visible do serialize, so what
+the checker rejects is the staleness of the read and not the presence of an index. A client sees a row
+it has been told is committed missing from an indexed read, with no error attached and no ordering of
+the events that explains the answer.
+
+-/
 
 /-- A row is committed, and then an indexed read on a replica whose index is still
     building does not find it.  `k = 0` was written (`append 0 7`) and the read that
@@ -120,7 +138,16 @@ def hIndexedFresh : History := ⟨[
 theorem indexed_read_when_fresh_is_serializable : strictlySerializableB hIndexedFresh = true := by
   native_decide
 
-/-! ## Index entries themselves merge safely -/
+/-! ## Index entries themselves merge safely
+
+An index partition holds set-valued entries keyed by value and primary key, so two concurrent inserts
+of different entries commute and neither is lost — the index's difficulty is the lag in building it,
+not the merge. A removal is a different matter: it has to know what to take out, and
+`setRemove_not_comm_with_add` shows that removing and adding the same value give different results in
+the two orders. Deleting an index entry is therefore a read-modify-write of the row's old value, the
+same shape as a collection update on the row path in `Ferrosa/Cql/Collections.lean`.
+
+-/
 
 /-- An index partition holds a set of `(value, primary key)` entries, so maintaining
     it is `setAdd`, not an append: two concurrent inserts of different entries

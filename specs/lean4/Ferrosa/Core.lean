@@ -14,7 +14,14 @@
 -/
 namespace Ferrosa
 
-/-! ## Nodes as a predicate over `{0, …, n-1}`, and how a set's size is counted -/
+/-! ## Nodes as a predicate over `{0, …, n-1}`, and how a set's size is counted
+
+A node is a natural number drawn from `{0, …, n-1}`, and a set of nodes is a predicate over that universe, so
+membership and size are Boolean arithmetic rather than a separate datatype with invariants of its own. Size is
+always counted against a stated `n`, which makes the whole cluster the baseline: a quorum is what remains after
+the nodes allowed to be missing are subtracted. Nothing here can count a node twice or count a node outside the
+cluster, which is why every later quorum argument is arithmetic rather than bookkeeping.
+-/
 
 abbrev Node := Nat
 
@@ -60,7 +67,14 @@ def singleton (i : Node) : SetU := fun j => j == i
 
 end SetU
 
-/-! ## What counts as a quorum, and the one inequality every consistency claim rests on -/
+/-! ## What counts as a quorum, and the one inequality every consistency claim rests on
+
+A quorum is a strict majority of the cluster, and two strict majorities of the same set must share a node — the
+single fact every consistency claim in the corpus reduces to. In the form a user buys it, `W + R > RF` means any
+read ack set and any write ack set overlap, so a read at that level sees a write acknowledged at its level. The
+contrapositive matters as much: two disjoint ack sets are never both quorums, which bounds what a partition can
+split apart.
+-/
 
 /-- `IsQuorum n q` — `q` is a strict majority of the universe of size `n`.
     Ferrosa's `block_for(QUORUM, rf) = rf / 2 + 1` is the same predicate one
@@ -181,7 +195,13 @@ theorem localQuorum_global_rf_infeasible (dcRf totalRf : Nat)
 theorem localQuorum_threshold_path_mismatch :
     blockFor .localQuorum (3 + 3) ≠ blockForDc .localQuorum 3 := by decide
 
-/-! ## What each replication factor buys, in acks tolerated and failures survived -/
+/-! ## What each replication factor buys, in acks tolerated and failures survived
+
+At replication factor 2, `QUORUM` is both replicas, so one loss takes the write and there is no fault tolerance
+at all; at 3 it is two of three and exactly one loss is survivable; at 5 it is three and two losses are. The pair
+of levels matters more than either level alone: `QUORUM` writing and `QUORUM` reading at 3 intersects, while `ONE`
+and `ONE` at 2 does not, so a `ONE` read can miss a `ONE` write that acknowledged on the other replica.
+-/
 
 /-- `RF = 2`: QUORUM needs every replica, so there is no fault tolerance. -/
 theorem rf2_quorum_requires_all : blockFor .quorum 2 = 2 := by decide

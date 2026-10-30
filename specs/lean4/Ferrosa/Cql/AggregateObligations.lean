@@ -27,7 +27,15 @@ open Ferrosa.Cql.Aggregate
 
 abbrev Val := Nat
 
-/-! ## The ledger -/
+/-! ## The ledger
+
+Every claim this module measures is an item: either discharged, naming the theorem that proves it, or
+red, carrying the reason it fails and the witness that exhibits the gap. `render` prints a red item's
+reason and witness on their own lines, so the same text serves a `#eval` in an editor and a CI log.
+Because a status holds a theorem's name rather than a note, a claim that has stopped holding cannot
+sit quietly in the list.
+
+-/
 
 /-- An item is either discharged by a named theorem or red for a stated reason. -/
 inductive Status where
@@ -48,7 +56,14 @@ def render (i : SpecItem) : String :=
   | .met proof => s!"  PASS  {i.name}\n          proved by {proof}"
   | .failing why wit => s!"  RED   {i.name}\n          why: {why}\n          witness: {wit}"
 
-/-! ## The items that are met, with their discharging theorem -/
+/-! ## The items that are met, with their discharging theorem
+
+`COUNT(*)` is the aggregate whose obligations are all discharged: the count of a row set is its
+length, and no row it counted can be recovered from the answer. Both restate results from
+`Ferrosa/Cql/Aggregate.lean` under the names the ledger cites, so a passing item points at a theorem
+rather than at a claim. A user can rely on the row count being exact whatever the row count is.
+
+-/
 
 /-- `COUNT(*)` over the rows is their number, so a row count never has to be
     estimated or approximated. -/
@@ -77,7 +92,16 @@ theorem model_visited_set_length_is_the_count (rows : List Val) :
     (walkExactPair rows (0, [])).2.length = (walkExactPair rows (0, [])).1 :=
   (exact_distinct_is_cardinality rows).symm
 
-/-! ## Red item 2 — `COUNT(DISTINCT)` does not decompose across shards -/
+/-! ## Red item 2 — `COUNT(DISTINCT)` does not decompose across shards
+
+Summing per-shard `COUNT(DISTINCT)` answers over-counts by exactly the overlap: a value present in
+two shards is one distinct value globally and two counted ones. `sum_of_shard_counts_overcounts`
+gives the single-row case and `shard_sum_overcounts_by_the_overlap` the same gap over several
+values, so the excess is the overlap rather than an artefact of one row. A distributed
+`COUNT(DISTINCT)` must merge the per-shard sets or sketches and never the counts; a client that
+sums totals sees a figure larger than the table's cardinality.
+
+-/
 
 /-- The distinct count of one shard. -/
 def shardDistinct (rows : List Val) : Nat := (walkExactPair rows (0, [])).1
@@ -155,7 +179,16 @@ theorem exactness_does_not_hold :
   have hlt := estimate_can_be_strict
   omega
 
-/-! ## The ledger -/
+/-! ## The ledger
+
+Six of the ten obligations here are red, and the count is pinned by `ledger_has_six_red_items` so a CI
+check can require it to fall and never to rise. Two of the red items are gaps in the surface rather
+than in a proof — nothing in the AST accepts `COUNT(DISTINCT c)`, and `ESTIMATE_DISTINCT` is not a
+CQL keyword — so they name no witness, only the missing implementation. The other four each name the
+theorem that shows the property failing, which lets the list be read as an inventory of what the
+aggregate functions do not yet deliver.
+
+-/
 
 def ledger : List SpecItem := [
   ⟨"COUNT(*) is exact",

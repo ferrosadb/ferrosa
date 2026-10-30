@@ -22,7 +22,10 @@ namespace Ferrosa.Testing.Guarantees
 
 open Ferrosa Ferrosa.Ledger
 
-/-! ## Profiles -/
+/-! ## Profiles
+
+`Profile` is the four facts that decide what a read may be trusted to see: the replication factor, the write level, the read level, and whether the read may be answered elsewhere. `replicaCount` resolves a consistency level into a number of replicas on a single datacenter, so `CL=QUORUM` and `CL=LOCAL_QUORUM` collapse to the same count. `crossDcRead` is the one field no level name expresses, and it is the field that decides the multi-datacenter results.
+-/
 
 /-- The replica count a write is spread over in its datacenter. -/
 structure Profile where
@@ -46,7 +49,10 @@ def replicaCount : Ferrosa.Sql.Consistency.Level → Nat → Nat
 def profile (rf : Nat) (w r : Ferrosa.Sql.Consistency.Level) (crossDcRead : Bool) : Profile :=
   ⟨rf, replicaCount w rf, replicaCount r rf, crossDcRead⟩
 
-/-! ## The overlap condition -/
+/-! ## The overlap condition
+
+One inequality decides whether any data-loss claim is available: a read sees every acknowledged write only when the write level plus the read level exceeds the replication factor. `overlap` is that inequality, `readsEveryAckedWrite` adds the routing condition, and `survivesOneNodeLoss` and `survivesQuorumLoss` are the durability forms of the same arithmetic. Every theorem in the module is a case of these four definitions.
+-/
 
 /-- **A read must intersect every write's replica set** exactly when `W + R > RF`. This is the single
     condition behind every data-loss guarantee Ferrosa can make about a read. -/
@@ -62,7 +68,10 @@ def survivesOneNodeLoss (p : Profile) : Bool := decide (1 < p.writeLevel)
 /-- The write survives the loss of a quorum. -/
 def survivesQuorumLoss (p : Profile) : Bool := decide (p.rf / 2 + 1 ≤ p.writeLevel)
 
-/-! ## CL=ONE and CL=ALL are different guarantees -/
+/-! ## CL=ONE and CL=ALL are different guarantees
+
+Neither configuration is wrong; they promise different things, and choosing one is choosing which failures it survives. On three nodes `CL=ONE` acknowledges a single replica and does not survive that replica's loss, while `CL=ALL` does, and both are correct behaviour. The overlap results sit here too, because the same arithmetic decides whether a read can see an acknowledged write at all.
+-/
 
 /-- **On a three-node cluster, CL=ONE and CL=ALL do not share a durability guarantee**, by design: one
     acknowledged replica is not two, and a single-node loss is exactly what CL=ONE does not survive.
@@ -91,7 +100,10 @@ theorem an_all_write_with_a_one_read_still_overlaps :
 theorem a_one_write_with_a_quorum_read_does_not_overlap :
     readsEveryAckedWrite (profile 3 .one .quorum false) = false := by decide
 
-/-! ## Monotonicity: a weaker configuration is a subset, not a bug -/
+/-! ## Monotonicity: a weaker configuration is a subset, not a bug
+
+Raising either level can only add guarantees, never remove one, which is why the suite asserts per configuration rather than globally. The two `omega` proofs show the overlap survives a one-step raise of either level. `all_implies_one_for_durability` puts the durability claims in a chain on five nodes, so `CL=ALL` covers every weaker level and a weaker result never contradicts a stronger one.
+-/
 
 /-- **Raising either level can only add guarantees.** A configuration that promises less is sound —
     it tests less — so the suite must assert per configuration rather than globally. -/
@@ -116,7 +128,10 @@ theorem all_implies_one_for_durability :
       ∧ survivesOneNodeLoss (profile 5 .quorum .one false) = true
       ∧ survivesOneNodeLoss (profile 5 .all .one false) = true := by decide
 
-/-! ## A cross-datacenter read defeats the overlap argument -/
+/-! ## A cross-datacenter read defeats the overlap argument
+
+The overlap argument is about one replica set, so a read answered from a datacenter that does not hold the write defeats it however the counts fall. `DC_QUORUM` reads locally by design, and a run under it across a failover cannot establish strict serializability. `a_datacenter_quorum_read_restores_the_overlap` shows the guarantee is about routing: a read that consults a quorum of datacenters is safe, and no level name on its own says so.
+-/
 
 /-- **DC_QUORUM's local read cannot see a write acknowledged elsewhere**, even with an overlapping
     replica count, because the overlap is an argument about one replica set. -/
@@ -129,7 +144,10 @@ theorem a_cross_datacenter_read_defeats_the_overlap :
 theorem a_datacenter_quorum_read_restores_the_overlap :
     readsEveryAckedWrite (profile 3 .localQuorum .localQuorum false) = true := by decide
 
-/-! ## What the suite may assert -/
+/-! ## What the suite may assert
+
+`lossIsEvidence` is the whole of what a missing value proves: it is evidence of loss exactly when the profile could have seen every acknowledged write, and otherwise the verdict has to say the configuration did not test it. The pair of theorems under it makes the same book yield opposite verdicts under `CL=ONE/CL=ONE` and `CL=QUORUM/CL=QUORUM`. That is why a verdict is a function of `(history, profile)` and a pass/fail line with no level attached is not a result.
+-/
 
 /-- **A missing value is evidence of loss only when the reads overlap the writes.** Otherwise the
     verdict must be "not tested at this configuration", which is not the same as green. -/

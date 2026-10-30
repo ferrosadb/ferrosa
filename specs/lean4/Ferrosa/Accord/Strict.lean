@@ -20,7 +20,13 @@ import Ferrosa.Accord.Protocol
 
 namespace Ferrosa.Accord
 
-/-! ## The deadline formula §7.1 sets the buffer's clock from -/
+/-! ## The deadline formula §7.1 sets the buffer's clock from
+
+  A replica processes a transaction only after its deadline, computed as the proposing wall clock
+  plus the skew bound plus the worst-case latency, less the estimated latency from the coordinator.
+  The deadline never precedes the proposing timestamp and later timestamps get later deadlines, so
+  the buffer delays transactions in the order it will apply them.
+-/
 
 /-- `Deadline(t0, C, P) = wall_clock(t0.time) + SkewMax + maxLat - Latency(C,P)`,
     transcribed.  All quantities are nanoseconds. -/
@@ -40,7 +46,13 @@ theorem deadline_monotone (t₁ t₂ skewMax maxLatency latencyCP : Nat) (h : t�
   unfold deadline
   omega
 
-/-! ## The guarantee the formula rests on, stated as a premise rather than proved -/
+/-! ## The guarantee the formula rests on, stated as a premise rather than proved
+
+  The formula buys ordering only if every conflicting transaction with a lower timestamp arrives
+  before the deadline it is measured against, and that is an engineering claim about measured skew
+  and latency rather than a theorem. Naming it separately keeps the safety argument honest about
+  which part is logic and which is an estimate taken from the P99.9 and P99 windows.
+-/
 
 /-- "If skew and latency bounds are not exceeded, any conflicting transaction
     with `t0_γ < t0_τ` sent by any coordinator will arrive at P before
@@ -53,7 +65,14 @@ theorem deadline_monotone (t₁ t₂ skewMax maxLatency latencyCP : Nat) (h : t�
 def DeadlineSound (arrival : TxnId → Nat) (dl : TxnId → Nat) (t0 : TxnId → Nat) : Prop :=
   ∀ γ τ, t0 γ < t0 τ → arrival γ ≤ dl τ
 
-/-! ## What the buffer buys: dependency completeness for in-flight conflicts -/
+/-! ## What the buffer buys: dependency completeness for in-flight conflicts
+
+  Under the deadline guarantee, a lower-timestamped conflicting transaction still in flight is in
+  the buffer by the time the replica processes the later one, which supplies the dependency
+  `Accord/Protocol.lean` needs for the in-flight case. The committed case is recovery's
+  responsibility instead, and a dependency missing from the buffer is evidence the deadline was set
+  from stale estimates.
+-/
 
 /-- A replica processes `τ`'s PreAccept only after `τ`'s deadline, and everything
     that arrived by then is in its buffer. -/

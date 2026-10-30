@@ -20,7 +20,14 @@ namespace Ferrosa.Storage.Recovery
 
 open Ferrosa.Ledger
 
-/-! ## Mutations and the keyspace -/
+/-! ## Mutations and the keyspace
+
+A commitlog record is one of three mutations — `put`, `inc`, `del` — and they are told apart here by the only
+property replay depends on: whether re-applying the mutation is harmless. `put` and `del` land on the same
+cell however often they are applied, while `inc` moves the counter again every time, which is why replay
+needs a dedup key at all. An operator reading a segment needs that vocabulary to know what a second
+application of a record would cost.
+-/
 
 abbrev Key := Nat
 abbrev Val := Nat
@@ -73,7 +80,14 @@ theorem inc_is_not_idempotent :
   have h1 := congrFun h 0
   simp [Mut.apply] at h1
 
-/-! ## The on-disk record and what can be detected -/
+/-! ## The on-disk record and what can be detected
+
+Each record carries the lengths of its fields, so a torn write — the common shape of a crash — is
+detectable: the declared length overruns the bytes present and the record does not parse. A bit flip inside
+a payload is not detectable, because the current format carries no checksum, so a corrupted mutation parses
+as a plausible one and the divergence is silent. That asymmetry sets what replay can promise: it stops at a
+tear, and it cannot notice a substitution.
+-/
 
 /-- One commitlog record as the reader sees it: the id, the decoded mutation, the length
     the header declares, the bytes actually present, and whether a checksum accompanies
@@ -292,7 +306,16 @@ theorem only_quarantine_preserves_data :
       ∧ CorruptAction.preservesData .ignore = false := by
   decide
 
-/-! ## The ledger -/
+/-! ## The ledger
+
+The obligations recorded here are per sync mode, so the modes an operator can choose are named in `AckMode`
+and `ackedSurvivesCrash` answers for each: `perAck` and `perCommit` survive an unclean stop, and `periodic`
+does not, because there the ack precedes the fsync and selecting that mode accepts the window. The table
+then pairs every claim with the theorem that carries it and every gap with the sentence saying what a user
+meets — the missing payload checksum, a zero `mutation_id` that double-applies a counter, and a quarantine
+policy the engine does not yet act on. The red count is pinned, so a gap closed without a table update
+fails the build.
+-/
 
 /-- The sync modes an operator can choose. -/
 inductive AckMode where

@@ -20,7 +20,10 @@ namespace Ferrosa.TlaCheck
 
 open Ferrosa
 
-/-! ## What `raft.tla` claims, and the guard that holds of every state -/
+/-! ## What `raft.tla` claims, and the guard that holds of every state
+
+The first invariant covered here is `NoTermAdvanceWithoutPreVoteMajority`, which ends its disjunction with `\/ TRUE` in `raft.tla`. A disjunction with `TRUE` is `TRUE` in every state, so the invariant holds vacuously and model checking can never falsify it. `prevote_guard_is_vacuous` is that rewriting stated once, and the election machine below shows it is not a harmless typo around a property that holds for some other reason: `BecomeCandidate` is not guarded on `PreVoteSucceeds`, so a candidate with zero PreVotes is reachable even if the guard were repaired.
+-/
 
 /-- The invariant as written in `raft.tla:283-286`:
 
@@ -69,7 +72,10 @@ theorem candidate_without_prevote_reachable :
   exact ElectionReach.step ElectionReach.init
     (ElectionStep.becomeCandidate (by simp))
 
-/-! ### Membership: `config` is per-server and only the leader ever changes it -/
+/-! ### Membership: `config` is per-server and only the leader ever changes it
+
+`raft.tla` gives every server its own `config` and `pendingConfig`, which is right, but `ProposeMembership` and `CommitMembership` write only the index of the server taking the step. A leader that commits the new configuration therefore leaves the others computing quorums against the old one. `JointConsensusSafety` quantifies over a single server's `config`, so the model cannot express the claim the joint phase is supposed to make, and `config_never_propagates` exhibits the state where the divergence sits.
+-/
 
 structure CfgState where
   /-- Voter set as each server believes it. -/
@@ -106,7 +112,10 @@ theorem config_never_propagates :
     (CfgStep.propose (i := 0) (new := [0, 1, 2, 3]) (by decide))) ?_
   exact CfgStep.commit (i := 0) (by decide)
 
-/-! ### `GrantVote` has no state requirement on the voter -/
+/-! ### `GrantVote` has no state requirement on the voter
+
+`GrantVote(i, j)` sets the voter's term and its `votedFor` and leaves the voter's `state` untouched, which the action spells as `UNCHANGED … state …`. Nothing then stops a Leader from voting for another candidate and continuing to lead, which real Raft forbids because a live leader's `votedFor` and `state` cannot disagree. `leader_can_vote_without_stepping_down` exhibits that state, so `ElectionSafety` is proved against a machine weaker than the implementation's.
+-/
 
 structure VoteState where
   term : List Nat

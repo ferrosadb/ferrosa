@@ -24,7 +24,16 @@ namespace Ferrosa.Sql.Txn
 
 open Ferrosa.Ledger
 
-/-! ## All or nothing, and what independent execution gives instead -/
+/-! ## All or nothing, and what independent execution gives instead
+
+A multi-key write can leave everything applied, nothing applied, or a strict subset, and only the first
+two are atomic — independent statement execution produces the third, so a crash partway through leaves
+half a transaction behind. If every participant obeys one commit decision the outcome is all or nothing
+by construction, because there is only one thing for them to disagree about. A participant that acts
+before the decision is known can still contradict it, which is why the decision has to be durable
+before anyone applies it.
+
+-/
 
 /-- What a multi-key write can leave behind. (`partial` is a Lean keyword, hence the naming.) -/
 inductive Outcome where
@@ -60,7 +69,16 @@ theorem one_decision_is_atomic (commit : Bool) :
 theorem acting_early_can_contradict_the_decision :
     outcomeOfDecision true ≠ outcomeOfDecision false := by decide
 
-/-! ## Isolation: the three levels, and what each costs -/
+/-! ## Isolation: the three levels, and what each costs
+
+Two transactions that each preserve an invariant alone can break it together when both read the state
+before either writes: no conflict is visible to either, so both commit and no lock fires. The state a
+client sees afterwards is one the application's own rule forbids — in the shape here, nobody on call —
+where a serial order would have kept one. Serializable isolation refuses the second transaction by
+recording its read set, so the level a client picks is a price paid in aborts rather than a setting on
+a dial.
+
+-/
 
 /-- Two transactions, each reading the other's column and writing its own to its negation — the
     canonical write-skew shape. -/
@@ -98,7 +116,15 @@ def Policy.admitsSkew : Policy → Bool
 theorem serializable_requires_the_read_set :
     Policy.admitsSkew .snapshot = true ∧ Policy.admitsSkew .checkReadSets = false := by decide
 
-/-! ## The decision has to be on disk before the client is told -/
+/-! ## The decision has to be on disk before the client is told
+
+A commit record that reaches the client before it is durable is a transaction the client believes in
+and the store does not: a crash after the acknowledgement loses it, and nothing in the answer says so.
+`Ferrosa/Storage/Recovery.lean` states the same premise for a data record — an acknowledged write
+survives a crash — and this is that premise moved to the decision the records hang from. The ordering,
+not the record's contents, is what the client is relying on.
+
+-/
 
 /-- The commit decision as a record on the log, and whether it is durable at the moment of the
     acknowledgement. -/
@@ -111,7 +137,15 @@ structure CommitRecord where
 theorem a_commit_acked_before_sync_can_be_lost (c : CommitRecord)
     (h : c.syncedBeforeAck = false) : c.syncedBeforeAck = false := h
 
-/-! ## The ledger -/
+/-! ## The ledger
+
+Six obligations are listed against the declaration that decides each, and two are red: a commit record
+durable before the acknowledgement, and serializable isolation as a level the surface can offer. The
+other four hold — atomicity from a single decision, the demonstration that independent execution is not
+atomic, snapshot isolation being available, and the isolation level being a stated choice rather than an
+accident. `txn_has_two_red_items` pins the count so a CI check can require it to fall and never to rise.
+
+-/
 
 def ledger : List SpecItem := [
   ⟨"a multi-key write is all-or-nothing",

@@ -19,7 +19,15 @@ namespace Ferrosa.WritePath
 
 open Ferrosa
 
-/-! ## The store as the write path sees it: one log, a synced prefix, two memtables -/
+/-! ## The store as the write path sees it: one log, a synced prefix, two memtables
+
+A write is durable exactly when its position in the commit log falls below `synced`, so the distance
+between `synced` and the log's length is the number of rows a crash can still take. The two memtables
+are staging, not a second copy of record: `active` fills, is sealed into `flushing`, and is published
+as an SSTable a reader can see, and no step anywhere removes a row from the log. Quarantine is where a
+row that fails validation at flush or replay goes — out of the memtable, still in the log, never
+silently dropped.
+-/
 
 /-- The three sync strategies of `SyncStrategyConfig`. -/
 inductive SyncMode where
@@ -112,7 +120,16 @@ inductive Reachable (mode : SyncMode) : Store → Prop where
   | init : Reachable mode (init mode)
   | step : Reachable mode s → Step mode s s' → Reachable mode s'
 
-/-! ## What holds of every store the engine can reach, in any mode -/
+/-! ## What holds of every store the engine can reach, in any mode
+
+Three things hold whatever sync mode the operator selected: the commit log only grows, the fsynced
+prefix never runs past the log, and the ack counter never runs past the log either — a client is never
+told a row exists that the engine is not holding. What the mode buys is the fourth: under `Batch` an
+acknowledged write is also a synced one, so it survives the process dying, while under the default
+`Periodic` there is a reachable store where the ack precedes the fsync and an unclean stop loses that
+write. Admission failure is sticky as well: once a row is refused, no later step appends to the log, so
+a full log stops taking writes instead of quietly degrading durability.
+-/
 
 /-- The commit log only ever grows. -/
 theorem log_append_only {mode : SyncMode} {s s' : Store} (h : Step mode s s') :
