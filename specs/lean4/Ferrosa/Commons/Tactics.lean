@@ -65,11 +65,38 @@ theorem min_le_left (a b : Nat) : min a b ≤ a := by omega
     as well as inside the backlog. -/
 theorem min_le_right (a b : Nat) : min a b ≤ b := by omega
 
-/-- The bound is the hypothesis here: the statement assumes the share already fits and concludes it,
-    so it names the obligation a share calculation owes rather than establishing it for any
-    particular scheduler. -/
-theorem a_bounded_share_stays_inside_its_bound (a bound : Nat) (h : min a bound ≤ bound) :
-    min a bound ≤ bound := h
+/-- **Once a backlog is inside its share, it stays inside.** The premise is what "steady state"
+    means for a consumer: it never lets the backlog grow. Anything that starts inside the
+    allocation and never grows is inside the allocation at every step, which is the property a
+    spill bound is for — the earlier version of this theorem assumed its own conclusion and so
+    established nothing about any scheduler. -/
+theorem a_bounded_share_stays_inside_its_bound (backlog : Nat → Nat) (share : Nat)
+    (steady : ∀ n, backlog (n + 1) ≤ backlog n) (start : backlog 0 ≤ share) :
+    ∀ n, backlog n ≤ share := by
+  intro n
+  induction n with
+  | zero => exact start
+  | succ n ih => exact Nat.le_trans (steady n) ih
+
+/-- **Resident bytes do not rise while the backlog does not.** Resident bytes are `min backlog
+    share`; `min` is monotone, so a consumer that keeps up can only bring memory down. This is the
+    "memory does not increase" half of the steady-state guarantee, and it holds for every step, not
+    only at the end. -/
+theorem resident_does_not_rise_when_the_backlog_does_not (backlog : Nat → Nat) (share : Nat)
+    (steady : ∀ n, backlog (n + 1) ≤ backlog n) : ∀ n, min (backlog n) share ≤ min (backlog 0) share := by
+  have key : ∀ x y : Nat, x ≤ y → min x share ≤ min y share := by
+    intro x y hxy
+    by_cases hx : x ≤ share
+    · by_cases hy : y ≤ share
+      · rw [Nat.min_eq_left hx, Nat.min_eq_left hy]; exact hxy
+      · rw [Nat.min_eq_left hx, Nat.min_eq_right (by omega)]; omega
+    · by_cases hy : y ≤ share
+      · rw [Nat.min_eq_right (by omega), Nat.min_eq_left hy]; omega
+      · rw [Nat.min_eq_right (by omega), Nat.min_eq_right (by omega)]; omega
+  intro n
+  induction n with
+  | zero => exact Nat.le_refl _
+  | succ n ih => exact Nat.le_trans (key _ _ (steady n)) ih
 
 /-- A consumer holding at most its share cannot exceed the pool if the share cannot. -/
 theorem a_share_inside_the_pool_stays_inside (resident share pool : Nat)

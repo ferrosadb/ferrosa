@@ -160,9 +160,13 @@ def scanFile (env : Environment) (idx : Std.HashMap String (Array Name)) (key sr
     else if t.startsWith "/-!" then
       -- a section: `/-! ## Title` … `-/`
       let (body, next) := collectBlock lines i (dropStr t 3)
-      let firstLine := trim ((body.splitOn "\n").head!)
+      let bodyLines := body.splitOn "\n"
+      let firstLine := trim bodyLines.head!
       let (lvl, title) := headingOf firstLine
-      let rest := trim (dropStr body firstLine.length)
+      -- The rest of the block is every line after the heading. Counting characters instead of
+      -- lines dropped the paragraph: the heading is trimmed before it is measured, so the arithmetic
+      -- lands inside the first line and the prose never reaches the book.
+      let rest := trim (String.intercalate "\n" (bodyLines.drop 1))
       let text := if title.isEmpty then rest
         else if rest.isEmpty then title else title ++ "\n\n" ++ rest
       evs := evs.push (.sect (if lvl == 0 then 2 else lvl) (i + 1) text)
@@ -297,9 +301,12 @@ def check (mods : Array ModuleView) : IO UInt32 := do
         if (d.kind == "theorem" || d.kind == "lemma") && (trim d.doc).isEmpty then
           bad := bad.push s!"{m.path}:{d.line}: {d.short} has no docstring"
       | .sect _ line text =>
-        -- 2. a section heading with nothing under it
+        -- 2. a section heading with nothing under it: a heading and no paragraph is a table of
+        --    contents entry, not a section of a specification
         if (trim text).isEmpty then
           bad := bad.push s!"{m.path}:{line}: empty section heading"
+        else if !(text.contains "\n\n") then
+          bad := bad.push s!"{m.path}:{line}: section has a heading but no prose"
   for b in bad do
     IO.eprintln b
   if bad.isEmpty then

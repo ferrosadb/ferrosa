@@ -230,14 +230,40 @@ theorem nonzero_id_is_deduped : (⟨7, .inc 0, 16, 16, none⟩ : Rec).deduped = 
 
 /-! ## Recovery is deterministic
 
-The semantics the other nodes rely on: the same durable log, replayed, gives the same
-state. This is what lets two replicas that crash at different times converge. -/
+Two replicas that crash at different moments, with different clocks and different amounts already
+replayed, converge when they read the same log — because replay can see nothing about a node except
+the value at the key it is about to write. That is the only sense in which recovery is deterministic,
+and it is the sense the other nodes rely on: not that a replay run equals itself, but that it forgets
+everything about where the bytes came from. -/
 
-/-- Replay is a function of the mutation list alone, so two runs from the same starting state agree —
-    but the statement names the same term on both sides, so it fixes the shape the other nodes rely
-    on rather than saying anything about two nodes that read different bytes. -/
-theorem recovery_is_deterministic (ms : List Mut) :
-    replayFrom (fun _ => none) ms = replayFrom (fun _ => none) ms := rfl
+/-- **Replay depends on the value at the key and nothing else about the store.** Two nodes whose
+    keyspace agrees at `k` land on the same value for `k` after any log — whatever their age,
+    whatever their timestamps say, whether the store was built a second ago or a day ago, and
+    whether either of them has replayed this log before. That is the property "recovery is
+    deterministic across nodes" actually names: not that a function of one argument equals itself,
+    but that the only thing replay can see of a node is the value it is about to overwrite. -/
+theorem recovery_is_deterministic (s t : KS) (ms : List Mut) (k : Key) (h : s k = t k) :
+    replayFrom s ms k = replayFrom t ms k := by
+  induction ms generalizing s t with
+  | nil => exact h
+  | cons m rest ih =>
+    apply ih
+    cases m with
+    | put k' v =>
+      by_cases hk : k = k'
+      · subst hk
+        simp [Mut.apply]
+      · simp [Mut.apply, hk, h]
+    | inc k' =>
+      by_cases hk : k = k'
+      · subst hk
+        simp [Mut.apply, h]
+      · simp [Mut.apply, hk, h]
+    | del k' =>
+      by_cases hk : k = k'
+      · subst hk
+        simp [Mut.apply]
+      · simp [Mut.apply, hk, h]
 
 /-! ## Corruption handling: quarantine, never delete
 
