@@ -1035,6 +1035,38 @@ mod tests {
         ));
     }
 
+    /// The mapping's SAFETY claim is that a component is never truncated or rewritten in place:
+    /// compaction publishes a replacement by rename, and GC unlinks. Both leave the mapped inode
+    /// intact, so a reader opened before the compaction must keep answering with the bytes it
+    /// opened. Truncation is the one operation that would fault (SIGBUS), and no test can call it
+    /// without killing the process — so pin the two operations that actually happen instead.
+    #[test]
+    fn a_mapped_index_survives_replacement_and_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("1-Partitions.db");
+        std::fs::write(&path, b"first").unwrap();
+        let reader = FileReadAt::open(&path).unwrap();
+        assert!(matches!(reader.inner, FileReadAtInner::Mmap { .. }));
+
+        // Compaction publishes the replacement by rename, never in place.
+        let tmp = dir.path().join("1-Partitions.db.tmp");
+        std::fs::write(&tmp, b"second").unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+
+        let mut buf = [0u8; 5];
+        assert_eq!(reader.read_at(&mut buf, 0).unwrap(), 5);
+        assert_eq!(&buf, b"first", "the mapping still sees the inode it opened");
+
+        // GC unlinks the file while a reader holds the mapping.
+        std::fs::remove_file(&path).unwrap();
+        let mut buf = [0u8; 5];
+        assert_eq!(reader.read_at(&mut buf, 0).unwrap(), 5);
+        assert_eq!(
+            &buf, b"first",
+            "an unlinked mapping stays readable until it is dropped"
+        );
+    }
+
     #[test]
     fn file_write_at_offset() {
         let dir = tempfile::tempdir().unwrap();

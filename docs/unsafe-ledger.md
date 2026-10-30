@@ -50,17 +50,57 @@ Production sites by crate:
 | `ferrosa-storage/src/range_merger.rs` | 3 | self-referential borrow across an await | the owner is pinned and outlives the stream | queued |
 | `ferrosa-loadgen/src/resource_monitor.rs` | 2 | `libc` resource query | return code checked | queued |
 | `ferrosa-sstable/src/dio_align.rs` | 2 | `mem::zeroed`, `posix_memalign`-style alignment | the zeroed type has no invalid all-zero bit pattern | queued |
-| `ferrosa-storage/src/write_set_spill.rs` | 2 | `memmap2::Mmap` | the file is never truncated or written while mapped | queued |
-| `ferrosa-storage/src/flush.rs` | 2 | `memmap2::Mmap`, `posix_fadvise` | same, plus the fd is valid for the call | queued |
+| `ferrosa-storage/src/write_set_spill.rs` | 2 | `memmap2::Mmap` | the file is never truncated or written while mapped | audited |
+| `ferrosa-storage/src/flush.rs` | 2 | `memmap2::Mmap`, `posix_fadvise` | same, plus the fd is valid for the call | mapping audited, `fadvise` queued |
 | `ferrosa-schema/src/registry.rs` | 1 | `libc` | return code checked | queued |
-| `ferrosa-sstable/src/io.rs` | 1 | `memmap2::Mmap` | the file is never truncated or written while mapped | queued |
-| `ferrosa-storage/src/index/sidecar.rs` | 1 | `memmap2::Mmap` | same | queued |
-| `ferrosa-storage/src/write_set_stage.rs` | 1 | `memmap2::Mmap` | same | queued |
+| `ferrosa-sstable/src/io.rs` | 1 | `memmap2::Mmap` | the file is never truncated or written while mapped | audited |
+| `ferrosa-storage/src/index/sidecar.rs` | 1 | `memmap2::Mmap` | same | audited |
+| `ferrosa-storage/src/write_set_stage.rs` | 1 | `memmap2::Mmap` | same | audited |
 
-**Zero files audited as of this commit.** The table is the queue, not a certificate; `Status` moves to
-`audited` only when a reviewer has checked the invariant against the call sites and recorded what they
-checked. 33 of the 188 sites in `src/` carry a `SAFETY:` comment today, so most rows also need the
-comment written before they can be audited at all.
+**Five of the seven mappings are audited; nothing else is.** The table is the queue, not a
+certificate; `Status` moves to `audited` only when a reviewer has checked the invariant against the
+call sites and recorded what they checked — the three artifacts for each are in *The mapping
+contract* below. 33 of the 188 sites in `src/` carry a `SAFETY:` comment today, so most rows also need
+the comment written before they can be audited at all.
+
+## The mapping contract
+
+`memmap2::Mmap::map` is `unsafe` for exactly one reason: if the file shrinks underneath the mapping,
+touching the missing pages faults (`SIGBUS`). Everything else about a mapping is safe. So the whole
+obligation is one sentence — **nothing truncates or rewrites a mapped file in place** — and it is
+discharged three ways:
+
+The sites split into two mechanisms, and conflating them would be the error:
+
+1. **Published files: written to a temp name, `rename`d into place.** Sidecars (`sidecar.rs:231`) and
+   SSTable components are never written in place. `rename` swaps the directory entry and leaves the
+   old inode intact, so a reader holding the previous version keeps reading the previous bytes. Test:
+   `rewriting_a_sidecar_leaves_a_mapped_reader_intact` (`index/sidecar.rs`).
+2. **Private files: written, closed, then mapped, with no surviving writable handle.** A spilled write
+   set lives in a fresh directory from `reserve_write_set_stage`; the writer is dropped and the file
+   reopened read-only *before* `Mmap::map`, and no other handle to it exists. There is no `rename` in
+   these two files, so the guarantee is exclusivity rather than atomic publication. Tests:
+   `mmap_entry_reads_identical_bytes_to_the_owned_mutation_path` and
+   `mmap_entry_is_a_stable_slice_of_the_mapping` (`write_set_spill.rs`).
+3. **Unlink only after the last reader drops.** GC and compaction delete whole files, which removes
+   the name but not the inode while it is mapped. Test:
+   `a_mapped_index_survives_replacement_and_removal` (`sstable/io.rs`) replaces a mapped component by
+   rename and then deletes it; the open reader returns the original bytes after both.
+4. **No in-place truncation anywhere.** Checked against every `set_len` and `truncate(true)` call site
+   in `ferrosa-storage` and `ferrosa-sstable`: `engine.rs` (4), `schema_snapshot.rs`, `store.rs`,
+   `eviction_audit.rs` (`CURRENT` pointer), `count.rs`, `upload/download.rs` (download target). Every
+   one sizes a file that is never mapped — none names a component, sidecar or spill file.
+
+**Residual, not covered by any of the above:** another process truncating one of these files. Nothing
+in Rust can prevent that, and the failure is a fault rather than an error — the honest mitigation is
+that these are files only this server writes.
+
+**Why they were not removed.** Each has a safe replacement — read the bytes into a `Vec` — and each
+loses the property the mapping exists for: the kernel can evict mapped pages under memory pressure,
+whereas a `Vec` is resident until dropped. On a table with many open components that is unbounded RSS,
+so removal here trades a contract that holds by construction for a memory regression. The sites that
+*were* removable for free — the hand-rolled aligned allocator, which is neither reclaimable nor
+cheap — are removed instead (`direct.rs`, 8 -> 3).
 
 ## Audit order
 
