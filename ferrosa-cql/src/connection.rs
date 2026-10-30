@@ -2893,10 +2893,10 @@ fn cql_value_to_term(v: &CqlValue) -> Term {
         CqlValue::Tinyint(n) => Term::IntegerLiteral(*n as i64),
         CqlValue::Float(bits) => Term::FloatLiteral(f32::from_bits(*bits) as f64),
         CqlValue::Double(bits) => Term::FloatLiteral(f64::from_bits(*bits)),
-        CqlValue::Text(s) | CqlValue::Ascii(s) => Term::StringLiteral(s.clone()),
+        CqlValue::Text(s) | CqlValue::Ascii(s) => Term::StringLiteral(s.to_string()),
         CqlValue::Boolean(b) => Term::BoolLiteral(*b),
         CqlValue::Uuid(u) | CqlValue::Timeuuid(u) => Term::UuidLiteral(*u),
-        CqlValue::Blob(b) => Term::BlobLiteral(b.clone()),
+        CqlValue::Blob(b) => Term::BlobLiteral(b.to_vec()),
         CqlValue::Inet(addr) => Term::StringLiteral(addr.to_string()),
         // These types do not have parser literals that can represent every wire
         // value without loss. Keep their exact CQL encoding and let

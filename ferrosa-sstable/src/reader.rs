@@ -1361,60 +1361,102 @@ impl<R: ReadAt> SSTableReader<R> {
     /// Best-effort salvage of every partition, recovering each partition's
     /// header and leading rows even when a later row fails to decode.
     ///
-    /// Partition boundaries come from the index walk ([`Self::partition_offsets`]),
-    /// so an intra-partition parse drift (the writer-bitmap-under-count
-    /// corruption signature) does NOT cascade into the next partition — each
-    /// partition is decoded independently at its indexed offset. Calls
-    /// `on_partition` for every partition that yields at least a header and
-    /// returns aggregate [`SalvageStats`].
+    /// Streamed end to end. Partition starts come from a lazy walk of Data.db
+    /// headers (the `next_partition_count` byte-skip walk, nothing cached), and
+    /// each partition is then salvaged independently at its start, so an
+    /// intra-partition parse drift (the writer-bitmap-under-count corruption
+    /// signature) does NOT cascade into the next partition. Every recovered row
+    /// is handed to `on_row(key, row, is_static)` from one reused buffer, so
+    /// memory is one row whatever the partition or file size.
     ///
-    /// Memory is bounded: only the current partition is materialized.
-    pub fn salvage<F>(&self, mut on_partition: F) -> Result<SalvageStats>
+    /// The walk can only find a partition whose predecessors' headers decode;
+    /// where it stops, and why, is reported in [`SalvageStats::walk_stopped`]
+    /// rather than ending the pass silently (t_d34e5ffe tracks reaching the
+    /// partitions after that point through the partition index).
+    pub fn salvage<F>(&self, mut on_row: F) -> Result<SalvageStats>
     where
-        F: FnMut(SalvagedPartition),
+        F: FnMut(&ferrosa_common::key::DecoratedKey, &crate::types::Row, bool),
     {
-        let offsets = self.partition_offsets();
         let mut stats = SalvageStats::default();
         let source = self.data_source()?;
-        for &off in offsets.iter() {
-            Self::salvage_one(&source, &self.stored, off, &mut stats, &mut on_partition);
+        let mut walk = self.partitions_iter()?;
+        let mut row = crate::types::Row {
+            clustering: Vec::new(),
+            cells: Vec::new(),
+            deletion: crate::types::DeletionTime::LIVE,
+            primary_key_liveness: crate::types::LivenessInfo::NONE,
+        };
+        loop {
+            let start = walk.pos;
+            match walk.next_partition_count() {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(e) => {
+                    stats.walk_stopped = Some(format!(
+                        "partition walk stopped at byte {start}: {e}; later partitions not attempted"
+                    ));
+                    break;
+                }
+            }
+            Self::salvage_one(
+                &source,
+                &self.stored,
+                start,
+                &mut stats,
+                &mut row,
+                &mut on_row,
+            );
+        }
+        // A Data.db cut on a partition boundary ends the walk at a clean EOF.
+        // Only the index knows partitions are missing, so compare against it.
+        let indexed = self.key_count();
+        if stats.walk_stopped.is_none() && stats.partitions_total < indexed {
+            stats.walk_stopped = Some(format!(
+                "Data.db ended after {} of {indexed} indexed partitions (truncated)",
+                stats.partitions_total
+            ));
         }
         Ok(stats)
     }
 
-    /// Salvage one partition at `offset`, updating `stats` and invoking
-    /// `on_partition` on success. Generic over the (possibly decompressed)
-    /// data source so compressed and uncompressed SSTables share one path.
-    fn salvage_one<D: ReadAt, F: FnMut(SalvagedPartition)>(
+    /// Salvage one partition at `offset`, updating `stats` with what it
+    /// delivered and, for the first failure of each kind, why. Generic over the
+    /// (possibly decompressed) data source so compressed and uncompressed
+    /// SSTables share one path.
+    fn salvage_one<D: ReadAt, F>(
         data: &D,
         header: &crate::statistics::SerializationHeader,
         offset: u64,
         stats: &mut SalvageStats,
-        on_partition: &mut F,
-    ) {
+        row: &mut crate::types::Row,
+        on_row: &mut F,
+    ) where
+        F: FnMut(&ferrosa_common::key::DecoratedKey, &crate::types::Row, bool),
+    {
         stats.partitions_total += 1;
         let mut reader = crate::data::DataReader::new(data, header, offset);
-        match reader.salvage_partition() {
-            Ok(Some((key, deletion, static_row, rows, complete))) => {
-                if complete {
+        match reader.salvage_partition(row, &mut *on_row) {
+            Ok(Some(outcome)) => {
+                if outcome.complete {
                     stats.partitions_complete += 1;
                 } else {
                     stats.partitions_partial += 1;
+                    if stats.first_partial.is_none() {
+                        stats.first_partial = outcome
+                            .stopped
+                            .map(|why| format!("partition at byte {offset}: {why}"));
+                    }
                 }
-                stats.rows_recovered += rows.len() as u64;
-                if static_row.is_some() {
-                    stats.static_rows_recovered += 1;
-                }
-                on_partition(SalvagedPartition {
-                    key,
-                    deletion,
-                    static_row,
-                    rows,
-                    complete,
-                });
+                stats.rows_recovered += outcome.rows;
+                stats.static_rows_recovered += outcome.static_rows;
             }
             Ok(None) => {}
-            Err(_) => stats.partitions_failed += 1,
+            Err(e) => {
+                stats.partitions_failed += 1;
+                if stats.first_failure.is_none() {
+                    stats.first_failure = Some(format!("partition header at byte {offset}: {e}"));
+                }
+            }
         }
     }
 }
@@ -1438,25 +1480,47 @@ pub fn load_checksums_if_present<R: ReadAt>(
     digest_path: Option<&std::path::Path>,
     crc_path: Option<&std::path::Path>,
 ) {
-    if let Some(path) = digest_path {
-        if let Ok(digest) = std::fs::read(path) {
-            if let Err(e) = reader.load_digest(&digest) {
-                tracing::warn!(
-                    gen, error = %e, path = %path.display(),
-                    "failed to parse Digest.crc32; digest verification disabled for this generation"
-                );
-            }
+    if let Some(digest) = digest_path.and_then(|path| read_checksum_component(gen, path)) {
+        if let Err(e) = reader.load_digest(&digest) {
+            tracing::warn!(
+                gen, error = %e, path = ?digest_path,
+                "failed to parse Digest.crc32; digest verification disabled for this generation"
+            );
         }
     }
-    if let Some(path) = crc_path {
-        if let Ok(crc) = std::fs::read(path) {
-            if let Err(e) = reader.load_crc_table(&crc) {
-                tracing::warn!(
-                    gen, error = %e, path = %path.display(),
-                    "failed to parse CRC.db; chunk verification disabled for this generation"
-                );
-            }
+    if let Some(crc) = crc_path.and_then(|path| read_checksum_component(gen, path)) {
+        if let Err(e) = reader.load_crc_table(&crc) {
+            tracing::warn!(
+                gen, error = %e, path = ?crc_path,
+                "failed to parse CRC.db; chunk verification disabled for this generation"
+            );
         }
+    }
+}
+
+/// Read a checksum component. Absence is the designed pre-T-011 state and
+/// returns `None` quietly. Any other read failure also returns `None` (the
+/// generation still opens, unverified), but warns: an unreadable checksum file
+/// must not disable verification without a trace.
+fn read_checksum_component(gen: &str, path: &std::path::Path) -> Option<Vec<u8>> {
+    match classify_checksum_read(std::fs::read(path)) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(
+                gen, error = %e, path = %path.display(),
+                "cannot read checksum component; verification disabled on this generation"
+            );
+            None
+        }
+    }
+}
+
+/// `Ok(None)` only on `NotFound`; every other error is returned.
+fn classify_checksum_read(read: std::io::Result<Vec<u8>>) -> std::io::Result<Option<Vec<u8>>> {
+    match read {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -1482,22 +1546,10 @@ pub fn load_checksums_for_generation<R: ReadAt>(
     );
 }
 
-/// One partition recovered (possibly partially) by [`SSTableReader::salvage`].
-#[derive(Debug, Clone)]
-pub struct SalvagedPartition {
-    pub key: ferrosa_common::key::DecoratedKey,
-    pub deletion: crate::types::DeletionTime,
-    pub static_row: Option<crate::types::Row>,
-    pub rows: Vec<crate::types::Row>,
-    /// `true` if the partition ended on a clean `END_OF_PARTITION`; `false` if
-    /// recovery stopped early at a parse drift or truncation.
-    pub complete: bool,
-}
-
 /// Aggregate outcome of a [`SSTableReader::salvage`] pass.
 #[derive(Debug, Clone, Default)]
 pub struct SalvageStats {
-    /// Partition offsets attempted (from the partition-index walk).
+    /// Partition starts attempted (from the Data.db header walk).
     pub partitions_total: u64,
     /// Partitions recovered fully (ended on `END_OF_PARTITION`).
     pub partitions_complete: u64,
@@ -1509,6 +1561,13 @@ pub struct SalvageStats {
     pub rows_recovered: u64,
     /// Total static rows recovered.
     pub static_rows_recovered: u64,
+    /// Why the partition walk ended before EOF, when it did. Partitions after
+    /// that point were not attempted.
+    pub walk_stopped: Option<String>,
+    /// Why the first partially recovered partition stopped.
+    pub first_partial: Option<String>,
+    /// Why the first unrecoverable partition header failed.
+    pub first_failure: Option<String>,
 }
 
 /// Streaming partition iterator over an SSTable.
@@ -1925,10 +1984,44 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
         self.pos = reader.position();
         Ok(result)
     }
+
+    /// Bookmark within this pinned immutable source for an exceptional full read.
+    pub fn partition_position(&self) -> u64 {
+        self.pos
+    }
+
+    /// Schema of this pinned source for exceptional liveness reads.
+    pub fn source_header(&self) -> &SerializationHeader {
+        self.sst.header()
+    }
+
+    /// Read a bookmarked partition without advancing this iterator. This keeps
+    /// a count's exceptional TTL/deletion reads on its original source view.
+    pub fn read_partition_at(&self, position: u64) -> Result<Option<crate::types::Partition>> {
+        DataReader::new(&self.source, &self.sst.stored, position).read_partition()
+    }
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// An absent checksum file is the designed pre-T-011 state; any other read
+    /// failure must surface (and is warned about) instead of reading as absent.
+    #[test]
+    fn checksum_read_treats_only_absence_as_absent() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(
+            classify_checksum_read(Err(Error::from(ErrorKind::NotFound))).unwrap(),
+            None
+        );
+        assert_eq!(
+            classify_checksum_read(Ok(vec![1, 2])).unwrap(),
+            Some(vec![1, 2])
+        );
+        let err = classify_checksum_read(Err(Error::from(ErrorKind::PermissionDenied)))
+            .expect_err("permission denied is not absence");
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+    }
     use super::*;
     use crate::bloom::BloomFilter;
     use crate::statistics::{
@@ -3877,8 +3970,13 @@ mod tests {
         let (output, total_rows) = build_multi_partition_output(3, 2);
         let reader = SSTableReader::open(components_from(output)).unwrap();
 
-        let mut got = Vec::new();
-        let stats = reader.salvage(|p| got.push(p)).unwrap();
+        let (mut rows, mut keys) = (0usize, std::collections::BTreeSet::new());
+        let stats = reader
+            .salvage(|key, _row, _is_static| {
+                rows += 1;
+                keys.insert(key.key.as_bytes().to_vec());
+            })
+            .unwrap();
 
         assert_eq!(stats.partitions_total, 3);
         assert_eq!(
@@ -3888,8 +3986,9 @@ mod tests {
         assert_eq!(stats.partitions_partial, 0);
         assert_eq!(stats.partitions_failed, 0);
         assert_eq!(stats.rows_recovered, total_rows as u64);
-        assert_eq!(got.iter().map(|p| p.rows.len()).sum::<usize>(), total_rows);
-        assert!(got.iter().all(|p| p.complete));
+        assert_eq!(rows, total_rows, "every row reaches the callback");
+        assert_eq!(keys.len(), 3, "rows carry their own partition key");
+        assert_eq!(stats.walk_stopped, None, "a healthy file is walked to EOF");
     }
 
     /// Salvage must never error or panic on a truncated Data.db, and must
@@ -3910,9 +4009,11 @@ mod tests {
         };
         let reader = SSTableReader::open(components).unwrap();
 
-        let mut got = Vec::new();
+        let mut delivered = 0u64;
         // Must return Ok (never propagate a per-partition failure).
-        let stats = reader.salvage(|p| got.push(p)).unwrap();
+        let stats = reader
+            .salvage(|_key, _row, _is_static| delivered += 1)
+            .unwrap();
 
         assert!(stats.rows_recovered > 0, "leading partitions recover");
         assert!(
@@ -3922,9 +4023,12 @@ mod tests {
             total_rows
         );
         assert_eq!(
-            stats.rows_recovered,
-            got.iter().map(|p| p.rows.len()).sum::<usize>() as u64,
-            "stats agree with delivered partitions"
+            stats.rows_recovered, delivered,
+            "stats agree with delivered rows"
+        );
+        assert!(
+            stats.walk_stopped.is_some() || stats.first_partial.is_some(),
+            "a truncated file says where and why recovery stopped: {stats:?}"
         );
     }
 

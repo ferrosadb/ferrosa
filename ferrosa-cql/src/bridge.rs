@@ -232,8 +232,8 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
         },
 
         Term::StringLiteral(s) => match target {
-            CqlType::Varchar => Ok(CqlValue::Text(s.clone())),
-            CqlType::Ascii => Ok(CqlValue::Ascii(s.clone())),
+            CqlType::Varchar => Ok(CqlValue::Text(s.clone().into())),
+            CqlType::Ascii => Ok(CqlValue::Ascii(s.clone().into())),
             CqlType::Inet => {
                 let addr: IpAddr = s
                     .parse()
@@ -390,7 +390,7 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
         Term::BlobLiteral(b) => match target {
             // Guarded above; explicit so a new arm cannot fall through.
             CqlType::Jsonb => Err(jsonb_unsupported("literals")),
-            CqlType::Blob => Ok(CqlValue::Blob(b.clone())),
+            CqlType::Blob => Ok(CqlValue::Blob(b.clone().into())),
             // EXECUTE bind values may arrive as raw bytes (BlobLiteral) when
             // the prepared statement's bound_columns couldn't be resolved.
             // Decode them based on the target type rather than rejecting.
@@ -408,9 +408,9 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                 let ms = i64::from_be_bytes(b.as_slice().try_into().unwrap());
                 Ok(CqlValue::Timestamp(validate_timestamp_ms(ms)?))
             }
-            CqlType::Varchar | CqlType::Ascii => {
-                Ok(CqlValue::Text(String::from_utf8_lossy(b).to_string()))
-            }
+            CqlType::Varchar | CqlType::Ascii => Ok(CqlValue::Text(
+                String::from_utf8_lossy(b).to_string().into(),
+            )),
             CqlType::Boolean if b.len() == 1 => Ok(CqlValue::Boolean(b[0] != 0)),
             CqlType::Float if b.len() == 4 => Ok(CqlValue::Float(u32::from_be_bytes(
                 b.as_slice().try_into().unwrap(),
@@ -1735,7 +1735,7 @@ mod tests {
     #[test]
     fn term_blob_ok() {
         let val = term_to_cql_value(&Term::BlobLiteral(vec![0xDE, 0xAD]), &CqlType::Blob).unwrap();
-        assert_eq!(val, CqlValue::Blob(vec![0xDE, 0xAD]));
+        assert_eq!(val, CqlValue::Blob(vec![0xDE, 0xAD].into()));
     }
 
     #[test]
@@ -2687,9 +2687,15 @@ mod tests {
             CqlValue::Udt(fields) => {
                 assert_eq!(fields.len(), 2);
                 assert_eq!(fields[0].0, "street");
-                assert_eq!(fields[0].1, Some(CqlValue::Text("123 Main".to_string())));
+                assert_eq!(
+                    fields[0].1,
+                    Some(CqlValue::Text("123 Main".to_string().into()))
+                );
                 assert_eq!(fields[1].0, "city");
-                assert_eq!(fields[1].1, Some(CqlValue::Text("Springfield".to_string())));
+                assert_eq!(
+                    fields[1].1,
+                    Some(CqlValue::Text("Springfield".to_string().into()))
+                );
             }
             other => panic!("expected Udt, got {:?}", other),
         }
@@ -2714,7 +2720,10 @@ mod tests {
         match val {
             CqlValue::Udt(fields) => {
                 assert_eq!(fields.len(), 2);
-                assert_eq!(fields[0].1, Some(CqlValue::Text("123 Main".to_string())));
+                assert_eq!(
+                    fields[0].1,
+                    Some(CqlValue::Text("123 Main".to_string().into()))
+                );
                 // Missing field should be None
                 assert_eq!(fields[1].0, "city");
                 assert_eq!(fields[1].1, None);
@@ -2739,7 +2748,10 @@ mod tests {
         match val {
             CqlValue::Udt(fields) => {
                 assert_eq!(fields[0].0, "street");
-                assert_eq!(fields[0].1, Some(CqlValue::Text("123 Main".to_string())));
+                assert_eq!(
+                    fields[0].1,
+                    Some(CqlValue::Text("123 Main".to_string().into()))
+                );
             }
             other => panic!("expected Udt, got {:?}", other),
         }
@@ -2769,7 +2781,10 @@ mod tests {
         match val {
             CqlValue::Udt(fields) => {
                 assert_eq!(fields.len(), 2);
-                assert_eq!(fields[0].1, Some(CqlValue::Text("Alice".to_string())));
+                assert_eq!(
+                    fields[0].1,
+                    Some(CqlValue::Text("Alice".to_string().into()))
+                );
                 assert_eq!(fields[1].1, Some(CqlValue::Int(30)));
             }
             other => panic!("expected Udt, got {:?}", other),
@@ -3027,7 +3042,7 @@ mod tests {
     fn term_blob_to_varchar() {
         let val =
             term_to_cql_value(&Term::BlobLiteral(b"hello".to_vec()), &CqlType::Varchar).unwrap();
-        assert_eq!(val, CqlValue::Text("hello".to_string()));
+        assert_eq!(val, CqlValue::Text("hello".to_string().into()));
     }
 
     #[test]
@@ -3130,25 +3145,31 @@ mod tests {
 
     #[test]
     fn tojson_blob() {
-        let json = cql_value_to_json(&CqlValue::Blob(vec![0xDE, 0xAD]));
+        let json = cql_value_to_json(&CqlValue::Blob(vec![0xDE, 0xAD].into()));
         assert_eq!(json, "\"0xdead\"");
         // Lowercase, two digits per byte, `0x`-prefixed (T6 replaced the
         // per-byte `format!` with a table-driven encoder).
-        assert_eq!(cql_value_to_json(&CqlValue::Blob(vec![])), "\"0x\"");
-        assert_eq!(cql_value_to_json(&CqlValue::Blob(vec![0x00])), "\"0x00\"");
-        assert_eq!(cql_value_to_json(&CqlValue::Blob(vec![0xff])), "\"0xff\"");
+        assert_eq!(cql_value_to_json(&CqlValue::Blob(vec![].into())), "\"0x\"");
         assert_eq!(
-            cql_value_to_json(&CqlValue::Blob(vec![0xFF, 0x0F, 0x80, 0x7f])),
+            cql_value_to_json(&CqlValue::Blob(vec![0x00].into())),
+            "\"0x00\""
+        );
+        assert_eq!(
+            cql_value_to_json(&CqlValue::Blob(vec![0xff].into())),
+            "\"0xff\""
+        );
+        assert_eq!(
+            cql_value_to_json(&CqlValue::Blob(vec![0xFF, 0x0F, 0x80, 0x7f].into())),
             "\"0xff0f807f\""
         );
         let key: Vec<u8> = (0u8..32).collect();
         assert_eq!(
-            cql_value_to_json(&CqlValue::Blob(key)),
+            cql_value_to_json(&CqlValue::Blob(key.into())),
             "\"0x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\"",
             "32-byte key hex must stay lowercase and zero-padded"
         );
         // One allocation for the whole JSON value, however many bytes.
-        let json = cql_value_to_json(&CqlValue::Blob(vec![0xAB; 1024]));
+        let json = cql_value_to_json(&CqlValue::Blob(vec![0xAB; 1024].into()));
         assert_eq!(json.len(), 1024 * 2 + 4);
         assert_eq!(json.capacity(), json.len());
     }

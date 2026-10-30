@@ -114,3 +114,30 @@ Notes:
   verification remain outstanding; see [fmea.md](fmea.md) PG-11.
 - The encoder is the single canonical `ferrosa-row-bridge` codec, so the row is
   byte-identical whether written via Postgres or CQL (no second encoder, D10).
+
+## Direct READ COMMITTED statement and commit
+
+1. Default/explicit RC and implicit statements take fresh committed views and
+   overlay their own staged writes. SERIALIZABLE retains its BEGIN view.
+2. UPDATE/DELETE select candidates through MVCC point/scan reads or a proven
+   stable declared-key index. Each initially matching candidate waits for its
+   table-UUID/partition hash stripe, then rechecks the winner and full predicate.
+3. Mutations retain table UUIDs and spill through TxnWriteSet. Local FIFO requests
+   record predecessor dependencies; cycle-closing requesters fail with `40P01`.
+   Default lock timeout is disabled. Admission above 16,384 identities or 262,144
+   held/pending references fails `53200`; errors discard the transaction's writes
+   and ownership. Pending guards reclaim cancelled queued or granted reservations.
+4. COMMIT validates original incarnation/lease boundaries, acquires remaining
+   write scopes, and uses a fresh RC commit view (original for SERIALIZABLE).
+   Ownership lives outside the consumed write source until atomic apply and MVCC
+   publication both finish. Late bulk writers retain conservative conflict checks.
+5. COMMIT/ROLLBACK, failure, disconnect or dropped execution futures release
+   ownership. While execution is blocked, native EOF/Terminate/CancelRequest
+   detection remains t_b254fd86. No statement or whole transaction is replayed.
+6. Original BEGIN lifetime (600 seconds by default) survives RC refresh. Expiry
+   wakes waiting acquisitions and releases idle owners without another client
+   frame, reporting `40001`. The reaper never drops leases; pre-apply validation
+   rejects expired work, while irreversible apply/publication retain ownership.
+
+The local stripe domain has no remote coordinator; distributed RC remains a
+separate requirement. SQL transaction-clock values do not change across statements.

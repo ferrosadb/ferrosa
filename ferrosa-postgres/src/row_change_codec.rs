@@ -48,9 +48,23 @@ const TRAVERSAL_LIMIT_WORDS: usize = 8 * 1024 * 1024;
 /// The result is what `encode_postgres_mvcc_mutation` frames into the storage
 /// mutation that the Accord write-set ships.
 pub(crate) fn encode_partition(changes: &[RowChange]) -> Result<Vec<u8>, String> {
+    let (table, table_id) = changes
+        .first()
+        .map(|c| (c.table.as_str(), c.table_id))
+        .unwrap_or(("", uuid::Uuid::nil()));
+    encode_table_partition(table, table_id, changes)
+}
+
+pub(crate) fn encode_table_partition(
+    table: &str,
+    table_id: uuid::Uuid,
+    changes: &[RowChange],
+) -> Result<Vec<u8>, String> {
     let mut message = Builder::new_default();
     {
-        let root = message.init_root::<pg_mvcc_row_changes::Builder>();
+        let mut root = message.init_root::<pg_mvcc_row_changes::Builder>();
+        root.set_table(table);
+        root.set_table_id(table_id.as_bytes());
         let mut list = root.init_changes(changes.len() as u32);
         for (index, change) in changes.iter().enumerate() {
             write_row_change(change, list.reborrow().get(index as u32));
@@ -65,6 +79,12 @@ pub(crate) fn encode_partition(changes: &[RowChange]) -> Result<Vec<u8>, String>
 /// metadata is only ever produced by [`encode_partition`], so anything else is
 /// corruption, never a value to guess at.
 pub(crate) fn decode_partition(payload: &[u8]) -> Result<Vec<RowChange>, String> {
+    decode_table_partition(payload).map(|(_, _, changes)| changes)
+}
+
+pub(crate) fn decode_table_partition(
+    payload: &[u8],
+) -> Result<(String, uuid::Uuid, Vec<RowChange>), String> {
     let reader = serialize::read_message(
         &mut std::io::Cursor::new(payload),
         ReaderOptions {
@@ -79,13 +99,51 @@ pub(crate) fn decode_partition(payload: &[u8]) -> Result<Vec<RowChange>, String>
     let changes = root
         .get_changes()
         .map_err(|error| format!("read PostgreSQL MVCC row-version list: {error}"))?;
-    (0..changes.len())
+    let (table, id) = read_table_identity(root)?;
+    let changes: Vec<RowChange> = (0..changes.len())
         .map(|index| read_row_change(changes.get(index)))
-        .collect()
+        .collect::<Result<_, _>>()?;
+    if changes
+        .iter()
+        .any(|change| change.table != table || change.table_id != id)
+    {
+        return Err("PostgreSQL row metadata disagrees with partition incarnation".into());
+    }
+    Ok((table, id, changes))
+}
+
+/// Read only the relation header during apply admission, without allocating row images.
+pub(crate) fn decode_table_identity(payload: &[u8]) -> Result<(String, uuid::Uuid), String> {
+    let reader = serialize::read_message(
+        &mut std::io::Cursor::new(payload),
+        ReaderOptions {
+            traversal_limit_in_words: Some(TRAVERSAL_LIMIT_WORDS),
+            nesting_limit: 64,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    let root = reader
+        .get_root::<pg_mvcc_row_changes::Reader>()
+        .map_err(|e| e.to_string())?;
+    read_table_identity(root)
+}
+
+fn read_table_identity(
+    root: pg_mvcc_row_changes::Reader<'_>,
+) -> Result<(String, uuid::Uuid), String> {
+    let table = root
+        .get_table()
+        .map_err(|e| e.to_string())?
+        .to_string()
+        .map_err(|e| e.to_string())?;
+    let id = uuid::Uuid::from_slice(root.get_table_id().map_err(|e| e.to_string())?)
+        .map_err(|_| "PostgreSQL MVCC metadata has no valid table incarnation; legacy replay requires an explicit migration".to_string())?;
+    Ok((table, id))
 }
 
 fn write_row_change(change: &RowChange, mut builder: pg_mvcc_row_change::Builder<'_>) {
     builder.set_table(&change.table);
+    builder.set_table_id(change.table_id.as_bytes());
     write_value_list(
         &change.key,
         builder.reborrow().init_key(change.key.len() as u32),
@@ -119,7 +177,11 @@ fn read_row_change(reader: pg_mvcc_row_change::Reader<'_>) -> Result<RowChange, 
     } else {
         None
     };
+    let table_id = uuid::Uuid::from_slice(reader.get_table_id()
+        .map_err(|e| format!("read PostgreSQL table incarnation: {e}"))?)
+        .map_err(|_| "PostgreSQL MVCC metadata has no valid table incarnation; legacy replay requires an explicit migration".to_string())?;
     Ok(RowChange {
+        table_id,
         table: reader
             .get_table()
             .map_err(|error| format!("read PostgreSQL MVCC row table: {error}"))?
@@ -224,7 +286,7 @@ fn read_value(reader: pg_mvcc_value::Reader<'_>) -> Result<Value, String> {
         {
             op::NullValue(()) => Value::Null,
             op::IntValue(inner) => Value::Int(inner),
-            op::TextValue(text) => Value::Text(read_text(text, "text value")?),
+            op::TextValue(text) => Value::Text(read_text(text, "text value")?.into()),
             op::BoolValue(inner) => Value::Bool(inner),
             op::FloatValue(bits) => Value::float(f64::from_bits(bits)),
             op::UuidValue(bytes) => {
@@ -238,7 +300,7 @@ fn read_value(reader: pg_mvcc_value::Reader<'_>) -> Result<Value, String> {
             op::ByteaValue(bytes) => {
                 let bytes =
                     bytes.map_err(|error| format!("read PostgreSQL MVCC bytea value: {error}"))?;
-                Value::Bytea(bytes.to_vec())
+                Value::Bytea(bytes.to_vec().into())
             }
             op::TimestampValue(micros) => Value::Timestamp(micros),
             op::DateValue(days) => Value::Date(days),
@@ -336,7 +398,7 @@ mod tests {
             Value::Uuid(uuid::Uuid::from_u128(
                 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10,
             )),
-            Value::Bytea(vec![0, 255, 128, 7]),
+            Value::Bytea(vec![0, 255, 128, 7].into()),
             Value::Timestamp(1_700_000_000_000_000),
             Value::Date(-1),
             Value::Time(86_399_999_999),
@@ -353,13 +415,15 @@ mod tests {
         vec![
             RowChange {
                 table: "ks.t".into(),
+                table_id: uuid::Uuid::nil(),
                 key: vec![Value::Int(1)],
                 partition_key: vec![0, 1, 2],
                 before: None,
                 after: Some(Row::new(all_value_variants())),
             },
             RowChange {
-                table: "ks.empty".into(),
+                table: "ks.t".into(),
+                table_id: uuid::Uuid::nil(),
                 key: Vec::new(),
                 partition_key: Vec::new(),
                 before: Some(Row::new(Vec::new())),
@@ -367,6 +431,7 @@ mod tests {
             },
             RowChange {
                 table: "ks.t".into(),
+                table_id: uuid::Uuid::nil(),
                 key: vec![Value::Text("pk".into()), Value::Int(2)],
                 partition_key: b"partition-\0-bytes".to_vec(),
                 before: Some(Row::new(vec![Value::Int(1), Value::Text("old".into())])),
@@ -404,6 +469,7 @@ mod tests {
     fn row_change_binary_round_trips_nan_and_signed_zero_by_bit_pattern() {
         let change = RowChange {
             table: "ks.f".into(),
+            table_id: uuid::Uuid::nil(),
             key: vec![Value::Int(7)],
             partition_key: b"pk".to_vec(),
             before: Some(Row::new(vec![Value::float(-0.0)])),
@@ -446,6 +512,7 @@ mod tests {
 
         let single = vec![RowChange {
             table: "ks.one".into(),
+            table_id: uuid::Uuid::nil(),
             key: vec![Value::Int(1)],
             partition_key: vec![9],
             before: None,

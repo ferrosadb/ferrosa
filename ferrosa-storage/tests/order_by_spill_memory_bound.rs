@@ -80,7 +80,10 @@ const PAYLOAD_BYTES: usize = 512;
 fn make_row(key: i64) -> Vec<Option<CqlValue>> {
     let mut payload = vec![0u8; PAYLOAD_BYTES];
     payload[..8].copy_from_slice(&key.to_le_bytes());
-    vec![Some(CqlValue::Bigint(key)), Some(CqlValue::Blob(payload))]
+    vec![
+        Some(CqlValue::Bigint(key)),
+        Some(CqlValue::Blob(payload.into())),
+    ]
 }
 
 /// Deterministic LCG (no `rand` dependency) producing pseudo-random keys.

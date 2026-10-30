@@ -1,4 +1,7 @@
 //! SPARQL engine: parse → plan → execute.
+//! Correctness: legacy RDF identity tests and COUNT/JSON/protocol regressions.
+//! Last revised: 2026-10-27
+//! Last changed: Add query base context and negotiate typed result boundaries.
 
 use std::sync::Arc;
 
@@ -108,10 +111,10 @@ impl SparqlResult {
     }
 
     /// Serialize to N-Triples bytes.
-    pub fn to_ntriples(&self) -> Vec<u8> {
+    pub fn to_ntriples(&self) -> Result<Vec<u8>, String> {
         match self {
             Self::Select(results) => results.to_ntriples(),
-            Self::Ask(result) => format!("# boolean: {}\n", result.boolean).into_bytes(),
+            Self::Ask(result) => Ok(format!("# boolean: {}\n", result.boolean).into_bytes()),
             Self::Graph(triples) => {
                 let mut buf = String::new();
                 for t in triples {
@@ -131,7 +134,13 @@ impl SparqlResult {
                             }
                         }
                         _ => {
-                            let escaped = t.object.replace('\\', "\\\\").replace('"', "\\\"");
+                            let escaped = t
+                                .object
+                                .replace('\\', "\\\\")
+                                .replace('"', "\\\"")
+                                .replace('\n', "\\n")
+                                .replace('\r', "\\r")
+                                .replace('\t', "\\t");
                             if let Some(lang) = &t.lang {
                                 format!("\"{}\"@{}", escaped, lang)
                             } else if let Some(dt) = &t.datatype {
@@ -143,16 +152,16 @@ impl SparqlResult {
                     };
                     buf.push_str(&format!("{subj} {pred} {obj} .\n"));
                 }
-                buf.into_bytes()
+                Ok(buf.into_bytes())
             }
         }
     }
 
     /// Serialize to Turtle bytes (currently N-Triples subset).
-    pub fn to_turtle(&self) -> Vec<u8> {
+    pub fn to_turtle(&self) -> Result<Vec<u8>, String> {
         match self {
             Self::Select(results) => results.to_turtle(),
-            Self::Ask(result) => format!("# boolean: {}\n", result.boolean).into_bytes(),
+            Self::Ask(result) => Ok(format!("# boolean: {}\n", result.boolean).into_bytes()),
             Self::Graph(_) => self.to_ntriples(),
         }
     }
@@ -165,9 +174,23 @@ impl SparqlResult {
     pub fn serialize(&self, format: crate::results::ResultFormat) -> Result<Vec<u8>, String> {
         match format {
             crate::results::ResultFormat::Json => self.to_json().map_err(|e| e.to_string()),
+            crate::results::ResultFormat::Json12 => match self {
+                Self::Select(rows) => rows.to_json_version(Some("1.2")).map_err(|e| e.to_string()),
+                Self::Ask(result) => serde_json::to_vec(
+                    &serde_json::json!({"head":{"version":"1.2"},"boolean":result.boolean}),
+                )
+                .map_err(|e| e.to_string()),
+                Self::Graph(_) => Err("SPARQL Results JSON does not represent RDF graphs".into()),
+            },
+            crate::results::ResultFormat::Json11 => {
+                if matches!(self,Self::Select(rows) if rows.requires_json12()) {
+                    return Err("RDF 1.2 terms cannot be represented in JSON 1.1".into());
+                }
+                self.to_json().map_err(|e| e.to_string())
+            }
             crate::results::ResultFormat::Xml => self.to_xml(),
-            crate::results::ResultFormat::Turtle => Ok(self.to_turtle()),
-            crate::results::ResultFormat::NTriples => Ok(self.to_ntriples()),
+            crate::results::ResultFormat::Turtle => self.to_turtle(),
+            crate::results::ResultFormat::NTriples => self.to_ntriples(),
         }
     }
 }
@@ -210,7 +233,7 @@ pub struct SparqlEngine {
 impl SparqlEngine {
     /// Create a new SPARQL engine.
     ///
-    /// Registers the `rdf_triples` table schema for the default graph
+    /// Admits fresh/v2 datasets and registers the `rdf_triples_v2` schema for the default graph
     /// keyspace so that INSERT/DELETE/SELECT queries can execute without
     /// requiring external DDL.
     pub fn new(
@@ -218,11 +241,6 @@ impl SparqlEngine {
         write_path: Arc<WritePath>,
         config: SparqlConfig,
     ) -> Self {
-        // Register the RDF triples table for the default keyspace.
-        let schema = crate::triple_store::rdf_triples_schema(&config.default_graph);
-        if let Err(e) = storage.register_table(schema) {
-            tracing::warn!(%e, "failed to register rdf_triples table for default graph");
-        }
         let limits = ExecutionLimits {
             max_rows: config.max_rows,
         };
@@ -232,30 +250,45 @@ impl SparqlEngine {
             config,
             limits,
         };
-        engine.ensure_object_index(&engine.config.default_graph);
+        if let Err(error) = engine.ensure_table_registered(&engine.config.default_graph) {
+            tracing::warn!(%error,"SPARQL dataset admission refused; requests will fail");
+        }
         engine
     }
 
     /// Ensure the rdf_triples table is registered for a given keyspace.
     ///
     /// Called lazily when a query targets a keyspace other than the default.
-    fn ensure_table_registered(&self, keyspace: &str) {
+    fn ensure_table_registered(&self, keyspace: &str) -> Result<(), SparqlError> {
+        crate::triple_store::refuse_legacy(&self.storage, keyspace)?;
         let schema = crate::triple_store::rdf_triples_schema(keyspace);
-        if let Err(e) = self.storage.register_table(schema) {
-            // register_table returns Ok(()) if already registered.
-            tracing::debug!(%e, keyspace, "rdf_triples table registration");
+        if let Some(actual) = self
+            .storage
+            .table_schema(&crate::triple_store::triples_table_id(keyspace))
+        {
+            if actual.key_type != schema.key_type
+                || actual.clustering_columns != schema.clustering_columns
+                || actual.regular_columns != schema.regular_columns
+                || actual.static_columns != schema.static_columns
+            {
+                return Err(SparqlError::Execution(
+                    "RDF v2 schema mismatch; refusing serving and writes".into(),
+                ));
+            }
         }
+        self.storage.register_table(schema)?;
         // A keyspace registered here rather than in `new` needs the index just
         // as much: an object-bound pattern against it would otherwise scan.
         self.ensure_object_index(keyspace);
+        Ok(())
     }
 
-    /// Declare the object index for `keyspace`'s `rdf_triples` table.
+    /// Declare the object index for `keyspace`'s `rdf_triples_v2` table.
     ///
     /// [`TripleOp::ObjectScan`](crate::planner::TripleOp::ObjectScan) reads
     /// through `rdf_triples_object_idx` and streams a full table scan when this
     /// node does not declare it — and nothing else creates that index for
-    /// `rdf_triples`, so every `?s ?p <o>` pattern read the whole table. The
+    /// `rdf_triples_v2`, so every `?s ?p <o>` pattern read the whole table. The
     /// declaration goes through the same engine-level path a `CREATE INDEX` and
     /// a post-restart reload use ([`StorageEngine::register_index_in_engine`]),
     /// which also builds sidecars for any SSTable that predates the index and
@@ -339,7 +372,7 @@ impl SparqlEngine {
                 "invalid keyspace name: {ks}"
             )));
         }
-        self.ensure_table_registered(ks);
+        self.ensure_table_registered(ks)?;
         crate::update::execute_update(
             update_str,
             ks,
@@ -359,10 +392,28 @@ impl SparqlEngine {
         query_str: &str,
         keyspace: &str,
     ) -> Result<SparqlResult, SparqlError> {
+        self.execute_with_base(query_str, keyspace, None).await
+    }
+
+    /// Execute with an HTTP service base IRI; explicit BASE declarations take precedence.
+    pub async fn execute_with_base(
+        &self,
+        query_str: &str,
+        keyspace: &str,
+        base: Option<&str>,
+    ) -> Result<SparqlResult, SparqlError> {
         // 1. Parse SPARQL → algebra. The parser recurses per nesting level
         // without a limit, so the depth is bounded first.
         crate::nesting::check_nesting(query_str)?;
-        let query = spargebra::SparqlParser::new()
+        let parser = spargebra::SparqlParser::new();
+        let parser = if let Some(base) = base {
+            parser
+                .with_base_iri(base)
+                .map_err(|e| SparqlError::Parse(e.to_string()))?
+        } else {
+            parser
+        };
+        let query = parser
             .parse_query(query_str)
             .map_err(|e| SparqlError::Parse(format!("{e}")))?;
 
@@ -382,7 +433,7 @@ impl SparqlEngine {
         }
 
         // Ensure rdf_triples table exists for this keyspace.
-        self.ensure_table_registered(graph);
+        self.ensure_table_registered(graph)?;
 
         // The keyspace names the TABLE; the default graph names the PARTITION.
         // These were one value until this fix, and that conflation meant a
@@ -445,7 +496,7 @@ async fn build_graph_result(
                     let subject = match &tp.subject {
                         TermPattern::NamedNode(n) => n.as_str().to_string(),
                         TermPattern::Variable(v) => match solution.get(v.as_str()) {
-                            Some(b) => b.value.clone(),
+                            Some(b) => graph_scalar(b)?.to_owned(),
                             None => continue,
                         },
                         TermPattern::BlankNode(b) => format!("_:{}", b.as_str()),
@@ -456,7 +507,7 @@ async fn build_graph_result(
                     let predicate = match &tp.predicate {
                         NamedNodePattern::NamedNode(n) => n.as_str().to_string(),
                         NamedNodePattern::Variable(v) => match solution.get(v.as_str()) {
-                            Some(b) => b.value.clone(),
+                            Some(b) => graph_scalar(b)?.to_owned(),
                             None => continue,
                         },
                     };
@@ -466,25 +517,32 @@ async fn build_graph_result(
                         TermPattern::NamedNode(n) => {
                             (n.as_str().to_string(), "uri".to_string(), None, None)
                         }
-                        TermPattern::Literal(l) => (
-                            l.value().to_string(),
-                            "literal".to_string(),
-                            Some(l.datatype().as_str().to_string()),
-                            l.language().map(|s| s.to_string()),
-                        ),
+                        TermPattern::Literal(l) => {
+                            let binding = crate::results::Binding::from_literal(l);
+                            (
+                                graph_scalar(&binding)?.to_owned(),
+                                "literal".to_owned(),
+                                binding.datatype().map(str::to_owned),
+                                binding.lang().map(str::to_owned),
+                            )
+                        }
                         TermPattern::BlankNode(b) => {
                             (format!("_:{}", b.as_str()), "bnode".to_string(), None, None)
                         }
                         TermPattern::Variable(v) => match solution.get(v.as_str()) {
                             Some(b) => (
-                                b.value.clone(),
-                                b.binding_type.clone(),
-                                b.datatype.clone(),
-                                b.lang.clone(),
+                                graph_scalar(b)?.to_owned(),
+                                b.kind().to_owned(),
+                                b.datatype().map(str::to_owned),
+                                b.lang().map(str::to_owned),
                             ),
                             None => continue,
                         },
-                        _ => continue,
+                        TermPattern::Triple(_) => {
+                            return Err(SparqlError::Plan(
+                                "RDF 1.2 graph terms are not implemented".into(),
+                            ))
+                        }
                     };
 
                     triples.push(ConstructedTriple {
@@ -530,6 +588,7 @@ async fn build_graph_result(
                 };
                 let lookup_plan = planner::QueryPlan {
                     ops: vec![(dummy_tp, op)],
+                    steps: vec![planner::PlanStep::Triple(0)],
                     projection: vec!["__p".into(), "__o".into()],
                     limit: None,
                     offset: None,
@@ -542,7 +601,7 @@ async fn build_graph_result(
                 let sub = crate::executor::execute(&lookup_plan, write_path, limits).await?;
                 for row in sub.results.bindings {
                     let pred = match row.get("__p") {
-                        Some(b) => b.value.clone(),
+                        Some(b) => graph_scalar(b)?.to_owned(),
                         None => continue,
                     };
                     let obj_b = match row.get("__o") {
@@ -552,10 +611,10 @@ async fn build_graph_result(
                     triples.push(ConstructedTriple {
                         subject: iri.clone(),
                         predicate: pred,
-                        object: obj_b.value.clone(),
-                        object_type: obj_b.binding_type.clone(),
-                        datatype: obj_b.datatype.clone(),
-                        lang: obj_b.lang.clone(),
+                        object: graph_scalar(obj_b)?.to_owned(),
+                        object_type: obj_b.kind().to_owned(),
+                        datatype: obj_b.datatype().map(str::to_owned),
+                        lang: obj_b.lang().map(str::to_owned),
                     });
                 }
             }
@@ -574,8 +633,11 @@ async fn build_graph_result(
             // Collect all bound URI values that look like the described subject.
             for sol in &where_results.results.bindings {
                 for binding in sol.values() {
-                    if binding.binding_type == "uri" && !subjects.contains(&binding.value) {
-                        subjects.push(binding.value.clone());
+                    if binding.kind() == "uri" {
+                        let value = graph_scalar(binding)?.to_owned();
+                        if !subjects.contains(&value) {
+                            subjects.push(value);
+                        }
                     }
                 }
             }
@@ -601,6 +663,7 @@ async fn build_graph_result(
                 };
                 let dummy_plan = planner::QueryPlan {
                     ops: vec![(dummy_tp, op)],
+                    steps: vec![planner::PlanStep::Triple(0)],
                     projection: vec!["__p".into(), "__o".into()],
                     limit: None,
                     offset: None,
@@ -613,7 +676,7 @@ async fn build_graph_result(
                 let sub_result = crate::executor::execute(&dummy_plan, write_path, limits).await?;
                 for row in sub_result.results.bindings {
                     let pred = match row.get("__p") {
-                        Some(b) => b.value.clone(),
+                        Some(b) => graph_scalar(b)?.to_owned(),
                         None => continue,
                     };
                     let obj_binding = match row.get("__o") {
@@ -623,16 +686,27 @@ async fn build_graph_result(
                     triples.push(ConstructedTriple {
                         subject: subject_iri.clone(),
                         predicate: pred,
-                        object: obj_binding.value.clone(),
-                        object_type: obj_binding.binding_type.clone(),
-                        datatype: obj_binding.datatype.clone(),
-                        lang: obj_binding.lang.clone(),
+                        object: graph_scalar(obj_binding)?.to_owned(),
+                        object_type: obj_binding.kind().to_owned(),
+                        datatype: obj_binding.datatype().map(str::to_owned),
+                        lang: obj_binding.lang().map(str::to_owned),
                     });
                 }
             }
             Ok(triples)
         }
     }
+}
+
+fn graph_scalar(binding: &crate::results::Binding) -> Result<&str, SparqlError> {
+    if binding.requires_json12() {
+        return Err(SparqlError::Plan(
+            "RDF 1.2 graph serialization is not implemented".into(),
+        ));
+    }
+    binding
+        .scalar_value()
+        .ok_or_else(|| SparqlError::Plan("non-scalar graph term".into()))
 }
 
 #[cfg(test)]

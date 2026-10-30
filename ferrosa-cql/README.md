@@ -226,6 +226,14 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   `mixed_wide_and_narrow_partitions_page_exactly`,
   `wide_partition_multi_text_clustering_pages_exactly_after_flush`,
   `many_small_partitions_pk_projection_pages_without_stalling`.
+  Scan-order full scans, including `ALLOW FILTERING`, carry the original `LIMIT`
+  and cumulative rows returned in a versioned scan cursor. Each page resumes at
+  the raw partition/clustering position and returns at most the smaller of the
+  client fetch size and remaining query limit. Reaching `LIMIT` completes the
+  result without an extra page; a fetch size of 5,000 never caps the whole query.
+  Regression coverage: `router::tests::limited_scan_paging` (narrow and wide
+  partitions, v4 wire continuation, exact boundaries, filtering, and bounded
+  upstream consumption).
   **Wire ingress (`connection.rs`, `decode_query_params`)** — the QUERY/EXECUTE
   `<query_parameters>` section (§4.1.4) is decoded IN ORDER — flags → values →
   `page_size` (flag 0x04) → `paging_state` (flag 0x08) — into `PagingParams`,
@@ -444,3 +452,13 @@ mode and says the capability ledger (D15a) is required; there is no bypass.
 Storage cells expose immutable `CellBytes` slices. Typed result decoding
 borrows these bytes; legacy blob result values still explicitly own vectors at
 the `CqlValue::Blob` boundary.
+
+Limited scan continuations use a signed, versioned outer envelope (`FF 4C 53`,
+version 1) around the raw scan position and cumulative LIMIT progress. Older
+coordinators reject this envelope instead of interpreting its key as an offset.
+Resume an in-flight limited query from its first page if a coordinator rejects
+its token after an upgrade; unlimited scan tokens retain their existing format.
+
+## Immutable scalar scan values
+
+Plain scalar projection consumes decoded page rows. Identity projection retains the page and row buffers; reordered projection moves cells, and repeated immutable payloads share backing. LIMIT and paging move selected rows rather than cloning a page. Function/UDF/toJson evaluation retains the established evaluation path. Scalar text/blob decoding shares immutable storage backing; wire framing still appends bytes into bounded response buffers. This does not promise end-to-end zero-copy network writes. Page sizes, cursors, row ordering and total-query LIMIT semantics remain unchanged.

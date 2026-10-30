@@ -331,6 +331,27 @@ enum SstableAction {
         json: bool,
     },
 
+    /// Print every row whose partition key, clustering or a cell value contains
+    /// a byte pattern, with each cell's column, type, value and timestamps as
+    /// the generation's own header names them. Pure read; streams one
+    /// partition at a time.
+    Find {
+        /// Path to a table's SSTable directory.
+        dir: std::path::PathBuf,
+
+        /// Bytes to search for, as hex. `-`, `:` and spaces are ignored, so a
+        /// UUID can be pasted as is.
+        hex: String,
+
+        /// Also search generations in the `quarantine/` subdirectory.
+        #[arg(long)]
+        include_quarantine: bool,
+
+        /// Emit machine-readable JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Salvage rows from this table's CORRUPT generations and re-insert them
     /// through the live cluster (`--host`) via the fixed write path (proper RF
     /// replication, original timestamps preserved). Dry-run by default — pass
@@ -845,6 +866,12 @@ async fn main() {
                 include_quarantine,
                 json,
             } => commands::sstable::sstable_salvage(&dir, include_quarantine, json),
+            SstableAction::Find {
+                dir,
+                hex,
+                include_quarantine,
+                json,
+            } => commands::sstable::sstable_find(&dir, &hex, include_quarantine, json),
             SstableAction::Reingest {
                 dir,
                 user,

@@ -1,0 +1,2138 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1200" height="2134" onload="init(evt)" viewBox="0 0 1200 2134" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<!-- Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples. -->
+<!-- NOTES:  -->
+<defs>
+	<linearGradient id="background" y1="0" y2="1" x1="0" x2="0" >
+		<stop stop-color="#eeeeee" offset="5%" />
+		<stop stop-color="#eeeeb0" offset="95%" />
+	</linearGradient>
+</defs>
+<style type="text/css">
+	text { font-family:Verdana; font-size:12px; fill:rgb(0,0,0); }
+	#search, #ignorecase { opacity:0.1; cursor:pointer; }
+	#search:hover, #search.show, #ignorecase:hover, #ignorecase.show { opacity:1; }
+	#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+	#title { text-anchor:middle; font-size:17px}
+	#unzoom { cursor:pointer; }
+	#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+	.hide { display:none; }
+	.parent { opacity:0.5; }
+</style>
+<script type="text/ecmascript">
+<![CDATA[
+	"use strict";
+	var details, searchbtn, unzoombtn, matchedtxt, svg, searching, currentSearchTerm, ignorecase, ignorecaseBtn;
+	function init(evt) {
+		details = document.getElementById("details").firstChild;
+		searchbtn = document.getElementById("search");
+		ignorecaseBtn = document.getElementById("ignorecase");
+		unzoombtn = document.getElementById("unzoom");
+		matchedtxt = document.getElementById("matched");
+		svg = document.getElementsByTagName("svg")[0];
+		searching = 0;
+		currentSearchTerm = null;
+
+		// use GET parameters to restore a flamegraphs state.
+		var params = get_params();
+		if (params.x && params.y)
+			zoom(find_group(document.querySelector('[x="' + params.x + '"][y="' + params.y + '"]')));
+                if (params.s) search(params.s);
+	}
+
+	// event listeners
+	window.addEventListener("click", function(e) {
+		var target = find_group(e.target);
+		if (target) {
+			if (target.nodeName == "a") {
+				if (e.ctrlKey === false) return;
+				e.preventDefault();
+			}
+			if (target.classList.contains("parent")) unzoom(true);
+			zoom(target);
+			if (!document.querySelector('.parent')) {
+				// we have basically done a clearzoom so clear the url
+				var params = get_params();
+				if (params.x) delete params.x;
+				if (params.y) delete params.y;
+				history.replaceState(null, null, parse_params(params));
+				unzoombtn.classList.add("hide");
+				return;
+			}
+
+			// set parameters for zoom state
+			var el = target.querySelector("rect");
+			if (el && el.attributes && el.attributes.y && el.attributes._orig_x) {
+				var params = get_params()
+				params.x = el.attributes._orig_x.value;
+				params.y = el.attributes.y.value;
+				history.replaceState(null, null, parse_params(params));
+			}
+		}
+		else if (e.target.id == "unzoom") clearzoom();
+		else if (e.target.id == "search") search_prompt();
+		else if (e.target.id == "ignorecase") toggle_ignorecase();
+	}, false)
+
+	// mouse-over for info
+	// show
+	window.addEventListener("mouseover", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = "Function: " + g_to_text(target);
+	}, false)
+
+	// clear
+	window.addEventListener("mouseout", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = ' ';
+	}, false)
+
+	// ctrl-F for search
+	// ctrl-I to toggle case-sensitive search
+	window.addEventListener("keydown",function (e) {
+		if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+			e.preventDefault();
+			search_prompt();
+		}
+		else if (e.ctrlKey && e.keyCode === 73) {
+			e.preventDefault();
+			toggle_ignorecase();
+		}
+	}, false)
+
+	// functions
+	function get_params() {
+		var params = {};
+		var paramsarr = window.location.search.substr(1).split('&');
+		for (var i = 0; i < paramsarr.length; ++i) {
+			var tmp = paramsarr[i].split("=");
+			if (!tmp[0] || !tmp[1]) continue;
+			params[tmp[0]]  = decodeURIComponent(tmp[1]);
+		}
+		return params;
+	}
+	function parse_params(params) {
+		var uri = "?";
+		for (var key in params) {
+			uri += key + '=' + encodeURIComponent(params[key]) + '&';
+		}
+		if (uri.slice(-1) == "&")
+			uri = uri.substring(0, uri.length - 1);
+		if (uri == '?')
+			uri = window.location.href.split('?')[0];
+		return uri;
+	}
+	function find_child(node, selector) {
+		var children = node.querySelectorAll(selector);
+		if (children.length) return children[0];
+	}
+	function find_group(node) {
+		var parent = node.parentElement;
+		if (!parent) return;
+		if (parent.id == "frames") return node;
+		return find_group(parent);
+	}
+	function orig_save(e, attr, val) {
+		if (e.attributes["_orig_" + attr] != undefined) return;
+		if (e.attributes[attr] == undefined) return;
+		if (val == undefined) val = e.attributes[attr].value;
+		e.setAttribute("_orig_" + attr, val);
+	}
+	function orig_load(e, attr) {
+		if (e.attributes["_orig_"+attr] == undefined) return;
+		e.attributes[attr].value = e.attributes["_orig_" + attr].value;
+		e.removeAttribute("_orig_"+attr);
+	}
+	function g_to_text(e) {
+		var text = find_child(e, "title").firstChild.nodeValue;
+		return (text)
+	}
+	function g_to_func(e) {
+		var func = g_to_text(e);
+		// if there's any manipulation we want to do to the function
+		// name before it's searched, do it here before returning.
+		return (func);
+	}
+	function update_text(e) {
+		var r = find_child(e, "rect");
+		var t = find_child(e, "text");
+		var w = parseFloat(r.attributes.width.value) -3;
+		var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+		t.attributes.x.value = parseFloat(r.attributes.x.value) + 3;
+
+		// Smaller than this size won't fit anything
+		if (w < 2 * 12 * 0.59) {
+			t.textContent = "";
+			return;
+		}
+
+		t.textContent = txt;
+		var sl = t.getSubStringLength(0, txt.length);
+		// check if only whitespace or if we can fit the entire string into width w
+		if (/^ *$/.test(txt) || sl < w)
+			return;
+
+		// this isn't perfect, but gives a good starting point
+		// and avoids calling getSubStringLength too often
+		var start = Math.floor((w/sl) * txt.length);
+		for (var x = start; x > 0; x = x-2) {
+			if (t.getSubStringLength(0, x + 2) <= w) {
+				t.textContent = txt.substring(0, x) + "..";
+				return;
+			}
+		}
+		t.textContent = "";
+	}
+
+	// zoom
+	function zoom_reset(e) {
+		if (e.attributes != undefined) {
+			orig_load(e, "x");
+			orig_load(e, "width");
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_reset(c[i]);
+		}
+	}
+	function zoom_child(e, x, ratio) {
+		if (e.attributes != undefined) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = (parseFloat(e.attributes.x.value) - x - 10) * ratio + 10;
+				if (e.tagName == "text")
+					e.attributes.x.value = find_child(e.parentNode, "rect[x]").attributes.x.value + 3;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseFloat(e.attributes.width.value) * ratio;
+			}
+		}
+
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_child(c[i], x - 10, ratio);
+		}
+	}
+	function zoom_parent(e) {
+		if (e.attributes) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = 10;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseInt(svg.width.baseVal.value) - (10 * 2);
+			}
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_parent(c[i]);
+		}
+	}
+	function zoom(node) {
+		var attr = find_child(node, "rect").attributes;
+		var width = parseFloat(attr.width.value);
+		var xmin = parseFloat(attr.x.value);
+		var xmax = parseFloat(xmin + width);
+		var ymin = parseFloat(attr.y.value);
+		var ratio = (svg.width.baseVal.value - 2 * 10) / width;
+
+		// XXX: Workaround for JavaScript float issues (fix me)
+		var fudge = 0.0001;
+
+		unzoombtn.classList.remove("hide");
+
+		var el = document.getElementById("frames").children;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var a = find_child(e, "rect").attributes;
+			var ex = parseFloat(a.x.value);
+			var ew = parseFloat(a.width.value);
+			var upstack;
+			// Is it an ancestor
+			if (0 == 0) {
+				upstack = parseFloat(a.y.value) > ymin;
+			} else {
+				upstack = parseFloat(a.y.value) < ymin;
+			}
+			if (upstack) {
+				// Direct ancestor
+				if (ex <= xmin && (ex+ew+fudge) >= xmax) {
+					e.classList.add("parent");
+					zoom_parent(e);
+					update_text(e);
+				}
+				// not in current path
+				else
+					e.classList.add("hide");
+			}
+			// Children maybe
+			else {
+				// no common path
+				if (ex < xmin || ex + fudge >= xmax) {
+					e.classList.add("hide");
+				}
+				else {
+					zoom_child(e, xmin, ratio);
+					update_text(e);
+				}
+			}
+		}
+		search();
+	}
+	function unzoom(dont_update_text) {
+		unzoombtn.classList.add("hide");
+		var el = document.getElementById("frames").children;
+		for(var i = 0; i < el.length; i++) {
+			el[i].classList.remove("parent");
+			el[i].classList.remove("hide");
+			zoom_reset(el[i]);
+			if(!dont_update_text) update_text(el[i]);
+		}
+		search();
+	}
+	function clearzoom() {
+		unzoom();
+
+		// remove zoom state
+		var params = get_params();
+		if (params.x) delete params.x;
+		if (params.y) delete params.y;
+		history.replaceState(null, null, parse_params(params));
+	}
+
+	// search
+	function toggle_ignorecase() {
+		ignorecase = !ignorecase;
+		if (ignorecase) {
+			ignorecaseBtn.classList.add("show");
+		} else {
+			ignorecaseBtn.classList.remove("show");
+		}
+		reset_search();
+		search();
+	}
+	function reset_search() {
+		var el = document.querySelectorAll("#frames rect");
+		for (var i = 0; i < el.length; i++) {
+			orig_load(el[i], "fill")
+		}
+		var params = get_params();
+		delete params.s;
+		history.replaceState(null, null, parse_params(params));
+	}
+	function search_prompt() {
+		if (!searching) {
+			var term = prompt("Enter a search term (regexp " +
+			    "allowed, eg: ^ext4_)"
+			    + (ignorecase ? ", ignoring case" : "")
+			    + "\nPress Ctrl-i to toggle case sensitivity", "");
+			if (term != null) search(term);
+		} else {
+			reset_search();
+			searching = 0;
+			currentSearchTerm = null;
+			searchbtn.classList.remove("show");
+			searchbtn.firstChild.nodeValue = "Search"
+			matchedtxt.classList.add("hide");
+			matchedtxt.firstChild.nodeValue = ""
+		}
+	}
+	function search(term) {
+		if (term) currentSearchTerm = term;
+		if (currentSearchTerm === null) return;
+
+		var re = new RegExp(currentSearchTerm, ignorecase ? 'i' : '');
+		var el = document.getElementById("frames").children;
+		var matches = new Object();
+		var maxwidth = 0;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var func = g_to_func(e);
+			var rect = find_child(e, "rect");
+			if (func == null || rect == null)
+				continue;
+
+			// Save max width. Only works as we have a root frame
+			var w = parseFloat(rect.attributes.width.value);
+			if (w > maxwidth)
+				maxwidth = w;
+
+			if (func.match(re)) {
+				// highlight
+				var x = parseFloat(rect.attributes.x.value);
+				orig_save(rect, "fill");
+				rect.attributes.fill.value = "rgb(230,0,230)";
+
+				// remember matches
+				if (matches[x] == undefined) {
+					matches[x] = w;
+				} else {
+					if (w > matches[x]) {
+						// overwrite with parent
+						matches[x] = w;
+					}
+				}
+				searching = 1;
+			}
+		}
+		if (!searching)
+			return;
+		var params = get_params();
+		params.s = currentSearchTerm;
+		history.replaceState(null, null, parse_params(params));
+
+		searchbtn.classList.add("show");
+		searchbtn.firstChild.nodeValue = "Reset Search";
+
+		// calculate percent matched, excluding vertical overlap
+		var count = 0;
+		var lastx = -1;
+		var lastw = 0;
+		var keys = Array();
+		for (k in matches) {
+			if (matches.hasOwnProperty(k))
+				keys.push(k);
+		}
+		// sort the matched frames by their x location
+		// ascending, then width descending
+		keys.sort(function(a, b){
+			return a - b;
+		});
+		// Step through frames saving only the biggest bottom-up frames
+		// thanks to the sort order. This relies on the tree property
+		// where children are always smaller than their parents.
+		var fudge = 0.0001;	// JavaScript floating point
+		for (var k in keys) {
+			var x = parseFloat(keys[k]);
+			var w = matches[keys[k]];
+			if (x >= lastx + lastw - fudge) {
+				count += w;
+				lastx = x;
+				lastw = w;
+			}
+		}
+		// display matched percent
+		matchedtxt.classList.remove("hide");
+		var pct = 100 * count / maxwidth;
+		if (pct != 100) pct = pct.toFixed(1)
+		matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+	}
+]]>
+</script>
+<rect x="0.0" y="0" width="1200.0" height="2134.0" fill="url(#background)"  />
+<text id="title" x="600.00" y="24" >pipeline_bolt_protocol_139_profile_sparql-oxigraph-profile CPU</text>
+<text id="details" x="10.00" y="2117" > </text>
+<text id="unzoom" x="10.00" y="24" class="hide">Reset Zoom</text>
+<text id="search" x="1090.00" y="24" >Search</text>
+<text id="ignorecase" x="1174.00" y="24" >ic</text>
+<text id="matched" x="1090.00" y="2117" > </text>
+<g id="frames">
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="245" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="255.5" >[unknown]</text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;core::iter::adapters::map::Map&lt;core::iter::adapters::map::Map&lt;oxigraph::storage::DecodingQuadIterator, &lt;oxigraph::sparql::dataset::DatasetView as spareval::dataset::QueryableDataset&gt;::internal_quads_for_pattern::{closure#1}&gt;, &lt;spareval::eval::EvalDataset&lt;oxigraph::sparql::dataset::DatasetView&gt;&gt;::underlying_internal_quads_for_pattern::{closure#0}&gt;&gt; (1 samples, 0.13%)</title><rect x="711.3" y="2037" width="1.6" height="15.0" fill="rgb(215,47,11)" rx="2" ry="2" />
+<text  x="714.32" y="2047.5" ></text>
+</g>
+<g >
+<title>rocksdb::InstrumentedMutex::Lock (1 samples, 0.13%)</title><rect x="789.2" y="2005" width="1.6" height="15.0" fill="rgb(208,14,3)" rx="2" ry="2" />
+<text  x="792.25" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1701" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1711.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (72 samples, 9.70%)</title><rect x="506.2" y="1989" width="114.5" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="509.17" y="1999.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (6 samples, 0.81%)</title><rect x="784.5" y="2021" width="9.5" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="787.47" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1029" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1039.5" >[unknown]</text>
+</g>
+<g >
+<title>cfree (5 samples, 0.67%)</title><rect x="913.3" y="2053" width="7.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="916.29" y="2063.5" ></text>
+</g>
+<g >
+<title>rocksdb::ColumnFamilyHandleImpl::GetComparator (1 samples, 0.13%)</title><rect x="770.2" y="2037" width="1.6" height="15.0" fill="rgb(224,89,21)" rx="2" ry="2" />
+<text  x="773.16" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="373" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="383.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;core::iter::adapters::map::Map&lt;core::iter::adapters::map::Map&lt;oxigraph::storage::DecodingQuadIterator, &lt;oxigraph::sparql::dataset::DatasetView as spareval::dataset::QueryableDataset&gt;::internal_quads_for_pattern::{closure#1}&gt;, &lt;spareval::eval::EvalDataset&lt;oxigraph::sparql::dataset::DatasetView&gt;&gt;::underlying_internal_quads_for_pattern::{closure#0}&gt; as core::iter::traits::iterator::Iterator&gt;::next (1 samples, 0.13%)</title><rect x="324.9" y="2037" width="1.6" height="15.0" fill="rgb(228,109,26)" rx="2" ry="2" />
+<text  x="327.88" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1333" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1343.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;alloc::rc::Rc&lt;dyn for&lt;a&gt; core::ops::function::Fn&lt; (1 samples, 0.13%)</title><rect x="315.3" y="2037" width="1.6" height="15.0" fill="rgb(239,160,38)" rx="2" ry="2" />
+<text  x="318.34" y="2047.5" ></text>
+</g>
+<g >
+<title>clock_gettime (2 samples, 0.27%)</title><rect x="391.7" y="2021" width="3.2" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="394.67" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="597" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="607.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;core::hash::sip::Hasher&lt;core::hash::sip::Sip13Rounds&gt; as core::hash::Hasher&gt;::write (1 samples, 0.13%)</title><rect x="318.5" y="2037" width="1.6" height="15.0" fill="rgb(233,130,31)" rx="2" ry="2" />
+<text  x="321.52" y="2047.5" ></text>
+</g>
+<g >
+<title>&lt;oxigraph::storage::rocksdb_wrapper::Reader&gt;::contains_key (16 samples, 2.16%)</title><rect x="124.5" y="2053" width="25.4" height="15.0" fill="rgb(248,200,48)" rx="2" ry="2" />
+<text  x="127.50" y="2063.5" >&lt;..</text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.27%)</title><rect x="800.4" y="2021" width="3.2" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="803.38" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="101" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="111.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="389" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="399.5" >[unknown]</text>
+</g>
+<g >
+<title>sparopt::optimizer::estimate_graph_pattern_size (2 samples, 0.27%)</title><rect x="908.5" y="2037" width="3.2" height="15.0" fill="rgb(237,150,35)" rx="2" ry="2" />
+<text  x="911.52" y="2047.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_OrderClause (1 samples, 0.13%)</title><rect x="878.3" y="2037" width="1.6" height="15.0" fill="rgb(222,81,19)" rx="2" ry="2" />
+<text  x="881.30" y="2047.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_GroupGraphPattern (1 samples, 0.13%)</title><rect x="1120.0" y="2053" width="1.6" height="15.0" fill="rgb(212,34,8)" rx="2" ry="2" />
+<text  x="1123.03" y="2063.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_DECIMAL (1 samples, 0.13%)</title><rect x="848.1" y="2037" width="1.6" height="15.0" fill="rgb(214,45,10)" rx="2" ry="2" />
+<text  x="851.09" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1301" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1311.5" >[unknown]</text>
+</g>
+<g >
+<title>rocksdb_create_iterator_cf (1 samples, 0.13%)</title><rect x="779.7" y="1989" width="1.6" height="15.0" fill="rgb(215,46,11)" rx="2" ry="2" />
+<text  x="782.70" y="1999.5" ></text>
+</g>
+<g >
+<title>oxhttp::io::decoder::read_header_bytes::&lt;&amp;mut std::io::buffered::bufreader::BufReader&lt;std::net::tcp::TcpStream&gt;&gt; (1 samples, 0.13%)</title><rect x="994.4" y="2053" width="1.6" height="15.0" fill="rgb(243,176,42)" rx="2" ry="2" />
+<text  x="997.39" y="2063.5" ></text>
+</g>
+<g >
+<title>core::str::converts::from_utf8 (1 samples, 0.13%)</title><rect x="926.0" y="2053" width="1.6" height="15.0" fill="rgb(224,91,21)" rx="2" ry="2" />
+<text  x="929.01" y="2063.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_VARNAME (1 samples, 0.13%)</title><rect x="889.4" y="2037" width="1.6" height="15.0" fill="rgb(240,163,39)" rx="2" ry="2" />
+<text  x="892.43" y="2047.5" ></text>
+</g>
+<g >
+<title>rocksdb::(anonymous namespace)::SkipListRep::Get (7 samples, 0.94%)</title><rect x="641.3" y="2005" width="11.2" height="15.0" fill="rgb(227,103,24)" rx="2" ry="2" />
+<text  x="644.35" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1877" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1887.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;core::str::pattern::CharSearcher as core::str::pattern::Searcher&gt;::next_match (6 samples, 0.81%)</title><rect x="48.2" y="2053" width="9.5" height="15.0" fill="rgb(238,152,36)" rx="2" ry="2" />
+<text  x="51.17" y="2063.5" ></text>
+</g>
+<g >
+<title>cfree (1 samples, 0.13%)</title><rect x="620.7" y="1989" width="1.6" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="623.67" y="1999.5" ></text>
+</g>
+<g >
+<title>oxiri::is_iunreserved_or_sub_delims (2 samples, 0.27%)</title><rect x="1011.9" y="2053" width="3.2" height="15.0" fill="rgb(220,70,16)" rx="2" ry="2" />
+<text  x="1014.89" y="2063.5" ></text>
+</g>
+<g >
+<title>&lt;oxigraph::sparql::dataset::DatasetView&gt;::insert_str (1 samples, 0.13%)</title><rect x="108.6" y="2053" width="1.6" height="15.0" fill="rgb(229,113,27)" rx="2" ry="2" />
+<text  x="111.60" y="2063.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;alloc::vec::Vec&lt;alloc::string::String&gt;&gt; (1 samples, 0.13%)</title><rect x="708.1" y="2037" width="1.6" height="15.0" fill="rgb(211,29,6)" rx="2" ry="2" />
+<text  x="711.14" y="2047.5" ></text>
+</g>
+<g >
+<title>rocksdb::DBIter::FindNextUserEntryInternal (2 samples, 0.27%)</title><rect x="1097.8" y="2053" width="3.1" height="15.0" fill="rgb(205,2,0)" rx="2" ry="2" />
+<text  x="1100.76" y="2063.5" ></text>
+</g>
+<g >
+<title>&lt;u16 as core::fmt::Display&gt;::fmt (1 samples, 0.13%)</title><rect x="1186.8" y="2005" width="1.6" height="15.0" fill="rgb(213,37,9)" rx="2" ry="2" />
+<text  x="1189.82" y="2015.5" ></text>
+</g>
+<g >
+<title>rocksdb::(anonymous namespace)::SkipListRep::Iterator::Next (2 samples, 0.27%)</title><rect x="627.0" y="2021" width="3.2" height="15.0" fill="rgb(218,62,14)" rx="2" ry="2" />
+<text  x="630.04" y="2031.5" ></text>
+</g>
+<g >
+<title>std::io::default_read_to_end::small_probe_read::&lt;oxhttp::model::body::Body&gt; (1 samples, 0.13%)</title><rect x="1164.6" y="2053" width="1.5" height="15.0" fill="rgb(209,18,4)" rx="2" ry="2" />
+<text  x="1167.56" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="469" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="479.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;spareval::eval::SimpleEvaluator&lt;oxigraph::sparql::dataset::DatasetView&gt;&gt;::graph_pattern_evaluator (2 samples, 0.27%)</title><rect x="175.4" y="2053" width="3.2" height="15.0" fill="rgb(214,43,10)" rx="2" ry="2" />
+<text  x="178.39" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1685" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1695.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="437" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="447.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1957" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1967.5" >[unknown]</text>
+</g>
+<g >
+<title>rocksdb::MemTable::Get (4 samples, 0.54%)</title><rect x="138.8" y="1989" width="6.4" height="15.0" fill="rgb(241,169,40)" rx="2" ry="2" />
+<text  x="141.81" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="709" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="719.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;oxigraph::storage::StorageReader&gt;::quads_for_pattern (1 samples, 0.13%)</title><rect x="364.6" y="2037" width="1.6" height="15.0" fill="rgb(226,99,23)" rx="2" ry="2" />
+<text  x="367.64" y="2047.5" ></text>
+</g>
+<g >
+<title>rocksdb::ArenaWrappedDBIter::status (1 samples, 0.13%)</title><rect x="759.0" y="2037" width="1.6" height="15.0" fill="rgb(249,206,49)" rx="2" ry="2" />
+<text  x="762.03" y="2047.5" ></text>
+</g>
+<g >
+<title>rocksdb::IterKey::EnlargeBuffer (1 samples, 0.13%)</title><rect x="639.8" y="2021" width="1.5" height="15.0" fill="rgb(206,7,1)" rx="2" ry="2" />
+<text  x="642.76" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1509" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1519.5" >[unknown]</text>
+</g>
+<g >
+<title>rocksdb::MemTable::NewIterator (1 samples, 0.13%)</title><rect x="654.1" y="2021" width="1.6" height="15.0" fill="rgb(238,151,36)" rx="2" ry="2" />
+<text  x="657.07" y="2031.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.13%)</title><rect x="840.1" y="1973" width="1.6" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="843.13" y="1983.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_Query (1 samples, 0.13%)</title><rect x="881.5" y="2037" width="1.6" height="15.0" fill="rgb(213,36,8)" rx="2" ry="2" />
+<text  x="884.48" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="837" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="847.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;sparopt::optimizer::Optimizer&gt;::push_filters (1 samples, 0.13%)</title><rect x="499.8" y="2021" width="1.6" height="15.0" fill="rgb(235,142,34)" rx="2" ry="2" />
+<text  x="502.81" y="2031.5" ></text>
+</g>
+<g >
+<title>&lt;oxigraph::RequestParams&gt;::from_request_url (1 samples, 0.13%)</title><rect x="99.1" y="2053" width="1.5" height="15.0" fill="rgb(213,38,9)" rx="2" ry="2" />
+<text  x="102.06" y="2063.5" ></text>
+</g>
+<g >
+<title>cfree (1 samples, 0.13%)</title><rect x="623.9" y="2021" width="1.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="626.85" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1749" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1759.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;alloc::string::String as core::fmt::Write&gt;::write_str.5135 (1 samples, 0.13%)</title><rect x="1116.8" y="2037" width="1.6" height="15.0" fill="rgb(216,52,12)" rx="2" ry="2" />
+<text  x="1119.85" y="2047.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_STRING_LITERAL1 (1 samples, 0.13%)</title><rect x="1145.5" y="2053" width="1.6" height="15.0" fill="rgb(248,199,47)" rx="2" ry="2" />
+<text  x="1148.47" y="2063.5" ></text>
+</g>
+<g >
+<title>spareval::eval::eval_node_label (8 samples, 1.08%)</title><rect x="832.2" y="2037" width="12.7" height="15.0" fill="rgb(207,11,2)" rx="2" ry="2" />
+<text  x="835.18" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1397" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1407.5" >[unknown]</text>
+</g>
+<g >
+<title>TLS init function for rocksdb::perf_context (1 samples, 0.13%)</title><rect x="774.9" y="1957" width="1.6" height="15.0" fill="rgb(233,133,31)" rx="2" ry="2" />
+<text  x="777.93" y="1967.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1109" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1119.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1781" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1791.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;sparesults::format::QueryResultsFormat&gt;::from_media_type (1 samples, 0.13%)</title><rect x="162.7" y="2053" width="1.6" height="15.0" fill="rgb(250,207,49)" rx="2" ry="2" />
+<text  x="165.67" y="2063.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVec&lt;alloc::rc::Rc&lt;spareval::eval::EvalNodeWithStats&gt;&gt;&gt;::grow_one (1 samples, 0.13%)</title><rect x="310.6" y="2037" width="1.6" height="15.0" fill="rgb(223,83,19)" rx="2" ry="2" />
+<text  x="313.57" y="2047.5" ></text>
+</g>
+<g >
+<title>rocksdb::ArenaWrappedDBIter::MaybeAutoRefresh (1 samples, 0.13%)</title><rect x="633.4" y="2021" width="1.6" height="15.0" fill="rgb(238,155,37)" rx="2" ry="2" />
+<text  x="636.40" y="2031.5" ></text>
+</g>
+<g >
+<title>&lt;sparopt::algebra::GraphPattern&gt;::from_sparql_algebra (1 samples, 0.13%)</title><rect x="410.8" y="2037" width="1.5" height="15.0" fill="rgb(222,78,18)" rx="2" ry="2" />
+<text  x="413.75" y="2047.5" ></text>
+</g>
+<g >
+<title>rocksdb::InlineSkipList&lt;rocksdb::MemTableRep::KeyComparator const&amp;&gt;::FindGreaterOrEqual (1 samples, 0.13%)</title><rect x="652.5" y="2005" width="1.6" height="15.0" fill="rgb(239,160,38)" rx="2" ry="2" />
+<text  x="655.48" y="2015.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;oxrdf::literal::Literal&gt; (1 samples, 0.13%)</title><rect x="712.9" y="2037" width="1.6" height="15.0" fill="rgb(212,33,8)" rx="2" ry="2" />
+<text  x="715.91" y="2047.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;oxrdf::triple::Term&gt; (2 samples, 0.27%)</title><rect x="714.5" y="2037" width="3.2" height="15.0" fill="rgb(209,19,4)" rx="2" ry="2" />
+<text  x="717.50" y="2047.5" ></text>
+</g>
+<g >
+<title>core::slice::memchr::memrchr (1 samples, 0.13%)</title><rect x="924.4" y="2053" width="1.6" height="15.0" fill="rgb(205,3,0)" rx="2" ry="2" />
+<text  x="927.42" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="533" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="543.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;json_event_parser::write::LowLevelJsonSerializer&gt;::before_value::&lt;&amp;mut &amp;mut oxigraph::ReadForWriteWriter&gt; (1 samples, 0.13%)</title><rect x="80.0" y="2053" width="1.6" height="15.0" fill="rgb(233,130,31)" rx="2" ry="2" />
+<text  x="82.97" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1541" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1551.5" >[unknown]</text>
+</g>
+<g >
+<title>rocksdb::EncodeKey (4 samples, 0.54%)</title><rect x="803.6" y="2037" width="6.3" height="15.0" fill="rgb(228,106,25)" rx="2" ry="2" />
+<text  x="806.56" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="453" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="463.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="501" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="511.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1045" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1055.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;oxigraph::storage::rocksdb::RocksDbDecodingQuadIterator as core::iter::traits::iterator::Iterator&gt;::next (3 samples, 0.40%)</title><rect x="116.5" y="2053" width="4.8" height="15.0" fill="rgb(207,11,2)" rx="2" ry="2" />
+<text  x="119.55" y="2063.5" ></text>
+</g>
+<g >
+<title>&lt;std::hash::random::RandomState as core::hash::BuildHasher&gt;::hash_one::&lt;&amp;str&gt; (1 samples, 0.13%)</title><rect x="188.1" y="2053" width="1.6" height="15.0" fill="rgb(229,113,27)" rx="2" ry="2" />
+<text  x="191.11" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="741" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="751.5" >[unknown]</text>
+</g>
+<g >
+<title>malloc (7 samples, 0.94%)</title><rect x="733.6" y="2037" width="11.1" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="736.58" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.40%)</title><rect x="817.9" y="2021" width="4.7" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="820.87" y="2031.5" ></text>
+</g>
+<g >
+<title>rocksdb::MemTableIterator::write_unix_time (2 samples, 0.27%)</title><rect x="822.6" y="2037" width="3.2" height="15.0" fill="rgb(246,190,45)" rx="2" ry="2" />
+<text  x="825.64" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1813" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1823.5" >[unknown]</text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_PathElt (1 samples, 0.13%)</title><rect x="1140.7" y="2053" width="1.6" height="15.0" fill="rgb(205,1,0)" rx="2" ry="2" />
+<text  x="1143.70" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (380 samples, 51.21%)</title><rect x="309.0" y="2053" width="604.3" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="311.98" y="2063.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.27%)</title><rect x="827.4" y="2021" width="3.2" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="830.41" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1525" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1535.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;alloc::boxed::Box&lt;core::iter::adapters::map::Map&lt;alloc::boxed::Box&lt;dyn core::iter::traits::iterator::Iterator&lt;Item = core::result::Result&lt;spareval::eval::InternalTuple&lt;oxigraph::storage::numeric_encoder::EncodedTerm&gt;, spareval::error::QueryEvaluationError&gt;&gt;&gt;, spareval::eval::decode_bindings&lt;oxigraph::sparql::dataset::DatasetView&gt;::{closure#0}&gt;&gt; as core::iter::traits::iterator::Iterator&gt;::next (1 samples, 0.13%)</title><rect x="309.0" y="2037" width="1.6" height="15.0" fill="rgb(218,60,14)" rx="2" ry="2" />
+<text  x="311.98" y="2047.5" ></text>
+</g>
+<g >
+<title>rocksdb::(anonymous namespace)::SkipListRep::Iterator::Valid (1 samples, 0.13%)</title><rect x="630.2" y="2021" width="1.6" height="15.0" fill="rgb(245,185,44)" rx="2" ry="2" />
+<text  x="633.22" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.27%)</title><rect x="755.8" y="2021" width="3.2" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="758.85" y="2031.5" ></text>
+</g>
+<g >
+<title>rocksdb::SaveValue (6 samples, 0.81%)</title><rect x="642.9" y="1989" width="9.6" height="15.0" fill="rgb(242,172,41)" rx="2" ry="2" />
+<text  x="645.94" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 samples, 0.13%)</title><rect x="673.2" y="2021" width="1.5" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="676.15" y="2031.5" ></text>
+</g>
+<g >
+<title>&lt;oxigraph::sparql::dataset::DatasetView as spareval::dataset::QueryableDataset&gt;::internalize_term (3 samples, 0.40%)</title><rect x="359.9" y="2037" width="4.7" height="15.0" fill="rgb(215,50,12)" rx="2" ry="2" />
+<text  x="362.87" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="789" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="799.5" >[unknown]</text>
+</g>
+<g >
+<title>rocksdb::Status::operator= (1 samples, 0.13%)</title><rect x="146.8" y="2021" width="1.6" height="15.0" fill="rgb(245,186,44)" rx="2" ry="2" />
+<text  x="149.77" y="2031.5" ></text>
+</g>
+<g >
+<title>rocksdb::Arena::Arena (1 samples, 0.13%)</title><rect x="781.3" y="2005" width="1.6" height="15.0" fill="rgb(216,54,12)" rx="2" ry="2" />
+<text  x="784.29" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="965" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="975.5" >[unknown]</text>
+</g>
+<g >
+<title>[fdaa:79:e2c:a7 (742 samples, 100.00%)</title><rect x="10.0" y="2069" width="1180.0" height="15.0" fill="rgb(223,83,19)" rx="2" ry="2" />
+<text  x="13.00" y="2079.5" >[fdaa:79:e2c:a7</text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1589" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1599.5" >[unknown]</text>
+</g>
+<g >
+<title>rocksdb::NewArenaWrappedDbIterator (1 samples, 0.13%)</title><rect x="782.9" y="2005" width="1.6" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="785.88" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1669" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1679.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="725" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="735.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1061" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1071.5" >[unknown]</text>
+</g>
+<g >
+<title>oxhttp::io::encoder::encode_body::&lt;std::io::buffered::bufwriter::BufWriter&lt;std::net::tcp::TcpStream&gt;&gt; (3 samples, 0.40%)</title><rect x="996.0" y="2053" width="4.8" height="15.0" fill="rgb(222,78,18)" rx="2" ry="2" />
+<text  x="998.98" y="2063.5" ></text>
+</g>
+<g >
+<title>rocksdb::MemTable::~MemTable (3 samples, 0.40%)</title><rect x="817.9" y="2037" width="4.7" height="15.0" fill="rgb(231,123,29)" rx="2" ry="2" />
+<text  x="820.87" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1253" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1263.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (75 samples, 10.11%)</title><rect x="504.6" y="2021" width="119.3" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="507.58" y="2031.5" >[unknown]</text>
+</g>
+<g >
+<title>operator delete (2 samples, 0.27%)</title><rect x="124.5" y="2037" width="3.2" height="15.0" fill="rgb(247,196,46)" rx="2" ry="2" />
+<text  x="127.50" y="2047.5" ></text>
+</g>
+<g >
+<title>&lt;oxhttp::model::body::SimpleChunkedTransferEncoding&lt;oxigraph::ReadForWrite&lt; (1 samples, 0.13%)</title><rect x="95.9" y="2053" width="1.6" height="15.0" fill="rgb(215,50,12)" rx="2" ry="2" />
+<text  x="98.88" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (8 samples, 1.08%)</title><rect x="771.8" y="2021" width="12.7" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="774.75" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="885" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="895.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;http::header::map::HeaderMap&gt;::try_append2::&lt;http::header::name::HeaderName&gt; (1 samples, 0.13%)</title><rect x="68.8" y="2053" width="1.6" height="15.0" fill="rgb(205,2,0)" rx="2" ry="2" />
+<text  x="71.84" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1141" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1151.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVec&lt;sparopt::algebra::GraphPattern&gt;&gt;::grow_one (1 samples, 0.13%)</title><rect x="313.7" y="2037" width="1.6" height="15.0" fill="rgb(242,171,41)" rx="2" ry="2" />
+<text  x="316.75" y="2047.5" ></text>
+</g>
+<g >
+<title>&lt;spareval::eval::SimpleEvaluator&lt;oxigraph::sparql::dataset::DatasetView&gt;&gt;::build_graph_pattern_evaluator::{closure#3} (3 samples, 0.40%)</title><rect x="170.6" y="2053" width="4.8" height="15.0" fill="rgb(241,166,39)" rx="2" ry="2" />
+<text  x="173.62" y="2063.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVec&lt;alloc::vec::Vec&lt;core::option::Option&lt;spargebra::term::GroundTerm&gt;&gt;&gt;&gt;::grow_one (1 samples, 0.13%)</title><rect x="33.9" y="2053" width="1.5" height="15.0" fill="rgb(228,107,25)" rx="2" ry="2" />
+<text  x="36.85" y="2063.5" ></text>
+</g>
+<g >
+<title>rocksdb::(anonymous namespace)::SkipListRep::Iterator::~Iterator (1 samples, 0.13%)</title><rect x="1096.2" y="2053" width="1.6" height="15.0" fill="rgb(246,189,45)" rx="2" ry="2" />
+<text  x="1099.17" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1605" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1615.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;hashbrown::map::HashMap&lt;oxrdf::variable::Variable, sparopt::type_inference::VariableType, std::hash::random::RandomState&gt;&gt;::insert (3 samples, 0.40%)</title><rect x="57.7" y="2053" width="4.8" height="15.0" fill="rgb(222,80,19)" rx="2" ry="2" />
+<text  x="60.71" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="805" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="815.5" >[unknown]</text>
+</g>
+<g >
+<title>core::fmt::write (2 samples, 0.27%)</title><rect x="838.5" y="1989" width="3.2" height="15.0" fill="rgb(221,77,18)" rx="2" ry="2" />
+<text  x="841.54" y="1999.5" ></text>
+</g>
+<g >
+<title>&lt;spareval::eval::SimpleEvaluator&lt;oxigraph::sparql::dataset::DatasetView&gt;&gt;::build_graph_pattern_evaluator::{closure#28}::{closure#0} (1 samples, 0.13%)</title><rect x="169.0" y="2053" width="1.6" height="15.0" fill="rgb(206,6,1)" rx="2" ry="2" />
+<text  x="172.03" y="2063.5" ></text>
+</g>
+<g >
+<title>&lt;spareval::eval::InternalTuple&lt;oxigraph::storage::numeric_encoder::EncodedTerm&gt;&gt;::combine_with (1 samples, 0.13%)</title><rect x="167.4" y="2053" width="1.6" height="15.0" fill="rgb(216,54,13)" rx="2" ry="2" />
+<text  x="170.44" y="2063.5" ></text>
+</g>
+<g >
+<title>&lt;oxiri::IriParser&lt;oxiri::VoidOutputBuffer, false&gt;&gt;::parse_authority (1 samples, 0.13%)</title><rect x="374.2" y="2037" width="1.6" height="15.0" fill="rgb(209,21,5)" rx="2" ry="2" />
+<text  x="377.18" y="2047.5" ></text>
+</g>
+<g >
+<title>oxigraph::storage::binary_encoder::write_term (3 samples, 0.40%)</title><rect x="751.1" y="2037" width="4.7" height="15.0" fill="rgb(205,0,0)" rx="2" ry="2" />
+<text  x="754.08" y="2047.5" ></text>
+</g>
+<g >
+<title>rocksdb::InlineSkipList&lt;rocksdb::MemTableRep::KeyComparator const&amp;&gt;::FindGreaterOrEqual (70 samples, 9.43%)</title><rect x="507.8" y="37" width="111.3" height="15.0" fill="rgb(239,160,38)" rx="2" ry="2" />
+<text  x="510.76" y="47.5" >rocksdb::Inli..</text>
+</g>
+<g >
+<title>&lt;oxigraph::storage::rocksdb_wrapper::Reader&gt;::scan_prefix (1 samples, 0.13%)</title><rect x="369.4" y="2037" width="1.6" height="15.0" fill="rgb(254,227,54)" rx="2" ry="2" />
+<text  x="372.41" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="949" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="959.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (73 samples, 9.84%)</title><rect x="506.2" y="2005" width="116.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="509.17" y="2015.5" >[unknown]</text>
+</g>
+<g >
+<title>rocksdb::DBImpl::NewIterator (1 samples, 0.13%)</title><rect x="778.1" y="1989" width="1.6" height="15.0" fill="rgb(231,123,29)" rx="2" ry="2" />
+<text  x="781.11" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1637" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1647.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1173" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1183.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;core::net::parser::Parser&gt;::read_ipv6_addr (1 samples, 0.13%)</title><rect x="161.1" y="2037" width="1.6" height="15.0" fill="rgb(233,131,31)" rx="2" ry="2" />
+<text  x="164.08" y="2047.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse__ (3 samples, 0.40%)</title><rect x="1156.6" y="2053" width="4.8" height="15.0" fill="rgb(248,201,48)" rx="2" ry="2" />
+<text  x="1159.60" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="165" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="175.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;spareval::PreparedQuery&gt;::explain::&lt;oxigraph::sparql::dataset::DatasetView&gt; (2 samples, 0.27%)</title><rect x="380.5" y="2037" width="3.2" height="15.0" fill="rgb(232,125,29)" rx="2" ry="2" />
+<text  x="383.54" y="2047.5" ></text>
+</g>
+<g >
+<title>&lt;http::response::Builder&gt;::and_then::&lt;&lt;http::response::Builder&gt;::header&lt;http::header::name::HeaderName, &amp;str&gt;::{closure#0}&gt; (1 samples, 0.13%)</title><rect x="73.6" y="2053" width="1.6" height="15.0" fill="rgb(236,143,34)" rx="2" ry="2" />
+<text  x="76.61" y="2063.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_Var (1 samples, 0.13%)</title><rect x="1153.4" y="2053" width="1.6" height="15.0" fill="rgb(244,179,42)" rx="2" ry="2" />
+<text  x="1156.42" y="2063.5" ></text>
+</g>
+<g >
+<title>oxrocksdb_get_into_buffer_cf (13 samples, 1.75%)</title><rect x="127.7" y="2037" width="20.7" height="15.0" fill="rgb(243,179,42)" rx="2" ry="2" />
+<text  x="130.68" y="2047.5" ></text>
+</g>
+<g >
+<title>&lt;spareval::PreparedQuery&gt;::explain::&lt;oxigraph::sparql::dataset::DatasetView&gt; (1 samples, 0.13%)</title><rect x="164.3" y="2053" width="1.5" height="15.0" fill="rgb(232,125,29)" rx="2" ry="2" />
+<text  x="167.26" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="293" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="303.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;oxhttp::model::body::SimpleChunkedTransferEncoding&lt;oxigraph::ReadForWrite&lt; (2 samples, 0.27%)</title><rect x="355.1" y="2037" width="3.2" height="15.0" fill="rgb(215,50,12)" rx="2" ry="2" />
+<text  x="358.09" y="2047.5" ></text>
+</g>
+<g >
+<title>&lt;spareval::eval::TupleSelector&lt;oxigraph::storage::numeric_encoder::EncodedTerm&gt;&gt;::get_pattern_value::&lt;oxigraph::sparql::dataset::DatasetView&gt; (2 samples, 0.27%)</title><rect x="178.6" y="2053" width="3.2" height="15.0" fill="rgb(248,201,48)" rx="2" ry="2" />
+<text  x="181.57" y="2063.5" ></text>
+</g>
+<g >
+<title>&lt;oxigraph::ReadForWrite&lt; (1 samples, 0.13%)</title><rect x="97.5" y="2053" width="1.6" height="15.0" fill="rgb(205,3,0)" rx="2" ry="2" />
+<text  x="100.47" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="901" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="911.5" >[unknown]</text>
+</g>
+<g >
+<title>core::fmt::write (1 samples, 0.13%)</title><rect x="921.2" y="2053" width="1.6" height="15.0" fill="rgb(221,77,18)" rx="2" ry="2" />
+<text  x="924.24" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="613" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="623.5" >[unknown]</text>
+</g>
+<g >
+<title>rocksdb::DBIter::~DBIter (2 samples, 0.27%)</title><rect x="800.4" y="2037" width="3.2" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="803.38" y="2047.5" ></text>
+</g>
+<g >
+<title>oxigraph::configure_and_evaluate_sparql_query (2 samples, 0.27%)</title><rect x="1000.8" y="2053" width="3.1" height="15.0" fill="rgb(231,119,28)" rx="2" ry="2" />
+<text  x="1003.75" y="2063.5" ></text>
+</g>
+<g >
+<title>oxigraph::limited_string_body (2 samples, 0.27%)</title><rect x="1007.1" y="2053" width="3.2" height="15.0" fill="rgb(225,95,22)" rx="2" ry="2" />
+<text  x="1010.12" y="2063.5" ></text>
+</g>
+<g >
+<title>&lt;oxigraph::storage::numeric_encoder::EncodedTerm as core::clone::Clone&gt;::clone (3 samples, 0.40%)</title><rect x="111.8" y="2053" width="4.7" height="15.0" fill="rgb(233,129,30)" rx="2" ry="2" />
+<text  x="114.78" y="2063.5" ></text>
+</g>
+<g >
+<title>&lt;std::hash::random::RandomState as core::hash::BuildHasher&gt;::hash_one::&lt;&amp;alloc::string::String&gt; (2 samples, 0.27%)</title><rect x="184.9" y="2053" width="3.2" height="15.0" fill="rgb(222,78,18)" rx="2" ry="2" />
+<text  x="187.93" y="2063.5" ></text>
+</g>
+<g >
+<title>&lt;oxiri::IriParser&lt;alloc::string::String, false&gt;&gt;::parse_path::&lt;false&gt; (1 samples, 0.13%)</title><rect x="371.0" y="2037" width="1.6" height="15.0" fill="rgb(216,54,13)" rx="2" ry="2" />
+<text  x="374.00" y="2047.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_PNAME_NS (2 samples, 0.27%)</title><rect x="1131.2" y="2053" width="3.1" height="15.0" fill="rgb(225,92,22)" rx="2" ry="2" />
+<text  x="1134.16" y="2063.5" ></text>
+</g>
+<g >
+<title>rocksdb::MemTable::KeyComparator::operator (5 samples, 0.67%)</title><rect x="809.9" y="2037" width="8.0" height="15.0" fill="rgb(205,2,0)" rx="2" ry="2" />
+<text  x="812.92" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1125" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1135.5" >[unknown]</text>
+</g>
+<g >
+<title>rocksdb_iter_seek (5 samples, 0.67%)</title><rect x="762.2" y="1989" width="8.0" height="15.0" fill="rgb(224,89,21)" rx="2" ry="2" />
+<text  x="765.21" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1893" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1903.5" >[unknown]</text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;oxhttp::model::body::Body&gt; (1 samples, 0.13%)</title><rect x="922.8" y="2053" width="1.6" height="15.0" fill="rgb(214,43,10)" rx="2" ry="2" />
+<text  x="925.83" y="2063.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_NIL (1 samples, 0.13%)</title><rect x="876.7" y="2037" width="1.6" height="15.0" fill="rgb(246,189,45)" rx="2" ry="2" />
+<text  x="879.71" y="2047.5" ></text>
+</g>
+<g >
+<title>httparse::simd::runtime::match_uri_vectored (1 samples, 0.13%)</title><rect x="938.7" y="2053" width="1.6" height="15.0" fill="rgb(209,22,5)" rx="2" ry="2" />
+<text  x="941.73" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="677" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="687.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.27%)</title><rect x="827.4" y="2005" width="3.2" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="830.41" y="2015.5" ></text>
+</g>
+<g >
+<title>&lt;oxhttp::model::body::Body&gt;::trailers (1 samples, 0.13%)</title><rect x="94.3" y="2053" width="1.6" height="15.0" fill="rgb(205,2,0)" rx="2" ry="2" />
+<text  x="97.29" y="2063.5" ></text>
+</g>
+<g >
+<title>&lt;core::iter::adapters::flatten::Flatten&lt;alloc::vec::into_iter::IntoIter&lt;alloc::vec::Vec&lt;spargebra::parser::TripleOrPathPattern&gt;&gt;&gt; as core::iter::traits::iterator::Iterator&gt;::next (1 samples, 0.13%)</title><rect x="321.7" y="2037" width="1.6" height="15.0" fill="rgb(219,67,16)" rx="2" ry="2" />
+<text  x="324.70" y="2047.5" ></text>
+</g>
+<g >
+<title>&lt;spareval::eval::EvalDataset&lt;oxigraph::sparql::dataset::DatasetView&gt; as core::clone::Clone&gt;::clone (1 samples, 0.13%)</title><rect x="165.8" y="2053" width="1.6" height="15.0" fill="rgb(206,8,1)" rx="2" ry="2" />
+<text  x="168.85" y="2063.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_Path (1 samples, 0.13%)</title><rect x="879.9" y="2037" width="1.6" height="15.0" fill="rgb(248,197,47)" rx="2" ry="2" />
+<text  x="882.89" y="2047.5" ></text>
+</g>
+<g >
+<title>&lt;json_event_parser::write::LowLevelJsonSerializer&gt;::serialize_event::&lt;&amp;mut oxigraph::ReadForWriteWriter&gt; (6 samples, 0.81%)</title><rect x="81.6" y="2053" width="9.5" height="15.0" fill="rgb(209,22,5)" rx="2" ry="2" />
+<text  x="84.56" y="2063.5" ></text>
+</g>
+<g >
+<title>non-virtual thunk to rocksdb::(anonymous namespace)::BytewiseComparatorImpl::Compare (3 samples, 0.40%)</title><rect x="984.9" y="2053" width="4.7" height="15.0" fill="rgb(221,76,18)" rx="2" ry="2" />
+<text  x="987.85" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1765" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1775.5" >[unknown]</text>
+</g>
+<g >
+<title>realloc (4 samples, 0.54%)</title><rect x="1089.8" y="2053" width="6.4" height="15.0" fill="rgb(246,189,45)" rx="2" ry="2" />
+<text  x="1092.81" y="2063.5" ></text>
+</g>
+<g >
+<title>[[vdso]] (1 samples, 0.13%)</title><rect x="390.1" y="2021" width="1.6" height="15.0" fill="rgb(218,60,14)" rx="2" ry="2" />
+<text  x="393.08" y="2031.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse__ (2 samples, 0.27%)</title><rect x="894.2" y="2037" width="3.2" height="15.0" fill="rgb(248,201,48)" rx="2" ry="2" />
+<text  x="897.20" y="2047.5" ></text>
+</g>
+<g >
+<title>rocksdb::ArenaWrappedDBIter::Init (1 samples, 0.13%)</title><rect x="827.4" y="1989" width="1.6" height="15.0" fill="rgb(207,9,2)" rx="2" ry="2" />
+<text  x="830.41" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="309" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="319.5" >[unknown]</text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_String (1 samples, 0.13%)</title><rect x="1147.1" y="2053" width="1.6" height="15.0" fill="rgb(236,144,34)" rx="2" ry="2" />
+<text  x="1150.06" y="2063.5" ></text>
+</g>
+<g >
+<title>&lt;core::fmt::Formatter&gt;::pad (1 samples, 0.13%)</title><rect x="838.5" y="1973" width="1.6" height="15.0" fill="rgb(249,204,48)" rx="2" ry="2" />
+<text  x="841.54" y="1983.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1973" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1983.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="869" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="879.5" >[unknown]</text>
+</g>
+<g >
+<title>[libc.so.6] (2 samples, 0.27%)</title><rect x="501.4" y="2021" width="3.2" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="504.40" y="2031.5" ></text>
+</g>
+<g >
+<title>rocksdb::DBImpl::GetImpl (2 samples, 0.27%)</title><rect x="774.9" y="1973" width="3.2" height="15.0" fill="rgb(238,155,37)" rx="2" ry="2" />
+<text  x="777.93" y="1983.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="277" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="287.5" >[unknown]</text>
+</g>
+<g >
+<title>rocksdb::DBIter::ParseKey (1 samples, 0.13%)</title><rect x="800.4" y="2005" width="1.6" height="15.0" fill="rgb(239,158,37)" rx="2" ry="2" />
+<text  x="803.38" y="2015.5" ></text>
+</g>
+<g >
+<title>&lt;hashbrown::map::HashMap&lt;oxrdf::named_node::NamedNode, alloc::sync::Arc&lt;dyn for&lt;a&gt; core::ops::function::Fn&lt; (8 samples, 1.08%)</title><rect x="329.6" y="2037" width="12.8" height="15.0" fill="rgb(235,142,33)" rx="2" ry="2" />
+<text  x="332.65" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1477" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1487.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1237" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1247.5" >[unknown]</text>
+</g>
+<g >
+<title>core::fmt::write (3 samples, 0.40%)</title><rect x="996.0" y="2037" width="4.8" height="15.0" fill="rgb(221,77,18)" rx="2" ry="2" />
+<text  x="998.98" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1413" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1423.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (1 samples, 0.13%)</title><rect x="771.8" y="1989" width="1.5" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="774.75" y="1999.5" ></text>
+</g>
+<g >
+<title>&lt;oxigraph::sparql::dataset::DatasetView as oxigraph::storage::numeric_encoder::Decoder&gt;::decode_term (1 samples, 0.13%)</title><rect x="103.8" y="2053" width="1.6" height="15.0" fill="rgb(238,154,36)" rx="2" ry="2" />
+<text  x="106.83" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="229" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="239.5" >[unknown]</text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_GroupGraphPattern (6 samples, 0.81%)</title><rect x="852.9" y="2037" width="9.5" height="15.0" fill="rgb(212,34,8)" rx="2" ry="2" />
+<text  x="855.86" y="2047.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_NumericLiteral (3 samples, 0.40%)</title><rect x="1123.2" y="2053" width="4.8" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="1126.21" y="2063.5" ></text>
+</g>
+<g >
+<title>rocksdb::MemTable::NewIterator (2 samples, 0.27%)</title><rect x="819.5" y="2005" width="3.1" height="15.0" fill="rgb(238,151,36)" rx="2" ry="2" />
+<text  x="822.46" y="2015.5" ></text>
+</g>
+<g >
+<title>&lt;std::io::default_write_fmt::Adapter&lt;std::io::buffered::bufwriter::BufWriter&lt;std::net::tcp::TcpStream&gt;&gt; as core::fmt::Write&gt;::write_str (1 samples, 0.13%)</title><rect x="999.2" y="2021" width="1.6" height="15.0" fill="rgb(234,135,32)" rx="2" ry="2" />
+<text  x="1002.16" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="997" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1007.5" >[unknown]</text>
+</g>
+<g >
+<title>rocksdb::DBIter::Next (1 samples, 0.13%)</title><rect x="757.4" y="2005" width="1.6" height="15.0" fill="rgb(252,218,52)" rx="2" ry="2" />
+<text  x="760.44" y="2015.5" ></text>
+</g>
+<g >
+<title>rocksdb::DBIter::Seek (4 samples, 0.54%)</title><rect x="762.2" y="1973" width="6.4" height="15.0" fill="rgb(251,211,50)" rx="2" ry="2" />
+<text  x="765.21" y="1983.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;sparopt::algebra::GraphPattern&gt; (1 samples, 0.13%)</title><rect x="725.6" y="2037" width="1.6" height="15.0" fill="rgb(249,206,49)" rx="2" ry="2" />
+<text  x="728.63" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="405" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="415.5" >[unknown]</text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_Path (1 samples, 0.13%)</title><rect x="1139.1" y="2053" width="1.6" height="15.0" fill="rgb(248,197,47)" rx="2" ry="2" />
+<text  x="1142.11" y="2063.5" ></text>
+</g>
+<g >
+<title>&lt;oxhttp::model::body::Body as std::io::Read&gt;::read (2 samples, 0.27%)</title><rect x="91.1" y="2053" width="3.2" height="15.0" fill="rgb(244,180,43)" rx="2" ry="2" />
+<text  x="94.11" y="2063.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.13%)</title><rect x="843.3" y="1973" width="1.6" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="846.32" y="1983.5" ></text>
+</g>
+<g >
+<title>oxigraph::configure_and_evaluate_sparql_query (1 samples, 0.13%)</title><rect x="749.5" y="2037" width="1.6" height="15.0" fill="rgb(231,119,28)" rx="2" ry="2" />
+<text  x="752.49" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="213" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="223.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;spareval::service::ServiceHandlerRegistry as core::clone::Clone&gt;::clone (1 samples, 0.13%)</title><rect x="181.8" y="2053" width="1.5" height="15.0" fill="rgb(243,179,42)" rx="2" ry="2" />
+<text  x="184.75" y="2063.5" ></text>
+</g>
+<g >
+<title>&lt;oxiri::IriParser&lt;alloc::string::String, false&gt;&gt;::parse_path::&lt;false&gt; (5 samples, 0.67%)</title><rect x="149.9" y="2053" width="8.0" height="15.0" fill="rgb(216,54,13)" rx="2" ry="2" />
+<text  x="152.95" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1093" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1103.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1925" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1935.5" >[unknown]</text>
+</g>
+<g >
+<title>rocksdb::MemTableIterator::~MemTableIterator (1 samples, 0.13%)</title><rect x="825.8" y="2037" width="1.6" height="15.0" fill="rgb(253,223,53)" rx="2" ry="2" />
+<text  x="828.82" y="2047.5" ></text>
+</g>
+<g >
+<title>rocksdb::Arena::~Arena (1 samples, 0.13%)</title><rect x="631.8" y="2021" width="1.6" height="15.0" fill="rgb(252,219,52)" rx="2" ry="2" />
+<text  x="634.81" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1221" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1231.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;oxigraph::ReadForWrite&lt; (1 samples, 0.13%)</title><rect x="358.3" y="2037" width="1.6" height="15.0" fill="rgb(205,3,0)" rx="2" ry="2" />
+<text  x="361.27" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (6 samples, 0.81%)</title><rect x="771.8" y="2005" width="9.5" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="774.75" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="341" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="351.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1317" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1327.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;http::header::map::HeaderMap&gt;::get2::&lt;http::header::name::HeaderName&gt; (1 samples, 0.13%)</title><rect x="67.3" y="2053" width="1.5" height="15.0" fill="rgb(252,217,51)" rx="2" ry="2" />
+<text  x="70.25" y="2063.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_i (7 samples, 0.94%)</title><rect x="897.4" y="2037" width="11.1" height="15.0" fill="rgb(234,134,32)" rx="2" ry="2" />
+<text  x="900.39" y="2047.5" ></text>
+</g>
+<g >
+<title>std::sys::backtrace::__rust_begin_short_backtrace::&lt;&lt;oxhttp::server::Server&gt;::spawn::{closure#0}::{closure#0}::{closure#1},  (15 samples, 2.02%)</title><rect x="1166.1" y="2053" width="23.9" height="15.0" fill="rgb(233,132,31)" rx="2" ry="2" />
+<text  x="1169.15" y="2063.5" >s..</text>
+</g>
+<g >
+<title>rocksdb::ThreadStatusUtil::GetThreadOperation (2 samples, 0.27%)</title><rect x="1107.3" y="2053" width="3.2" height="15.0" fill="rgb(207,10,2)" rx="2" ry="2" />
+<text  x="1110.30" y="2063.5" ></text>
+</g>
+<g >
+<title>operator delete (1 samples, 0.13%)</title><rect x="989.6" y="2053" width="1.6" height="15.0" fill="rgb(247,196,46)" rx="2" ry="2" />
+<text  x="992.62" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (6 samples, 0.81%)</title><rect x="760.6" y="2021" width="9.6" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="763.62" y="2031.5" ></text>
+</g>
+<g >
+<title>rocksdb::MemTableIterator::NextAndGetResult (9 samples, 1.21%)</title><rect x="655.7" y="2021" width="14.3" height="15.0" fill="rgb(217,57,13)" rx="2" ry="2" />
+<text  x="658.66" y="2031.5" ></text>
+</g>
+<g >
+<title>&lt;oxigraph::storage::numeric_encoder::EncodedTerm as core::convert::From&lt;oxrdf::triple::TermRef&gt;&gt;::from (2 samples, 0.27%)</title><rect x="366.2" y="2037" width="3.2" height="15.0" fill="rgb(249,204,49)" rx="2" ry="2" />
+<text  x="369.23" y="2047.5" ></text>
+</g>
+<g >
+<title>rocksdb::ArenaWrappedDBIter::Valid (1 samples, 0.13%)</title><rect x="760.6" y="1989" width="1.6" height="15.0" fill="rgb(212,35,8)" rx="2" ry="2" />
+<text  x="763.62" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="645" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="655.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;oxigraph::sparql::algebra::Query as core::convert::From&lt;spargebra::query::Query&gt;&gt;::from (1 samples, 0.13%)</title><rect x="102.2" y="2053" width="1.6" height="15.0" fill="rgb(231,123,29)" rx="2" ry="2" />
+<text  x="105.24" y="2063.5" ></text>
+</g>
+<g >
+<title>operator new (1 samples, 0.13%)</title><rect x="625.4" y="2021" width="1.6" height="15.0" fill="rgb(216,51,12)" rx="2" ry="2" />
+<text  x="628.44" y="2031.5" ></text>
+</g>
+<g >
+<title>rocksdb::DBImpl::FailIfCfHasTs (1 samples, 0.13%)</title><rect x="130.9" y="2005" width="1.6" height="15.0" fill="rgb(249,202,48)" rx="2" ry="2" />
+<text  x="133.86" y="2015.5" ></text>
+</g>
+<g >
+<title>rocksdb::DBImpl::Get (1 samples, 0.13%)</title><rect x="148.4" y="2037" width="1.5" height="15.0" fill="rgb(235,141,33)" rx="2" ry="2" />
+<text  x="151.36" y="2047.5" ></text>
+</g>
+<g >
+<title>cfree (1 samples, 0.13%)</title><rect x="771.8" y="1973" width="1.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="774.75" y="1983.5" ></text>
+</g>
+<g >
+<title>all (742 samples, 100%)</title><rect x="10.0" y="2085" width="1180.0" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="13.00" y="2095.5" ></text>
+</g>
+<g >
+<title>rocksdb::DBImpl::FailIfCfHasTs (1 samples, 0.13%)</title><rect x="635.0" y="2021" width="1.6" height="15.0" fill="rgb(249,202,48)" rx="2" ry="2" />
+<text  x="637.99" y="2031.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_VarOrTerm (2 samples, 0.27%)</title><rect x="891.0" y="2037" width="3.2" height="15.0" fill="rgb(211,30,7)" rx="2" ry="2" />
+<text  x="894.02" y="2047.5" ></text>
+</g>
+<g >
+<title>rocksdb::(anonymous namespace)::PosixClock::~PosixClock (2 samples, 0.27%)</title><rect x="755.8" y="2037" width="3.2" height="15.0" fill="rgb(253,222,53)" rx="2" ry="2" />
+<text  x="758.85" y="2047.5" ></text>
+</g>
+<g >
+<title>rocksdb::DBImpl::ReleaseSnapshot (2 samples, 0.27%)</title><rect x="797.2" y="2037" width="3.2" height="15.0" fill="rgb(213,41,9)" rx="2" ry="2" />
+<text  x="800.20" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="485" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="495.5" >[unknown]</text>
+</g>
+<g >
+<title>rocksdb::DBImpl::GetImpl (10 samples, 1.35%)</title><rect x="130.9" y="2021" width="15.9" height="15.0" fill="rgb(238,155,37)" rx="2" ry="2" />
+<text  x="133.86" y="2031.5" ></text>
+</g>
+<g >
+<title>&lt;json_event_parser::write::LowLevelJsonSerializer&gt;::serialize_event::&lt;&amp;mut oxigraph::ReadForWriteWriter&gt; (6 samples, 0.81%)</title><rect x="345.6" y="2037" width="9.5" height="15.0" fill="rgb(209,22,5)" rx="2" ry="2" />
+<text  x="348.55" y="2047.5" ></text>
+</g>
+<g >
+<title>rocksdb::NewArenaWrappedDbIterator (1 samples, 0.13%)</title><rect x="802.0" y="2005" width="1.6" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="804.97" y="2015.5" ></text>
+</g>
+<g >
+<title>rocksdb::DBImpl::FailIfCfHasTs (1 samples, 0.13%)</title><rect x="794.0" y="2037" width="1.6" height="15.0" fill="rgb(249,202,48)" rx="2" ry="2" />
+<text  x="797.02" y="2047.5" ></text>
+</g>
+<g >
+<title>core::fmt::write (1 samples, 0.13%)</title><rect x="673.2" y="2005" width="1.5" height="15.0" fill="rgb(221,77,18)" rx="2" ry="2" />
+<text  x="676.15" y="2015.5" ></text>
+</g>
+<g >
+<title>&lt;spargebra::algebra::GraphPattern&gt;::lookup_in_scope_variables::&lt;spargebra::parser::build_select::{closure#0}&gt; (2 samples, 0.27%)</title><rect x="401.2" y="2037" width="3.2" height="15.0" fill="rgb(237,148,35)" rx="2" ry="2" />
+<text  x="404.21" y="2047.5" ></text>
+</g>
+<g >
+<title>oxigraph::base_url (1 samples, 0.13%)</title><rect x="747.9" y="2037" width="1.6" height="15.0" fill="rgb(211,29,6)" rx="2" ry="2" />
+<text  x="750.90" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="821" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="831.5" >[unknown]</text>
+</g>
+<g >
+<title>rocksdb::DBImpl::GetLastPublishedSequence (1 samples, 0.13%)</title><rect x="795.6" y="2037" width="1.6" height="15.0" fill="rgb(251,215,51)" rx="2" ry="2" />
+<text  x="798.61" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1205" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1215.5" >[unknown]</text>
+</g>
+<g >
+<title>rocksdb::DBImpl::Close (6 samples, 0.81%)</title><rect x="784.5" y="2037" width="9.5" height="15.0" fill="rgb(253,222,53)" rx="2" ry="2" />
+<text  x="787.47" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="773" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="783.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;core::hash::sip::Hasher&lt;core::hash::sip::Sip13Rounds&gt; as core::hash::Hasher&gt;::write (3 samples, 0.40%)</title><rect x="41.8" y="2053" width="4.8" height="15.0" fill="rgb(233,130,31)" rx="2" ry="2" />
+<text  x="44.81" y="2063.5" ></text>
+</g>
+<g >
+<title>rocksdb::DBIter::SetSavedKeyToSeekTarget (1 samples, 0.13%)</title><rect x="768.6" y="1973" width="1.6" height="15.0" fill="rgb(238,153,36)" rx="2" ry="2" />
+<text  x="771.57" y="1983.5" ></text>
+</g>
+<g >
+<title>rocksdb::ThreadStatusUtil::SetThreadOperation (1 samples, 0.13%)</title><rect x="1110.5" y="2053" width="1.6" height="15.0" fill="rgb(229,113,27)" rx="2" ry="2" />
+<text  x="1113.49" y="2063.5" ></text>
+</g>
+<g >
+<title>&lt;siphasher::sip128::Hasher&lt;siphasher::sip128::Sip24Rounds&gt; as core::hash::Hasher&gt;::write (3 samples, 0.40%)</title><rect x="375.8" y="2037" width="4.7" height="15.0" fill="rgb(240,162,38)" rx="2" ry="2" />
+<text  x="378.77" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1573" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1583.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="853" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="863.5" >[unknown]</text>
+</g>
+<g >
+<title>rocksdb::ThreadLocalPtr::Swap (1 samples, 0.13%)</title><rect x="792.4" y="2005" width="1.6" height="15.0" fill="rgb(253,222,53)" rx="2" ry="2" />
+<text  x="795.43" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1269" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1279.5" >[unknown]</text>
+</g>
+<g >
+<title>cfree (20 samples, 2.70%)</title><rect x="674.7" y="2037" width="31.8" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="677.74" y="2047.5" >cf..</text>
+</g>
+<g >
+<title>&lt;core::io::util::Take&lt;std::io::buffered::bufreader::BufReader&lt;std::net::tcp::TcpStream&gt;&gt; as std::io::Read&gt;::read (1 samples, 0.13%)</title><rect x="46.6" y="2053" width="1.6" height="15.0" fill="rgb(206,4,1)" rx="2" ry="2" />
+<text  x="49.58" y="2063.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_TriplesBlock (2 samples, 0.27%)</title><rect x="886.3" y="2037" width="3.1" height="15.0" fill="rgb(216,54,13)" rx="2" ry="2" />
+<text  x="889.25" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="85" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="95.5" >[unknown]</text>
+</g>
+<g >
+<title>oxrocksdb_get_pinned_cf_v2 (1 samples, 0.13%)</title><rect x="1015.1" y="2053" width="1.6" height="15.0" fill="rgb(238,152,36)" rx="2" ry="2" />
+<text  x="1018.07" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="517" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="527.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;oxigraph::storage::rocksdb::RocksDbStorageReader as oxigraph::storage::numeric_encoder::StrLookup&gt;::get_str (2 samples, 0.27%)</title><rect x="121.3" y="2053" width="3.2" height="15.0" fill="rgb(229,114,27)" rx="2" ry="2" />
+<text  x="124.32" y="2063.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_VARNAME (1 samples, 0.13%)</title><rect x="1151.8" y="2053" width="1.6" height="15.0" fill="rgb(240,163,39)" rx="2" ry="2" />
+<text  x="1154.83" y="2063.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_PN_CHARS_U (2 samples, 0.27%)</title><rect x="1135.9" y="2053" width="3.2" height="15.0" fill="rgb(231,123,29)" rx="2" ry="2" />
+<text  x="1138.93" y="2063.5" ></text>
+</g>
+<g >
+<title>&lt;spareval::eval::SimpleEvaluator&lt;oxigraph::sparql::dataset::DatasetView&gt;&gt;::graph_pattern_evaluator (2 samples, 0.27%)</title><rect x="386.9" y="2037" width="3.2" height="15.0" fill="rgb(214,43,10)" rx="2" ry="2" />
+<text  x="389.90" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="261" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="271.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;http::status::StatusCode as core::fmt::Display&gt;::fmt (1 samples, 0.13%)</title><rect x="1186.8" y="2037" width="1.6" height="15.0" fill="rgb(216,52,12)" rx="2" ry="2" />
+<text  x="1189.82" y="2047.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::sync::Arc&lt;oxhttp::client::Client&gt;&gt;::drop_slow (1 samples, 0.13%)</title><rect x="40.2" y="2053" width="1.6" height="15.0" fill="rgb(243,176,42)" rx="2" ry="2" />
+<text  x="43.22" y="2063.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.13%)</title><rect x="504.6" y="2005" width="1.6" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="507.58" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1797" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1807.5" >[unknown]</text>
+</g>
+<g >
+<title>oxigraph::handle_request (1 samples, 0.13%)</title><rect x="1003.9" y="2053" width="1.6" height="15.0" fill="rgb(231,123,29)" rx="2" ry="2" />
+<text  x="1006.94" y="2063.5" ></text>
+</g>
+<g >
+<title>rocksdb::ColumnFamilyHandleImpl::~ColumnFamilyHandleImpl (8 samples, 1.08%)</title><rect x="771.8" y="2037" width="12.7" height="15.0" fill="rgb(237,147,35)" rx="2" ry="2" />
+<text  x="774.75" y="2047.5" ></text>
+</g>
+<g >
+<title>oxigraph::limited_body (1 samples, 0.13%)</title><rect x="1005.5" y="2053" width="1.6" height="15.0" fill="rgb(222,79,19)" rx="2" ry="2" />
+<text  x="1008.53" y="2063.5" ></text>
+</g>
+<g >
+<title>rocksdb::DBImpl::TraceIteratorSeek (1 samples, 0.13%)</title><rect x="767.0" y="1957" width="1.6" height="15.0" fill="rgb(227,101,24)" rx="2" ry="2" />
+<text  x="769.98" y="1967.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="357" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="367.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;oxigraph::sparql::dataset::DatasetView as oxigraph::storage::numeric_encoder::StrLookup&gt;::get_str (2 samples, 0.27%)</title><rect x="105.4" y="2053" width="3.2" height="15.0" fill="rgb(254,226,54)" rx="2" ry="2" />
+<text  x="108.42" y="2063.5" ></text>
+</g>
+<g >
+<title>recv (1 samples, 0.13%)</title><rect x="622.3" y="2005" width="1.6" height="15.0" fill="rgb(222,82,19)" rx="2" ry="2" />
+<text  x="625.26" y="2015.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::string::String as core::fmt::Write&gt;::write_str.3192 (1 samples, 0.13%)</title><rect x="837.0" y="1989" width="1.5" height="15.0" fill="rgb(209,22,5)" rx="2" ry="2" />
+<text  x="839.95" y="1999.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVec&lt;alloc::vec::Vec&lt;core::option::Option&lt;spargebra::term::GroundTerm&gt;&gt;&gt;&gt;::grow_one (1 samples, 0.13%)</title><rect x="312.2" y="2037" width="1.5" height="15.0" fill="rgb(228,107,25)" rx="2" ry="2" />
+<text  x="315.16" y="2047.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_VarOrTerm (1 samples, 0.13%)</title><rect x="1155.0" y="2053" width="1.6" height="15.0" fill="rgb(211,30,7)" rx="2" ry="2" />
+<text  x="1158.01" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (110 samples, 14.82%)</title><rect x="498.2" y="2037" width="175.0" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="501.22" y="2047.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1445" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1455.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;sparopt::optimizer::Optimizer&gt;::reorder_joins (1 samples, 0.13%)</title><rect x="412.3" y="2037" width="1.6" height="15.0" fill="rgb(235,138,33)" rx="2" ry="2" />
+<text  x="415.35" y="2047.5" ></text>
+</g>
+<g >
+<title>&lt;oxiri::IriParser&lt;oxiri::VoidOutputBuffer, false&gt;&gt;::parse_host (3 samples, 0.40%)</title><rect x="157.9" y="2053" width="4.8" height="15.0" fill="rgb(244,183,43)" rx="2" ry="2" />
+<text  x="160.90" y="2063.5" ></text>
+</g>
+<g >
+<title>core::fmt::write (1 samples, 0.13%)</title><rect x="843.3" y="1989" width="1.6" height="15.0" fill="rgb(221,77,18)" rx="2" ry="2" />
+<text  x="846.32" y="1999.5" ></text>
+</g>
+<g >
+<title>&lt;&amp;spargebra::term::NamedNodePattern as core::fmt::Display&gt;::fmt (3 samples, 0.40%)</title><rect x="837.0" y="2005" width="4.7" height="15.0" fill="rgb(210,25,6)" rx="2" ry="2" />
+<text  x="839.95" y="2015.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (75 samples, 10.11%)</title><rect x="189.7" y="2053" width="119.3" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="192.70" y="2063.5" >[libc.so.6]</text>
+</g>
+<g >
+<title>rocksdb::ArenaWrappedDBIter::status (1 samples, 0.13%)</title><rect x="307.4" y="2037" width="1.6" height="15.0" fill="rgb(249,206,49)" rx="2" ry="2" />
+<text  x="310.39" y="2047.5" ></text>
+</g>
+<g >
+<title>&lt;spargebra::parser::SparqlParser&gt;::parse_query (2 samples, 0.27%)</title><rect x="407.6" y="2037" width="3.2" height="15.0" fill="rgb(251,215,51)" rx="2" ry="2" />
+<text  x="410.57" y="2047.5" ></text>
+</g>
+<g >
+<title>rocksdb::NewArenaWrappedDbIterator (1 samples, 0.13%)</title><rect x="779.7" y="1973" width="1.6" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="782.70" y="1983.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="917" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="927.5" >[unknown]</text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;spareval::QueryEvaluator&gt; (2 samples, 0.27%)</title><rect x="717.7" y="2037" width="3.2" height="15.0" fill="rgb(229,114,27)" rx="2" ry="2" />
+<text  x="720.68" y="2047.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::build_select (1 samples, 0.13%)</title><rect x="844.9" y="2037" width="1.6" height="15.0" fill="rgb(244,181,43)" rx="2" ry="2" />
+<text  x="847.91" y="2047.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_INTEGER (2 samples, 0.27%)</title><rect x="864.0" y="2037" width="3.2" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="866.99" y="2047.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;[spargebra::parser::ReifiedTerm]&gt; (1 samples, 0.13%)</title><rect x="706.5" y="2037" width="1.6" height="15.0" fill="rgb(234,133,31)" rx="2" ry="2" />
+<text  x="709.55" y="2047.5" ></text>
+</g>
+<g >
+<title>rocksdb_readoptions_destroy (1 samples, 0.13%)</title><rect x="830.6" y="2037" width="1.6" height="15.0" fill="rgb(254,225,53)" rx="2" ry="2" />
+<text  x="833.59" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1733" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1743.5" >[unknown]</text>
+</g>
+<g >
+<title>rocksdb::MergeContext::~MergeContext (1 samples, 0.13%)</title><rect x="145.2" y="2005" width="1.6" height="15.0" fill="rgb(212,36,8)" rx="2" ry="2" />
+<text  x="148.18" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1189" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1199.5" >[unknown]</text>
+</g>
+<g >
+<title>rocksdb::ThreadLocalPtr::StaticMeta::Swap (1 samples, 0.13%)</title><rect x="790.8" y="2005" width="1.6" height="15.0" fill="rgb(248,202,48)" rx="2" ry="2" />
+<text  x="793.84" y="2015.5" ></text>
+</g>
+<g >
+<title>&lt;hashbrown::raw::RawTable&lt; (1 samples, 0.13%)</title><rect x="62.5" y="2053" width="1.6" height="15.0" fill="rgb(251,213,51)" rx="2" ry="2" />
+<text  x="65.48" y="2063.5" ></text>
+</g>
+<g >
+<title>oxhttp::io::decoder::decode_body::&lt;std::io::buffered::bufreader::BufReader&lt;std::net::tcp::TcpStream&gt;&gt; (2 samples, 0.27%)</title><rect x="991.2" y="2053" width="3.2" height="15.0" fill="rgb(243,179,42)" rx="2" ry="2" />
+<text  x="994.21" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1621" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1631.5" >[unknown]</text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_GraphNodePath (1 samples, 0.13%)</title><rect x="849.7" y="2037" width="1.6" height="15.0" fill="rgb(211,30,7)" rx="2" ry="2" />
+<text  x="852.68" y="2047.5" ></text>
+</g>
+<g >
+<title>&lt;core::net::parser::Parser&gt;::read_ipv6_addr::read_groups (1 samples, 0.13%)</title><rect x="161.1" y="2021" width="1.6" height="15.0" fill="rgb(218,59,14)" rx="2" ry="2" />
+<text  x="164.08" y="2031.5" ></text>
+</g>
+<g >
+<title>&lt;hashbrown::map::HashMap&lt;oxrdf::variable::Variable, sparopt::type_inference::VariableType, std::hash::random::RandomState&gt; as core::clone::Clone&gt;::clone (1 samples, 0.13%)</title><rect x="342.4" y="2037" width="1.6" height="15.0" fill="rgb(220,70,16)" rx="2" ry="2" />
+<text  x="345.37" y="2047.5" ></text>
+</g>
+<g >
+<title>&lt;json_event_parser::write::LowLevelJsonSerializer&gt;::serialize_event::&lt;&amp;mut oxigraph::ReadForWriteWriter&gt; (1 samples, 0.13%)</title><rect x="498.2" y="2021" width="1.6" height="15.0" fill="rgb(209,22,5)" rx="2" ry="2" />
+<text  x="501.22" y="2031.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_GroupOrUnionGraphPattern (1 samples, 0.13%)</title><rect x="1121.6" y="2053" width="1.6" height="15.0" fill="rgb(250,208,49)" rx="2" ry="2" />
+<text  x="1124.62" y="2063.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_TriplesBlock (2 samples, 0.27%)</title><rect x="1148.7" y="2053" width="3.1" height="15.0" fill="rgb(216,54,13)" rx="2" ry="2" />
+<text  x="1151.65" y="2063.5" ></text>
+</g>
+<g >
+<title>&lt;core::fmt::Formatter&gt;::pad_integral (1 samples, 0.13%)</title><rect x="997.6" y="2021" width="1.6" height="15.0" fill="rgb(219,64,15)" rx="2" ry="2" />
+<text  x="1000.57" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="757" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="767.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (6 samples, 0.81%)</title><rect x="760.6" y="2005" width="9.6" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="763.62" y="2015.5" ></text>
+</g>
+<g >
+<title>rocksdb::Env::GetFileSystem (1 samples, 0.13%)</title><rect x="829.0" y="1989" width="1.6" height="15.0" fill="rgb(232,126,30)" rx="2" ry="2" />
+<text  x="832.00" y="1999.5" ></text>
+</g>
+<g >
+<title>httparse::simd::avx2::match_header_value_vectored (2 samples, 0.27%)</title><rect x="730.4" y="2037" width="3.2" height="15.0" fill="rgb(236,143,34)" rx="2" ry="2" />
+<text  x="733.40" y="2047.5" ></text>
+</g>
+<g >
+<title>http::header::map::hash_elem_using::&lt;http::header::name::HeaderName&gt; (2 samples, 0.27%)</title><rect x="927.6" y="2053" width="3.2" height="15.0" fill="rgb(206,5,1)" rx="2" ry="2" />
+<text  x="930.60" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1157" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1167.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="117" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="127.5" >[unknown]</text>
+</g>
+<g >
+<title>httparse::parse_headers_iter_uninit (1 samples, 0.13%)</title><rect x="937.1" y="2053" width="1.6" height="15.0" fill="rgb(210,26,6)" rx="2" ry="2" />
+<text  x="940.14" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="149" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="159.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1557" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1567.5" >[unknown]</text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_GroupClause (1 samples, 0.13%)</title><rect x="851.3" y="2037" width="1.6" height="15.0" fill="rgb(212,36,8)" rx="2" ry="2" />
+<text  x="854.27" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1381" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1391.5" >[unknown]</text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_PropertyListPathNotEmpty (2 samples, 0.27%)</title><rect x="1142.3" y="2053" width="3.2" height="15.0" fill="rgb(248,199,47)" rx="2" ry="2" />
+<text  x="1145.29" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1653" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1663.5" >[unknown]</text>
+</g>
+<g >
+<title>core::fmt::write (1 samples, 0.13%)</title><rect x="1186.8" y="2021" width="1.6" height="15.0" fill="rgb(221,77,18)" rx="2" ry="2" />
+<text  x="1189.82" y="2031.5" ></text>
+</g>
+<g >
+<title>rocksdb::MemTableIterator::value (1 samples, 0.13%)</title><rect x="671.6" y="2021" width="1.6" height="15.0" fill="rgb(218,61,14)" rx="2" ry="2" />
+<text  x="674.56" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1077" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1087.5" >[unknown]</text>
+</g>
+<g >
+<title>rocksdb::ArenaWrappedDBIter::~ArenaWrappedDBIter (6 samples, 0.81%)</title><rect x="760.6" y="2037" width="9.6" height="15.0" fill="rgb(210,27,6)" rx="2" ry="2" />
+<text  x="763.62" y="2047.5" ></text>
+</g>
+<g >
+<title>rocksdb::MemTableIterator::VerifyEntryChecksum (1 samples, 0.13%)</title><rect x="670.0" y="2021" width="1.6" height="15.0" fill="rgb(235,139,33)" rx="2" ry="2" />
+<text  x="672.97" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1429" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1439.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;core::str::pattern::CharSearcher as core::str::pattern::Searcher&gt;::next_match (2 samples, 0.27%)</title><rect x="326.5" y="2037" width="3.1" height="15.0" fill="rgb(238,152,36)" rx="2" ry="2" />
+<text  x="329.47" y="2047.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_PN_CHARS_BASE (1 samples, 0.13%)</title><rect x="1134.3" y="2053" width="1.6" height="15.0" fill="rgb(252,219,52)" rx="2" ry="2" />
+<text  x="1137.34" y="2063.5" ></text>
+</g>
+<g >
+<title>rocksdb::MemTable::Get (1 samples, 0.13%)</title><rect x="776.5" y="1941" width="1.6" height="15.0" fill="rgb(241,169,40)" rx="2" ry="2" />
+<text  x="779.52" y="1951.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="549" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="559.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1941" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1951.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;http::request::Builder&gt;::and_then::&lt;&lt;http::request::Builder&gt;::uri&lt;http::uri::Uri&gt;::{closure#0}&gt; (2 samples, 0.27%)</title><rect x="70.4" y="2053" width="3.2" height="15.0" fill="rgb(244,183,43)" rx="2" ry="2" />
+<text  x="73.43" y="2063.5" ></text>
+</g>
+<g >
+<title>malloc (28 samples, 3.77%)</title><rect x="940.3" y="2053" width="44.6" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="943.32" y="2063.5" >malloc</text>
+</g>
+<g >
+<title>TLS init function for rocksdb::perf_context (1 samples, 0.13%)</title><rect x="755.8" y="2005" width="1.6" height="15.0" fill="rgb(233,133,31)" rx="2" ry="2" />
+<text  x="758.85" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="69" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="79.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="197" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="207.5" >[unknown]</text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;std::collections::hash::map::HashMap&lt;oxrdf::named_node::NamedNode, alloc::sync::Arc&lt;dyn for&lt;a&gt; core::ops::function::Fn&lt; (2 samples, 0.27%)</title><rect x="727.2" y="2037" width="3.2" height="15.0" fill="rgb(212,32,7)" rx="2" ry="2" />
+<text  x="730.22" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="421" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="431.5" >[unknown]</text>
+</g>
+<g >
+<title>oxhttp::io::decoder::decode_headers (2 samples, 0.27%)</title><rect x="744.7" y="2037" width="3.2" height="15.0" fill="rgb(248,198,47)" rx="2" ry="2" />
+<text  x="747.72" y="2047.5" ></text>
+</g>
+<g >
+<title>rocksdb::DBImpl::GetSnapshotImpl (2 samples, 0.27%)</title><rect x="786.1" y="2005" width="3.1" height="15.0" fill="rgb(210,27,6)" rx="2" ry="2" />
+<text  x="789.06" y="2015.5" ></text>
+</g>
+<g >
+<title>&lt;spargebra::algebra::PropertyPathExpression as core::clone::Clone&gt;::clone.3852 (2 samples, 0.27%)</title><rect x="404.4" y="2037" width="3.2" height="15.0" fill="rgb(216,53,12)" rx="2" ry="2" />
+<text  x="407.39" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1365" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1375.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;oxigraph::sparql::SparqlEvaluator&gt;::into_evaluator (1 samples, 0.13%)</title><rect x="100.6" y="2053" width="1.6" height="15.0" fill="rgb(215,46,11)" rx="2" ry="2" />
+<text  x="103.65" y="2063.5" ></text>
+</g>
+<g >
+<title>oxsdatatypes::date_time::date_time_plus_duration (46 samples, 6.20%)</title><rect x="1016.7" y="2053" width="73.1" height="15.0" fill="rgb(219,66,15)" rx="2" ry="2" />
+<text  x="1019.66" y="2063.5" >oxsdatat..</text>
+</g>
+<g >
+<title>rocksdb::DBImpl::GetImpl (1 samples, 0.13%)</title><rect x="776.5" y="1957" width="1.6" height="15.0" fill="rgb(238,155,37)" rx="2" ry="2" />
+<text  x="779.52" y="1967.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.13%)</title><rect x="506.2" y="1973" width="1.6" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="509.17" y="1983.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::vec::into_iter::IntoIter&lt;sparopt::algebra::GraphPattern&gt; as core::iter::traits::iterator::Iterator&gt;::reduce::&lt;&lt;sparopt::optimizer::Optimizer&gt;::reorder_joins::{closure#8}&gt; (1 samples, 0.13%)</title><rect x="316.9" y="2037" width="1.6" height="15.0" fill="rgb(208,16,4)" rx="2" ry="2" />
+<text  x="319.93" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="53" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="63.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;core::iter::adapters::filter_map::FilterMap&lt;core::iter::adapters::map::Map&lt;alloc::boxed::Box&lt;dyn core::iter::traits::iterator::Iterator&lt;Item = core::result::Result&lt;spareval::dataset::InternalQuad&lt;oxigraph::storage::numeric_encoder::EncodedTerm&gt;, spareval::error::QueryEvaluationError&gt;&gt;&gt;, &lt;spareval::eval::SimpleEvaluator&lt;oxigraph::sparql::dataset::DatasetView&gt;&gt;::build_graph_pattern_evaluator::{closure#3}::{closure#1}&gt;, &lt;core::result::Result&lt;core::option::Option&lt;spareval::eval::InternalTuple&lt;oxigraph::storage::numeric_encoder::EncodedTerm&gt;&gt;, spareval::error::QueryEvaluationError&gt;&gt;::transpose&gt; as core::iter::traits::iterator::Iterator&gt;::next (1 samples, 0.13%)</title><rect x="320.1" y="2037" width="1.6" height="15.0" fill="rgb(254,228,54)" rx="2" ry="2" />
+<text  x="323.11" y="2047.5" ></text>
+</g>
+<g >
+<title>core::fmt::write (1 samples, 0.13%)</title><rect x="1188.4" y="2037" width="1.6" height="15.0" fill="rgb(221,77,18)" rx="2" ry="2" />
+<text  x="1191.41" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1829" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1839.5" >[unknown]</text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_GroupOrUnionGraphPattern (1 samples, 0.13%)</title><rect x="862.4" y="2037" width="1.6" height="15.0" fill="rgb(250,208,49)" rx="2" ry="2" />
+<text  x="865.40" y="2047.5" ></text>
+</g>
+<g >
+<title>&lt;spareval::eval::Timer&gt;::now (3 samples, 0.40%)</title><rect x="390.1" y="2037" width="4.8" height="15.0" fill="rgb(209,21,5)" rx="2" ry="2" />
+<text  x="393.08" y="2047.5" ></text>
+</g>
+<g >
+<title>http::uri::authority::create_authority::&lt;&amp;[u8], &lt;bytes::bytes::Bytes&gt;::copy_from_slice&gt; (4 samples, 0.54%)</title><rect x="930.8" y="2053" width="6.3" height="15.0" fill="rgb(243,177,42)" rx="2" ry="2" />
+<text  x="933.78" y="2063.5" ></text>
+</g>
+<g >
+<title>rocksdb::DBImpl::GetImpl (8 samples, 1.08%)</title><rect x="132.5" y="2005" width="12.7" height="15.0" fill="rgb(238,155,37)" rx="2" ry="2" />
+<text  x="135.45" y="2015.5" ></text>
+</g>
+<g >
+<title>&lt;http::uri::Uri&gt;::from_shared (3 samples, 0.40%)</title><rect x="75.2" y="2053" width="4.8" height="15.0" fill="rgb(242,173,41)" rx="2" ry="2" />
+<text  x="78.20" y="2063.5" ></text>
+</g>
+<g >
+<title>std::io::read_until::&lt;core::io::util::Take&lt;&amp;mut std::io::buffered::bufreader::BufReader&lt;std::net::tcp::TcpStream&gt;&gt;&gt; (1 samples, 0.13%)</title><rect x="911.7" y="2037" width="1.6" height="15.0" fill="rgb(226,100,24)" rx="2" ry="2" />
+<text  x="914.70" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1285" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1295.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;http::uri::Uri as core::fmt::Display&gt;::fmt (1 samples, 0.13%)</title><rect x="344.0" y="2037" width="1.6" height="15.0" fill="rgb(207,10,2)" rx="2" ry="2" />
+<text  x="346.96" y="2047.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_CollectionPath (1 samples, 0.13%)</title><rect x="846.5" y="2037" width="1.6" height="15.0" fill="rgb(205,2,0)" rx="2" ry="2" />
+<text  x="849.50" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1861" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1871.5" >[unknown]</text>
+</g>
+<g >
+<title>sparopt::type_inference::add_ground_term_pattern_types (1 samples, 0.13%)</title><rect x="1163.0" y="2053" width="1.6" height="15.0" fill="rgb(238,152,36)" rx="2" ry="2" />
+<text  x="1165.96" y="2063.5" ></text>
+</g>
+<g >
+<title>rocksdb::Arena::AllocateAligned (1 samples, 0.13%)</title><rect x="817.9" y="2005" width="1.6" height="15.0" fill="rgb(242,171,41)" rx="2" ry="2" />
+<text  x="820.87" y="2015.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_String (2 samples, 0.27%)</title><rect x="883.1" y="2037" width="3.2" height="15.0" fill="rgb(236,144,34)" rx="2" ry="2" />
+<text  x="886.07" y="2047.5" ></text>
+</g>
+<g >
+<title>sparesults::json::write_json_term (1 samples, 0.13%)</title><rect x="1112.1" y="2053" width="1.6" height="15.0" fill="rgb(228,109,26)" rx="2" ry="2" />
+<text  x="1115.08" y="2063.5" ></text>
+</g>
+<g >
+<title>rocksdb::DBImpl::NewInternalIterator (2 samples, 0.27%)</title><rect x="636.6" y="2021" width="3.2" height="15.0" fill="rgb(226,99,23)" rx="2" ry="2" />
+<text  x="639.58" y="2031.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;sparopt::algebra::Expression&gt; (2 samples, 0.27%)</title><rect x="722.5" y="2037" width="3.1" height="15.0" fill="rgb(233,131,31)" rx="2" ry="2" />
+<text  x="725.45" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="693" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="703.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;core::iter::adapters::map::Map&lt;alloc::boxed::Box&lt;core::iter::adapters::map::Map&lt;alloc::boxed::Box&lt;dyn core::iter::traits::iterator::Iterator&lt;Item = core::result::Result&lt;spareval::eval::InternalTuple&lt;oxigraph::storage::numeric_encoder::EncodedTerm&gt;, spareval::error::QueryEvaluationError&gt;&gt;&gt;, spareval::eval::decode_bindings&lt;oxigraph::sparql::dataset::DatasetView&gt;::{closure#0}&gt;&gt;, &lt;spareval::model::QuerySolutionIter&gt;::from_tuples&lt;alloc::boxed::Box&lt;core::iter::adapters::map::Map&lt;alloc::boxed::Box&lt;dyn core::iter::traits::iterator::Iterator&lt;Item = core::result::Result&lt;spareval::eval::InternalTuple&lt;oxigraph::storage::numeric_encoder::EncodedTerm&gt;, spareval::error::QueryEvaluationError&gt;&gt;&gt;, spareval::eval::decode_bindings&lt;oxigraph::sparql::dataset::DatasetView&gt;::{closure#0}&gt;&gt;&gt;::{closure#0}&gt; as core::iter::traits::iterator::Iterator&gt;::next (1 samples, 0.13%)</title><rect x="323.3" y="2037" width="1.6" height="15.0" fill="rgb(251,214,51)" rx="2" ry="2" />
+<text  x="326.29" y="2047.5" ></text>
+</g>
+<g >
+<title>&lt;oxiri::IriParser&lt;oxiri::VoidOutputBuffer, false&gt;&gt;::parse (1 samples, 0.13%)</title><rect x="372.6" y="2037" width="1.6" height="15.0" fill="rgb(239,159,38)" rx="2" ry="2" />
+<text  x="375.59" y="2047.5" ></text>
+</g>
+<g >
+<title>rocksdb::ColumnFamilyData::ReturnThreadLocalSuperVersion (1 samples, 0.13%)</title><rect x="784.5" y="2005" width="1.6" height="15.0" fill="rgb(228,108,25)" rx="2" ry="2" />
+<text  x="787.47" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1461" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1471.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="933" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="943.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;alloc::string::String as core::fmt::Display&gt;::fmt (1 samples, 0.13%)</title><rect x="841.7" y="2005" width="1.6" height="15.0" fill="rgb(248,198,47)" rx="2" ry="2" />
+<text  x="844.73" y="2015.5" ></text>
+</g>
+<g >
+<title>bytes::bytes::promotable_even_to_vec (1 samples, 0.13%)</title><rect x="673.2" y="2037" width="1.5" height="15.0" fill="rgb(249,203,48)" rx="2" ry="2" />
+<text  x="676.15" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1493" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1503.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="581" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="591.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;sparopt::optimizer::Optimizer&gt;::reorder_joins (1 samples, 0.13%)</title><rect x="183.3" y="2053" width="1.6" height="15.0" fill="rgb(235,138,33)" rx="2" ry="2" />
+<text  x="186.34" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="661" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="671.5" >[unknown]</text>
+</g>
+<g >
+<title>[libc.so.6] (53 samples, 7.14%)</title><rect x="413.9" y="2037" width="84.3" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="416.94" y="2047.5" >[libc.so.6]</text>
+</g>
+<g >
+<title>&lt;spareval::eval::TupleSelector&lt;oxigraph::storage::numeric_encoder::EncodedTerm&gt;&gt;::from_ground_term_pattern::&lt;oxigraph::sparql::dataset::DatasetView&gt; (4 samples, 0.54%)</title><rect x="394.9" y="2037" width="6.3" height="15.0" fill="rgb(206,9,2)" rx="2" ry="2" />
+<text  x="397.85" y="2047.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_DOUBLE (1 samples, 0.13%)</title><rect x="1118.4" y="2053" width="1.6" height="15.0" fill="rgb(250,210,50)" rx="2" ry="2" />
+<text  x="1121.44" y="2063.5" ></text>
+</g>
+<g >
+<title>rocksdb::SnapshotImpl::GetUnixTime (2 samples, 0.27%)</title><rect x="827.4" y="2037" width="3.2" height="15.0" fill="rgb(232,127,30)" rx="2" ry="2" />
+<text  x="830.41" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="325" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="335.5" >[unknown]</text>
+</g>
+<g >
+<title>oxrocksdb_get_pinned_cf_v2 (3 samples, 0.40%)</title><rect x="773.3" y="1989" width="4.8" height="15.0" fill="rgb(238,152,36)" rx="2" ry="2" />
+<text  x="776.34" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1717" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1727.5" >[unknown]</text>
+</g>
+<g >
+<title>rocksdb::MemTable::KeyComparator::operator (1 samples, 0.13%)</title><rect x="619.1" y="37" width="1.6" height="15.0" fill="rgb(205,2,0)" rx="2" ry="2" />
+<text  x="622.08" y="47.5" ></text>
+</g>
+<g >
+<title>oxigraph::query_results_content_negotiation (1 samples, 0.13%)</title><rect x="1010.3" y="2053" width="1.6" height="15.0" fill="rgb(211,28,6)" rx="2" ry="2" />
+<text  x="1013.30" y="2063.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVecInner&lt;_&gt;&gt;::reserve::do_reserve_and_handle::&lt;alloc::alloc::Global&gt; (1 samples, 0.13%)</title><rect x="1115.3" y="2037" width="1.5" height="15.0" fill="rgb(206,8,2)" rx="2" ry="2" />
+<text  x="1118.26" y="2047.5" ></text>
+</g>
+<g >
+<title>rocksdb::DBIter::ParseKey (3 samples, 0.40%)</title><rect x="1100.9" y="2053" width="4.8" height="15.0" fill="rgb(239,158,37)" rx="2" ry="2" />
+<text  x="1103.94" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1349" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1359.5" >[unknown]</text>
+</g>
+<g >
+<title>alloc::fmt::format::format_inner (8 samples, 1.08%)</title><rect x="832.2" y="2021" width="12.7" height="15.0" fill="rgb(237,150,35)" rx="2" ry="2" />
+<text  x="835.18" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1013" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1023.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1845" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1855.5" >[unknown]</text>
+</g>
+<g >
+<title>spareval::eval::format_list::&lt;&amp;oxrdf::variable::Variable, &amp;alloc::vec::Vec&lt;oxrdf::variable::Variable&gt;&gt; (3 samples, 0.40%)</title><rect x="1113.7" y="2053" width="4.7" height="15.0" fill="rgb(242,170,40)" rx="2" ry="2" />
+<text  x="1116.67" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="133" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="143.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;oxigraph::storage::StorageReader&gt;::quads_for_pattern (1 samples, 0.13%)</title><rect x="110.2" y="2053" width="1.6" height="15.0" fill="rgb(226,99,23)" rx="2" ry="2" />
+<text  x="113.19" y="2063.5" ></text>
+</g>
+<g >
+<title>rocksdb::MergeIteratorBuilder::~MergeIteratorBuilder (1 samples, 0.13%)</title><rect x="1105.7" y="2053" width="1.6" height="15.0" fill="rgb(222,78,18)" rx="2" ry="2" />
+<text  x="1108.71" y="2063.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_i (1 samples, 0.13%)</title><rect x="1161.4" y="2053" width="1.6" height="15.0" fill="rgb(234,134,32)" rx="2" ry="2" />
+<text  x="1164.37" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="629" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="639.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="181" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="191.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;spargebra::term::GroundTermPattern as core::fmt::Display&gt;::fmt (1 samples, 0.13%)</title><rect x="843.3" y="2005" width="1.6" height="15.0" fill="rgb(248,199,47)" rx="2" ry="2" />
+<text  x="846.32" y="2015.5" ></text>
+</g>
+<g >
+<title>&lt;&amp;spargebra::term::GroundTermPattern as core::fmt::Display&gt;::fmt (1 samples, 0.13%)</title><rect x="835.4" y="2005" width="1.6" height="15.0" fill="rgb(252,219,52)" rx="2" ry="2" />
+<text  x="838.36" y="2015.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;spareval::eval::EvalDataset&lt;oxigraph::sparql::dataset::DatasetView&gt;&gt; (1 samples, 0.13%)</title><rect x="720.9" y="2037" width="1.6" height="15.0" fill="rgb(217,57,13)" rx="2" ry="2" />
+<text  x="723.86" y="2047.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVecInner&gt;::finish_grow (3 samples, 0.40%)</title><rect x="35.4" y="2053" width="4.8" height="15.0" fill="rgb(252,220,52)" rx="2" ry="2" />
+<text  x="38.44" y="2063.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_IRIREF (6 samples, 0.81%)</title><rect x="867.2" y="2037" width="9.5" height="15.0" fill="rgb(212,32,7)" rx="2" ry="2" />
+<text  x="870.17" y="2047.5" ></text>
+</g>
+<g >
+<title>&lt;&amp;http::uri::authority::Authority as core::fmt::Display&gt;::fmt (1 samples, 0.13%)</title><rect x="344.0" y="2021" width="1.6" height="15.0" fill="rgb(250,208,49)" rx="2" ry="2" />
+<text  x="346.96" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="981" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="991.5" >[unknown]</text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_ObjectListPath (2 samples, 0.27%)</title><rect x="1128.0" y="2053" width="3.2" height="15.0" fill="rgb(217,55,13)" rx="2" ry="2" />
+<text  x="1130.98" y="2063.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;core::iter::adapters::flatten::Flatten&lt;alloc::vec::into_iter::IntoIter&lt;alloc::vec::Vec&lt;spargebra::parser::PartialGraphPattern&gt;&gt;&gt;&gt; (1 samples, 0.13%)</title><rect x="709.7" y="2037" width="1.6" height="15.0" fill="rgb(249,206,49)" rx="2" ry="2" />
+<text  x="712.73" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="1909" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="1919.5" >[unknown]</text>
+</g>
+<g >
+<title>rocksdb::MemTable::GetFromTable (8 samples, 1.08%)</title><rect x="641.3" y="2021" width="12.8" height="15.0" fill="rgb(229,113,27)" rx="2" ry="2" />
+<text  x="644.35" y="2031.5" ></text>
+</g>
+<g >
+<title>&lt;hashbrown::raw::RawTableInner&gt;::fallible_with_capacity::&lt;alloc::alloc::Global&gt; (2 samples, 0.27%)</title><rect x="64.1" y="2053" width="3.2" height="15.0" fill="rgb(230,118,28)" rx="2" ry="2" />
+<text  x="67.07" y="2063.5" ></text>
+</g>
+<g >
+<title>&lt;spareval::eval::SimpleEvaluator&lt;oxigraph::sparql::dataset::DatasetView&gt;&gt;::build_graph_pattern_evaluator::{closure#3}::{closure#1} (2 samples, 0.27%)</title><rect x="383.7" y="2037" width="3.2" height="15.0" fill="rgb(205,1,0)" rx="2" ry="2" />
+<text  x="386.72" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (71 samples, 9.57%)</title><rect x="507.8" y="565" width="112.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="510.76" y="575.5" >[unknown]</text>
+</g>
+</g>
+</svg>

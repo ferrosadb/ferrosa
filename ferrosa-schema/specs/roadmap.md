@@ -88,3 +88,12 @@ placement rule (T-154a, D3, D21) — jsonb is refused in partition/clustering ke
   replacement is dropped — jsonb needs no ledger.
 - ALTER ... TYPE to or from jsonb is not applied by any path yet (the CQL router
   rejects ALTER TYPE outright), so no rule exists for it here.
+
+
+### PostgreSQL table incarnation isolation (2026-10-26)
+
+The registry exposes `lifecycle_read()` for synchronous validation plus physical apply and `lifecycle_write()` for synchronous schema/storage reconciliation. Read leases may overlap; mutation leases are exclusive and reentrant on their acquiring thread. Registry writers acquire lifecycle before the registry mutex. Callers must acquire the lifecycle fence before storage locks and must never hold either guard across an await. Table retirement, replacement, keyspace retirement and snapshot restore therefore wait for admitted PostgreSQL applies to finish. The fence is shared across the registry, so DDL can wait for applies to unrelated tables too.
+
+Snapshot import adopts an incoming different table UUID and removes superseded index metadata. The registry owns no storage: callers must retire the old physical incarnation under the write fence before publishing this replacement. Same-UUID imports preserve the existing definition.
+
+Storage schemas now persist the authoritative UUID in the reserved `ferrosa.table_id` extension (overwriting caller-supplied values). Restore prefers that provenance, with the local schema registry supplying legacy provenance when available. Unidentified data or malformed UUID metadata is refused before any table is retired; recoverable data is preserved for explicit repair. Empty registrations can adopt the incoming schema.

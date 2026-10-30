@@ -19,9 +19,12 @@
 //! buffer. Exceeding it is an ERROR, never a truncation: a clipped result
 //! reported as complete is worse than a failure, because the caller cannot tell
 //! the difference. `LIMIT` is pushed INTO the scan whenever it is safe to do so
-//! — one triple pattern, no ORDER BY, DISTINCT, FILTER, or graph query form —
+//! — one triple pattern, no explicit Join, ORDER BY, DISTINCT, FILTER, or graph form —
 //! so a bounded query does bounded work rather than reading the whole table and
 //! throwing most of it away.
+//! Correctness: legacy RDF identity tests and COUNT/JSON/protocol regressions.
+//! Last revised: 2026-10-27
+//! Last changed: Stream COUNT input and preserve typed bindings.
 
 use std::collections::HashMap;
 use std::ops::ControlFlow;
@@ -32,7 +35,7 @@ use ferrosa_sstable::types::{Partition, Row};
 use futures::StreamExt;
 
 use crate::error::SparqlError;
-use crate::planner::{QueryPlan, TripleOp, TripleScope};
+use crate::planner::{PlanStep, QueryPlan, TripleOp, TripleScope};
 use crate::results::{Binding, SparqlJsonResults};
 use crate::triple_store;
 
@@ -76,16 +79,7 @@ pub async fn execute(
     write_path: &Arc<WritePath>,
     limits: &ExecutionLimits,
 ) -> Result<SparqlJsonResults, SparqlError> {
-    let mut binding_sets = evaluate_triple_patterns(plan, write_path, limits).await?;
-
-    // Apply FILTER expressions to binding sets.
-    if !plan.filters.is_empty() {
-        binding_sets.retain(|row| {
-            plan.filters
-                .iter()
-                .all(|expr| crate::filter::eval_filter(expr, row))
-        });
-    }
+    let mut binding_sets = evaluate_pattern(plan, write_path, limits).await?;
 
     // BUG-S13 / URS-QEC-S04: apply ORDER BY (evaluates expressions per solution;
     // fails loud on unsupported forms).
@@ -143,20 +137,10 @@ pub async fn execute_bindings(
     write_path: &Arc<WritePath>,
     limits: &ExecutionLimits,
 ) -> Result<Vec<HashMap<String, Binding>>, SparqlError> {
-    let mut binding_sets = evaluate_triple_patterns(plan, write_path, limits).await?;
-
-    if !plan.filters.is_empty() {
-        binding_sets.retain(|row| {
-            plan.filters
-                .iter()
-                .all(|expr| crate::filter::eval_filter(expr, row))
-        });
-    }
-
-    Ok(binding_sets)
+    evaluate_pattern(plan, write_path, limits).await
 }
 
-/// Evaluate all triple patterns via nested-loop join, returning binding sets.
+/// Evaluate the WHERE algebra in order, returning full solution bindings.
 ///
 /// SCOPE NOTE (unchanged by the streaming work): the join itself is still a
 /// nested loop that rebuilds a materialized `binding_sets` per pattern, so for
@@ -164,39 +148,164 @@ pub async fn execute_bindings(
 /// sets, not by the scan. Those intermediates are now *bounded* — appending
 /// past [`ExecutionLimits::max_rows`] is a loud error — but they are not
 /// pipelined. Pipelining the join is a separate redesign.
-async fn evaluate_triple_patterns(
+async fn evaluate_pattern(
     plan: &QueryPlan,
     write_path: &Arc<WritePath>,
     limits: &ExecutionLimits,
 ) -> Result<Vec<HashMap<String, Binding>>, SparqlError> {
-    let mut binding_sets: Vec<HashMap<String, Binding>> = vec![HashMap::new()];
-    let budget = scan_budget(plan);
+    evaluate_steps(&plan.steps, plan, write_path, limits, scan_budget(plan)).await
+}
 
-    for (tp, op) in &plan.ops {
-        let new_bindings = match op {
-            TripleOp::PropertyPath {
-                scope,
-                subject,
-                path,
-                object,
-            } => {
-                evaluate_path_op(
-                    scope,
-                    subject,
-                    path,
-                    object,
-                    &binding_sets,
-                    write_path,
-                    limits,
-                )
-                .await?
+async fn evaluate_steps(
+    steps: &[PlanStep],
+    plan: &QueryPlan,
+    write_path: &Arc<WritePath>,
+    limits: &ExecutionLimits,
+    budget: Option<usize>,
+) -> Result<Vec<HashMap<String, Binding>>, SparqlError> {
+    let mut binding_sets = vec![HashMap::new()];
+    for step in steps {
+        match step {
+            PlanStep::Filter(index) => {
+                binding_sets.retain(|row| crate::filter::eval_filter(&plan.filters[*index], row));
             }
-            _ => evaluate_standard_op(tp, op, &binding_sets, write_path, limits, budget).await?,
-        };
-        binding_sets = new_bindings;
+            PlanStep::Extend {
+                variable,
+                expression,
+            } => {
+                for row in &mut binding_sets {
+                    if let Some(binding) = crate::bind::evaluate(expression, row)? {
+                        row.insert(variable.clone(), binding);
+                    }
+                }
+            }
+            PlanStep::Join { left, right } => {
+                // Neither operand may see the other's variables until the join.
+                let left = Box::pin(evaluate_steps(left, plan, write_path, limits, None)).await?;
+                let right = Box::pin(evaluate_steps(right, plan, write_path, limits, None)).await?;
+                binding_sets = join_solutions(&binding_sets, &left, limits)?;
+                binding_sets = join_solutions(&binding_sets, &right, limits)?;
+            }
+            PlanStep::Count {
+                input,
+                variables,
+                aggregates,
+            } => {
+                let counted =
+                    evaluate_counts(input, variables, aggregates, plan, write_path, limits).await?;
+                binding_sets = join_solutions(&binding_sets, &counted, limits)?;
+            }
+            PlanStep::Triple(index) => {
+                let (tp, op) = &plan.ops[*index];
+                binding_sets = match op {
+                    TripleOp::PropertyPath {
+                        scope,
+                        subject,
+                        path,
+                        object,
+                    } => {
+                        evaluate_path_op(
+                            scope,
+                            subject,
+                            path,
+                            object,
+                            &binding_sets,
+                            write_path,
+                            limits,
+                        )
+                        .await?
+                    }
+                    _ => {
+                        evaluate_standard_op(tp, op, &binding_sets, write_path, limits, budget)
+                            .await?
+                    }
+                };
+            }
+        }
     }
-
     Ok(binding_sets)
+}
+
+/// A single triple scan streams into counters; joins/path operations use their
+/// existing bounded evaluator. Neither path returns input rows as COUNT output.
+async fn evaluate_counts(
+    input: &[PlanStep],
+    variables: &[String],
+    aggregates: &[(String, crate::planner::CountAggregate)],
+    plan: &QueryPlan,
+    write_path: &Arc<WritePath>,
+    limits: &ExecutionLimits,
+) -> Result<Vec<HashMap<String, Binding>>, SparqlError> {
+    let mut counts = crate::aggregate::Counts::new(variables, aggregates, limits);
+    if let Some((index, tail)) = count_stream_input(input, plan) {
+        let (pattern, op) = &plan.ops[index];
+        let empty = HashMap::new();
+        for_each_triple(op, write_path, limits, |triple| {
+            let Some(mut row) = try_bind_triple(pattern, &triple, &empty) else {
+                return Ok(ControlFlow::Continue(()));
+            };
+            for step in tail {
+                match step {
+                    PlanStep::Filter(index)
+                        if !crate::filter::eval_filter(&plan.filters[*index], &row) =>
+                    {
+                        return Ok(ControlFlow::Continue(()))
+                    }
+                    PlanStep::Extend {
+                        variable,
+                        expression,
+                    } => {
+                        if let Some(binding) = crate::bind::evaluate(expression, &row)? {
+                            row.insert(variable.clone(), binding);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            counts.feed(row)?;
+            Ok(ControlFlow::Continue(()))
+        })
+        .await?;
+    } else {
+        let input = Box::pin(evaluate_steps(input, plan, write_path, limits, None)).await?;
+        for row in input {
+            counts.feed(row)?;
+        }
+    }
+    Ok(counts.finish())
+}
+fn count_stream_input<'a>(
+    input: &'a [PlanStep],
+    plan: &QueryPlan,
+) -> Option<(usize, &'a [PlanStep])> {
+    let (PlanStep::Triple(index), tail) = input.split_first()? else {
+        return None;
+    };
+    if matches!(plan.ops[*index].1, TripleOp::PropertyPath { .. })
+        || !tail
+            .iter()
+            .all(|s| matches!(s, PlanStep::Filter(_) | PlanStep::Extend { .. }))
+    {
+        return None;
+    }
+    Some((*index, tail))
+}
+
+fn join_solutions(
+    left: &[HashMap<String, Binding>],
+    right: &[HashMap<String, Binding>],
+    limits: &ExecutionLimits,
+) -> Result<Vec<HashMap<String, Binding>>, SparqlError> {
+    let mut joined = Vec::new();
+    for left_row in left {
+        for right_row in right {
+            if let Some(row) = try_merge_bindings(left_row, right_row) {
+                joined.push(row);
+                check_solution_bound(joined.len(), limits)?;
+            }
+        }
+    }
+    Ok(joined)
 }
 
 /// How many solutions a single-pattern scan must produce before the executor
@@ -205,7 +314,8 @@ async fn evaluate_triple_patterns(
 /// `LIMIT` may only be pushed into the scan when every operator between the
 /// scan and the LIMIT preserves both the row count and the row order:
 ///
-/// - exactly one triple pattern — a join re-pairs solutions, so pattern *n*'s
+/// - exactly one triple pattern and no explicit Join — a join re-pairs
+///   solutions, so pattern *n*'s
 ///   rows are not the query's rows;
 /// - no `ORDER BY` and no `DISTINCT` — both are blocking, and the top *n* of a
 ///   sorted or deduplicated sequence is not the first *n* rows read;
@@ -217,7 +327,11 @@ async fn evaluate_triple_patterns(
 /// `None` means "read every matching row". That is still bounded by
 /// [`ExecutionLimits::max_rows`] — it is unbounded LIMIT, not unbounded work.
 fn scan_budget(plan: &QueryPlan) -> Option<usize> {
-    if plan.ops.len() != 1
+    if plan
+        .steps
+        .iter()
+        .any(|step| matches!(step, PlanStep::Join { .. } | PlanStep::Count { .. }))
+        || plan.ops.len() != 1
         || !plan.order_by.is_empty()
         || plan.distinct
         || !plan.filters.is_empty()
@@ -278,8 +392,29 @@ async fn evaluate_standard_op(
     budget: Option<usize>,
 ) -> Result<Vec<HashMap<String, Binding>>, SparqlError> {
     let mut new_bindings: Vec<HashMap<String, Binding>> = Vec::new();
+    let subject_index = bound_subject_index(tp, existing_bindings);
     for_each_triple(op, write_path, limits, |triple| {
-        for existing in existing_bindings {
+        let kind = if triple.0.starts_with("_:") {
+            "bnode"
+        } else {
+            "uri"
+        };
+        let indexed = subject_index
+            .as_ref()
+            .and_then(|index| index.get(&(kind, triple.0.as_str())))
+            .into_iter()
+            .flatten()
+            .copied();
+        // An unbound subject still needs the general compatibility join.
+        // Otherwise only visit matching indices, retaining duplicates and
+        // arrival order without cloning keys or candidate solutions.
+        let fallback = 0..if subject_index.is_none() {
+            existing_bindings.len()
+        } else {
+            0
+        };
+        for position in indexed.chain(fallback) {
+            let existing = &existing_bindings[position];
             let Some(row) = try_bind_triple(tp, &triple, existing) else {
                 continue;
             };
@@ -295,8 +430,29 @@ async fn evaluate_standard_op(
     Ok(new_bindings)
 }
 
+type SubjectIndex<'a> = HashMap<(&'a str, &'a str), Vec<usize>>;
+
+fn bound_subject_index<'a>(
+    pattern: &spargebra::term::TriplePattern,
+    rows: &'a [HashMap<String, Binding>],
+) -> Option<SubjectIndex<'a>> {
+    let spargebra::term::TermPattern::Variable(var) = &pattern.subject else {
+        return None;
+    };
+    let mut index = HashMap::new();
+    for (position, row) in rows.iter().enumerate() {
+        let value = row.get(var.as_str())?;
+        let key = (value.kind(), value.scalar_value()?);
+        index.entry(key).or_insert_with(Vec::new).push(position);
+    }
+    Some(index)
+}
+
 /// Fail loud when an operator's solution buffer crosses the row bound.
-fn check_solution_bound(buffered: usize, limits: &ExecutionLimits) -> Result<(), SparqlError> {
+pub(crate) fn check_solution_bound(
+    buffered: usize,
+    limits: &ExecutionLimits,
+) -> Result<(), SparqlError> {
     if buffered > limits.max_rows {
         return Err(SparqlError::Execution(format!(
             "SPARQL query buffered more than {} solutions. Refusing to return a \
@@ -313,6 +469,11 @@ fn try_merge_bindings(
     a: &HashMap<String, Binding>,
     b: &HashMap<String, Binding>,
 ) -> Option<HashMap<String, Binding>> {
+    if b.iter()
+        .any(|(key, value)| a.get(key).is_some_and(|old| old != value))
+    {
+        return None;
+    }
     let mut merged = a.clone();
     for (key, val) in b {
         if !try_insert_binding(&mut merged, key, val) {
@@ -339,12 +500,35 @@ fn try_bind_triple(
     triple: &FetchedTriple,
     existing: &HashMap<String, Binding>,
 ) -> Option<HashMap<String, Binding>> {
-    let (s, p, o, obj_type, datatype, lang) = triple;
+    let (s, p, o) = triple;
+    // Reject bound join-key mismatches using borrowed terms before cloning
+    // the solution. Most pairs in a selective join do not match.
+    if let spargebra::term::TermPattern::Variable(var) = &tp.subject {
+        if existing.get(var.as_str()).is_some_and(|value| {
+            let kind = if s.starts_with("_:") { "bnode" } else { "uri" };
+            value.kind() != kind || value.scalar_value() != Some(s.as_str())
+        }) {
+            return None;
+        }
+    }
+    if let spargebra::term::NamedNodePattern::Variable(var) = &tp.predicate {
+        if existing
+            .get(var.as_str())
+            .is_some_and(|value| value.kind() != "uri" || value.scalar_value() != Some(p.as_str()))
+        {
+            return None;
+        }
+    }
+    if let spargebra::term::TermPattern::Variable(var) = &tp.object {
+        if existing.get(var.as_str()).is_some_and(|value| value != o) {
+            return None;
+        }
+    }
     let mut row = existing.clone();
 
     if !bind_or_check_subject(&tp.subject, s, &mut row)
         || !bind_or_check_predicate(&tp.predicate, p, &mut row)
-        || !bind_or_check_object(&tp.object, o, obj_type, datatype, lang, &mut row)
+        || !bind_or_check_object(&tp.object, o, &mut row)
     {
         return None;
     }
@@ -362,16 +546,10 @@ fn bind_or_check_subject(
     use spargebra::term::TermPattern;
     match pattern {
         TermPattern::Variable(var) => {
-            let binding = Binding {
-                binding_type: if subject.starts_with("_:") {
-                    "bnode"
-                } else {
-                    "uri"
-                }
-                .into(),
-                value: subject.to_string(),
-                datatype: None,
-                lang: None,
+            let binding = if subject.starts_with("_:") {
+                Binding::blank_node(subject)
+            } else {
+                Binding::uri(subject)
             };
             try_insert_binding(row, var.as_str(), &binding)
         }
@@ -391,12 +569,7 @@ fn bind_or_check_predicate(
     use spargebra::term::NamedNodePattern;
     match pattern {
         NamedNodePattern::Variable(var) => {
-            let binding = Binding {
-                binding_type: "uri".into(),
-                value: predicate.to_string(),
-                datatype: None,
-                lang: None,
-            };
+            let binding = Binding::uri(predicate);
             try_insert_binding(row, var.as_str(), &binding)
         }
         NamedNodePattern::NamedNode(n) => n.as_str() == predicate,
@@ -406,41 +579,34 @@ fn bind_or_check_predicate(
 /// Bind the object variable, or check an object constant.
 fn bind_or_check_object(
     pattern: &spargebra::term::TermPattern,
-    object: &str,
-    obj_type: &str,
-    datatype: &Option<String>,
-    lang: &Option<String>,
+    object: &Binding,
     row: &mut HashMap<String, Binding>,
 ) -> bool {
     use spargebra::term::TermPattern;
     match pattern {
-        TermPattern::Variable(var) => {
-            let binding = Binding {
-                binding_type: obj_type.to_string(),
-                value: object.to_string(),
-                datatype: datatype.clone(),
-                lang: lang.clone(),
-            };
-            try_insert_binding(row, var.as_str(), &binding)
+        TermPattern::Variable(variable) => try_insert_binding(row, variable.as_str(), object),
+        TermPattern::NamedNode(node) => {
+            object.kind() == "uri" && object.scalar_value() == Some(node.as_str())
         }
-        // An IRI constant matches only a stored IRI object with the same value
-        // — never a literal that happens to spell the same characters.
-        TermPattern::NamedNode(n) => obj_type == "uri" && n.as_str() == object,
-        // A literal constant is compared against the stored LEXICAL value.
-        // `Literal::to_string()` is the quoted N-Triples serialization and can
-        // never equal a stored object (t_c3a2d3e4).
-        TermPattern::Literal(l) => obj_type == "literal" && l.value() == object,
-        _ => true,
+        TermPattern::Literal(literal) => triple_store::canonical_term(
+            "literal",
+            literal.value(),
+            Some(literal.datatype().as_str()),
+            literal.language(),
+        )
+        .is_ok_and(|expected| expected == *object),
+        TermPattern::BlankNode(_) => true,
+        TermPattern::Triple(_) => false,
     }
 }
 
 /// Insert a binding into a row, or check compatibility if already present.
 ///
-/// BUG-S4 fix: compares both `value` and `binding_type`.
+/// Compare the full RDF term: lexical value, term kind, datatype and language.
 /// Returns `false` if the existing binding is incompatible.
 fn try_insert_binding(row: &mut HashMap<String, Binding>, name: &str, binding: &Binding) -> bool {
     if let Some(existing) = row.get(name) {
-        existing.value == binding.value && existing.binding_type == binding.binding_type
+        existing == binding
     } else {
         row.insert(name.to_string(), binding.clone());
         true
@@ -489,28 +655,13 @@ fn apply_order_by(
 fn apply_distinct(binding_sets: &mut Vec<HashMap<String, Binding>>, projection: &[String]) {
     let mut seen = std::collections::HashSet::new();
     binding_sets.retain(|row| {
-        let key: Vec<(&str, &str, &str)> = projection
-            .iter()
-            .map(|var| {
-                row.get(var)
-                    .map(|b| (var.as_str(), b.value.as_str(), b.binding_type.as_str()))
-                    .unwrap_or((var.as_str(), "", ""))
-            })
-            .collect();
-        let key_str = format!("{key:?}");
-        seen.insert(key_str)
+        let key: Vec<_> = projection.iter().map(|var| row.get(var).cloned()).collect();
+        seen.insert(key)
     });
 }
 
 /// A fetched triple: (subject, predicate, object, object_type, datatype, language).
-type FetchedTriple = (
-    String,
-    String,
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-);
+type FetchedTriple = (String, String, Binding);
 
 /// Name of the secondary index on the object column.
 ///
@@ -573,17 +724,14 @@ where
     /// and dropped before the next one is touched.
     fn feed(&mut self, partition: &Partition) -> Result<ControlFlow<()>, SparqlError> {
         // BUG-S3 fix: decode composite partition key (graph, subject) properly.
-        let key_bytes = partition.key.key.as_bytes();
-        // Graph isolation: a `GRAPH <iri>` scope (or the served default-graph
-        // scope) reads one graph's partitions only. Checking the graph here —
-        // before any row is counted or decoded — is what makes a named-graph
-        // scan exact without materializing the other graphs' rows.
-        if let Some(expected) = self.graph_filter.as_deref() {
-            if extract_composite_component(key_bytes, 0).as_deref() != Some(expected) {
-                return Ok(ControlFlow::Continue(()));
-            }
+        let (graph, subject) = triple_store::decode_partition(partition.key.key.as_bytes())?;
+        if self
+            .graph_filter
+            .as_deref()
+            .is_some_and(|expected| expected != graph)
+        {
+            return Ok(ControlFlow::Continue(()));
         }
-        let subject = extract_subject_from_partition_key(key_bytes);
         for row in &partition.rows {
             self.rows_read += 1;
             if self.rows_read > self.limits.max_rows {
@@ -596,7 +744,7 @@ where
                     describe_op(self.op),
                 )));
             }
-            let Some(triple) = decode_triple(row, &subject) else {
+            let Some(triple) = decode_triple(row, &subject)? else {
                 continue;
             };
             if !triple_matches_op(self.op, &triple) {
@@ -648,7 +796,7 @@ where
     match op {
         TripleOp::SubjectLookup { subject, .. } => {
             // Point read: bounded by one partition's row count by construction.
-            let key = triple_store::partition_key(&scope.graph, subject);
+            let key = triple_store::checked_partition_key(&scope.graph, subject)?;
             if let Some(partition) = write_path.read(&table_id, &key).await? {
                 // Exactly one partition: `Break` and `Continue` are equivalent
                 // here because there is nothing left to feed either way.
@@ -784,46 +932,11 @@ fn extract_composite_component(data: &[u8], position: usize) -> Option<String> {
 
 /// Decode one storage row into a triple, or `None` if it is not a live triple.
 ///
-/// Returns `None` for a row whose deletion marker is non-live: that row is a
-/// tombstone (or is masked by one in the merge) and MUST NOT surface as a
-/// triple. Without this, a SPARQL delete would remain visible to a subsequent
-/// SELECT (URS-QEC-D05).
-fn decode_triple(row: &Row, subject: &str) -> Option<FetchedTriple> {
-    if !row.deletion.is_live() {
-        return None;
-    }
-
-    let predicate = extract_clustering_string(&row.clustering, 0);
-    let object = extract_clustering_string(&row.clustering, 1);
-
-    // BUG-S18 fix: validate object type against known values.
-    let raw_obj_type =
-        cell_string(row, triple_store::COL_OBJECT_TYPE).unwrap_or_else(|| "literal".to_string());
-    let obj_type = match raw_obj_type.as_str() {
-        "uri" | "literal" | "bnode" => raw_obj_type,
-        other => {
-            tracing::warn!(value = other, "invalid object type, defaulting to literal");
-            "literal".into()
-        }
-    };
-
-    Some((
-        subject.to_string(),
-        predicate,
-        object,
-        obj_type,
-        cell_string(row, triple_store::COL_DATATYPE),
-        cell_string(row, triple_store::COL_LANGUAGE),
-    ))
-}
-
-/// Read a regular column's value out of a row as a UTF-8 string.
-fn cell_string(row: &Row, column: u16) -> Option<String> {
-    row.cells
-        .iter()
-        .find(|(idx, _)| *idx == column)
-        .and_then(|(_, cell)| cell.value.as_ref())
-        .map(|v| String::from_utf8_lossy(v).to_string())
+/// The v2 decoder validates identity and accounts for liveness newer than a
+/// retained tombstone. Deleted rows are omitted; malformed live rows fail loud.
+fn decode_triple(row: &Row, subject: &str) -> Result<Option<FetchedTriple>, SparqlError> {
+    Ok(triple_store::decode_v2_row(row)?
+        .map(|(predicate, term)| (subject.to_owned(), predicate, term)))
 }
 
 /// Access-path filter: does this triple satisfy the constraint the op was
@@ -838,14 +951,14 @@ fn cell_string(row: &Row, column: u16) -> Option<String> {
 /// BUG-S8 fix: ObjectScan filters by object value.
 /// BUG-S9 fix: PredicateScan filters by predicate value.
 fn triple_matches_op(op: &TripleOp, triple: &FetchedTriple) -> bool {
-    let (_, p, o, _, _, _) = triple;
+    let (_, p, o) = triple;
     match op {
         TripleOp::SubjectLookup {
             predicate_filter: Some(pred),
             ..
         } => p == pred,
         TripleOp::PredicateScan { predicate, .. } => p == predicate,
-        TripleOp::ObjectScan { object, .. } => o == object,
+        TripleOp::ObjectScan { object, .. } => o.scalar_value() == Some(object.as_str()),
         _ => true,
     }
 }
@@ -853,7 +966,7 @@ fn triple_matches_op(op: &TripleOp, triple: &FetchedTriple) -> bool {
 /// Extract a string component from a CQL clustering key at the given position.
 ///
 /// Clustering keys use the strict CQL composite encoding written by
-/// `update::encode_triple_clustering`: `[u16 len][bytes]` per component with NO
+/// `triple_store::encode_clustering`: `[u16 len][bytes]` per component with NO
 /// separator byte (this is what `ferrosa-common::schema` validates). A trailing
 /// separator must NOT be assumed — for short components the next component's
 /// length prefix high byte is `0x00`, and skipping it would corrupt the read.
@@ -960,12 +1073,7 @@ mod tests {
     #[test]
     fn try_insert_binding_compatible() {
         let mut row = HashMap::new();
-        let b = Binding {
-            binding_type: "uri".into(),
-            value: "http://example.org/alice".into(),
-            datatype: None,
-            lang: None,
-        };
+        let b = Binding::uri("http://example.org/alice");
         assert!(try_insert_binding(&mut row, "s", &b));
         assert!(
             try_insert_binding(&mut row, "s", &b),
@@ -976,18 +1084,8 @@ mod tests {
     #[test]
     fn try_insert_binding_incompatible_value() {
         let mut row = HashMap::new();
-        let b1 = Binding {
-            binding_type: "uri".into(),
-            value: "http://example.org/alice".into(),
-            datatype: None,
-            lang: None,
-        };
-        let b2 = Binding {
-            binding_type: "uri".into(),
-            value: "http://example.org/bob".into(),
-            datatype: None,
-            lang: None,
-        };
+        let b1 = Binding::uri("http://example.org/alice");
+        let b2 = Binding::uri("http://example.org/bob");
         assert!(try_insert_binding(&mut row, "s", &b1));
         assert!(!try_insert_binding(&mut row, "s", &b2));
     }
@@ -995,18 +1093,8 @@ mod tests {
     #[test]
     fn try_insert_binding_incompatible_type() {
         let mut row = HashMap::new();
-        let uri_binding = Binding {
-            binding_type: "uri".into(),
-            value: "http://example.org/alice".into(),
-            datatype: None,
-            lang: None,
-        };
-        let literal_binding = Binding {
-            binding_type: "literal".into(),
-            value: "http://example.org/alice".into(),
-            datatype: None,
-            lang: None,
-        };
+        let uri_binding = Binding::uri("http://example.org/alice");
+        let literal_binding = Binding::literal("http://example.org/alice", None, None);
         assert!(try_insert_binding(&mut row, "x", &uri_binding));
         assert!(
             !try_insert_binding(&mut row, "x", &literal_binding),
@@ -1040,7 +1128,10 @@ mod tests {
             ascending: true,
         }];
         apply_order_by(&mut rows, &conditions).unwrap();
-        let names: Vec<&str> = rows.iter().map(|r| r["name"].value.as_str()).collect();
+        let names: Vec<&str> = rows
+            .iter()
+            .map(|r| r["name"].scalar_value().unwrap())
+            .collect();
         assert_eq!(names, vec!["Alice", "Bob", "Charlie"]);
     }
 
@@ -1056,7 +1147,10 @@ mod tests {
             ascending: false,
         }];
         apply_order_by(&mut rows, &conditions).unwrap();
-        let names: Vec<&str> = rows.iter().map(|r| r["name"].value.as_str()).collect();
+        let names: Vec<&str> = rows
+            .iter()
+            .map(|r| r["name"].scalar_value().unwrap())
+            .collect();
         assert_eq!(names, vec!["Charlie", "Bob", "Alice"]);
     }
 
@@ -1072,12 +1166,11 @@ mod tests {
         for (var, val) in [(a_var, a_val), (b_var, b_val)] {
             row.insert(
                 var.to_string(),
-                Binding {
-                    binding_type: "literal".into(),
-                    value: val.into(),
-                    datatype: Some("http://www.w3.org/2001/XMLSchema#integer".into()),
-                    lang: None,
-                },
+                Binding::literal(
+                    val,
+                    Some("http://www.w3.org/2001/XMLSchema#integer".into()),
+                    None,
+                ),
             );
         }
         row
@@ -1105,7 +1198,10 @@ mod tests {
         apply_order_by(&mut rows, &conditions).unwrap();
         let sums: Vec<i64> = rows
             .iter()
-            .map(|r| r["a"].value.parse::<i64>().unwrap() + r["b"].value.parse::<i64>().unwrap())
+            .map(|r| {
+                r["a"].scalar_value().unwrap().parse::<i64>().unwrap()
+                    + r["b"].scalar_value().unwrap().parse::<i64>().unwrap()
+            })
             .collect();
         assert_eq!(
             sums,
@@ -1140,7 +1236,7 @@ mod tests {
     }
 
     /// Build a strict CQL clustering component: `[u16 len][bytes]` (no
-    /// separator), matching `update::encode_triple_clustering`.
+    /// separator), matching `triple_store::encode_clustering`.
     fn encode_clustering_component(s: &str) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(&(s.len() as u16).to_be_bytes());
@@ -1269,25 +1365,9 @@ mod tests {
     #[test]
     fn merge_bindings_compatible() {
         let mut a = HashMap::new();
-        a.insert(
-            "s".into(),
-            Binding {
-                binding_type: "uri".into(),
-                value: "http://ex/alice".into(),
-                datatype: None,
-                lang: None,
-            },
-        );
+        a.insert("s".into(), Binding::uri("http://ex/alice"));
         let mut b = HashMap::new();
-        b.insert(
-            "o".into(),
-            Binding {
-                binding_type: "uri".into(),
-                value: "http://ex/bob".into(),
-                datatype: None,
-                lang: None,
-            },
-        );
+        b.insert("o".into(), Binding::uri("http://ex/bob"));
         let merged = try_merge_bindings(&a, &b);
         assert!(merged.is_some(), "disjoint bindings must merge");
         let m = merged.unwrap();
@@ -1298,25 +1378,9 @@ mod tests {
     #[test]
     fn merge_bindings_conflict() {
         let mut a = HashMap::new();
-        a.insert(
-            "s".into(),
-            Binding {
-                binding_type: "uri".into(),
-                value: "http://ex/alice".into(),
-                datatype: None,
-                lang: None,
-            },
-        );
+        a.insert("s".into(), Binding::uri("http://ex/alice"));
         let mut b = HashMap::new();
-        b.insert(
-            "s".into(),
-            Binding {
-                binding_type: "uri".into(),
-                value: "http://ex/bob".into(),
-                datatype: None,
-                lang: None,
-            },
-        );
+        b.insert("s".into(), Binding::uri("http://ex/bob"));
         let merged = try_merge_bindings(&a, &b);
         assert!(merged.is_none(), "conflicting bindings must not merge");
     }
@@ -1325,19 +1389,19 @@ mod tests {
 
     fn make_binding_row(var: &str, val: &str) -> HashMap<String, Binding> {
         let mut row = HashMap::new();
-        row.insert(
-            var.to_string(),
-            Binding {
-                binding_type: "literal".into(),
-                value: val.into(),
-                datatype: None,
-                lang: None,
-            },
-        );
+        row.insert(var.to_string(), Binding::literal(val, None, None));
         row
     }
 
     fn triple(s: &str, p: &str, o: &str, otype: &str) -> FetchedTriple {
-        (s.into(), p.into(), o.into(), otype.into(), None, None)
+        (
+            s.into(),
+            p.into(),
+            match otype {
+                "uri" => Binding::uri(o),
+                "bnode" => Binding::blank_node(o),
+                _ => Binding::literal(o, None, None),
+            },
+        )
     }
 }

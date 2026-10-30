@@ -408,6 +408,32 @@ pub enum MergeSource<'a, R: ReadAt> {
 }
 
 impl<'a, R: ReadAt> MergeSource<'a, R> {
+    fn count_bookmark(&self) -> Option<u64> {
+        match self {
+            Self::Memtable { .. } => None,
+            Self::SsTable { iter, .. } => Some(iter.partition_position()),
+            Self::SsTableRun { run, .. } => run.current.as_ref().map(|it| it.partition_position()),
+        }
+    }
+
+    fn read_count_bookmark(&self, position: u64, schema: &TableSchema) -> Result<Partition> {
+        let iter = match self {
+            Self::SsTable { iter, .. } => iter,
+            Self::SsTableRun { run, .. } => run
+                .current
+                .as_ref()
+                .ok_or_else(|| Error::InvalidFormat("missing count source".into()))?,
+            Self::Memtable { .. } => {
+                return Err(Error::InvalidFormat("memtable count bookmark".into()))
+            }
+        };
+        let mut partition = iter.read_partition_at(position)?.ok_or_else(|| {
+            Error::InvalidFormat("count source ended at bookmarked partition".into())
+        })?;
+        ColumnOrdinalMapping::for_header(schema, iter.source_header())
+            .remap_partition(&mut partition);
+        Ok(partition)
+    }
     /// Look at the next partition's key WITHOUT decoding the body.
     /// Repeated calls are idempotent; the cached peek is consumed by
     /// the next `pop_partition()`. Returns `Ok(None)` at EOS.
@@ -1216,6 +1242,34 @@ pub fn merger_for_metadata_sources<'a, R: ReadAt + Send + Sync + 'static>(
     )
 }
 
+/// Single-row counting skips payloads when PK liveness is sufficient. TTLs or
+/// deletions require original cell winners: re-read every overlapping source
+/// at its pinned bookmark before LWW merge, including equal-timestamp value ties.
+pub fn merger_for_live_single_row_count<'a, R: ReadAt + Send + Sync + 'static>(
+    active_iter: Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>,
+    flushing_iters: Vec<Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>>,
+    sstables: &'a [Arc<SSTableReader<R>>],
+    start: Option<DecoratedKey>,
+    end: Option<DecoratedKey>,
+    schema: &'a TableSchema,
+    force_full: bool,
+) -> Result<RangeMerger<'a, R>> {
+    let mut merger = build_merger_with_runs(
+        active_iter,
+        flushing_iters,
+        sstables,
+        RunMode::Metadata,
+        start,
+        end,
+    )?;
+    merger.live_count = Some(LiveCount {
+        schema,
+        force_full,
+        bookmarks: Vec::new(),
+    });
+    Ok(merger)
+}
+
 fn build_merger_without_runs<'a, R: ReadAt + Send + Sync + 'static>(
     active_iter: Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>,
     flushing_iters: Vec<Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>>,
@@ -1401,6 +1455,14 @@ pub struct RangeMerger<'a, R: ReadAt> {
     /// the `Drop` impl below. `*const` rather than `Box` because
     /// `Box::leak`'s output has to be re-wrapped manually.
     runs_arena: Option<*const [Vec<Arc<SSTableReader<R>>>]>,
+    live_count: Option<LiveCount<'a>>,
+}
+
+struct LiveCount<'a> {
+    schema: &'a TableSchema,
+    force_full: bool,
+    /// Reused across partitions; one bookmark per overlapping SSTable source.
+    bookmarks: Vec<(usize, u64, usize)>,
 }
 
 /// One source's current row head while a partition is being streamed
@@ -1471,6 +1533,7 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
             exhausted: false,
             active: None,
             runs_arena: None,
+            live_count: None,
         };
         // Prime the heap with one partition per non-empty source.
         // We need a Vec of indices to avoid double-borrowing `merger.sources`.
@@ -1533,6 +1596,12 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
         }
         let key = first.key.clone();
         let first_src = first.src;
+        if let Some(count) = &mut self.live_count {
+            count.bookmarks.clear();
+            if let Some(position) = self.sources[first_src].count_bookmark() {
+                count.bookmarks.push((first_src, position, 0));
+            }
+        }
         let first_partition = match self.sources[first_src].pop_partition() {
             Ok(Some(p)) => p,
             Ok(None) => {
@@ -1549,8 +1618,15 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
                 break;
             }
             let entry = self.heap.pop().expect("peek succeeded");
+            let bookmark = self
+                .live_count
+                .as_ref()
+                .and_then(|_| self.sources[entry.src].count_bookmark());
             match self.sources[entry.src].pop_partition()? {
                 Some(p) => {
+                    if let (Some(count), Some(position)) = (&mut self.live_count, bookmark) {
+                        count.bookmarks.push((entry.src, position, group.len()));
+                    }
                     popped_srcs.push(entry.src);
                     group.push(p);
                 }
@@ -1560,6 +1636,35 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
             }
         }
 
+        if let Some(count) = &self.live_count {
+            if !crate::table_tombstone::is_table_tombstone_key(&key)
+                && group.iter().any(|p| {
+                    p.static_row.is_some()
+                        || p.rows.len() > 1
+                        || p.rows.iter().any(|r| !r.clustering.is_empty())
+                })
+            {
+                return Err(Error::InvalidFormat(
+                    "single-row count received clustered/static rows".into(),
+                ));
+            }
+            let needs_cells = count.force_full
+                || group.iter().any(|p| {
+                    !p.deletion.is_live()
+                        || p.rows
+                            .iter()
+                            .any(|r| r.primary_key_liveness.has_ttl() || !r.deletion.is_live())
+                });
+            if needs_cells {
+                for &(src, position, group_index) in &count.bookmarks {
+                    let full = self.sources[src].read_count_bookmark(position, count.schema)?;
+                    if full.key != group[group_index].key {
+                        return Err(Error::InvalidFormat("count bookmark key mismatch".into()));
+                    }
+                    group[group_index] = Arc::new(full);
+                }
+            }
+        }
         for src in popped_srcs {
             self.refill_source(src)?;
         }

@@ -180,8 +180,9 @@ fn values(rows: &[HashMap<String, Binding>], var: &str) -> Vec<String> {
         .map(|r| {
             r.get(var)
                 .unwrap_or_else(|| panic!("every row must bind ?{var}"))
-                .value
-                .clone()
+                .scalar_value()
+                .unwrap()
+                .to_owned()
         })
         .collect()
 }
@@ -199,6 +200,200 @@ const THREE_SUBJECTS: &str = "INSERT DATA { \
      <http://ex/a> <http://ex/p> \"alpha\" . \
      <http://ex/b> <http://ex/p> \"beta\" . \
      <http://ex/c> <http://ex/p> \"gamma\" }";
+
+/// Baseline compatibility regression list (t_c5b544d4):
+/// - Empty BGP yields exactly one empty solution mapping (control).
+/// - Constant BIND creates an RDF integer, including its datatype.
+/// - Dependent BIND sees the preceding binding and preserves numeric type.
+/// - Unbound-variable, type, and division errors leave the target unbound,
+///   preserve existing bindings, and allow subsequent BINDs to execute.
+///
+/// SPARQL 1.1 sections 5.2.1 and 18.5 (Extend):
+/// https://www.w3.org/TR/sparql11-query/#emptyGroupPattern
+/// https://www.w3.org/TR/sparql11-query/#defn_extend
+mod baseline_bind {
+    use super::*;
+
+    fn assert_integer(row: &HashMap<String, Binding>, variable: &str, value: &str) {
+        let binding = row
+            .get(variable)
+            .unwrap_or_else(|| panic!("expected ?{variable} to be bound"));
+        assert_eq!(binding.kind(), "literal");
+        assert_eq!(binding.scalar_value().unwrap(), value);
+        assert_eq!(
+            binding.datatype(),
+            Some("http://www.w3.org/2001/XMLSchema#integer")
+        );
+        assert_eq!(binding.lang(), None);
+    }
+
+    #[tokio::test]
+    async fn empty_bgp_has_one_empty_solution() {
+        let f = fixture();
+
+        let rows = f.execute("SELECT ?x WHERE {}").await;
+
+        assert_eq!(rows.len(), 1, "empty BGP is the join identity");
+        assert!(rows[0].is_empty(), "?x must remain unbound");
+    }
+
+    #[tokio::test]
+    async fn constant_bind_produces_one_typed_integer() {
+        let f = fixture();
+
+        let rows = f.execute("SELECT ?x WHERE { BIND(1 AS ?x) }").await;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].len(), 1);
+        assert_integer(&rows[0], "x", "1");
+    }
+
+    #[tokio::test]
+    async fn dependent_bind_uses_the_preceding_binding() {
+        let f = fixture();
+
+        let rows = f
+            .execute("SELECT ?x ?y WHERE { BIND(1 AS ?x) BIND(?x + 1 AS ?y) }")
+            .await;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].len(), 2);
+        assert_integer(&rows[0], "x", "1");
+        assert_integer(&rows[0], "y", "2");
+    }
+
+    async fn assert_expression_error_preserves_solution(expression: &str) {
+        let f = fixture();
+        let query = format!(
+            "SELECT ?x ?bad ?y WHERE {{ \
+             BIND(1 AS ?x) BIND({expression} AS ?bad) BIND(?x AS ?y) }}"
+        );
+
+        let rows = f.execute(&query).await;
+
+        assert_eq!(
+            rows.len(),
+            1,
+            "an expression error must not discard the row"
+        );
+        assert!(
+            !rows[0].contains_key("bad"),
+            "an expression error leaves ?bad absent, not bound to a placeholder"
+        );
+        assert_eq!(rows[0].len(), 2);
+        assert_integer(&rows[0], "x", "1");
+        assert_integer(&rows[0], "y", "1");
+    }
+
+    #[tokio::test]
+    async fn unbound_variable_error_leaves_bind_target_unbound() {
+        assert_expression_error_preserves_solution("?missing + 1").await;
+    }
+
+    #[tokio::test]
+    async fn type_error_leaves_bind_target_unbound() {
+        // A numeric-looking xsd:string is still not a numeric operand.
+        assert_expression_error_preserves_solution("\"2\" + 1").await;
+    }
+
+    #[tokio::test]
+    async fn division_by_zero_leaves_bind_target_unbound() {
+        assert_expression_error_preserves_solution("1 / 0").await;
+    }
+
+    #[tokio::test]
+    async fn bgp_bind_filter_and_following_bgp_keep_algebra_order() {
+        let f = fixture();
+        f.insert("INSERT DATA { <http://ex/a> <http://ex/n> 1 . <http://ex/b> <http://ex/n> 2 }")
+            .await;
+        let rows = f.execute("SELECT ?s ?next WHERE { ?s <http://ex/n> ?n BIND(?n + 1 AS ?next) FILTER(?next = 2) ?t <http://ex/n> ?next }").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["s"].scalar_value().unwrap(), "http://ex/a");
+        assert_integer(&rows[0], "next", "2");
+    }
+
+    #[tokio::test]
+    async fn bind_cannot_read_a_later_bgp_binding() {
+        let f = fixture();
+        f.insert("INSERT DATA { <http://ex/a> <http://ex/n> 1 }")
+            .await;
+        let rows = f.execute("SELECT ?early ?n WHERE { BIND(?n AS ?early) ?s <http://ex/n> ?n FILTER(!BOUND(?early)) }").await;
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].contains_key("early"));
+        assert_integer(&rows[0], "n", "1");
+    }
+
+    #[tokio::test]
+    async fn bind_join_checks_literal_datatype() {
+        let f = fixture();
+        f.insert("INSERT DATA { <http://ex/a> <http://ex/n> \"1\" }")
+            .await;
+        let rows = f
+            .execute("SELECT ?s WHERE { BIND(1 AS ?n) ?s <http://ex/n> ?n }")
+            .await;
+        assert!(
+            rows.is_empty(),
+            "integer and string literals are different RDF terms"
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_filter_does_not_see_an_outer_bind() {
+        let f = fixture();
+        let rows = f
+            .execute("SELECT ?x WHERE { { FILTER(!BOUND(?x)) } BIND(1 AS ?x) }")
+            .await;
+        assert_eq!(rows.len(), 1);
+        assert_integer(&rows[0], "x", "1");
+        let rows = f
+            .execute("SELECT ?x ?y WHERE { BIND(1 AS ?x) { BIND(?x AS ?y) FILTER(!BOUND(?y)) } }")
+            .await;
+        assert_eq!(rows.len(), 1);
+        assert_integer(&rows[0], "x", "1");
+        assert!(!rows[0].contains_key("y"));
+    }
+
+    #[tokio::test]
+    async fn integer_arithmetic_stays_exact_above_float_precision() {
+        let f = fixture();
+        let rows = f.execute("SELECT ?x ?y ?z WHERE { BIND(9007199254740993 AS ?x) BIND(?x + 2 AS ?y) BIND((?y - 1) * 2 AS ?z) }").await;
+        assert_eq!(rows.len(), 1);
+        assert_integer(&rows[0], "x", "9007199254740993");
+        assert_integer(&rows[0], "y", "9007199254740995");
+        assert_integer(&rows[0], "z", "18014398509481988");
+    }
+
+    #[tokio::test]
+    async fn integer_overflow_leaves_target_unbound() {
+        assert_expression_error_preserves_solution("9223372036854775807 + 1").await;
+    }
+
+    #[tokio::test]
+    async fn integer_division_produces_a_decimal() {
+        let f = fixture();
+        let rows = f.execute("SELECT ?x WHERE { BIND(1 / 2 AS ?x) }").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["x"].scalar_value().unwrap(), "0.5");
+        assert_eq!(
+            rows[0]["x"].datatype(),
+            Some("http://www.w3.org/2001/XMLSchema#decimal")
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_bindings_preserve_rdf_terms() {
+        let f = fixture();
+        let p = plan("SELECT ?copy WHERE { BIND(<http://ex/a> AS ?iri) BIND(\"hello\"@en AS ?text) BIND(?text AS ?copy) }");
+        let rows = executor::execute_bindings(&p, &f.write_path, &ExecutionLimits::default())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["iri"].kind(), "uri");
+        assert_eq!(rows[0]["iri"].scalar_value().unwrap(), "http://ex/a");
+        assert_eq!(rows[0]["copy"].scalar_value().unwrap(), "hello");
+        assert_eq!(rows[0]["copy"].lang(), Some("en"));
+    }
+}
 
 /// I1(predicate): `?s <p> ?o` must return exactly the triples whose predicate
 /// is `<p>`.
@@ -495,8 +690,8 @@ async fn join_emits_only_compatible_solutions() {
         .await;
 
     assert_eq!(rows.len(), 1, "only Bob satisfies both patterns");
-    assert_eq!(rows[0]["x"].value, "http://ex/bob");
-    assert_eq!(rows[0]["n"].value, "Bob");
+    assert_eq!(rows[0]["x"].scalar_value().unwrap(), "http://ex/bob");
+    assert_eq!(rows[0]["n"].scalar_value().unwrap(), "Bob");
 }
 
 /// An empty store yields zero solutions and no error — an empty stream, not a

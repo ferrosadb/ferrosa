@@ -2,6 +2,9 @@
 //!
 //! Converts `spargebra` algebra trees into a sequence of storage operations
 //! against ferrosa's CQL-backed triple store.
+//! Correctness: legacy RDF identity tests and COUNT/JSON/protocol regressions.
+//! Last revised: 2026-10-27
+//! Last changed: Plan bounded COUNT and reject unsupported aggregate input algebra.
 
 use spargebra::algebra::GraphPattern;
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
@@ -118,11 +121,48 @@ pub struct OrderCondition {
     pub ascending: bool,
 }
 
+/// Algebra-ordered evaluation steps. Indices address the plan's storage ops
+/// and filters; Join operands retain independent expression scopes.
+#[derive(Debug)]
+pub enum PlanStep {
+    /// Evaluate one storage operation against the current solutions.
+    Triple(usize),
+    /// Apply a filter at its algebra position.
+    Filter(usize),
+    /// Bind an expression result, retaining the solution on expression errors.
+    Extend {
+        variable: String,
+        expression: spargebra::algebra::Expression,
+    },
+    /// Evaluate both operands independently, then join compatible solutions.
+    Join {
+        left: Vec<PlanStep>,
+        right: Vec<PlanStep>,
+    },
+    /// Fold an independently scoped input into COUNT accumulators.
+    Count {
+        input: Vec<PlanStep>,
+        variables: Vec<String>,
+        aggregates: Vec<(String, CountAggregate)>,
+    },
+}
+
+/// A validated COUNT expression; `None` denotes COUNT(*).
+#[derive(Debug)]
+pub struct CountAggregate {
+    /// Expression whose successfully bound values are counted.
+    pub expression: Option<spargebra::algebra::Expression>,
+    /// Count distinct RDF terms or complete solution mappings.
+    pub distinct: bool,
+}
+
 /// A query execution plan.
 #[derive(Debug)]
 pub struct QueryPlan {
-    /// Ordered list of triple pattern operations to execute.
+    /// Storage-operation inventory; `steps` defines evaluation order.
     pub ops: Vec<(TriplePattern, TripleOp)>,
+    /// Evaluation order, including expression scope boundaries.
+    pub steps: Vec<PlanStep>,
     /// Variables to project in the result.
     pub projection: Vec<String>,
     /// Optional LIMIT.
@@ -135,7 +175,7 @@ pub struct QueryPlan {
     pub distinct: bool,
     /// ORDER BY conditions (empty if none).
     pub order_by: Vec<OrderCondition>,
-    /// FILTER expressions to evaluate against binding sets.
+    /// FILTER inventory; each expression is applied by its indexed step.
     pub filters: Vec<spargebra::algebra::Expression>,
     /// Non-None for CONSTRUCT/DESCRIBE query forms; None for SELECT/ASK.
     pub graph_mode: Option<GraphQueryMode>,
@@ -223,6 +263,7 @@ pub fn plan_query(query: &Query, scope: &TripleScope) -> Result<QueryPlan, Sparq
             }
 
             Ok(QueryPlan {
+                steps: (0..ops.len()).map(PlanStep::Triple).collect(),
                 ops,
                 projection: vec!["__p".into(), "__o".into()],
                 limit: None,
@@ -251,6 +292,7 @@ fn plan_select(
     is_ask: bool,
 ) -> Result<QueryPlan, SparqlError> {
     let mut ops = Vec::new();
+    let mut steps = Vec::new();
     let mut projection = Vec::new();
     let mut limit = None;
     let mut offset = None;
@@ -268,10 +310,12 @@ fn plan_select(
         &mut distinct,
         &mut order_by,
         &mut filters,
+        &mut steps,
     )?;
 
     Ok(QueryPlan {
         ops,
+        steps,
         projection,
         limit,
         offset,
@@ -294,11 +338,13 @@ fn collect_ops(
     distinct: &mut bool,
     order_by: &mut Vec<OrderCondition>,
     filters: &mut Vec<spargebra::algebra::Expression>,
+    steps: &mut Vec<PlanStep>,
 ) -> Result<(), SparqlError> {
     match pattern {
         GraphPattern::Bgp { patterns } => {
             for tp in patterns {
                 let op = plan_triple_pattern(tp, scope)?;
+                steps.push(PlanStep::Triple(ops.len()));
                 ops.push((tp.clone(), op));
             }
         }
@@ -307,7 +353,7 @@ fn collect_ops(
                 projection.push(var.as_str().to_string());
             }
             collect_ops(
-                inner, scope, ops, projection, limit, offset, distinct, order_by, filters,
+                inner, scope, ops, projection, limit, offset, distinct, order_by, filters, steps,
             )?;
         }
         GraphPattern::Slice {
@@ -322,14 +368,105 @@ fn collect_ops(
                 *limit = Some(*len);
             }
             collect_ops(
-                inner, scope, ops, projection, limit, offset, distinct, order_by, filters,
+                inner, scope, ops, projection, limit, offset, distinct, order_by, filters, steps,
             )?;
         }
         GraphPattern::Filter { inner, expr } => {
+            collect_ops(
+                inner, scope, ops, projection, limit, offset, distinct, order_by, filters, steps,
+            )?;
+            steps.push(PlanStep::Filter(filters.len()));
             filters.push(expr.clone());
+        }
+        GraphPattern::Extend {
+            inner,
+            variable,
+            expression,
+        } => {
+            crate::bind::validate(expression)?;
+            collect_ops(
+                inner, scope, ops, projection, limit, offset, distinct, order_by, filters, steps,
+            )?;
+            steps.push(PlanStep::Extend {
+                variable: variable.as_str().to_owned(),
+                expression: expression.clone(),
+            });
+        }
+        GraphPattern::Group {
+            inner,
+            variables,
+            aggregates,
+        } => {
+            validate_count_input(inner)?;
+            use spargebra::algebra::{AggregateExpression, AggregateFunction};
+            let mut counts = Vec::with_capacity(aggregates.len());
+            for (variable, aggregate) in aggregates {
+                let count = match aggregate {
+                    AggregateExpression::CountSolutions { distinct } => CountAggregate {
+                        expression: None,
+                        distinct: *distinct,
+                    },
+                    AggregateExpression::FunctionCall {
+                        name: AggregateFunction::Count,
+                        expr,
+                        distinct,
+                    } => {
+                        crate::bind::validate(expr)?;
+                        CountAggregate {
+                            expression: Some(expr.clone()),
+                            distinct: *distinct,
+                        }
+                    }
+                    _ => {
+                        return Err(SparqlError::Plan(format!(
+                            "unsupported aggregate: {aggregate:?}"
+                        )))
+                    }
+                };
+                counts.push((variable.as_str().to_owned(), count));
+            }
+            let mut input = Vec::new();
             collect_ops(
                 inner, scope, ops, projection, limit, offset, distinct, order_by, filters,
+                &mut input,
             )?;
+            steps.push(PlanStep::Count {
+                input,
+                variables: variables.iter().map(|v| v.as_str().to_owned()).collect(),
+                aggregates: counts,
+            });
+        }
+        GraphPattern::Join { left, right } => {
+            let mut left_steps = Vec::new();
+            let mut right_steps = Vec::new();
+            collect_ops(
+                left,
+                scope,
+                ops,
+                projection,
+                limit,
+                offset,
+                distinct,
+                order_by,
+                filters,
+                &mut left_steps,
+            )?;
+            collect_ops(
+                right,
+                scope,
+                ops,
+                projection,
+                limit,
+                offset,
+                distinct,
+                order_by,
+                filters,
+                &mut right_steps,
+            )?;
+            steps.push(PlanStep::Join {
+                left: left_steps,
+                right: right_steps,
+            });
         }
         GraphPattern::OrderBy {
             inner, expression, ..
@@ -348,18 +485,18 @@ fn collect_ops(
                 });
             }
             collect_ops(
-                inner, scope, ops, projection, limit, offset, distinct, order_by, filters,
+                inner, scope, ops, projection, limit, offset, distinct, order_by, filters, steps,
             )?;
         }
         GraphPattern::Distinct { inner } => {
             *distinct = true;
             collect_ops(
-                inner, scope, ops, projection, limit, offset, distinct, order_by, filters,
+                inner, scope, ops, projection, limit, offset, distinct, order_by, filters, steps,
             )?;
         }
         GraphPattern::Reduced { inner } => {
             collect_ops(
-                inner, scope, ops, projection, limit, offset, distinct, order_by, filters,
+                inner, scope, ops, projection, limit, offset, distinct, order_by, filters, steps,
             )?;
         }
         GraphPattern::Path {
@@ -379,6 +516,7 @@ fn collect_ops(
                     object: object.clone(),
                 };
                 let op = plan_triple_pattern(&tp, scope)?;
+                steps.push(PlanStep::Triple(ops.len()));
                 ops.push((tp, op));
             } else {
                 // Transitive/closure path — emit PropertyPath op for BFS.
@@ -389,24 +527,25 @@ fn collect_ops(
                     path: path.clone(),
                     object: object.clone(),
                 };
+                steps.push(PlanStep::Triple(ops.len()));
                 ops.push((tp, op));
             }
         }
         GraphPattern::Union { left, right } => {
             // BUG-S14: UNION support — concat both sides.
             collect_ops(
-                left, scope, ops, projection, limit, offset, distinct, order_by, filters,
+                left, scope, ops, projection, limit, offset, distinct, order_by, filters, steps,
             )?;
             // UNION appends the right side's patterns too.
             collect_ops(
-                right, scope, ops, projection, limit, offset, distinct, order_by, filters,
+                right, scope, ops, projection, limit, offset, distinct, order_by, filters, steps,
             )?;
         }
         GraphPattern::LeftJoin { left, .. } => {
             // OPTIONAL → evaluate left side; right side patterns are optional.
             // For now, just evaluate the left side (inner patterns).
             collect_ops(
-                left, scope, ops, projection, limit, offset, distinct, order_by, filters,
+                left, scope, ops, projection, limit, offset, distinct, order_by, filters, steps,
             )?;
             tracing::warn!("OPTIONAL (LeftJoin) right side not yet evaluated");
         }
@@ -429,6 +568,7 @@ fn collect_ops(
                         distinct,
                         order_by,
                         filters,
+                        steps,
                     )?;
                 }
                 NamedNodePattern::Variable(v) => {
@@ -619,6 +759,18 @@ pub fn extract_describe_iris(pattern: &spargebra::algebra::GraphPattern) -> Vec<
         GraphPattern::Bgp { .. } => vec![],
         _ => vec![],
     }
+}
+
+/// COUNT may only consume algebra the evaluator implements without changing its
+/// bag of solutions. In particular, the older UNION/OPTIONAL/subquery shortcuts
+/// must never silently produce a plausible but incorrect aggregate.
+fn validate_count_input(pattern: &GraphPattern) -> Result<(), SparqlError> {
+    match pattern {
+  GraphPattern::Bgp{..}|GraphPattern::Path{..}=>Ok(()),
+  GraphPattern::Filter{inner,..}|GraphPattern::Extend{inner,..}|GraphPattern::Graph{inner,..}=>validate_count_input(inner),
+  GraphPattern::Join{left,right}=>{validate_count_input(left)?;validate_count_input(right)},
+  _=>Err(SparqlError::Plan("COUNT over this input algebra is not implemented (UNION, OPTIONAL, subqueries and blocking input operators)".into()))
+ }
 }
 
 #[cfg(test)]

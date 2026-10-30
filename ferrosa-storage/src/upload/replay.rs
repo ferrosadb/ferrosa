@@ -185,7 +185,7 @@ mod tests {
         for sstable_id in ["1", "2"] {
             write_component(&data_dir.join("sstables"), table_id, sstable_id);
         }
-        let log = PendingUploadsLog::open(&data_dir.join("pending-uploads.log")).unwrap();
+        let log = PendingUploadsLog::open(&data_dir).unwrap();
         log.add_entry(table_id, "1").unwrap();
         log.add_entry(table_id, "2").unwrap();
         let entries = log.pending_entries().unwrap();

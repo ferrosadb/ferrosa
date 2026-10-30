@@ -104,7 +104,9 @@ fn decode(result: &QueryResult) -> Result<Vec<IndexRow>, CqlError> {
             .get(i)
             .and_then(|c| c.as_ref())
             .map(|b| String::from_utf8_lossy(b).to_string())
-            .unwrap_or_default()
+            // A NULL cell shows as `null`, not as an empty cell that reads as
+            // an unnamed keyspace or index.
+            .unwrap_or_else(|| "null".to_string())
     };
 
     // `pending_sstable_count` is a CQL `int`: four big-endian bytes, NOT text.
@@ -170,12 +172,6 @@ pub async fn run_index_list(addr: SocketAddr, problems_only: bool) -> Result<(),
     let result = client.query(SECONDARY_INDEXES).await?;
     let rows = decode(&result)?;
 
-    let shown: Vec<&IndexRow> = if problems_only {
-        rows.iter().filter(|r| r.reads_are_incomplete()).collect()
-    } else {
-        rows.iter().collect()
-    };
-
     println!("Indexes on the node at {addr}");
     if rows.is_empty() {
         println!("  (this node has no registered indexes)");
@@ -186,7 +182,12 @@ pub async fn run_index_list(addr: SocketAddr, problems_only: bool) -> Result<(),
     builder.push_record(vec![
         "keyspace", "table", "index", "kind", "status", "pending", "reads",
     ]);
-    for r in &shown {
+    // `rows` is the node's index registry, one row per index: bounded by the
+    // schema, and already one CQL result frame. Filter it in place.
+    for r in rows
+        .iter()
+        .filter(|r| !problems_only || r.reads_are_incomplete())
+    {
         builder.push_record(vec![
             r.keyspace.clone(),
             r.table.clone(),
@@ -256,53 +257,48 @@ pub struct RebuildReport {
     pub complete: bool,
 }
 
-/// Read the node's rebuild response.
+/// The node's rebuild response as sent, parsed straight off the wire.
 ///
-/// `complete` is taken from the node rather than recomputed here: the node
-/// knows how many SSTables it holds, and a client that guessed would drift.
-/// A response missing the counts is a disagreement about the API, reported
-/// rather than defaulted — defaulting to zero would render a failed repair as
-/// "rebuilt 0 of 0, complete".
-///
-/// # Errors
-///
-/// Returns a message when the body is not the expected shape.
-pub fn parse_rebuild_report(body: &serde_json::Value) -> Result<RebuildReport, String> {
-    let rebuilt = body
-        .get("sstables_rebuilt")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or("response has no `sstables_rebuilt`; this ferrosa-ctl and the node disagree about /api/index/rebuild")?;
-    let total = body
-        .get("sstables_total")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or("response has no `sstables_total`; this ferrosa-ctl and the node disagree about /api/index/rebuild")?;
-    let vanished = required_count(body, "sstables_vanished")?;
-    let failed = required_count(body, "sstables_failed")?;
-    let complete = body
-        .get("complete")
-        .and_then(serde_json::Value::as_bool)
-        .ok_or("response has no `complete`; refusing to guess whether the repair finished")?;
-    Ok(RebuildReport {
-        sstables_rebuilt: rebuilt,
-        sstables_total: total,
-        sstables_vanished: vanished,
-        sstables_failed: failed,
-        complete,
-    })
+/// Fields are optional here so a missing one is reported by name in
+/// [`RebuildWire::into_report`] instead of as a generic parse error; unknown
+/// fields are skipped without being stored. `complete` is taken from the node
+/// rather than recomputed: the node knows how many SSTables it holds, and a
+/// client that guessed would drift. A missing count is a disagreement about
+/// the API, reported rather than defaulted — defaulting to zero would render a
+/// failed repair as "rebuilt 0 of 0, complete".
+#[derive(Debug, Default, serde::Deserialize)]
+struct RebuildWire {
+    sstables_rebuilt: Option<u64>,
+    sstables_total: Option<u64>,
+    sstables_vanished: Option<u64>,
+    sstables_failed: Option<u64>,
+    complete: Option<bool>,
+}
+
+impl RebuildWire {
+    fn into_report(self) -> Result<RebuildReport, String> {
+        Ok(RebuildReport {
+            sstables_rebuilt: required(self.sstables_rebuilt, "sstables_rebuilt")?,
+            sstables_total: required(self.sstables_total, "sstables_total")?,
+            sstables_vanished: required(self.sstables_vanished, "sstables_vanished")?,
+            sstables_failed: required(self.sstables_failed, "sstables_failed")?,
+            complete: self.complete.ok_or(
+                "response has no `complete`; refusing to guess whether the repair finished",
+            )?,
+        })
+    }
 }
 
 /// A count the node must report. Missing means this tool and the node disagree
 /// about the response: defaulting to zero would render "3 SSTables failed" as
 /// "none failed" against a node that predates the field.
-fn required_count(body: &serde_json::Value, field: &str) -> Result<u64, String> {
-    body.get(field)
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| {
-            format!(
-                "response has no `{field}`; this ferrosa-ctl and the node disagree about \
-                 /api/index/rebuild"
-            )
-        })
+fn required(value: Option<u64>, field: &str) -> Result<u64, String> {
+    value.ok_or_else(|| {
+        format!(
+            "response has no `{field}`; this ferrosa-ctl and the node disagree about \
+             /api/index/rebuild"
+        )
+    })
 }
 
 /// Turn the node's report into what the operator reads and the process
@@ -371,8 +367,6 @@ pub async fn run_index_rebuild(
         .send()
         .await?;
     let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-
     if status.as_u16() == 404 {
         return Err(format!(
             "the node at {web_host}:{web_port} has no /api/index/rebuild endpoint (HTTP 404). \
@@ -380,18 +374,15 @@ pub async fn run_index_rebuild(
         )
         .into());
     }
-    let body: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| format!("could not read the node's response ({e}): {text}"))?;
-
     if !status.is_success() {
-        let msg = body
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or(&text);
-        return Err(format!("{keyspace}.{table} index '{index}': {msg}").into());
+        let what = format!("{keyspace}.{table} index '{index}'");
+        return Err(crate::commands::body::error_from_body(resp, &what).await);
     }
 
-    let report = parse_rebuild_report(&body)?;
+    let wire: RebuildWire = crate::commands::body::parse_json_body(resp)
+        .await
+        .map_err(|e| format!("could not read the node's response: {e}"))?;
+    let report = wire.into_report()?;
     let line = render_rebuild(&report, index, &format!("{keyspace}.{table}"), web_host)?;
     println!("{line}");
     Ok(())
@@ -400,6 +391,13 @@ pub async fn run_index_rebuild(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_rebuild_report(body: &serde_json::Value) -> Result<RebuildReport, String> {
+        use serde::Deserialize as _;
+        RebuildWire::deserialize(body)
+            .map_err(|e| format!("response is not a rebuild report: {e}"))?
+            .into_report()
+    }
 
     fn row(name: &str, status: &str, pending: i64) -> IndexRow {
         IndexRow {

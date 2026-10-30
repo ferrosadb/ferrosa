@@ -572,3 +572,110 @@ fn periodic_one_hour() -> SyncStrategyConfig {
         sync_interval: Duration::from_secs(3600),
     }
 }
+
+/// A torn transaction record must never replay an individually valid prefix.
+#[test]
+fn apply_batch_torn_log_does_not_replay_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = || engine_config_with(dir.path(), periodic_one_hour(), 256 * 1024);
+    let engine = StorageEngine::new(cfg(), None).unwrap();
+    engine.register_table(test_schema("ks", "t")).unwrap();
+    let ops: Vec<_> = (0..3)
+        .map(|i| BatchOp::Write {
+            keyspace: "ks".into(),
+            table: "t".into(),
+            key: make_key("p1"),
+            row: live_row(ck(i), &[b'x'; 1024], 100),
+            timestamp: 100,
+        })
+        .collect();
+    engine.apply_batch(ops).unwrap();
+    drop(engine);
+    let log = std::fs::read_dir(dir.path().join("commitlog"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "log"))
+        .expect("segment file");
+    // Enough bytes for the first legacy mutation but not the whole batch.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(log)
+        .unwrap()
+        .set_len(1600)
+        .unwrap();
+    let (engine, pending) = StorageEngine::open(cfg(), None).unwrap();
+    engine.register_table(test_schema("ks", "t")).unwrap();
+    engine.replay_mutations(pending).unwrap();
+    for i in 0..3 {
+        assert_eq!(
+            read_cell(&engine, &TableId::new("ks", "t"), &make_key("p1"), &ck(i)),
+            None,
+            "torn batch must not recover a prefix"
+        );
+    }
+}
+
+#[test]
+fn batch_txn_publishes_real_cdc_events_only_after_commit() {
+    use ferrosa_cdc::{CdcBus, CdcRecvError, CdcStream};
+    let dir = tempfile::tempdir().unwrap();
+    let engine = StorageEngine::new(test_engine_config(dir.path()), None).unwrap();
+    engine.register_table(test_schema("ks", "t")).unwrap();
+    let bus = CdcBus::new(16);
+    engine.set_cdc_bus(bus.clone());
+    let mut events = bus.subscribe(CdcStream::WrittenOnNode);
+    let mut batch = engine.begin_batch();
+    for i in 0..2 {
+        batch.stage(BatchOp::Write {
+            keyspace: "ks".into(),
+            table: "t".into(),
+            key: make_key("p1"),
+            row: live_row(ck(i), b"value", 100),
+            timestamp: 100,
+        });
+    }
+    assert_eq!(events.try_recv(), Err(CdcRecvError::Empty));
+    batch.commit().unwrap();
+    for i in 0..2 {
+        let event = events
+            .try_recv()
+            .expect("committed mutation must reach CDC");
+        assert_eq!(event.keyspace, "ks");
+        assert_eq!(event.table, "t");
+        assert_eq!(event.rows[0].clustering, ck(i));
+    }
+    assert_eq!(events.try_recv(), Err(CdcRecvError::Empty));
+}
+
+#[test]
+fn batch_txn_cdc_cursor_resumes_between_envelope_members() {
+    use ferrosa_storage::commitlog::cdc::CdcReader;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = StorageEngine::new(test_engine_config(dir.path()), None).unwrap();
+    engine.register_table(test_schema("ks", "t")).unwrap();
+    engine
+        .apply_batch(
+            (0..3)
+                .map(|i| BatchOp::Write {
+                    keyspace: "ks".into(),
+                    table: "t".into(),
+                    key: make_key("p1"),
+                    row: live_row(ck(i), b"value", 100),
+                    timestamp: 100,
+                })
+                .collect(),
+        )
+        .unwrap();
+    let log_dir = dir.path().join("commitlog");
+    let mut reader = CdcReader::new(&log_dir, &dir.path().join("cdc"), None).unwrap();
+    let (first, cursor) = reader.next_mutation().unwrap().unwrap();
+    assert_eq!(first.rows[0].clustering, ck(0));
+    drop(reader);
+    let mut resumed = CdcReader::from_position(&log_dir, cursor, None).unwrap();
+    for i in 1..3 {
+        let (mutation, position) = resumed.next_mutation().unwrap().unwrap();
+        assert!(position > cursor);
+        assert_eq!(mutation.rows[0].clustering, ck(i));
+    }
+    assert!(resumed.next_mutation().unwrap().is_none());
+}

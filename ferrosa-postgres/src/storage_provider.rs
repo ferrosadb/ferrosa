@@ -115,6 +115,9 @@ use tokio::sync::mpsc;
 
 use crate::cluster_read::{read_consistency, PartitionStream, RangeRead};
 
+mod count;
+use count::metadata_count;
+
 /// Convert a ferrosa [`CqlValue`] to [`ferrosa_sql::Value`]. Unsupported values
 /// return an error so callers cannot turn real data into fabricated SQL NULLs.
 pub fn cql_to_value(v: &CqlValue) -> Result<Value, String> {
@@ -283,6 +286,7 @@ fn storage_to_table_indices(meta: &TableMetadata) -> Vec<usize> {
 /// defect" rule applied to the read path: remove the repeated allocation rather
 /// than shrink the schema.
 pub(crate) struct TableCodec {
+    pub(crate) table_id: uuid::Uuid,
     /// Declared column names, in declared order.
     names: Vec<String>,
     /// Parsed CQL type per declared column, in declared order.
@@ -318,6 +322,7 @@ impl TableCodec {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?;
         Ok(Self {
+            table_id: meta.id,
             names,
             types,
             pk: pk_indices(meta),
@@ -498,6 +503,8 @@ struct ScanContext {
     /// Complete key for a single-row table. The relational executor still
     /// evaluates the predicate; this only narrows physical I/O and MVCC tails.
     point: Option<PointLookup>,
+    /// One logical row per partition permits key-only MVCC reconciliation.
+    metadata_countable: bool,
 }
 
 pub(crate) struct PointLookup {
@@ -587,9 +594,9 @@ mod validation_tests {
     #[test]
     fn physical_validation_does_not_materialize_payloads() {
         let row = vec![
-            Some(CqlValue::Text("x".repeat(4096))),
-            Some(CqlValue::Ascii("y".repeat(4096))),
-            Some(CqlValue::Blob(vec![7; 4096])),
+            Some(CqlValue::Text("x".repeat(4096).into())),
+            Some(CqlValue::Ascii("y".repeat(4096).into())),
+            Some(CqlValue::Blob(vec![7; 4096].into())),
             Some(CqlValue::Int(12)),
             None,
         ];
@@ -679,25 +686,24 @@ async fn produce_scan(
         // Mirror the CQL SELECT path: one engine row per logical CQL row, with
         // values in the table's declared column order. The decomposition is
         // per-partition, so this holds one partition's rows, not the table's.
-        let cql_rows = match ferrosa_row_bridge::partition_to_rows_with_storage_mapping(
-            &partition,
+        let cql_rows = ferrosa_row_bridge::into_partition_rows_with_storage_mapping(
+            partition,
             &ctx.col_names,
             &ctx.col_types,
             &ctx.pk_idx,
             &ctx.ck_idx,
             &ctx.storage_to_table,
-        ) {
-            Ok(rows) => rows,
-            Err(error) => {
-                // A corrupt cell fails the query. It must never surface as a
-                // NULL or a truncated result (PG-Tcf7ca2cc).
-                let error =
-                    error.in_table(format!("{}.{}", ctx.table_id.keyspace, ctx.table_id.table));
-                failure.record(format!("scan failed: {error}"));
-                return;
-            }
-        };
-        for cql_row in cql_rows {
+        );
+        for decoded in cql_rows {
+            let (_, cql_row) = match decoded {
+                Ok(row) => row,
+                Err(error) => {
+                    let error =
+                        error.in_table(format!("{}.{}", ctx.table_id.keyspace, ctx.table_id.table));
+                    failure.record(format!("scan failed: {error}"));
+                    return;
+                }
+            };
             if let Err(error) = validate_decoded_row(&cql_row) {
                 failure.record(format!(
                     "scan of {}.{} cannot represent a stored value: {error}",
@@ -869,6 +875,21 @@ pub struct StreamingTable {
 }
 
 impl StreamingTable {
+    /// Async DML consumers share the SELECT producer and its bounded row channel.
+    pub(crate) fn rows(&self) -> mpsc::Receiver<Row> {
+        let (tx, rx) = mpsc::channel(self.scan_buffer_rows);
+        self.handle.spawn(guard_scan_producer(
+            produce_scan(
+                self.ctx.clone(),
+                tx,
+                self.failure.clone(),
+                self.mvcc_view.clone(),
+            ),
+            self.failure.clone(),
+        ));
+        rx
+    }
+
     pub(crate) fn with_point_lookup(mut self, point: Option<PointLookup>) -> Self {
         // Providers are uniquely owned until installed in the catalog.
         Arc::get_mut(&mut self.ctx)
@@ -896,18 +917,21 @@ impl TableProvider for StreamingTable {
         &self.schema
     }
 
+    fn count_all(&self) -> Option<Result<u64, String>> {
+        if !self.ctx.metadata_countable {
+            return None;
+        }
+        self.handle
+            .block_on(metadata_count(
+                &self.ctx,
+                self.mvcc_view.as_ref(),
+                &self.failure,
+            ))
+            .transpose()
+    }
+
     fn scan(&self) -> Box<dyn Iterator<Item = Row> + Send> {
-        let (tx, rx) = mpsc::channel(self.scan_buffer_rows);
-        self.handle.spawn(guard_scan_producer(
-            produce_scan(
-                self.ctx.clone(),
-                tx,
-                self.failure.clone(),
-                self.mvcc_view.clone(),
-            ),
-            self.failure.clone(),
-        ));
-        Box::new(ScanIter { rx })
+        Box::new(ScanIter { rx: self.rows() })
     }
 }
 
@@ -1012,6 +1036,12 @@ pub(crate) async fn load_table_with_overlay(
     Ok(StreamingTable {
         schema: rel_schema,
         ctx: Arc::new(ScanContext {
+            metadata_countable: pk_idx.len() == 1
+                && ck_idx.is_empty()
+                && meta
+                    .columns
+                    .values()
+                    .all(|column| column.kind != ColumnKind::Static),
             engine: engine.clone(),
             table_id: TableId::new(keyspace, table),
             col_names,
@@ -1068,6 +1098,11 @@ pub(crate) fn staged_overlay(
     let storage_error =
         |message: String| MvccCommitError::Storage(ferrosa_common::Error::InvalidData(message));
     let codec = TableCodec::build(keyspace, table, schema).map_err(storage_error)?;
+    if writes.iter().any(|write| {
+        write.0.keyspace == keyspace && write.0.table == table && write.1 != codec.table_id
+    }) {
+        return Err(MvccCommitError::SerializationFailure);
+    }
     // Resolve only the keys the transaction actually staged. Building a whole
     // snapshot overlay here made even one own write clone unrelated payloads.
     if let Some(view) = view {
@@ -1486,6 +1521,59 @@ mod tests {
     use std::time::Duration;
     use uuid::Uuid;
 
+    #[test]
+    fn shared_cell_payload_survives_cql_sql_conversion_and_clone() {
+        for ty in [CqlType::Varchar, CqlType::Blob] {
+            let cell = ferrosa_common::cell::CellValue::live(vec![b'x'; 4096], 1000);
+            let sibling = cell.value.as_ref().unwrap().clone();
+            let original = sibling.as_ref().as_ptr();
+            let partition = ferrosa_sstable::types::Partition {
+                key: ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+                    1i32.to_be_bytes().to_vec(),
+                )),
+                deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                static_row: None,
+                rows: vec![ferrosa_sstable::types::Row {
+                    clustering: vec![],
+                    cells: vec![(0, cell)],
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
+                        1000,
+                    ),
+                }],
+            };
+            let mut values = None;
+            ferrosa_row_bridge::consume_partition_rows_with_clustering(
+                partition,
+                &["pk".into(), "value".into()],
+                &[CqlType::Int, ty],
+                &[0],
+                &[],
+                &[1],
+                |_, _, row| {
+                    values = Some(super::decoded_row_values(row).unwrap());
+                    std::ops::ControlFlow::Continue(())
+                },
+            )
+            .unwrap();
+            let values = values.unwrap();
+            let clone = values.clone();
+            for values in [&values, &clone] {
+                let bytes: &[u8] = match &values[1] {
+                    Value::Text(text) => text.as_bytes(),
+                    Value::Bytea(bytes) => bytes.as_ref(),
+                    other => panic!("unexpected payload: {other:?}"),
+                };
+                assert_eq!(
+                    bytes.as_ptr(),
+                    original,
+                    "payload copied across CQL/SQL or clone"
+                );
+                assert_eq!(bytes, sibling.as_ref());
+            }
+        }
+    }
+
     // ── Pure conversion tests (no infra) ──────────────────────────────────
 
     #[test]
@@ -1502,17 +1590,17 @@ mod tests {
             (blob.as_ptr(), blob.capacity()),
         ];
         let values = super::decoded_row_values(vec![
-            Some(CqlValue::Text(text)),
-            Some(CqlValue::Ascii(ascii)),
-            Some(CqlValue::Blob(blob)),
+            Some(CqlValue::Text(text.into())),
+            Some(CqlValue::Ascii(ascii.into())),
+            Some(CqlValue::Blob(blob.into())),
             None,
             Some(CqlValue::Int(42)),
         ])
         .unwrap();
         for (value, (pointer, capacity)) in values.iter().zip(allocations) {
             let (actual_pointer, actual_capacity) = match value {
-                Value::Text(text) => (text.as_ptr(), text.capacity()),
-                Value::Bytea(bytes) => (bytes.as_ptr(), bytes.capacity()),
+                Value::Text(text) => (text.as_ptr(), text.retained_capacity()),
+                Value::Bytea(bytes) => (bytes.as_ptr(), bytes.retained_capacity()),
                 _ => panic!("expected an owned payload"),
             };
             assert_eq!(actual_pointer, pointer, "payload must move without a copy");
@@ -1539,7 +1627,7 @@ mod tests {
             CqlValue::Double((-0.0_f64).to_bits()),
             CqlValue::Uuid(Uuid::nil()),
             CqlValue::Timeuuid(Uuid::nil()),
-            CqlValue::Blob(vec![0, 255]),
+            CqlValue::Blob(vec![0, 255].into()),
             CqlValue::Timestamp(1000),
             CqlValue::Timestamp(i64::MAX),
             CqlValue::Date(u32::MAX),
@@ -1577,12 +1665,12 @@ mod tests {
         assert_eq!(cql_to_value(&CqlValue::Smallint(-3)), Value::Int(-3));
         assert_eq!(cql_to_value(&CqlValue::Tinyint(5)), Value::Int(5));
         assert_eq!(
-            cql_to_value(&CqlValue::Text("hi".to_string())),
-            Value::Text("hi".to_string())
+            cql_to_value(&CqlValue::Text("hi".to_string().into())),
+            Value::Text("hi".to_string().into())
         );
         assert_eq!(
-            cql_to_value(&CqlValue::Ascii("a".to_string())),
-            Value::Text("a".to_string())
+            cql_to_value(&CqlValue::Ascii("a".to_string().into())),
+            Value::Text("a".to_string().into())
         );
         assert_eq!(cql_to_value(&CqlValue::Boolean(true)), Value::Bool(true));
     }
@@ -1639,8 +1727,8 @@ mod tests {
         assert_eq!(cql_to_value(&CqlValue::Uuid(u)), Value::Uuid(u));
         assert_eq!(cql_to_value(&CqlValue::Timeuuid(u)), Value::Uuid(u));
         assert_eq!(
-            cql_to_value(&CqlValue::Blob(vec![1, 2, 3])),
-            Value::Bytea(vec![1, 2, 3])
+            cql_to_value(&CqlValue::Blob(vec![1, 2, 3].into())),
+            Value::Bytea(vec![1, 2, 3].into())
         );
     }
 
@@ -1873,6 +1961,48 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_partition_decode_error_fails_statement_after_valid_prefix() {
+        use crate::messages::BackendMessage;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(StorageEngine::new(engine_config(dir.path()), None).unwrap());
+        engine.register_table(storage_schema()).unwrap();
+        let schema = schema_with_table();
+        let table = TableId::new("ks", "t");
+        let key = DecoratedKey::new(PartitionKey::new(b"alpha".to_vec()));
+        engine
+            .write(&table, &key, storage_row(1, "valid", 10, 1000), 1000)
+            .unwrap();
+        let mut corrupt = storage_row(2, "bad", 20, 1001);
+        corrupt.cells[0].1 = CellValue::live(vec![0xff], 1001);
+        engine.write(&table, &key, corrupt, 1001).unwrap();
+        for flushed in [false, true] {
+            if flushed {
+                engine.flush_all().unwrap();
+            }
+            let messages = crate::query::execute_query(
+                &engine,
+                &schema,
+                "SELECT id, ck, name, score FROM t",
+                "ks",
+                &crate::jsonb_wire::test_limits(),
+                None,
+            )
+            .await;
+            assert!(messages.iter().any(|message| matches!(message,
+                BackendMessage::ErrorResponse { fields }
+                    if fields.iter().any(|(kind, value)| *kind == b'C' && value == "58000")
+                        && fields.iter().any(|(kind, value)| *kind == b'M' && value.contains("ks.t") && value.contains("name"))
+            )), "missing contextual statement failure (flushed={flushed}): {messages:?}");
+            assert!(
+                !messages
+                    .iter()
+                    .any(|message| matches!(message, BackendMessage::CommandComplete { .. })),
+                "corrupt stream must not finish successfully: {messages:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn load_table_streams_rows_in_declared_order() {
         let dir = tempfile::tempdir().unwrap();
         let engine = Arc::new(StorageEngine::new(engine_config(dir.path()), None).unwrap());
@@ -1927,17 +2057,17 @@ mod tests {
         });
 
         // alpha/ck=1 -> ann/10
-        assert_eq!(rows[0].0[0], Value::Text("alpha".to_string()));
+        assert_eq!(rows[0].0[0], Value::Text("alpha".to_string().into()));
         assert_eq!(rows[0].0[1], Value::Int(1));
-        assert_eq!(rows[0].0[2], Value::Text("ann".to_string()));
+        assert_eq!(rows[0].0[2], Value::Text("ann".to_string().into()));
         assert_eq!(rows[0].0[3], Value::Int(10));
         // alpha/ck=2 -> amy/20
         assert_eq!(rows[1].0[1], Value::Int(2));
-        assert_eq!(rows[1].0[2], Value::Text("amy".to_string()));
+        assert_eq!(rows[1].0[2], Value::Text("amy".to_string().into()));
         assert_eq!(rows[1].0[3], Value::Int(20));
         // beta/ck=1 -> bob/30
-        assert_eq!(rows[2].0[0], Value::Text("beta".to_string()));
-        assert_eq!(rows[2].0[2], Value::Text("bob".to_string()));
+        assert_eq!(rows[2].0[0], Value::Text("beta".to_string().into()));
+        assert_eq!(rows[2].0[2], Value::Text("bob".to_string().into()));
         assert_eq!(rows[2].0[3], Value::Int(30));
 
         engine.shutdown().unwrap();
@@ -1994,6 +2124,7 @@ mod tests {
                 &HashSet::new(),
                 vec![crate::mvcc::RowChange {
                     table: "ks.t".into(),
+                    table_id: schema.snapshot().tables[&("ks".into(), "t".into())].id,
                     key: vec![Value::Text("alpha".into()), Value::Int(1)],
                     partition_key: b"alpha".to_vec(),
                     before: Some(before.clone()),
@@ -2019,6 +2150,7 @@ mod tests {
                 &HashSet::new(),
                 vec![crate::mvcc::RowChange {
                     table: "ks.t".into(),
+                    table_id: schema.snapshot().tables[&("ks".into(), "t".into())].id,
                     key: vec![Value::Text("alpha".into()), Value::Int(1)],
                     partition_key: b"alpha".to_vec(),
                     before: Some(Row::new(vec![
@@ -2039,13 +2171,16 @@ mod tests {
                 .unwrap();
             assert_eq!(rows, vec![before.clone()]);
         }
-        let staged = vec![crate::mvcc::PgWrite(ferrosa_storage::Mutation::new(
-            "ks".into(),
-            "t".into(),
-            key.clone(),
-            vec![storage_row(1, "own", 40, 4000)],
-            4000,
-        ))];
+        let staged = vec![crate::mvcc::PgWrite(
+            ferrosa_storage::Mutation::new(
+                "ks".into(),
+                "t".into(),
+                key.clone(),
+                vec![storage_row(1, "own", 40, 4000)],
+                4000,
+            ),
+            schema.snapshot().tables[&("ks".into(), "t".into())].id,
+        )];
         let (own_catalog, own_failure) = crate::query::load_catalog_with_mvcc(
             &engine,
             &schema,
@@ -2158,7 +2293,11 @@ mod tests {
                 load_table(&engine, &schema, "ks", "t", failure.clone())
                     .await
                     .unwrap()
-                    .with_mvcc_view(manager.table_view(&snapshot, "ks.t")),
+                    .with_mvcc_view(manager.table_view(
+                        &snapshot,
+                        "ks.t",
+                        schema.snapshot().tables[&("ks".into(), "t".into())].id,
+                    )),
             );
             let rows = scan_rows(table.clone()).await;
             assert_eq!(rows, baseline_rows);
@@ -2230,6 +2369,7 @@ mod tests {
             let changes = (0..size)
                 .map(|i| RowChange {
                     table: "ks.t".into(),
+                    table_id: schema.snapshot().tables[&("ks".into(), "t".into())].id,
                     key: vec![Value::Text("alpha".into()), Value::Int(i)],
                     partition_key: b"alpha".to_vec(),
                     before: None,
@@ -2245,13 +2385,16 @@ mod tests {
                 .commit(&manager.snapshot(), &HashSet::new(), changes, || Ok(()))
                 .unwrap();
             let snapshot = manager.snapshot();
-            let staged = vec![PgWrite(ferrosa_storage::Mutation::new(
-                "ks".into(),
-                "t".into(),
-                DecoratedKey::new(PartitionKey::new(b"alpha".to_vec())),
-                vec![storage_row(1, "own", 40, 4000)],
-                4000,
-            ))];
+            let staged = vec![PgWrite(
+                ferrosa_storage::Mutation::new(
+                    "ks".into(),
+                    "t".into(),
+                    DecoratedKey::new(PartitionKey::new(b"alpha".to_vec())),
+                    vec![storage_row(1, "own", 40, 4000)],
+                    4000,
+                ),
+                schema.snapshot().tables[&("ks".into(), "t".into())].id,
+            )];
             let mut counts = Vec::new();
             for writes in [None, Some(staged.as_slice())] {
                 let count = MvccManager::count_allocations_for_test(|| {

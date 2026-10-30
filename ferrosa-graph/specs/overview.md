@@ -22,13 +22,23 @@ executive_summary: >
 
 ## Purpose & boundary
 
-Native-primary-key equality uses the keyed reader. Eligible integer/UUID equality
-uses a CQL-declared, current BTree/Hash secondary index; unsupported predicates or
-unready indexes use the range reader. All candidates retain predicate checks.
-Cypher index DDL remains unsupported. Simple unfiltered vertex counts use row
-metadata without materializing payloads; other aggregate shapes retain the
-general evaluator. See the [measurement status](../../deploy/fly-bench/pipeline/RESULTS.md)
-and [experiment record](../../deploy/fly-bench/pipeline/HISTORY.md).
+Native-primary-key equality uses the keyed reader. Bolt's first access to an
+authorized table automatically declares missing scalar BTree indexes through
+`GraphSchemaCoordinator` and waits for backfill. `engine::bolt_indexes` memoizes
+setup per table, using weak immutable snapshot/path identity; ordinary connections
+reuse the same cache. Setup is performed before leaf writes, including buffered
+UNWIND/FOREACH/CALL execution. Snapshot replacement invalidates it even when the
+schema UUID stays unchanged. Cold cluster probes observe each current source
+before publishing setup; subsequent reads retain fail-closed readiness checks.
+
+The scalar reader seeks the complete finite set of encodings matching the
+existing evaluator: integer/UUID, text/hex, boolean and bounded floating-point
+aliases. Dense epsilon matches, unsupported predicates or unready indexes retain
+the range reader. Candidates retain all predicate checks. Explicit Cypher index
+DDL remains unsupported. Simple unfiltered vertex counts use row metadata without
+materializing payloads; other aggregate shapes retain the general evaluator.
+See the [measurement status](../../deploy/fly-bench/pipeline/RESULTS.md) and
+[experiment record](../../deploy/fly-bench/pipeline/HISTORY.md).
 
 `ferrosa-graph` turns a ferrosa keyspace into a queryable property graph without
 a dedicated graph store. There is no separate graph storage engine: vertices and
@@ -188,3 +198,70 @@ full graph.
 Graph column extraction retains immutable `CellBytes` handles for regular
 cells. Adjacency repair carries those handles into new cells; visited traversal
 keys remain independently owned at the key boundary.
+
+
+### First-write scalar columns over Bolt
+
+Before planning a Bolt data write, the engine derives missing columns from bound
+scalar properties, checks ALTER permission, rechecks under the shared schema gate,
+and applies them through the schema coordinator. Standalone and replicated paths
+update storage's column layout through the existing ALTER path. Warm writes issue
+no column DDL and take no schema-setup mutex. Signed numeric literals are normalized
+by the parser, so inference, byte encoding and indexed equality share literal
+semantics. Null, collection and computed first values require declared columns.
+
+## Single-node Bolt transaction path
+
+`ConnectionState` owns `LocalTransaction`. `RUN` scopes `TRANSACTION_IO` while
+executing and draining the existing query pipeline; owned execution contexts
+capture the `GraphWrite` implementation, including nested write orchestration.
+The overlay stores mutations, never query text. Point reads and streaming scans
+use storage's `merge_partitions`; index/count shortcuts use reconciled data.
+The complete RUN is evaluated before SUCCESS, so COMMIT cannot omit a lazy SET
+whose result was not pulled. Results and writes are independently bounded.
+
+Writer admission is one FIFO async mutex per GraphEngine, shared across all keys,
+keyspaces, autocommit and explicit transactions. Exhaustive recursive classification
+of the bound AST happens before admission and before data-dependent execution.
+The first writing RUN stores an owned guard in LocalTransaction; later RUNs reuse
+it. BEGIN/read-only RUNs do not acquire it. Autocommit captures its guard in the
+outer row stream; nested executors inherit ownership without reacquiring. This
+also covers lazy UNION arms. Mutation timestamps are allocated during admitted
+execution with a process-local monotonic clock (reserving +1 for adjacency repair).
+
+Order: writer admission -> publication read -> execution. A queued writer owns no
+publication guard. COMMIT retains admission, takes publication write, checks the
+deadline/topology, then submits the existing `BatchTxn`. Publication drops before
+admission. Pure readers only acquire publication read, preserving reader concurrency
+while a transaction stages writes. Finite streams retain publication through
+exhaustion/drop; terminal errors drop the executor and guards before yielding the
+error. Slow/unconsumed readers can still delay publication until the commit deadline.
+This preserves read committed plus own writes, not snapshot isolation; separate
+read-only RUN plus constant SET is not a protected dependent update.
+
+Admission/setup and finite stream polls share an absolute query deadline, capped
+by the explicit transaction deadline. Explicit idle timeout and observed
+rollback/error/RESET/EOF drop the transaction and its ownership. An unpolled
+autocommit result holds admission until polling/drop; its waiters still expire.
+Bolt still awaits RUN before reading another message: prompt RESET/EOF observation
+while RUN queues is a separate transport cycle. No reader-task rewrite is included;
+the existing partial-frame timeout handling remains intact.
+
+Performance: unrelated writers and databases serialize too. Average ownership H
+bounds throughput to roughly 1/H; client think time and slow draining count in H.
+Benchmark metadata must disclose this graph-level gate and must not describe it as
+Neo4j-equivalent locking. Narrow partition/key ownership with refreshed dependency
+bindings is the next optimization. CQL/raw storage/other GraphEngines/distributed
+coordinators do not participate. Schema-incarnation fencing is a separate
+correctness boundary; this fresh-schema baseline excludes concurrent DDL.
+Adjacency setup completes before BEGIN; label creation must precede BEGIN.
+The direct path is the implemented commit sink; distributed I/O is not bypassed.
+
+### Automatic schema preparation and explicit transactions
+
+First-write label and scalar-column creation runs in autocommit mode. Explicit
+transactions require those labels and columns to exist: an attempted structural
+change is refused before DDL or storage rotation, and failure/RESET discards
+staged rows and releases writer ownership. Existing scalar columns retain the
+shared automatic-index setup; index readiness never bypasses the transaction's
+read-your-writes overlay.

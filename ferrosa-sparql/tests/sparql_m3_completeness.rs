@@ -71,7 +71,7 @@ async fn select_values(eng: &SparqlEngine, query: &str, var: &str) -> Vec<String
             .results
             .bindings
             .iter()
-            .filter_map(|row| row.get(var).map(|b| b.value.clone()))
+            .filter_map(|row| row.get(var).map(|b| b.scalar_value().unwrap().to_owned()))
             .collect(),
         SparqlResult::Ask(_) => panic!("expected SELECT, got ASK"),
         SparqlResult::Graph(_) => panic!("expected SELECT, got Graph"),
@@ -119,7 +119,7 @@ async fn construct_query_produces_graph_result() {
     }
 
     // Must serialize to N-Triples without error.
-    let nt = String::from_utf8(result.to_ntriples()).unwrap();
+    let nt = String::from_utf8(result.to_ntriples().unwrap()).unwrap();
     assert!(
         nt.contains("Alice") || nt.contains("alice"),
         "serialized CONSTRUCT result must contain Alice: {nt}"

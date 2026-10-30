@@ -189,9 +189,9 @@ const INDEX_RESULT_CAP: usize = 10_000;
 const RANGE_READ_MATERIALIZATION_CAP: usize = 10_000;
 const QVEC_HNSW_MAGIC: &[u8] = b"FERROSA-QVEC-HNSW-V1\n";
 
-fn build_quantized_vector_artifact(
+fn build_quantized_vector_artifact<V: AsRef<[f32]>>(
     cfg: &VectorIndexConfig,
-    drained: Vec<(ferrosa_index::vector::RowPosition, Vec<f32>)>,
+    drained: impl IntoIterator<Item = (ferrosa_index::vector::RowPosition, V)>,
 ) -> Result<Vec<u8>> {
     let hnsw_bytes = ferrosa_index::vector::hnsw::build_and_serialize(
         cfg.m,
@@ -293,6 +293,38 @@ pub(crate) struct SstableDescriptor {
     /// Whether either persisted key bound uses the legacy non-byte-comparable
     /// encoding and therefore needs a sorting rewrite.
     pub legacy_format: bool,
+    /// What compaction planning last reported about this generation's local
+    /// components, shared by every clone of the descriptor so a view swap
+    /// does not reset it. Planning runs over every SSTable on every pass, so
+    /// it reports a change of state, never the state itself (t_c14245f9).
+    planning_report: Arc<std::sync::atomic::AtomicU8>,
+}
+
+/// Compaction planning's view of one generation's local components, as stored
+/// in [`SstableDescriptor::planning_report`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum PlanningComponents {
+    /// Every required component is on local disk (the initial state).
+    Local = 0,
+    /// Local components are missing but `Data.db` has a remote length, so the
+    /// generation is evicted and execution can rehydrate it.
+    Evicted = 1,
+    /// Missing locally and no remote length: planning skips it.
+    Unplannable = 2,
+}
+
+impl PlanningComponents {
+    fn from_u8(raw: u8) -> Self {
+        match raw {
+            0 => Self::Local,
+            1 => Self::Evicted,
+            2 => Self::Unplannable,
+            other => {
+                unreachable!("planning_report holds only PlanningComponents values, got {other}")
+            }
+        }
+    }
 }
 
 /// Normalise every last-write-wins timestamp `row` carries (cells, primary-key
@@ -383,7 +415,20 @@ impl SstableDescriptor {
             max_timestamp: header.max_timestamp,
             partition_count: reader.key_count(),
             legacy_format,
+            planning_report: Arc::new(std::sync::atomic::AtomicU8::new(
+                PlanningComponents::Local as u8,
+            )),
         }
+    }
+
+    /// Record that planning now sees this generation's components as `now`,
+    /// returning the state it saw before. Equal values mean nothing changed
+    /// and nothing is reported.
+    fn swap_planning_report(&self, now: PlanningComponents) -> PlanningComponents {
+        PlanningComponents::from_u8(
+            self.planning_report
+                .swap(now as u8, std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     fn compaction_metadata(
@@ -420,23 +465,49 @@ impl SstableDescriptor {
         if self.dir.as_os_str().is_empty() {
             return Some(metadata);
         }
+        // Planning runs over every SSTable on every maintenance pass, so each
+        // branch reports only when this generation's state CHANGES: once when
+        // it is evicted, once when it is local again, once when it becomes
+        // unplannable. A per-pass warning logged the same evicted generations
+        // 18–72 times a minute on every dev node (t_c14245f9).
         match sstable_compaction_component_size(&metadata.path, &metadata.id) {
-            Some(size_bytes) => metadata.size_bytes = size_bytes,
+            Some(size_bytes) => {
+                metadata.size_bytes = size_bytes;
+                let before = self.swap_planning_report(PlanningComponents::Local);
+                if before != PlanningComponents::Local {
+                    tracing::info!(
+                        sstable_id = %metadata.id,
+                        table_dir = ?metadata.path,
+                        previously = ?before,
+                        "compaction planning: SSTable local components are present again"
+                    );
+                }
+            }
             None if sstable_compaction_remote_component_available(&metadata.path, &metadata.id) => {
-                tracing::warn!(
-                    sstable_id = %metadata.id,
-                    table_dir = ?metadata.path,
-                    size_bytes = metadata.size_bytes,
-                    "compaction planning: SSTable local components are missing or empty; \
-                     using cached verified-reader size and allowing execution to rehydrate inputs"
-                );
+                if self.swap_planning_report(PlanningComponents::Evicted)
+                    != PlanningComponents::Evicted
+                {
+                    tracing::warn!(
+                        sstable_id = %metadata.id,
+                        table_dir = ?metadata.path,
+                        size_bytes = metadata.size_bytes,
+                        "compaction planning: SSTable local components are missing or empty; \
+                         using cached verified-reader size and allowing execution to rehydrate inputs \
+                         (reported once per eviction, not per planning pass)"
+                    );
+                }
             }
             None => {
-                tracing::warn!(
-                    sstable_id = %metadata.id,
-                    table_dir = ?metadata.path,
-                    "compaction planning: skipping SSTable because required components are missing or empty and no remote length is registered"
-                );
+                if self.swap_planning_report(PlanningComponents::Unplannable)
+                    != PlanningComponents::Unplannable
+                {
+                    tracing::warn!(
+                        sstable_id = %metadata.id,
+                        table_dir = ?metadata.path,
+                        "compaction planning: skipping SSTable because required components are missing \
+                         or empty and no remote length is registered (reported once, not per planning pass)"
+                    );
+                }
                 return None;
             }
         }
@@ -845,7 +916,7 @@ impl IndexCatalog {
     }
 
     /// This catalog with every column ordinal remapped from `old_schema`'s
-    /// regular-column layout onto `new_schema`'s.
+    /// flat static-plus-regular column layout onto `new_schema`'s.
     ///
     /// Regular columns are ordered by Cassandra's column-name comparator, so
     /// `ALTER TABLE ADD` of a column that sorts before an indexed column
@@ -858,7 +929,10 @@ impl IndexCatalog {
     fn remapped_onto(&self, old_schema: &TableSchema, new_schema: &TableSchema) -> Self {
         let mut catalog = self.clone();
         let remap = |index_name: &str, pos: &mut usize| {
-            let Some(old_col) = old_schema.regular_columns.get(*pos) else {
+            let Some(old_col) = u16::try_from(*pos)
+                .ok()
+                .and_then(|ordinal| old_schema.column_at_ordinal(ordinal))
+            else {
                 tracing::error!(
                     index = index_name,
                     position = *pos,
@@ -867,11 +941,7 @@ impl IndexCatalog {
                 );
                 return;
             };
-            match new_schema
-                .regular_columns
-                .iter()
-                .position(|c| c.name == old_col.name)
-            {
+            match new_schema.column_index(&old_col.name).map(usize::from) {
                 Some(new_pos) => {
                     if new_pos != *pos {
                         tracing::info!(
@@ -981,6 +1051,37 @@ impl IndexCatalog {
             self.index_type_for(index_name),
             self.index_filter_predicates.get(index_name),
         ))
+    }
+
+    /// Interpret target index definitions against a frozen row layout.
+    /// A column absent from that layout has no cells: its sentinel ordinal
+    /// cannot equal any u16 cell tag, so extraction produces no postings.
+    /// This catalog is local to sidecar building, never published to writers.
+    fn for_source_schema(&self, target: &TableSchema, source: &TableSchema) -> Self {
+        let mut catalog = self.clone();
+        let remap = |position: &mut usize| {
+            *position = u16::try_from(*position)
+                .ok()
+                .and_then(|ordinal| target.column_at_ordinal(ordinal))
+                .and_then(|column| source.column_index(&column.name))
+                .map(usize::from)
+                .unwrap_or(usize::MAX);
+        };
+        for (_, position) in &mut catalog.indexed_columns {
+            remap(position);
+        }
+        for (_, position) in &mut catalog.fulltext_indexes {
+            remap(position);
+        }
+        for config in &mut catalog.vector_index_configs {
+            remap(&mut config.column_position);
+        }
+        for predicate in catalog.index_filter_predicates.values_mut() {
+            for clause in &mut predicate.clauses {
+                remap(&mut clause.column_position);
+            }
+        }
+        catalog
     }
 
     /// Whether this catalog declares an index named `index_name`, of any kind.
@@ -1567,6 +1668,8 @@ fn vector_index_from_rows(
         cfg.ef_construction,
     ));
     for partition in partitions {
+        // One scope per partition, shared by its rows' entries.
+        let mut scope: Option<Arc<[u8]>> = None;
         for row in partition.static_row.iter().chain(partition.rows.iter()) {
             let Some(value) = row
                 .cells
@@ -1576,15 +1679,14 @@ fn vector_index_from_rows(
             else {
                 continue;
             };
-            let Ok(vector) = ferrosa_index::bytes_to_vec_f32(value) else {
+            let Ok(vector) = ferrosa_index::bytes_to_f32s::<Arc<[f32]>>(value) else {
                 continue;
             };
             let position = ferrosa_index::vector::RowPosition::new(vector_index.len() as u64);
-            vector_index.insert_with_scope(
-                position,
-                vector,
-                Some(partition.key.key.as_bytes().to_vec()),
-            );
+            let scope = scope
+                .get_or_insert_with(|| Arc::from(partition.key.key.as_bytes()))
+                .clone();
+            vector_index.insert_with_scope(position, vector, Some(scope));
         }
     }
     vector_index
@@ -1688,6 +1790,14 @@ fn scope_of_vector_sidecar(index_name: &str, sidecar_name: &str) -> Option<Resul
     Some(scope)
 }
 
+/// One ANN query's terms, as every sidecar search takes them.
+#[derive(Debug, Clone, Copy)]
+struct ScopedQuery<'q> {
+    query: &'q [f32],
+    k: usize,
+    ef_search: usize,
+}
+
 /// Sidecar name of the manifest that marks `index_name`'s scoped sidecars
 /// of a generation complete. It is a `-VEC-` file, so it lives and dies with
 /// the generation's other vector sidecars.
@@ -1748,6 +1858,32 @@ impl VectorSidecarManifest {
     }
 }
 
+/// Sidecar name of the marker that a generation's scoped sidecars for
+/// `index_name` passed a full check. Like the manifest it is a `-VEC-` file of
+/// the generation; binaries that predate it pass it over (it is neither a
+/// manifest nor a scoped sidecar), so it changes nothing for them.
+fn vector_verified_marker_name(index_name: &str) -> String {
+    format!("{index_name}__verified")
+}
+
+/// What a verified marker records: the manifest of the sidecars that were
+/// checked. It vouches for those sidecars only. A rebuild writes a new
+/// manifest, and a marker that does not match the manifest on disk vouches
+/// for nothing, so that generation is checked again.
+const VECTOR_VERIFIED_MAGIC: &[u8; 4] = b"FVV1";
+
+fn encode_vector_verified(manifest: &VectorSidecarManifest) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + VectorSidecarManifest::ENCODED_LEN);
+    out.extend_from_slice(VECTOR_VERIFIED_MAGIC);
+    out.extend_from_slice(&manifest.encode());
+    out
+}
+
+/// The manifest a verified marker vouches for; `None` if it is malformed.
+fn decode_vector_verified(bytes: &[u8]) -> Option<VectorSidecarManifest> {
+    VectorSidecarManifest::decode(bytes.strip_prefix(VECTOR_VERIFIED_MAGIC)?)
+}
+
 /// Key of `(gen, index_name)` in a store's set of vector-ready generations.
 fn vector_ready_key(gen: &str, index_name: &str) -> String {
     format!("{gen}/{index_name}")
@@ -1774,30 +1910,28 @@ fn build_generation_vector_sidecars<F: FlushTarget>(
     let mut manifest = VectorSidecarManifest::default();
     while let Some(mut partition) = iter.next_partition()? {
         mapping.remap_partition(&mut partition);
-        let entries = partition_vectors(&partition, cfg.column_position)?;
+        // The key is moved out, not copied; the rows are consumed as their
+        // vectors are taken, so rows and vectors are never both held whole.
+        let Partition {
+            key,
+            static_row,
+            rows,
+            ..
+        } = partition;
+        let entries = partition_vectors(static_row, rows, cfg.column_position)?;
         if entries.is_empty() {
             continue;
         }
         let vectors = entries.len();
-        let scope = partition.key.key.as_bytes();
-        let bytes = ferrosa_index::vector::hnsw::build_and_serialize(
-            cfg.m,
-            cfg.ef_construction,
-            cfg.metric,
-            entries,
-        )
-        .map_err(|e| {
-            ferrosa_common::Error::InvalidData(format!(
-                "vector index {}: building generation {gen}'s sidecar for one scope: {e}",
-                cfg.index_name
-            ))
-        })?;
-        flush_target.write_vector_sidecar(
+        let scope = key.key.as_bytes();
+        let bytes = write_streamed_vector_sidecar(
+            flush_target,
             gen,
             &scoped_vector_sidecar_name(&cfg.index_name, scope),
-            &bytes,
+            cfg,
+            entries,
         )?;
-        manifest.add_scope(vectors, bytes.len());
+        manifest.add_scope(vectors, bytes as usize);
         on_scope(scope);
     }
     flush_target.write_vector_sidecar(
@@ -1808,15 +1942,56 @@ fn build_generation_vector_sidecars<F: FlushTarget>(
     Ok(manifest)
 }
 
-/// The live vectors of `partition`'s `column_position` column, positioned in
-/// row order. A deleted row or cell carries none; a value that is not a
-/// float vector is an error, not a silently unindexed row.
+/// Build `cfg`'s HNSW graph over `entries` and stream it into generation
+/// `gen`'s sidecar `name`, returning the bytes written. The graph holds each
+/// vector as given (moved or borrowed, never copied) and the encoding is
+/// never held whole.
+fn write_streamed_vector_sidecar<F: FlushTarget + ?Sized, V: AsRef<[f32]>>(
+    flush_target: &F,
+    gen: u64,
+    name: &str,
+    cfg: &VectorIndexConfig,
+    entries: impl IntoIterator<Item = (ferrosa_index::vector::RowPosition, V)>,
+) -> Result<u64> {
+    let mut entries = Some(entries);
+    flush_target.write_vector_sidecar_streamed(gen, name, &mut |out| {
+        let entries = entries.take().ok_or_else(|| {
+            ferrosa_common::Error::InvalidData(format!(
+                "vector sidecar {name}'s writer was called twice"
+            ))
+        })?;
+        ferrosa_index::vector::hnsw::build_and_write(
+            cfg.m,
+            cfg.ef_construction,
+            cfg.metric,
+            entries,
+            out,
+        )
+        .map_err(|e| {
+            ferrosa_common::Error::InvalidData(format!(
+                "vector index {}: building generation {gen}'s sidecar {name}: {e}",
+                cfg.index_name
+            ))
+        })
+    })
+}
+
+/// The live vectors of a partition's `column_position` column, positioned in
+/// row order (static row first). A deleted row or cell carries none; a value
+/// that is not a float vector is an error, not a silently unindexed row.
+///
+/// Consumes the rows: each is freed once its vector is decoded, so the peak
+/// is the vectors plus one row, not the vectors plus every row.
 fn partition_vectors(
-    partition: &Partition,
+    static_row: Option<Row>,
+    rows: Vec<Row>,
     column_position: usize,
 ) -> Result<Vec<(ferrosa_index::vector::RowPosition, Vec<f32>)>> {
-    let mut entries = Vec::new();
-    for row in partition.static_row.iter().chain(partition.rows.iter()) {
+    let rows = static_row.into_iter().chain(rows);
+    // Sized once from the row count: growing by doubling would hold up to
+    // twice the vectors' table while it reallocates.
+    let mut entries = Vec::with_capacity(rows.size_hint().0);
+    for row in rows {
         if !row.deletion.is_live() {
             continue;
         }
@@ -3859,7 +4034,7 @@ impl<F: FlushTarget> TableStore<F> {
                     .find(|(idx, _)| *idx as usize == cfg.column_position)
                 {
                     if let Some(ref value) = cell.1.value {
-                        if let Ok(vector) = ferrosa_index::bytes_to_vec_f32(value) {
+                        if let Ok(vector) = ferrosa_index::bytes_to_f32s::<Arc<[f32]>>(value) {
                             // Use a sequential position based on current index size
                             // (placeholder offset; not a true file offset).
                             let pos = ferrosa_index::vector::RowPosition::new(
@@ -3873,7 +4048,7 @@ impl<F: FlushTarget> TableStore<F> {
                                 vi.insert_with_scope(
                                     pos,
                                     vector,
-                                    Some(key.key.as_bytes().to_vec()),
+                                    Some(Arc::from(key.key.as_bytes())),
                                 );
                             }
                         }
@@ -5447,7 +5622,7 @@ impl<F: FlushTarget> TableStore<F> {
         // reloads the view.
         let new_active: Arc<dyn Memtable> = new_memtable();
         let phase_start = Instant::now();
-        let target_catalog = {
+        let (target_catalog, target_schema) = {
             let old_view = self.view.load_full();
             let flush_schema = Arc::clone(&old_view.indexes.schema);
             let flush_catalog = Arc::clone(&old_view.indexes.catalog);
@@ -5458,7 +5633,8 @@ impl<F: FlushTarget> TableStore<F> {
             if !Arc::ptr_eq(&target_schema, &flush_schema) {
                 self.schema.store(Arc::clone(&target_schema));
             }
-            let fresh_indexes = new_indexes(Arc::clone(&target_catalog), target_schema);
+            let fresh_indexes =
+                new_indexes(Arc::clone(&target_catalog), Arc::clone(&target_schema));
             let fresh_vector_indexes = new_vector_indexes(&target_catalog.vector_index_configs);
             let frozen_active = Arc::clone(&old_view.active);
             let old_indexes = Arc::clone(&old_view.indexes);
@@ -5506,7 +5682,7 @@ impl<F: FlushTarget> TableStore<F> {
             // Writers that load the view from here on write to the new
             // memtable; seal the old one and wait out the writes inside it.
             old_indexes.gate.seal_and_drain(MEMTABLE_SEAL_DEADLINE)?;
-            target_catalog
+            (target_catalog, target_schema)
         };
         crate::metrics::observe_flush_phase(
             crate::metrics::FlushPhase::SwapMemtable,
@@ -5531,7 +5707,8 @@ impl<F: FlushTarget> TableStore<F> {
         }
         let mut outcome = FlushOutcome::NothingToFlush;
         for memtable in &sealed {
-            if self.flush_sealed(memtable, &target_catalog, total_start)? == FlushOutcome::Published
+            if self.flush_sealed(memtable, &target_catalog, &target_schema, total_start)?
+                == FlushOutcome::Published
             {
                 outcome = FlushOutcome::Published;
             }
@@ -5546,6 +5723,7 @@ impl<F: FlushTarget> TableStore<F> {
         &self,
         sealed: &Arc<SealedMemtable>,
         target_catalog: &Arc<IndexCatalog>,
+        target_schema: &Arc<TableSchema>,
         total_start: Instant,
     ) -> Result<FlushOutcome> {
         let old_active = Arc::clone(&sealed.memtable);
@@ -5665,12 +5843,17 @@ impl<F: FlushTarget> TableStore<F> {
             );
         }
 
-        // Step 5a': the memtable speaks flat ordinals (statics first, static
-        // cells inside clustered rows); an SSTable numbers statics and regulars
-        // separately and holds statics in the static row. Convert here, in
-        // place, before any header is built (t_65661473).
-        for p in partitions.iter_mut() {
-            crate::ordinal_space::flat_into_sstable_space(p, schema.static_columns.len())?;
+        // Sidecars consume memtable FLAT cell ordinals. Indexed flushes
+        // convert in place only after extraction; early unindexed branches
+        // already need SSTable ordinal space for their writers.
+        let indexed_flush = flush_catalog.declares_any() || target_catalog.declares_any();
+        if !indexed_flush {
+            for partition in &mut partitions {
+                crate::ordinal_space::flat_into_sstable_space(
+                    partition,
+                    schema.static_columns.len(),
+                )?;
+            }
         }
 
         if partitions.is_empty() {
@@ -5712,7 +5895,7 @@ impl<F: FlushTarget> TableStore<F> {
                 )));
             }
             Some(Ok(config)) => {
-                if flush_catalog.declares_any() || target_catalog.declares_any() {
+                if indexed_flush {
                     return Err(ferrosa_common::Error::InvalidData(format!(
                         "{}.{} sets {} so a flush writes one generation per window, but the \
                          table declares a secondary, vector or full-text index: a memtable's \
@@ -5745,7 +5928,7 @@ impl<F: FlushTarget> TableStore<F> {
         // fulltext/vector steps stay exactly as-is.
         // Sidecars are written for the target catalog (see Step 5b), so a
         // flush whose rotation added an index must take the indexed path.
-        let can_shard = !flush_catalog.declares_any() && !target_catalog.declares_any();
+        let can_shard = !indexed_flush;
         let num_shards = flush::desired_flush_shards(
             partitions.len(),
             can_shard,
@@ -5774,7 +5957,16 @@ impl<F: FlushTarget> TableStore<F> {
         // memtable to get here: an index it dropped gets no sidecar, and an
         // index it added is posted now from the frozen rows, which no write
         // can reach any more.
-        let sidecar_indexes = self.flush_sidecar_indexes(&old_indexes, target_catalog, &partitions);
+        // Catalog edits use the target layout; frozen rows keep their original
+        // ordinals. Normalize definitions once, without remapping/copying rows.
+        // Ordinary flushes borrow the catalog and allocate nothing here.
+        let source_catalog = if Arc::ptr_eq(&flush_schema, target_schema) {
+            std::borrow::Cow::Borrowed(target_catalog.as_ref())
+        } else {
+            std::borrow::Cow::Owned(target_catalog.for_source_schema(target_schema, &flush_schema))
+        };
+        let sidecar_indexes =
+            self.flush_sidecar_indexes(&old_indexes, &source_catalog, &partitions);
         // Serve exactly these postings for the flushing memtable until the
         // sidecar is installed: an index the rotating DDL added now reads the
         // frozen rows too, and one it dropped no longer answers from them.
@@ -5784,7 +5976,7 @@ impl<F: FlushTarget> TableStore<F> {
         // its own index, or one built from the rows for an index the rotating
         // DDL added. The same map feeds the vector sidecars below.
         let flush_vector_indexes: Arc<HashMap<String, Arc<VectorMemtableIndex>>> = Arc::new(
-            target_catalog
+            source_catalog
                 .vector_index_configs
                 .iter()
                 .map(|cfg| {
@@ -5803,12 +5995,7 @@ impl<F: FlushTarget> TableStore<F> {
         // when it declares the index). Built before encoding, from the rows as
         // the memtable holds them; written once the generation is known.
         let mut fti_sidecars: Vec<(String, std::result::Result<Vec<u8>, String>)> = Vec::new();
-        for (index_name, target_pos) in &target_catalog.fulltext_indexes {
-            let col_pos = flush_catalog
-                .fulltext_indexes
-                .iter()
-                .find(|(name, _)| name == index_name)
-                .map_or(target_pos, |(_, frozen_pos)| frozen_pos);
+        for (index_name, col_pos) in &source_catalog.fulltext_indexes {
             let mut fti_builder = ferrosa_index::fulltext::builder::FullTextIndexBuilder::new();
             for partition in &partitions {
                 let pk_bytes = partition.key.key.as_bytes();
@@ -5841,6 +6028,15 @@ impl<F: FlushTarget> TableStore<F> {
                 index_name.clone(),
                 fti_builder.finish().map_err(|e| e.to_string()),
             ));
+        }
+
+        if indexed_flush {
+            for partition in &mut partitions {
+                crate::ordinal_space::flat_into_sstable_space(
+                    partition,
+                    schema.static_columns.len(),
+                )?;
+            }
         }
 
         let header = flush::header_for_flush(&schema, &partitions);
@@ -6041,8 +6237,11 @@ impl<F: FlushTarget> TableStore<F> {
                 continue;
             };
             {
-                let drained_with_scopes = vi.entries_with_scopes();
-                if drained_with_scopes.is_empty() {
+                // Shared with the frozen memtable's index, which keeps serving
+                // reads until the sidecars are installed: every build below
+                // borrows these vectors, none copies one.
+                let entries = vi.entries_with_scopes();
+                if entries.is_empty() {
                     self.complete_flushed_vector_sidecars(
                         gen,
                         cfg,
@@ -6050,46 +6249,29 @@ impl<F: FlushTarget> TableStore<F> {
                     );
                     continue;
                 }
-
-                let drained: Vec<_> = drained_with_scopes
-                    .iter()
-                    .map(|(_, pos, vector)| (*pos, vector.clone()))
-                    .collect();
+                let all = || entries.iter().map(|(_, pos, vector)| (*pos, &**vector));
 
                 match target_catalog.vector_index_method(&cfg.index_name) {
                     VectorIndexMethod::Hnsw => {
-                        // Build HNSW graph and serialize via the public API.
-                        match ferrosa_index::vector::hnsw::build_and_serialize(
-                            cfg.m,
-                            cfg.ef_construction,
-                            cfg.metric,
-                            drained,
+                        match write_streamed_vector_sidecar(
+                            &*self.flush_target,
+                            gen,
+                            &cfg.index_name,
+                            cfg,
+                            all(),
                         ) {
-                            Ok(vec_bytes) => {
-                                if let Err(e) = self.flush_target.write_vector_sidecar(
-                                    gen,
-                                    &cfg.index_name,
-                                    &vec_bytes,
-                                ) {
-                                    tracing::error!(%e, index_name = %cfg.index_name, gen,
-                                        "store: vector sidecar persist failed");
-                                    #[cfg(debug_assertions)]
-                                    panic!("vector sidecar persist failed: {e}");
-                                } else {
-                                    tracing::debug!(index_name = %cfg.index_name, gen,
-                                        "flush: vector sidecar written");
-                                }
-                            }
+                            Ok(_) => tracing::debug!(index_name = %cfg.index_name, gen,
+                                "flush: vector sidecar written"),
                             Err(e) => {
                                 tracing::error!(%e, index_name = %cfg.index_name, gen,
-                                    "store: vector sidecar serialization failed");
+                                    "store: vector sidecar build or persist failed");
                                 #[cfg(debug_assertions)]
-                                panic!("vector sidecar serialize failed: {e}");
+                                panic!("vector sidecar build or persist failed: {e}");
                             }
                         }
                     }
                     VectorIndexMethod::QuantizedIvf => {
-                        match build_quantized_vector_artifact(cfg, drained) {
+                        match build_quantized_vector_artifact(cfg, all()) {
                             Ok(qvec_bytes) => {
                                 if let Err(e) = self.flush_target.write_quantized_vector_sidecar(
                                     gen,
@@ -6115,17 +6297,22 @@ impl<F: FlushTarget> TableStore<F> {
                     }
                 }
 
+                // Grouped by reference: the scope and each vector stay where
+                // they are, one entry per row points at them.
                 let mut by_scope: HashMap<
-                    Vec<u8>,
-                    Vec<(ferrosa_index::vector::RowPosition, Vec<f32>)>,
+                    &[u8],
+                    Vec<(ferrosa_index::vector::RowPosition, &[f32])>,
                 > = HashMap::new();
                 // A vector with no scope is in no scoped sidecar, so the
                 // generation is left without a manifest and rebuilt from its
                 // rows rather than marked complete without that row.
                 let mut complete = true;
-                for (scope, pos, vector) in drained_with_scopes {
+                for (scope, pos, vector) in &entries {
                     match scope {
-                        Some(scope) => by_scope.entry(scope).or_default().push((pos, vector)),
+                        Some(scope) => by_scope
+                            .entry(&**scope)
+                            .or_default()
+                            .push((*pos, &**vector)),
                         None => complete = false,
                     }
                 }
@@ -6134,40 +6321,25 @@ impl<F: FlushTarget> TableStore<F> {
                 // Remember these scopes so `ann_search_partitions` can later
                 // enumerate the scoped sidecars and recover partition keys
                 // (the global sidecar drops the scope on write).
-                self.record_vector_scopes(&cfg.index_name, by_scope.keys());
+                self.record_vector_scopes(&cfg.index_name, by_scope.keys().copied());
                 for (scope, scoped_entries) in by_scope {
-                    let scoped_index_name = scoped_vector_sidecar_name(&cfg.index_name, &scope);
+                    let scoped_index_name = scoped_vector_sidecar_name(&cfg.index_name, scope);
                     let vectors = scoped_entries.len();
-                    match ferrosa_index::vector::hnsw::build_and_serialize(
-                        cfg.m,
-                        cfg.ef_construction,
-                        cfg.metric,
+                    match write_streamed_vector_sidecar(
+                        &*self.flush_target,
+                        gen,
+                        &scoped_index_name,
+                        cfg,
                         scoped_entries,
                     ) {
-                        Ok(vec_bytes) => {
-                            if let Err(e) = self.flush_target.write_vector_sidecar(
-                                gen,
-                                &scoped_index_name,
-                                &vec_bytes,
-                            ) {
-                                complete = false;
-                                tracing::error!(%e, index_name = %scoped_index_name, gen,
-                                    "store: scoped vector sidecar persist failed; the generation \
-                                     is rebuilt from its rows before ANN answers over it");
-                                if cfg!(debug_assertions) {
-                                    panic!("scoped vector sidecar persist failed: {e}");
-                                }
-                            } else {
-                                manifest.add_scope(vectors, vec_bytes.len());
-                            }
-                        }
+                        Ok(bytes) => manifest.add_scope(vectors, bytes as usize),
                         Err(e) => {
                             complete = false;
                             tracing::error!(%e, index_name = %scoped_index_name, gen,
-                                "store: scoped vector sidecar serialization failed; the \
+                                "store: scoped vector sidecar build or persist failed; the \
                                  generation is rebuilt from its rows before ANN answers over it");
                             if cfg!(debug_assertions) {
-                                panic!("scoped vector sidecar serialize failed: {e}");
+                                panic!("scoped vector sidecar build or persist failed: {e}");
                             }
                         }
                     }
@@ -6790,6 +6962,26 @@ impl<F: FlushTarget> TableStore<F> {
         end: Option<&DecoratedKey>,
         matches: &dyn Fn(&DecoratedKey) -> bool,
     ) -> Result<u64> {
+        self.count_range_matching_impl(start, end, matches, false)
+    }
+
+    /// Exact single-row liveness count; TTL/deletion cases retain full cell LWW.
+    pub fn count_live_single_row_range_matching(
+        &self,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+        matches: &dyn Fn(&DecoratedKey) -> bool,
+    ) -> Result<u64> {
+        self.count_range_matching_impl(start, end, matches, true)
+    }
+
+    fn count_range_matching_impl(
+        &self,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+        matches: &dyn Fn(&DecoratedKey) -> bool,
+        live_single_row: bool,
+    ) -> Result<u64> {
         let view = self.view.load_full();
         let start_owned = start.cloned();
         let end_owned = end.cloned();
@@ -6814,14 +7006,6 @@ impl<F: FlushTarget> TableStore<F> {
         )?;
         let sstables_slice = &sst_readers[..];
 
-        let mut merger = crate::range_merger::merger_for_metadata_sources(
-            active_iter,
-            flushing_iters,
-            sstables_slice,
-            start_owned,
-            end_owned,
-        )?;
-
         let mut total: u64 = 0;
         // Each row in the merged partition contributes 1 to the
         // count unless its tombstone marker covers it.
@@ -6843,8 +7027,33 @@ impl<F: FlushTarget> TableStore<F> {
                 c.max_token,
             ));
         }
+        let schema = self.schema.load_full();
+        let mut merger = if live_single_row {
+            crate::range_merger::merger_for_live_single_row_count(
+                active_iter,
+                flushing_iters,
+                sstables_slice,
+                start_owned,
+                end_owned,
+                &schema,
+                !table_delete.is_live(),
+            )?
+        } else {
+            crate::range_merger::merger_for_metadata_sources(
+                active_iter,
+                flushing_iters,
+                sstables_slice,
+                start_owned,
+                end_owned,
+            )?
+        };
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            .min(i32::MAX as u64) as i32;
         while let Some(p) = merger.next_merged_partition()? {
-            if !matches(&p.key) || crate::table_tombstone::is_table_tombstone_key(&p.key) {
+            if crate::table_tombstone::is_table_tombstone_key(&p.key) {
                 continue;
             }
             let p = if !table_delete.is_live()
@@ -6852,11 +7061,23 @@ impl<F: FlushTarget> TableStore<F> {
             {
                 let mut owned = Arc::unwrap_or_clone(p);
                 merge::apply_table_deletion(&mut owned, table_delete);
-                owned
+                std::borrow::Cow::Owned(owned)
             } else {
-                Arc::unwrap_or_clone(p)
+                // Counting observes row metadata; it does not need an owned
+                // copy of every resident cell. Keep the merger's shared view.
+                std::borrow::Cow::Borrowed(p.as_ref())
             };
-            total = total.saturating_add(p.rows.len() as u64);
+            // Resolve snapshot predicates only after this pinned physical image
+            // (including any exceptional cell reads) has been obtained.
+            if !matches(&p.key) {
+                continue;
+            }
+            let rows = if live_single_row {
+                p.rows.iter().filter(|r| r.is_visible_at(now_secs)).count()
+            } else {
+                p.rows.len()
+            };
+            total = total.saturating_add(rows as u64);
             if p.static_row.is_some() {
                 total = total.saturating_add(1);
             }
@@ -8940,11 +9161,7 @@ impl<F: FlushTarget> TableStore<F> {
     /// written its sidecars, and a scope left unrecorded makes
     /// `ann_search_partitions` miss that scope's sidecar until the next
     /// flush records it again.
-    fn record_vector_scopes<'a>(
-        &self,
-        index_name: &str,
-        scopes: impl Iterator<Item = &'a Vec<u8>>,
-    ) {
+    fn record_vector_scopes<'a>(&self, index_name: &str, scopes: impl Iterator<Item = &'a [u8]>) {
         if let Err(e) = self.try_record_vector_scopes(index_name, scopes) {
             tracing::error!(
                 index_name,
@@ -8959,9 +9176,9 @@ impl<F: FlushTarget> TableStore<F> {
     fn try_record_vector_scopes<'a>(
         &self,
         index_name: &str,
-        scopes: impl Iterator<Item = &'a Vec<u8>>,
+        scopes: impl Iterator<Item = &'a [u8]>,
     ) -> Result<()> {
-        let scopes: Vec<&Vec<u8>> = scopes.collect();
+        let scopes: Vec<&[u8]> = scopes.collect();
         crate::lockfree::update(&self.vector_index_scopes, "vector index scopes", |map| {
             let known = map.get(index_name);
             if scopes
@@ -8971,7 +9188,7 @@ impl<F: FlushTarget> TableStore<F> {
                 return (None, ());
             }
             let mut set = known.map(|set| (**set).clone()).unwrap_or_default();
-            set.extend(scopes.iter().map(|scope| (*scope).clone()));
+            set.extend(scopes.iter().map(|scope| scope.to_vec()));
             let mut next = map.clone();
             next.insert(index_name.to_string(), Arc::new(set));
             (Some(next), ())
@@ -9012,8 +9229,10 @@ impl<F: FlushTarget> TableStore<F> {
     fn recover_vector_scopes(&self, index_name: &str) -> Result<()> {
         let live = self.live_generations();
         let manifest_name = vector_manifest_name(index_name);
+        let marker_name = vector_verified_marker_name(index_name);
         let mut scoped_bytes: HashMap<u64, u64> = HashMap::new();
         let mut with_manifest = Vec::new();
+        let mut with_marker = std::collections::HashSet::new();
         let mut scopes = std::collections::HashSet::new();
         for file in self.flush_target.list_vector_sidecars()? {
             if !live.contains(&file.generation) {
@@ -9021,17 +9240,25 @@ impl<F: FlushTarget> TableStore<F> {
             }
             if file.name == manifest_name {
                 with_manifest.push(file.generation);
+            } else if file.name == marker_name {
+                with_marker.insert(file.generation);
             } else if let Some(scope) = scope_of_vector_sidecar(index_name, &file.name) {
                 scopes.insert(scope?);
                 let total = scoped_bytes.entry(file.generation).or_default();
                 *total = total.saturating_add(file.len);
             }
         }
-        let mut ready = 0usize;
+        let (mut ready, mut verified) = (0usize, 0usize);
         for gen in with_manifest {
             let on_disk = scoped_bytes.get(&gen).copied().unwrap_or(0);
             match self.read_vector_manifest(gen, index_name) {
                 Ok(Some(manifest)) if manifest.bytes == on_disk => {
+                    if with_marker.contains(&gen)
+                        && self.vector_marker_vouches_for(gen, index_name, &manifest)
+                    {
+                        self.note_vector_verified(&gen.to_string(), index_name);
+                        verified += 1;
+                    }
                     self.mark_vector_ready(&gen.to_string(), index_name);
                     ready += 1;
                 }
@@ -9049,10 +9276,11 @@ impl<F: FlushTarget> TableStore<F> {
             index_name,
             scopes = scopes.len(),
             ready_generations = ready,
+            verified_generations = verified,
             pending_generations = live.len().saturating_sub(ready),
             "recovered vector sidecars from disk"
         );
-        self.record_vector_scopes(index_name, scopes.iter());
+        self.record_vector_scopes(index_name, scopes.iter().map(Vec::as_slice));
         Ok(())
     }
 
@@ -9089,6 +9317,63 @@ impl<F: FlushTarget> TableStore<F> {
     fn unmark_vector_ready(&self, gen: &str, index_name: &str) {
         if let Err(e) = self.vector_ready.remove(&vector_ready_key(gen, index_name)) {
             tracing::error!(%e, gen, index_name, "could not unmark a generation's vector sidecars");
+        }
+    }
+
+    /// Whether generation `gen`'s verified marker for `index_name` was
+    /// written for exactly `manifest`. An unreadable or malformed marker
+    /// vouches for nothing (logged): the generation is checked again.
+    fn vector_marker_vouches_for(
+        &self,
+        gen: u64,
+        index_name: &str,
+        manifest: &VectorSidecarManifest,
+    ) -> bool {
+        let marker = self
+            .flush_target
+            .read_vector_sidecar(gen, &vector_verified_marker_name(index_name));
+        match marker {
+            Ok(Some(bytes)) => match decode_vector_verified(&bytes) {
+                Some(vouched) => vouched == *manifest,
+                None => {
+                    tracing::warn!(
+                        gen,
+                        index_name,
+                        "vector verified marker is malformed; the generation is checked again"
+                    );
+                    false
+                }
+            },
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(%e, gen, index_name, "vector verified marker is unreadable; the generation is checked again");
+                false
+            }
+        }
+    }
+
+    /// Mark generation `gen`'s sidecars for `index_name` verified in memory.
+    fn note_vector_verified(&self, gen: &str, index_name: &str) {
+        if let Err(e) = self
+            .vector_verified
+            .insert(&vector_ready_key(gen, index_name))
+        {
+            // Unmarked, it is decoded again next pass: costlier, never wrong.
+            tracing::error!(%e, gen, index_name, "could not mark a generation's vector sidecars verified");
+        }
+    }
+
+    /// Mark generation `gen`'s sidecars for `index_name`, described by
+    /// `manifest`, verified: in memory, and on disk so a restart does not
+    /// decode them again.
+    fn mark_vector_verified(&self, gen: u64, index_name: &str, manifest: &VectorSidecarManifest) {
+        self.note_vector_verified(&gen.to_string(), index_name);
+        if let Err(e) = self.flush_target.write_vector_sidecar(
+            gen,
+            &vector_verified_marker_name(index_name),
+            &encode_vector_verified(manifest),
+        ) {
+            tracing::error!(%e, gen, index_name, "could not persist a generation's verified mark; it is decoded again after a restart");
         }
     }
 
@@ -9172,9 +9457,11 @@ impl<F: FlushTarget> TableStore<F> {
     /// the dropped index's vectors.
     fn remove_vector_sidecars(&self, index_name: &str) -> Result<()> {
         let manifest_name = vector_manifest_name(index_name);
+        let marker_name = vector_verified_marker_name(index_name);
         for file in self.flush_target.list_vector_sidecars()? {
             if file.name == index_name
                 || file.name == manifest_name
+                || file.name == marker_name
                 || scope_of_vector_sidecar(index_name, &file.name).is_some()
             {
                 self.flush_target
@@ -9198,9 +9485,11 @@ impl<F: FlushTarget> TableStore<F> {
     fn clear_generation_vector_sidecars(&self, gen: u64, index_name: &str) -> Result<()> {
         self.unmark_vector_ready(&gen.to_string(), index_name);
         let manifest_name = vector_manifest_name(index_name);
+        let marker_name = vector_verified_marker_name(index_name);
         for file in self.flush_target.list_vector_sidecars()? {
             if file.generation == gen
                 && (file.name == manifest_name
+                    || file.name == marker_name
                     || scope_of_vector_sidecar(index_name, &file.name).is_some())
             {
                 self.flush_target.remove_vector_sidecar(gen, &file.name)?;
@@ -9246,18 +9535,23 @@ impl<F: FlushTarget> TableStore<F> {
             build_generation_vector_sidecars(&*self.flush_target, reader, schema, gen, cfg, |s| {
                 scopes.insert(s.to_vec());
             })?;
-        self.try_record_vector_scopes(&cfg.index_name, scopes.iter())?;
+        self.try_record_vector_scopes(&cfg.index_name, scopes.iter().map(Vec::as_slice))?;
         Ok(manifest)
     }
 
-    /// Mark generation `gen`'s freshly built sidecars for `index_name`
-    /// verified and complete: ANN answers over it from here on.
-    fn complete_vector_build(&self, gen: &str, index_name: &str) {
-        if let Err(e) = self
-            .vector_verified
-            .insert(&vector_ready_key(gen, index_name))
-        {
-            tracing::error!(%e, gen, index_name, "could not mark freshly built vector sidecars verified; they are decoded once more");
+    /// Mark generation `gen`'s freshly built sidecars for `index_name`,
+    /// described by `manifest`, verified and complete: ANN answers over it
+    /// from here on.
+    fn complete_vector_build(&self, gen: &str, index_name: &str, manifest: &VectorSidecarManifest) {
+        match gen.parse::<u64>() {
+            Ok(number) => self.mark_vector_verified(number, index_name, manifest),
+            // Unreachable from the builds, which name sidecars by number;
+            // unmarked, the generation is decoded once more.
+            Err(_) => tracing::error!(
+                gen,
+                index_name,
+                "generation id is not numeric; its fresh vector sidecars are not marked verified"
+            ),
         }
         self.mark_vector_ready(gen, index_name);
     }
@@ -9320,7 +9614,7 @@ impl<F: FlushTarget> TableStore<F> {
                         index_name,
                         self.take_vector_invalid_reason(&key).as_str(),
                     );
-                    self.complete_vector_build(&gen, index_name);
+                    self.complete_vector_build(&gen, index_name, &manifest);
                     tracing::info!(
                         index_name,
                         gen = %gen,
@@ -9396,6 +9690,15 @@ impl<F: FlushTarget> TableStore<F> {
         }
         if let Err(e) = self.vector_verified.remove(&key) {
             tracing::error!(%e, gen, index_name, "could not clear a generation's verified mark");
+        }
+        // And on disk, so a restart before the repair does not trust it. A
+        // non-numeric generation has no sidecars to remove: they are named
+        // by number.
+        if let Ok(number) = gen.parse::<u64>() {
+            let marker = vector_verified_marker_name(index_name);
+            if let Err(e) = self.flush_target.remove_vector_sidecar(number, &marker) {
+                tracing::error!(%e, gen, index_name, "could not remove an invalid generation's verified marker; its rebuild clears it");
+            }
         }
         self.unmark_vector_ready(gen, index_name);
     }
@@ -9519,7 +9822,7 @@ impl<F: FlushTarget> TableStore<F> {
                 "vector index: scopes with sidecars on disk were missing from the scope set; \
                  ANN never probed them. Restored."
             );
-            self.try_record_vector_scopes(index_name, missing_scopes.iter())?;
+            self.try_record_vector_scopes(index_name, missing_scopes.iter().map(Vec::as_slice))?;
             crate::metrics::index_repaired(index_name, VectorInvalidReason::ScopeSet.as_str());
         }
         outcome.pending = self.vector_generations_pending(index_name).len();
@@ -9567,9 +9870,10 @@ impl<F: FlushTarget> TableStore<F> {
             .ok_or(VectorInvalidReason::Missing)?;
         let mut vectors = 0u64;
         for (_, name, _) in files {
+            // Mapped and streamed: the check holds counters, not the sidecar.
             let bytes = self
                 .flush_target
-                .read_vector_sidecar(gen, name)
+                .map_vector_sidecar(gen, name)
                 .map_err(|_| VectorInvalidReason::Corrupt)?
                 .ok_or(VectorInvalidReason::Missing)?;
             let stats = ferrosa_index::vector::hnsw::inspect_bytes(&bytes)
@@ -9584,13 +9888,7 @@ impl<F: FlushTarget> TableStore<F> {
         if vectors != manifest.vectors {
             return Err(VectorInvalidReason::CountMismatch);
         }
-        if let Err(e) = self
-            .vector_verified
-            .insert(&vector_ready_key(&gen.to_string(), index_name))
-        {
-            // Unmarked, it is decoded again next pass: costlier, never wrong.
-            tracing::error!(%e, gen, index_name, "could not mark a generation's vector sidecars verified");
-        }
+        self.mark_vector_verified(gen, index_name, &manifest);
         Ok(())
     }
 
@@ -9679,7 +9977,7 @@ impl<F: FlushTarget> TableStore<F> {
                 Ok(manifest) => {
                     outcome.repaired += 1;
                     outcome.vectors += manifest.vectors;
-                    self.complete_vector_build(output_gen, &cfg.index_name);
+                    self.complete_vector_build(output_gen, &cfg.index_name, &manifest);
                 }
                 Err(e) => {
                     outcome.failed += 1;
@@ -10553,8 +10851,10 @@ impl<F: FlushTarget> TableStore<F> {
             if let Ok(gen) = gen_str.parse::<u64>() {
                 match method {
                     VectorIndexMethod::Hnsw => {
+                        // Mapped and searched where it lies: a query reads the
+                        // nodes it visits, never the whole sidecar.
                         if let Some(vec_bytes) =
-                            self.flush_target.read_vector_sidecar(gen, index_name)?
+                            self.flush_target.map_vector_sidecar(gen, index_name)?
                         {
                             let results = ferrosa_index::vector::hnsw::search_from_bytes(
                                 &vec_bytes, query, k, ef_search,
@@ -10665,37 +10965,19 @@ impl<F: FlushTarget> TableStore<F> {
             }
         }
 
-        let scoped_index_name = scoped_vector_sidecar_name(index_name, partition_scope);
-        for (gen_str, _dir) in guard.sstable_ids.iter() {
-            if let Ok(gen) = gen_str.parse::<u64>() {
-                if let Some(vec_bytes) = self
-                    .flush_target
-                    .read_vector_sidecar(gen, &scoped_index_name)?
-                {
-                    // A sidecar that cannot be searched fails the query:
-                    // skipping it would answer without this scope's rows.
-                    let results = ferrosa_index::vector::hnsw::search_from_bytes(
-                        &vec_bytes, query, k, ef_search,
-                    )
-                    .map_err(|e| {
-                        // Fail this query, and queue the generation for the
-                        // repair so the next one is not failed the same way.
-                        self.invalidate_vector_generation(
-                            gen_str,
-                            index_name,
-                            VectorInvalidReason::Corrupt,
-                        );
-                        ferrosa_common::Error::InvalidData(format!(
-                            "scoped vector sidecar {scoped_index_name} of generation {gen} \
-                             cannot be searched: {e}"
-                        ))
-                    })?;
-                    for result in results {
-                        merged.insert(VectorRowRef::sstable(gen, result.position), result);
-                    }
-                }
-            }
-        }
+        self.search_scoped_sidecars(
+            &guard,
+            index_name,
+            partition_scope,
+            ScopedQuery {
+                query,
+                k,
+                ef_search,
+            },
+            &mut |gen, result| {
+                merged.insert(VectorRowRef::sstable(gen, result.position), result);
+            },
+        )?;
 
         let mut all: Vec<(VectorRowRef, IndexResult)> = merged.into_iter().collect();
         all.sort_by(|a, b| {
@@ -10706,6 +10988,54 @@ impl<F: FlushTarget> TableStore<F> {
         });
         all.truncate(k);
         Ok(all.into_iter().map(|(_, result)| result).collect())
+    }
+
+    /// Search every live generation's sidecar for `scope` of `index_name`,
+    /// handing each result to `found` with its generation. Each sidecar is
+    /// mapped and searched where it lies.
+    ///
+    /// A sidecar that cannot be searched fails the query, since skipping it
+    /// would answer without this scope's rows, and queues its generation for
+    /// the repair so the next query is not failed the same way.
+    fn search_scoped_sidecars(
+        &self,
+        view: &StoreView,
+        index_name: &str,
+        scope: &[u8],
+        q: ScopedQuery<'_>,
+        found: &mut dyn FnMut(u64, ferrosa_index::vector::IndexResult),
+    ) -> Result<()> {
+        let scoped_index_name = scoped_vector_sidecar_name(index_name, scope);
+        for (gen_str, _dir) in view.sstable_ids.iter() {
+            let Ok(gen) = gen_str.parse::<u64>() else {
+                // Sidecars are named by number: a non-numeric generation
+                // has none.
+                continue;
+            };
+            let Some(bytes) = self
+                .flush_target
+                .map_vector_sidecar(gen, &scoped_index_name)?
+            else {
+                continue;
+            };
+            let results =
+                ferrosa_index::vector::hnsw::search_from_bytes(&bytes, q.query, q.k, q.ef_search)
+                    .map_err(|e| {
+                    self.invalidate_vector_generation(
+                        gen_str,
+                        index_name,
+                        VectorInvalidReason::Corrupt,
+                    );
+                    ferrosa_common::Error::InvalidData(format!(
+                        "scoped vector sidecar {scoped_index_name} of generation {gen} \
+                             cannot be searched: {e}"
+                    ))
+                })?;
+            for result in results {
+                found(gen, result);
+            }
+        }
+        Ok(())
     }
 
     /// Consult the vector index for the `k` nearest rows and return their
@@ -10777,7 +11107,7 @@ impl<F: FlushTarget> TableStore<F> {
             })?;
             for (result, scope) in results {
                 match scope {
-                    Some(scope) => consider(scope, result.score),
+                    Some(scope) => consider(scope.to_vec(), result.score),
                     None => scopeless_memtable_hits += 1,
                 }
             }
@@ -10793,17 +11123,27 @@ impl<F: FlushTarget> TableStore<F> {
         }
 
         // Source (b): flushed scoped sidecars — probe each remembered scope.
-        let scopes: Vec<Vec<u8>> = self
-            .vector_index_scopes
-            .load()
-            .get(index_name)
-            .map(|set| set.iter().cloned().collect())
-            .unwrap_or_default();
-        for scope in scopes {
-            let scoped =
-                self.ann_search_in_partition_scope(index_name, &scope, query, k, ef_search)?;
-            for result in scoped {
-                consider(scope.clone(), result.score);
+        // The set is shared, not copied, and the memtables were searched
+        // above with their scopes inline, so only the sidecars are probed
+        // here. A scope's nearest result is all `consider` keeps.
+        let scopes = self.vector_index_scopes.load().get(index_name).cloned();
+        for scope in scopes.iter().flat_map(|set| set.iter()) {
+            let mut nearest: Option<f32> = None;
+            self.search_scoped_sidecars(
+                &guard,
+                index_name,
+                scope,
+                ScopedQuery {
+                    query,
+                    k,
+                    ef_search,
+                },
+                &mut |_, result| {
+                    nearest = Some(nearest.map_or(result.score, |n| n.min(result.score)));
+                },
+            )?;
+            if let Some(score) = nearest {
+                consider(scope.clone(), score);
             }
         }
 
@@ -11480,7 +11820,11 @@ impl<F: FlushTarget> TableStore<F> {
     }
 }
 
+/// Local on-disk size of generation `id`, or `None` when a required component
+/// is absent or empty. The generation may live flat in `table_dir` or in its
+/// own `table_dir/<id>/` (see [`crate::flush::generation_files_dir`]).
 fn sstable_compaction_component_size(table_dir: &std::path::Path, id: &str) -> Option<u64> {
+    let dir = crate::flush::generation_files_dir(table_dir, id);
     let mut total = 0u64;
     for suffix in [
         "Data.db",
@@ -11490,24 +11834,32 @@ fn sstable_compaction_component_size(table_dir: &std::path::Path, id: &str) -> O
         "Statistics.db",
         "TOC.txt",
     ] {
-        let path = table_dir.join(format!("{id}-{suffix}"));
-        let meta = std::fs::metadata(&path).ok()?;
-        if matches!(suffix, "Data.db" | "Partitions.db" | "Statistics.db") && meta.len() == 0 {
+        let len = component_len(&dir.join(format!("{id}-{suffix}")))?;
+        if matches!(suffix, "Data.db" | "Partitions.db" | "Statistics.db") && len == 0 {
             return None;
         }
-        total = total.saturating_add(meta.len());
+        total = total.saturating_add(len);
     }
-    let compression_info = table_dir.join(format!("{id}-CompressionInfo.db"));
-    if let Ok(meta) = std::fs::metadata(compression_info) {
-        total = total.saturating_add(meta.len());
-    }
-    for suffix in ["Digest.crc32", "CRC.db"] {
-        let path = table_dir.join(format!("{id}-{suffix}"));
-        if let Ok(meta) = std::fs::metadata(path) {
-            total = total.saturating_add(meta.len());
+    for suffix in ["CompressionInfo.db", "Digest.crc32", "CRC.db"] {
+        if let Some(len) = component_len(&dir.join(format!("{id}-{suffix}"))) {
+            total = total.saturating_add(len);
         }
     }
     Some(total)
+}
+
+/// A component's length. Absence is the designed `None` (an evicted or
+/// optional component); any other stat failure is also `None`, so planning
+/// falls back to the cached size, but it is logged rather than read as absence.
+fn component_len(path: &std::path::Path) -> Option<u64> {
+    match std::fs::metadata(path) {
+        Ok(meta) => Some(meta.len()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "compaction planning: could not stat an SSTable component");
+            None
+        }
+    }
 }
 
 fn sstable_compaction_remote_component_available(table_dir: &std::path::Path, id: &str) -> bool {
@@ -11753,6 +12105,49 @@ mod tests {
     use ferrosa_common::key::PartitionKey;
     use ferrosa_common::schema::ColumnDefinition;
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition};
+
+    /// Write the components compaction planning sizes, each `len` bytes.
+    fn write_sized_components(dir: &std::path::Path, id: &str, len: usize) -> u64 {
+        std::fs::create_dir_all(dir).unwrap();
+        let suffixes = [
+            "Data.db",
+            "Partitions.db",
+            "Rows.db",
+            "Filter.db",
+            "Statistics.db",
+            "TOC.txt",
+        ];
+        suffixes.iter().for_each(|suffix| {
+            std::fs::write(dir.join(format!("{id}-{suffix}")), vec![1u8; len]).unwrap();
+        });
+        (suffixes.len() * len) as u64
+    }
+
+    /// A generation restored from S3 into `<table>/<gen>/` while registered
+    /// with its table dir was sized as "missing" by planning, which warned on
+    /// every pass (122k times in two hours on one live node) and fell back to
+    /// a cached size.
+    #[test]
+    fn compaction_sizing_finds_a_generation_in_its_own_directory() {
+        let table = tempfile::tempdir().unwrap();
+        let id = "1793143261618700";
+        let want = write_sized_components(&table.path().join(id), id, 7);
+        assert_eq!(
+            sstable_compaction_component_size(table.path(), id),
+            Some(want)
+        );
+    }
+
+    #[test]
+    fn compaction_sizing_still_reads_a_flat_generation_and_refuses_a_missing_one() {
+        let table = tempfile::tempdir().unwrap();
+        let want = write_sized_components(table.path(), "11", 3);
+        assert_eq!(
+            sstable_compaction_component_size(table.path(), "11"),
+            Some(want)
+        );
+        assert_eq!(sstable_compaction_component_size(table.path(), "12"), None);
+    }
 
     fn test_schema() -> TableSchema {
         TableSchema {
@@ -12439,6 +12834,36 @@ mod tests {
         });
     }
 
+    /// A verified marker carries the manifest it was written for and nothing
+    /// else decodes as one; the marker is never mistaken for a scoped
+    /// sidecar of its index, which would add a phantom scope.
+    #[test]
+    fn a_verified_marker_records_exactly_the_manifest_it_vouches_for() {
+        let mut manifest = VectorSidecarManifest::default();
+        manifest.add_scope(1_500, 4_600_000);
+        let marker = encode_vector_verified(&manifest);
+        assert_eq!(decode_vector_verified(&marker), Some(manifest));
+
+        let mut rebuilt = manifest;
+        rebuilt.add_scope(1, 10);
+        assert_ne!(decode_vector_verified(&marker), Some(rebuilt));
+
+        assert_eq!(
+            decode_vector_verified(&manifest.encode()),
+            None,
+            "a manifest is not a marker"
+        );
+        assert_eq!(
+            decode_vector_verified(&marker[..marker.len() - 1]),
+            None,
+            "truncated"
+        );
+        assert_eq!(decode_vector_verified(b""), None);
+        assert!(
+            scope_of_vector_sidecar("vec_idx", &vector_verified_marker_name("vec_idx")).is_none()
+        );
+    }
+
     /// A scoped sidecar name maps back to the scope it was written for, and
     /// nothing else is mistaken for one of the index's scoped sidecars.
     #[test]
@@ -12480,7 +12905,7 @@ mod tests {
                     let index = format!("vec_{}", t % 2);
                     (0..SCOPES).for_each(|i| {
                         let scope = format!("{t}-{i}").into_bytes();
-                        store.record_vector_scopes(&index, std::iter::once(&scope));
+                        store.record_vector_scopes(&index, std::iter::once(scope.as_slice()));
                     });
                 })
             })
@@ -16764,6 +17189,96 @@ mod tests {
         );
     }
 
+    /// Count the lines of `logs` that carry `needle`.
+    fn log_lines_with(logs: &crate::upload::config::tests::CapturedLogs, needle: &str) -> usize {
+        logs.text()
+            .lines()
+            .filter(|line| line.contains(needle))
+            .count()
+    }
+
+    /// An evicted generation (Data.db in S3, not on disk) is a designed steady
+    /// state, and every maintenance pass plans over every SSTable of every
+    /// table. Warning on each pass logged the same three to thirty-six
+    /// generations 18–72 times a minute on every dev node for days
+    /// (t_c14245f9). The planner must still plan the generation each pass, but
+    /// report it once per transition: evicted, local again, evicted again.
+    #[test]
+    fn compaction_planning_reports_an_evicted_sstable_on_each_transition_not_each_pass() {
+        const EVICTED: &str = "compaction planning: SSTable local components are missing or empty";
+        let tmp = tempfile::tempdir().unwrap();
+        let store = file_backed_test_store(tmp.path());
+        store
+            .write(&make_key("evicted-planning"), make_row(b"v1", 1000))
+            .unwrap();
+        store.flush().unwrap();
+        let gen = store.last_flush_generation();
+        let data_path = tmp.path().join(format!("{gen}-Data.db"));
+        let data = std::fs::read(&data_path).unwrap();
+        let remote_path = data_path.clone();
+        let remote_len = data.len() as u64;
+        ferrosa_sstable::io::register_file_read_len_hook(Arc::new(move |path| {
+            Ok((path == remote_path.as_path()).then_some(remote_len))
+        }));
+
+        let logs = crate::upload::config::tests::CapturedLogs::default();
+        tracing::subscriber::with_default(logs.subscriber(), || {
+            std::fs::remove_file(&data_path).unwrap();
+            for _ in 0..5 {
+                assert_eq!(
+                    store.sstable_metadata(tmp.path()).len(),
+                    1,
+                    "an evicted generation with a remote Data.db stays plannable"
+                );
+            }
+            assert_eq!(
+                log_lines_with(&logs, EVICTED),
+                1,
+                "one report per eviction:\n{}",
+                logs.text()
+            );
+
+            std::fs::write(&data_path, &data).unwrap();
+            for _ in 0..3 {
+                assert_eq!(store.sstable_metadata(tmp.path()).len(), 1);
+            }
+            std::fs::remove_file(&data_path).unwrap();
+            for _ in 0..5 {
+                assert_eq!(store.sstable_metadata(tmp.path()).len(), 1);
+            }
+        });
+        assert_eq!(
+            log_lines_with(&logs, EVICTED),
+            2,
+            "a second eviction is a new edge and reports again:\n{}",
+            logs.text()
+        );
+    }
+
+    /// The other half of the same edge rule: a generation with no local
+    /// components and no remote length is skipped by every pass, and is
+    /// reported once, not on each of them.
+    #[test]
+    fn compaction_planning_reports_an_unplannable_sstable_once_not_each_pass() {
+        const SKIPPED: &str = "compaction planning: skipping SSTable because required components";
+        let tmp = tempfile::tempdir().unwrap();
+        let store = file_backed_test_store(tmp.path());
+        store
+            .write(&make_key("unplannable"), make_row(b"v1", 1000))
+            .unwrap();
+        store.flush().unwrap();
+        let gen = store.last_flush_generation();
+        std::fs::remove_file(tmp.path().join(format!("{gen}-Data.db"))).unwrap();
+
+        let logs = crate::upload::config::tests::CapturedLogs::default();
+        tracing::subscriber::with_default(logs.subscriber(), || {
+            for _ in 0..5 {
+                assert!(store.sstable_metadata(tmp.path()).is_empty());
+            }
+        });
+        assert_eq!(log_lines_with(&logs, SKIPPED), 1, "{}", logs.text());
+    }
+
     #[test]
     fn sstable_metadata_does_not_scan_data_stream_order() {
         let tmp = tempfile::tempdir().unwrap();
@@ -17041,7 +17556,7 @@ mod tests {
                 m: 4,
                 ef_construction: 8,
             },
-            vec![],
+            Vec::<(ferrosa_index::vector::RowPosition, Vec<f32>)>::new(),
         )
         .expect("build empty quantized artifact");
         let reader = RecordingReadAt {
@@ -19793,6 +20308,147 @@ mod tests {
         assert!(
             missing.is_empty(),
             "partitions dropped by the pauses: {missing:?}"
+        );
+    }
+    #[test]
+    fn a_schema_and_index_rotation_keeps_old_postings_and_does_not_invent_new_cells() {
+        let old_schema = two_column_schema("pk", "zulu");
+        let store = TableStore::new_with_indexes(
+            old_schema.clone(),
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..Default::default()
+            },
+            vec![("pk_idx".into(), 0)],
+        );
+        store
+            .write(
+                &make_key("old"),
+                make_two_column_row(b"match", b"kept", 1000),
+            )
+            .unwrap();
+        let mut new_schema = old_schema;
+        new_schema.regular_columns.insert(
+            0,
+            ColumnDefinition {
+                name: "alpha".into(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            },
+        );
+        let _rotation: FlushOutcome = store
+            .flush_rotating(
+                |catalog, schema| {
+                    let mut target = catalog.remapped_onto(schema, &new_schema);
+                    target.indexed_columns.push(("alpha_idx".into(), 0));
+                    target
+                        .index_types
+                        .insert("alpha_idx".into(), IndexType::BTree);
+                    (Arc::new(target), Arc::new(new_schema))
+                },
+                || {},
+            )
+            .unwrap();
+        let key = IndexKey(b"match".to_vec());
+        assert_eq!(
+            collect_index_results(&store, "pk_idx", &key).unwrap().len(),
+            1,
+            "an ordinal shift must reuse semantically unchanged postings"
+        );
+        assert!(
+            collect_index_results(&store, "alpha_idx", &key)
+                .unwrap()
+                .is_empty(),
+            "a column absent from frozen rows must not inherit another column's values"
+        );
+    }
+    #[test]
+    fn schema_and_index_rotation_with_static_columns_keeps_flat_ordinals() {
+        let mut old_schema = two_column_schema("pk", "zulu");
+        old_schema.static_columns.push(ColumnDefinition {
+            name: "s".into(),
+            type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+        });
+        let store = TableStore::new_with_indexes(
+            old_schema.clone(),
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..Default::default()
+            },
+            vec![("pk_idx".into(), 1)],
+        );
+        let mut row = make_two_column_row(b"match", b"kept", 1000);
+        for (position, _) in &mut row.cells {
+            *position += 1;
+        }
+        store.write(&make_key("old"), row).unwrap();
+        let mut new_schema = old_schema;
+        new_schema.regular_columns.insert(
+            1,
+            ColumnDefinition {
+                name: "score".into(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            },
+        );
+        let _rotation: FlushOutcome = store
+            .flush_rotating(
+                |catalog, schema| {
+                    let mut target = catalog.remapped_onto(schema, &new_schema);
+                    target.indexed_columns.push(("score_idx".into(), 2));
+                    target
+                        .index_types
+                        .insert("score_idx".into(), IndexType::BTree);
+                    target.indexed_columns.push(("zulu_idx".into(), 3));
+                    target
+                        .index_types
+                        .insert("zulu_idx".into(), IndexType::BTree);
+                    (Arc::new(target), Arc::new(new_schema))
+                },
+                || {},
+            )
+            .unwrap();
+        assert_eq!(
+            collect_index_results(&store, "pk_idx", &IndexKey(b"match".to_vec()))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            collect_index_results(&store, "score_idx", &IndexKey(b"match".to_vec()))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            collect_index_results(&store, "zulu_idx", &IndexKey(b"kept".to_vec()))
+                .unwrap()
+                .len(),
+            1,
+            "new index extraction must use the frozen flat row layout before SSTable conversion"
+        );
+        let row = Row {
+            clustering: 1_i32.to_be_bytes().to_vec(),
+            cells: vec![
+                (1, CellValue::live(b"fresh".to_vec(), 2000)),
+                (2, CellValue::live(b"new score".to_vec(), 2000)),
+                (3, CellValue::live(b"more".to_vec(), 2000)),
+            ],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(2000),
+        };
+        store.write(&make_key("new"), row).unwrap();
+        assert_eq!(
+            collect_index_results(&store, "pk_idx", &IndexKey(b"fresh".to_vec()))
+                .unwrap()
+                .len(),
+            1,
+            "static columns occupy the prefix of the shared cell-ordinal space"
+        );
+        assert_eq!(
+            collect_index_results(&store, "score_idx", &IndexKey(b"new score".to_vec()))
+                .unwrap()
+                .len(),
+            1
         );
     }
 }

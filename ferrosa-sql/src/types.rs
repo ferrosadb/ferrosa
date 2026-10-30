@@ -14,7 +14,7 @@ use num_bigint::BigInt;
 /// keys depend on. SQL-level comparison ([`Value::sql_cmp`]) still uses the inner
 /// `f64`'s `partial_cmp`, so NaN is UNKNOWN there.
 ///
-/// `Uuid` wraps [`uuid::Uuid`] and `Bytea` wraps `Vec<u8>`; both inner types are
+/// `Uuid` wraps [`uuid::Uuid`] and `Bytea` wraps immutable `CellBytes`; both inner types are
 /// `Eq`/`Hash`/`Clone`, so the enum keeps its derives (and stays usable as a
 /// join/group key).
 ///
@@ -40,11 +40,11 @@ use num_bigint::BigInt;
 pub enum Value {
     Null,
     Int(i64),
-    Text(String),
+    Text(ferrosa_common::SharedText),
     Bool(bool),
     Float(ordered_float::OrderedFloat<f64>),
     Uuid(uuid::Uuid),
-    Bytea(Vec<u8>),
+    Bytea(ferrosa_common::cell_bytes::CellBytes),
     /// Microseconds since the Unix epoch (UTC).
     Timestamp(i64),
     /// Days since the Unix epoch (1970-01-01).
@@ -215,7 +215,11 @@ pub enum ColumnType {
     Float,
     Uuid,
     Bytea,
+    /// Timestamp without time zone, carried as `Value::Timestamp`.
     Timestamp,
+    /// UTC instant (PostgreSQL timestamptz), also carried as `Value::Timestamp`.
+    /// The column type preserves its timezone semantics independently of the payload.
+    TimestampTz,
     Date,
     Time,
     Inet,
@@ -367,15 +371,15 @@ mod tests {
     #[test]
     fn sql_cmp_bytea_is_lexicographic() {
         assert_eq!(
-            Value::Bytea(vec![0x01, 0x02]).sql_cmp(&Value::Bytea(vec![0x01, 0x03])),
+            Value::Bytea(vec![0x01, 0x02].into()).sql_cmp(&Value::Bytea(vec![0x01, 0x03].into())),
             Some(Ordering::Less)
         );
         assert_eq!(
-            Value::Bytea(vec![0x01, 0x02]).sql_cmp(&Value::Bytea(vec![0x01])),
+            Value::Bytea(vec![0x01, 0x02].into()).sql_cmp(&Value::Bytea(vec![0x01].into())),
             Some(Ordering::Greater)
         );
         assert_eq!(
-            Value::Bytea(vec![]).sql_cmp(&Value::Bytea(vec![])),
+            Value::Bytea(vec![].into()).sql_cmp(&Value::Bytea(vec![].into())),
             Some(Ordering::Equal)
         );
     }
@@ -383,11 +387,11 @@ mod tests {
     #[test]
     fn sql_cmp_uuid_bytea_cross_and_null_are_unknown() {
         let u = uuid::Uuid::nil();
-        assert_eq!(Value::Uuid(u).sql_cmp(&Value::Bytea(vec![0])), None);
-        assert_eq!(Value::Bytea(vec![0]).sql_cmp(&Value::Uuid(u)), None);
+        assert_eq!(Value::Uuid(u).sql_cmp(&Value::Bytea(vec![0].into())), None);
+        assert_eq!(Value::Bytea(vec![0].into()).sql_cmp(&Value::Uuid(u)), None);
         assert_eq!(Value::Uuid(u).sql_cmp(&Value::Int(1)), None);
         assert_eq!(Value::Uuid(u).sql_cmp(&Value::Null), None);
-        assert_eq!(Value::Bytea(vec![0]).sql_cmp(&Value::Null), None);
+        assert_eq!(Value::Bytea(vec![0].into()).sql_cmp(&Value::Null), None);
     }
 
     #[test]
@@ -398,8 +402,8 @@ mod tests {
         let mut set: HashSet<Value> = HashSet::new();
         set.insert(Value::Uuid(u));
         set.insert(Value::Uuid(u));
-        set.insert(Value::Bytea(vec![1, 2, 3]));
-        set.insert(Value::Bytea(vec![1, 2, 3]));
+        set.insert(Value::Bytea(vec![1, 2, 3].into()));
+        set.insert(Value::Bytea(vec![1, 2, 3].into()));
         assert_eq!(set.len(), 2);
     }
 
@@ -536,5 +540,35 @@ mod tests {
         assert_ne!(ColumnType::Date, ColumnType::Time);
         assert_ne!(ColumnType::Inet, ColumnType::Numeric);
         assert_eq!(ColumnType::Numeric, ColumnType::Numeric);
+    }
+}
+
+#[cfg(test)]
+mod timestamp_regression {
+    use super::*;
+
+    #[test]
+    fn timestamp_timezone_is_part_of_the_column_type() {
+        assert_ne!(ColumnType::Timestamp, ColumnType::TimestampTz);
+        let column = Column::new("now", ColumnType::TimestampTz);
+        assert_eq!(column.ty, ColumnType::TimestampTz);
+        // Both temporal types carry microseconds; the column carries zone semantics.
+        assert_eq!(
+            Value::Timestamp(123).sql_cmp(&Value::Timestamp(123)),
+            Some(std::cmp::Ordering::Equal)
+        );
+    }
+}
+
+#[cfg(test)]
+mod immutable_value_compatibility {
+    use super::Value;
+
+    #[test]
+    fn immutable_sql_values_preserve_legacy_spill_json() {
+        for json in [r#"{"Text":"hé\n\""}"#, r#"{"Bytea":[0,128,255]}"#] {
+            let value: Value = serde_json::from_str(json).unwrap();
+            assert_eq!(serde_json::to_string(&value).unwrap(), json);
+        }
     }
 }

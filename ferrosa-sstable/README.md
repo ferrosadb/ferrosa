@@ -63,8 +63,11 @@ resolution beyond the serialization header, or cluster routing.
   is checked against `CRC.db`, naming the failing chunk's byte offset on
   mismatch. An SSTable without these components (older than T-011, or opened
   without loading them) reads exactly as before — "not checked", logged once
-  per generation, never an error. See `checksum` module docs for the exact
-  on-disk formats.
+  per generation, never an error. `load_checksums_if_present` treats only a
+  missing file as absent: a checksum file that exists but cannot be read
+  still leaves the generation unverified, and logs a warning naming the path
+  rather than passing silently as "absent". See `checksum` module docs for
+  the exact on-disk formats.
 - **Complex (non-frozen collection) columns** — `list`/`set`/`map` columns
   read and write Cassandra's per-element cell layout: `uvint(cell-count)` then
   one cell per element, each with a length-prefixed cell path (list → TimeUUID,
@@ -104,9 +107,13 @@ resolution beyond the serialization header, or cluster routing.
 - **Bloom filter** — Cassandra-compatible double-hashing over the Murmur3
   `h1`/`h2` pair from `ferrosa-common`.
 - **Corruption resilience** — `validate_data_extent` (index-vs-data truncation
-  check), `salvage` (best-effort per-partition recovery with `SalvageStats`),
+  check), `salvage` (best-effort per-partition recovery that streams each row to a callback, with `SalvageStats` naming why the walk stopped),
   and a hard `MAX_VALUE_LEN` ceiling that rejects bogus on-disk lengths before
-  they drive a pathological allocation.
+  they drive a pathological allocation. The full row decoder checks every
+  decoded row body against its declared `row_size` and refuses a row where the
+  two disagree, rather than decoding the next row from leftover cell bytes
+  (t_78c7f689, fmea ST-21). Both `row_size` conventions are accepted:
+  Cassandra's, which counts the prev-size varint, and ferrosa's, which does not.
 - **Tooling binaries** — `ferrosa-sstable-dump` and `ferrosa-sstable-import`.
 
 ## Runtime tuning
@@ -629,3 +636,7 @@ charge the full retained backing and a conservative shared-owner allowance.
 Reusable cursor allocation guards count only the decoder thread. A controlled
 foreign-thread allocation verifies attribution; the existing allocation bound
 and byte/corruption assertions are retained.
+
+## Single-row COUNT pushdown
+
+`PartitionIter` exposes its current partition position, source serialization header and an independent read at that position. The liveness-count consumer uses these pinned-source bookmarks before iterator refill when cell values are necessary to resolve TTL/deletion visibility. `Row::is_visible_at` supplies the shared primary-key/cell TTL and row-deletion predicate used by the row bridge and exact single-row counter.

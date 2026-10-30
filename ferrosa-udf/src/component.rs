@@ -495,11 +495,11 @@ mod tests {
             .call(
                 "ks",
                 "rev",
-                vec![CqlValue::Blob(vec![1, 2, 3, 4])],
+                vec![CqlValue::Blob(vec![1, 2, 3, 4].into())],
                 &args,
                 &CqlType::Blob,
             )
             .expect("invoke");
-        assert_eq!(out, CqlValue::Blob(vec![4, 3, 2, 1]));
+        assert_eq!(out, CqlValue::Blob(vec![4, 3, 2, 1].into()));
     }
 }

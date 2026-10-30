@@ -14,6 +14,8 @@ pub mod accord;
 pub mod cancel;
 pub mod cell;
 pub mod cell_bytes;
+pub mod shared_text;
+pub use shared_text::SharedText;
 pub mod cell_ts;
 /// Cluster formation lifecycle. Lives here, not in ferrosa-cluster, because
 /// ferrosa-sim needs the same state machine and deliberately cannot depend on

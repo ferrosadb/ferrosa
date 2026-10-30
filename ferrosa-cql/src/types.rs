@@ -106,7 +106,7 @@ mod tests {
 
     #[test]
     fn encode_decode_text() {
-        let val = CqlValue::Text("hello world".to_string());
+        let val = CqlValue::Text("hello world".to_string().into());
         let bytes = encode_value(&val);
         let decoded = decode_value(&CqlType::Varchar, &bytes).unwrap();
         assert_eq!(decoded, val);
@@ -157,7 +157,7 @@ mod tests {
 
     #[test]
     fn encode_decode_blob() {
-        let val = CqlValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        let val = CqlValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF].into());
         let bytes = encode_value(&val);
         let decoded = decode_value(&CqlType::Blob, &bytes).unwrap();
         assert_eq!(decoded, val);
@@ -446,7 +446,7 @@ mod tests {
         let udt_val = CqlValue::Udt(vec![
             (
                 "street".to_string(),
-                Some(CqlValue::Text("123 Main".to_string())),
+                Some(CqlValue::Text("123 Main".to_string().into())),
             ),
             ("zip".to_string(), Some(CqlValue::Int(62701))),
         ]);
@@ -468,7 +468,7 @@ mod tests {
         let udt_val = CqlValue::Udt(vec![
             (
                 "street".to_string(),
-                Some(CqlValue::Text("Main St".to_string())),
+                Some(CqlValue::Text("Main St".to_string().into())),
             ),
             ("zip".to_string(), None),
         ]);
@@ -518,7 +518,7 @@ mod tests {
         // Only encode 1 field (street) — city and zip should decode as null
         let partial_val = CqlValue::Udt(vec![(
             "street".to_string(),
-            Some(CqlValue::Text("Main".to_string())),
+            Some(CqlValue::Text("Main".to_string().into())),
         )]);
         let encoded = encode_value(&partial_val);
         let decoded = decode_value(&udt_type, &encoded).unwrap();
@@ -558,10 +558,10 @@ mod proptests {
             any::<u32>().prop_map(|n| (CqlType::Date, CqlValue::Date(n))),
             any::<i64>().prop_map(|n| (CqlType::Time, CqlValue::Time(n))),
             any::<i64>().prop_map(|n| (CqlType::Timestamp, CqlValue::Timestamp(n))),
-            "[ -~]{0,100}".prop_map(|s| (CqlType::Varchar, CqlValue::Text(s))),
-            "[ -~]{0,100}".prop_map(|s| (CqlType::Ascii, CqlValue::Ascii(s))),
+            "[ -~]{0,100}".prop_map(|s| (CqlType::Varchar, CqlValue::Text(s.into()))),
+            "[ -~]{0,100}".prop_map(|s| (CqlType::Ascii, CqlValue::Ascii(s.into()))),
             prop::collection::vec(any::<u8>(), 0..100)
-                .prop_map(|b| (CqlType::Blob, CqlValue::Blob(b))),
+                .prop_map(|b| (CqlType::Blob, CqlValue::Blob(b.into()))),
             prop::array::uniform16(any::<u8>())
                 .prop_map(|b| (CqlType::Uuid, CqlValue::Uuid(uuid::Uuid::from_bytes(b)))),
             prop::array::uniform16(any::<u8>()).prop_map(|b| (
@@ -609,7 +609,7 @@ mod proptests {
             (any::<i32>(), "\\PC{0,20}"), 0..10
         )) {
             let val = CqlValue::Map(
-                entries.iter().map(|(k, v)| (CqlValue::Int(*k), CqlValue::Text(v.clone()))).collect()
+                entries.iter().map(|(k, v)| (CqlValue::Int(*k), CqlValue::Text(v.clone().into()))).collect()
             );
             let encoded = encode_value(&val);
             let decoded = decode_value(
@@ -628,7 +628,7 @@ mod proptests {
             let tuple_type = CqlType::Tuple(vec![CqlType::Int, CqlType::Varchar]);
             let list_type = CqlType::List(Box::new(tuple_type.clone()));
             let tuples: Vec<CqlValue> = items.iter().map(|(n, s)| {
-                CqlValue::Tuple(vec![Some(CqlValue::Int(*n)), Some(CqlValue::Text(s.clone()))])
+                CqlValue::Tuple(vec![Some(CqlValue::Int(*n)), Some(CqlValue::Text(s.clone().into()))])
             }).collect();
             let val = CqlValue::List(tuples);
             let encoded = encode_value(&val);

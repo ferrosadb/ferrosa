@@ -344,6 +344,30 @@ impl ClusterCoordinator {
         strategy: &crate::ring::strategy::ReplicationStrategy,
         matches: &(dyn Fn(&ferrosa_common::key::DecoratedKey) -> bool + Sync),
     ) -> crate::error::Result<u64> {
+        self.coordinate_count_matching_impl(table_id, cl, strategy, matches, false)
+            .await
+    }
+
+    /// Visibility-correct single-row count over the same selected replicas as a scan.
+    pub async fn coordinate_live_single_row_count_matching(
+        &self,
+        table_id: &TableId,
+        cl: crate::consistency::ConsistencyLevel,
+        strategy: &crate::ring::strategy::ReplicationStrategy,
+        matches: &(dyn Fn(&ferrosa_common::key::DecoratedKey) -> bool + Sync),
+    ) -> crate::error::Result<u64> {
+        self.coordinate_count_matching_impl(table_id, cl, strategy, matches, true)
+            .await
+    }
+
+    async fn coordinate_count_matching_impl(
+        &self,
+        table_id: &TableId,
+        cl: crate::consistency::ConsistencyLevel,
+        strategy: &crate::ring::strategy::ReplicationStrategy,
+        matches: &(dyn Fn(&ferrosa_common::key::DecoratedKey) -> bool + Sync),
+        live_single_row: bool,
+    ) -> crate::error::Result<u64> {
         // Correctness over speed (forge t_8c4e44e8): the local replica only
         // holds the partitions whose tokens fall in ITS owned ranges. When the
         // TABLE's keyspace RF does not span the whole ring (`RF < node_count`,
@@ -367,10 +391,14 @@ impl ClusterCoordinator {
         // never the local subset.
         let rf = strategy.replication_factor();
         if self.range_read_remotes(cl, rf).needed == 0 {
-            return self
-                .storage
-                .count_range_matching(table_id, None, None, matches)
-                .map_err(ClusterError::Storage);
+            return if live_single_row {
+                self.storage
+                    .count_live_single_row_range_matching(table_id, None, None, matches)
+            } else {
+                self.storage
+                    .count_range_matching(table_id, None, None, matches)
+            }
+            .map_err(ClusterError::Storage);
         }
 
         // Fan out the unbounded streaming range read (local + CL-selected
@@ -383,13 +411,35 @@ impl ClusterCoordinator {
         let mut stream = self
             .coordinate_range_read_stream_all_with(table_id, 0, cl, rf)
             .await?;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            .min(i32::MAX as u64) as i32;
         let mut total: u64 = 0;
         while let Some(item) = stream.next().await {
             let partition = item?;
             if !matches(&partition.key) {
                 continue;
             }
-            total = total.saturating_add(partition.rows.len() as u64);
+            if live_single_row
+                && (partition.static_row.is_some()
+                    || partition.rows.iter().any(|r| !r.clustering.is_empty()))
+            {
+                return Err(ClusterError::Storage(ferrosa_common::Error::InvalidFormat(
+                    "single-row count received clustered/static rows".into(),
+                )));
+            }
+            let rows = if live_single_row {
+                partition
+                    .rows
+                    .iter()
+                    .filter(|r| r.is_visible_at(now_secs))
+                    .count()
+            } else {
+                partition.rows.len()
+            };
+            total = total.saturating_add(rows as u64);
             if partition.static_row.is_some() {
                 total = total.saturating_add(1);
             }
@@ -3258,6 +3308,69 @@ mod tests {
         assert!(
             outcome.iter().any(|item| item.is_err()),
             "the failure must reach the reader: {outcome:?}"
+        );
+    }
+
+    /// A readiness probe must observe every replica's initial status before
+    /// accepting even its first local hit.
+    #[tokio::test]
+    async fn index_readiness_probe_reports_remote_staleness_before_first_local_hit() {
+        let mut merged = merge_index_streams_in_row_order(vec![
+            replica(vec![index_hit(b"a", b"1")]),
+            replica(vec![Err(ClusterError::Internal(
+                "secondary index is not current; backfill pending".into(),
+            ))]),
+        ]);
+
+        let error = merged
+            .next()
+            .await
+            .expect("remote staleness must produce an item")
+            .expect_err("the first item must report the stale remote, before any local hit");
+        assert!(error.to_string().contains("not current"));
+    }
+
+    /// A remote that has not answered cannot be treated as an empty source.
+    #[tokio::test]
+    async fn index_readiness_probe_waits_for_remote_status_before_first_local_hit() {
+        let (status_tx, status_rx) = tokio::sync::oneshot::channel::<()>();
+        let remote: ClusterPartitionStream = Box::pin(futures::stream::once(async move {
+            status_rx
+                .await
+                .expect("the test must release the remote status");
+            Err(ClusterError::Internal(
+                "secondary index is not current; backfill pending".into(),
+            ))
+        }));
+        let mut merged =
+            merge_index_streams_in_row_order(vec![replica(vec![index_hit(b"a", b"1")]), remote]);
+        let mut first = Box::pin(merged.next());
+
+        assert!(
+            matches!(futures::poll!(first.as_mut()), std::task::Poll::Pending),
+            "a ready local head must wait for the remote's initial status"
+        );
+        status_tx
+            .send(())
+            .expect("the remote must still be waiting");
+        let error = first
+            .await
+            .expect("remote staleness must produce an item")
+            .expect_err("the delayed remote failure must precede the local hit");
+        assert!(error.to_string().contains("not current"));
+    }
+
+    #[tokio::test]
+    async fn index_readiness_probe_accepts_all_current_empty_sources() {
+        let mut merged = merge_index_streams_in_row_order(vec![
+            replica(Vec::new()),
+            replica(Vec::new()),
+            replica(Vec::new()),
+        ]);
+
+        assert!(
+            merged.next().await.is_none(),
+            "an empty-key miss on every current source must complete cleanly"
         );
     }
 

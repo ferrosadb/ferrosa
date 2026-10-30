@@ -32,6 +32,258 @@ use tokio_postgres::config::SslMode;
 use tokio_postgres::types::Type;
 use tokio_postgres::{Config, NoTls};
 
+// t_6b946676: stock pgbench timestamp compatibility, through the real wire path.
+mod timestamp_regression {
+    use super::{start, Duration, Fixture, Type};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio_postgres::{Client, SimpleQueryMessage};
+
+    async fn history() -> Fixture {
+        let fixture = start().await;
+        fixture
+            .client
+            .batch_execute(
+                "CREATE TABLE pgbench_history \
+                 (tid int, bid int, aid int, delta int, mtime timestamp, filler char(22))",
+            )
+            .await
+            .expect("create stock pgbench history table");
+        fixture
+    }
+
+    fn epoch_micros() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64
+    }
+
+    async fn timestamps(client: &Client, sql: &str) -> Vec<i64> {
+        client
+            .simple_query(sql)
+            .await
+            .unwrap_or_else(|error| panic!("timestamp query failed: {sql}: {error:?}"))
+            .into_iter()
+            .filter_map(|message| match message {
+                SimpleQueryMessage::Row(row) => Some(
+                    chrono::NaiveDateTime::parse_from_str(
+                        row.get(0).expect("timestamp must not be NULL"),
+                        "%Y-%m-%d %H:%M:%S%.f",
+                    )
+                    .expect("valid PostgreSQL timestamp text")
+                    .and_utc()
+                    .timestamp_micros(),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn prepared_select_uses_execute_time_and_autocommit_refreshes() {
+        let fixture = start().await;
+        let client = &fixture.client;
+        let prepared = client
+            .prepare("SELECT CURRENT_TIMESTAMP, now()")
+            .await
+            .unwrap();
+        assert!(prepared
+            .columns()
+            .iter()
+            .all(|c| c.type_() == &Type::TIMESTAMPTZ));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let before = SystemTime::now();
+        let first = client.query_one(&prepared, &[]).await.unwrap();
+        let started: SystemTime = first.get(0);
+        assert!(started >= before && started <= SystemTime::now());
+        assert_eq!(started, first.get::<_, SystemTime>(1));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let second: SystemTime = client.query_one(&prepared, &[]).await.unwrap().get(0);
+        assert!(second > started);
+        let messages = client
+            .simple_query("SELECT CURRENT_TIMESTAMP, now()")
+            .await
+            .unwrap();
+        let row = messages
+            .iter()
+            .find_map(|m| match m {
+                SimpleQueryMessage::Row(r) => Some(r),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(row.get(0), row.get(1));
+        assert!(row.get(0).unwrap().ends_with("+00"));
+    }
+
+    #[tokio::test]
+    async fn timestamp_update_uses_transaction_clock_and_unknown_functions_fail() {
+        let fixture = start().await;
+        let client = &fixture.client;
+        client
+            .batch_execute("CREATE TABLE clock_updates (id int PRIMARY KEY, ts timestamp)")
+            .await
+            .unwrap();
+        client.batch_execute("BEGIN").await.unwrap();
+        let first = timestamps(
+            client,
+            "INSERT INTO clock_updates (id, ts) VALUES (1, now()) RETURNING ts",
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        client
+            .batch_execute("UPDATE clock_updates SET ts = CURRENT_TIMESTAMP WHERE id = 1")
+            .await
+            .unwrap();
+        client.batch_execute("COMMIT").await.unwrap();
+        assert_eq!(
+            timestamps(client, "SELECT ts FROM clock_updates WHERE id = 1").await,
+            vec![first[0] / 1000 * 1000]
+        );
+        for sql in [
+            "SELECT clock_timestamp()",
+            "INSERT INTO clock_updates (id, ts) VALUES (2, clock_timestamp())",
+        ] {
+            let error = client.simple_query(sql).await.unwrap_err();
+            assert_eq!(error.code().unwrap().code(), "0A000");
+        }
+    }
+
+    #[tokio::test]
+    async fn stock_pgbench_insert_current_timestamp_persists_a_current_timestamp() {
+        let fixture = history().await;
+        let before = epoch_micros();
+        let messages = fixture
+            .client
+            .simple_query(
+                "INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) \
+                 VALUES (1, 1, 1, 100, CURRENT_TIMESTAMP)",
+            )
+            .await
+            .expect("stock pgbench CURRENT_TIMESTAMP INSERT must succeed");
+        let after = epoch_micros();
+        assert!(messages
+            .iter()
+            .any(|message| matches!(message, SimpleQueryMessage::CommandComplete(1))));
+        let stored = timestamps(&fixture.client, "SELECT mtime FROM pgbench_history").await;
+        assert_eq!(stored.len(), 1);
+        // The current storage bridge persists milliseconds. This bound detects
+        // NULL/epoch/fabricated values without claiming microsecond storage fidelity.
+        assert!((before / 1000 * 1000..=after).contains(&stored[0]));
+    }
+
+    #[tokio::test]
+    async fn current_timestamp_is_begin_time_across_rows_and_statements() {
+        let fixture = history().await;
+        let client = &fixture.client;
+        let before_begin = epoch_micros();
+        client.batch_execute("BEGIN").await.unwrap();
+        let after_begin = epoch_micros();
+        // A delay before the FIRST use rejects lazy initialization at INSERT.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let first = timestamps(
+            client,
+            "INSERT INTO pgbench_history (tid, mtime) \
+             VALUES (1, CURRENT_TIMESTAMP), (2, CURRENT_TIMESTAMP) RETURNING mtime",
+        )
+        .await;
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0], first[1], "one transaction time for every row");
+        assert!((before_begin..=after_begin).contains(&first[0]));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let second = timestamps(
+            client,
+            "INSERT INTO pgbench_history (tid, mtime) \
+             VALUES (3, CURRENT_TIMESTAMP) RETURNING mtime",
+        )
+        .await;
+        assert_eq!(
+            second,
+            vec![first[0]],
+            "stable across separate wire queries"
+        );
+        client.batch_execute("COMMIT").await.unwrap();
+        let stored = timestamps(client, "SELECT mtime FROM pgbench_history").await;
+        assert_eq!(stored.len(), 3);
+        assert!(stored.iter().all(|value| *value == first[0] / 1000 * 1000));
+    }
+
+    #[tokio::test]
+    async fn prepared_now_alias_uses_execution_transaction_and_resets_after_end() {
+        let fixture = history().await;
+        let client = &fixture.client;
+        // Parse/Describe happen before BEGIN: now() must not freeze at prepare time.
+        let insert = client
+            .prepare("INSERT INTO pgbench_history (tid, mtime) VALUES ($1, now()) RETURNING mtime")
+            .await
+            .expect("prepare now() INSERT");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let before_begin = epoch_micros();
+        client.batch_execute("BEGIN").await.unwrap();
+        let after_begin = epoch_micros();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let row = client
+            .query_one(&insert, &[&1_i32])
+            .await
+            .expect("execute now() INSERT");
+        assert_eq!(row.columns()[0].type_(), &Type::TIMESTAMP);
+        let first: SystemTime = row.get(0);
+        let first_micros = first.duration_since(UNIX_EPOCH).unwrap().as_micros() as i64;
+        assert!((before_begin..=after_begin).contains(&first_micros));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let current = timestamps(
+            client,
+            "INSERT INTO pgbench_history (tid, mtime) \
+             VALUES (2, CURRENT_TIMESTAMP) RETURNING mtime",
+        )
+        .await;
+        assert_eq!(
+            current,
+            vec![first_micros],
+            "now() aliases CURRENT_TIMESTAMP"
+        );
+        client.batch_execute("COMMIT").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let second: SystemTime = client.query_one(&insert, &[&3_i32]).await.unwrap().get(0);
+        assert!(second > first, "COMMIT must clear the previous timestamp");
+
+        client.batch_execute("BEGIN").await.unwrap();
+        let rolled_back: SystemTime = client.query_one(&insert, &[&4_i32]).await.unwrap().get(0);
+        client.batch_execute("ROLLBACK").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let after_rollback: SystemTime = client.query_one(&insert, &[&5_i32]).await.unwrap().get(0);
+        assert!(
+            after_rollback > rolled_back,
+            "ROLLBACK must clear the timestamp"
+        );
+        let stored = timestamps(client, "SELECT mtime FROM pgbench_history").await;
+        assert_eq!(stored.len(), 4, "rolled-back INSERT must not persist");
+    }
+
+    #[tokio::test]
+    async fn select_timestamp_aliases_have_postgres_type_and_transaction_stability() {
+        let fixture = start().await;
+        let client = &fixture.client;
+        client.batch_execute("BEGIN").await.unwrap();
+        let first = client
+            .query_one("SELECT CURRENT_TIMESTAMP, now()", &[])
+            .await
+            .expect("SELECT both transaction timestamp spellings");
+        for column in first.columns() {
+            assert_eq!(column.type_(), &Type::TIMESTAMPTZ);
+        }
+        let current: SystemTime = first.get(0);
+        assert_eq!(current, first.get::<_, SystemTime>(1));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let second = client
+            .query_one("SELECT CURRENT_TIMESTAMP, now()", &[])
+            .await
+            .unwrap();
+        assert_eq!(current, second.get::<_, SystemTime>(0));
+        assert_eq!(current, second.get::<_, SystemTime>(1));
+        client.batch_execute("ROLLBACK").await.unwrap();
+    }
+}
+
 struct OneRole(ScramVerifier);
 
 /// A single superuser login with no limiter (PR #465 added the limiter
@@ -726,13 +978,8 @@ async fn a_delete_by_the_declared_key_removes_exactly_that_row() {
 ///      value and every other row is unchanged (identity, never a count).
 #[test]
 fn the_tpcb_statement_invariants_hold_after_each_statement() {
-    let logs = CapturedLogs::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(logs.clone())
-        .with_max_level(tracing::Level::WARN)
-        .with_ansi(false)
-        .finish();
-    tracing::subscriber::with_default(subscriber, || {
+    let test_name = "the_tpcb_statement_invariants_hold_after_each_statement";
+    with_captured_logs(test_name, |logs| {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -887,24 +1134,101 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
     }
 }
 
+/// Isolate each capture from the test harness's other subscribers and callsites.
+/// In tracing-core 0.1.36, the single-dispatch registration fast path consults the
+/// emitting thread's default. A first use on an unsubscribed thread can cache
+/// `Interest::never()` even while another thread has a scoped capture installed.
+/// A dedicated child with a global default covers every server task and first use.
+fn with_captured_logs(test_name: &str, test: impl FnOnce(CapturedLogs)) {
+    const CHILD: &str = "FERROSA_PG_DDL_LOG_CAPTURE_CHILD";
+    if std::env::var(CHILD).as_deref() == Ok(test_name) {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("one global subscriber per capture child");
+        test(logs);
+    } else {
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, test_name)
+            .output()
+            .expect("run isolated log capture");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("running 1 test"),
+            "isolated capture {test_name} failed ({}):\n{stdout}\n{stderr}",
+            output.status
+        );
+    }
+}
+
+/// Force the first-use interleaving that broke the SQL warning capture, then
+/// verify that an overlapping thread-local subscriber neither steals nor leaks events.
+#[test]
+fn log_capture_survives_unsubscribed_first_use_and_concurrent_subscriber() {
+    fn emit(label: &str) {
+        tracing::warn!(label, "capture isolation control");
+    }
+    with_captured_logs(
+        "log_capture_survives_unsubscribed_first_use_and_concurrent_subscriber",
+        |logs| {
+            std::thread::spawn(|| emit("first-use-without-local-subscriber"))
+                .join()
+                .expect("first-use thread");
+            emit("capture-after-first-use");
+            assert!(
+                logs.text().contains("capture-after-first-use"),
+                "an unsubscribed first use must not disable later capture: {}",
+                logs.text()
+            );
+            assert!(logs.text().contains("first-use-without-local-subscriber"));
+
+            let competing_logs = CapturedLogs::default();
+            let ready = std::sync::Barrier::new(2);
+            let done = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    let subscriber = tracing_subscriber::fmt()
+                        .with_writer(competing_logs.clone())
+                        .with_max_level(tracing::Level::WARN)
+                        .with_ansi(false)
+                        .finish();
+                    tracing::subscriber::with_default(subscriber, || {
+                        emit("competing-subscriber-only");
+                        ready.wait();
+                        done.wait();
+                    });
+                });
+                ready.wait();
+                emit("capture-during-competing-subscriber");
+                done.wait();
+            });
+            assert!(logs.text().contains("capture-during-competing-subscriber"));
+            assert!(!logs.text().contains("competing-subscriber-only"));
+            assert!(competing_logs.text().contains("competing-subscriber-only"));
+            assert!(!competing_logs
+                .text()
+                .contains("capture-during-competing-subscriber"));
+        },
+    );
+}
+
 /// User ruling (2026-10-11): the scan fallback that serves the previous test must be
 /// LOGGED LOUDLY, never silent. A silent fallback hides a missing or unusable index
 /// behind a result that looks the same, so this pins the warning on the real statement
 /// path: it boots a server under a capturing subscriber and asserts that an UPDATE whose
 /// WHERE names no indexed column emits a warning that names the table.
 ///
-/// Deliberately NOT `tokio::test`: the runtime is built INSIDE the subscriber scope so
-/// every task the server spawns — including the connection handler that logs — polls on
-/// the same thread as the capturing subscriber.
+/// Runs in its own process with a global subscriber: a thread-local subscriber cannot
+/// isolate tracing's process-wide callsite interest cache from concurrent tests.
 #[test]
 fn a_scan_fallback_is_logged_loudly() {
-    let logs = CapturedLogs::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(logs.clone())
-        .with_max_level(tracing::Level::WARN)
-        .with_ansi(false)
-        .finish();
-    tracing::subscriber::with_default(subscriber, || {
+    with_captured_logs("a_scan_fallback_is_logged_loudly", |logs| {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -928,29 +1252,22 @@ fn a_scan_fallback_is_logged_loudly() {
                 .await
                 .expect("UPDATE with no index must not be refused");
 
-            // The scan warning rides the statement path but can land AFTER the UPDATE's
-            // response, so yield until it does instead of racing it. The wait MUST be inside
-            // this subscriber scope: `with_default` is thread-local, so anything logged after
-            // the scope closes is simply never captured. This test passed on one schedule and
-            // failed on the next, so the wait is the fix — a single lucky run was not evidence.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while std::time::Instant::now() < deadline && !logs.text().contains("pbscanlog") {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
+            // CandidateContext::rows emits the warning synchronously before the
+            // UPDATE response. Awaiting execute is the synchronization boundary.
         });
-    });
 
-    let captured = logs.text();
-    assert!(
-        captured.contains("pbscanlog"),
-        "the scan fallback must be logged LOUDLY and name the table it scanned. \
+        let captured = logs.text();
+        assert!(
+            captured.contains("pbscanlog"),
+            "the scan fallback must be logged LOUDLY and name the table it scanned. \
          --- captured warnings ---\n{captured}"
-    );
-    assert!(
-        captured.contains("full scan"),
-        "the warning must say the statement is streaming a full scan with filtering. \
+        );
+        assert!(
+            captured.contains("full scan"),
+            "the warning must say the statement is streaming a full scan with filtering. \
          --- captured warnings ---\n{captured}"
-    );
+        );
+    });
 }
 
 /// I6 — `count(*)` MUST be reported and encoded as `int8` (PostgreSQL's own type

@@ -283,3 +283,7 @@ backing and Arc counters, plus a separate vector's entire capacity; inline
 capacity is included in the owner charge. The SSTable allocation regression keeps
 its existing five-allocation-per-row budget. On the 384-row macOS fixture, steady
 allocations fell from 2,400 (6.25/row) to 1,632 (4.25/row).
+
+## Immutable scalar scan values
+
+Runtime `CqlValue::Text`/`Ascii` use immutable `SharedText`, and `Blob` uses `CellBytes`. Clones share payload ownership. `SharedText::from_cell` validates UTF-8 once while retaining the original `CellBytes` owner through `bytes::Bytes`/`bytestring::ByteString`; it does not copy the payload when another storage owner is alive. Adopting text allocates an ownership handle, so this is not allocation-free. String constructors transfer their buffer with `.into()`. Retained backing capacity is tracked separately from byte-based equality, ordering, hashing and string serialization. Blob serialization retains the existing strict byte-array representation.

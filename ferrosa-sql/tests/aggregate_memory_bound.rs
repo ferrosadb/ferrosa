@@ -10,9 +10,8 @@
 //! This drives the real accumulator ([`hash_aggregate`], the operator the plan
 //! runs for every aggregate) over a synthetic, LAZY row generator — so nothing
 //! in the fixture holds the rows — at N and 10N, under a counting allocator,
-//! with a small spill threshold that forces the bounded external sort to spill
-//! at BOTH sizes. The peak is then the resident accumulator plus bounded spill
-//! buffers. A materializing accumulator (or a sort that buffered its whole
+//! with a small spill threshold. An ungrouped aggregate needs no sort or spill;
+//! its peak is only the resident accumulator and one input row. A materializing accumulator (or a sort that buffered its whole
 //! input) would make the peak at 10N roughly ten times the peak at N.
 //!
 //! It also pins the exact sum, so "flat" cannot be bought by dropping rows.
@@ -139,10 +138,9 @@ fn aggregate_accumulator_peak_is_flat_as_rows_grow() {
     assert_eq!(sum_a, (0..N).sum::<i64>(), "sum at N must be exact");
     assert_eq!(sum_b, (0..N * 10).sum::<i64>(), "sum at 10N must be exact");
 
-    // Both runs must actually be on the spilling path, or the flatness below
-    // would be measuring an in-memory fast path rather than the accumulator.
-    assert!(spilled_a, "the run at N must have spilled");
-    assert!(spilled_b, "the run at 10N must have spilled");
+    // A single group requires no spill, regardless of input cardinality.
+    assert!(!spilled_a, "a scalar aggregate must not spill at N");
+    assert!(!spilled_b, "a scalar aggregate must not spill at 10N");
 
     // I-SPACE: the peak must NOT grow with the row count. Constant-space, the
     // peak is (accumulator + one spill buffer window) and is flat — measured at

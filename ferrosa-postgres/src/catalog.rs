@@ -182,11 +182,14 @@ pub fn pg_namespace(schema: &Schema) -> InMemoryTable {
     for ns in RESERVED_NAMESPACES {
         rows.push(Row::new(vec![
             oid_val(namespace_oid(ns)),
-            Value::Text(ns.to_string()),
+            Value::Text(ns.to_string().into()),
         ]));
     }
     for ks in sorted_keyspaces(&snapshot) {
-        rows.push(Row::new(vec![oid_val(namespace_oid(&ks)), Value::Text(ks)]));
+        rows.push(Row::new(vec![
+            oid_val(namespace_oid(&ks)),
+            Value::Text(ks.into()),
+        ]));
     }
 
     InMemoryTable::new(rel_schema, rows)
@@ -223,16 +226,16 @@ pub fn pg_class(schema: &Schema) -> InMemoryTable {
             .then(|| primary_key_index_name(&table));
         rows.push(Row::new(vec![
             oid_val(relation_oid(&ks, &table)),
-            Value::Text(table),
+            Value::Text(table.into()),
             oid_val(namespace_oid(&ks)),
-            Value::Text("r".to_string()),
+            Value::Text("r".to_string().into()),
         ]));
         if let Some(index_name) = index_name {
             rows.push(Row::new(vec![
                 oid_val(index_oid(&ks, &index_name)),
-                Value::Text(index_name),
+                Value::Text(index_name.into()),
                 oid_val(namespace_oid(&ks)),
-                Value::Text("i".to_string()),
+                Value::Text("i".to_string().into()),
             ]));
         }
     }
@@ -281,7 +284,7 @@ pub fn pg_attribute(schema: &Schema) -> Result<InMemoryTable, PgTypeError> {
 fn attribute_row(relid: u32, col: &ColumnMetadata, attnum: i64, pg: PgType) -> Row {
     Row::new(vec![
         oid_val(relid),
-        Value::Text(col.name.clone()),
+        Value::Text(col.name.clone().into()),
         oid_val(pg.oid),
         Value::Int(attnum),
     ])
@@ -320,7 +323,7 @@ pub fn pg_type(schema: &Schema) -> Result<InMemoryTable, PgTypeError> {
     for p in used {
         rows.push(Row::new(vec![
             oid_val(p.oid),
-            Value::Text(p.typname.to_string()),
+            Value::Text(p.typname.to_string().into()),
         ]));
     }
 
@@ -399,8 +402,8 @@ pub fn pg_constraint(schema: &Schema) -> InMemoryTable {
         };
         rows.push(Row::new(vec![
             oid_val(primary_key_constraint_oid(&ks, &table)),
-            Value::Text(primary_key_index_name(&table)),
-            Value::Text("p".to_string()),
+            Value::Text(primary_key_index_name(&table).into()),
+            Value::Text("p".to_string().into()),
             oid_val(relation_oid(&ks, &table)),
             attnum_vector(&attnums),
         ]));
@@ -786,7 +789,7 @@ mod tests {
         // relnamespace == ks's namespace oid
         assert_eq!(tbl_row.get(2).clone(), oid_val(namespace_oid("ks")));
         // relkind == 'r'
-        assert_eq!(tbl_row.get(3).clone(), Value::Text("r".to_string()));
+        assert_eq!(tbl_row.get(3).clone(), Value::Text("r".to_string().into()));
         // oid == relation oid
         assert_eq!(tbl_row.get(0).clone(), oid_val(relation_oid("ks", "tbl")));
     }
@@ -907,8 +910,15 @@ mod tests {
             .iter()
             .find(|r| r.get(0) == &indexrelid)
             .expect("the pk index has a pg_class row");
-        assert_eq!(idx_row.get(1), &Value::Text("orders_pkey".to_string()));
-        assert_eq!(idx_row.get(3), &Value::Text("i".to_string()), "relkind = i");
+        assert_eq!(
+            idx_row.get(1),
+            &Value::Text("orders_pkey".to_string().into())
+        );
+        assert_eq!(
+            idx_row.get(3),
+            &Value::Text("i".to_string().into()),
+            "relkind = i"
+        );
 
         // pg_constraint: contype 'p' with the same key attnums.
         let con_rows = rows_of(&pg_constraint(&schema));
@@ -916,10 +926,10 @@ mod tests {
         let con = &con_rows[0];
         assert_eq!(
             con.get(1),
-            &Value::Text("orders_pkey".to_string()),
+            &Value::Text("orders_pkey".to_string().into()),
             "conname"
         );
-        assert_eq!(con.get(2), &Value::Text("p".to_string()), "contype");
+        assert_eq!(con.get(2), &Value::Text("p".to_string().into()), "contype");
         assert_eq!(con.get(3), &relid, "conrelid");
         assert_eq!(con.get(4), &key, "conkey");
     }
@@ -950,16 +960,15 @@ mod tests {
         // The table itself IS listed, so the absences are not an empty catalog.
         let class_rows = rows_of(&pg_class(&schema));
         assert!(
-            class_rows
-                .iter()
-                .any(|r| r.get(1) == &Value::Text("pgbench_accounts".to_string())
-                    && r.get(3) == &Value::Text("r".to_string())),
+            class_rows.iter().any(|r| r.get(1)
+                == &Value::Text("pgbench_accounts".to_string().into())
+                && r.get(3) == &Value::Text("r".to_string().into())),
             "the table is listed as an ordinary relation"
         );
         assert!(
             !class_rows
                 .iter()
-                .any(|r| r.get(3) == &Value::Text("i".to_string())),
+                .any(|r| r.get(3) == &Value::Text("i".to_string().into())),
             "but no index row is invented for the synthesized key"
         );
 

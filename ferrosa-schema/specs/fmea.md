@@ -87,3 +87,12 @@ constraint is the placement rule (T-154a, D3, D21) above.
 | SCH-T300-04 | A UDT field that is or nests jsonb, or a column typed by such a UDT, slips past | Nested jsonb outside standalone | — | — | — | — | **REMOVED.** The UDT-field allow-check and its type-map resolution were deleted. The surviving placement rule still refuses jsonb (or a jsonb-nesting field type) entering a key through a UDT (SCH-T154a-05). |
 | SCH-T300-05 | A node leaves standalone while jsonb columns exist | Cluster with jsonb and no ledger | — | — | — | — | **REMOVED.** Leaving standalone is no longer refused on account of jsonb columns; the departure check and its table scan were deleted with the gate. Residual closed: jsonb replicates on every topology (see ferrosa-cluster). |
 | SCH-T300-06 | A scan for jsonb tables fails and is read as "none" | Departure allowed with jsonb present | — | — | — | — | **REMOVED.** The jsonb-table scan was deleted; nothing reads its result and nothing turns its error into a refusal. Departure is not gated on jsonb, so there is no residual. |
+
+
+### PostgreSQL table incarnation isolation (2026-10-26)
+
+The registry exposes `lifecycle_read()` for synchronous validation plus physical apply and `lifecycle_write()` for synchronous schema/storage reconciliation. Read leases may overlap; mutation leases are exclusive and reentrant on their acquiring thread. Registry writers acquire lifecycle before the registry mutex. Callers must acquire the lifecycle fence before storage locks and must never hold either guard across an await. Table retirement, replacement, keyspace retirement and snapshot restore therefore wait for admitted PostgreSQL applies to finish. The fence is shared across the registry, so DDL can wait for applies to unrelated tables too.
+
+Snapshot import adopts an incoming different table UUID and removes superseded index metadata. The registry owns no storage: callers must retire the old physical incarnation under the write fence before publishing this replacement. Same-UUID imports preserve the existing definition.
+
+Storage schemas now persist the authoritative UUID in the reserved `ferrosa.table_id` extension (overwriting caller-supplied values). Restore prefers that provenance, with the local schema registry supplying legacy provenance when available. Unidentified data or malformed UUID metadata is refused before any table is retired; recoverable data is preserved for explicit repair. Empty registrations can adopt the incoming schema.

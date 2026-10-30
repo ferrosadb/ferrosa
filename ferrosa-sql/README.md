@@ -170,6 +170,15 @@ placement: ASC⇒NULLS LAST, DESC⇒NULLS FIRST), `hash_aggregate` (first-seen g
 order; ungrouped-empty yields one row), `dedup` (DISTINCT, first-occurrence
 order), `limit_offset`.
 
+Ungrouped aggregates consume each owned row once using one accumulator set;
+`COUNT(*)` does not sort, retain payloads, or use spill storage. The storage
+provider still decodes visible rows and reconciles MVCC before feeding this
+operator; this is not a metadata-only count. Grouped aggregates retain the
+bounded sort/spill path. Projection moves owned text/blob values, reuses the
+row vector for an identity prefix, and clones only additional occurrences of a
+repeated output column. Ownership regressions are covered by
+`tests/projection_ownership.rs` and `tests/scalar_aggregate.rs`.
+
 **Spill** (`spill`): the four BLOCKING operators — `sort`, `hash_aggregate`,
 `hash_join` and `dedup` — cannot emit a first row before consuming their whole
 input, so they **spill to disk** rather than buffering it (forge `t_50d99192`).
@@ -247,9 +256,10 @@ an owned, `Send` iterator, and `RowStream`/`TryRowStream` are `Send`.
 
 ## Dependencies
 
-**Calls** (ferrosa crates this depends on): `ferrosa-storage` only, for the
+**Calls** (ferrosa crates this depends on): `ferrosa-storage`, for the
 bounded external merge sort and the cancellable temp-table reservation the
-blocking operators spill through. Nothing else from it is used, and the engine
+blocking operators spill through, and `ferrosa-jsonb`, for validated JSON values.
+Nothing else from storage is used, and the engine
 still carries its own `Value`/`Row`/`RelSchema` model — it does not adopt
 `CqlValue`.
 
@@ -299,3 +309,21 @@ under nextest (one process per test) and never shares the budget.
 - [Architecture overview](specs/overview.md) — module map, invariants, data flow
 - [FMEA / known issues](specs/fmea.md) — supported surface vs gaps, ranked by RPN
 - [Roadmap](specs/roadmap.md) — Now / Next / Later
+
+## Transaction clock syntax and types (t_6b946676)
+
+The no-FROM scalar grammar recognizes bare `CURRENT_TIMESTAMP` alongside zero-arg
+`now()`, including mixed lists and aliases. It preserves function AST nodes:
+parsing never reads a clock. The PostgreSQL frontend owns transaction/statement
+clock evaluation. `ColumnType::TimestampTz` distinguishes timestamp-with-time-zone
+results from `ColumnType::Timestamp`; both carry `Value::Timestamp` microseconds,
+with the column type supplying temporal interpretation and wire typing. This
+adds no new dependency. Table projections and precision arguments are unchanged.
+
+## Single-row COUNT pushdown
+
+Eligible unfiltered, single-table `COUNT(*)` calls the optional `TableProvider::count_all` capability before opening a row cursor. Aliases, BIGINT overflow checking, LIMIT and OFFSET retain normal semantics. WHERE, joins, grouping, HAVING, DISTINCT, ORDER BY and COUNT(expression) use the ordinary executor. Unsupported capabilities return `None`; a source error fails the statement rather than falling back to a potentially different answer.
+
+## Immutable scalar scan values
+
+`Value::Text` is immutable `ferrosa_common::SharedText`; `Value::Bytea` is immutable `CellBytes`. Clone and repeated projection share payload backing. Comparisons, ordering, hashing and JSON spill representation retain value semantics, with legacy string/byte-array fixtures. Construct owned strings and vectors with `.into()` to transfer their buffers. Mutable string/byte transformations create new values explicitly. The direct dependency on ferrosa-common supplies these shared value types.

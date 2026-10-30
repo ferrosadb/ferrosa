@@ -336,3 +336,7 @@ charge the full retained backing and a conservative shared-owner allowance.
 Reusable cursor allocation guards count only the decoder thread. A controlled
 foreign-thread allocation verifies attribution; the existing allocation bound
 and byte/corruption assertions are retained.
+
+## Single-row COUNT pushdown
+
+`PartitionIter` exposes its current partition position, source serialization header and an independent read at that position. The liveness-count consumer uses these pinned-source bookmarks before iterator refill when cell values are necessary to resolve TTL/deletion visibility. `Row::is_visible_at` supplies the shared primary-key/cell TTL and row-deletion predicate used by the row bridge and exact single-row counter.

@@ -76,7 +76,7 @@ async fn select_values(eng: &SparqlEngine, query: &str, var: &str) -> Vec<String
             .results
             .bindings
             .iter()
-            .filter_map(|row| row.get(var).map(|b| b.value.clone()))
+            .filter_map(|row| row.get(var).map(|b| b.scalar_value().unwrap().to_owned()))
             .collect(),
         SparqlResult::Ask(_) => panic!("expected SELECT result, got ASK"),
         SparqlResult::Graph(_) => panic!("expected SELECT result, got Graph"),

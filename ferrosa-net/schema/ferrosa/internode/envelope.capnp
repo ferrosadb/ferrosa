@@ -616,11 +616,15 @@ struct PgMvccRowChange {
   # Optional before/after images (`hasBefore()`/`hasAfter()`).
   before @3 :PgMvccRow;
   after @4 :PgMvccRow;
+  # Authoritative TableMetadata.id. Missing legacy identity is refused by new readers.
+  tableId @5 :Data;
 }
 
 struct PgMvccRowChanges {
   # One partition's `Vec<RowChange>`.
   changes @0 :List(PgMvccRowChange);
+  table @1 :Text;
+  tableId @2 :Data;
 }
 
 # ---------------------------------------------------------------------------

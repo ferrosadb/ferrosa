@@ -463,3 +463,85 @@ immutable payloads. Commit-log and spill encodings retain their byte sequences.
 Published cell bytes are shared across row copies. Readers recover only unique
 scratch capacity; retained older payloads remain immutable. Memory estimates
 charge the full retained backing and a conservative shared-owner allowance.
+
+
+### Index sidecars across column-layout changes
+
+A rotation captures the target schema with its target index catalog. Frozen rows
+and postings retain their original schema. Before extracting sidecars, the target
+catalog is mapped by column name into that frozen layout, including predicates,
+full-text positions and vector positions. Missing source columns use an ordinal
+outside the u16 cell-tag space and contribute no postings. Unchanged scalar index
+definitions reuse their frozen postings. Ordinary flushes borrow the catalog; a
+schema change clones only index metadata, without remapping or copying rows.
+
+## Resident BatchTxn WAL framing
+
+`apply_batch` lowers BatchOps into mutations and wraps them in a versioned
+internal transaction record (`commitlog/transaction_record.rs`). Ordinary entry
+CRC framing covers the entire set. The reader validates and decodes every member
+before exposing one, assigning consecutive virtual offsets from the physical
+record's offset. Dirty-table tracking uses the same offsets. `BatchTxn` rejects
+a whole record exceeding segment capacity before append and forces fsync before
+applying rows and dispatching observers. The streamed `WriteSetSource` batch
+API remains separate. Callers requiring query-level atomic visibility must hold
+a publication barrier across reads and the commit, as the graph engine does.
+
+
+### PostgreSQL table incarnation isolation (2026-10-26)
+
+`PostgresMvccApplyObserver::acquire_postgres_apply` provides an owned lifecycle lease for the caller to retain through metadata preparation, atomic storage apply and publication. Production PostgreSQL observers validate every bound table UUID before returning a lease; all error paths release it by RAII. Storage continues to treat PostgreSQL metadata as opaque and adds no schema dependency. The default no-op hook preserves non-PostgreSQL/test observer compatibility; an observer protecting PostgreSQL incarnations must override it.
+
+
+### Storage-owned recovery admission (2026-10-26)
+
+The public `assert_table_recovery_complete(&TableId)` checks a registered,
+quiesced local table after its `open` handoff and deferred replay are drained.
+A monotone per-table `recovery-incomplete/` summary is atomically published using
+`schema_snapshot::persist_bounded_json` and directory fsync before a rejected row
+can be treated as retained. A live table latch is set first, so a failed summary
+write also prevents later flush checkpoints. The document is bounded to 256 bytes
+on read, stores only version/incomplete state, and survives table-directory
+lifecycle cleanup. It is never cleared by this implementation.
+
+Startup, explicit replay, lazy registration, and set-aside reingestion use strict
+application errors. Successful quarantine preserves valid-row salvage but blocks
+migration; quarantine or summary persistence failures propagate and retain the
+source frame. Explicit replay durably logs supplied mutations before application;
+failed and unattempted items remain queued. Admission also scans existing
+set-aside and quarantine artifacts and fails closed on unreadable status.
+This is local recovery status, not proof of unobservable historical completeness
+or distributed admission fencing. Callers must quiesce all Direct access.
+
+Reader rejection is also covered: CRC failures, undecodable payloads, malformed
+transaction envelopes and nonempty rejected tails persist unknown-source evidence
+before survivors are delivered or a source segment can retire. Such evidence
+blocks admission for every table and survives restart. Normal empty padding and
+torn creation headers do not create false rejection evidence. Persistence failure
+returns an error and keeps the source bytes. Replay/checkpoint locking prevents
+flush from crossing an unhandled replay frame.
+
+Existing WAL must be recovered via `StorageEngine::open`. Constructors using
+`new` detect pre-existing WAL artifacts and refuse admission for that engine,
+without decoding or reimplementing WAL recovery. Fresh `new` engines can admit
+clean tables.
+
+Set-aside replay retains the exclusive recovery checkpoint gate through its
+durability flush. It uses the guarded flush body directly, avoiding recursive
+read-lock acquisition while retaining the SSTable and WAL durability ordering.
+
+## Count allocation and result-boundary regression coverage (2026-10-27)
+
+The resident single-source count path borrows its Arc-pinned partition. It no
+longer clones the unrelated Row/Cell metadata vector; table-deletion shadowing
+still uses an owned filtered partition. Allocation guards vary column width and
+payload size independently. Counts remain O(N); TTL, tombstone and overlap
+semantics retain their existing read/merge rules.
+
+## Single-row COUNT pushdown
+
+`count_live_single_row_range_matching` is a separate exact liveness counter for partitions containing at most one non-clustered row and no static row. Stable primary-key liveness uses SSTable row metadata and shared resident partitions. TTL, row/partition deletions and table tombstones trigger full reads of all overlapping pinned source partitions before LWW reconciliation; this preserves value-based ties and source column mappings. Source refill happens after these reads. The callback runs after the pinned physical image is obtained. Exceptional rows can read payload bytes; this API does not promise zero payload I/O for TTL/deletion cases. Existing `count_range_matching` remains unchanged in its liveness contract.
+
+## Immutable scalar scan values
+
+CQL values consumed by sorting/test adapters carry shared immutable text/blob payloads. Storage cell payload ownership remains `CellBytes`; cloning it shares immutable backing. Existing external-sort, spill and read formats are unchanged by the runtime-value representation, and shared decoded values do not imply that storage metadata or final response buffers are allocation-free.

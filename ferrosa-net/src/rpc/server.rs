@@ -1295,7 +1295,7 @@ mod tests {
                 max_streams_per_lane: max_streams,
                 ..NetConfig::default()
             });
-            spawn_lane_actor(lane, LaneState::Connected(client), |h| {
+            spawn_lane_actor(lane, LaneState::Connected(Box::new(client)), |h| {
                 ActorReconnectContext {
                     lane,
                     config,
