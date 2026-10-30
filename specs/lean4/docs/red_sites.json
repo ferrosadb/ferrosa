@@ -1,0 +1,36 @@
+{
+  "_doc": "Where each red claim lives in the implementation. The Lean ledger says what is red and proves it absent; this says where the code that fails it is, so the book can print the line beside the claim and a fixer can jump to it. Keyed by the witness theorem, which is stable. A null line means the whole file is the site. Maintained by hand: nothing can infer a line number from a theorem, and a guess would be worse than a blank.",
+  "sites": {
+    "Streaming.a_per_chunk_decoder_copies_the_whole_input": {
+      "path": "ferrosa-sstable/src/compression.rs",
+      "line": 282,
+      "note": "decompress_into takes a caller buffer, but the per-chunk path above copies through a Vec"
+    },
+    "Consistency.a_total_count_can_hide_a_missing_datacenter": {
+      "path": "ferrosa-cluster/src/coordinator/write.rs",
+      "line": 753,
+      "note": "the error branch a per-datacenter shortfall falls through when only the total is checked"
+    },
+    "Commons.Stream.a_gap_is_either_resumable_or_an_explicit_reset": {
+      "path": "ferrosa-cql/src/subscribe.rs",
+      "line": 420,
+      "note": "Lagged carries a count and no position, so the client cannot resume"
+    },
+    "Flight.a_stream_ticket_is_not_a_range_select": {
+      "path": "ferrosa-flight/src/plan.rs",
+      "line": 52,
+      "note": "the only ticket type is a token-range SELECT; no stream ticket exists"
+    },
+    "Commons.Hll.merge_is_commutative": {
+      "path": "ferrosa-storage/src/count.rs",
+      "line": 449,
+      "note": "a Bloom filter plus a counter: it cannot merge, because bits do not determine a count"
+    },
+    "Jepsen.a_read_only_transaction_can_carry_the_only_cycle": {
+      "path": "ferrosa-jepsen/src/orchestrator.rs",
+      "line": 1,
+      "note": "the harness asserts strict serializability over the whole history; it does not isolate read-only transactions"
+    }
+  },
+  "_status": "STOPGAP, hand-maintained. The intended source is Charon's span table from the Aeneas extraction, which records file and line for every function it translates; until that is wired, this file is six hand-checked anchors out of fifty-nine red claims and is not a substitute for it."
+}
