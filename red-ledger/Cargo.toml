@@ -1,0 +1,9 @@
+[package]
+name = "red-ledger"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# No dependencies on purpose: this crate is the join between the Lean specification and the Rust
+# implementation, and a join that drags the cluster in behind it is a join nobody runs in CI.
+[dependencies]

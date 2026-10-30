@@ -86,6 +86,16 @@ jobs:
         working-directory: specs/lean4
         run: lake exe docs build/specs.json
 
+      - name: Check the source docs say what the book prints
+        working-directory: specs/lean4
+        run: lake exe docs --check
+
+      # The tie to the implementation. Every red claim above has a test of the same name in
+      # red-ledger/tests/reds.rs; this step fails when the two sides have drifted, which is the
+      # only way to notice that a red was closed in one place and not the other.
+      - name: Check the Rust red ledger matches this one
+        run: python3 scripts/red_ledger.py --check
+
       - name: Install tectonic
         id: tectonic
         run: |
