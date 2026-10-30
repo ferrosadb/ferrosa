@@ -368,7 +368,43 @@ struct PoppedHeader {
     /// by clustering key, to be drained by the `RangeMerger`. `None` for
     /// SSTable-backed sources, whose rows stream via
     /// [`MergeSource::next_fragment_row`].
-    mem_body: Option<Vec<Row>>,
+    mem_body: Option<MemPartitionRows>,
+}
+
+/// Move uniquely owned rows; otherwise retain the immutable source and copy
+/// only each requested row's metadata. Cell payload backing remains shared.
+enum MemPartitionRows {
+    Owned(std::vec::IntoIter<Row>),
+    Shared {
+        partition: Arc<Partition>,
+        position: usize,
+        // Preserve the historical sorting behavior for noncanonical inputs
+        // without cloning every row. Normal memtable rows are already sorted.
+        order: Option<Vec<usize>>,
+    },
+}
+
+impl Iterator for MemPartitionRows {
+    type Item = Row;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Owned(rows) => rows.next(),
+            Self::Shared {
+                partition,
+                position,
+                order,
+            } => {
+                let index = match order {
+                    Some(order) => *order.get(*position)?,
+                    None => *position,
+                };
+                let row = partition.rows.get(index)?.clone();
+                *position += 1;
+                Some(row)
+            }
+        }
+    }
 }
 
 pub enum MergeSource<'a, R: ReadAt> {
@@ -557,28 +593,54 @@ impl<'a, R: ReadAt> MergeSource<'a, R> {
     fn pop_partition_header(&mut self) -> Result<Option<PoppedHeader>> {
         match self {
             Self::Memtable { iter, peeked } => {
-                // Clone-on-write: only deep-clone if the Arc is shared (the
-                // memtable still holds it). In the fragment path the whole-
-                // partition iterator has already been consumed, so this is
-                // usually a move.
-                let partition = match peeked.take() {
-                    Some(p) => Arc::unwrap_or_clone(p),
-                    None => match iter.next() {
-                        Some(p) => Arc::unwrap_or_clone(p),
-                        None => return Ok(None),
-                    },
+                let Some(partition) = peeked.take().or_else(|| iter.next()) else {
+                    return Ok(None);
                 };
-                let key = partition.key.clone();
-                let deletion = partition.deletion;
-                let static_row = partition.static_row.clone();
-                let mut rows = partition.rows;
-                rows.sort_by(|a, b| a.clustering.cmp(&b.clustering));
-                Ok(Some(PoppedHeader {
-                    key,
-                    deletion,
-                    static_row,
-                    mem_body: Some(rows),
-                }))
+                let header = match Arc::try_unwrap(partition) {
+                    Ok(mut partition) => {
+                        if !partition
+                            .rows
+                            .is_sorted_by(|a, b| a.clustering <= b.clustering)
+                        {
+                            partition
+                                .rows
+                                .sort_by(|a, b| a.clustering.cmp(&b.clustering));
+                        }
+                        PoppedHeader {
+                            key: partition.key,
+                            deletion: partition.deletion,
+                            static_row: partition.static_row,
+                            mem_body: Some(MemPartitionRows::Owned(partition.rows.into_iter())),
+                        }
+                    }
+                    Err(partition) => {
+                        let order = if partition
+                            .rows
+                            .is_sorted_by(|a, b| a.clustering <= b.clustering)
+                        {
+                            None
+                        } else {
+                            let mut order: Vec<usize> = (0..partition.rows.len()).collect();
+                            order.sort_by(|&a, &b| {
+                                partition.rows[a]
+                                    .clustering
+                                    .cmp(&partition.rows[b].clustering)
+                            });
+                            Some(order)
+                        };
+                        PoppedHeader {
+                            key: partition.key.clone(),
+                            deletion: partition.deletion,
+                            static_row: partition.static_row.clone(),
+                            mem_body: Some(MemPartitionRows::Shared {
+                                partition,
+                                position: 0,
+                                order,
+                            }),
+                        }
+                    }
+                };
+                Ok(Some(header))
             }
             Self::SsTable {
                 iter,
@@ -1469,7 +1531,7 @@ struct LiveCount<'a> {
 /// in fragments.
 enum RowCursor {
     /// In-memory rows (memtable source), pre-sorted by clustering key.
-    Mem(std::vec::IntoIter<Row>),
+    Mem(MemPartitionRows),
     /// SSTable-backed source — rows pulled lazily via
     /// `MergeSource::next_fragment_row`, identified by source index.
     Sst { src: usize },
@@ -1803,7 +1865,7 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
                 };
             }
             match header.mem_body {
-                Some(rows) => cursors.push(RowCursor::Mem(rows.into_iter())),
+                Some(rows) => cursors.push(RowCursor::Mem(rows)),
                 None => cursors.push(RowCursor::Sst { src }),
             }
             refill_srcs.push(src);
@@ -1890,7 +1952,10 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
     /// not the first fragment) — in which case the active partition has
     /// been retired and its sources refilled.
     fn emit_fragment(&mut self, k: usize) -> Result<Option<PartitionFragment>> {
-        let mut out: Vec<Row> = Vec::with_capacity(k);
+        // `k` bounds emitted rows, not the initial allocation. Most partitions
+        // are much narrower; reserving the full cap here allocates hundreds of
+        // KiB even for a single row. Grow only when a surviving row is emitted.
+        let mut out: Vec<Row> = Vec::new();
         let partition_delete_at = self
             .active
             .as_ref()
@@ -2376,6 +2441,32 @@ mod tests {
             format!("{err}").contains("out of clustering order"),
             "unexpected error variant: {err}"
         );
+    }
+
+    #[test]
+    fn narrow_partition_fragment_does_not_reserve_the_row_cap() {
+        let reader = Arc::new(reader_from_partitions(&[partition_with_rows(
+            b"narrow",
+            vec![row(0, 0, b"value", 1000)],
+        )]));
+        let readers = [reader];
+        let mut merger = merger_for_sources(
+            Box::new(std::iter::empty()),
+            Vec::new(),
+            &readers,
+            None,
+            None,
+        )
+        .unwrap();
+        let fragment = merger.next_fragment(4096).unwrap().unwrap();
+        assert_eq!(fragment.rows.len(), 1);
+        assert!(fragment.first && fragment.last);
+        assert!(
+            fragment.rows.capacity() <= 4,
+            "one row reserved {} slots instead of growing on demand",
+            fragment.rows.capacity()
+        );
+        assert!(merger.next_fragment(4096).unwrap().is_none());
     }
 
     /// MEMORY-BOUND (RED before the fix): one partition with N rows must

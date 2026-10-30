@@ -605,8 +605,8 @@ async fn process_message_inner(
                 let (batch, has_more) = result.take_batch(requested_batch_size(&extra)).await?;
 
                 // Send a RECORD for each row in this batch.
-                for row in &batch {
-                    let values: Vec<PackValue> = row.iter().map(json_to_pack_value).collect();
+                for row in batch {
+                    let values: Vec<PackValue> = row.into_iter().map(json_to_pack_value).collect();
                     replies.push(BoltMessage::Record { values });
                 }
 
@@ -1009,10 +1009,10 @@ impl PendingRows {
     }
 }
 
-fn json_to_pack_value(v: &serde_json::Value) -> PackValue {
+fn json_to_pack_value(v: serde_json::Value) -> PackValue {
     match v {
         serde_json::Value::Null => PackValue::Null,
-        serde_json::Value::Bool(b) => PackValue::Bool(*b),
+        serde_json::Value::Bool(b) => PackValue::Bool(b),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 PackValue::Int(i)
@@ -1022,13 +1022,13 @@ fn json_to_pack_value(v: &serde_json::Value) -> PackValue {
                 PackValue::Null
             }
         }
-        serde_json::Value::String(s) => PackValue::String(s.clone()),
+        serde_json::Value::String(s) => PackValue::String(s),
         serde_json::Value::Array(arr) => {
-            PackValue::List(arr.iter().map(json_to_pack_value).collect())
+            PackValue::List(arr.into_iter().map(json_to_pack_value).collect())
         }
         serde_json::Value::Object(obj) => PackValue::Map(
-            obj.iter()
-                .map(|(k, v)| (k.clone(), json_to_pack_value(v)))
+            obj.into_iter()
+                .map(|(k, v)| (k, json_to_pack_value(v)))
                 .collect(),
         ),
     }
@@ -1210,32 +1210,44 @@ mod tests {
 
     #[test]
     fn json_to_pack_value_primitives() {
+        assert_eq!(json_to_pack_value(serde_json::Value::Null), PackValue::Null);
         assert_eq!(
-            json_to_pack_value(&serde_json::Value::Null),
-            PackValue::Null
-        );
-        assert_eq!(
-            json_to_pack_value(&serde_json::Value::Bool(true)),
+            json_to_pack_value(serde_json::Value::Bool(true)),
             PackValue::Bool(true)
         );
         assert_eq!(
-            json_to_pack_value(&serde_json::json!(42)),
+            json_to_pack_value(serde_json::json!(42)),
             PackValue::Int(42)
         );
         assert_eq!(
-            json_to_pack_value(&serde_json::json!(1.23)),
+            json_to_pack_value(serde_json::json!(1.23)),
             PackValue::Float(1.23)
         );
         assert_eq!(
-            json_to_pack_value(&serde_json::json!("hello")),
+            json_to_pack_value(serde_json::json!("hello")),
             PackValue::String("hello".into())
+        );
+    }
+
+    #[test]
+    fn owned_bolt_string_moves_into_packstream_without_a_payload_copy() {
+        let input = serde_json::Value::String("x".repeat(1024 * 1024));
+        let (packed, bytes) =
+            crate::allocation_test_support::allocated_bytes(|| json_to_pack_value(input));
+        let PackValue::String(text) = packed else {
+            panic!("expected PackStream string");
+        };
+        assert_eq!(text.len(), 1024 * 1024);
+        assert_eq!(
+            bytes, 0,
+            "owned Bolt string conversion allocated {bytes} bytes"
         );
     }
 
     #[test]
     fn json_to_pack_value_compound() {
         let arr = serde_json::json!([1, "two", null]);
-        let packed = json_to_pack_value(&arr);
+        let packed = json_to_pack_value(arr);
         match packed {
             PackValue::List(items) => {
                 assert_eq!(items.len(), 3);

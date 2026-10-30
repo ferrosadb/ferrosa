@@ -12,6 +12,13 @@ real backlog is structural and security-shaped.
 
 ## Recently addressed
 
+- **Table-access metrics wiring.** The production virtual-table reader and
+  ordinary/prepared CQL routes share one tracker. Router regressions cover
+  scalar INSERT/SELECT, metadata COUNT, token ranges and bounded scans; a live
+  binary probe validates three reads and sixteen prepared writes. Extend the
+  producer coverage to LOGGED batches, Accord transactions and other protocols
+  before interpreting these counters as complete platform access totals.
+
 - **Conditional statements fail closed without SELECT (CQL-24, t_9d641778,
   2026-09-28).** `IF NOT EXISTS` / `IF EXISTS` / `IF <cond>` (CQL, batches and
   `BEGIN TRANSACTION` blocks) now require SELECT as well as MODIFY and are

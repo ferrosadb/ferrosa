@@ -431,3 +431,7 @@ PostgreSQL is registered as starting before the web readiness endpoint is
 exposed. It becomes up only after its background TCP bind succeeds; pending or
 failed binds keep readiness false. This closes the startup window where an
 empty listener-status map could briefly make an occupied-port node look ready.
+
+CQL routing and `system_views.table_access` share one `Arc<TableAccessTracker>`
+created by the binary. The counters describe routed CQL reads/writes, including
+prepared statements; they do not represent every protocol or physical disk I/O.

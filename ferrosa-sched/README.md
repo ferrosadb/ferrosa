@@ -1,5 +1,12 @@
 # ferrosa-sched
 
+Async supervisors can use `execute_scan` and `resume_scan` to await admission
+in their existing task. These return `Result<ScanOutcome<_>, JoinError>` so a
+producer panic remains an error. They preserve fair tickets, cancellation,
+overload and I/O permits without spawning an additional async admission task
+per continuation. Carrier work still runs on the bounded blocking pool.
+`submit_scan` and `resubmit_scan` remain available as spawned-handle wrappers.
+
 Query QoS scheduler core ([epic](../specs/proposed/query-scheduler/)): a bounded
 execution pool that reserves CPU headroom for consensus (**Phase 0 / B0**), plus
 CFS-inspired fair-share scheduling so concurrent scans share that pool without

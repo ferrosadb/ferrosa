@@ -1,5 +1,15 @@
 # ferrosa-storage
 
+Range-read fragments retain a configurable row bound (default 4,096), with
+continuation across fragments; it is not a total query result limit. Fragment
+row vectors now grow as rows are emitted instead of reserving the full bound
+for every partition, avoiding oversized allocations for narrow partitions.
+Fragment cursors retain immutable shared memtable partitions and pull row
+metadata on demand instead of cloning the whole body. Uniquely owned rows move
+into the cursor. Already ordered rows avoid sort scratch; noncanonical shared
+input retains ordering through an index vector. Cell payload backing stays
+shared. The ordering precheck still examines the source's clustering keys.
+
 > The single-node storage engine: memtable → commit log → flush → SSTable →
 > S3 write-behind, plus compaction, local cache, NVMe pinning, secondary-index
 > pipeline, snapshot/PITR, and the corruption quarantine + self-heal controller.
@@ -1763,3 +1773,7 @@ read-lock acquisition while retaining the SSTable and WAL durability ordering.
 ## Immutable scalar scan values
 
 CQL values consumed by sorting/test adapters carry shared immutable text/blob payloads. Storage cell payload ownership remains `CellBytes`; cloning it shares immutable backing. Existing external-sort, spill and read formats are unchanged by the runtime-value representation, and shared decoded values do not imply that storage metadata or final response buffers are allocation-free.
+
+Resumable range-scan supervisors await scheduler admission directly through
+`execute_scan`/`resume_scan`; carrier work remains on the bounded blocking pool.
+Producer panics are delivered as stream errors.

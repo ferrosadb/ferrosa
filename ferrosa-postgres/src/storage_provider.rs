@@ -178,16 +178,35 @@ pub fn cql_to_value(v: &CqlValue) -> Result<Value, String> {
 
 /// Convert one owned decoded storage row to the SQL executor's positional values.
 fn decoded_row_values(row: Vec<Option<CqlValue>>) -> Result<Vec<Value>, String> {
-    row.into_iter()
-        .map(|cell| match cell {
-            Some(CqlValue::Text(text) | CqlValue::Ascii(text)) => Ok(Value::Text(text)),
-            Some(CqlValue::Blob(bytes)) => Ok(Value::Bytea(bytes)),
-            Some(CqlValue::Decimal { scale, unscaled }) => Ok(Value::numeric(unscaled, scale)),
-            Some(CqlValue::Varint(unscaled)) => Ok(Value::numeric(unscaled, 0)),
-            Some(CqlValue::Jsonb(doc)) => Ok(Value::Jsonb(doc)),
-            Some(value) => cql_to_value(&value),
-            None => Ok(Value::Null),
-        })
+    row.into_iter().map(decoded_cell_value).collect()
+}
+
+/// Move one decoded cell without allocating a temporary one-column row.
+fn decoded_cell_value(cell: Option<CqlValue>) -> Result<Value, String> {
+    match cell {
+        Some(CqlValue::Text(text) | CqlValue::Ascii(text)) => Ok(Value::Text(text)),
+        Some(CqlValue::Blob(bytes)) => Ok(Value::Bytea(bytes)),
+        Some(CqlValue::Decimal { scale, unscaled }) => Ok(Value::numeric(unscaled, scale)),
+        Some(CqlValue::Varint(unscaled)) => Ok(Value::numeric(unscaled, 0)),
+        Some(CqlValue::Jsonb(doc)) => Ok(Value::Jsonb(doc)),
+        Some(value) => cql_to_value(&value),
+        None => Ok(Value::Null),
+    }
+}
+
+/// Keep a single-column key inline; composite keys may spill to the heap.
+type ScanKey = smallvec::SmallVec<[Value; 1]>;
+
+/// Decode only key columns; the caller retains the positional output row.
+fn decoded_scan_key(
+    row: &[Option<CqlValue>],
+    partition_columns: &[usize],
+    clustering_columns: &[usize],
+) -> Result<ScanKey, String> {
+    partition_columns
+        .iter()
+        .chain(clustering_columns)
+        .map(|index| row[*index].as_ref().map_or(Ok(Value::Null), cql_to_value))
         .collect()
 }
 
@@ -392,7 +411,7 @@ struct ScanKeyMetrics {
 /// Exact membership is needed to restore a row first deleted AFTER a physical
 /// row was emitted without emitting it twice. Own decoded keys, never rows.
 struct ScanSeen {
-    keys: std::collections::HashSet<Vec<Value>>,
+    keys: std::collections::HashSet<ScanKey>,
     #[cfg(test)]
     metrics: Arc<ScanKeyMetrics>,
 }
@@ -404,7 +423,7 @@ impl ScanSeen {
             metrics: _failure.1.clone(),
         }
     }
-    fn insert(&mut self, key: Vec<Value>) {
+    fn insert(&mut self, key: ScanKey) {
         let inserted = self.keys.insert(key);
         #[cfg(test)]
         if inserted {
@@ -418,7 +437,7 @@ impl ScanSeen {
         #[cfg(not(test))]
         let _ = inserted;
     }
-    fn contains(&self, key: &Vec<Value>) -> bool {
+    fn contains(&self, key: &[Value]) -> bool {
         self.keys.contains(key)
     }
 }
@@ -711,17 +730,7 @@ async fn produce_scan(
                 ));
                 return;
             }
-            let key = match ctx
-                .pk_idx
-                .iter()
-                .chain(ctx.ck_idx.iter())
-                .map(|index| {
-                    cql_row[*index]
-                        .as_ref()
-                        .map_or(Ok(Value::Null), cql_to_value)
-                })
-                .collect::<Result<Vec<Value>, String>>()
-            {
+            let key = match decoded_scan_key(&cql_row, &ctx.pk_idx, &ctx.ck_idx) {
                 Ok(key) => key,
                 Err(error) => {
                     failure.record(error);
@@ -738,7 +747,7 @@ async fn produce_scan(
                     return;
                 }
             };
-            let replacement = ctx.overlay.get(&key).or(historical.as_deref());
+            let replacement = ctx.overlay.get(key.as_slice()).or(historical.as_deref());
             let row = match replacement {
                 Some(Some(row)) => Some(row.clone()),
                 Some(None) => None,
@@ -750,7 +759,7 @@ async fn produce_scan(
                     }
                 },
             };
-            if view.is_some() || ctx.overlay.contains_key(&key) {
+            if view.is_some() || ctx.overlay.contains_key(key.as_slice()) {
                 overlay_seen.insert(key);
             }
             let Some(row) = row else {
@@ -1452,6 +1461,26 @@ where
 mod tests {
     use super::*;
     use ferrosa_sql::ColumnType;
+
+    #[test]
+    fn single_column_scan_key_does_not_allocate_a_vector() {
+        let row = vec![Some(CqlValue::Int(7)), Some(CqlValue::Int(8))];
+        let mut key = None;
+        let allocations = crate::mvcc::MvccManager::count_allocations_for_test(|| {
+            key = Some(super::decoded_scan_key(&row, &[0], &[]));
+        });
+        assert_eq!(key.unwrap().unwrap().as_slice(), &[Value::Int(7)]);
+        assert_eq!(
+            allocations, 0,
+            "single-column scan key allocated {allocations} times"
+        );
+        assert_eq!(
+            super::decoded_scan_key(&row, &[0], &[1])
+                .unwrap()
+                .as_slice(),
+            &[Value::Int(7), Value::Int(8)],
+        );
+    }
 
     fn jsonb_cell(text: &str) -> ferrosa_jsonb::JsonbValue {
         use ferrosa_jsonb::{parse_text, JsonbValue, Limits, LimitsConfig};

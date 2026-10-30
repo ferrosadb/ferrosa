@@ -36,6 +36,14 @@ impl TableAccessCounters {
 /// Key for the access tracker: (keyspace, table_name).
 type TableKey = (String, String);
 
+/// The physical CQL read path, independent of result cardinality.
+#[derive(Clone, Copy)]
+pub enum TableReadKind {
+    Point,
+    Range,
+    Full,
+}
+
 /// Concurrent tracker for per-table access statistics.
 pub struct TableAccessTracker {
     counters: DashMap<TableKey, Arc<TableAccessCounters>>,
@@ -63,6 +71,18 @@ impl TableAccessTracker {
         self.get_counters(keyspace, table)
             .reads
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a read and its physical access class with one counter lookup.
+    pub fn record_read_access(&self, keyspace: &str, table: &str, kind: TableReadKind) {
+        let counters = self.get_counters(keyspace, table);
+        counters.reads.fetch_add(1, Ordering::Relaxed);
+        let access = match kind {
+            TableReadKind::Point => &counters.point_lookups,
+            TableReadKind::Range => &counters.range_scans,
+            TableReadKind::Full => &counters.full_scans,
+        };
+        access.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a write operation.

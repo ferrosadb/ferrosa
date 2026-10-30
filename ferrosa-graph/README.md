@@ -8,6 +8,15 @@
 
 ## What this crate is
 
+Scalar property evaluation borrows the parent JSON object and owns only the
+selected output value. Empty property maps pass without constructing a binding
+map or cloning the node. Unit allocation guards cover both paths with a large
+unselected payload, alongside null and output-ownership semantics.
+
+Plain no-hop anchor queries stop after enough matching rows satisfy an explicit
+LIMIT. ORDER BY, DISTINCT, WITH pipelines, post-filters and OPTIONAL hops retain
+their existing evaluation boundaries; unlimited queries still return every row.
+
 `ferrosa-graph` lets a ferrosa keyspace be queried as a property graph without
 a separate graph store. Vertices and edges live in **regular CQL tables** tagged
 with `extensions["graph.type"] = "vertex" | "edge"` (plus `graph.label`,
@@ -559,3 +568,9 @@ read-your-writes overlay.
 Transaction read overlays retain immutable mutation handles and materialize only
 the consumed partition, avoiding a copy of unrelated pending rows. COMMIT requires
 all transaction read streams to be drained before consuming staged mutations.
+
+Owned property-only streaming projections move fields at their last use; earlier
+duplicate references retain their required value copies. Complex projections
+keep the general evaluator. Bolt serialization consumes owned rows and moves
+strings, map keys and nested values into PackStream values. Wire encoding still
+writes output bytes, and unlimited anchor/PULL batches can still materialize.

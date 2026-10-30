@@ -1,4 +1,32 @@
-# Performance comparison: PR #625
+# Performance comparisons
+
+## Local allocation follow-up (2026-10-28)
+
+This follow-up is a separate local Linux ARM64 VM experiment, **not a rerun of
+the product comparisons below**. Baseline source was `0b552fea9`; the timing arm
+changed only CQL fragment reservation. The fixture was 5,000 memtable partitions
+with 96-byte payloads, validated for complete keys and values. Three paired
+trials alternated before/after order, each with one warmup and 20 queries, with
+profiling disabled and no concurrent builds. Values below are medians across
+trial medians; the small sample does not establish statistical significance.
+
+| CQL scan measurement | Before | After |
+| --- | ---: | ---: |
+| Throughput, rows/s | 117,958 | 121,242 |
+| Query median, ms | 42.39 | 41.24 |
+| Process CPU seconds per 21-query batch | 0.84 | 0.47 |
+
+Separate sampled jemalloc profiles, subtracting a matched no-query fixture and
+dividing by 21 queries, attributed fragment allocations of 1,639.16 to 2.38
+decimal MB/query. This is cumulative allocation traffic, not live memory or RSS.
+The first Bolt empty-predicate, borrowed-parent and eligible anchor-LIMIT fixes
+reduced estimated full-scan allocation from 38.46 to 20.12 MB/query; no paired
+Bolt throughput result is available. Shared memtable cursors, scheduler admission,
+PG inline keys and the final owned Bolt projection/serialization moves were
+added later and have **not** had a completed combined performance comparison.
+Do not attribute these timing numbers to that whole batch.
+
+## Historical Fly comparison: PR #625
 
 PostgreSQL/CQL below measure production code `2286f389ac6669d44d5cfef1e71c7facdce37c30`.
 Later Rust commits change tests only (`03cf9511e`). **Bolt/SPARQL retain older

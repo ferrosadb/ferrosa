@@ -182,6 +182,7 @@ pub fn standalone_for_test_with(data_dir: &Path, options: StandaloneOptions) -> 
         query_tracker: Arc::new(QueryTracker::new()),
         full_scan_tracker: Arc::new(FullScanTracker::new()),
         index_usage_tracker: Arc::new(IndexUsageTracker::new()),
+        table_access_tracker: std::sync::Arc::new(crate::virtual_tables::TableAccessTracker::new()),
         event_sender: tokio::sync::broadcast::channel(64).0,
         last_schema_event: tokio::sync::watch::channel(None).0,
         cql_metrics: Arc::new(CqlMetrics::new()),
