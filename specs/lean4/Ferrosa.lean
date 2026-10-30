@@ -31,6 +31,7 @@ import Ferrosa.Accord.Recovery
 import Ferrosa.Accord.Strict
 import Ferrosa.Accord.Edn
 import Ferrosa.Topology.ConsistencyLevels
+import Ferrosa.Topology.DcQuorum
 import Ferrosa.Cql.Syntax
 import Ferrosa.Cql.Classify
 import Ferrosa.Cql.Conformance

@@ -24,6 +24,7 @@
 -/
 import Ferrosa.Ledger
 import Ferrosa.Topology.ConsistencyLevels
+import Ferrosa.Topology.DcQuorum
 import Ferrosa.Sql.Txn
 
 set_option linter.deprecated false
@@ -236,10 +237,16 @@ def dcHasMajority (rf acks : Nat) : Bool := acks > rf / 2
 def dcsWithMajority (t : Topology) (acks : List Nat) : Nat :=
   (idxMap (fun i rf => if dcHasMajority rf (acks.getD i 0) then 1 else 0) 0 t.dcs).sum
 
-/-- The code's QUORUM: origin-DC majority, then a strict majority of configured DCs. -/
+/-- Per-datacenter acknowledgement counts as the general model's `count_in_dc`. -/
+def ackCount (acks : List Nat) (d : Nat) : Nat := acks.getD d 0
+
+/-- The code's QUORUM shape: origin-DC majority, then a strict majority of configured DCs.  This is
+    gates 1 and 2 of `Topology.DcQuorum`, so every theorem proved there for all topologies holds of
+    the examples in this file; in particular a DC configured with `rf = 0` does not count towards
+    the denominator, exactly as the code's `.filter(|rf| **rf > 0)`. -/
 def quorumSatisfied (t : Topology) (origin : Nat) (acks : List Nat) : Bool :=
-  dcHasMajority (t.dcs.getD origin 0) (acks.getD origin 0)
-    && (t.dcs.length / 2 + 1 ≤ dcsWithMajority t acks)
+  Topology.DcQuorum.originGate t.dcs origin (ackCount acks)
+    && Topology.DcQuorum.dcGate t.dcs (ackCount acks)
 
 /-- EACH_QUORUM: every configured DC holds its own majority. -/
 def eachQuorumSatisfied (t : Topology) (acks : List Nat) : Bool :=
@@ -348,9 +355,20 @@ cannot both hold a strict majority of the configured ones. `quorumSatisfied` abo
 pair of gates, so its theorems are DC_QUORUM's. -/
 
 /-- DC_QUORUM's write requirement: all three conditions — the origin datacenter's quorum, a quorum
-    of configured datacenters, and a quorum of all replicas. -/
+    of configured datacenters, and a quorum of all replicas.  It *is* `Topology.DcQuorum.write`; the
+    general theorems (`dc_quorum_writes_share_a_replica`, `no_partition_admits_two_dc_quorum_writes`,
+    `write_is_monotone`) are stated there over replica sets. -/
 def dcQuorumWrite (t : Topology) (origin : Nat) (acks : List Nat) : Bool :=
-  quorumSatisfied t origin acks && cassandraQuorumSatisfied t acks
+  Topology.DcQuorum.write t.dcs origin (ackCount acks) acks.sum
+
+/-- **A datacenter configured with `rf = 0` is not in the denominator.**  On `{3, 0}` the only
+    eligible datacenter is the origin, so its quorum is a quorum of configured datacenters.  Counting
+    `t.dcs.length` instead would demand a second datacenter that holds no replicas, and reject every
+    write; `Topology.DcQuorum.a_zero_rf_datacenter_is_inert` is the general statement. -/
+theorem a_zero_rf_datacenter_is_not_in_the_denominator :
+    quorumSatisfied ⟨[3, 0]⟩ 0 [2, 0] = true
+      ∧ quorumSatisfied ⟨[3, 0]⟩ 0 [2, 0] = quorumSatisfied ⟨[3]⟩ 0 [2]
+      ∧ ¬ ([3, 0].length / 2 + 1 ≤ 1) := by decide
 
 /-- **`{5,5,5}` accepts `{5,3,0}` and rejects `{3,3,0}`.**  Both have the origin's quorum and two DC
     quorums; only the first reaches a quorum of all fifteen replicas, which is eight. -/
@@ -517,7 +535,7 @@ theorem quorum_is_strictly_weaker_than_dc_quorum :
 
 /-- DC_QUORUM's read requirement: the local quorum alone. -/
 def dcQuorumRead (t : Topology) (origin : Nat) (acks : List Nat) : Bool :=
-  dcHasMajority (t.dcs.getD origin 0) (acks.getD origin 0)
+  Topology.DcQuorum.read t.dcs origin (ackCount acks)
 
 /-- **Local quorum alone does not prevent a split.** On `{3,3}`, a partition that separates the
     datacenters leaves each side holding its own local quorum, so both would answer. -/
@@ -543,7 +561,7 @@ theorem dc_quorum_writes_need_both_conditions :
 theorem a_local_read_does_not_consult_remote_datacenters (t : Topology) (origin : Nat)
     (a b : List Nat) (h : a.getD origin 0 = b.getD origin 0) :
     dcQuorumRead t origin a = dcQuorumRead t origin b := by
-  simp only [dcQuorumRead, h]
+  simp only [dcQuorumRead, Topology.DcQuorum.read, Topology.DcQuorum.originGate, ackCount, h]
 
 /-- **So a client that fails over between datacenters can read backwards.**  `[3, 0]` and `[3, 5]`
     are the same read: a reader in the second DC whose own quorum is intact cannot tell whether the
@@ -565,8 +583,7 @@ theorem local_quorum_commits_have_a_datacenter_failure_rpo :
     DC_QUORUM left its origin datacenter at quorum, so reading there needs no hop. -/
 theorem a_local_read_sees_a_dc_quorum_write (t : Topology) (origin : Nat) (acks : List Nat)
     (h : dcQuorumWrite t origin acks = true) : dcQuorumRead t origin acks = true := by
-  unfold dcQuorumRead
-  simp only [dcQuorumWrite, quorumSatisfied, Bool.and_eq_true] at h
+  simp only [dcQuorumWrite, Topology.DcQuorum.write, Bool.and_eq_true] at h
   exact h.1.1
 
 /-! ## A transaction's statements and its commit decision
@@ -684,7 +701,19 @@ def ledger : List SpecItem := [
   ⟨"LOCAL_QUORUM gives read-your-writes only while the client stays connected to the same datacenter",
    .met "Consistency.local_quorum_does_not_cross_dcs"⟩,
   ⟨"DC_QUORUM's node quorum is what makes an acknowledged write recoverable after a DC loss",
-   .met "Consistency.a_node_quorum_cannot_be_split"⟩,
+   .met "Topology.DcQuorum.node_gate_forces_a_shared_replica"⟩,
+  ⟨"any two DC_QUORUM writes share a replica, for every topology and every pair of origins",
+   .met "Topology.DcQuorum.dc_quorum_writes_share_a_replica"⟩,
+  ⟨"a DC_QUORUM write and a Cassandra QUORUM write on the same keyspace share a replica",
+   .met "Topology.DcQuorum.dc_quorum_and_cassandra_quorum_writes_share_a_replica"⟩,
+  ⟨"a DC_QUORUM read in the write's origin datacenter always sees it",
+   .met "Topology.DcQuorum.a_same_origin_read_sees_a_dc_quorum_write"⟩,
+  ⟨"a DC_QUORUM read in another datacenter can miss an acknowledged DC_QUORUM write",
+   .met "Topology.DcQuorum.a_read_in_another_datacenter_can_miss_a_dc_quorum_write"⟩,
+  ⟨"a late or duplicated acknowledgement never revokes a DC_QUORUM verdict",
+   .met "Topology.DcQuorum.write_is_monotone"⟩,
+  ⟨"a datacenter configured with rf = 0 changes no DC_QUORUM verdict",
+   .met "Topology.DcQuorum.a_zero_rf_datacenter_is_inert"⟩,
   ⟨"LOCAL_QUORUM exists for Cassandra wire compatibility, not as an operating recommendation",
    .met "Consistency.a_local_quorum_can_sit_outside_every_future_quorum"⟩,
   ⟨"LOCAL_QUORUM is strong inside its datacenter and makes no promise about any other",
@@ -720,7 +749,7 @@ def ledger : List SpecItem := [
   ⟨"DC_QUORUM reads are served from the local datacenter without a cross-DC hop",
    .met "Consistency.a_local_read_sees_a_dc_quorum_write"⟩,
   ⟨"the datacenter-majority condition prevents two partitions from both answering",
-   .met "Consistency.two_disjoint_dc_sets_cannot_both_hold_a_majority"⟩,
+   .met "Topology.DcQuorum.no_partition_admits_two_dc_quorum_writes"⟩,
   ⟨"a multi-DC keyspace defaults to DC_QUORUM, a single-DC one to Cassandra's QUORUM",
    .met "Consistency.the_multi_dc_default_is_dc_quorum"⟩,
   ⟨"DC_QUORUM collapses to QUORUM when there is only one datacenter",
@@ -732,7 +761,7 @@ def ledger : List SpecItem := [
   ⟨"DC_QUORUM is strictly stronger than Cassandra's QUORUM, not incomparable to it",
    .met "Consistency.quorum_is_strictly_weaker_than_dc_quorum"⟩,
   ⟨"a partition cannot shrink the configured DC denominator",
-   .met "Consistency.a_partition_does_not_shrink_the_dc_denominator"⟩,
+   .met "Topology.DcQuorum.a_dark_majority_of_datacenters_blocks_every_write"⟩,
   ⟨"the decision level is carried by the transaction, not ranked from the enum",
    .met "Consistency.the_level_is_carried_not_ranked"⟩,
   ⟨"no consistency level, however high or newly defined, prevents write skew",

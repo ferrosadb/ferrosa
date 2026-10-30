@@ -16,6 +16,16 @@ import Ferrosa.Commons.Stream
 import Ferrosa.Cql.Subscribe
 import Ferrosa.Flight.Subscribe
 
+#check Ferrosa.Topology.DcQuorum.dc_quorum_writes_share_a_replica
+#check Ferrosa.Topology.DcQuorum.no_partition_admits_two_dc_quorum_writes
+#check Ferrosa.Topology.DcQuorum.node_gate_forces_a_shared_replica
+#check Ferrosa.Topology.DcQuorum.dc_quorum_and_cassandra_quorum_writes_share_a_replica
+#check Ferrosa.Topology.DcQuorum.a_same_origin_read_sees_a_dc_quorum_write
+#check Ferrosa.Topology.DcQuorum.a_read_in_another_datacenter_can_miss_a_dc_quorum_write
+#check Ferrosa.Topology.DcQuorum.write_is_monotone
+#check Ferrosa.Topology.DcQuorum.a_dark_majority_of_datacenters_blocks_every_write
+#check Ferrosa.Topology.DcQuorum.a_zero_rf_datacenter_is_inert
+#check Ferrosa.Sql.Consistency.a_zero_rf_datacenter_is_not_in_the_denominator
 #check Ferrosa.Sql.Consistency.dc_quorum_tolerates_a_whole_dc_outage
 #check Ferrosa.Sql.Consistency.the_survivors_must_supply_eight_of_ten
 #check Ferrosa.Sql.Consistency.a_local_read_sees_a_dc_quorum_write
