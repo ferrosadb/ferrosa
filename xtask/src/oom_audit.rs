@@ -70,6 +70,10 @@ pub const NON_SERVING_CRATES: &[(&str, &str)] = &[
         "per-connection session state; sized by connection count, not by result rows",
     ),
     (
+        "tools/alloc-count",
+        "dev-only counting allocator for four unit tests; owns no query path",
+    ),
+    (
         "ferrosa-sched",
         "task scheduling and admission control; moves no row data",
     ),
