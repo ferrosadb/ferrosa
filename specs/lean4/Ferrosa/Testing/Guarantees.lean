@@ -1,26 +1,18 @@
 /-
-  Ferrosa formal specification — a guarantee is a function of the consistency level.
-  ==============================================================================
+  A guarantee is a function of the consistency level
+  ==================================================
 
-  CL=ONE on a three-node cluster does not guarantee what CL=ALL guarantees, and that is the design
-  rather than a defect. So the Jepsen suite cannot assert one fixed property; it has to assert the
-  property the configured levels actually promise. This module makes that a function:
-
-    `Profile`   — durability, write level, read level, replica count, and whether a read may be
-                  served from a datacenter that does not hold the write.
-    `overlap`   — W + R > RF, the condition under which a read must intersect every write's replica
-                  set. This is the whole basis of "a read can see every acknowledged write".
-    `guarantees` — the set of promises the profile delivers.
-
-  The theorems below are the ones the suite has to respect:
-
-  * a missing value is evidence of loss only when `overlap` holds;
-  * CL=ALL writes plus CL=ONE reads still overlap, so a single-replica read is not automatically
-    unsound — it is the *pair* that matters, not either level alone;
-  * raising either level can only add guarantees, never remove them, so a weaker configuration is a
-    sound subset and not a bug;
-  * a read served from another datacenter breaks the overlap argument even when W + R > RF, which is
-    why DC_QUORUM's local reads cannot establish strict serializability.
+  CL=ONE on a three-node cluster does not promise what CL=ALL promises, and that is the design rather
+  than a defect, so the suite cannot assert one fixed property — it has to assert the property the
+  configured levels actually deliver. The single condition behind every guarantee Ferrosa makes about
+  a read is overlap: a read can be trusted to see an acknowledged write only when W + R > RF, and it is
+  the pair of levels that decides it, never either level on its own. A read answered by a datacenter
+  that does not hold the write defeats the argument however the replica counts fall, which is why
+  DC_QUORUM's local reads cannot establish strict serializability. Raising either level can only add
+  guarantees, so a weaker configuration is a sound subset rather than a bug, and a verdict is a
+  function of the history and the profile — a pass/fail without the profile is not a result. Every row
+  in this ledger is met; where the suite fails to respect these conditions is audited in
+  `Ferrosa/Testing/Jepsen.lean`.
 -/
 import Ferrosa.Core
 import Ferrosa.Ledger
@@ -102,13 +94,15 @@ theorem a_one_write_with_a_quorum_read_does_not_overlap :
 /-! ## Monotonicity: a weaker configuration is a subset, not a bug -/
 
 /-- **Raising either level can only add guarantees.** A configuration that promises less is sound —
-    it simply tests less — so the suite must assert per configuration rather than globally. -/
+    it tests less — so the suite must assert per configuration rather than globally. -/
 theorem raising_the_read_level_cannot_remove_a_guarantee (rf w r : Nat) :
     overlap ⟨rf, w, r, false⟩ = true → overlap ⟨rf, w, r + 1, false⟩ = true := by
   intro h
   simp only [overlap, decide_eq_true_eq] at h ⊢
   omega
 
+/-- Raising the write level by one cannot break the overlap, so a configuration that could see every
+    acknowledged write still can after the change. -/
 theorem raising_the_write_level_cannot_remove_a_guarantee (rf w r : Nat) :
     overlap ⟨rf, w, r, false⟩ = true → overlap ⟨rf, w + 1, r, false⟩ = true := by
   intro h
@@ -179,6 +173,8 @@ def ledger : List SpecItem := [
    .met "Histories.nothing_is_confirmed_that_the_profile_cannot_support"⟩
 ]
 
+/-- No red rows: every claim this ledger makes about the consistency levels is proved, and this pins
+    that none has been added since without a proof. -/
 theorem guarantees_has_no_red_items : redCount ledger = 0 := by decide
 
 def main : IO Unit :=

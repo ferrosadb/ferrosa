@@ -1,27 +1,20 @@
 /-
-  Ferrosa formal specification — what a Jepsen/Elle run is allowed to conclude.
-  ========================================================================
+  What a green Jepsen/Elle run is allowed to conclude
+  ===================================================
 
-  The suite's goal is `StrictlySerializable`, and the interesting question is not whether the checker
-  is correct in the abstract (that is `Accord.StrictlySerializable`) but whether a *green run* licenses
-  the claim. It does not, in three ways that are all machine-checked below:
-
-  1. **A run that observed nothing establishes nothing.** `orchestrator.rs` notes that an empty result
-     vector is vacuously all-linear — so a suite that produces no acknowledged read/write pair passes
-     the linearizability check while proving nothing. A verdict needs witnesses, not the absence of
-     counterexamples.
-
-  2. **A local read cannot establish it across a failover.** DC_QUORUM and LOCAL_QUORUM reads are served
-     from the origin datacenter (`a_local_read_does_not_consult_remote_datacenters`). A write acked in
-     DC A and a read served in DC B need not see it, which is exactly the stale-read shape that is
-     serializable but not strictly serializable. So a multi-DC run with local reads and failover must
-     *expect* strict-serializability violations: that is the documented semantics, not a defect. The
-     assertion is only meaningful single-DC, or with reads at a level that consults a quorum of DCs.
-
-  3. **A cycle in the dependency graph refutes it, and the cycle may run through a read-only
-     transaction.** Elle's whole point: ww, wr and rw edges are computed over *all* transactions
-     including read-only ones. Drop the read-only transaction from the graph and the remaining edges
-     are acyclic, so the checker reports serializable for a history that is not.
+  Whether the checker is right in the abstract is settled in `Ferrosa/Accord/Serializable.lean`; what
+  a run licenses a customer to claim is decided here, and a green run licenses less than it looks
+  like in three ways that are all machine-checked. A run that produced no acknowledged read/write
+  pair passes the linearizability check vacuously, because an empty result vector is all-linear, so a
+  verdict needs witnesses rather than the absence of counterexamples. A read served from the local
+  datacenter across a failover produces exactly the stale-read shape that is serializable but not
+  strictly serializable, and under DC_QUORUM and LOCAL_QUORUM that is the documented semantics, so a
+  multi-DC run with local reads should expect the violation rather than record it as a defect. A
+  cycle carried by a read-only transaction vanishes from the dependency graph when the checker graphs
+  only writers, so dropping a transaction can only ever under-report a violation. Three ledger rows
+  stay red: the suite asserts strict serializability for multi-key transactions, the inclusion of
+  read-only transactions is unverified from the code, and a local-read run across a failover records
+  a semantics consequence as a failure.
 -/
 import Ferrosa.Accord.Serializable
 import Ferrosa.Sql.Consistency
@@ -163,6 +156,9 @@ def ledger : List SpecItem := [
      "Jepsen.a_local_read_run_cannot_establish_strict_serializability"⟩
 ]
 
+/-- The ledger carries exactly three reds — the multi-key assertion, the unverified read-only
+    inclusion, and the local-read failure — and this pins the count, so a row cannot be dropped
+    quietly. -/
 theorem jepsen_has_three_red_items : redCount ledger = 3 := by decide
 
 def main : IO Unit :=

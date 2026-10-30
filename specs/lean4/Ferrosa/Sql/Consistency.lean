@@ -1,26 +1,22 @@
 /-
-  Ferrosa formal specification — consistency levels on the SQL surface.
+  Ferrosa formal specification — consistency levels on the SQL surface, and what each
+  one buys.
   =====================================================================
 
-  Consistency is a *configuration* of the SQL surface, with four levels and a default:
+  A statement on the SQL surface runs at `ALL`, `QUORUM`, `LOCAL_QUORUM` or `ONE`, and
+  `QUORUM` is the default. The level decides which replicas must answer and nothing
+  else: `QUORUM` on three replicas needs two acknowledgements on each side, those two
+  sets must overlap, and so a read finds the last acknowledged write. `ONE` needs one
+  on each, the two need not overlap, and a write the client was told had succeeded can
+  be invisible to its very next read.
 
-    ALL, QUORUM, LOCAL_QUORUM, ONE — default QUORUM.
-
-  It is not a new mechanism. The ack rules already live in `Topology/ConsistencyLevels.lean`,
-  because which replicas must answer is a property of the topology and not of the query language
-  (the same reason that file was moved out of Accord). This module adds only what is specific to
-  SQL: the level set, the default, the acceptance table the tests check against, and the
-  interaction between a read level and a write level.
-
-  Three results are worth stating up front because they are the ones that surprise people:
-
-    - `quorum_reads_see_quorum_writes_rf3` — QUORUM/QUORUM on RF=3 overlaps, so a read sees the
-      last acknowledged write.
-    - `one_read_can_miss_a_one_write` — ONE/ONE does not. A write the client was told succeeded
-      can be invisible to the next read.
-    - `all_does_not_prevent_write_skew` — and no consistency level prevents write skew, because
-      a level chooses *which replicas answer* and isolation chooses *which versions are visible*.
-      ALL makes every replica agree that the invariant is broken.
+  Two things surprise operators: the requirement is per datacenter and not a total,
+  so five acknowledgements all in the primary do not stand in for three there and two
+  in the secondary — and one write path, the truncate path at
+  `coordinator/write.rs:753`, counts a bare total and admits exactly that write. And
+  no level prevents write skew: a level chooses which replicas answer, while isolation
+  chooses which versions are visible, so `ALL` makes every replica agree that the
+  invariant is broken.
 -/
 import Ferrosa.Ledger
 import Ferrosa.Topology.ConsistencyLevels
@@ -46,6 +42,9 @@ inductive Level where
     failures. -/
 def defaultLevel : Level := .quorum
 
+/-- A statement or transaction that names no level runs at `QUORUM`, which on three
+    replicas is two of them — enough to meet another `QUORUM` read and not enough to
+    survive two failures. -/
 theorem default_is_quorum : defaultLevel = Level.quorum := rfl
 
 /-- Replicas that must acknowledge. `localRf` is the replica count in the coordinating
@@ -104,6 +103,8 @@ theorem local_quorum_constrains_only_the_coordinating_dc :
     Level.localQuorum.perDcNeeded primarySecondary 0 = [3, 0]
       ∧ Level.localQuorum.perDcNeeded primarySecondary 1 = [0, 2] := by decide
 
+/-- `ALL` on a five-and-three keyspace requires all five replicas in the primary and
+    all three in the secondary, so it tolerates no failure at all. -/
 theorem all_requires_every_replica :
     Level.all.perDcNeeded primarySecondary 0 = [5, 3] := by decide
 
@@ -341,6 +342,10 @@ theorem dc_quorum_trades_total_durability_for_dc_shape :
 def dcQuorumStrict (t : Topology) (origin : Nat) (acks : List Nat) : Bool :=
   quorumSatisfied t origin acks && cassandraQuorumSatisfied t acks
 
+/-- Requiring a datacenter quorum and a node quorum together refuses both bad shapes on
+    `{3,3,3}`: five acks in one datacenter fail the shape, and two datacenters' majorities
+    of four acks fail Cassandra's total of five. Three in the origin and two remote pass
+    both. -/
 theorem requiring_both_rejects_both_bad_shapes :
     dcQuorumStrict ⟨[3, 3, 3]⟩ 0 [5, 0, 0] = false
       ∧ dcQuorumStrict ⟨[3, 3, 3]⟩ 0 [2, 2, 0] = false
@@ -784,6 +789,9 @@ def ledger : List SpecItem := [
      "Consistency.the_last_writer_is_the_one_told_to_retry"⟩
 ]
 
+/-- Two of the ledger's obligations are red: one write path enforces a total rather than
+    a per-datacenter requirement, and no read set is captured or validated before
+    commit, so a write skew commits with no exception raised. -/
 theorem consistency_has_two_red_items : redCount ledger = 2 := by decide
 
 def main : IO Unit :=

@@ -1,15 +1,18 @@
 /-
-  Memory: a bounded, single-copy pipeline
-  =======================================
+  Memory and streaming: two copies, and a footprint that follows the link
+  ======================================================================
 
-  The contract is that bytes enter one buffer, are transformed into views of that same buffer, and
-  are written out — and that no stage in between copies or modifies them. Two copies are
-  irreducible (socket → buffer, buffer → kernel); everything else must be free.
+  Bytes enter one buffer, every stage between views them, and the write into the kernel is the only
+  other copy — two in total, both irreducible, and the parse, the transform and the framing add none.
+  What a scan holds is therefore a property of the chunk size and the link, never of the table: the
+  window that keeps a pipe busy is its bandwidth-delay product, and past that extra buffers buy
+  nothing.
 
-  The code has half of this already: `encode_rows_with_writer` (ferrosa-cql/src/result.rs) visits
-  rows one at a time into a `BytesMut` and patches the count afterwards, so the response is never
-  held as `Vec<Vec<Option<CqlValue>>>`. What it does not have is a byte bound on the scan side —
-  see `a_row_count_page_bound_is_not_a_memory_bound`.
+  Throttling is the only lever the scheduler has. A smaller share slows a client's delivery and
+  leaves its result set identical, so no scheduling decision can become missing data — but that only
+  holds while every response either carries the whole answer or says there is more, and while a full
+  queue refuses the push instead of dropping it. `Storage.Streaming` records seven places the tree
+  falls short of this, the widest being a page bound counted in rows rather than bytes.
 -/
 import Ferrosa.Ledger
 
@@ -132,6 +135,8 @@ theorem refilling_a_buffer_invalidates_its_views :
 /-- A refill is allowed exactly when nothing is outstanding. -/
 def mayRefill (outstandingViews : Nat) : Bool := outstandingViews == 0
 
+/-- A buffer is refilled only when no view of its previous contents is outstanding. That is what
+    backpressure is for: refilling under a live view hands the consumer bytes it never asked for. -/
 theorem refill_is_allowed_only_when_nothing_is_outstanding :
     mayRefill 0 = true ∧ mayRefill 1 = false := by decide
 
@@ -202,6 +207,8 @@ theorem a_bounded_queue_never_exceeds_its_capacity (q : Queue) (h : q.length ≤
     yet consumed, which is unbounded in the producer's speed. -/
 def unboundedOccupancy (produced consumed : Nat) : Nat := produced - consumed
 
+/-- With no bound on the queue, what a slow client leaves resident is exactly what has been produced
+    and not yet consumed, so occupancy tracks the producer and has no ceiling in it at all. -/
 theorem without_flow_control_occupancy_follows_the_producer (produced consumed : Nat)
     (h : consumed ≤ produced) : unboundedOccupancy produced consumed + consumed = produced := by
   unfold unboundedOccupancy
@@ -212,6 +219,9 @@ theorem without_flow_control_occupancy_follows_the_producer (produced consumed :
 def pushDropping (q : Queue) : PushResult :=
   if q.length < q.capacity then .accepted ⟨q.capacity, q.length + 1⟩ else .dropped q
 
+/-- A full queue that drops the push reports the drop to nobody: the consumer receives a result set
+    that looks complete with an item missing from it. This is why dropping is not a form of flow
+    control. -/
 theorem dropping_when_full_silently_loses_the_item :
     pushDropping ⟨2, 2⟩ = .dropped ⟨2, 2⟩ := by decide
 
@@ -220,6 +230,8 @@ def drainSteps : Nat → Nat
   | 0 => 0
   | n + 1 => drainSteps n + 1
 
+/-- A queue of `n` items empties in `n` pops, so a consumer that keeps draining always finishes and
+    the backpressure it imposes always clears. -/
 theorem a_queue_drains_in_its_length (n : Nat) : drainSteps n = n := by
   induction n with
   | zero => rfl
@@ -266,6 +278,8 @@ theorem beyond_the_product_extra_buffers_buy_nothing (w bw rtt : Nat) (hrtt : 0 
   unfold delivered
   exact Nat.min_eq_right ((Nat.le_div_iff_mul_le hrtt).mpr h)
 
+/-- The window a scan needs is the bandwidth-delay product of the link, with no term for the number
+    of rows: a 64 TiB table and a 64 KiB one ask the coordinator for the same memory. -/
 theorem the_window_depends_on_the_link_not_the_table (bw rtt rows : Nat) :
     windowFor bw rtt = bw * rtt := rfl
 
@@ -428,6 +442,8 @@ def ledger : List SpecItem := [
      "Streaming.materialising_grows_with_the_input"⟩
 ]
 
+/-- The area records twenty-three obligations of which seven are unmet, and both numbers are pinned
+    here: adding a claim, or closing one, forces the ledger to be updated in the same change. -/
 theorem streaming_has_twenty_three_items_and_seven_red : ledger.length = 23 ∧ redCount ledger = 7 := by
   decide
 

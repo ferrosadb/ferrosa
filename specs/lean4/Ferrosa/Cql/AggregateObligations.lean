@@ -1,31 +1,20 @@
 /-
-  Ferrosa formal specification — CQL aggregates, part 9: the obligation ledger.
+  Ferrosa formal specification — CQL aggregates, part 9: what is still owed.
   =====================================================================
 
-  `Aggregate.lean` proves the contract of each aggregate *on the model*. This file is
-  the specification of what is still owed, written red-first: every item whose
-  obligation the current spec and implementation do not meet is listed as `failing`,
-  with the theorem that shows *why* it is red — not a comment saying "TODO".
+  Six of the obligations attached to the aggregate functions are not met, and each
+  is written as a theorem exhibiting why rather than as a note saying so. Two are
+  gaps in the implementation; the other four are things the model here cannot
+  state at all, which is the more interesting half — `COUNT(DISTINCT)` keeps its
+  visited set in memory, so the constant-memory obligation is met by the Rust
+  `DistinctExact` and not by the model, and the refinement between them is
+  unproved.
 
-  The point of writing the failures as theorems is that they stop being prose. When
-  the implementation changes, the witness breaks, the build goes red, and the item has
-  to be moved to `met` with a real proof. That is the TDD loop, expressed in a
-  type-checked file.
-
-  Six items are red today, and four of them are not implementation gaps — they are
-  things the spec cannot currently prove at all:
-
-    1. the **model** of `COUNT(DISTINCT)` keeps the visited set in memory, so the
-       O(1)-memory obligation is met by the Rust `DistinctExact` and *not* by the
-       model (`model_visited_set_length_is_the_count`);
-    2. per-shard distinct counts cannot be summed — a value on every shard is one
-       distinct value and `n` counted ones (`sum_of_shard_counts_overcounts`);
-    3. a Bloom bit array does not determine its own count, so merging filters cannot
-       produce a merged estimate (`bloom_bits_do_not_determine_the_count`);
-    4. only monotonicity is proved for the estimate; the quantitative error bound is
-       not, and `estimate_can_be_strict` shows no exactness claim can replace it;
-    5. the CQL surface has neither function: no AST node, no planner arm, and `COUNT`
-       is recognised by name-matching in the router.
+  Writing the failures as theorems is what keeps them honest. When the
+  implementation changes, the witness stops holding, the build goes red, and the
+  item has to move to `met` with a real proof — the loop closed by the compiler
+  rather than by a comment. `Ferrosa/Cql/Aggregate.lean` proves the contracts these
+  items are measured against.
 -/
 import Ferrosa.Cql.Aggregate
 
@@ -61,9 +50,13 @@ def render (i : SpecItem) : String :=
 
 /-! ## The items that are met, with their discharging theorem -/
 
+/-- `COUNT(*)` over the rows is their number, so a row count never has to be
+    estimated or approximated. -/
 theorem count_star_is_exact (rows : List Val) : foldCount rows 0 = rows.length := by
   rw [foldCount_eq]; omega
 
+/-- Two row sets of the same length produce the same `COUNT(*)`, so the answer
+    carries nothing about any individual row. -/
 theorem count_star_retains_no_row (a b : List Val) (h : a.length = b.length) :
     foldCount a 0 = foldCount b 0 :=
   count_forgets_which_rows a b h
@@ -76,6 +69,10 @@ entry per distinct value. That is not a bug in the model — a model may abstrac
 storage — but it does mean the O(1)-memory obligation is **not** discharged here, and
 the refinement from `walkExactPair` to `DistinctExact` is not proved. -/
 
+/-- The model holds one entry per distinct value, so the count and the memory the
+    visited set occupies are the same number. That is why the constant-memory
+    obligation is red here even though the implementation's `DistinctExact` keeps
+    its map on disk. -/
 theorem model_visited_set_length_is_the_count (rows : List Val) :
     (walkExactPair rows (0, [])).2.length = (walkExactPair rows (0, [])).1 :=
   (exact_distinct_is_cardinality rows).symm
@@ -198,6 +195,8 @@ def ledger : List SpecItem := [
 /-- The count of red items, so a CI check can assert it only ever goes down. -/
 def redCount : Nat := ledger.countP (fun i => match i.status with | .failing _ _ => true | _ => false)
 
+/-- Six of the ledger's ten items are red, and the count is pinned here so a CI
+    check can require it to fall and never to rise. -/
 theorem ledger_has_six_red_items : redCount = 6 := by decide
 
 /-- Render the ledger: `lake env lean --run` prints it, `#eval` shows it in an editor. -/

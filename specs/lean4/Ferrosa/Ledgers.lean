@@ -1,17 +1,15 @@
 /-
-  Runners for the obligation ledgers.
-  ==================================
+  The runner: one list, printed and counted
+  =========================================
 
-  One `main` in the library, so the root can import every module. Run:
-
-  ```text
-  lake env lean --run Ferrosa/Ledgers.lean
-  ```
-
-  The area ledgers printed here are exactly `Ferrosa.Unimplemented.areas` — the same list
-  `ledgerTotal` sums — so a ledger cannot print without being counted or be counted without
-  printing. `main` also re-scans the source tree and fails if a file defining
-  `def ledger : List SpecItem` is missing from that registry.
+  One `main` prints every area ledger, the unspecified-surface manifest, the refactoring record, the
+  broken list and the classification, then fails if the registry has drifted. The ledgers it prints are
+  exactly `Ferrosa.Unimplemented.areas` — the list `ledgerTotal` sums — so a ledger cannot print without
+  being counted, or be counted without printing. It also re-scans the source tree for files that define
+  a ledger and fails on three kinds of drift: a ledger module missing from the registry, a registered
+  key with no ledger behind it, and a scan that found almost nothing and would otherwise pass
+  vacuously. Any of those exits non-zero, so a lost ledger is a build failure rather than a quietly
+  smaller total. `lake env lean --run Ferrosa/Ledgers.lean` runs the whole report.
 -/
 import Ferrosa.Cql.AggregateObligations
 import Ferrosa.Storage.Recovery

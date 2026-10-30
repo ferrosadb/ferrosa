@@ -1,27 +1,17 @@
 /-
-  Ferrosa formal specification — MVCC over the `fnf` record format.
-  =====================================================================
+  Snapshots: the version a read sees, and the version collection may not remove
+  ===========================================================================
 
-  Three requirements intersect here and they are not independent:
+  A transaction reads the newest version of a cell at or below its snapshot, and that answer stays
+  the same for the life of the transaction because collection keeps the newest version at or below
+  the oldest live snapshot and everything newer than it. A reader that stops making progress pins
+  every version behind it, which is why it is killed after thirty seconds without one and why its
+  next statement fails instead of silently reading a newer state.
 
-    1. Postgres needs **snapshot reads**: a transaction sees the state as of its start.
-    2. ADR-022 needs **O(1) probes**: one record read per lookup.
-    3. The record holds **one value per cell**.
-
-  (1) and (3) conflict. A cell holds one value, so either older versions live in *older SSTables*
-  — and then a snapshot read must consult every overlapping file
-  (`a_version_per_file_is_not_a_constant_read`) — or the versions live *inside the record*, in
-  which case (2) survives but the record must carry a bounded chain.
-
-  The second half is garbage collection, and the naive rule is wrong in a way that only shows up
-  under concurrency. "Drop every version older than the oldest live snapshot" removes the very
-  version that snapshot can still see (`naive_gc_breaks_a_live_snapshot`), because the version a
-  snapshot needs is the *newest version at or below it*, not the newest version overall. The safe
-  rule keeps a floor: the newest version at or below the oldest snapshot, plus everything newer
-  (`safe_gc_preserves_live_snapshots`).
-
-  This is the same shape as `Storage.Tombstone.purge_requires_all_replicas_applied`: a collection
-  rule that is safe only under a precondition about what the readers still need.
+  Versions held inside the record buy a constant probe but not a constant read: one record per
+  lookup while the chain covers the snapshot, yet every SSTable in the view is still bloom-probed
+  to find that record. Two pieces of this are designed and not built — the in-record chain, since a
+  cell still holds one value, and the predicate locks SSI needs, since the read path takes no tag.
 -/
 import Ferrosa.Ledger
 
@@ -111,11 +101,17 @@ theorem a_version_per_file_is_not_a_constant_read (files : Nat) (h : 1 < files) 
     the number of snapshots that can still need an older version. -/
 def readsWithInRecordVersions : Nat := 1
 
+/-- With the chain inside the record, a lookup reads one record however many snapshots can still see
+    an older version — this is the constant the design is bought with, and it holds by the shape of
+    the read rather than by any measurement. -/
 theorem in_record_versions_keep_the_probe_constant : readsWithInRecordVersions = 1 := rfl
 
 /-- The bound the chain must respect: one version per live snapshot, plus the floor. -/
 def chainBound (liveSnapshots : Nat) : Nat := liveSnapshots + 1
 
+/-- The chain has to hold one version per live snapshot plus the floor, and that count is the only
+    thing bounding how long a record's version list can get: retention follows the oldest reader,
+    never the clock. -/
 theorem the_chain_bound_is_one_per_live_snapshot (liveSnapshots : Nat) :
     chainBound liveSnapshots = liveSnapshots + 1 := rfl
 
@@ -160,6 +156,8 @@ theorem spilled_versions_are_lost_if_compaction_drops_the_pointer :
 /-- The cost side of the trade: one more probe for the row that spilled, nothing for the rest. -/
 def probesFor (spilled : Bool) : Nat := if spilled then 2 else 1
 
+/-- A row that has spilled costs two record reads where a row that has not costs one, so an
+    overflowing chain is paid for by the rows that overflowed and by no others. -/
 theorem a_spilled_row_costs_one_extra_probe :
     probesFor false = 1 ∧ probesFor true = 2 := by decide
 
@@ -355,6 +353,8 @@ def stalledReaderTimeoutMs : Nat := 30000
     clock, not age, so a long-running but active scan is never killed. -/
 def stalled (sinceProgressMs : Nat) : Bool := sinceProgressMs ≥ stalledReaderTimeoutMs
 
+/-- A reader that reports no progress for thirty seconds is killed, and that single number is the
+    whole of the policy: how long a reader has lived plays no part in the decision. -/
 theorem the_default_stalled_reader_timeout_is_thirty_seconds :
     stalledReaderTimeoutMs = 30000 := rfl
 
@@ -517,6 +517,10 @@ def ledger : List SpecItem := [
      "Mvcc.in_record_versions_keep_the_probe_constant"⟩
 ]
 
+/-- Five obligations are recorded red: no vacuum, no predicate locks taken on the read path, one
+    value per cell rather than an in-record chain, a spill pointer no compaction carries, and the
+    claim that a snapshot lookup may stop at the first file holding the key. The count is pinned so
+    that closing one without updating the ledger fails the build. -/
 theorem mvcc_has_five_red_items : redCount ledger = 5 := by decide
 
 def main : IO Unit :=

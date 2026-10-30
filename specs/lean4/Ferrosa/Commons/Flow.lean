@@ -1,11 +1,18 @@
 /-
-  Ferrosa formal specification — flow control, shared by every streaming surface.
-  =================================================================================
+  Flow control: what a slow consumer costs, and what it can never cost
+  ====================================================================
 
-  This is the fair-share pool, the occupancy bands, the recompute policy, the sampling rate and the
-  controller. It lived in the CDC SUBSCRIBE module because that is where it was first worked out, but
-  three surfaces depend on it (CDC, CQL, Flight), so it lives here and the surfaces import it. There is
-  exactly one place to tune: the constants below.
+  A consumer that falls behind costs disk and never the node's memory: resident bytes stay inside
+  the node-wide pool, a consumer inside its fair share never touches a file, and a smaller
+  allocation slows a consumer's catch-up without removing an event from its stream. The writer is
+  outside all of it — its progress takes no pool argument, so no consumer, however stalled, can
+  turn saturation into write unavailability.
+
+  Two things about the loop surprise readers. The share is recomputed on a period and approached in
+  steps rather than in one move, so a tightening pool is never yanked; and the recurring half-gap
+  step already supplies integral action, which is why no integral term is needed and why a
+  derivative term is excluded at this sampling rate. `Cdc.Subscribe` records the gap between this
+  design and the code: the fair share in the tree has no controller behind it at all.
 -/
 import Ferrosa.Core
 import Ferrosa.Ledger
@@ -168,6 +175,8 @@ def evalTrigger (used poolSize elapsedMs : Nat) : Option Trigger :=
   else if usedPct used poolSize > highWatermarkPct then some .highWatermark
   else none
 
+/-- The fair share is recalculated every five seconds by default, and that one number sets both the
+    decision rate and, through the sampling period, how stale an observation can be. -/
 theorem the_default_evaluation_period_is_five_seconds : evalPeriodMs = 5000 := rfl
 
 /-- **A pool above 90% is re-evaluated without waiting for the period**, which is what keeps
@@ -307,6 +316,9 @@ def rateOf : List Sample → Option Nat
   | a :: b :: _ => some (rateFrom a b)
   | _ => none
 
+/-- Occupancy is sampled every 2.5 s, derived from the evaluation period rather than configured
+    beside it, so an operator who changes the period changes the sampling rate with it and the ratio
+    cannot drift. -/
 theorem the_sampling_period_is_half_the_evaluation_period : samplePeriodMs = 2500 := by decide
 
 /-- **Two samples tile the evaluation window exactly**, so every decision has a fresh observation
@@ -370,6 +382,9 @@ theorem a_gain_above_one_oscillates :
     wants under load — not an error to be driven to zero. -/
 def steadyError (inflow kp : Nat) : Nat := inflow / kp
 
+/-- Against a steady inflow the loop settles with the error still standing at `inflow / kp` — 10 at
+    a gain of 2, 5 at a gain of 4 — and that offset is the operating point the watermark wants
+    rather than a miss to be driven out. -/
 theorem a_proportional_loop_holds_a_steady_offset :
     steadyError 20 2 = 10 ∧ steadyError 20 4 = 5 := by decide
 
@@ -379,6 +394,9 @@ theorem a_proportional_loop_holds_a_steady_offset :
     explicit integral term would duplicate it. -/
 def halfSteps (gap n : Nat) : Nat := gap / 2 ^ n
 
+/-- Repeating "move half the remaining gap" every period shrinks the gap geometrically — 1024, 512,
+    64 after four periods, 1 after ten — so the recurring step is the integrating action and an
+    explicit integral term would only duplicate it. -/
 theorem the_periodic_step_already_integrates :
     halfSteps 1024 0 = 1024 ∧ halfSteps 1024 1 = 512
       ∧ halfSteps 1024 4 = 64 ∧ halfSteps 1024 10 = 1 := by decide

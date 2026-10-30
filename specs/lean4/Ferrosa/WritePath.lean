@@ -1,23 +1,17 @@
 /-
-  Ferrosa formal specification — Trace 1: write-path correctness.
-  ==============================================================
+  The write path: when a write is durable, when it is visible, and what a crash takes
+  ================================================================================
 
-  Sources modelled:
-    * `ferrosa-storage/specs/data-flow.md` § Write path
-      (admission → commit-log append → sync strategy → memtable put → ack →
-       flush → BTI SSTable → S3 upload),
-    * `ferrosa-storage/specs/data-flow.md` § Notes (durability boundary,
-      FMEA ST-1, quarantine),
-    * `ferrosa-cluster/specs/overview.md` invariants 1–4 and
-      `ferrosa-cluster/specs/data-flow.md` § 1 (tunable-CL write coordination).
+  A client is never told a row exists that the engine is not holding: an ack follows the commit-log
+  append, and under `batch` it also follows an fsync, so an acknowledged write survives the process
+  dying. The default mode is not that one — under `periodic` an acked write can still be unsynced
+  when the machine stops, and that loss is a reachable state rather than a hypothesis. Admission
+  fails closed, so a rejected row is never partly written and nothing appends after the failure, and
+  no later tier drops a row on its way through flush or quarantine.
 
-  `SyncMode` is a configuration, so it is a parameter of the transition system
-  rather than a mutable field: `Reachable .batch s` means "s is reachable when
-  the engine is configured for fsync-per-write".
-
-  Every theorem below is about the *specified* machine, not the Rust code.  Where
-  code and spec disagree, the disagreement is recorded in
-  `specs/lean4/FINDINGS.md` together with the theorem name that exhibits it.
+  On the read side cells resolve to the newest timestamp, with one gap a user can meet: two replicas
+  holding the same cells in a different physical order pick different winners at equal timestamps,
+  so read repair is what converges them, not the merge alone.
 -/
 import Ferrosa.Core
 
@@ -25,7 +19,7 @@ namespace Ferrosa.WritePath
 
 open Ferrosa
 
-/-! ## Storage engine state -/
+/-! ## The store as the write path sees it: one log, a synced prefix, two memtables -/
 
 /-- The three sync strategies of `SyncStrategyConfig`. -/
 inductive SyncMode where
@@ -71,7 +65,7 @@ def init (mode : SyncMode) : Store where
   admitted := true
   maxLog := 1024
 
-/-! ## Transitions
+/-! ## The steps a row takes, and the guard on each
 
 One constructor per arrow in `data-flow.md`.  The guards are the ones the spec
 states: admission is checked *before* the commit-log append (fail closed); an
@@ -106,13 +100,19 @@ inductive Step (mode : SyncMode) : Store → Store → Prop where
       Step mode s { s with active := s.active.filter (fun x => x != e),
                            quarantined := s.quarantined ++ [e] }
 
-/-! ## Reachability -/
+/-! ## Which stores the engine can actually reach, given its sync mode
+
+`SyncMode` is a configuration, so it is a parameter of the transition system and not a field of the
+store: `Reachable .batch s` reads "`s` is reachable when the engine fsyncs every write", and the
+same store may be reachable under one mode and not another. Every property `WritePath` proves is
+stated over this predicate, which is why each of them is conditional on the mode an operator chose.
+-/
 
 inductive Reachable (mode : SyncMode) : Store → Prop where
   | init : Reachable mode (init mode)
   | step : Reachable mode s → Step mode s s' → Reachable mode s'
 
-/-! ## Invariants -/
+/-! ## What holds of every store the engine can reach, in any mode -/
 
 /-- The commit log only ever grows. -/
 theorem log_append_only {mode : SyncMode} {s s' : Store} (h : Step mode s s') :
@@ -138,6 +138,9 @@ theorem step_synced_le {mode : SyncMode} {s s' : Store} (hs : Step mode s s')
   | publish => simpa using h0
   | quarantine _ => simpa using h0
 
+/-- The fsynced prefix never runs past the log, so the durable region is always a real prefix of
+    what was written — the premise every durability statement about a reachable store is stated
+    against. -/
 theorem synced_le_logged {mode : SyncMode} {s : Store} (h : Reachable mode s) :
     s.synced ≤ s.log.length := by
   induction h with
@@ -294,14 +297,20 @@ def mergeCell (inc : Nat × Nat) : Option (Nat × Nat) → Option (Nat × Nat)
 def resolveCell (l : List (Nat × Nat)) : Option (Nat × Nat) :=
   l.foldr mergeCell none
 
+/-- Resolution is defined one cell at a time: the answer for a newest-first list is that list's head
+    merged into the answer for its tail, which is the step form every read-path argument uses. -/
 theorem resolveCell_cons (p : Nat × Nat) (ps : List (Nat × Nat)) :
     resolveCell (p :: ps) = mergeCell p (resolveCell ps) := by
   simp [resolveCell]
 
+/-- A merge always yields a cell once it has an incoming one, whatever was there before, so a
+    partition's resolution cannot be empty by accident. -/
 theorem mergeCell_ne_none (inc : Nat × Nat) (st : Option (Nat × Nat)) :
     mergeCell inc st ≠ none := by
   cases st <;> simp [mergeCell]
 
+/-- So resolution returns nothing only for the empty list: a partition with a cell always resolves
+    to a value, and a missing answer means there was no cell there rather than a lost one. -/
 theorem resolveCell_none {l : List (Nat × Nat)} (h : resolveCell l = none) : l = [] := by
   cases l with
   | nil => rfl

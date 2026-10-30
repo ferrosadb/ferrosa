@@ -1,28 +1,19 @@
 /-
-  Ferrosa formal specification — Jepsen's checker models, ported.
-  ============================================================
+  Jepsen's checker models, ported and pinned
+  ==========================================
 
-  Source: `jepsen-io/jepsen`, `jepsen/test/jepsen/checker_test.clj`. That file tests the built-in
-  models (`queue`, `total-queue`, `set`, `unique-ids`, `counter`, `set-full`) rather than a storage
-  system, so every assertion in it is a statement about *checker semantics* — exactly what a machine
-  check can hold us to.
-
-  What is ported here is the semantics and the verdicts, not the Clojure:
-
-  * A history is a list of operations, each with an outcome and a real-time interval.
-  * The checker searches for a serial order that respects real time and replays to the observed
-    results. Three outcome kinds are load-bearing:
-      - `ok v`     — took effect, and the observation must match;
-      - `fail`/`info` — *may or may not* have taken effect, with an unconstrained observation;
-      - `pending`  — never completed, so it may take effect anywhere after its invocation.
-    Collapsing `fail`/`info`/`pending` into "no effect" is the classic porting mistake and it makes
-    the checker unsound in the permissive direction; the cases below pin the distinction.
-  * Each `deftest` assertion becomes a theorem. `native_decide` is used only over these finite
-    histories.
-
-  Not ported, and listed in the ledger: the `set` model's multi-value reads and `set-full`,
-  `unique-ids`, the generators, the nemeses, and the stats/plot assertions (which are about reporting,
-  not about correctness).
+  A verdict is only as trustworthy as the model's handling of operations whose outcome is unknown,
+  and `jepsen/test/jepsen/checker_test.clj` is the file that pins that handling. What is ported is the
+  semantics and the verdicts, not the Clojure: a history is a list of operations each with an outcome
+  and a real-time interval, and the checker searches for a serial order that respects real time and
+  replays to every observation. Three outcome kinds are load-bearing — `ok` must match the
+  observation, `fail` and `info` may or may not have taken effect, and `pending` may take effect
+  anywhere after its invocation — and collapsing them into "no effect" is the classic porting
+  mistake, because it makes the checker unsound in the permissive direction. The counter, the
+  unordered queue and the FIFO queue are modelled, and the two queue models are shown to disagree on
+  one history, so the choice of model is part of the test rather than a detail of it. The set,
+  set-full and unique-ids models, the generators, the nemeses and the stats assertions are not ported,
+  which accounts for three of the ledger's red rows.
 -/
 import Ferrosa.Core
 import Ferrosa.Ledger
@@ -210,8 +201,8 @@ theorem total_queue_rejects_out_of_order_dequeues :
        ⟨.dequeue 2, .ok 2, 5, 6⟩, ⟨.dequeue 1, .ok 1, 7, 8⟩] = false := by native_decide
 
 /-- The same history is legal when the enqueues overlap, because then either enqueue order is
-    possible and the FIFO model can fit the observations either way. This is why the *generator*, not
-    just the model, decides what a history can prove. -/
+    possible and the FIFO model can fit the observations either way. This is why the *generator*,
+    and not only the model, decides what a history can prove. -/
 theorem overlapping_enqueues_leave_the_fifo_order_free :
     totalQueueLinearizable
       [⟨.enqueue 1, .ok 0, 1, 3⟩, ⟨.enqueue 2, .ok 0, 2, 4⟩,
@@ -257,6 +248,8 @@ def ledger : List SpecItem := [
      "Models.the_queue_models_differ_on_the_same_history"⟩
 ]
 
+/-- Three reds, one per unported family: the set model with its multi-value reads, set-full with
+    unique-ids, and the generators and nemeses. -/
 theorem models_has_three_red_items : redCount ledger = 3 := by decide
 
 def main : IO Unit :=

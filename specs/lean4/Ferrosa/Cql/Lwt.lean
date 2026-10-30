@@ -2,35 +2,20 @@
   Ferrosa formal specification — CQL front end, part 4: lightweight transactions.
   ===========================================================================
 
-  LWT is the one place where a front-end question becomes a *correctness* question
-  rather than a routing one.  `INSERT … IF NOT EXISTS`, `UPDATE … IF`, and
-  `DELETE … IF EXISTS` are compare-and-set: they read a value, decide, and write
-  conditionally.  Three things have to hold:
+  `INSERT … IF NOT EXISTS`, `UPDATE … IF`, and `DELETE … IF EXISTS` are
+  compare-and-set: each reads a value, decides, and writes only if the expectation
+  holds. Two clients that send the same expectation against the same key cannot
+  both succeed, and the one that is rejected is handed back the value it tested —
+  so what a client reads after a rejection is the state the next transaction will
+  see, not a stale one.
 
-    1. the condition is evaluated against a state that agrees with the
-       transaction's serial point — otherwise a CAS is a stale read plus a blind
-       write (`Accord.Recovery.write_skew_not_serializable`);
-    2. therefore two CAS with the same expectation on the same key cannot both
-       apply (`at_most_one_applies`);
-    3. a CAS that *fails* reports the values it tested, so the client's
-       `CurrentValues` is the serial state, not a stale one
-       (`failed_cas_reports_the_state_it_tested`).
-
-  `Classify.lean` establishes the front-end half: a conditional statement reads
-  the keys it compares against (`conditional_reads_its_keys`) and a transaction
-  containing one is never blind (`conditional_txn_not_blind`).  This file supplies
-  the semantics on top of that, and `Accord.Serializable` supplies the check that
-  the resulting histories pass.
-
-  Two models are used deliberately:
-
-  * `Cell` is a scalar register (`Key → Option Val`) — that is what `IF col = v`
-    means for a non-collection column, and it makes the CAS algebra provable;
-  * `Accord.History.State` is the append-list keyspace — that is the model the
-    serializability checker speaks, and it is where the anomaly is exhibited.
-    The two are connected by `encodeOf`, which maps a run of applied CAS to the
-    append history the checker reasons about ("value v was written" = "v was
-    appended to the key's list").
+  That guarantee holds only while the condition is evaluated against the
+  transaction's serial point. A conditional statement whose read set covers the key
+  it conditioned on is protected, and `Ferrosa/Cql/Classify.lean` is where such a
+  statement is shown to read that key and to make its transaction non-blind. One
+  whose read set misses that key is not protected: two of them apply on interleaved
+  keys and produce a history with no serial explanation, with both clients told
+  they succeeded.
 -/
 import Ferrosa.Accord.Serializable
 import Ferrosa.Cql.Classify
@@ -40,7 +25,7 @@ namespace Ferrosa.Cql.Lwt
 open Ferrosa
 open Ferrosa.Accord
 
-/-! ## The scalar cell -/
+/-! ## A key that holds one value, which is what a condition compares -/
 
 abbrev Cell := Key → Option Val
 
@@ -71,7 +56,7 @@ def Lwt.ops (l : Lwt) : List Op := [.read l.key, .append l.key l.newValue]
 def Lwt.execute (s : Cell) (l : Lwt) : Cell × Bool :=
   if l.cond s then (s.set l.key (some l.newValue), true) else (s, false)
 
-/-! ### The basic facts -/
+/-! ### What a conditional write does to the value it tests -/
 
 /-- An applied CAS wrote its value. -/
 theorem applied_writes (s : Cell) (l : Lwt) (h : (l.execute s).2 = true) :
@@ -100,6 +85,8 @@ theorem insert_if_not_exists_on_empty (k : Key) (v : Val) :
     (⟨k, none, v⟩ : Lwt).execute Cell.empty = (Cell.empty.set k (some v), true) := by
   simp [Lwt.execute, Lwt.cond, Cell.empty]
 
+/-- `UPDATE … IF v = v0` on a key that holds nothing is rejected, so a conditional
+    update never creates the row it conditions on. -/
 theorem update_if_on_empty_fails (k : Key) (v0 v : Val) :
     (⟨k, some v0, v⟩ : Lwt).execute Cell.empty = (Cell.empty, false) := by
   simp [Lwt.execute, Lwt.cond, Cell.empty]
@@ -185,6 +172,8 @@ def hProtectedCas : History := ⟨[
   invEv 1 2 [.read 0, .append 1 20] 20,
   okEv 1 2 [.read 0, .append 1 20] [[10]] 20 30]⟩
 
+/-- A run in which the second conditional write observes the first one's value
+    serializes in timestamp order, so the checker accepts it. -/
 theorem protected_cas_is_serializable : strictlySerializableB hProtectedCas = true := by
   native_decide
 
@@ -198,6 +187,9 @@ def hCasWithFailure : History := ⟨[
   invEv 1 2 [.read 0, .append 0 2] 20,
   ⟨1, .info, 2, [.read 0, .append 0 2], [[1]], 20, 30⟩]⟩
 
+/-- A run of two conditional writes on one key, where the second is rejected, is
+    serializable: only the first is in the serial order, and the rejected one wrote
+    nothing. -/
 theorem cas_with_failure_is_serializable : strictlySerializableB hCasWithFailure = true := by
   native_decide
 
@@ -218,6 +210,10 @@ exactly the failure `FINDINGS.md` G2 exhibits.  There is no separate LWT
 consistency argument: there is one serializability argument, and LWT either
 respects it or falls outside it.
 -/
+
+/-- A conditional statement's operations include a read of the key it conditions on,
+    which is what makes the condition protected rather than a stale read followed by
+    a blind write. -/
 theorem protected_cas_reads_its_write_key (l : Lwt) : l.key ∈ (l.ops.map Op.key) := by
   simp [Lwt.ops, Op.key]
 

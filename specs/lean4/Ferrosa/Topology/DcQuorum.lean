@@ -1,36 +1,19 @@
 /-
-  Ferrosa formal specification — DC_QUORUM, for every topology.
-  ==============================================================
+  Ferrosa formal specification — DC_QUORUM, and why two of them cannot both be written.
+  ===================================================================================
 
-  Source: `ferrosa-cluster/src/coordinator/dc_quorum.rs` (PR #634), `progress` for
-  `ConsistencyLevel::DcQuorum` and `local_progress`.  The code answers a DC_QUORUM write with three
-  gates, evaluated over the *configured* replication factors and never over the reachable ones:
-
-    1. the origin datacenter reaches its own majority      (`origin_rf / 2 + 1 ≤ count_in_dc(origin)`)
-    2. a strict majority of configured datacenters each reach theirs
-                                                            (`configured_dcs / 2 + 1 ≤ #{dc : count > rf/2}`)
-    3. a quorum of all configured replicas                  (`rf_total / 2 + 1 ≤ total`)
-
-  and a DC_QUORUM read with gate 1 alone.  Datacenters configured with `rf = 0` are filtered out of
-  every count (`.filter(|rf| **rf > 0)`), and an origin with `rf = 0` fails closed.
-
-  `Sql/Consistency.lean` checks these rules on concrete topologies.  This module proves the claims
-  the code's comments rest on for **every** topology, every pair of origins, and every ack set:
-
-    * `dc_gate_forces_a_shared_replica` — two writes that pass gate 2 share a replica.  This is the
-      split-brain argument: `no_partition_admits_two_dc_quorum_writes`.
-    * `node_gate_forces_a_shared_replica` — gate 3 alone does the same, so a DC_QUORUM write and a
-      plain Cassandra QUORUM write on the same keyspace also intersect.
-    * `a_local_read_sees_every_write_that_reached_its_datacenter` and its same-origin corollary,
-      against `a_read_in_another_datacenter_can_miss_a_dc_quorum_write`.
-    * `write_is_monotone` — a late or duplicated acknowledgement can never revoke a verdict.
-    * `a_dark_majority_of_datacenters_blocks_every_write` — the general form of "a partition cannot
-      shrink the denominator".
-    * `a_zero_rf_datacenter_is_inert` — appending an `rf = 0` datacenter changes no verdict.
-
-  Replicas of datacenter `d` are the universe `{0, …, rf d - 1}`, and an acknowledgement set assigns
-  each datacenter a `SetU` over its own universe.  The code's `count_in_dc(dc)` is that set's
-  cardinality, and its `total` is the sum of them (distinct eligible responders).
+  A DC_QUORUM write is acknowledged only when three gates hold: the origin datacenter
+  reached a majority of its own replicas, a strict majority of the configured datacenters
+  each reached theirs, and a quorum of all configured replicas answered; a DC_QUORUM read
+  asks only the first.  What a client can rely on is the intersection — any two
+  DC_QUORUM writes, whatever their origins, share at least one replica, so a partition
+  cannot admit both, and a DC_QUORUM write likewise intersects a plain Cassandra QUORUM
+  write on the same keyspace.  The cost falls on reads: a read in a datacenter other than
+  the write's origin can miss it entirely, because the read waits for its own
+  datacenter's majority and nothing else.  Every count is taken over *configured*
+  replication factors, so a partition can shrink the acknowledgements and never the
+  denominator — a datacenter configured with no replicas changes no verdict, and an
+  origin configured with no replicas fails closed rather than admitting a write.
 -/
 import Ferrosa.Core
 
@@ -84,7 +67,7 @@ def write (rfs : Rfs) (origin : Nat) (cnt : Nat → Nat) (total : Nat) : Bool :=
 /-- A DC_QUORUM read: `local_progress(…).satisfied()`, the origin's majority alone. -/
 def read (rfs : Rfs) (origin : Nat) (cnt : Nat → Nat) : Bool := originGate rfs origin cnt
 
-/-! ## Acknowledgement sets -/
+/-! ## Acknowledgement sets, and what it means for two of them to share a replica -/
 
 /-- The replicas of each datacenter that acknowledged, as a set over that datacenter's universe. -/
 abbrev Acks := Nat → SetU
@@ -229,7 +212,7 @@ theorem dc_quorum_and_cassandra_quorum_writes_share_a_replica {rfs : Rfs} {o : N
     SharesReplica rfs A B :=
   node_gate_forces_a_shared_replica (dc_quorum_write_is_a_cassandra_quorum_write hA) hB
 
-/-! ## Reads: local, hop-free, and blind elsewhere -/
+/-! ## What a local read sees, and what it is blind to -/
 
 /-- **A local read sees every write that reached a majority of the reader's datacenter.** -/
 theorem a_local_read_sees_every_write_that_reached_its_datacenter {rfs : Rfs} {r : Nat}
@@ -278,6 +261,8 @@ theorem filter_length_mono (l : List Nat) {p q : Nat → Bool} (h : ∀ a, p a =
       · exact absurd (h a hp) (by simp [hq])
       · omega
 
+/-- A datacenter that has reached its own majority keeps it as more acknowledgements
+    arrive, so the number of datacenters that vote never falls. -/
 theorem votes_length_mono {rfs : Rfs} {c c' : Nat → Nat} (h : ∀ d, c d ≤ c' d) :
     (votes rfs c).length ≤ (votes rfs c').length := by
   apply filter_length_mono
@@ -319,6 +304,9 @@ theorem a_dark_majority_of_datacenters_blocks_every_write {rfs : Rfs} {o : Nat}
 
 /-! ## An `rf = 0` datacenter is inert -/
 
+/-- A datacenter index past the end of the configured list has replication factor
+    zero, which is the arithmetic behind "an unconfigured datacenter holds no
+    replicas". -/
 theorem rfOf_ge {rfs : Rfs} {d : Nat} (h : rfs.length ≤ d) : rfOf rfs d = 0 := by
   induction rfs generalizing d with
   | nil => simp [rfOf]
@@ -329,6 +317,8 @@ theorem rfOf_ge {rfs : Rfs} {d : Nat} (h : rfs.length ≤ d) : rfOf rfs d = 0 :=
           simp only [rfOf, List.getD_cons_succ] at ih ⊢
           exact ih (by simpa using h)
 
+/-- Appending a datacenter with no replicas leaves every replication factor where it
+    was — its own, necessarily, and every existing one too. -/
 theorem rfOf_append_zero (rfs : Rfs) (d : Nat) : rfOf (rfs ++ [0]) d = rfOf rfs d := by
   induction rfs generalizing d with
   | nil =>
@@ -342,6 +332,8 @@ theorem rfOf_append_zero (rfs : Rfs) (d : Nat) : rfOf (rfs ++ [0]) d = rfOf rfs 
           simp only [rfOf, List.cons_append, List.getD_cons_succ] at ih ⊢
           exact ih d
 
+/-- A datacenter with no replicas is not counted, so the denominator gate 2 measures
+    against is the same with or without it. -/
 theorem eligibleDcs_append_zero (rfs : Rfs) : eligibleDcs (rfs ++ [0]) = eligibleDcs rfs := by
   have he : eligible (rfs ++ [0]) = eligible rfs := by
     funext d; simp only [eligible, rfOf_append_zero]
@@ -350,6 +342,8 @@ theorem eligibleDcs_append_zero (rfs : Rfs) : eligibleDcs (rfs ++ [0]) = eligibl
   have : eligible rfs rfs.length = false := by simp [eligible, rfOf_ge (Nat.le_refl _)]
   simp [this]
 
+/-- The replica total gate 3 measures against is unchanged as well, so a datacenter
+    added with no replicas cannot lower the bar for anyone else's write. -/
 theorem rfTotal_append_zero (rfs : Rfs) : rfTotal (rfs ++ [0]) = rfTotal rfs := by
   have hr : rfOf (rfs ++ [0]) = rfOf rfs := by funext d; exact rfOf_append_zero rfs d
   have h0 : rfOf rfs rfs.length = 0 := rfOf_ge (Nat.le_refl _)

@@ -1,22 +1,16 @@
 /-
-  Ferrosa formal specification — Trace 2, rung 2: Pair mode.
-  ==========================================================
+  Ferrosa formal specification — pair mode: two nodes, one primary, no quorum.
+  ==========================================================================
 
-  Source: `specs/reference/cluster-formation-state-machine.md` T1 (Standalone →
-  Pair, role assignment by connection direction), T8a/T8b (secondary/primary
-  failure), T9 (operator promotes the secondary), and its stated invariants:
-
-    * "Old primary always becomes secondary on return (it initiates the
-       connection)"
-    * "No automatic role swap — operator promotion is the only way to change
-       roles"
-    * "Split brain is impossible: only one node can be promoted, and connection
-       direction determines roles on reconnect"
-
-  The last claim is the one worth checking.  It holds **only because** promotion
-  is gated on the operator asserting the primary is dead.  `pair_no_split_brain`
-  proves the gated system safe; `unguarded_promotion_splits_brain` proves that
-  dropping the gate makes two writable primaries reachable.
+  Two nodes and no quorum: a write the primary acknowledges is on exactly one machine,
+  and losing that machine loses the write until an operator promotes the other node.
+  The surviving secondary keeps serving reads, so a pair whose primary is down is
+  read-only rather than unavailable, and writes refuse rather than split.  Promotion is
+  the operator's decision and is gated on the operator having confirmed the peer dead,
+  which is the only thing keeping a pair from accepting two divergent writes under one
+  key — `unguarded_promotion_splits_brain` is the split brain that arrives the moment
+  that gate is dropped.  A returning primary is demoted on reconnect, because connection
+  direction assigns the roles and no election is involved.
 -/
 import Ferrosa.Topology.Basic
 
@@ -80,7 +74,7 @@ inductive Reachable (op : Bool) : Pair → Prop where
   | t1 : Reachable op ⟨.none, .none, true, true⟩
   | step : Reachable op s → Step op s s' → Reachable op s'
 
-/-! ## The pair is single-primary by construction -/
+/-! ## The pair is single-primary by construction, with no election to run -/
 
 /-- T1 assigns both roles at once: the receiver is primary, the initiator is
     secondary.  There is no interleaving in which both call themselves primary. -/
@@ -121,7 +115,7 @@ theorem no_two_writable {op : Bool} {s : Pair} (h : Reachable op s) :
       | demote0 | demote1 | rejoin0 _ | rejoin1 _ | fail0 | fail1 =>
           simp_all [Writable]
 
-/-! ## What the operator gate buys, and what it costs -/
+/-! ## What the operator gate buys, and what dropping it would cost -/
 
 /-- Dropping the "peer is confirmed dead" guard makes split brain reachable:
 both nodes end up primary and up, so both accept writes.  This is the theorem
@@ -130,6 +124,11 @@ inductive UnguardedStep : Pair → Pair → Prop where
   | t1 : UnguardedStep ⟨.none, .none, true, true⟩ ⟨.primary, .secondary, true, true⟩
   | promote1 {s : Pair} (hn : s.r1 ≠ .primary) : UnguardedStep s { s with r1 := .primary }
 
+/-- **Red: without the guard, one promotion splits the brain.**  A single
+    `promote1` step from the T1 state leaves both nodes primary and up, so both
+    accept writes for the same key and a client can be told two different values
+    succeeded.  Nothing in the unguarded system can tell a dead peer from a
+    partitioned one, so there is no state at which the promotion is safe. -/
 theorem unguarded_promotion_splits_brain :
     ∃ s s', UnguardedStep s s' ∧ Writable s' 0 ∧ Writable s' 1 := by
   refine ⟨⟨.primary, .secondary, true, true⟩, ⟨.primary, .primary, true, true⟩,

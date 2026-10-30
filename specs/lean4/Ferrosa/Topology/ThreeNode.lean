@@ -1,15 +1,15 @@
 /-
-  Ferrosa formal specification — Trace 2, rung 3: three nodes at RF = 2.
-  ====================================================================
+  Ferrosa formal specification — three nodes at RF = 2: a spare replica, no spare node.
+  ====================================================================================
 
-  `specs/reference/cluster-formation-state-machine.md` T6a says:
-
-  > Quorum still holds (e.g., 1 of 3 nodes down — 2 remain, quorum = 2).
-  > 3. Writes continue at CL=QUORUM (2 of 3 replicas available)
-
-  That sentence silently assumes RF = 3.  At RF = 2 — the rung this ladder climbs
-  first — one node loss removes the *only* quorum for half the keyspace.
-  `rf2_has_no_fault_tolerance` is the machine-checked correction.
+  Three nodes at `RF = 2` is the first rung with a replica to spare and the last with
+  nowhere to put a failure: `QUORUM` at `RF = 2` means both replicas must acknowledge, so
+  one dead node blocks writes for every key that had it as a replica.  Guidance that
+  promises continued `QUORUM` writes with a node down silently assumes `RF = 3`, and
+  `rf2_has_no_fault_tolerance` is the machine-checked correction for this shape.  What
+  the rung does buy is `QUORUM`/`QUORUM` read-your-write — a two-ack write and a two-ack
+  read out of the same two replicas must overlap — while `ONE`/`ONE` does not, because a
+  write acked by one replica can be missed by a read served by the other.
 -/
 import Ferrosa.Topology.Basic
 

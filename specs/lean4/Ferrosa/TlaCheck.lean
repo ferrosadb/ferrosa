@@ -1,42 +1,18 @@
 /-
-  Ferrosa formal specification — audit of the existing TLA+ models.
-  ================================================================
+  The TLA+ models: which of their invariants can fail at all
+  ==========================================================
 
-  `specs/tla/raft.tla` and `specs/tla/multi-dc.tla` are the only machine-oriented
-  specs Ferrosa has, and neither has ever been model-checked: both files say
-  "Apalache is NOT installed in the agent environment … an operator follow-up".
-
-  This file checks the *claims those models make* against the *machines they
-  actually define*, faithfully encoding the named actions.  It does not try to
-  prove the protocols right or wrong; it establishes which invariants are
-  load-bearing and which are tautologies over the transition system.
-
-  Result summary (each item is a theorem below):
-
-  raft.tla
-    1. `prevote_guard_is_vacuous` — `NoTermAdvanceWithoutPreVoteMajority` ends
-       in `\/ TRUE`, so it is satisfied by every state, including a Candidate
-       that never saw a PreVote (`candidate_without_prevote_reachable`).
-    2. `config_never_propagates` — `ProposeMembership`/`CommitMembership` write
-       only the *leader's* `config`, so the "joint consensus" phase is joint on
-       one server only; `JointConsensusSafety` is therefore local, not cluster.
-    3. `leader_can_vote_without_stepping_down` — `GrantVote` does not require
-       the voter to be a follower, so the model admits a Leader that votes for
-       another candidate and keeps leading.
-
-  multi-dc.tla
-    4. `stale_commit_timestamp_reachable` — `AccordCommit` accepts any `hlc`,
-       including one below the DC's watermark.
-    5. `apply_order_violation` — consequence: a transaction committed *later*
-       with a *smaller* timestamp can be applied after one with a larger
-       timestamp, breaking ADR-015's I-27 "applies in order".
-    6. `swap_dc_antecedent_never_holds` — no action in the module assigns
-       `pendingConfig`, so `SwapDcDrainsAccord` (I-30) is vacuous.
-    7. `applied_implies_committed` — `AccordIdempotence` (I-28) is a consequence
-       of the commit/apply guards; the model has no way to express "applied
-       twice", because `appliedAccord` is a set.
-    8. `per_dc_commit_index_never_advances` — the per-DC Raft layer is a stub,
-       so no Raft property of the multi-DC composition is checked at all.
+  `specs/tla/raft.tla` and `specs/tla/multi-dc.tla` are the only machine-oriented specs Ferrosa has,
+  neither has ever been model-checked, and several of the invariants they claim to check cannot fail
+  of any state. Encoding the modules' actual actions shows why: `NoTermAdvanceWithoutPreVoteMajority`
+  ends in `\/ TRUE`, so it holds of a Candidate that never saw a PreVote;
+  `ProposeMembership` and `CommitMembership` write only the leader's own `config`, so the
+  joint-consensus phase is joint on one server and `JointConsensusSafety` is a local claim rather than
+  a cluster one; and `GrantVote` never requires the voter to be a follower, so the model admits a
+  Leader that votes for another candidate and keeps leading. Each of those weakens the machine an
+  election-safety argument would be checked against, and no amount of model checking can expose it,
+  because a tautology has no counterexample to find. What `raft.tla` actually checks is here; the
+  `multi-dc.tla` half of the same audit is `Ferrosa/Accord/AccordMultiDcLean.lean`.
 -/
 import Ferrosa.Core
 
@@ -44,7 +20,7 @@ namespace Ferrosa.TlaCheck
 
 open Ferrosa
 
-/-! ## raft.tla -/
+/-! ## What `raft.tla` claims, and the guard that holds of every state -/
 
 /-- The invariant as written in `raft.tla:283-286`:
 

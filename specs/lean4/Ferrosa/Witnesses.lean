@@ -1,8 +1,13 @@
-/- Every witness a ledger names must exist as a declaration.
+/-
+  Every witness a ledger names, checked against the environment
+  =============================================================
 
-Ledger entries carry their witness as a **string**, so deleting a theorem does not break the build —
-the ledger goes on citing something that is no longer there. These `#check`s make the citation
-checked: a witness that is renamed, moved, or removed fails the build here.
+  A ledger holds its witness as a string, so a theorem that is renamed, moved or deleted does not
+  break the build — the claim goes on citing something that no longer exists. The `#check`s here make
+  every one of those citations resolve, so a promise cannot survive the theorem that justified it.
+
+  Nothing here proves anything about Ferrosa. It is the machinery that keeps the claim list honest,
+  which is why it is printed with the reference material rather than as a chapter.
 -/
 import Ferrosa.Unimplemented
 import Ferrosa.Cdc.Subscribe

@@ -1,14 +1,15 @@
 /-
-  Ferrosa formal specification — Trace 2, rung 4: five nodes at RF = quorum.
-  ========================================================================
+  Ferrosa formal specification — five nodes at RF = 3: which quorum does QUORUM mean.
+  ==================================================================================
 
-  "5 node RF = quorum" is ambiguous, and the ambiguity is load-bearing: a quorum
-  of *replicas* at RF = 3 is 2, while a quorum of the *cluster* is 3.  Ferrosa
-  computes `block_for(QUORUM, rf)` from the RF, so quorum means "2 of the 3
-  replicas", not "3 of the 5 nodes".
-
-  `quorum_is_over_replicas_not_cluster` and
-  `cluster_majority_read_can_miss_replica_write` make that difference explicit.
+  Five nodes at `RF = 3` is the first rung of the ladder where a node may be lost without
+  losing any key, and where two simultaneous replica losses do block some key.  The
+  ambiguity worth naming is what `QUORUM` counts: it is computed from the replication
+  factor, so at `RF = 3` a quorum is two replicas and not three of the five nodes — one ack
+  of slack rather than a cluster majority.  A read that collects three of the five nodes can
+  therefore miss a write that two of three replicas acknowledged, which is what makes a
+  `SERIAL` or leader read the only way to be sure of the newest value without reading the
+  replica set the write landed on.
 -/
 import Ferrosa.Topology.Basic
 

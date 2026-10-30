@@ -1,13 +1,15 @@
 /-
-  Ferrosa formal specification — Trace 2: the escalation ladder.
-  =============================================================
+  Ferrosa formal specification — the escalation ladder as one threshold table.
+  ============================================================================
 
-  Single → Pair → 3-node RF=2 → 5-node RF=quorum → 2 DCs (one link) → 3 DC ring.
-
-  Each rung is verified in its own file.  This file records the *ladder* itself:
-  the threshold table, the fault-tolerance each rung actually buys, and the two
-  properties that must survive every escalation — read-your-write and the
-  impossibility of two disjoint write quorums.
+  Choosing a replication factor is choosing a row of one table: how many acks `QUORUM`
+  costs at each shape, how many replicas may be lost while writes still succeed, and
+  where a read can stop seeing an acknowledged write.  Two rows matter more than the rest.
+  Three nodes at `RF = 2` tolerate no failure at all, and five nodes at `RF = 3` tolerate one
+  replica — the same as the two-datacenter rung — because a quorum of three is two.  What
+  never changes as the ladder climbs is the pair of properties every rung preserves:
+  `QUORUM`/`QUORUM` reading a write back, and the impossibility of two disjoint write
+  quorums at any replication factor.
 -/
 import Ferrosa.Topology.Basic
 import Ferrosa.Topology.Pair

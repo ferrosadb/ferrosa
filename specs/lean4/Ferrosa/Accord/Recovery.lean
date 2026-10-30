@@ -3,23 +3,15 @@
   what breaking dependency completeness costs.
   ==========================================================================
 
-  Sources:
-    * `research/SPEC-accord-transactions.md` §6.1 ("two ballot numbers are
-      required; conflating them is unsound — Sutra 2019"), §11.2 (the 24-step
-      EPaxos correctness test, which is a CI gate).
-
-  Two machine-checked results:
-
-  1. `recovery_diverges` — with a single ballot variable, the recovery phase
-     selects a value that was never chosen by a quorum, while the two-ballot
-     version selects the chosen one.  This is the reduction of Sutra's
-     counterexample to the minimal acceptor triple; the full 24-step version
-     additionally interleaves client requests, which this reduction abstracts
-     away because the divergence is already present at the acceptor level.
-  2. `write_skew_not_serializable` — the history that results when a dependency
-     is dropped (i.e. when dependency completeness fails) is *not* serializable,
-     and `dep_guard_restores_serializability` shows the guard is what rules it
-     out.
+  Recovery is where Accord can silently lose an acknowledged commit, and the two ballot
+  numbers are what prevent it: the ballot an acceptor promised and the ballot it accepted a
+  value at are separate facts, and conflating them lets a Prepare relabel a stale value as
+  freshly accepted.  `recovery_diverges` reduces Sutra's counterexample to three acceptors
+  and shows the wrong value being chosen — one that no quorum ever accepted, in place of
+  one a quorum had committed.  Breaking dependency completeness costs the same way at the
+  history level: two transactions that each write one key and read the other's admit no
+  serial order, and `dep_guard_restores_serializability` shows the dep-wait guard ruling
+  that shape out.
 -/
 import Ferrosa.Accord.Protocol
 
@@ -61,11 +53,11 @@ def recoveryChoice (as : List Acceptor) : Option (Nat × Val) :=
         | none => some (a.accBallot, v)
         | some (b, _) => if b < a.accBallot then some (a.accBallot, v) else best) none
 
-/-! ### The counterexample
+/-! ### The counterexample, reduced to three acceptors
 
 Three acceptors, one command.  Ballot 3 carries value 2 and is chosen (accepted
 by `a1` and `a2`); ballot 1 carries value 1 at `a0` only.  A later Prepare for
-ballot 5 reaches `a0`. -/
+ballot 5 reaches `a0`, and with one ballot field that is enough to lose the commit. -/
 
 def a0 : Acceptor := accept (accept (prepare Acceptor.init 1) 1 1) 1 1
 def a1 : Acceptor := accept (accept (prepare Acceptor.init 3) 3 2) 3 2
@@ -84,6 +76,10 @@ def a0' : Acceptor := prepareConflated a0 5
     committed. -/
 theorem recovery_diverges : recoveryChoice [a0', a1, a2] = some (5, 1) := by native_decide
 
+/-- **Red: the conflated acceptor proposes a value no quorum ever accepted.**  The same
+    three acceptors, after one Prepare at ballot 5, yield `1` where the correct recovery
+    yields the committed `2` — so two replicas recovering from this state would agree on
+    a value that contradicts the one the client was told was committed. -/
 theorem recovery_wrong_value : recoveryChoice [a0', a1, a2] ≠ recoveryChoice [a0, a1, a2] := by
   rw [recovery_diverges, recovery_correct]
   simp
@@ -130,6 +126,9 @@ def hSkewGuarded : History := ⟨[
   invEv 1 2 [.read 0, .append 1 20] 20,
   okEv 1 2 [.read 0, .append 1 20] [[10]] 20 30]⟩
 
+/-- With the dependency intact the write-skew pair is strictly serializable — B's read
+    observes A's append — so it is the missing edge, not the checker, that made the
+    unguarded history fail. -/
 theorem dep_guard_restores_serializability : strictlySerializableB hSkewGuarded = true := by
   native_decide
 

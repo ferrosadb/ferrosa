@@ -2,24 +2,17 @@
   Ferrosa formal specification — CQL front end, part 6: collections.
   ================================================================
 
-  A collection update is a read-modify-write wearing the clothes of a blind write.
-  `UPDATE t SET tags = tags + {'x'} WHERE k = 1` has no `IF` clause, so
-  `Stmt.blind` classifies it blind (`collection_append_classified_blind`), and the
-  statement genuinely must read the old value to compute the new one
-  (`collection_append_must_read`).  Both are machine-checked, which is the finding:
-  **the classifier inspects only the `IF` clause, never the assignment terms.**
+  `UPDATE t SET tags = tags + {'x'} WHERE k = 1` carries no `IF` clause, so the
+  front end calls it a blind write — and it cannot be executed without reading
+  the old value of `tags`. The classifier that decides which writes skip the read
+  phase, built in `Ferrosa/Cql/Classify.lean`, looks only at the `IF` clause and
+  never at the assignment terms.
 
-  What that costs depends on the collection type, and this is the distinction worth
-  having in a spec rather than in a comment:
-
-    * a **set** (or map) add is commutative and idempotent, so a last-write-wins
-      merge of two concurrent adds loses nothing — merging is a union;
-    * a **list** append is neither, so two concurrent appends merged by
-      last-write-wins lose an element.
-
-  So `SET<v>` is safe to treat as a blind write under LWW; `LIST<v>` is not, and
-  needs the read phase.  The anomaly is `list_lww_loses_an_element`; the safe case is
-  `set_lww_is_order_free`.
+  What that costs depends on the collection type, and the two answers are
+  different. Adding to a set is commutative and idempotent, so a last-write-wins
+  merge of two concurrent adds keeps both elements: merging is a union. Appending
+  to a list is neither, so the same merge keeps one element, and a client that
+  received two acknowledgements sees one of its two writes.
 -/
 import Ferrosa.Cql.Classify
 
@@ -150,8 +143,12 @@ theorem scalar_assignment_is_genuinely_blind :
 def Stmt.blindSem : Stmt → Bool
   | s => s.blind && !Stmt.readsOwnColumn s
 
+/-- The tightened classifier refuses a collection append, so `tags = tags + {'x'}`
+    takes the read phase and cannot be acknowledged on the write path alone. -/
 theorem blindSem_rejects_collection_append : Stmt.blindSem listAppendStmt = false := by decide
 
+/-- A plain scalar assignment still qualifies as blind under the tightened
+    classifier, so ordinary writes keep the fast path. -/
 theorem blindSem_accepts_scalar :
     Stmt.blindSem (.update "t" [⟨"name", .literal 0⟩] [⟨"k", "=", .literal 1⟩] false []) = true := by
   decide

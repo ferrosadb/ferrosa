@@ -1,17 +1,16 @@
 /-
-  Ferrosa formal specification — the distinct-count sketch, in commons because all three front ends
-  need it.
-  ========================================================
+  The distinct-count sketch, and the accuracy claim it cannot make here
+  =====================================================================
 
-  `COUNT(DISTINCT v)` is exact and spills to disk (`DistinctExact`, a slot table with 19/19 tests), so
-  its memory is bounded without approximating. `COUNT(ESTIMATE_DISTINCT v)` is the other job: it must
-  survive per-partition evaluation and merge afterwards, which rules out a Bloom filter — a Bloom count
-  is a function of probe history, so OR-ing two filters yields membership, not a count.
+  An estimate of `COUNT(DISTINCT v)` costs `2^p` registers whatever the number of distinct values,
+  and partial sketches merge in any order because the merge is register-wise maximum — so a
+  per-partition estimate combines into a cluster estimate, and a retried merge cannot inflate it.
+  That is what a Bloom filter cannot do: OR-ing two filters yields membership, not a count.
 
-  The sketch is a HyperLogLog: `2^p` registers, each holding the rank of the longest run of zero bits
-  seen for its bucket. Merging is register-wise maximum, borrowed from `Commons.Tactics` because the
-  tombstone merge is the same algebra. What is *not* proved is the accuracy claim: `1.04/sqrt(m)` needs
-  a probability model this corpus does not build, so it is carried as a red rather than assumed.
+  What is not available is the number users will ask for. The `1.04/√m` error bound needs a
+  probability model over the hash that this corpus does not build, and the estimator in the tree is
+  a Bloom probe returning a lower bound, so an operator gets a bound on under-counting rather than
+  an error bar.
 -/
 import Ferrosa.Core
 import Ferrosa.Ledger
@@ -27,10 +26,14 @@ abbrev Registers := Nat → Nat
 /-- Register-wise maximum — the merge. -/
 def merge (a b : Registers) : Registers := fun i => max (a i) (b i)
 
+/-- Two partial sketches produce the same registers whichever order they are folded in, so
+    per-partition results can be combined in arrival order. -/
 theorem merge_is_commutative (a b : Registers) : merge a b = merge b a := by
   funext i
   exact Tactics.merge_comm a b i
 
+/-- Grouping does not matter either, so a fan-out of partials can be folded pairwise in any tree
+    shape and still give one sketch. -/
 theorem merge_is_associative (a b c : Registers) :
     merge (merge a b) c = merge a (merge b c) := by
   funext i
@@ -69,6 +72,9 @@ def ledger : List SpecItem := [
      "Commons.Hll.merge_is_commutative"⟩
 ]
 
+/-- Two obligations are unmet here: the `1.04/√m` error bound, which needs a probability model this
+    corpus does not build, and the sketch itself, which the tree does not have — `count.rs` probes a
+    Bloom filter and returns a lower bound. The count is pinned so neither can be closed quietly. -/
 theorem hll_has_two_red_items : redCount ledger = 2 := by decide
 
 def main : IO Unit :=

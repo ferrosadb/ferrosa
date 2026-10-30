@@ -1,25 +1,18 @@
 /-
-  Ferrosa formal specification — CQL front end, part 3: the conformance corpus.
-  =====================================================================
+  Ferrosa formal specification — CQL front end, part 3: the conformance table.
+  ==========================================================================
 
-  This is the artifact that makes "the implementation agrees with the spec" a
-  checkable claim rather than a hope.  It is a table:
+  A handful of statements are written out in full alongside the classification
+  and acknowledgement plan each produces, so that "the implementation agrees with
+  the specification" is a comparison against a fixed table rather than a hope. A
+  Rust integration test in `ferrosa-cql/tests/` runs the same statements through
+  the real parser and planner; a row that disagrees names either a parser bug or
+  a specification bug, and says which statement is at fault.
 
-      statement  →  (reads, writes, conditional, blind, ack plan)
-
-  The table lives here, is checked by `decide`, and is meant to be **mirrored in
-  Rust as an integration test** (`ferrosa-cql/tests/`): the same statements run
-  through the real parser and planner must produce the same row.  Two directions,
-  both cheap:
-
-    * Lean → Rust: this table is the expected output.  A Rust test that disagrees
-      is either a parser bug or a spec bug, and the diff says which.
-    * Rust → Lean: `#eval` the Rust planner's output as a row and `decide` it
-      against this table.
-
-  What this does *not* do is prove the parser correct.  A corpus proves agreement
-  on the corpus.  That is the honest boundary: the grammar is checked by
-  differential testing, the semantics are proved.
+  Agreement on the table is all the table can show. It does not establish that the
+  parser accepts exactly CQL — a corpus proves agreement on the corpus — and the
+  grammar is left to differential testing while the semantics above the parse are
+  proved in `Ferrosa/Cql/Classify.lean`.
 -/
 import Ferrosa.Cql.Classify
 
@@ -63,27 +56,39 @@ def qBatchMixed : Statement :=
   .batch .logged [.insert "users" [⟨"id", .literal 1⟩] false,
                   .insert "users" [⟨"id", .literal 2⟩] true]
 
-/-! ## The classification table -/
+/-! ## Every statement above, with the answer the classifier gives it -/
 
 /-- `(reads, writes, conditional, blind)` for the statement. -/
 def classify (s : Statement) : Bool × Bool × Bool × Bool :=
   (s.reads, s.writes, s.conditional, s.blind)
 
+/-- `SELECT * FROM users WHERE id = 1` reads without writing, tests no condition,
+    and therefore takes no blind path. -/
 theorem qSelect_classified :
     classify qSelect = (true, false, false, false) := by decide
 
+/-- A plain `INSERT` writes without reading anything first, so it qualifies as a
+    blind write. -/
 theorem qInsert_classified :
     classify qInsert = (false, true, false, true) := by decide
 
+/-- `INSERT … IF NOT EXISTS` reads the partition to test its condition, so it is
+    not a blind write. -/
 theorem qInsertIf_classified :
     classify qInsertIf = (true, true, true, false) := by decide
 
+/-- `UPDATE … IF name = 'a'` reads, writes and tests a condition, so it needs the
+    read phase. -/
 theorem qUpdateIf_classified :
     classify qUpdateIf = (true, true, true, false) := by decide
 
+/-- `DELETE … IF EXISTS` reads, writes and tests a condition, so it needs the read
+    phase. -/
 theorem qDeleteIf_classified :
     classify qDeleteIf = (true, true, true, false) := by decide
 
+/-- A batch of two blind inserts is itself blind: no member reads and none tests a
+    condition, so the whole batch can be acknowledged on the write path. -/
 theorem qBatchBlind_classified :
     classify qBatchBlind = (false, true, false, true) := by decide
 
@@ -133,6 +138,9 @@ theorem plan_quorum_2_2_differs :
 def keyOf : Stmt → List Key
   | _ => [1]
 
+/-- Two blind inserts between `BEGIN` and `COMMIT` give a transaction with nothing
+    in its read set and no condition, which is the shape Accord can commit on the
+    write path. -/
 theorem txn_shape_of_blind_pair :
     txnShape keyOf keyOf [.insert "users" [⟨"id", .literal 1⟩] false,
                           .insert "users" [⟨"id", .literal 2⟩] false]

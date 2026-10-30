@@ -1,24 +1,18 @@
 /-
-  Ferrosa formal specification — SUBSCRIBE, the change-data-capture streams.
-  ========================================================================
+  Change streams: what a subscriber is told, and what it is not given
+  ===================================================================
 
-  `ferrosa-cql/src/subscribe.rs` and `ferrosa-cdc` expose two optional, event-driven streams:
+  A subscriber is never told that nothing happened when the truth is that events were lost: a
+  gap arrives as a counted `lagged` signal, and a transaction that has not committed is never
+  announced. Delivery is at-least-once, so collapsing repeats on `mutationId` is part of using
+  the stream rather than a precaution against it. The two streams also order by different keys
+  — `WrittenOnNode` by mutation timestamp, `CommittedToCluster` by commit timestamp — and offer
+  no shared cursor, so a consumer following both supplies its own order.
 
-    * `WrittenOnNode`        — every mutation durably appended to this node's commit log,
-                               ordered by mutation timestamp.
-    * `CommittedToCluster`   — mutations the cluster has agreed or acknowledged (Accord
-                               commit, or a regular-CL quorum ack on the coordinator).
-
-  This is not a polled `SELECT` snapshot, so none of the query-path rules transfer: a subscriber
-  cannot be allowed to slow the writer, which means the trade that governs `SELECT *` — backpressure
-  — is inverted here. A slow subscriber is given an explicit, counted gap instead of flow control.
-  The obligation is therefore *legibility*, not completeness: nothing may be lost silently, and a
-  gap must say how much it swallowed.
-
-  What the code does not have, and this file records as red, is a resumption point. A lagged
-  subscriber is told how many events it missed and is given no cursor to fetch them with, so its
-  only correct recovery is a fresh snapshot. For a change stream that is a real operational hole,
-  not a wording problem.
+  What a subscriber does not get is a way back: a lagged consumer learns how many events it missed
+  and is handed no position to fetch them from, so its only correct recovery is a fresh snapshot, and
+  a cancelled subscription records no final cursor at all. `Commons.Stream` is the protocol that would
+  close that hole; the bus behind SUBSCRIBE does not speak it yet.
 -/
 import Ferrosa.Core
 import Ferrosa.Ledger
@@ -84,6 +78,9 @@ theorem a_slow_subscriber_cannot_stall_the_writer (occupancy accepted : Nat) :
 def dedup (events : List Event) : List Nat :=
   (events.map (·.mutationId)).eraseDups
 
+/-- The same mutation delivered twice collapses to one entry, so a consumer that dedups on
+    `mutationId` sees each committed change exactly once however many times the bus hands it
+    over. -/
 theorem at_least_once_delivers_every_committed_id_at_least_once :
     dedup [⟨7, 0, 0, true⟩, ⟨7, 0, 0, true⟩, ⟨8, 1, 1, true⟩] = [7, 8] := by decide
 
@@ -93,6 +90,9 @@ theorem at_least_once_delivers_every_committed_id_at_least_once :
 def writtenFirst : List Nat := [1, 2]
 def committedFirst : List Nat := [2, 1]
 
+/-- The same two mutations arrive in opposite orders on `WrittenOnNode` and
+    `CommittedToCluster`, so no ordering of one stream can be read as the ordering of the other:
+    e2 is written later and commits first. -/
 theorem the_two_streams_order_differently :
     writtenFirst ≠ committedFirst := by decide
 
@@ -100,6 +100,9 @@ theorem the_two_streams_order_differently :
     promise that a single cursor exists. -/
 def mergedOrderIsTheConsumersProblem (a b : List Nat) : Bool := a == b
 
+/-- A consumer that merges the two streams finds them in disagreement, so the ordering key has to
+    be chosen on the client side — the server holds no position from which one cursor over both
+    would exist. -/
 theorem merging_the_streams_needs_a_consumer_side_order :
     mergedOrderIsTheConsumersProblem writtenFirst committedFirst = false := by decide
 
@@ -233,6 +236,9 @@ def ledger : List SpecItem := [
      "Commons.Stream.a_cancellation_reports_the_position_to_resume_from"⟩
 ]
 
+/-- The area's red count is pinned at four: no controller behind the fair share, a bus that drops
+    instead of spilling, a gap carrying no position to replay from, and a cancellation carrying no
+    final cursor. Closing one without striking it from the ledger fails here. -/
 theorem cdc_has_four_red_items : redCount ledger = 4 := by decide
 
 def main : IO Unit :=

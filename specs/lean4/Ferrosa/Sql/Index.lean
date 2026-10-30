@@ -1,30 +1,20 @@
 /-
-  Ferrosa formal specification — what the layer under the SQL surface must provide (indexes).
+  Ferrosa formal specification — what the layer under the SQL surface must provide
+  for indexes.
   =====================================================================
 
-  The SQL surface promised O(1) lookups on indexed columns. This file states what that can and
-  cannot mean, so the layer beneath has something checkable to satisfy.
+  A lookup on an indexed column was promised to be constant-time, and only one of
+  the two senses of that is achievable. An equality probe names one value, which
+  belongs to one partition, so it costs one node contact and one record read however
+  large the table is. A range probe names a set of values that belong to every
+  partition, so it cannot be answered by one node: it either walks an ordered index
+  on one node or gathers from all of them.
 
-  **Two different O(1)s, and only one of them is achievable.**
-
-    - *Global*: one node contact per equality lookup. Achievable — hash-partition the index by
-      the value, so the value names exactly one index partition
-      (`equality_contacts_one_node`).
-    - *Global*: one node contact per **range** lookup. Not achievable with a hash-partitioned
-      index, because a range's values land on every node
-      (`range_lookup_cannot_be_constant`). A range index must be ordered and pays
-      O(log N + k) on one node, or scatter-gathers across all of them.
-
-    - *Local*: one record read per probe, versus a linear scan
-      (`index_lookup_is_constant`).
-
-  The obligation the layer must meet is therefore not "O(1)" but:
-  **equality probes touch one node and one record; range probes touch one node and O(log N + k)
-  records, or all nodes.** Anything stronger than that is a promise the index cannot keep.
-
-  And one correctness obligation that ties this to the transaction work: an index maintained
-  outside the write's atomic boundary can be made inconsistent with the table, in both
-  directions (`a_non_atomic_index_write_is_inconsistent`).
+  The obligation is therefore a shape rather than a constant — equality touches one
+  node and one record, range touches one node and a walk or every node — and
+  anything stronger is a promise the index cannot keep. One correctness item sits
+  beside the cost: an index maintained outside the row write's atomic boundary can be
+  left disagreeing with the table, in either direction.
 -/
 import Ferrosa.Ledger
 
@@ -70,6 +60,8 @@ def indexLookupReads : Nat := 1
 /-- Records read by a full scan. -/
 def tableScanReads (rows : Nat) : Nat := rows
 
+/-- An index probe reads exactly one record whatever the table holds, which is the
+    whole of the constant-time claim. -/
 theorem index_lookup_is_constant : indexLookupReads = 1 := rfl
 
 /-- **An index probe beats a scan exactly when there is more than one row**, which is the whole
@@ -83,6 +75,8 @@ theorem index_lookup_beats_a_scan (rows : Nat) (h : 1 < rows) :
     otherwise would be the bug. -/
 def rangeLookupReads (hits logn : Nat) : Nat := hits + logn
 
+/-- A range probe reads every matching row, so it grows with the number of matches
+    and is never a constant-cost operation. -/
 theorem a_range_probe_is_not_constant (hits : Nat) (h : 1 < hits) :
     indexLookupReads < rangeLookupReads hits 0 := by
   simp [indexLookupReads, rangeLookupReads]
@@ -155,6 +149,9 @@ def ledger : List SpecItem := [
    .met "Index.atomic_maintenance_preserves_consistency"⟩
 ]
 
+/-- One of the five index obligations is red: the index and the table can diverge,
+    because maintenance today runs as a separate step rather than inside the row
+    write. A lookup can then miss a committed row or find one that is gone. -/
 theorem sql_index_has_one_red_item : redCount ledger = 1 := by decide
 
 def main : IO Unit :=

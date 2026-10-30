@@ -1,38 +1,18 @@
 /-
-  Ferrosa formal specification — storage, part 2: tombstones, TTL, and purge safety.
-  =====================================================================
+  Deletes and expiry: what a tombstone hides, and the two ways a row comes back
+  ===========================================================================
 
-  Grounded in the stored shapes (`ferrosa-storage/src/commitlog/mutation.rs`,
-  `ferrosa-sstable/src/types.rs`):
+  A delete leaves a tombstone that beats every value at or below its timestamp, in either arrival
+  order, so the row cannot return by being merged in a different sequence; a tie between a delete and
+  an insert resolves to the delete, which is what stops a concurrent insert from undoing it. A TTL is
+  materialised at write time into a stored local deletion time, so expiry compares against a number
+  the coordinator wrote and a replica's clock never enters the answer — which is also why a write
+  carrying a past `USING TIMESTAMP` is invisible the moment it arrives.
 
-  ```text
-  Row:  deletion_marked_for_delete_at:i64 | deletion_local_deletion_time:u32
-     | liveness_timestamp:i64 | liveness_ttl:i32 | liveness_local_deletion_time:i32
-  Cell: column_index:u16 | timestamp:i64 | ttl:i32 | local_deletion_time:i32
-     | value_len:i32 (-1 = tombstone) | value
-  ```
-
-  Three facts about that layout drive this file:
-
-    1. **TTL is materialised as a stored local-deletion-time (`ldt`)**, not recomputed at
-       read. That is the right design and it is why `ttl_is_clock_independent` holds: a
-       replica with a wrong clock still gets the same expiry, because it compares against a
-       number the coordinator wrote. The corollary is `past_timestamp_expires_on_arrival`,
-       since the number is derived from the *write* timestamp, which a client may supply
-       with `USING TIMESTAMP`.
-    2. **`ldt` is stored as an `i32`** for cells. Seconds since the epoch cross `2^31` in
-       2038, so any TTL that pushes `ldt` past that — about twelve years from today —
-       wraps to a negative number and the cell reads as already expired.
-    3. **`gc_grace` exists as a display default** (`gc_grace_seconds: 864000`, ten days) and
-       there is no purge path in the tree. So absence is currently monotone and resurrection
-       is impossible — but only because space grows without bound. The purge condition is
-       specified here so that adding one cannot go wrong: a tombstone may be discarded only
-       once every replica has applied it.
-
-  The merge is last-write-wins with two tie-breaks that are *required*, not stylistic:
-  tombstone beats value at equal timestamp, and the value breaks a remaining tie. Both are
-  proved below by counterexample — without the first a delete can be undone by a concurrent
-  insert at the same timestamp, and without the second two replicas keep different winners.
+  Two ways a user can still lose. The stored local deletion time is an `i32`, so a TTL reaching past
+  `2^31` seconds wraps negative and the cell reads as expired while the writer was told the value
+  would live for years. And a tombstone purged on the grace window alone lets a replica that never
+  saw the delete copy its older value back, which is permanent: no tombstone is left to beat it.
 -/
 import Ferrosa.Ledger
 
@@ -99,6 +79,9 @@ Two merges that omit a tie-break, and the concrete states that expose each. -/
 /-- A merge that resolves on the timestamp alone. -/
 def mergeTsOnly (a b : Obs) : Obs := if a.ts > b.ts then a else b
 
+/-- Timestamp-only merge is still idempotent, so replay is not where the missing tie-break shows up:
+    the failure appears between replicas, each of which keeps its own second argument and never
+    converges with the other. -/
 theorem mergeTsOnly_idempotent (a : Obs) : mergeTsOnly a a = a := by simp [mergeTsOnly]
 
 /-- **Without a value tie-break, two replicas keep different winners.**  `USING TIMESTAMP`
@@ -208,6 +191,9 @@ def resurrectAfterPurge : Bool :=
   let a'' := a'.applyCell (b.getD ⟨0, false, 0⟩) -- read repair pulls B's value back
   a''.visible
 
+/-- Replica A purges its tombstone when grace elapses while replica B never saw the delete; read
+    repair then pulls B's older value back and the row is visible again, with no tombstone remaining
+    to hide it. Purging on time alone is how a deleted row comes back for good. -/
 theorem purge_before_propagation_resurrects : resurrectAfterPurge = true := by decide
 
 /-- **Purging is safe once every replica has applied the tombstone.**  Then no replica holds
@@ -303,6 +289,10 @@ def ledger : List SpecItem := [
      "Tombstone.purge_requires_all_replicas_applied"⟩
 ]
 
+/-- Four obligations are recorded red: a general proof that the merge is order-independent, an `i32`
+    local deletion time that survives every valid TTL, a delete that cannot be resurrected, and a
+    purge path that checks the grace window and propagation before removing anything. The count is
+    pinned so none of them can leave the ledger unnoticed. -/
 theorem tombstone_has_four_red_items : redCount ledger = 4 := by decide
 
 def main : IO Unit :=

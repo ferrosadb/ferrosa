@@ -1,34 +1,20 @@
 /-
-  Ferrosa formal specification — CQL front end, part 8: aggregates and aggregates
-  that are *not* the same aggregate.
-  =====================================================================
+  Ferrosa formal specification — CQL front end, part 8: three counts that are not
+  the same function.
+  ========================================================================
 
-  Three functions, three contracts. They are not interchangeable, and the type
-  discipline is part of the specification:
+  `COUNT(*)` counts rows, `COUNT(DISTINCT v)` counts distinct values, and
+  `COUNT(ESTIMATE_DISTINCT v)` returns a lower bound that can be short. Two are
+  exact and one is not, and they are kept apart by name and by type because a
+  caller handed the estimate where a count was asked for receives a wrong answer
+  rather than a conservative one.
 
-  * `COUNT(*)` — exact, O(1) state, no row retained. `foldCount` below;
-  * `COUNT(DISTINCT v)` — exact, and on the implementation side a disk-backed
-    indexed map (O(1) expected insert, O(1) in-memory). `walkExact` below, where the
-    visited set lives outside the accumulator;
-  * `COUNT(ESTIMATE_DISTINCT v)` — a Bloom-based **lower bound**, not a count.
-    `walkFrom` below, ending in `estimate_le_exact`.
-
-  The last two must never share a name. `Agg.isExact` is `false` for the estimate and
-  the theorems here are what justify the separation: [the estimate can be strictly
-  short](#Ferrosa.Cql.Aggregate.estimate_can_be_strict) while the exact count cannot,
-  so no caller may receive one where the other was asked for.
-
-  The correspondence with `ferrosa-storage/src/count.rs`:
-
-  | here | there |
-  |---|---|
-  | `foldCount` | `RowCounter` / `count_stream` |
-  | `walkExact` | `DistinctExact` (slot table + value arena on disk) and `count_distinct_stream_exact` |
-  | `walkFrom` | `DistinctEstimate` and `count_distinct_stream_estimate` |
-
-  What is *proved* is the contract of each; what the Rust owes is that its
-  implementation refines these (the `DistinctExact` tests do that on concrete data,
-  including a `HashSet` oracle).
+  `COUNT(*)` keeps a single counter and retains no row, so its state is a number
+  however many rows pass through. `COUNT(DISTINCT v)` is exact and keeps the
+  values it has seen beside the counter, which is the disk-backed map in
+  `ferrosa-storage/src/count.rs`. The estimate keeps a fixed-size Bloom filter, so
+  its memory does not grow with the data — the same bounded state that makes it a
+  bound and not a count.
 -/
 import Ferrosa.Cql.Collections
 
@@ -109,6 +95,8 @@ def walkExactPair : List Val → Nat × List Val → Nat × List Val
       if seen.contains v then walkExactPair rest (n, seen)
       else walkExactPair rest (n + 1, seen ++ [v])
 
+/-- The counter and the visited set stay in step: whenever they start equal, the
+    running count after a pass over the rows is the size of the set it ends with. -/
 theorem walkExactPair_fst (rows : List Val) (n : Nat) (seen : List Val)
     (h : n = seen.length) : (walkExactPair rows (n, seen)).1 = (walkExactPair rows (n, seen)).2.length := by
   induction rows generalizing n seen with

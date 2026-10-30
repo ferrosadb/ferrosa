@@ -2,24 +2,19 @@
   Ferrosa formal specification — audit of `specs/tla/multi-dc.tla`.
   ===============================================================
 
-  `multi-dc.tla` claims to model "N independent per-DC Raft groups plus a cross-DC
-  Accord layer" and to check four invariants (I-27 watermark monotonicity, I-27'
-  cross-DC atomicity, I-28 idempotent apply, I-30 DC-swap drain).
-
-  Encoding the module's *actual* actions shows three of the four cannot fail:
-
-    * `SwapDcDrainsAccord` (I-30) — no action assigns `pendingConfig`, so the
-      antecedent `pendingConfig[d] /= {}` never holds.
-    * `AccordIdempotence` (I-28) — `appliedAccord` is a `SUBSET`, so "applied
-      twice" is not expressible; the invariant only says applied ⊆ committed,
-      which the guards already imply.
-    * `NoMixedCommitAbort` — both `AccordCommit` and `AccordAbort` guard on the
-      other set, so it is an invariant of the guards.
-
-  And the one invariant that *can* fail, does: `AccordCommit(t, hlc)` accepts any
-  `hlc ∈ 1..MaxHlc` with no reference to `hlcWatermark[d]`, so a transaction can
-  be committed at a timestamp the DC has already applied past.  That is exactly
-  the "timestamp-ordered apply" property ADR-015 §I-27 claims.
+  `specs/tla/multi-dc.tla` claims to model independent per-DC Raft groups under a cross-DC
+  Accord layer, and it names four invariants; encoding the actions it actually has shows
+  that three of them cannot fail and the fourth does.  The three vacuous ones: no action
+  assigns `pendingConfig`, so the DC-swap drain has an antecedent that never holds;
+  `appliedAccord` is a set that only ever gains committed transactions, so applying a
+  transaction twice is not expressible and the idempotence invariant restates the guards;
+  and commit and abort each guard on the other's set, so their mutual exclusion is an
+  invariant of the guards rather than of the protocol.  The one that can fail is
+  timestamp-ordered apply — commit accepts any HLC with no reference to the datacenter's
+  watermark, so a transaction can be committed at a timestamp the datacenter has already
+  applied past, and the apply order then disagrees with commit-timestamp order.  The per-DC
+  Raft layer is a stub: no action advances a commit index, so no Raft property of the
+  composition is checked at all.
 -/
 import Ferrosa.Core
 
@@ -125,7 +120,7 @@ theorem apply_order_violation :
   refine ⟨s4, h4, ?_, by simp [s4]⟩
   simp [appliedOutOfOrder, tsOf, s4, s3]
 
-/-! ## The invariants that cannot fail -/
+/-! ## The three invariants that cannot fail, and what that means for the audit -/
 
 /-- **I-30 is vacuous**: no action of the module assigns `pendingConfig`. -/
 theorem swap_dc_antecedent_never_holds :

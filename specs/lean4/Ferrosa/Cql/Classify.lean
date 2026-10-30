@@ -1,19 +1,22 @@
 /-
-  Ferrosa formal specification — CQL front end, part 2: routing, ack plans, and
-  transaction shape.
-  =====================================================================
+  Ferrosa formal specification — CQL front end, part 2: how many replicas must
+  acknowledge, and what a transaction touches.
+  ==============================================================================
 
-  This file connects the front end to the two layers already specified:
+  A statement and the keyspace's replication strategy are enough to decide how
+  many replicas must acknowledge it: one level names the coordinating
+  datacenter, another asks for a quorum in every datacenter, and the plan says
+  which. Those two shapes are not interchangeable, and the requirement is per
+  datacenter rather than a total — five acknowledgements all in the primary do
+  not stand in for three there and two in the secondary. What a single
+  acknowledgement means is `Ferrosa/Topology/ConsistencyLevels.lean`; counting a
+  whole statement's worth of them is here.
 
-    * a statement plus a keyspace strategy yields an **ack plan** — the acks
-      required in total and the per-DC requirements.  It consumes
-      `Topology/ConsistencyLevels.lean`, and it is where "2 local + 2 remote" is
-      either expressed or lost;
-    * a sequence of statements yields a **transaction shape** — read set, write
-      set, conditions, and whether the transaction needs Accord at all.  It feeds
-      `Accord.Protocol`.
-
-  `local` is a Lean keyword, so the local data centre is `localDc` throughout.
+  A run of statements between `BEGIN` and `COMMIT` is summarised the same way: the
+  keys it reads, the keys it writes, and how many conditions it tests. A
+  transaction containing any conditional statement is never blind, so it is never
+  acknowledged on the write path alone, and the coordinating datacenter is called
+  `localDc` throughout because `local` is a Lean keyword.
 -/
 import Ferrosa.Cql.Syntax
 
@@ -21,7 +24,7 @@ namespace Ferrosa.Cql
 
 open Ferrosa
 
-/-! ## Keyspace strategy -/
+/-! ## How a keyspace spreads its replicas, and how many it has -/
 
 abbrev DcId := String
 
@@ -45,7 +48,7 @@ def Strategy.dcs : Strategy → List DcId
   | .simple _ => []
   | .nts dcs => dcs.map (·.1)
 
-/-! ## The ack plan
+/-! ## How many acknowledgements a level requires, and in which datacenters
 
 `total` and `perDc` are not interchangeable: `total ≥ n` with the wrong
 distribution is a different requirement from a per-DC one, which is exactly the
@@ -78,7 +81,12 @@ def planFor (cl : ConsistencyLevel) (s : Strategy) (localDc : DcId) : AckPlan :=
 
 /-! ### The plan's properties, and where the code's plan differs -/
 
+/-- A keyspace holding one replica needs one acknowledgement at `ONE`, so the
+    level adds nothing to what the topology already requires. -/
 theorem blockFor_one_at_one : blockFor .one 1 = 1 := by decide
+
+/-- With one replica, `ALL` asks for that replica and so for a single
+    acknowledgement — the same number as `ONE`. -/
 theorem blockFor_all_at_one : blockFor .all 1 = 1 := by decide
 
 /-- `RF = 1` needs one ack at every level that applies to a single-DC keyspace —
@@ -131,7 +139,7 @@ theorem plan_all_is_total (dcs : List (DcId × Nat)) (localDc : DcId) :
     (planFor .all (.nts dcs) localDc).total = (dcs.map (·.2)).sum := by
   simp [planFor, Strategy.globalRf, blockFor]
 
-/-! ## Consistency-level resolution
+/-! ## Which level a statement actually runs at
 
 The frame may carry a level; if it does not, the session/keyspace default
 applies.  Two properties matter: resolution never overrides an explicit choice,
@@ -140,13 +148,17 @@ and it never invents one. -/
 def resolveCl (dflt : ConsistencyLevel) (q : Query) : ConsistencyLevel :=
   q.cl.getD dflt
 
+/-- A level carried in the frame is used as sent: the session default never
+    overrides a client's explicit choice. -/
 theorem resolveCl_of_some (dflt cl : ConsistencyLevel) (stmt : Statement) :
     resolveCl dflt ⟨stmt, some cl⟩ = cl := rfl
 
+/-- A query that names no level runs at the session default, so a client that
+    says nothing gets the configured level rather than an error. -/
 theorem resolveCl_of_none (dflt : ConsistencyLevel) (stmt : Statement) :
     resolveCl dflt ⟨stmt, none⟩ = dflt := rfl
 
-/-! ## Transaction shape -/
+/-! ## What a run of statements between `BEGIN` and `COMMIT` touches -/
 
 structure TxnShape where
   reads : List Key
@@ -186,6 +198,8 @@ theorem unconditional_has_no_condition (readKeys writeKeys : Stmt → List Key) 
     (h : s.conditional = false) : (s.shape readKeys writeKeys).conditions = 0 := by
   simp [Stmt.shape, h]
 
+/-- A group of statements tests a condition exactly when one of its members does,
+    which is what lets a batch's shape be read off its statements. -/
 theorem any_conditional_iff (ss : List Stmt) :
     ss.any Stmt.conditional = true ↔ ∃ s ∈ ss, Stmt.conditional s = true := by
   simp [List.any_eq_true]

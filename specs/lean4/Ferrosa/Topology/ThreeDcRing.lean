@@ -1,15 +1,16 @@
 /-
-  Ferrosa formal specification — Trace 2, rung 6: three DCs in a ring.
-  ===================================================================
+  Ferrosa formal specification — three datacenters in a ring: one may go, two may not.
+  ==================================================================================
 
-  Topology: DC0 = {0,1,2}, DC1 = {3,4,5}, DC2 = {6,7,8}; NTS `{2,2,2}` (RF = 6);
-  WAN links forming a ring DC0–DC1–DC2–DC0.
-
-  The ring is chosen for one reason: it survives *any* two of its three links
-  going down.  `ring_survives_two_link_losses` checks that, and
-  `isolated_dc_breaks_cross_dc_commit` checks the cost — an isolated DC cannot
-  take part in a cross-DC commit, because a quorum of 6 needs 4 acks and no
-  single DC holds 4.
+  Three datacenters of three nodes each at `{2,2,2}` is the shape that survives the loss
+  of any one whole datacenter: a quorum of six needs four acks, and the two surviving DCs
+  supply exactly four — which is the property `specs/decisions/015-multi-dc-raft-per-dc-accord.md`
+  is buying with a per-DC replication factor.  It does not survive two: one DC
+  contributes two replicas against a threshold of four, so cross-DC writes stop instead of
+  under-acking, and no single DC holds enough replicas to carry a quorum on its own.  The
+  ring wiring buys the same kind of margin one level down — any one WAN link may fail and
+  all three DCs stay mutually reachable, two failures isolate at most one DC, and the two
+  that remain still talk to each other.
 -/
 import Ferrosa.Topology.Basic
 
@@ -18,7 +19,7 @@ namespace Ferrosa.Topology.ThreeDcRing
 open Ferrosa
 open Ferrosa.Topology
 
-/-! ## DC-level connectivity -/
+/-! ## Which datacenters can still reach each other once a link is cut -/
 
 /-- A direct WAN link between DCs `a` and `b`, in either direction. -/
 def dcLink (links : List (Nat × Nat)) (a b : Nat) : Bool :=
@@ -69,7 +70,7 @@ theorem isolating_one_dc_keeps_the_other_two_connected :
       dcReach (afterCut [(1, 2), (0, 2)]) 1 2 = false := by
   decide
 
-/-! ## Quorum arithmetic at RF = 6 -/
+/-! ## What a quorum of six needs, and which datacenter losses it survives -/
 
 /-- 9 nodes, 3 per DC, RF = 6 (NTS 2 + 2 + 2). -/
 def threeDc : Topo where
@@ -105,7 +106,7 @@ theorem two_dc_loss_breaks_quorum :
 theorem each_quorum_never_survives_dc_loss :
     threeDc.localOkAtB (downOf [6, 7, 8]) 2 0 .eachQuorum 2 = false := by decide
 
-/-! ## Where the redundancy stops -/
+/-! ## Where the redundancy stops: one datacenter may go, two may not -/
 
 /-- The ring tolerates exactly one DC loss: one is free, two take `QUORUM` with
     them.  That is the boundary of the last rung. -/

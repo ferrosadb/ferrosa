@@ -1,11 +1,16 @@
 /-
-  Ferrosa formal specification — shared tactics and lemma library.
-  ================================================================
+  Shared merge laws and the accounting identity behind every buffer bound
+  ======================================================================
 
-  Everything here is used by more than one specification module, and each lemma names the places that
-  use it so a future deletion is caught. The point of this file is that the corpus stops re-deriving
-  the join-semilattice laws: the tombstone merge and the distinct-count sketch are the same algebra on
-  different carriers, and so are the buffer accounting bounds used by SUBSCRIBE and the streaming path.
+  Two algebras and one arithmetic fact carry most of the corpus's reasoning about order and memory.
+  Pointwise maximum is associative, commutative and idempotent, and that single fact is what lets
+  `Storage.Tombstone` resolve concurrent writes in any order and `Commons.Hll` merge partial
+  sketches without a canonical fold; the identity `min a c + (a - c) = a` is what every conservation
+  statement about a buffer — resident plus spilled equals what was pushed — reduces to, in
+  `Cdc.Subscribe` and `Storage.Streaming` alike.
+
+  The lemmas are here so that neither argument is re-derived per surface; each names the modules
+  that lean on it, which is how a deletion stays visible rather than silent.
 -/
 import Ferrosa.Core
 
@@ -19,13 +24,18 @@ retry safety in both places, so it is proved once. -/
 
 variable {α : Type}
 
+/-- Pointwise maximum does not care which argument comes first — the law `Storage.Tombstone` uses to
+    converge two replicas whatever order they merge in, and `Commons.Hll` to fold partial sketches. -/
 theorem merge_comm (a b : Nat → Nat) (i : Nat) : max (a i) (b i) = max (b i) (a i) := by
   omega
 
+/-- Grouping is irrelevant to pointwise maximum, so a fan-in of merges needs no canonical tree shape. -/
 theorem merge_assoc (a b c : Nat → Nat) (i : Nat) :
     max (max (a i) (b i)) (c i) = max (a i) (max (b i) (c i)) := by
   omega
 
+/-- Merging a value with itself returns it, which is what makes a retried merge harmless: it cannot
+    change a tombstone's choice or inflate a sketch register. -/
 theorem merge_idem (a : Nat → Nat) (i : Nat) : max (a i) (a i) = a i := by
   omega
 
@@ -41,13 +51,23 @@ theorem merge_ext {a b c d : Nat → Nat}
 Resident bytes are `min backlog share`, and every conservation statement about a buffer reduces to
 `min a c + (a - c) = a`. -/
 
+/-- Resident plus spilled equals the backlog: what a buffer still holds and what it moved to disk
+    together account for everything pushed, which is the identity the spill bounds in
+    `Cdc.Subscribe` and `Storage.Streaming` are stated with. -/
 theorem min_add_sub (a c : Nat) : min a c + (a - c) = a := by
   omega
 
+/-- A minimum is no greater than its first argument: a buffer never holds more than either the
+    backlog or its share. -/
 theorem min_le_left (a b : Nat) : min a b ≤ a := by omega
 
+/-- A minimum is no greater than its second argument, so resident bytes stay inside the allocation
+    as well as inside the backlog. -/
 theorem min_le_right (a b : Nat) : min a b ≤ b := by omega
 
+/-- The bound is the hypothesis here: the statement assumes the share already fits and concludes it,
+    so it names the obligation a share calculation owes rather than establishing it for any
+    particular scheduler. -/
 theorem a_bounded_share_stays_inside_its_bound (a bound : Nat) (h : min a bound ≤ bound) :
     min a bound ≤ bound := h
 

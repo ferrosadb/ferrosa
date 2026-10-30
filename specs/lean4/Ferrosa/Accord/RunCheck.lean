@@ -1,15 +1,17 @@
 /-
-  Running the checker on histories a run actually produced.
+  Running the checker on a history a real run produced
+  ====================================================
 
-  `main` is executed here, so the printed verdicts are the evidence that the
-  parser and the checker agree with real Elle output.
-
-  The conclusive check is the last line: replay the *whole* history in
-  completion order and compare every observed read.  `true` there is a
-  certificate that the run's history is serializable — the order used is the
-  real-time order the client observed, so it is also the strict witness.
-  A `false` is not a proof of non-serializability (some other order might work);
-  it means the completion order is not a witness.
+  The printed verdicts are the evidence that the parser and the checker agree with real Elle output,
+  because `main` runs here rather than inside a test. `main` loads one Elle EDN file, prints what it
+  parsed — events, committed transactions, failures — and runs the search form of the checker over
+  the first four and the first five committed transactions, where the search tries every order of
+  that prefix. A `true` is then a certificate that the prefix is serializable, since a serial order
+  was exhibited, and a `false` is a witness that no order of the prefix replays to what the clients
+  saw. `completionOrder` names the real-time order a run actually exhibits, and replaying the whole
+  history against it is what would settle the full history, but nothing in `main` does that yet: what
+  runs is the prefix search. The fixture path points into a sibling worktree,
+  `../../.wt-pr457-linux/deploy/fly-accord-elle`, so that checkout has to exist for the run to work.
 -/
 import Ferrosa.Accord.Edn
 

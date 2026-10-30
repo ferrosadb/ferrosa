@@ -3,26 +3,24 @@
   real-time order.
   ==========================================================================
 
-  Sources:
-    * `research/SPEC-accord-transactions.md` §7.1 (the deadline formula),
-      §7.3 (skew measurement).
-
-  Two things are kept apart, because the spec keeps them apart:
-
-  * the **deadline formula** is an engineering premise — it is sound only while
-    observed skew and latency stay inside their P99.9 / P99 estimates.  It is
-    modelled as `DeadlineSound`, and what is *proved* is its consequence;
-  * the **consequence** is dependency completeness for concurrent transactions:
-    if every conflicting lower-timestamp PreAccept has arrived before the
-    deadline, then processing τ after its deadline observes it, so γ ends up in
-    deps(τ).  That is exactly the `DepComplete` hypothesis of `Protocol.lean`,
-    for the case where γ is still in flight.
+  Strict serializability asks for one thing more than serializability: the serial order
+  has to agree with the order clients saw, so a transaction that completed before another
+  began cannot be placed after it.  Accord buys that agreement with a reorder buffer — a
+  replica waits out a transaction's deadline before processing it, so any conflicting
+  transaction stamped earlier has already arrived.  The deadline formula is an engineering
+  premise rather than a theorem: it holds only while measured skew and latency stay inside
+  the P99.9 and P99 estimates it is computed from, which is why the premise is named
+  (`DeadlineSound`) and kept apart from its consequence — dependency completeness for
+  transactions still in flight, which is the `DepComplete` hypothesis
+  `Accord/Protocol.lean` needs.  Losing the premise is observable in a run: a
+  lower-timestamped transaction that never reached the buffer means the deadline was set
+  from stale numbers, not that the argument failed.
 -/
 import Ferrosa.Accord.Protocol
 
 namespace Ferrosa.Accord
 
-/-! ## §7.1 the deadline formula -/
+/-! ## The deadline formula §7.1 sets the buffer's clock from -/
 
 /-- `Deadline(t0, C, P) = wall_clock(t0.time) + SkewMax + maxLat - Latency(C,P)`,
     transcribed.  All quantities are nanoseconds. -/
@@ -42,7 +40,7 @@ theorem deadline_monotone (t₁ t₂ skewMax maxLatency latencyCP : Nat) (h : t�
   unfold deadline
   omega
 
-/-! ## §7.1's guarantee, as a premise -/
+/-! ## The guarantee the formula rests on, stated as a premise rather than proved -/
 
 /-- "If skew and latency bounds are not exceeded, any conflicting transaction
     with `t0_γ < t0_τ` sent by any coordinator will arrive at P before
@@ -86,7 +84,7 @@ theorem missing_dependency_means_premise_failed (arrival dl t0 : TxnId → Nat)
     (γ τ : TxnId) (h : t0 γ < t0 τ) (hmiss : γ ∉ buffered τ) : False :=
   hmiss (deadline_yields_dependency arrival dl t0 buffered hsound hproc γ τ h)
 
-/-! ## Real-time order
+/-! ## Real-time order, and why a timestamp needs the buffer behind it
 
 Strict serializability additionally needs the serial (timestamp) order to agree
 with real time.  That is a property of timestamp *assignment*, not of the

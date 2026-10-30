@@ -1,25 +1,17 @@
 /-
-  Ferrosa formal specification — the bookkeeping a run must do, and what a generator can prove.
-  ==========================================================================================
+  The bookkeeping a run must do, and what a generator can prove
+  =============================================================
 
-  Jepsen's verdict is not only `valid?`: `check` also returns multisets (`:lost`, `:unexpected`,
-  `:recovered`, `:acknowledged`, `:attempt`, `:duplicated`). Those are where the failure mode the
-  product cares about actually shows up — *a user not getting all of their data silently* — and they
-  are the one part of the harness that is arithmetic rather than search, so they can be specified
-  exactly.
-
-  Three things are specified here:
-
-  1. **Multiset bookkeeping.** What `lost` and `unexpected` mean, and why they cannot cancel.
-  2. **Generators.** A generator decides what anomalies a green run can rule out. Two theorems say
-     so: a generator that never overlaps two operations cannot convict an ordering model, and a
-     generator that never writes cannot lose anything.
-  3. **Nemeses, at the level of the verdict rather than the injection.** A fault must be logged to be
-     attributable, and an acknowledgement before a crash is a durability promise while one after a
-     crash is not.
-
-  Fault *injection* is deliberately not modelled: it belongs to test time. What belongs here is what
-  the system promises given that a fault happened.
+  A user silently not getting all of their data is the failure the product forbids, and a pass/fail
+  verdict cannot express it — only the multiset arithmetic can. `lost` and `unexpected` are separate
+  multisets and they cannot cancel, because a run can lose one value and fabricate another, so
+  summing them into a single error count would hide a loss behind a fabrication. The verdict is a
+  function of the book and the profile: a run is only ever `confirmed` when the profile could have
+  seen every acknowledged write, and a missing value is excused only by a fault that was logged and
+  that fell before the acknowledgement. A generator is part of the claim too, since a generator that
+  never overlaps two operations cannot convict an ordering model and one that never writes cannot
+  test durability. One row is red: the endurance and alert paths summarise a verdict as pass/fail,
+  which is exactly the cancellation the multisets forbid.
 -/
 import Ferrosa.Core
 import Ferrosa.Ledger
@@ -44,6 +36,8 @@ def msSub : List Nat → List Nat → List Nat
 /-- Multiset inclusion. -/
 def msLe (a b : List Nat) : Bool := a.all (fun v => decide (cnt v a ≤ cnt v b))
 
+/-- A value's multiplicity in a concatenation is the sum of its multiplicities in the parts, which
+    is what lets the bookkeeping treat the order of a multiset as irrelevant. -/
 theorem cnt_append (v : Nat) (a b : List Nat) : cnt v (a ++ b) = cnt v a + cnt v b := by
   induction a with
   | nil => simp [cnt]
@@ -245,15 +239,19 @@ def excusesMissingWrite : CrashTime → Bool
   | .beforeAck => true
   | .afterAck => false
 
+/-- A crash after the acknowledgement excuses nothing, because the acknowledgement was the promise
+    to survive it; a crash before the acknowledgement is the only case that does. -/
 theorem an_ack_before_the_crash_is_a_durability_promise :
     excusesMissingWrite .afterAck = false
       ∧ excusesMissingWrite .beforeAck = true := by decide
 
 /-- **A fault that is not logged cannot be attributed**, so a red verdict with no fault log cannot
-    distinguish an anomaly from an injected failure. The verdict needs the log, not just the
+    distinguish an anomaly from an injected failure. The verdict needs the log, not only the
     history. -/
 def attributable (logged : Bool) (excused : Bool) : Bool := logged && !excused
 
+/-- An attribution needs both a fault log and a crash that preceded the acknowledgement: an
+    unlogged fault, or one that arrived after the promise, leaves the missing value unexplained. -/
 theorem a_missing_write_after_a_crash_is_only_excusable_if_the_crash_was_logged :
     attributable false false = false
       ∧ attributable true false = true
@@ -294,6 +292,8 @@ def ledger : List SpecItem := [
      "Histories.a_loss_and_a_fabrication_do_not_cancel"⟩
 ]
 
+/-- One red in this ledger, and it is the summary path: `check` returns the multisets, but a verdict
+    printed as pass/fail has already collapsed them. -/
 theorem histories_has_one_red_item : redCount ledger = 1 := by decide
 
 def main : IO Unit :=

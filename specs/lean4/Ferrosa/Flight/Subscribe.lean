@@ -1,15 +1,16 @@
 /-
-  Ferrosa formal specification — SUBSCRIBE on the Arrow Flight surface.
-  ===================================================================
+  Flight subscriptions: a gap is a frame, never an empty batch
+  ===========================================================
 
-  `ferrosa-flight/src/plan.rs` builds read tickets as token-range-scoped CQL: one `FlightEndpoint`
-  per ring token range, each ticket a bounded `SELECT`, fetched with `do_get`. A change stream has no
-  token range — it is a single ordered sequence per node — so the read ticket shape does not apply
-  to it, and the Flight surface needs its own ticket and its own gap encoding.
+  A Flight client that falls behind is handed a frame that says so — a `gap` naming the position
+  and the outstanding count, or a `reset` telling it to re-snapshot — so "you missed events"
+  cannot arrive encoded as "nothing changed". A subscription is one endpoint from one cursor, not
+  a token-range fan-out, because a change stream is a single ordered sequence and has no range to
+  split.
 
-  What must hold at this layer is the CDC rule restated in Arrow terms: a gap is never an empty
-  batch. An empty `RecordBatch` is the one encoding that would turn "you missed events" into "nothing
-  happened", and that is the silent-loss failure this whole area exists to prevent.
+  The surface does not exist yet. `plan.rs` builds token-range `SELECT` tickets and `do_get` has
+  no subscription path, so a Flight client cannot subscribe at all today; what is specified is the
+  ticket and gap encoding that path would need, and it is the same cursor `Cdc.Subscribe` reports.
 -/
 import Ferrosa.Core
 import Ferrosa.Ledger
@@ -67,6 +68,8 @@ theorem a_gap_is_never_an_empty_batch :
     layer therefore inherits the bounded bus rather than the scan's backpressure. -/
 def producerProgress (_clientDrainRate accepted : Nat) : Nat := accepted
 
+/-- A client's drain rate is not an argument to the producer's progress, so a slow `do_get`
+    consumer cannot throttle the write path the way a slow scan throttles only itself. -/
 theorem flight_backpressure_cannot_reach_the_writer (rate accepted : Nat) :
     producerProgress rate accepted = accepted := rfl
 
@@ -77,6 +80,9 @@ def resumeTicket (g : Gap) : Option Ticket :=
   | .resumable start _ => some (.stream true start)
   | .resetRequired => none
 
+/-- A resumable gap becomes the next stream ticket carrying the same cursor, and a reset becomes no
+    ticket at all, so the position `Cdc.Subscribe` reports is the position Flight's next `do_get`
+    asks from. -/
 theorem a_resumable_gap_becomes_the_next_ticket :
     resumeTicket (.resumable 7 3) = some (.stream true 7) ∧ resumeTicket .resetRequired = none := by
   decide
@@ -96,6 +102,9 @@ def ledger : List SpecItem := [
      "Flight.a_stream_ticket_is_not_a_range_select"⟩
 ]
 
+/-- The area records one unmet obligation — there is no stream ticket type and no subscription
+    `do_get` — and the count is pinned so that implementing it without updating the ledger fails
+    the build. -/
 theorem flight_has_one_red_item : redCount ledger = 1 := by decide
 
 def main : IO Unit :=

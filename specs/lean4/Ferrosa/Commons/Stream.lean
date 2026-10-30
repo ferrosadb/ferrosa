@@ -1,10 +1,15 @@
 /-
-  Ferrosa formal specification — a change stream's gap protocol, shared by every streaming surface.
-  ===================================================================================================
+  The gap protocol: a position to resume from, or an explicit reset
+  ==================================================================
 
-  A consumer that falls behind is told where to resume: either a resumable gap carrying a start and a
-  count, or an explicit reset. Both CQL's SUBSCRIBE and Flight's stream ticket speak this protocol, so
-  it is defined once here.
+  A consumer that falls behind is told one of two things, and never a bare count: the position to
+  replay from together with how many events are outstanding, or that it has fallen outside the
+  retention window and must re-snapshot. Every streaming surface speaks this protocol — CQL's
+  SUBSCRIBE, the Flight stream ticket, and `Cdc.Subscribe` — so the position a gap carries and the
+  position a ticket carries are the same number.
+
+  A cancellation is a position, not a loss: delivery reports where it stopped, and a later
+  subscription resumes there rather than from a re-query.
 -/
 import Ferrosa.Core
 import Ferrosa.Ledger

@@ -1,23 +1,19 @@
 /-
-  Ferrosa formal specification — the trusted base under the `unsafe` surface.
-  =========================================================================
+  The trusted base under the `unsafe` surface
+  ===========================================
 
-  Aeneas cannot translate `unsafe`: its entire argument is that the borrow checker already ruled out
-  aliasing, use-after-free and data races, and `unsafe` is precisely where that no longer holds. So
-  the IR bridge here is not Aeneas. It is:
-
-    * **Kani** (CBMC over MIR) — the only tool in reach that reasons about raw pointers, allocation
-      layouts and uninitialised memory, and it reasons about *this* code rather than a model. It is
-      bounded, so it proves the property for all inputs up to a bound, not for all inputs.
-    * **Miri** — runtime UB detection on executed paths; a green Miri run is evidence, never a proof.
-    * **This file** — the *specification* of each invariant, and the proof that the invariant is
-      sufficient: that the safe wrapper refines the abstract object **assuming** the invariant holds.
-
-  That last part is what a trusted base always looks like. Each `unsafe` cluster gets one invariant,
-  one abstract object, and theorems showing the wrapper is correct if the invariant holds. The audit
-  then has a precise question — "does the code establish `Inv`?" — instead of "is this unsafe OK?".
+  Aeneas cannot translate `unsafe`, because its whole argument is that the borrow checker already ruled
+  out aliasing, use-after-free and data races, so proving the `unsafe` surface needs a different story:
+  Kani over MIR, which is the only reachable tool that reasons about raw pointers, allocation layouts
+  and uninitialised memory in the code as written, and is bounded, so it proves each property only up
+  to a bound; Miri, which detects UB on executed paths and is evidence rather than proof; and this
+  specification. Each unsafe cluster gets one invariant, one abstract object, and the theorems showing
+  the safe wrapper refines that object assuming the invariant holds, which turns the audit into one
+  precise question — does the code establish the invariant? — instead of "is this unsafe OK?".
   `docs/unsafe-proof-plan.md` maps every site in `docs/unsafe-ledger.md` to one of these predicates and
-  to the tool that can discharge it.
+  to the tool that can discharge it. Three rows are red, and they are the trusted base's whole gap: no
+  Kani integration exists, nothing prevents a truncate-while-mapped, and no separation-logic route to
+  `unsafe` is available in this toolchain, so review covers what the tools cannot.
 -/
 import Ferrosa.Core
 import Ferrosa.Ledger
@@ -151,6 +147,8 @@ def outParam : Syscall → Option Nat
     branch on the return code before touching the buffer. -/
 theorem a_failed_syscall_has_no_out_parameter : outParam (.failed 22) = none := by rfl
 
+/-- An out-parameter is readable exactly when the call succeeded, so branching on the return code
+    before touching the buffer is what makes the read defined rather than undefined. -/
 theorem checking_the_return_code_is_what_makes_the_read_defined :
     (outParam (.ok 1024)).isSome = true ∧ (outParam (.failed 22)).isSome = false := by decide
 
@@ -240,6 +238,8 @@ def ledger : List SpecItem := [
      "Unsafe.a_reference_used_past_its_owner_is_invalid"⟩
 ]
 
+/-- Three reds, and between them they are the trusted base's whole gap: no Kani integration, the
+    truncation contract stated but not enforced, and no separation-logic route to `unsafe`. -/
 theorem unsafe_has_three_red_items : redCount ledger = 3 := by decide
 
 def main : IO Unit :=

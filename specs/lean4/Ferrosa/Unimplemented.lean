@@ -1,35 +1,19 @@
 /-
-  Unimplemented: not there yet.
-  =============================
+  What is not proved, and which kind of not-proved it is
+  ======================================================
 
-  The ledgers say a property is not proved. That is one word for several situations, and only one
-  of them is a red (see `Ferrosa/Broken.lean`). This file holds the rest:
-
-    unimplemented   no code, no format field, no plan node. Build it.
-    requirement     no implementation can meet it as written. Narrow the requirement.
-    proof           the behaviour may well be right; the proof is missing.
-    measurement     the claim needs evidence, not a proof. Build the harness.
-    inherited       a third-party protocol decides it. Document, do not fix.
-    undecided       blocked on a design choice nobody has made yet.
-    closed          was listed as red, has since been implemented.
-
-  ## How the accounting is checked
-
-  A row does not describe the ledger item it classifies in prose. It *names* it: `ledger` is the
-  module key of the area ledger and `item` is the exact `SpecItem.name` in that ledger. The area
-  ledgers themselves are enumerated exactly once, in `areas` below; that one list is what the
-  runner prints and what `ledgerTotal` sums, so a ledger cannot be printed without being counted or
-  counted without being printed. Against that:
-
-    every_row_names_a_red_item            every row resolves to an item that exists and is red;
-    every_red_is_classified_exactly_once  every red item in every registered ledger is named by
-                                          exactly one row — no red unclassified, none double-counted;
-    per_area_counts                       each area's row count is that area's red count;
-    rows_are_the_ledger_reds              the totals agree.
-
-  Rows that were red when they were written and are discharged now are not deleted: they live in
-  `discharged`, and `discharged_rows_name_met_items` proves each one still names a real ledger item
-  whose status is `.met`.
+  A ledger entry that says a property is not proved is one word for several situations, and only the
+  first is a defect: no code path at all, a requirement no implementation can meet as written, a
+  missing proof of behaviour that may well be right, a claim that needs measurement rather than a
+  theorem, a third-party protocol's decision, a design nobody has settled yet, and a claim that has
+  since been discharged. The classification is machine-checked rather than asserted: a row names an
+  exact ledger item instead of describing one, every row's item exists and is red, every red item of
+  every registered ledger is named by exactly one row, and each area's row count equals its red count,
+  so the totals agree as a consequence rather than a coincidence. The area ledgers are enumerated once,
+  in `areas`, and that single list is both what prints and what `ledgerTotal` sums, so a ledger cannot
+  print without being counted or be counted without printing. Rows that were red when written and are
+  discharged now are kept in `discharged` rather than deleted, because deleting a row is how a count
+  stays balanced while the bookkeeping goes wrong.
 -/
 import Ferrosa.Ledger
 import Ferrosa.Commons.Hll
@@ -149,6 +133,8 @@ theorem registered_ledger_count : areas.length = 21 := by decide
     There is no literal term here. -/
 def ledgerTotal : Nat := (areas.map fun a => redCount a.ledger).sum
 
+/-- The corpus total is by definition the sum of the registered ledgers' red counts; there is no
+    literal term anywhere that could fall out of step with the ledgers it counts. -/
 theorem ledgerTotal_is_the_registry_sum :
     ledgerTotal = (areas.map fun a => redCount a.ledger).sum := rfl
 
@@ -394,13 +380,15 @@ theorem every_ledger_item_is_classified :
     Ferrosa.Broken.broken.length + unimplemented.length + nonDefects.length = ledgerTotal := by
   native_decide
 
+/-- Thirty-seven items have no code path yet, and the count is pinned so a row cannot disappear
+    between commits without this failing. -/
 theorem unimplemented_has_the_right_length : unimplemented.length = 37 := by native_decide
 
 /-- Seven, not eight: two rows were discharged into the ledger itself (see `discharged`), and one
     new row records the refuted constant-probe claim in the MVCC ledger. -/
 theorem twelve_are_not_defects : nonDefects.length = 7 := by native_decide
 
-/-- **Live defects now outnumber everything else.**  Thirteen reds against twelve requirements,
+/-- **Live defects now outnumber everything else.**  Fifteen reds against seven requirements,
     proofs, measurements, inherited protocol behaviour and closures. This theorem had the opposite
     direction until the memory specs found three more: the closer the specs get to the code, the
     more of it turns out to be shipping something that is not true. -/

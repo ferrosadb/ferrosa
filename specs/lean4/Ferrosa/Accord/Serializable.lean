@@ -2,23 +2,21 @@
   Ferrosa formal specification — Accord, part 2: serializability, executable.
   ===========================================================================
 
-  Two predicates, matching what Jepsen/Elle actually check:
-
-  * `Serializable`      — some total order of the committed transactions replays
-                          to exactly the observed read results;
-  * `StrictlySerializable` — that order also respects real time.
-
-  Both are decidable by search over permutations, so a history can be *run*
-  through the definition with `#eval`.  `permutations` is factorial, so the
-  executable form is intended for the sizes Jepsen histories are checked at
-  (tens of transactions with a fixed order supplied, or a handful when
-  searching); the protocol proofs never search — they exhibit the order.
+  Serializability here is a search, not an opinion: a history is serializable when some
+  total order of its committed transactions replays from the empty database and reproduces
+  every read result the client observed, and strictly serializable when that order also
+  respects real time.  Both predicates are decidable, so a history a run actually produced
+  can be replayed and judged, and the five hand-written histories at the end of the module
+  are the small cases that name what the checker accepts and what it rejects — a stale
+  read, a phantom value, an transaction that failed to see its own append.  The search is
+  factorial in the number of transactions, which suits checking a Jepsen history of tens of
+  transactions; the protocol proofs never search, they exhibit the order.
 -/
 import Ferrosa.Accord.History
 
 namespace Ferrosa.Accord
 
-/-! ## Lists of transactions, indexed -/
+/-! ## Indexing a transaction list by position -/
 
 def idxFrom : Nat → List TxnId → List (Nat × TxnId)
   | _, [] => []
@@ -27,7 +25,7 @@ def idxFrom : Nat → List TxnId → List (Nat × TxnId)
 def findTxn (txns : List TxnRec) (id : TxnId) : Option TxnRec :=
   txns.find? (fun r => r.id == id)
 
-/-! ## Replaying an order -/
+/-! ## Replaying a candidate order, and rejecting a history that names a transaction it never ran -/
 
 /-- Replay `order` from the empty database; every transaction's observed read
     results must match.  `false` on a dangling id, which keeps the checker
@@ -52,7 +50,7 @@ def coversAll (txns : List TxnRec) (order : List TxnId) : Bool :=
 def serializableBy (txns : List TxnRec) (order : List TxnId) : Bool :=
   coversAll txns order && orderOk txns order
 
-/-! ## Real time -/
+/-! ## Real time, as the condition that separates strict from plain -/
 
 /-- The strict-serializability side condition: for `a` earlier than `b` in the
     order, `b` must not have completed before `a` was invoked. -/
@@ -153,9 +151,14 @@ def hReadYourWritesBroken : History := ⟨[
   invEv 0 1 [.append 0 1, .read 0] 0,
   okEv 0 1 [.append 0 1, .read 0] [[]] 0 10]⟩
 
-/-! ### The demos -/
+/-! ### Five small histories, each naming the property it demonstrates -/
 
+/-- A write followed by a read that observes it is strictly serializable: the order
+    that runs the write first reproduces the read and respects the clock. -/
 theorem hFreshRead_strict : strictlySerializableB hFreshRead = true := by native_decide
+
+/-- The same history in the `Prop` form, witnessed by the order that runs the write
+    before the read. -/
 theorem hFreshRead_serial : Serializable hFreshRead := ⟨[1, 2], by native_decide⟩
 
 /-- **Serializable but not strictly serializable** — one theorem, two facts. -/
@@ -163,10 +166,20 @@ theorem hStaleRead_serial_but_not_strict :
     serializableB hStaleRead = true ∧ strictlySerializableB hStaleRead = false := by
   native_decide
 
+/-- **Red: a read of a value nothing ever wrote is not serializable in any order.**
+    The transaction returns `9` from a key no transaction appended to, so no replay
+    from the empty database reproduces it — the shape a phantom or a lost write takes
+    when it reaches a client. -/
 theorem hPhantom_not_serializable : serializableB hPhantom = false := by native_decide
 
+/-- A transaction whose read observes its own earlier append is strictly serializable:
+    the checker applies the transaction's ops in order, so read-your-writes is part of
+    atomicity rather than a separate guarantee. -/
 theorem hReadYourWrites_ok : strictlySerializableB hReadYourWrites = true := by native_decide
 
+/-- **Red: and the same transaction observed not seeing its own append is rejected.**
+    An atomic transaction cannot read a state that excludes its own write, so the
+    history has no serial order at all. -/
 theorem hReadYourWritesBroken_rejected :
     serializableB hReadYourWritesBroken = false := by native_decide
 

@@ -1,34 +1,24 @@
 /-
   Ferrosa formal specification — Accord, part 3: the apply layer and its safety.
-  ====================================================================
+  ============================================================================
 
-  Sources:
-    * `research/SPEC-accord-transactions.md` §4.5 (Apply is dep-gated),
-      §6.3 (dependency completeness).
-    * `specs/decisions/021-write-path-accord-replica-boundary.md`.
-
-  The claim this file is built around:
-
-  **If every transaction's dependency set contains every conflicting
-  transaction with a lower timestamp, then every apply interleaving the
-  replicas are allowed to run yields a serializable history, with the serial
-  order being timestamp order.**
-
-  Two things are deliberately separated:
-
-    `DepComplete` — §6.3's property.  It is the hypothesis of the theorem and a
-                    *refutable* property of a concrete run; `Recovery.lean`
-                    exhibits a run that violates it and the resulting
-                    unserializable history.
-    `LogOk`       — §4.5's apply guard, carried as a certificate so the safety
-                    argument is independent of the consensus layer that
-                    produced the log.
+  If every transaction's dependency set contains every conflicting transaction with a
+  lower timestamp, then every apply interleaving the replicas are allowed to run yields a
+  serializable history, and the serial order is timestamp order.  That is what a client
+  writing a multi-key Accord transaction is buying, and the premise is load-bearing rather
+  than decorative: `DepComplete` is a refutable property of a concrete run, and
+  `Accord/Recovery.lean` exhibits a run that violates it together with the unserializable
+  history that follows.  The apply guard itself — dep-wait before §4.5's apply — is
+  carried as a certificate, so the safety argument stands whatever consensus layer
+  produced the log.  The enumerator at the end checks the claim over every ordering of a
+  three-transaction cluster the guard permits, including the orderings where apply order
+  and timestamp order differ.
 -/
 import Ferrosa.Accord.Serializable
 
 namespace Ferrosa.Accord
 
-/-! ## A replica's applied state -/
+/-! ## What a replica has applied, and what it hands back to a client -/
 
 /-- The durable transaction state of one replica (§3.2): the apply log, the
     keyspace, and the read results handed back to clients. -/
@@ -57,7 +47,7 @@ def Replica.apply (txns : List Txn) (r : Replica) (τ : TxnId) : Replica :=
 def depWait (pos : TxnId → Nat) (deps : TxnId → List TxnId) (r : Replica) (τ : TxnId) : Bool :=
   (deps τ).all (fun γ => !(decide (pos γ < pos τ)) || r.applied.contains γ)
 
-/-! ## The certificate -/
+/-! ## The certificate a dep-respecting log carries -/
 
 /-- A sequence of applies that respected dep-wait at every step. -/
 inductive LogOk (txns : List Txn) (pos : TxnId → Nat) (deps : TxnId → List TxnId) :
@@ -83,9 +73,13 @@ def foldTxnsFrom (s : State) (txns : List Txn) : List TxnId → State
 
 def foldTxns (txns : List Txn) (l : List TxnId) : State := foldTxnsFrom State.empty txns l
 
+/-- Applying a transaction folds its ops into the replica's keyspace, in order, so an
+    earlier op in the same transaction is visible to a later one. -/
 theorem Replica.apply_store (txns : List Txn) (r : Replica) (τ : TxnId) :
     (r.apply txns τ).store = r.store.runOps (txnOf txns τ).ops := rfl
 
+/-- Applying a transaction appends its id to the apply log and touches nothing that
+    was already there, which is what later dep-waits read. -/
 theorem Replica.apply_log (txns : List Txn) (r : Replica) (τ : TxnId) :
     (r.apply txns τ).applied = r.applied ++ [τ] := rfl
 
@@ -104,7 +98,7 @@ theorem run_log_eq_fold (txns : List Txn) (l : List TxnId) :
     (l.foldl (fun r τ => r.apply txns τ) Replica.init).store = foldTxns txns l :=
   foldl_apply_store txns Replica.init l
 
-/-! ## Dependency completeness -/
+/-! ## Dependency completeness, the premise the safety argument stands on -/
 
 /-- §6.3: every conflicting transaction with a lower timestamp is a dependency. -/
 def DepComplete (txns : List Txn) (pos : TxnId → Nat) (deps : TxnId → List TxnId)
@@ -112,12 +106,14 @@ def DepComplete (txns : List Txn) (pos : TxnId → Nat) (deps : TxnId → List T
   ∀ δ τ, δ ∈ committed → τ ∈ committed → δ ≠ τ →
     (txnOf txns δ).conflicts (txnOf txns τ) = true → pos δ < pos τ → δ ∈ deps τ
 
-/-! ## Order in the log -/
+/-! ## Order in the log, and the decomposition `Before` is defined over -/
 
 /-- `x` occurs before `y` in `l`. -/
 def Before (l : List TxnId) (x y : TxnId) : Prop :=
   ∃ a b, l = a ++ x :: b ∧ y ∈ b
 
+/-- Any element of a list splits it as `a ++ x :: b`, the decomposition `Before` is
+    defined over.  Nothing about position: the split is the witness. -/
 theorem mem_iff_append {α : Type} {x : α} : ∀ {l : List α}, x ∈ l → ∃ a b, l = a ++ x :: b
   | [], h => by simp at h
   | y :: ys, h => by
@@ -126,6 +122,9 @@ theorem mem_iff_append {α : Type} {x : α} : ∀ {l : List α}, x ∈ l → ∃
       · obtain ⟨a, b, hab⟩ := mem_iff_append h'
         exact ⟨y :: a, b, by simp [hab]⟩
 
+/-- Appending a transaction to a log leaves the relative order of the transactions
+    already in it alone, so an order once established cannot be disturbed by a late
+    arrival. -/
 theorem before_append_singleton {l : List TxnId} {x y z : TxnId} (h : Before l x y) :
     Before (l ++ [z]) x y := by
   obtain ⟨a, b, hab, hy⟩ := h

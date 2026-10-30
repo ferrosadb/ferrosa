@@ -1,31 +1,21 @@
 /-
-  Ferrosa formal specification — CQL front end, part 5: the Cell/State refinement.
-  ==============================================================================
+  Ferrosa formal specification — CQL front end, part 5: one system at two
+  resolutions.
+  ======================================================================
 
-  `Lwt.lean` proves the CAS algebra on a scalar register (`Cell = Key → Option Val`)
-  and exhibits the anomaly on the append-list keyspace (`State = Key → List Val`)
-  that `Accord.Serializable` speaks.  This file closes the gap between the two, so
-  that "the CAS guarantee" and "the history is serializable" are statements about
-  one system rather than two parallel ones.
+  The compare-and-set guarantee is proved on a scalar register, where each key
+  holds one value, while the serializability check speaks about a keyspace in which
+  each key holds the list of everything appended to it. A cell is what is left when
+  only the last element of each list is kept, and the two are the same system seen at
+  two resolutions — so a statement about a value and a statement about a history are
+  statements about one implementation.
 
-  The bridge is an **abstraction function**, not an equality: a cell is what you see
-  when you look only at the *last* element of each key's list.  Appending therefore
-  does not commute with encoding — the list keeps history the cell forgets — but it
-  does commute with decoding.  The relation is `Simulates s c` ("`s`'s last values are
-  `c`"), and the content of this file is:
-
-    * `encode`/`decode` are a section and a retraction, so a cell is recoverable
-      from a state and the abstraction is well defined (`decode_unique`);
-    * `simulates_append` — the keyspace transition refines the cell transition,
-      which is what makes this a *refinement* rather than a restatement;
-    * `lwt_refines` — a whole LWT (condition test, then conditional append)
-      refines its cell-level execution, in both branches.
-
-  Naming: the structure `Lwt` lives inside the namespace `Ferrosa.Cql.Lwt`, so its
-  full name is `Ferrosa.Cql.Lwt.Lwt` and its methods are `…Lwt.Lwt.cond` and
-  `…Lwt.Lwt.execute`.  The `LCell`/`LWT` abbreviations and the
-  `cellSet`/`lwtCond`/`lwtExec` wrappers keep the statements below readable without
-  hiding which function is meant — each wrapper is `rfl`-equal to the original.
+  Appending does not commute with that reading, because the list keeps history the
+  cell forgets: two different lists are the same cell. The transition does commute
+  — appending `v` at a key is setting that key to `v` and leaving the others alone —
+  which is what makes the correspondence a refinement rather than a restatement. A
+  whole conditional write refines its scalar execution in both branches: applied, or
+  rejected with the keyspace unchanged.
 -/
 import Ferrosa.Cql.Lwt
 
@@ -77,10 +67,14 @@ def encode (c : LCell) : State :=
 /-- Read a cell out of a keyspace. -/
 def decode (s : State) : LCell := fun k => State.last s k
 
+/-- Encoding a cell that holds nothing at a key gives a keyspace whose list for that
+    key is empty, so its last value is nothing. -/
 theorem last_encode_none (c : LCell) (k : Key) (h : c k = none) :
     State.last (encode c) k = none := by
   simp [encode, State.last, h]
 
+/-- Encoding a cell that holds `v` at a key gives a keyspace whose last value at that
+    key is `v`. -/
 theorem last_encode_some (c : LCell) (k : Key) (v : Val) (h : c k = some v) :
     State.last (encode c) k = some v := by
   simp [encode, State.last, h]

@@ -1,37 +1,16 @@
 /-
-  Ferrosa formal specification — storage, part 1: crash recovery, replay semantics,
-  and corruption handling.
-  =====================================================================
+  Crash recovery: what a crash takes, what replay detects, and what it cannot
+  ========================================================================
 
-  Grounded in the actual on-disk format (`ferrosa-storage/src/commitlog/mutation.rs`):
+  An acknowledged write is lost only in a mode the operator chose: with a sync per ack the durable
+  prefix always covers every ack, and under periodic sync a crash between the ack and the fsync
+  loses a write the client was told had succeeded. Truncation is detectable because every field
+  carries a length; a bit flip inside a payload is not, because the record has no checksum, so a
+  corrupted record parses and the divergence is silent.
 
-  ```text
-  Mutation: mutation_id:[u8;16] | keyspace_len:u16 | keyspace | table_len:u16 | table
-          | key_len:u16 | key_bytes | token:i64 | timestamp:i64
-          | row_count:u16 | rows...
-  ```
-
-  Four facts about that layout decide everything in this file:
-
-    1. **There is no checksum.** The format is self-describing (lengths everywhere), so
-       truncation is detectable — a declared length that runs past the file — but a bit
-       flip inside a payload is not detectable at all. That is `no_checksum_detects_only_
-       truncation`, and it is the reason `quarantine` cannot be a substitute for a CRC.
-    2. **`mutation_id` is the only dedup key**, and the code states that a zero id "is
-       **never** used for deduplication — mutations with a zero id are always re-applied
-       on replay". Legacy segments and any producer that leaves the id zero therefore
-       replay non-idempotently; `zero_id_replay_duplicates_a_nonidempotent_mutation`.
-    3. **The sync strategy is configurable** (`Batch` / `Periodic` / `Group`), so
-       "acknowledged survives a crash" is a *conditional* property, not a property:
-       `acked_survives_crash` has an explicit premise and `periodic_sync_loses_acked_writes`
-       is the refutation of the unconditional version.
-    4. **A torn tail misaligns the stream**, so a reader that skips a bad record and keeps
-       parsing is reading whatever bytes follow — not later records. `stop_replays_a_prefix`
-       is the safety property, and `skip_does_not_replay_a_prefix` is what skipping costs.
-
-  The model is deliberately small: a mutation is one cell write, and a keyspace is
-  `Key → Option Val`. What is being specified is the *ordering and detection* argument,
-  not the row format.
+  Replay stops at the first record that does not parse rather than skipping it — the bytes after a
+  torn write are the tail of that record, not later records — and a `mutation_id` of zero is never
+  deduplicated, so a legacy segment holding a counter applies it twice.
 -/
 import Ferrosa.Ledger
 
@@ -78,6 +57,8 @@ theorem put_is_idempotent (s : KS) (k : Key) (v : Val) :
   funext j
   by_cases hj : j = k <;> simp [Mut.apply, hj]
 
+/-- Deleting the same key twice leaves the same keyspace as deleting it once, so a replayed delete
+    costs a client nothing even when the dedup key is missing. -/
 theorem del_is_idempotent (s : KS) (k : Key) :
     Mut.apply (Mut.apply s (.del k)) (.del k) = Mut.apply s (.del k) := by
   funext j
@@ -252,6 +233,9 @@ theorem nonzero_id_is_deduped : (⟨7, .inc 0, 16, 16, none⟩ : Rec).deduped = 
 The semantics the other nodes rely on: the same durable log, replayed, gives the same
 state. This is what lets two replicas that crash at different times converge. -/
 
+/-- Replay is a function of the mutation list alone, so two runs from the same starting state agree —
+    but the statement names the same term on both sides, so it fixes the shape the other nodes rely
+    on rather than saying anything about two nodes that read different bytes. -/
 theorem recovery_is_deterministic (ms : List Mut) :
     replayFrom (fun _ => none) ms = replayFrom (fun _ => none) ms := rfl
 
@@ -330,6 +314,9 @@ def ledger : List SpecItem := [
      "Recovery.only_quarantine_preserves_data"⟩
 ]
 
+/-- Three obligations here are recorded red: a payload checksum, idempotent replay, and a quarantine
+    action the engine actually models. The count is pinned so that one cannot be closed without the
+    ledger moving with it. -/
 theorem recovery_has_three_red_items : redCount ledger = 3 := by decide
 
 def main : IO Unit :=

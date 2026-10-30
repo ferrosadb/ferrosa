@@ -1,14 +1,16 @@
 /-
-  Ferrosa formal specification — what belongs in commons.
-  ======================================================
+  What the five front ends duplicate, and which module should own each piece
+  ==========================================================================
 
-  The front ends (CQL, SQL/Postgres, Bolt, SPARQL, Flight) were specified separately, and the exercise
-  showed the same twelve concerns appearing in each with different names and slightly different rules.
-  Each entry below is duplicated today, names the code sites that duplicate it, and names the commons
-  module that should own it. The theorems at the bottom are the machine-checked part: every target is
-  shared by at least two front ends, which is the test for belonging in commons at all.
+  The same twelve concerns are specified once per surface today — a value system, three-valued
+  truth, a logical plan, parameter binding, an error taxonomy, stream and gap handling,
+  backpressure, consistency levels, aggregate merges, wire framing, reader liveness, and the merge
+  laws under all of them — under different names and with slightly different rules. Each entry names
+  the code sites that duplicate it and the commons module that should own it, so a unification has an
+  inventory rather than an opinion.
 
-  A target that a single front end owns is not listed — it stays where it is.
+  The test for belonging in commons is stated as a theorem: an entry is listed only when at least
+  two front ends need it, and a single surface's concern stays where it is.
 -/
 import Ferrosa.Core
 

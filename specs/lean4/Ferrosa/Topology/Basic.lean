@@ -1,16 +1,15 @@
 /-
-  Ferrosa formal specification — topology primitives.
-  ===================================================
+  Placement as data: one shape for every rung of the failure ladder
+  ================================================================
 
-  Shared vocabulary for the escalation ladder:
+  Each rung a deployment can be on — a single node, a pair, three nodes at replication factor 2, five
+  at quorum, two datacenters joined by one WAN link — is described by the same four pieces of data,
+  so a claim about availability is a claim about a `Topo` and nothing else. Admission is computed from
+  that data rather than asserted: a request is served when the live replicas reach `blockFor rf`, and
+  refused when they do not.
 
-      Single → Pair → 3-node RF=2 → 5-node RF=quorum
-             → 2 DCs (one WAN link) → 3 DC ring
-
-  A rung is a `Topo`: a finite node set, a replication factor, a DC map, and a
-  per-key replica list.  Everything else — quorum admission, local quorum,
-  "can a read miss a write" — is computed from that data, so each rung's claims
-  can be checked with `decide` and are reviewable as a table.
+  The Boolean mirrors and the failure-pattern enumerations exist so that each rung's claims can be
+  checked by `decide` over every failure shape rather than argued one case at a time.
 -/
 import Ferrosa.Core
 
@@ -94,6 +93,9 @@ def singleFailures (n : Nat) : List (List Node) := [] :: (List.range n).map (fun
 def Topo.okAtB (t : Topo) (down : Down) (key : Node) (cl : ConsistencyLevel) : Bool :=
   Nat.ble (blockFor cl t.rf) (t.ackCount down key)
 
+/-- The Boolean admission test agrees with the propositional one for every placement, failure
+    pattern and consistency level, so an answer obtained by enumerating failures is an answer about
+    the predicate and not a separate rule that could drift from it. -/
 theorem Topo.okAtB_iff {t : Topo} {down : Down} {key : Node} {cl : ConsistencyLevel} :
     t.okAtB down key cl = true ↔ t.okAt down key cl := by
   simp [Topo.okAtB, Topo.okAt, Nat.ble_eq]
@@ -104,6 +106,8 @@ def Topo.localOkAtB (t : Topo) (down : Down) (dc : Nat) (key : Node)
   Nat.ble (blockForDc cl dcRf)
     ((t.localReplicas dc key).filter (fun i => !(down i))).length
 
+/-- The same agreement for the per-datacenter gate, so a failure pattern enumerated for a `LOCAL_*`
+    level answers the question `localOkAt` asks. -/
 theorem Topo.localOkAtB_iff {t : Topo} {down : Down} {dc : Nat} {key : Node}
     {cl : ConsistencyLevel} {dcRf : Nat} :
     t.localOkAtB down dc key cl dcRf = true ↔ t.localOkAt down dc key cl dcRf := by

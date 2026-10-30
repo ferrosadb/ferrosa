@@ -1,18 +1,19 @@
 /-
-  Ferrosa formal specification — SUBSCRIBE on the CQL surface.
+  Ferrosa formal specification — `SUBSCRIBE` on the CQL surface.
   ==========================================================
 
-  `ferrosa-cql/src/parser.rs::parse_subscribe` accepts three shapes, and they are not three spellings
-  of one thing:
+  A `SUBSCRIBE` is one of three things and they do not make the same promise: with
+  no `ON` clause it polls a snapshot, `ON LOCAL` follows the changes written to one
+  node, and `ON COMMITTED` follows the changes committed to the cluster. A client
+  choosing between them is choosing what it is allowed to miss, not how the rows
+  are delivered.
 
-    * `SUBSCRIBE <SELECT ...>`              — a polled snapshot. `SubscribeStreams::Snapshot`.
-    * `SUBSCRIBE <SELECT ...> ON LOCAL`    — the `WrittenOnNode` change stream.
-    * `SUBSCRIBE <SELECT ...> ON COMMITTED`— the `CommittedToCluster` change stream.
-    * `... WITH INTERVAL <ms>`             — snapshot polling period, floored at 500ms.
-
-  The distinction that matters to a client is not delivery mechanism but what can be *missed*: a
-  snapshot is always current and can miss every intermediate state, while a change stream delivers
-  every state and can lag. Those are different guarantees and the spec states both.
+  A snapshot is always current and can miss every state in between two polls,
+  because the values in between were overwritten before it looked; a change stream
+  delivers every state and can fall behind, which is the one case where the client
+  is told a gap happened. Polling also has a floor — a period under 500 ms is
+  rejected — so the read amplification of snapshot mode is bounded by the protocol
+  rather than by client restraint.
 -/
 import Ferrosa.Core
 import Ferrosa.Ledger
@@ -33,6 +34,9 @@ inductive Mode where
     snapshot cannot lose an event. -/
 def defaultMode : Mode := .snapshot 1000
 
+/-- A `SUBSCRIBE` that names no `ON` clause polls a snapshot once a second, so a
+    client that says nothing gets the mode that cannot lose an event to a lagging
+    stream. -/
 theorem the_default_subscribe_mode_is_a_polled_snapshot : defaultMode = .snapshot 1000 := rfl
 
 /-- `parse_subscribe` rejects a tighter period than this. -/
@@ -68,6 +72,8 @@ def modeCanLag : Mode → Bool
   | .snapshot _ => false
   | .cdc _ _ => true
 
+/-- Only the two change-stream shapes can report a gap: a snapshot re-reads instead,
+    so falling behind costs it nothing it has to tell the client about. -/
 theorem only_the_stream_modes_can_report_a_gap :
     modeCanLag (.snapshot 1000) = false ∧ modeCanLag (.cdc true true) = true := by decide
 
@@ -84,6 +90,8 @@ def ledger : List SpecItem := [
    .met "Subscribe.only_the_stream_modes_can_report_a_gap"⟩
 ]
 
+/-- All five `SUBSCRIBE` obligations in the ledger are discharged, so none of them is
+    a gap a client has to be warned about. -/
 theorem cql_subscribe_has_no_red_items : redCount ledger = 0 := by decide
 
 def main : IO Unit :=

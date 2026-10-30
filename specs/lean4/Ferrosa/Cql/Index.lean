@@ -2,33 +2,19 @@
   Ferrosa formal specification — CQL front end, part 7: secondary indexes.
   =====================================================================
 
-  A secondary index is a *derived* view, and it is maintained by a background build
-  over SSTables rather than inside the row write (`ferrosa-storage/src/index/`:
-  `scheduler`, `tracker`, `remote_backend`).  That makes index reads subject to a
-  readiness question the row path does not have, and the coordinator's answer is
-  `select_index_ready_replicas` (`ferrosa-cluster/src/coordinator/read.rs:51`), whose
-  own doc comment says:
+  A secondary index is built in the background rather than inside the row write, so
+  an indexed read carries a readiness question the row path does not. The
+  coordinator answers it by reordering replicas — those whose build has finished go
+  first — and returns all of them: a replica still building the index is preferred
+  against, never excluded, and nothing in the response tells the client the answer
+  may be incomplete.
 
-      "Reorder replicas so that nodes with [`IndexNodeStatus::Ready`] ... come
-       first. ... Returns all replicas (never filters)."
-
-  So the function is a **preference**, not a guarantee, and this file says exactly
-  that in machine-checked form:
-
-    * `reorder_never_filters` — the selection has the same members as the replica
-      set, so a replica building the index is still eligible to serve the query;
-    * `ready_replicas_come_first` — the preference is real, just not a filter;
-    * `preference_is_not_completeness` — there are replica sets where the selection
-      returns exactly the input and nothing is ready, which is the "all building"
-      case the Rust test `select_index_ready_replicas_all_building_returns_all`
-      pins down;
-    * `indexed_read_can_be_stale` — a read served this way can miss a row that a
-      preceding committed write put there, and that history is not serializable.
-
-  Index *entries*, once built, are keyed by `(value, primary key)`, so maintaining
-  them is a set operation — commutative and idempotent (`index_entries_commute`,
-  reusing the collections model), which is why index maintenance is not itself a
-  lost-update hazard.  The hazard is the lag, not the merge.
+  That makes readiness a correctness premise rather than a performance hint. A
+  committed write followed by an indexed read that does not find it has no serial
+  explanation, and the replica is the one the coordinator chose, so a client can be
+  handed a stale answer with no error. Index entries themselves are keyed by value
+  and primary key, which makes maintaining them a set operation — adding two of
+  them commutes, so the hazard is the lag and not the merge.
 -/
 import Ferrosa.Cql.Collections
 import Ferrosa.Accord.Serializable
@@ -103,7 +89,7 @@ theorem all_ready_is_complete (replicas : List Node) :
   unfold Complete selectIndexReady
   simp [List.filter]
 
-/-! ## The history this admits -/
+/-! ## The history this ordering admits, and the one it does not -/
 
 /-- A row is committed, and then an indexed read on a replica whose index is still
     building does not find it.  `k = 0` was written (`append 0 7`) and the read that
@@ -129,6 +115,8 @@ def hIndexedFresh : History := ⟨[
   invEv 1 2 [.read 0] 20,
   okEv 1 2 [.read 0] [[7]] 20 30]⟩
 
+/-- The same history with the row visible to the indexed read serializes, so it is
+    the staleness and not the index that the checker rejects. -/
 theorem indexed_read_when_fresh_is_serializable : strictlySerializableB hIndexedFresh = true := by
   native_decide
 
@@ -149,6 +137,9 @@ theorem index_entries_commute (s : Collections.SetVal) (a b : Val) :
 def setRemove (s : Collections.SetVal) (v : Val) : Collections.SetVal :=
   fun w => s w && !(w == v)
 
+/-- A removal does not commute with an add of the same value: adding then removing
+    clears the entry, while removing then adding leaves it present. Deleting an index
+    entry is therefore a read-modify-write, not a set merge. -/
 theorem setRemove_not_comm_with_add :
     ∃ (s : Collections.SetVal) (a b : Val),
       setRemove (Collections.setAdd s a) b ≠ Collections.setAdd (setRemove s b) a := by

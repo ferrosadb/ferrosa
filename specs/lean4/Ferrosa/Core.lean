@@ -1,22 +1,20 @@
 /-
-  Ferrosa formal specification — Core.
-  ===================================
+  Quorum arithmetic: why two majorities always share a node
+  ========================================================
 
-  Self-contained (Lean core only, no Mathlib) model of the primitives every
-  later trace leans on:
+  Every consistency claim in the corpus reduces to one fact about finite sets: two strict majorities
+  of the same `n` nodes must overlap, so a read that gathers a majority sees any write that was
+  acknowledged by one. That fact is `quorum_intersects`, proved once for arbitrary `n`, and
+  `quorum_wr_intersects` states the form users buy — `W + R > RF` means a read sees the write.
 
-    * node sets over a finite universe `{0, …, n-1}`,
-    * quorum arithmetic and the quorum-intersection theorem,
-    * `ConsistencyLevel` and its ack thresholds, mirroring
-      `ferrosa-cluster/src/consistency.rs::ConsistencyLevel::block_for`.
-
-  The intersection theorem is the load-bearing one: every consistency claim in
-  the Ferrosa specs (read-your-write, "QUORUM never returns stale", Accord fast
-  path) reduces to it.  It is proved here once, for arbitrary `n`.
+  The same module carries the ack thresholds the engine actually computes, `blockFor` and
+  `blockForDc`, including the case that surprises operators: `LOCAL_QUORUM` evaluated against the
+  global replication factor asks for more acks than a single datacenter holds, and the same level
+  therefore blocks on one coordinator path and not on the other.
 -/
 namespace Ferrosa
 
-/-! ## Node sets -/
+/-! ## Nodes as a predicate over `{0, …, n-1}`, and how a set's size is counted -/
 
 abbrev Node := Nat
 
@@ -56,18 +54,21 @@ def singleton (i : Node) : SetU := fun j => j == i
 
 end SetU
 
-/-! ## Quorum arithmetic -/
+/-! ## What counts as a quorum, and the one inequality every consistency claim rests on -/
 
 /-- `IsQuorum n q` — `q` is a strict majority of the universe of size `n`.
     Ferrosa's `block_for(QUORUM, rf) = rf / 2 + 1` is the same predicate one
     level down: an ack set is a quorum iff it holds at least `rf/2 + 1` nodes. -/
 def IsQuorum (n : Nat) (q : SetU) : Prop := 2 * q.card n > n
 
-/-! ### Counting lemma
+/-! ### The counting step the intersection argument runs on
 
 The whole quorum theory rests on this: for any two predicates over a finite
 list, the counts of `p` and `q` together overshoot the list length by at most
 the count of `p ∧ q`.  Equivalently `|A| + |B| ≤ n + |A ∩ B|`. -/
+
+/-- Two predicates over one finite list cannot tally more than the list plus their overlap — the
+    step that forces two strict majorities of the same universe to share a node. -/
 theorem filter_and_length_le (l : List Node) (p q : Node → Bool) :
     (l.filter p).length + (l.filter q).length
       ≤ l.length + (l.filter (fun x => p x && q x)).length := by
@@ -174,7 +175,7 @@ theorem localQuorum_global_rf_infeasible (dcRf totalRf : Nat)
 theorem localQuorum_threshold_path_mismatch :
     blockFor .localQuorum (3 + 3) ≠ blockForDc .localQuorum 3 := by decide
 
-/-! ## Replication factors as first-class values -/
+/-! ## What each replication factor buys, in acks tolerated and failures survived -/
 
 /-- `RF = 2`: QUORUM needs every replica, so there is no fault tolerance. -/
 theorem rf2_quorum_requires_all : blockFor .quorum 2 = 2 := by decide

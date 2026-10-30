@@ -1,17 +1,15 @@
 /-
-  Broken: the implementation exists and it is wrong.
-  ==================================================
+  Broken: built, shipping, and wrong
+  ==================================
 
-  These are the reds. Not "we have not built it" — built, shipping, and producing a wrong answer
-  or a wrong claim today. Every one has a witness theorem in its area's ledger, and every one has a
-  place in the code that can be pointed at.
-
-  The distinction orders the work: an unimplemented feature can be scheduled against a milestone, a
-  broken one is already telling someone something false.
-
-  Every row carries the area ledger it classifies (`ledger`, a module key registered in
-  `Ferrosa/Unimplemented.lean`) and the exact `SpecItem.name` it classifies (`item`). `area` and
-  `what` are prose for the reader; `ledger` and `item` are what the machine checks.
+  Everything in this list is built and shipping and tells a customer something false today, which is
+  a different category from a feature that was never written — an unimplemented item can be scheduled
+  against a milestone, a broken one is already lying to someone. Each of the fifteen rows names a site
+  in the code that can be pointed at and a witness theorem in its area's ledger, so the claim is not an
+  opinion about the code. The damage concentrates on the surfaces a client trusts: five of the fifteen
+  are SQL or SPARQL, the two places where a confidently wrong answer is most likely to be acted on.
+  Rows carry the area ledger they classify and the exact ledger item, because `Ferrosa/Unimplemented.lean`
+  re-derives the whole classification from those two fields and fails if a red is unaccounted for.
 -/
 import Ferrosa.Ledger
 
@@ -76,9 +74,11 @@ def broken : List Item := [
    "Ferrosa.Storage.Streaming", "acks are coalesced so a high-latency pipe is not ack-starved"⟩
 ]
 
+/-- Fifteen built-and-wrong items, pinned so a defect cannot be dropped from the list without the
+    corpus classification breaking. -/
 theorem broken_has_fifteen_items : broken.length = 15 := by native_decide
 
-/-- The surfaces are where the damage concentrates: five of the thirteen are SQL or SPARQL, which are
+/-- The surfaces are where the damage concentrates: five of the fifteen are SQL or SPARQL, which are
     the two places a client is most likely to be told something confidently wrong. -/
 theorem the_surfaces_carry_five : (broken.filter fun i => i.area == "SQL").length
     + (broken.filter fun i => i.area == "SPARQL").length = 5 := by native_decide

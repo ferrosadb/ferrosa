@@ -2,21 +2,19 @@
   Ferrosa formal specification — the Bolt session (`ferrosa-graph/src/bolt`).
   =====================================================================
 
-  Bolt is a stateful session protocol: HELLO, LOGON, RUN, PULL, DISCARD, RESET, GOODBYE, with
-  four server-side states. Three properties are what a driver depends on:
+  A Bolt connection is stateful — HELLO, LOGON, RUN, PULL, DISCARD, RESET, GOODBYE over
+  four server-side states — and two of its rules a driver can rely on. A failure is
+  sticky: only RESET, or closing the connection, gets out of it, and every other
+  message is ignored. RESET restores the connection exactly, with no queued result
+  stream left behind and a failed session usable again.
 
-    `failure_is_sticky`            only RESET leaves FAILED — no message can slip through
-    `reset_clears_streams_and_failure`  RESET restores the initial state exactly
-    `replies_are_not_one_per_message`   and therefore a client **cannot** pair replies to
-                                 messages by index, which is the assumption every naive driver
-                                 starts from
-
-  The last one is the interesting one. After a failure the server ignores messages silently, so
-  the reply stream is shorter than the message stream and shifts underneath the client. A
-  driver that counts replies desynchronises by exactly the number of ignored messages.
-
-  The open item is unbounded: `unconsumed_runs_grow_the_queue` shows that RUN without PULL
-  accumulates results the server must hold, and nothing in the protocol bounds it.
+  What a driver cannot rely on is pairing replies to messages by position: because a
+  failed session ignores messages silently, the reply stream is shorter than the message
+  stream, and every later reply sits one place earlier for each message that was
+  swallowed — a driver that counts replies desynchronises for the rest of the connection,
+  and the failure it is told about carries no statement identity to recover from. RUN
+  without PULL is also unbounded — each unconsumed run is a result set the server holds,
+  with no backpressure in the protocol.
 -/
 import Ferrosa.Ledger
 
@@ -126,6 +124,9 @@ def ledger : List SpecItem := [
      "Bolt.ignored_messages_shift_every_later_reply"⟩
 ]
 
+/-- Three of the six Bolt obligations are red: replies cannot be paired to messages by
+    position, queued result streams are unbounded, and a failure carries no statement
+    identity for the client to recover from. -/
 theorem bolt_has_three_red_items : redCount ledger = 3 := by decide
 
 def main : IO Unit :=

@@ -1,38 +1,20 @@
 /-
-  Ferrosa formal specification — CQL front end, part 1: abstract syntax.
-  =====================================================================
+  Ferrosa formal specification — CQL front end, part 1: what a statement is.
+  ========================================================================
 
-  Scope, stated up front.  This is the front end's **semantic** surface: the
-  shape of a statement, what it reads, what it writes, what it conditions on,
-  and which consistency level it was sent with.  It is *not* a grammar and not a
-  parser model.  `ferrosa-cql/src/parser.rs` is 220 KB of recursive descent; its
-  correctness is a question about a concrete program, best answered by
-  differential testing against this AST (`Conformance.lean`), not by a proof that
-  some grammar recognises exactly CQL.
+  Every statement a CQL client sends is understood as one of a small set of
+  shapes, and the shape alone settles three questions the rest of the system has
+  to ask of it: whether it reads, whether it writes, and whether its outcome
+  depends on a value that is already stored. A collection update is the shape
+  that surprises — `SET tags = tags + {'x'}` reads the old value even though it
+  carries no `IF` — and `Ferrosa/Cql/Collections.lean` is where that is settled.
 
-  What is formalised is what the rest of the system's guarantees depend on:
-
-    * which statements read, which write, which do both (LWT);
-    * where a statement's consistency level comes from (frame or keyspace
-      default) — because `Topology/ConsistencyLevels.lean` says what an ack means
-      only once the level is known;
-    * how a sequence of statements becomes one transaction with a read set, a
-      write set and a condition — which is what `Accord.Protocol` consumes.
-
-  Two modelling notes:
-
-    * a partition key is an opaque `Key` (a token).  `transaction_keys.rs` turns a
-      `Term` list into one; the front end's job is only to say *which* terms are
-      partition keys, so token hashing stays out of the spec;
-    * `Stmt` is flat and `Statement` adds the batch wrapper, because **CQL does
-      not allow nested batches**.  Splitting them this way is faithful to the
-      grammar and also keeps the classification functions structurally
-      recursive, so their properties are provable rather than `partial`.
-
-  Rust shapes mirrored (`ferrosa-cql/src/ast.rs`): `Statement` (line 45),
-  `SelectStatement`, `InsertStatement`, `UpdateStatement`, `DeleteStatement`,
-  `BatchStatement`, `Term`, `WhereClause`, `IfCondition`, `Assignment`,
-  `BatchType`.
+  The consistency level is not part of the statement text: CQL carries it in the
+  frame, so a query with no level means the session or keyspace default applies,
+  and `Ferrosa/Cql/Classify.lean` turns the two together into an acknowledgement
+  requirement. Batches cannot nest, so one statement and a batch of them are
+  different shapes; a partition key is an opaque token, and which terms form one is
+  decided here while the hashing is left to `ferrosa-cluster/src/transaction_keys.rs`.
 -/
 import Ferrosa.Core
 
@@ -115,7 +97,7 @@ structure Query where
   cl : Option ConsistencyLevel
   deriving DecidableEq, Repr
 
-/-! ## Classification
+/-! ## The three questions the rest of the system asks of a statement
 
 The questions the rest of the spec has to be able to ask of a statement.  Each is
 a `Bool`, so a corpus can be tabulated by `decide` in `Conformance.lean`. -/

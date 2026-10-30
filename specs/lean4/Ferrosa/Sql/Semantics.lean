@@ -2,27 +2,17 @@
   Ferrosa formal specification — the SQL surface (`ferrosa-postgres`).
   =====================================================================
 
-  `ferrosa-postgres` speaks the Postgres wire protocol over a Cassandra-lineage store: it has
-  `TransactionStatus::{Idle, InTransaction}` and answers `BEGIN`/`COMMIT` with `ReadyForQuery`,
-  so a driver reasonably concludes that a transaction is in progress. This file specifies what
-  SQL promises, what the store can deliver, and the places the two differ.
+  A Postgres driver talking to `ferrosa-postgres` gets the protocol it expects —
+  `BEGIN` and `COMMIT` are answered with `ReadyForQuery` and the session reports
+  `InTransaction` — and three of the things SQL promises are not behind it. NULL is
+  a value here rather than an absence, so a translation of `<>` that compares and
+  negates admits rows SQL excludes. `SUM` over no rows returns zero rather than NULL.
+  And statements execute independently, so `COMMIT` is at best a prefix of the
+  transaction that a crash interrupts.
 
-  Three of the differences are semantic, not implementational:
-
-    - SQL has three-valued logic; a cell store has two-valued presence. A naive translation of
-      `NOT (b = v)` admits rows that SQL excludes (`null_passes_a_naive_not_equal`).
-    - `SUM` over no rows is NULL in SQL and 0 in the obvious accumulator
-      (`sum_of_no_rows_is_null_not_zero`).
-    - `COUNT(*)` and `COUNT(col)` disagree on NULL by design, and a store that cannot
-      distinguish "NULL" from "never written" gets the second one right by accident.
-
-  One is structural: statements execute independently, so `COMMIT` is a prefix at best
-  (`commit_is_not_atomic_across_statements`).
-
-  One thing that is *not* a bug, checked so it does not get "fixed": SQL permits gaps in a
-  sequence, so the commitlog's non-idempotent counter replay
-  (`Storage.Recovery.zero_id_replay_duplicates_a_nonidempotent_mutation`) is harmless for
-  `SERIAL` and harmful only for `COUNTER` (`sequence_need_only_be_monotone`).
+  One difference that looks like a defect is not: SQL permits gaps in a sequence, so
+  a replay that consumes an extra identifier is still a correct sequence, and that
+  cost lands on `COUNTER` rather than on `SERIAL`.
 -/
 import Ferrosa.Ledger
 
@@ -35,7 +25,7 @@ open Ferrosa.Ledger
 /-- A SQL value. `none` is NULL — a value, not an absence. -/
 abbrev SqlVal := Option Nat
 
-/-! ## Three-valued logic -/
+/-! ## NULL is a value, so a comparison can be neither true nor false -/
 
 /-- The obvious translation of `b <> v`: compare and negate. -/
 def notEqNaive (b : SqlVal) (v : Nat) : Bool := !(b == some v)
@@ -57,7 +47,7 @@ theorem null_passes_a_naive_not_equal :
 theorem the_two_agree_without_nulls :
     notEqNaive (some 6) 5 = notEqStd (some 6) 5 := by decide
 
-/-! ## Transaction atomicity -/
+/-! ## What a crash in the middle of a transaction leaves behind -/
 
 /-- A transaction as the surface accepts it: statements in order, and how many of them are
     durable at the moment of the crash. -/
@@ -80,7 +70,7 @@ theorem commit_is_not_atomic_across_statements :
 theorem status_is_not_a_durability_claim :
     (⟨[1, 2], 1⟩ : Txn).applied.length < 2 := by decide
 
-/-! ## Aggregates and NULL -/
+/-! ## What the aggregate functions return when there are no rows -/
 
 /-- The obvious accumulator. -/
 def sumNaive (xs : List Nat) : SqlVal := some (xs.foldl (· + ·) 0)
@@ -109,7 +99,7 @@ def countCol (rows : List (List SqlVal)) (i : Nat) : Nat :=
 theorem count_star_and_count_col_disagree :
     countStar [[none], [some 1]] = 2 ∧ countCol [[none], [some 1]] 0 = 1 := by decide
 
-/-! ## Sequences -/
+/-! ## What a sequence has to be, and what it may skip -/
 
 /-- A sequence value only has to be monotone; gaps are legal in SQL. -/
 def monotone (xs : List Nat) : Bool := xs.zip xs.tail |>.all fun p => p.1 ≤ p.2
@@ -146,6 +136,9 @@ def ledger : List SpecItem := [
    .met "Sql.sequence_need_only_be_monotone"⟩
 ]
 
+/-- Three of the six obligations the SQL surface carries are red: multi-statement
+    atomicity, three-valued logic, and `SUM` over the empty set. A driver that
+    relies on any of them gets an answer SQL would not have given. -/
 theorem sql_has_three_red_items : redCount ledger = 3 := by decide
 
 def main : IO Unit :=

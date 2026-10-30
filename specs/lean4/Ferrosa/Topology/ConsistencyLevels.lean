@@ -1,49 +1,20 @@
 /-
-  Ferrosa formal specification — consistency levels as a topology guarantee.
-  ==========================================================================
+  Ferrosa formal specification — a consistency level is a count, not a protocol.
+  =============================================================================
 
-  **This is not an Accord file.**  A consistency level is an acknowledgement
-  rule over a replica set:
-
-      a write at CL `x` with replication factor `rf` is acknowledged
-      once `acks ≥ blockFor(x, rf)` replicas have acknowledged it.
-
-  Nothing in that sentence mentions transactions, dependencies, ballots or
-  ordering.  `RF=1` acknowledges on the first ack at every level; `LOCAL_QUORUM`
-  acknowledges once the *local* DC's quorum has acked; `QUORUM` on an NTS
-  keyspace acknowledges once a quorum exists in every DC.  A plain fan-out write
-  with no consensus protocol at all obeys the same rule.
-
-  Accord contributes two things on top, and both are about *ordering*:
-
-    * the **commit decision** — the transaction is committed once the
-      fast/slow quorum of the electorate has accepted it (§4.2, §4.3);
-    * the **dep-wait before the read phase** — the transaction must not observe
-      a state that is missing a conflicting predecessor (§4.5).
-
-  Those are modelled in `Ferrosa.Accord.Protocol` and `Ferrosa.Accord.Recovery`,
-  and they compose with — they do not replace — the ack rule here.  A
-  multi-statement transaction is acknowledged when *every* key it wrote has met
-  its own CL, which is again a conjunction of topology facts (`txnAckOk` below).
-
-  The retraction this file also records: an earlier finding in `FINDINGS.md`
-  (A3) claimed `LOCAL_QUORUM` is unsatisfiable on `{3,3}` because the global RF
-  makes the threshold 4.  That was wrong twice over — `write_path.rs:938` routes
-  NTS keyspaces to `coordinate_write_nts`, which computes the local threshold
-  correctly, and a local level never consults the global RF at all.
-
-  Code references (`ferrosa-cluster/src`):
-
-    * `consistency.rs:31` `block_for`, `:46` `block_for_dc`.
-    * `write_path.rs:938` dispatches `Simple` → `coordinate_write_with`,
-      `NetworkTopology` → `coordinate_write_nts`.
-    * `coordinator/write.rs:612` computes the NTS required count
-      (`LocalQuorum => block_for_dc(local_rf)`), `:630` the rest
-      (`_ => block_for(strategy.replication_factor())`).
-    * `ring/strategy.rs:23` — `replication_factor()` for NTS is the **sum** of
-      the per-DC factors.
-    * `coordinator/write.rs:753` counts `total_acks >= required` for every level
-      except `EachQuorum`, whose per-DC counters are the only ones consulted.
+  A consistency level decides how many replicas must acknowledge before the client is
+  told the write succeeded, and that is the whole of it: `acks ≥ blockFor(level, rf)`,
+  with no ballot, dependency or transaction order anywhere in the rule.  At `RF = 1`
+  every level acknowledges on the first ack; `LOCAL_QUORUM` counts only the local
+  datacenter's replicas and is computed from the local replication factor, never from the
+  global sum, which is why the two entry points must not be confused.  A multi-statement
+  transaction is acknowledged when every key it wrote has met its own level — still a
+  conjunction of topology facts.  One correction is on record: A3 in `FINDINGS.md` claimed
+  `LOCAL_QUORUM` is unsatisfiable on `{3,3}` because the global factor makes the
+  threshold four, and that was wrong twice over — the NTS write path computes the local
+  threshold correctly, and `blockFor` fed the global factor is the category error
+  `Topology/TwoDc.lean` exhibits one size down.  Both arithmetic forms are transcribed
+  from `ferrosa-cluster/src/consistency.rs` (`block_for`, `block_for_dc`).
 -/
 import Ferrosa.Core
 
@@ -51,7 +22,7 @@ namespace Ferrosa.Topology.ConsistencyLevels
 
 open Ferrosa
 
-/-! ## The ack rule -/
+/-! ## The ack rule, and why nothing about transactions appears in it -/
 
 /-- A write is acknowledged when the acknowledgement count reaches the level's
     block-for value.  This is the whole of the consistency-level contract. -/
@@ -93,6 +64,9 @@ def txnAckOk (keys : List Key) (acksOf : Key → Nat) (cl : ConsistencyLevel)
     (rf : Nat) : Bool :=
   keys.all (fun k => ackOk (acksOf k) cl rf)
 
+/-- A transaction is acknowledged exactly when every key it wrote has met its own
+    level, spelled out as a `∀` over the keys — which is all the composition there
+    is. -/
 theorem txnAckOk_iff (keys : List Key) (acksOf : Key → Nat) (cl : ConsistencyLevel)
     (rf : Nat) : txnAckOk keys acksOf cl rf = true ↔ ∀ k ∈ keys, ackOk (acksOf k) cl rf = true := by
   simp [txnAckOk, List.all_eq_true]
@@ -102,6 +76,8 @@ theorem txnAckOk_iff (keys : List Key) (acksOf : Key → Nat) (cl : ConsistencyL
 theorem txnAckOk_nil (acksOf : Key → Nat) (cl : ConsistencyLevel) (rf : Nat) :
     txnAckOk [] acksOf cl rf = true := by simp [txnAckOk]
 
+/-- A one-key transaction's verdict is that key's ack rule and nothing more, so a
+    single-key transaction never waits on a second key's replicas. -/
 theorem txnAckOk_single (k : Key) (acksOf : Key → Nat) (cl : ConsistencyLevel) (rf : Nat) :
     txnAckOk [k] acksOf cl rf = ackOk (acksOf k) cl rf := by simp [txnAckOk]
 
@@ -121,10 +97,14 @@ theorem localQuorumThreshold_eq (localRf : Nat) : localQuorumThreshold localRf =
 theorem global_rf_would_over_ask_2_2 : blockFor .localQuorum 4 > localQuorumThreshold 2 := by
   decide
 
+/-- On `{3,3}` the global factor is six, so a `LOCAL_QUORUM` computed from it asks
+    four acks where the local datacenter's three replicas need only two.  This is the
+    same category error as `{2,2}`, one size up, and it is why the two thresholds are
+    never interchangeable. -/
 theorem global_rf_would_over_ask_3_3 : blockFor .localQuorum 6 > localQuorumThreshold 3 := by
   decide
 
-/-! ## `QUORUM` on two uniform DCs -/
+/-! ## QUORUM on two uniform datacenters, and the parity that decides whether the numbers agree -/
 
 /-- `{3, 3}`: the global-RF threshold (4) coincides with `quorum_local_1 +
     quorum_local_2` (2 + 2).  This is why the numbers looked right. -/

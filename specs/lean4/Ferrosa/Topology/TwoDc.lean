@@ -1,21 +1,18 @@
 /-
-  Ferrosa formal specification — Trace 2, rung 5: two DCs, one WAN link.
-  =====================================================================
+  Ferrosa formal specification — two datacenters, one WAN link, and what a cut costs.
+  =================================================================================
 
-  Topology: DC0 = {0,1,2}, DC1 = {3,4,5}, NetworkTopologyStrategy `{dc0: 2,
-  dc1: 2}` (RF = 4), a single link carrying all cross-DC traffic.
-
-  Sources: `specs/decisions/015-multi-dc-raft-per-dc-accord.md` (S-48: "DC
-  partition steady state — each DC retains LOCAL availability; cross-DC blocked")
-  and `ferrosa-cluster/src/consistency.rs`.
-
-  Two results matter here:
-
-  1. `local_quorum_survives_wan_cut` / `global_quorum_blocked_by_wan_cut` — the
-     availability split ADR-015 promises, checked.
-  2. `local_quorum_acks_can_be_disjoint` — LOCAL_QUORUM is an *availability*
-     level, not a consistency level: with the WAN down, both DCs can ack a write
-     to the same key with no replica in common.
+  Two datacenters at `{2,2}` behind a single WAN link trade cross-datacenter consistency
+  for local availability: with the link down each DC keeps accepting `LOCAL_QUORUM`
+  writes and serving its own reads, while `QUORUM` writes are refused rather than
+  silently under-acked.  `LOCAL_QUORUM` is an availability level and not a consistency
+  level — during a cut both DCs can acknowledge a write to the same key with no replica
+  in common, and the two values are left for timestamp reconciliation.
+  `EACH_QUORUM` is the level that refuses the trade: it needs a local quorum in every
+  datacenter, so one DC down blocks it even though the survivor is healthy.  Feeding the
+  *global* replication factor to a local level would ask three acks where the local DC
+  can only supply two; `Topology/ConsistencyLevels.lean` states why the global factor is
+  never an input to a local level.
 -/
 import Ferrosa.Topology.Basic
 

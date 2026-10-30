@@ -1,27 +1,17 @@
 /-
   Ferrosa formal specification — Accord, part 1: transactions, histories,
   serializability.
-  ================================================================
+  ==========================================================================
 
-  Sources:
-    * `research/SPEC-accord-transactions.md` §3.2.1 (Timestamp),
-      §4.4 (Execute: Read set evaluated against local storage),
-     §4.5 (Apply: idempotent, dep-gated),
-    * `ferrosa-jepsen/src/history.rs` (Op / OpResult / Operation),
-    * `ferrosa-jepsen/elle-checker/src/ferrosa/elle_check.clj`
-      (the claimed model is `:strict-serializable` over `list-append`).
-
-  The correctness statement is the one Jepsen actually checks, made explicit:
-
-    a history is *strictly serializable* when there is a total order of the
-    committed transactions such that (a) replaying them in that order from the
-    empty database reproduces every observed read result, and (b) the order
-    respects real time — if A completed before B was invoked, A precedes B.
-
-  A transaction is modelled as an ordered list of ops (`read k`, `append k v`)
-  executed atomically against the keyspace, so "full transaction semantics"
-  includes intra-transaction read-your-writes: an `append` earlier in the same
-  transaction is visible to a later `read` in that transaction.
+  A history is what a client saw, in the shape the Jepsen driver records it, and whether
+  it is serializable is decided against the transactions it names rather than against the
+  order the events arrived in.  A transaction is an ordered list of `read` and `append` ops
+  executed atomically against a per-key append list, so intra-transaction read-your-writes
+  fall out of the model instead of needing a separate rule.  Two fields carry more weight
+  than they look: the four-field commit timestamp's field order *is* its comparison order,
+  which is what breaks ties between two nodes proposing in the same nanosecond; and the
+  committed set of a history takes the first `:ok` event per transaction, because an
+  `:info` transaction may or may not have executed and a `:fail` one must not have written.
 -/
 namespace Ferrosa.Accord
 
@@ -30,7 +20,7 @@ abbrev TxnId := Nat
 abbrev Key := Nat
 abbrev Val := Nat
 
-/-! ## §3.2.1 Timestamps -/
+/-! ## Timestamps, and the order their fields are compared in -/
 
 /-- The four-field commit timestamp.  Field order is significant: it *is* the
     comparison order (`epoch`, then `time`, then `seq`, then `node`). -/
@@ -56,9 +46,13 @@ def lt (a b : Ts) : Prop :=
 def bumpPast (other : Ts) (node : Node) : Ts :=
   { other with seq := other.seq + 1, node := node }
 
+/-- A counter-proposal's `seq` field is strictly larger than the one it bumps past, so
+    the replica cannot re-propose the number it has already rejected. -/
 theorem bumpPast_gt_seq (other : Ts) (node : Node) : other.seq < (bumpPast other node).seq := by
   simp [bumpPast]
 
+/-- The bumped timestamp is strictly later than the one it bumps past, which is what
+    makes a counter-proposal supersede the proposal it saw rather than tie with it. -/
 theorem bumpPast_gt (other : Ts) (node : Node) : lt other (bumpPast other node) := by
   refine Or.inr ⟨rfl, Or.inr ⟨rfl, Or.inl ?_⟩⟩
   simp [bumpPast]
@@ -73,7 +67,7 @@ theorem distinct_nodes_ordered (e t s n₁ n₂ : Nat) (h : n₁ ≠ n₂) :
 
 end Ts
 
-/-! ## Transactions and their ops -/
+/-! ## Transactions, the ops inside them, and when two of them conflict -/
 
 /-- One operation inside a transaction (the `list-append` op set of Elle's
     check, plus the intra-transaction order the real transaction has). -/
@@ -105,7 +99,7 @@ def Txn.readKeys (t : Txn) : List Key :=
 def Txn.conflicts (a b : Txn) : Bool :=
   a.keys.any (fun k => b.keys.contains k)
 
-/-! ## The keyspace -/
+/-! ## The keyspace an op list is executed against -/
 
 /-- A database: one append-list per key. -/
 abbrev State := Key → List Val
@@ -134,10 +128,14 @@ def State.readsOf (s : State) : List Op → List (List Val)
 def State.evalOps (s : State) (ops : List Op) : State × List (List Val) :=
   (s.runOps ops, s.readsOf ops)
 
-/-! ### Composition lemmas
+/-! ### Composition lemmas, which carry the serializability argument
 
-These carry the whole serializability argument: running `a` then `b` is running
-`a ++ b`. -/
+Running `a` then `b` is running `a ++ b`, and that is the step the whole argument takes
+when it treats a transaction's ops as one block. -/
+
+/-- Running op list `a` and then op list `b` leaves the same keyspace as running the
+    concatenation `a ++ b` — the composition lemma the serializability argument rests
+    on, since it is what lets a transaction's ops be replayed as one block. -/
 theorem State.runOps_append (s : State) (a b : List Op) :
     (s.runOps a).runOps b = s.runOps (a ++ b) := by
   induction a generalizing s with

@@ -1,20 +1,15 @@
 /-
-  Ferrosa formal specification — the surfaces that have no spec yet.
-  ================================================================
+  The surfaces that have no spec at all
+  =====================================
 
-  Every area in `specs/lean4/` is a ledger of obligations, each either proved or red. This file is
-  not a ledger: it is the manifest of surfaces that have **no obligations at all yet**, which is a
-  different and worse state. A red item says "we know what is required and it is not built"; an
-  entry here says "we have not decided what is required".
-
-  Each entry names the crate and the questions that must be settled before it can become a ledger,
-  because a stub without questions decays into a name. `gapCount` is pinned by a theorem, so an
-  entry can only be removed by adding its module — the list can shrink on purpose, never by
-  accident.
-
-  Ordering below is by risk, not by effort: JSONB and views first because a wrong semantic there is
-  silent, while `ferrosa-ctl` and the harnesses are deliberately absent from this list because they
-  carry no data semantics to get wrong.
+  A red item says the requirement is known and not built; an entry here says the requirement has not
+  been decided, which is worse, because nothing about that surface has been pinned and nothing about it
+  can be relied on. Each of the ten entries names the crate and the questions that must be settled
+  before it can become a ledger, since a stub without questions decays into a name. The count is pinned
+  by a theorem, so an entry leaves only when its module arrives: the list can shrink on purpose, never
+  by accident. Ordering is by risk rather than effort — JSONB and materialized views first, because a
+  wrong semantic there is silent — and `ferrosa-ctl` and the harnesses are deliberately absent, being
+  the surfaces that carry no data semantics to get wrong.
 -/
 import Ferrosa.Core
 import Ferrosa.Ledger

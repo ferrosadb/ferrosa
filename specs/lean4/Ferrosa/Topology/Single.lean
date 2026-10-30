@@ -1,13 +1,16 @@
 /-
-  Ferrosa formal specification — Trace 2, rung 1: Standalone.
-  ===========================================================
+  Ferrosa formal specification — standalone: one node, one copy, no quorum.
+  =======================================================================
 
-  `specs/reference/cluster-formation-state-machine.md`:
-  "First node starts with no seed → Standalone", writes local only, DDL direct.
-
-  With one copy there is no quorum arithmetic to get wrong: every consistency
-  level collapses to "is the node up".  These theorems are the base case of the
-  ladder and the reference for what escalation must preserve.
+  One node is the whole cluster, so every write it acknowledges sits on the only copy
+  that exists and losing that node loses the write with it.  At `RF = 1` there is no
+  quorum arithmetic to get wrong: `QUORUM`, `ALL`, `LOCAL_QUORUM` and `ONE` all resolve
+  to the same question, whether the node is up, and availability and durability are the
+  same fact.  `EACH_QUORUM` is the one level the single-node path does not cover, because
+  it is defined against a datacenter rather than against an `rf`.
+  `Topology/Ladder.lean` takes this rung as the base case every escalation has to keep
+  true: an acknowledged write stays readable, and nothing is acknowledged while the node
+  is down.
 -/
 import Ferrosa.Topology.Basic
 

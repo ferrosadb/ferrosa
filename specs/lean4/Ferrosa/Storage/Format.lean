@@ -1,29 +1,17 @@
 /-
-  Ferrosa formal specification — storage, part 3: the `fnf` record framing.
-  =====================================================================
+  The record framing: one bad byte costs one record, and the index is a speed-up
+  ===========================================================================
 
-  ADR-022. BTI keeps its trie and its data encoding; what changes is the *framing*:
+  A scan stops at the first record that fails its own length and CRC, so a damaged file yields a
+  verified prefix: nothing after the damage is decoded, and nothing before it is skipped. The data
+  is self-describing — every record carries its key — so a table can be read with no index at all,
+  and a wrong or damaged trie can only cause a miss, never a value the record does not hold. The
+  trie is kept because it is faster, not because it is trusted: the fast path reads one record where
+  rebuilding reads every record.
 
-  ```text
-  record = len:u32 | crc32c:u32 | partition body    (body = key_len:u16 | key | ...)
-  footer = partition_count | min_token | max_token | data_rolling_crc | index crc | crc
-  ```
-
-  Five properties are what the format is for, and each is a theorem here rather than a
-  claim in the ADR:
-
-    `scan_is_a_prefix`               a torn file yields a prefix, nothing after the damage
-    `corruption_stops_the_scan`      the blast radius of one bad byte is one record
-    `scan_finds_every_verified_frame` the data is self-describing; no index needed to read it
-    `trie_cannot_produce_a_wrong_value` a bad trie can miss, never lie
-    `trie_answer_agrees_with_the_scan` so the index is a speed-up, not an authority
-
-  The last two are the pair that justifies keeping the trie on the fast path even though its
-  bytes are only checksummed at block granularity: because every record carries its own key,
-  a mis-resolved offset produces a key mismatch and the lookup returns *absent*. Fail-closed.
-
-  Cost is stated too, because the reason the trie survives here is performance:
-  `trie_reads_at_most_one_record` against `rebuild_reads_every_record`.
+  Two layout decisions are visible to a client. Cells are fixed-stride, so a projection touches one
+  cell per projected column rather than every cell before it; and a value of eight bytes or less
+  never reaches the arena, so a narrow projection decompresses nothing.
 -/
 import Ferrosa.Ledger
 
@@ -107,6 +95,9 @@ theorem corruption_stops_the_prefix (pre post : List Frame) (bad : Frame)
     simp only [List.cons_append, scanPrefix, hpre.1, if_true]
     rw [ih hpre.2]
 
+/-- The scan in the form a reader of the table sees it: with every record before `bad` verified,
+    the partitions recovered are exactly those records, and nothing the file holds after the damage
+    is decoded as a partition. -/
 theorem corruption_stops_the_scan (pre post : List Frame) (bad : Frame)
     (hpre : pre.all Frame.verified = true) (hbad : bad.verified = false) :
     scan (pre ++ bad :: post) = pre.map (fun f => (f.key, f.val)) := by
@@ -141,6 +132,8 @@ def nthFrame : List Frame → Nat → Option Frame
   | f :: _, 0 => some f
   | _ :: rest, n + 1 => nthFrame rest n
 
+/-- A record read at an offset is a record the file actually holds, so an offset a damaged index
+    names can only ever reach real data. -/
 theorem nthFrame_mem (frames : List Frame) (n : Nat) (f : Frame)
     (h : nthFrame frames n = some f) : f ∈ frames := by
   induction frames generalizing n with
@@ -220,6 +213,8 @@ structure TrieBlock where
 
 def TrieBlock.ok (b : TrieBlock) : Bool := b.stored == b.computed
 
+/-- A trie block whose checksum disagrees with its bytes fails its own check, so a damaged index is
+    refused at the moment it is first touched rather than trusted for a lookup. -/
 theorem corrupt_trie_block_is_detected (b : TrieBlock) (h : b.stored ≠ b.computed) :
     b.ok = false := by
   simp [TrieBlock.ok, h]
@@ -393,7 +388,7 @@ theorem i32_ldt_wraps_where_u64_does_not :
 
 /-! ## The record: a hand-rolled layout with no free choices
 
-The body is hand-rolled rather than generated, so the byte layout is a decision we own and
+The body is hand-rolled rather than generated, so the byte layout is a decision the format owns and
 cannot drift with a codegen version. What that buys, stated as properties:
 
   - `encode_injective` — the bytes determine the cell. No layout ambiguity, no padding
@@ -458,10 +453,15 @@ def popcountUpTo (bits : List Bool) : Nat → Nat
   | 0 => 0
   | n + 1 => popcountUpTo bits n + (if bits.getD n false then 1 else 0)
 
+/-- The exception slot of cell `n + 1` is the slot of cell `n` plus one exactly when cell `n` is an
+    exception — the step that turns the slot lookup into a single popcount. -/
 theorem popcountUpTo_step (bits : List Bool) (n : Nat) :
     popcountUpTo bits (n + 1)
       = popcountUpTo bits n + (if bits.getD n false then 1 else 0) := rfl
 
+/-- The slot index after `n + 1` cells is never below the index after `n`: walking one more cell can
+    hand out a slot but never take one back, which is the induction step for the slot map being
+    order-preserving. -/
 theorem popcountUpTo_le_succ (bits : List Bool) (n : Nat) :
     popcountUpTo bits n ≤ popcountUpTo bits (n + 1) := by
   rw [popcountUpTo_step]
@@ -541,6 +541,8 @@ theorem row_lookup_is_bounded_by_the_group (rowIndex : Nat) :
 /-- Schema evolution adds a column id; it never renumbers the existing ones. -/
 def addColumn (cols : List Nat) (id : Nat) : List Nat := cols ++ [id]
 
+/-- Adding a column id leaves every id already in the schema where it was, so a table written before
+    the change is read by the same ids afterwards and no existing cell has to be rewritten. -/
 theorem column_ids_survive_a_new_column (cols : List Nat) (c id : Nat) (h : c ∈ cols) :
     c ∈ addColumn cols id := by
   unfold addColumn
@@ -551,6 +553,8 @@ theorem column_ids_survive_a_new_column (cols : List Nat) (c id : Nat) (h : c �
 def Partition.wellFormed (p : Partition) : Bool :=
   p.cells.all fun c => c.valOff + c.valLen <= p.arena.length
 
+/-- A check that holds of every element of a list holds of each one of them — the step that turns the
+    whole-partition well-formedness test into a bound on a single cell. -/
 theorem all_true_of_mem : ∀ {l : List Cell} {q : Cell → Bool}, l.all q = true →
     ∀ c ∈ l, q c = true
   | [], _, _, c, hc => by simp at hc
@@ -560,6 +564,9 @@ theorem all_true_of_mem : ∀ {l : List Cell} {q : Cell → Bool}, l.all q = tru
       · exact h.1
       · exact all_true_of_mem h.2 c hc
 
+/-- A partition that passes its well-formedness check has every `(offset, length)` inside its arena,
+    so projecting a cell reads value bytes the record actually holds and no part of a read can run
+    past the end of the partition. -/
 theorem well_formed_bounds_every_value (p : Partition) (h : p.wellFormed = true) :
     ∀ c ∈ p.cells, c.valOff + c.valLen ≤ p.arena.length := by
   have hall := all_true_of_mem (l := p.cells) (q := fun c => c.valOff + c.valLen <= p.arena.length) h
@@ -731,6 +738,9 @@ def ledger : List SpecItem := [
      "none (measurement gate, ADR-022)"⟩
 ]
 
+/-- Three obligations in this area are recorded red — a flush with no resume path, a BTI-to-Cassandra
+    export, and the 5% CRC budget, which is a measurement rather than a theorem. The count is pinned
+    so that none of them can be dropped from the ledger quietly. -/
 theorem format_has_three_red_items : redCount ledger = 3 := by decide
 
 def main : IO Unit :=

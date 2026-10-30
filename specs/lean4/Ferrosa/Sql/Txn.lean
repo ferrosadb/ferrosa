@@ -1,23 +1,20 @@
 /-
-  Ferrosa formal specification — what the layer under the SQL surface must provide (transactions).
+  Ferrosa formal specification — what the layer under the SQL surface must provide
+  for transactions.
   =====================================================================
 
-  The SQL surface promised ACID. Split into what each letter actually requires, and what the
-  layer has to supply for the letter to hold:
+  ACID splits into four requirements the store supplies separately, and two of them
+  are not supplied today. Atomicity is one durable decision obeyed by every
+  participant, while independent statement execution gives a prefix instead — which
+  is what the surface does now, so a crash can leave half a transaction. Durability
+  is the commit record synced before the acknowledgement, the premise
+  `Ferrosa/Storage/Recovery.lean` states for a data record moved to the decision.
 
-  - **A**tomicity: *one decision, obeyed by every participant.* Not "writes are ordered" and not
-    "the client is told it committed" — one durable decision, applied everywhere or nowhere
-    (`one_decision_is_atomic`). Independent execution gives a strict prefix
-    (`independent_execution_is_not_atomic`), which is what the surface does today.
-  - **D**urability: the decision record must be durable before the acknowledgement — the same
-    premise `Storage.Recovery.acked_survives_crash` needs, applied to the commit record rather
-    than to the data record.
-  - **I**solation: this is a *choice*, and the choice has a price. Snapshot isolation is cheap
-    and permits write skew (`snapshot_isolation_permits_write_skew`); serializable needs the
-    read set, either through SSI or through Accord's dependency tracking. The spec states all
-    three so the level can be chosen rather than assumed.
-  - **C**onsistency: an application invariant, not a property of the store. Not specified here;
-    it is preserved only if I and A hold.
+  Isolation is a choice with a price rather than a setting: snapshot isolation is
+  cheap and permits write skew, where two transactions each preserve the invariant
+  alone and together break it, and serializable needs the read set, through SSI or
+  through Accord's dependency tracking. Consistency is the application's invariant
+  and holds only if the other two do.
 -/
 import Ferrosa.Ledger
 
@@ -27,7 +24,7 @@ namespace Ferrosa.Sql.Txn
 
 open Ferrosa.Ledger
 
-/-! ## Atomicity -/
+/-! ## All or nothing, and what independent execution gives instead -/
 
 /-- What a multi-key write can leave behind. (`partial` is a Lean keyword, hence the naming.) -/
 inductive Outcome where
@@ -52,6 +49,8 @@ theorem independent_execution_is_not_atomic : Outcome.atomic (.halfApplied 1) = 
     thing to disagree about. -/
 def outcomeOfDecision (commit : Bool) : Outcome := if commit then .committed else .uncommitted
 
+/-- A single commit decision leaves either everything applied or nothing, whichever way
+    it went: there is no third outcome for the participants to disagree about. -/
 theorem one_decision_is_atomic (commit : Bool) :
     Outcome.atomic (outcomeOfDecision commit) = true := by
   cases commit <;> rfl
@@ -99,7 +98,7 @@ def Policy.admitsSkew : Policy → Bool
 theorem serializable_requires_the_read_set :
     Policy.admitsSkew .snapshot = true ∧ Policy.admitsSkew .checkReadSets = false := by decide
 
-/-! ## Durability -/
+/-! ## The decision has to be on disk before the client is told -/
 
 /-- The commit decision as a record on the log, and whether it is durable at the moment of the
     acknowledgement. -/
@@ -133,6 +132,9 @@ def ledger : List SpecItem := [
    .met "Txn.serializable_requires_the_read_set"⟩
 ]
 
+/-- Two of the six transaction obligations are red: a commit record durable before the
+    acknowledgement, and serializable isolation. Everything else the ledger claims is
+    discharged. -/
 theorem txn_has_two_red_items : redCount ledger = 2 := by decide
 
 def main : IO Unit :=

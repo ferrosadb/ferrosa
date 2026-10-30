@@ -2,31 +2,19 @@
   Ferrosa formal specification — the SPARQL surface (`ferrosa-sparql`).
   =====================================================================
 
-  `ferrosa-sparql` has an engine, a planner, an executor, `filter`, `property_path`, `rdf_star`
-  and `update`. Three semantics questions decide whether it can answer correctly, and the third
-  is the one that bites:
+  A graph here is a bag of triples, so a triple stored twice doubles every solution that
+  joins on it, and the row counts a client sees depend on how the data arrived. Adding a
+  triple never removes a match, which is what lets ingested data be applied without
+  re-running the query; deleting one is the case that needs the query re-evaluated
+  instead.
 
-    1. **Bag semantics.** A graph is a *bag* of triples, and a basic graph pattern is matched as
-       the multiset of homomorphisms. A duplicated triple must double every solution
-       (`a_duplicated_triple_double_counts`), and `DISTINCT` is a query-level property that a
-       plan may not silently push around. The planner carries `distinct : bool`, which is fine
-       only if every plan for a query agrees on it.
-    2. **Monotonicity.** Adding a triple never removes a solution
-       (`adding_a_triple_never_removes_a_match`), so an ingested triple can be applied
-       incrementally; a *deleted* triple cannot, which is the asymmetry incremental view
-       maintenance has to respect.
-    3. **Property paths are a set of pairs.**  `p+` is the transitive closure and the spec
-       returns each `(subject, object)` pair once. An expansion that follows every path without a
-       visited set returns one row per path — `closure_without_a_visited_set_duplicates_pairs`
-       exhibits a two-node cycle producing three rows for two pairs.
-
-  RDF-star adds a fourth: a quoted triple is a term, and any store that keys terms by a number
-  must encode it injectively. `encoding_is_not_injective` shows the obvious packing aliasing a
-  quoted triple with an IRI, which is a query returning rows it must not.
-
-  Not modelled, and listed red rather than claimed: `OPTIONAL` scoping. The distinction between
-  `{ A OPTIONAL { B FILTER(c) } }` and `{ A OPTIONAL { B } FILTER(c) }` is the subtlest rule in
-  SPARQL 1.1 and there is no representation of it in the plan types today.
+  Two answers a query can return that it should not: `p+` is a set of pairs, but an
+  expansion that walks every path without remembering where it has been returns one
+  row per path — on a two-node cycle, three rows for two pairs. A quoted triple packed
+  into a single number can land on the same key as an IRI, so a lookup for that IRI
+  returns rows that must not match. The third gap is `OPTIONAL` scoping, the rule that
+  separates a filter inside the optional from one outside it: the plan types cannot
+  express it, and it is listed as owed rather than claimed.
 -/
 import Ferrosa.Ledger
 
@@ -39,7 +27,7 @@ open Ferrosa.Ledger
 abbrev Triple := Nat × Nat × Nat
 abbrev Graph := List Triple
 
-/-! ## Bag semantics -/
+/-! ## A triple stored twice counts twice -/
 
 /-- How many times a triple occurs in the graph. -/
 def multiplicity (g : Graph) (s p o : Nat) : Nat := g.countP fun t => t == (s, p, o)
@@ -66,7 +54,7 @@ theorem deleting_a_triple_can_remove_a_match :
     multiplicity [(1, 2, 3), (1, 2, 3)] 1 2 3 = 2
       ∧ multiplicity [(1, 2, 3)] 1 2 3 = 1 := by decide
 
-/-! ## Property paths -/
+/-! ## A path query returns pairs, not walks -/
 
 /-- Successors of a node. -/
 def succs (g : List (Nat × Nat)) (n : Nat) : List Nat :=
@@ -93,7 +81,7 @@ theorem closure_without_a_visited_set_duplicates_pairs :
 theorem a_self_loop_diverges_without_fuel :
     expandNoVisited [(0, 0)] 3 [0] = [0, 0, 0] := by decide
 
-/-! ## RDF-star -/
+/-! ## A quoted triple has to keep its own identity in the store -/
 
 /-- A term: an IRI, or a quoted triple (RDF-star). -/
 inductive Term where
@@ -141,6 +129,9 @@ def ledger : List SpecItem := [
      "none (not modelled)"⟩
 ]
 
+/-- Three of the six SPARQL obligations are red: `p+` returns a row per path rather than
+    per pair, a quoted triple can share a store key with an IRI, and `OPTIONAL` scoping
+    has no representation at all. -/
 theorem sparql_has_three_red_items : redCount ledger = 3 := by decide
 
 def main : IO Unit :=

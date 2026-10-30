@@ -1,18 +1,17 @@
 /-
-  Ferrosa formal specification — the executable harness.
-  ======================================================
+  The executable harness: every invariant, over an enumerated case space
+  ======================================================================
 
-  `Witnesses.lean` proves the *shape* of every theorem: delete one and the build fails. It cannot
-  prove the theorem is *about the right thing* — a witness still elaborates if the predicate beneath
-  it was quietly weakened. This file is the other half: it runs every invariant predicate over an
-  enumerated case space and reports what actually held, so a theorem whose statement drifts away from
-  the obligation it names shows up as a failing harness rather than a green `#check`.
-
-  It is the Lean-side stand-in for the Kani harnesses `docs/unsafe-proof-plan.md` calls for: same
-  claim, same witness name, and no bound to argue because the case space is finite and enumerated
-  here. Where Kani would need `#[kani::proof]`, this needs `lake exe harness`, which exits non-zero.
-
-  Run: `lake exe harness`.
+  A theorem stays green while the predicate beneath it is quietly weakened, so the invariants under
+  the `unsafe` surface are re-run here as executable cases over a finite, enumerated space, printed
+  with the case count that was actually checked. A failure prints the falsifying input rather than a
+  boolean, and the run exits non-zero, so a statement that drifts away from the obligation it names
+  shows up as a red line naming the case that broke it. The harness must also cover exactly the
+  theorem names the ledger discharges — a ledger row with no harness is an unvalidated claim, a
+  harness with no ledger row is a claim nothing depends on — and both directions fail the run. There
+  is no bound left to argue because the case space is finite and written out in the source, which is
+  what makes this the Lean-side stand-in for the Kani harnesses `docs/unsafe-proof-plan.md` calls for.
+  `lake exe harness` runs it and exits non-zero on any falsified case or any drift.
 -/
 import Ferrosa.Core
 import Ferrosa.Ledger

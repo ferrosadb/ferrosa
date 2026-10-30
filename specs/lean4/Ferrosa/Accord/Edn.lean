@@ -2,31 +2,21 @@
   Ferrosa formal specification — Accord, part 6: reading real Jepsen histories.
   ==========================================================================
 
-  The `ferrosa-jepsen` Elle generator writes histories in the dialect
-
-    [{:process 0 :type :invoke :f :txn :value [[:append 7 1]]}
-     {:process 0 :type :ok     :f :txn :value [[:append 7 1]]}
-     {:process 1 :type :invoke :f :txn :value [[:r 5 nil]]}
-     {:process 1 :type :ok     :f :txn :value [[:r 5 []]]}]
-
-  which is what `elle_check.clj` feeds to `elle.list-append/check` under the
-  `:strict-serializable` model.  This file parses that dialect (no dependency,
-  no JSON) and turns it into `History`, so the checker in `Serializable.lean`
-  can be pointed at a history a run actually produced.
-
-  Two deliberate limitations, both visible in the checker's verdict:
-
-  * a transaction is identified by (process, invoke-ordinal), because the EDN
-    carries no transaction id;
-  * `:fail` and `:info` events are recorded but excluded from the serial order,
-    matching the treatment of an unknown outcome (it may or may not have
-    executed) in `History.committed`.
+  A checker that only reads hand-built histories cannot be pointed at a run, and the EDN
+  the `ferrosa-jepsen` Elle generator writes is the form a run actually produces — parsed
+  here with no Clojure runtime and no JSON, into the `History` that
+  `Accord/Serializable.lean` scores.  Two limitations are visible in every verdict it
+  produces: a transaction is identified by its process and invoke ordinal, because the EDN
+  carries no transaction id, and the recorded invoke and complete times are zero, so a
+  parsed history can be judged serializable but never strictly serializable.  `:fail` and
+  `:info` events are kept but held out of the serial order, matching how an unknown outcome
+  is treated in `History.committed`.
 -/
 import Ferrosa.Accord.Strict
 
 namespace Ferrosa.Accord
 
-/-! ## A minimal EDN reader -/
+/-! ## A minimal reader for the dialect the generator writes -/
 
 inductive Sexp where
   | atom (s : String)

@@ -1,12 +1,15 @@
 /-
-  Ferrosa formal specification — the obligation ledger, shared.
-  ============================================================
+  The ledger as a data structure: discharge a claim with a theorem, or record it red
+  ==================================================================================
 
-  Every spec area records what it has proved and what it still owes. An item is either
-  discharged by a named theorem or it is red, and a red item names the theorem that
-  exhibits the gap. Red items are asserted to exist in a fixed number
-  (`<area>_hasN_red_items`), so implementing one without updating the ledger breaks the
-  build: the red list can only shrink on purpose.
+  Every area of the corpus can be read as a list of claims, and each claim is either discharged by a
+  named theorem or red — stated as a property the code does not have, with the theorem that exhibits
+  the failure and a sentence saying what a user sees. Nothing here proves anything about Ferrosa; it
+  supplies the vocabulary the other modules use to say what they owe.
+
+  The count of red items in an area is itself pinned by a theorem, so a gap that is closed and a gap
+  that is quietly dropped are different events: the first breaks the build until the ledger is
+  updated, the second cannot happen without deleting a theorem the book cites.
 -/
 namespace Ferrosa.Ledger
 
@@ -48,6 +51,8 @@ theorem isRed_eq_status_test (i : SpecItem) :
   obtain ⟨n, s⟩ := i
   cases s <;> rfl
 
+/-- The red count is the length of the ledger filtered to its red items, so counting and filtering
+    cannot disagree about how many obligations an area has left open. -/
 theorem redCount_eq_filter_length (items : List SpecItem) :
     redCount items = (items.filter isRed).length := by
   have hfun : (fun i => match i.status with | .failing _ _ => true | _ => false) = isRed := by
@@ -60,6 +65,8 @@ theorem redCount_eq_filter_length (items : List SpecItem) :
     `Ferrosa/Unimplemented.lean` is keyed on: a row names one of these, or it names nothing. -/
 def redNames (items : List SpecItem) : List String := (items.filter isRed).map (·.name)
 
+/-- The names of the red items are as many as the red count, so the list a classification is keyed
+    on covers every unmet obligation and no discharged one. -/
 theorem redNames_length (items : List SpecItem) : (redNames items).length = redCount items := by
   simp [redNames, redCount_eq_filter_length]
 
