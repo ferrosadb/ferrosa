@@ -102,7 +102,10 @@ fn partition(idx: usize, rows: usize) -> Partition {
 
 /// Build a file-backed SSTable of `n` partitions × `rows` rows and open it.
 /// Returns the tempdir (kept alive) and the opened reader.
-fn build_and_open(n: usize, rows: usize) -> (tempfile::TempDir, SSTableReader<FileReadAt>) {
+fn build_and_open(
+    n: usize,
+    rows: usize,
+) -> (tempfile::TempDir, std::sync::Arc<SSTableReader<FileReadAt>>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let staging = dir.path().join("staging");
     let options = WriteOptions {
@@ -128,7 +131,7 @@ fn build_and_open(n: usize, rows: usize) -> (tempfile::TempDir, SSTableReader<Fi
         compression_info: None,
         statistics: std::fs::read(&files.statistics).expect("read stats"),
     };
-    let reader = SSTableReader::open(components).expect("reader open");
+    let reader = std::sync::Arc::new(SSTableReader::open(components).expect("reader open"));
     (dir, reader)
 }
 
@@ -171,7 +174,7 @@ fn sstable_read_peak_scales_with_file_only_for_the_materializing_path() {
     let (_d2, large) = build_and_open(LARGE, ROWS);
 
     // Warm the chunk cache + lazily-built caches outside the measuring window.
-    let warm = |reader: &SSTableReader<FileReadAt>| {
+    let warm = |reader: &std::sync::Arc<SSTableReader<FileReadAt>>| {
         let mut iter = reader.partitions_iter().expect("iter");
         while iter.next_partition().expect("next").is_some() {}
     };

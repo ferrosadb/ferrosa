@@ -100,6 +100,7 @@ fn check_deferred_scan(prefetch: bool) {
     reader
         .load_crc_table(output.crc.as_ref().expect("uncompressed CRC"))
         .unwrap();
+    let reader = std::sync::Arc::new(reader);
     reads.store(0, Ordering::Relaxed);
     let mut cursor = reader.scan_iter().unwrap();
     assert!(cursor.next_partition_header_only().unwrap().is_some());

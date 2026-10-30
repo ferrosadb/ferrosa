@@ -6,6 +6,7 @@
 //! row counts, and cell summaries.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use ferrosa_sstable::io::FileReadAt;
 use ferrosa_sstable::reader::{SSTableComponents, SSTableReader};
@@ -57,7 +58,7 @@ fn main() {
         compression_info,
         statistics,
     }) {
-        Ok(r) => r,
+        Ok(r) => Arc::new(r),
         Err(e) => {
             eprintln!("Error opening SSTable: {e}");
             std::process::exit(1);

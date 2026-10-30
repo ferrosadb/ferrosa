@@ -73,16 +73,18 @@ fn write(header: &SerializationHeader, partitions: &[Partition]) -> crate::write
     writer.finish().unwrap()
 }
 
-fn open(output: &crate::writer::SSTableOutput) -> SSTableReader<&[u8]> {
-    SSTableReader::open(SSTableComponents {
-        data: output.data.as_slice(),
-        partitions: output.partitions.as_slice(),
-        rows: output.rows.as_slice(),
-        filter: output.filter.clone(),
-        compression_info: output.compression_info.clone(),
-        statistics: output.statistics.clone(),
-    })
-    .unwrap()
+fn open(output: &crate::writer::SSTableOutput) -> std::sync::Arc<SSTableReader<&[u8]>> {
+    std::sync::Arc::new(
+        SSTableReader::open(SSTableComponents {
+            data: output.data.as_slice(),
+            partitions: output.partitions.as_slice(),
+            rows: output.rows.as_slice(),
+            filter: output.filter.clone(),
+            compression_info: output.compression_info.clone(),
+            statistics: output.statistics.clone(),
+        })
+        .unwrap(),
+    )
 }
 
 fn legacy_reader_output() -> crate::writer::SSTableOutput {

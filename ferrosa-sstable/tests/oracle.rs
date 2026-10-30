@@ -75,8 +75,10 @@ fn oracle_golden_reads_back_through_reader() {
             compression_info: disk.compression_info,
             statistics: disk.statistics,
         };
-        let reader = SSTableReader::open(components)
-            .unwrap_or_else(|e| panic!("case {}: reader open failed: {e}", spec.name));
+        let reader = std::sync::Arc::new(
+            SSTableReader::open(components)
+                .unwrap_or_else(|e| panic!("case {}: reader open failed: {e}", spec.name)),
+        );
 
         assert_eq!(
             reader.key_count() as usize,

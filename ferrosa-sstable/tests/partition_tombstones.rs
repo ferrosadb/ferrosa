@@ -44,7 +44,7 @@ fn tombstone_partitions(n: u32) -> Vec<Partition> {
     partitions
 }
 
-fn assert_reads_back(reader: &SSTableReader<Vec<u8>>, expected: &[Partition]) {
+fn assert_reads_back(reader: &std::sync::Arc<SSTableReader<Vec<u8>>>, expected: &[Partition]) {
     let mut iter = reader.partitions_iter().expect("partitions_iter");
     let mut read = Vec::with_capacity(expected.len());
     for _ in 0..=expected.len() {
@@ -118,15 +118,17 @@ fn in_memory_roundtrip(n: u32) {
         writer.add_partition(p).expect("add_partition");
     }
     let out = writer.finish().expect("finish");
-    let reader = SSTableReader::open(SSTableComponents {
-        data: out.data,
-        partitions: out.partitions,
-        rows: out.rows,
-        filter: out.filter,
-        compression_info: out.compression_info,
-        statistics: out.statistics,
-    })
-    .expect("open");
+    let reader = std::sync::Arc::new(
+        SSTableReader::open(SSTableComponents {
+            data: out.data,
+            partitions: out.partitions,
+            rows: out.rows,
+            filter: out.filter,
+            compression_info: out.compression_info,
+            statistics: out.statistics,
+        })
+        .expect("open"),
+    );
     assert_reads_back(&reader, &partitions);
 }
 
@@ -144,15 +146,17 @@ fn file_backed_roundtrip(n: u32) {
         .finish_to_directory(&staging)
         .expect("finish_to_directory");
     let read = |p: &std::path::Path| std::fs::read(p).expect("read component");
-    let reader = SSTableReader::open(SSTableComponents {
-        data: read(&files.data),
-        partitions: read(&files.partitions),
-        rows: read(&files.rows),
-        filter: read(&files.filter),
-        compression_info: files.compression_info.as_deref().map(read),
-        statistics: read(&files.statistics),
-    })
-    .expect("open");
+    let reader = std::sync::Arc::new(
+        SSTableReader::open(SSTableComponents {
+            data: read(&files.data),
+            partitions: read(&files.partitions),
+            rows: read(&files.rows),
+            filter: read(&files.filter),
+            compression_info: files.compression_info.as_deref().map(read),
+            statistics: read(&files.statistics),
+        })
+        .expect("open"),
+    );
     assert_reads_back(&reader, &partitions);
 }
 

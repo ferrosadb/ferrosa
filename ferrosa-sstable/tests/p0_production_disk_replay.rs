@@ -21,7 +21,7 @@ fn load(dir: &Path, suffix: &str) -> Vec<u8> {
     fs::read(&path).unwrap_or_else(|e| panic!("read fixture component {}: {e}", path.display()))
 }
 
-fn open_fixture(dir: &Path) -> SSTableReader<Vec<u8>> {
+fn open_fixture(dir: &Path) -> std::sync::Arc<SSTableReader<Vec<u8>>> {
     let compression_info_path = dir.join("CompressionInfo.db");
     let compression_info = compression_info_path
         .exists()
@@ -34,11 +34,11 @@ fn open_fixture(dir: &Path) -> SSTableReader<Vec<u8>> {
         compression_info,
         statistics: load(dir, "Statistics.db"),
     };
-    SSTableReader::open(components).expect("open SSTable fixture")
+    std::sync::Arc::new(SSTableReader::open(components).expect("open SSTable fixture"))
 }
 
 fn collect_fixture_partitions(
-    reader: &SSTableReader<Vec<u8>>,
+    reader: &std::sync::Arc<SSTableReader<Vec<u8>>>,
 ) -> Vec<ferrosa_sstable::types::Partition> {
     let mut partitions = Vec::new();
     let mut iter = reader

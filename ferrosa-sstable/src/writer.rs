@@ -1915,11 +1915,11 @@ impl SSTableWriter {
             compression_info: output.compression_info.clone(),
             statistics: output.statistics.clone(),
         };
-        let reader = SSTableReader::open(components).map_err(|e| {
+        let reader = Arc::new(SSTableReader::open(components).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!(
                 "ferrosa-sstable/writer: verify_output_readable: reopen failed: {e}"
             ))
-        })?;
+        })?);
         let mut iter = reader.partitions_iter().map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!(
                 "ferrosa-sstable/writer: verify_output_readable: partitions_iter failed: {e}"
@@ -1966,11 +1966,11 @@ impl SSTableWriter {
             },
             statistics: std::fs::read(&output.statistics)?,
         };
-        let reader = SSTableReader::open(components).map_err(|e| {
+        let reader = Arc::new(SSTableReader::open(components).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!(
                 "ferrosa-sstable/writer: verify_output_files: reopen failed: {e}"
             ))
-        })?;
+        })?);
         let mut iter = reader.partitions_iter().map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!(
                 "ferrosa-sstable/writer: verify_output_files: partitions_iter failed: {e}"

@@ -97,7 +97,10 @@ fn partition(idx: usize, rows: usize) -> Partition {
     }
 }
 
-fn build_and_open(n: usize, rows: usize) -> (tempfile::TempDir, SSTableReader<FileReadAt>) {
+fn build_and_open(
+    n: usize,
+    rows: usize,
+) -> (tempfile::TempDir, std::sync::Arc<SSTableReader<FileReadAt>>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let staging = dir.path().join("staging");
     let options = WriteOptions {
@@ -122,12 +125,12 @@ fn build_and_open(n: usize, rows: usize) -> (tempfile::TempDir, SSTableReader<Fi
         compression_info: None,
         statistics: std::fs::read(&files.statistics).expect("stats"),
     };
-    let reader = SSTableReader::open(components).expect("open");
+    let reader = std::sync::Arc::new(SSTableReader::open(components).expect("open"));
     (dir, reader)
 }
 
 /// Scan every partition through the streaming reader and count allocations.
-fn scan_allocs(reader: &SSTableReader<FileReadAt>) -> usize {
+fn scan_allocs(reader: &std::sync::Arc<SSTableReader<FileReadAt>>) -> usize {
     let before = alloc_events();
     let mut iter = reader.partitions_iter().expect("iter");
     while iter.next_partition().expect("next").is_some() {}

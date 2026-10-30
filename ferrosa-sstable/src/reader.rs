@@ -286,24 +286,28 @@ pub fn fuzz_read_compressed_chunk<R: ReadAt>(
     read_compressed_chunk(data, ci, compressed_file_len, chunk_index)
 }
 
-struct ChunkedCompressedData<'a, R: ReadAt> {
-    data: &'a R,
-    ci: &'a CompressionInfo,
+/// Owned view of a compressed Data.db. Holds `Arc` clones of the reader's
+/// shared read-path fields so a [`PartitionIter`] can outlive any borrow of
+/// the [`SSTableReader`] it came from.
+struct ChunkedCompressedData<R: ReadAt> {
+    data: Arc<R>,
+    ci: Arc<CompressionInfo>,
     compressed_file_len: u64,
-    cache: &'a Mutex<ChunkCache>,
+    cache: Arc<Mutex<ChunkCache>>,
 }
 
-impl<'a, R: ReadAt> ChunkedCompressedData<'a, R> {
-    fn new(data: &'a R, ci: &'a CompressionInfo, cache: &'a Mutex<ChunkCache>) -> Result<Self> {
+impl<R: ReadAt> ChunkedCompressedData<R> {
+    fn new(data: Arc<R>, ci: Arc<CompressionInfo>, cache: Arc<Mutex<ChunkCache>>) -> Result<Self> {
         if ci.chunk_length == 0 {
             return Err(ferrosa_common::Error::InvalidFormat(
                 "compressed SSTable has zero chunk length".into(),
             ));
         }
+        let compressed_file_len = data.len()?;
         Ok(Self {
             data,
             ci,
-            compressed_file_len: data.len()?,
+            compressed_file_len,
             cache,
         })
     }
@@ -317,8 +321,8 @@ impl<'a, R: ReadAt> ChunkedCompressedData<'a, R> {
         }
 
         let chunk = Arc::new(read_compressed_chunk(
-            self.data,
-            self.ci,
+            self.data.as_ref(),
+            self.ci.as_ref(),
             self.compressed_file_len,
             chunk_index,
         )?);
@@ -328,7 +332,7 @@ impl<'a, R: ReadAt> ChunkedCompressedData<'a, R> {
     }
 }
 
-impl<R: ReadAt> ReadAt for ChunkedCompressedData<'_, R> {
+impl<R: ReadAt> ReadAt for ChunkedCompressedData<R> {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
         if buf.is_empty() || offset >= self.ci.data_length {
             return Ok(0);
@@ -362,15 +366,15 @@ impl<R: ReadAt> ReadAt for ChunkedCompressedData<'_, R> {
 /// but validates a chunk against its stored CRC32 instead of decompressing
 /// it — a mismatch names the chunk's byte offset in Data.db (spec:
 /// `publication-safety.md` M1; see `checksum` module docs for the layout).
-struct ChunkedUncompressedData<'a, R: ReadAt> {
-    data: &'a R,
-    table: &'a ChunkCrcTable,
+struct ChunkedUncompressedData<R: ReadAt> {
+    data: Arc<R>,
+    table: Arc<ChunkCrcTable>,
     data_len: u64,
-    cache: &'a Mutex<ChunkCache>,
+    cache: Arc<Mutex<ChunkCache>>,
 }
 
-impl<'a, R: ReadAt> ChunkedUncompressedData<'a, R> {
-    fn new(data: &'a R, table: &'a ChunkCrcTable, cache: &'a Mutex<ChunkCache>) -> Result<Self> {
+impl<R: ReadAt> ChunkedUncompressedData<R> {
+    fn new(data: Arc<R>, table: Arc<ChunkCrcTable>, cache: Arc<Mutex<ChunkCache>>) -> Result<Self> {
         let data_len = data.len()?;
         let expected = table.expected_chunk_count(data_len);
         if expected != table.crcs.len() as u64 {
@@ -426,7 +430,7 @@ impl<'a, R: ReadAt> ChunkedUncompressedData<'a, R> {
     }
 }
 
-impl<R: ReadAt> ReadAt for ChunkedUncompressedData<'_, R> {
+impl<R: ReadAt> ReadAt for ChunkedUncompressedData<R> {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
         if buf.is_empty() || offset >= self.data_len {
             return Ok(0);
@@ -462,10 +466,10 @@ impl<R: ReadAt> ReadAt for ChunkedUncompressedData<'_, R> {
 /// A sequential cursor owns its two chunk buffers. RefCell expresses local
 /// mutation through ReadAt's shared-reference interface; no chunk-cache lock,
 /// Arc allocation, or sharing with point readers occurs on this path.
-struct ScanData<'a, R: ReadAt> {
-    data: &'a R,
-    compression: Option<&'a CompressionInfo>,
-    crc: Option<&'a ChunkCrcTable>,
+struct ScanData<R: ReadAt> {
+    data: Arc<R>,
+    compression: Option<Arc<CompressionInfo>>,
+    crc: Option<Arc<ChunkCrcTable>>,
     file_len: u64,
     len: u64,
     buffers: std::cell::RefCell<ScanBuffers>,
@@ -490,7 +494,7 @@ impl<R: ReadAt> ReadAt for ScanChunkRead<'_, R> {
         }
     }
 }
-impl<R: ReadAt> ReadAt for ScanData<'_, R> {
+impl<R: ReadAt> ReadAt for ScanData<R> {
     fn len(&self) -> Result<u64> {
         Ok(self.len)
     }
@@ -506,10 +510,12 @@ impl<R: ReadAt> ReadAt for ScanData<'_, R> {
         if self.compression.is_none() && self.crc.is_none() {
             return self.data.validate_range(offset, len);
         }
-        let chunk_size =
-            self.compression
-                .map(|c| c.chunk_length)
-                .unwrap_or_else(|| self.crc.expect("CRC").chunk_size as usize) as u64;
+        let chunk_size = self
+            .compression
+            .as_ref()
+            .map(|c| c.chunk_length)
+            .unwrap_or_else(|| self.crc.as_ref().expect("CRC").chunk_size as usize)
+            as u64;
         let mut pos = offset;
         let mut byte = [0u8; 1];
         while pos < end {
@@ -524,8 +530,9 @@ impl<R: ReadAt> ReadAt for ScanData<'_, R> {
         }
         let chunk_size = self
             .compression
+            .as_ref()
             .map(|c| c.chunk_length)
-            .unwrap_or_else(|| self.crc.expect("CRC or compression").chunk_size as usize);
+            .unwrap_or_else(|| self.crc.as_ref().expect("CRC or compression").chunk_size as usize);
         let mut copied = 0;
         let available = self.len.saturating_sub(offset).min(buf.len() as u64) as usize;
         let mut buffers = self.buffers.borrow_mut();
@@ -536,13 +543,13 @@ impl<R: ReadAt> ReadAt for ScanData<'_, R> {
                 let sparse = buffers
                     .index
                     .is_some_and(|previous| previous.checked_add(1) != Some(index));
-                let source = ScanChunkRead(self.data, sparse);
+                let source = ScanChunkRead(self.data.as_ref(), sparse);
                 buffers.index = None;
-                if let Some(ci) = self.compression {
+                if let Some(ci) = self.compression.as_deref() {
                     let ScanBuffers { input, output, .. } = &mut *buffers;
                     read_compressed_chunk_into(&source, ci, self.file_len, index, input, output)?;
                 } else {
-                    let table = self.crc.expect("CRC table");
+                    let table = self.crc.as_deref().expect("CRC table");
                     let start = index as u64 * chunk_size as u64;
                     let len = self.len.saturating_sub(start).min(chunk_size as u64) as usize;
                     buffers.output.resize(len, 0);
@@ -573,14 +580,14 @@ impl<R: ReadAt> ReadAt for ScanData<'_, R> {
     }
 }
 
-enum ReadSource<'a, R: ReadAt> {
-    Scan(ScanData<'a, R>),
-    Compressed(ChunkedCompressedData<'a, R>),
-    Verified(ChunkedUncompressedData<'a, R>),
-    Raw(&'a R),
+enum ReadSource<R: ReadAt> {
+    Scan(ScanData<R>),
+    Compressed(ChunkedCompressedData<R>),
+    Verified(ChunkedUncompressedData<R>),
+    Raw(Arc<R>),
 }
 
-impl<R: ReadAt> ReadAt for ReadSource<'_, R> {
+impl<R: ReadAt> ReadAt for ReadSource<R> {
     fn validate_range(&self, offset: u64, len: usize) -> Result<()> {
         match self {
             Self::Scan(d) => d.validate_range(offset, len),
@@ -824,18 +831,18 @@ impl<R: ReadAt> SSTableReader<R> {
     /// The unchecked case logs once per generation, never errors — an old
     /// SSTable predating T-011, or one opened without
     /// [`Self::load_crc_table`], must keep working.
-    fn data_source(&self) -> Result<ReadSource<'_, R>> {
+    fn data_source(&self) -> Result<ReadSource<R>> {
         if let Some(ref ci) = self.compression_info {
             Ok(ReadSource::Compressed(ChunkedCompressedData::new(
-                self.data.as_ref(),
-                ci,
-                self.decompressed_chunks.as_ref(),
+                Arc::clone(&self.data),
+                Arc::clone(ci),
+                Arc::clone(&self.decompressed_chunks),
             )?))
         } else if let Some(ref table) = self.crc_table {
             Ok(ReadSource::Verified(ChunkedUncompressedData::new(
-                self.data.as_ref(),
-                table,
-                self.verified_uncompressed_chunks.as_ref(),
+                Arc::clone(&self.data),
+                Arc::clone(table),
+                Arc::clone(&self.verified_uncompressed_chunks),
             )?))
         } else {
             if !self.crc_missing_warned.swap(true, Ordering::Relaxed) {
@@ -844,7 +851,7 @@ impl<R: ReadAt> SSTableReader<R> {
                      checksum-verified (old SSTable predating T-011, or CRC.db not loaded)"
                 );
             }
-            Ok(ReadSource::Raw(self.data.as_ref()))
+            Ok(ReadSource::Raw(Arc::clone(&self.data)))
         }
     }
 
@@ -866,20 +873,26 @@ impl<R: ReadAt> SSTableReader<R> {
         self.partition_offsets
             .get_or_init(|| {
                 let mut offsets: Vec<u64> = Vec::new();
-                let mut iter = match self.partitions_iter() {
-                    Ok(it) => it,
+                // The walk is built here rather than through `partitions_iter`
+                // because that iterator now owns an `Arc<SSTableReader<R>>` and
+                // this `&self` method cannot mint one; the walk itself only
+                // needs the data source and the serialization header.
+                let source = match self.data_source() {
+                    Ok(source) => source,
                     Err(_) => {
                         // Caller falls back to body-decode advance.
                         return std::sync::Arc::new(offsets);
                     }
                 };
+                let mut pos = 0u64;
                 loop {
-                    let pos_before = iter.pos;
-                    match iter.next_partition_count() {
+                    let pos_before = pos;
+                    let mut reader = DataReader::new(&source, &self.stored, pos);
+                    match reader.read_partition_count() {
                         Ok(Some(_)) => offsets.push(pos_before),
-                        Ok(None) => break,
-                        Err(_) => break,
+                        Ok(None) | Err(_) => break,
                     }
+                    pos = reader.position();
                 }
                 std::sync::Arc::new(offsets)
             })
@@ -930,8 +943,11 @@ impl<R: ReadAt> SSTableReader<R> {
         max_entries: usize,
     ) -> std::sync::Arc<Vec<(i64, u64)>> {
         let mut out: Vec<(i64, u64)> = Vec::new();
-        let mut iter = match self.partitions_iter() {
-            Ok(it) => it,
+        // Built directly rather than through `partitions_iter` for the same
+        // reason as `partition_offsets`: this `&self` method cannot mint the
+        // `Arc<SSTableReader<R>>` that iterator owns.
+        let source = match self.data_source() {
+            Ok(source) => source,
             Err(_) => return std::sync::Arc::new(out),
         };
         let n = self.partition_index.key_count() as usize;
@@ -941,20 +957,21 @@ impl<R: ReadAt> SSTableReader<R> {
         // their seek behaviour is byte-identical to the old code.
         let stride = if n <= max { 1 } else { n.div_ceil(max) };
         let mut i = 0usize;
+        let mut pos = 0u64;
         loop {
-            let pos = iter.pos;
-            match iter.peek_partition_key() {
+            let mut peek = DataReader::new(&source, &self.stored, pos);
+            match peek.peek_partition_key() {
                 Ok(Some(dk)) => {
                     if i.is_multiple_of(stride) {
                         out.push((dk.token.0, pos));
                     }
                 }
-                Ok(None) => break,
-                Err(_) => break,
+                Ok(None) | Err(_) => break,
             }
             i += 1;
-            match iter.next_partition_metadata() {
-                Ok(Some(_)) => {}
+            let mut advance = DataReader::new(&source, &self.stored, pos);
+            match advance.read_partition_metadata() {
+                Ok(Some(_)) => pos = advance.position(),
                 Ok(None) | Err(_) => break,
             }
         }
@@ -1269,8 +1286,8 @@ impl<R: ReadAt> SSTableReader<R> {
     /// Stream partitions from this SSTable in storage (token) order, one at
     /// a time, without materializing the whole file into memory.
     ///
-    /// The returned iterator borrows this `SSTableReader` for its lifetime
-    /// and decompresses the Data.db once up-front (for compressed
+    /// The returned iterator owns an `Arc` to this `SSTableReader` (rather than
+    /// borrowing it) and decompresses the Data.db once up-front (for compressed
     /// SSTables) or reads directly from the underlying [`ReadAt`] (for
     /// uncompressed). Each call to [`PartitionIter::next_partition`] yields
     /// at most one partition; the iterator returns `Ok(None)` at EOF.
@@ -1278,13 +1295,13 @@ impl<R: ReadAt> SSTableReader<R> {
     /// Memory: `O(decompressed_chunk_cache_entries * chunk_length)` for
     /// compressed SSTables via the bounded chunk LRU, `O(1)` for uncompressed.
     /// Independent of partition count.
-    pub fn partitions_iter(&self) -> Result<PartitionIter<'_, R>> {
+    pub fn partitions_iter(self: &Arc<Self>) -> Result<PartitionIter<R>> {
         PartitionIter::new(self)
     }
 
     /// Sequential, task-owned scan buffers bypass the shared chunk caches.
     /// The cursor is deliberately not Sync; each worker owns its decode state.
-    pub fn scan_iter(&self) -> Result<PartitionIter<'_, R>> {
+    pub fn scan_iter(self: &Arc<Self>) -> Result<PartitionIter<R>> {
         let file_len = self.data.len()?;
         if let Some(crc) = &self.crc_table {
             if crc.expected_chunk_count(file_len) != crc.crcs.len() as u64 {
@@ -1298,12 +1315,12 @@ impl<R: ReadAt> SSTableReader<R> {
             .as_ref()
             .map_or(file_len, |ci| ci.data_length);
         Ok(PartitionIter {
-            sst: self,
+            sst: Arc::clone(self),
             pos: 0,
             source: ReadSource::Scan(ScanData {
-                data: self.data.as_ref(),
-                compression: self.compression_info.as_deref(),
-                crc: self.crc_table.as_deref(),
+                data: Arc::clone(&self.data),
+                compression: self.compression_info.clone(),
+                crc: self.crc_table.clone(),
                 file_len,
                 len,
                 buffers: std::cell::RefCell::new(ScanBuffers::default()),
@@ -1379,7 +1396,9 @@ impl<R: ReadAt> SSTableReader<R> {
     {
         let mut stats = SalvageStats::default();
         let source = self.data_source()?;
-        let mut walk = self.partitions_iter()?;
+        // Walked directly (not via `partitions_iter`) because that iterator owns
+        // an `Arc<SSTableReader<R>>` and this `&self` method cannot mint one.
+        let mut pos = 0u64;
         let mut row = crate::types::Row {
             clustering: Vec::new(),
             cells: Vec::new(),
@@ -1387,8 +1406,9 @@ impl<R: ReadAt> SSTableReader<R> {
             primary_key_liveness: crate::types::LivenessInfo::NONE,
         };
         loop {
-            let start = walk.pos;
-            match walk.next_partition_count() {
+            let start = pos;
+            let mut walk = DataReader::new(&source, &self.stored, pos);
+            match walk.read_partition_count() {
                 Ok(Some(_)) => {}
                 Ok(None) => break,
                 Err(e) => {
@@ -1398,6 +1418,7 @@ impl<R: ReadAt> SSTableReader<R> {
                     break;
                 }
             }
+            pos = walk.position();
             Self::salvage_one(
                 &source,
                 &self.stored,
@@ -1578,21 +1599,21 @@ pub struct SalvageStats {
 ///
 /// Memory cost is constant in the number of partitions — only the
 /// currently-yielded `Partition` is materialized.
-pub struct PartitionIter<'a, R: ReadAt> {
-    sst: &'a SSTableReader<R>,
+pub struct PartitionIter<R: ReadAt> {
+    sst: Arc<SSTableReader<R>>,
     pos: u64,
     /// How this iterator reads Data.db — decompressed chunks (compressed
     /// tables), CRC-verified chunks (uncompressed tables with a loaded
     /// `CRC.db`), or directly (uncompressed, unchecked). Selected once at
     /// construction; see [`SSTableReader::data_source`].
-    source: ReadSource<'a, R>,
+    source: ReadSource<R>,
 }
 
-impl<'a, R: ReadAt> PartitionIter<'a, R> {
-    fn new(sst: &'a SSTableReader<R>) -> Result<Self> {
+impl<R: ReadAt> PartitionIter<R> {
+    fn new(sst: &Arc<SSTableReader<R>>) -> Result<Self> {
         let source = sst.data_source()?;
         Ok(Self {
-            sst,
+            sst: Arc::clone(sst),
             pos: 0,
             source,
         })
@@ -2310,7 +2331,7 @@ mod tests {
             statistics: stats_bytes,
         };
 
-        let reader = SSTableReader::open(components).unwrap();
+        let reader = Arc::new(SSTableReader::open(components).unwrap());
 
         // Verify key count
         assert_eq!(reader.key_count(), 1);
@@ -2356,7 +2377,7 @@ mod tests {
             compression_info: None,
             statistics: stats_bytes,
         };
-        let reader = SSTableReader::open(components).unwrap();
+        let reader = Arc::new(SSTableReader::open(components).unwrap());
         assert_eq!(reader.key_count(), 2);
         assert_eq!(
             reader.walkable_partition_count(),
@@ -2399,7 +2420,7 @@ mod tests {
             compression_info: None,
             statistics: stats_bytes,
         };
-        let reader = SSTableReader::open(components).unwrap();
+        let reader = Arc::new(SSTableReader::open(components).unwrap());
 
         assert_eq!(reader.key_count(), 2, "index must claim 2 partitions");
         assert_eq!(
@@ -2445,7 +2466,7 @@ mod tests {
             statistics: stats_bytes,
         };
 
-        let reader = SSTableReader::open(components).unwrap();
+        let reader = Arc::new(SSTableReader::open(components).unwrap());
 
         // The missing key should not be present in the bloom filter.
         // Due to the probabilistic nature, we verify via the bloom_filter
@@ -2488,7 +2509,7 @@ mod tests {
             statistics: stats_bytes,
         };
 
-        let reader = SSTableReader::open(components).unwrap();
+        let reader = Arc::new(SSTableReader::open(components).unwrap());
         let partitions = reader.read_partitions_limited_rows(2, 1).unwrap();
 
         assert_eq!(partitions.len(), 2);
@@ -2519,7 +2540,7 @@ mod tests {
             statistics: stats_bytes,
         };
 
-        let reader = SSTableReader::open(components).unwrap();
+        let reader = Arc::new(SSTableReader::open(components).unwrap());
         let partition = reader
             .get_partition_limited_rows(&dk, 2)
             .unwrap()
@@ -2663,7 +2684,7 @@ mod tests {
             statistics: stats,
         };
 
-        let reader = SSTableReader::open(components).unwrap();
+        let reader = Arc::new(SSTableReader::open(components).unwrap());
         let partition = reader
             .get_partition_limited_rows(&dk, 1)
             .unwrap()
@@ -2747,7 +2768,7 @@ mod tests {
                 statistics: output.statistics,
             };
 
-            let reader = SSTableReader::open(components).unwrap();
+            let reader = Arc::new(SSTableReader::open(components).unwrap());
             let partition = reader
                 .get_partition_limited_rows(&dk, 1)
                 .unwrap()
@@ -2832,7 +2853,7 @@ mod tests {
             statistics: output.statistics,
         };
 
-        let reader = SSTableReader::open(components).unwrap();
+        let reader = Arc::new(SSTableReader::open(components).unwrap());
         let target = 900_i32.to_be_bytes();
         let partition = reader
             .get_clustering_row(&dk, &target)
@@ -2922,7 +2943,7 @@ mod tests {
             statistics: output.statistics,
         };
 
-        let reader = SSTableReader::open(components).unwrap();
+        let reader = Arc::new(SSTableReader::open(components).unwrap());
         let target = 1_800_i32.to_be_bytes();
         let partition = reader
             .get_clustering_row(&dk, &target)
@@ -2993,7 +3014,7 @@ mod tests {
             statistics: output.statistics,
         };
 
-        let reader = SSTableReader::open(components).unwrap();
+        let reader = Arc::new(SSTableReader::open(components).unwrap());
         let partition = reader
             .get_partition_limited_rows(&dk, 5)
             .unwrap()
@@ -3039,7 +3060,7 @@ mod tests {
             statistics: stats_bytes,
         };
 
-        let reader = SSTableReader::open(components).unwrap();
+        let reader = Arc::new(SSTableReader::open(components).unwrap());
         assert_eq!(reader.key_count(), 3);
 
         // Verify header accessor
@@ -3090,7 +3111,7 @@ mod tests {
             compression_info: None,
             statistics: stats_bytes,
         };
-        let reader = SSTableReader::open(components).unwrap();
+        let reader = Arc::new(SSTableReader::open(components).unwrap());
 
         let materialized = reader
             .read_partitions_limited(dks.len())
@@ -3147,7 +3168,7 @@ mod tests {
             compression_info: None,
             statistics: stats_bytes,
         };
-        let reader = SSTableReader::open(components).unwrap();
+        let reader = Arc::new(SSTableReader::open(components).unwrap());
 
         // Seek to the token of the 10th partition. After seek, the
         // iterator's NEXT decoded partition must be that one — every
@@ -3217,7 +3238,7 @@ mod tests {
             compression_info: None,
             statistics: stats_bytes,
         };
-        let reader = SSTableReader::open(components).unwrap();
+        let reader = Arc::new(SSTableReader::open(components).unwrap());
 
         // Downsample target smaller than the partition count → the summary
         // must be bounded by `max`, not equal to `n`.
@@ -3289,7 +3310,7 @@ mod tests {
             compression_info: None,
             statistics: stats_bytes,
         };
-        let reader = SSTableReader::open(components).unwrap();
+        let reader = Arc::new(SSTableReader::open(components).unwrap());
 
         let mut iter = reader.partitions_iter().unwrap();
         let (key, _deletion, static_row) = iter.next_partition_header_only().unwrap().unwrap();
@@ -3348,7 +3369,7 @@ mod tests {
             compression_info: None,
             statistics: stats_bytes,
         };
-        let reader = SSTableReader::open(components).unwrap();
+        let reader = Arc::new(SSTableReader::open(components).unwrap());
 
         // Baseline via `next_partition`.
         let mut baseline = Vec::new();
@@ -3409,7 +3430,7 @@ mod tests {
             compression_info: None,
             statistics: stats_bytes,
         };
-        let reader = SSTableReader::open(components).unwrap();
+        let reader = Arc::new(SSTableReader::open(components).unwrap());
 
         // Baseline: the whole partition in one shot.
         let whole = reader
@@ -3483,7 +3504,7 @@ mod tests {
             compression_info: None,
             statistics: stats_bytes,
         };
-        let reader = SSTableReader::open(components).unwrap();
+        let reader = Arc::new(SSTableReader::open(components).unwrap());
 
         // Baseline: collect via `next_partition`.
         let mut materialised = Vec::new();
@@ -3560,7 +3581,7 @@ mod tests {
             compression_info: None,
             statistics: stats_bytes,
         };
-        let reader = SSTableReader::open(components).unwrap();
+        let reader = Arc::new(SSTableReader::open(components).unwrap());
 
         // Reference: full partition iteration with row counts.
         let mut iter_full = reader.partitions_iter().expect("partitions_iter");
@@ -3620,7 +3641,7 @@ mod tests {
             compression_info: None,
             statistics: stats_bytes,
         };
-        let reader = SSTableReader::open(components).unwrap();
+        let reader = Arc::new(SSTableReader::open(components).unwrap());
 
         // Reference iteration: full next_partition over every partition.
         let mut iter_ref = reader.partitions_iter().unwrap();
@@ -3691,7 +3712,7 @@ mod tests {
             compression_info: None,
             statistics: stats_bytes,
         };
-        let reader = SSTableReader::open(components).unwrap();
+        let reader = Arc::new(SSTableReader::open(components).unwrap());
 
         let mut iter = reader.partitions_iter().expect("partitions_iter");
         for expected in &dks {
@@ -3756,7 +3777,7 @@ mod tests {
             compression_info: None,
             statistics: stats_bytes,
         };
-        let reader = SSTableReader::open(components).unwrap();
+        let reader = Arc::new(SSTableReader::open(components).unwrap());
 
         let mut iter_full = reader.partitions_iter().expect("partitions_iter (full)");
         let mut full = Vec::new();
@@ -3818,7 +3839,7 @@ mod tests {
             compression_info: None,
             statistics: stats_bytes,
         };
-        let reader = SSTableReader::open(components).unwrap();
+        let reader = Arc::new(SSTableReader::open(components).unwrap());
 
         // Reference: full partition iteration.
         let mut iter_full = reader.partitions_iter().expect("partitions_iter (full)");
@@ -3886,7 +3907,7 @@ mod tests {
             compression_info: None,
             statistics: stats_bytes,
         };
-        let reader = SSTableReader::open(components).unwrap();
+        let reader = Arc::new(SSTableReader::open(components).unwrap());
         let mut iter = reader.partitions_iter().unwrap();
 
         let partition = iter
@@ -4007,7 +4028,7 @@ mod tests {
             compression_info: output.compression_info,
             statistics: output.statistics,
         };
-        let reader = SSTableReader::open(components).unwrap();
+        let reader = Arc::new(SSTableReader::open(components).unwrap());
 
         let mut delivered = 0u64;
         // Must return Ok (never propagate a per-partition failure).

@@ -121,7 +121,7 @@ fn row(i: i32, complex: bool) -> Row {
         },
     }
 }
-fn reader(output: SSTableOutput) -> (SSTableReader<Traced>, Arc<AtomicUsize>, usize) {
+fn reader(output: SSTableOutput) -> (Arc<SSTableReader<Traced>>, Arc<AtomicUsize>, usize) {
     let read = Arc::new(AtomicUsize::new(0));
     let size = output.data.len();
     let traced = |bytes| Traced {
@@ -141,7 +141,7 @@ fn reader(output: SSTableOutput) -> (SSTableReader<Traced>, Arc<AtomicUsize>, us
         r.load_crc_table(&crc).unwrap();
     }
     r.load_digest(&output.digest).unwrap();
-    (r, read, size)
+    (Arc::new(r), read, size)
 }
 #[test]
 fn scan_cursor_parity_allocation_pull_and_failure_contracts() {
