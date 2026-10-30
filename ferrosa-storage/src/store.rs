@@ -1432,7 +1432,7 @@ impl<F: FlushTarget> FulltextSidecarBuild<F> {
 /// Under Miri the sharded BTree memtable is used whatever the features say:
 /// crossbeam-skiplist 0.1.3 / crossbeam-epoch 0.9.18 trip Miri's aliasing
 /// models inside their own code (upstream, crossbeam#545), which would stop
-/// Miri before it reaches ferrosa's own unsafe (`OwnedMerger`). Production
+/// Miri before it reaches ferrosa's own `OwnedMerger` store-view cast. Production
 /// builds never set `miri`.
 fn new_memtable() -> Arc<dyn Memtable> {
     #[cfg(all(feature = "skiplist-memtable", not(miri)))]
@@ -2080,18 +2080,16 @@ enum ScanRun {
     Yielded,
 }
 
-/// A [`crate::range_merger::RangeMerger`] that owns everything it borrows: the
-/// store view whose memtables it iterates, the open SSTable readers, the
-/// column mappings and the projection. A paused scan keeps one of these, so
-/// it resumes at its exact position, on any thread, at no cost — no re-open,
-/// no re-seek, no skip, and exactly the output of a scan that never paused.
+/// A [`crate::range_merger::RangeMerger`] that outlives the borrows a plain
+/// merger would take: it owns the store view whose memtables it iterates, and
+/// its merger owns the SSTable readers, column mappings and projection. A
+/// paused scan keeps one of these, so it resumes at its exact position, on any
+/// thread, at no cost — no re-open, no re-seek, no skip, and exactly the output
+/// of a scan that never paused.
 struct OwnedMerger<R: ReadAt + Send + Sync + 'static> {
     // Declared FIRST so it is dropped first (fields drop in declaration
-    // order): it borrows from every field below.
+    // order): its memtable iterators borrow from `_view` below.
     merger: crate::range_merger::RangeMerger<'static, R>,
-    _mappings: Box<[ColumnOrdinalMapping]>,
-    _wanted: Option<Box<[u16]>>,
-    _readers: Box<[Arc<SSTableReader<R>>]>,
     _view: Arc<StoreView>,
 }
 
@@ -2104,29 +2102,21 @@ impl<R: ReadAt + Send + Sync + 'static> OwnedMerger<R> {
         start: Option<DecoratedKey>,
         end: Option<DecoratedKey>,
     ) -> Result<Self> {
-        let readers: Box<[Arc<SSTableReader<R>>]> = readers.into_boxed_slice();
-        let mappings: Box<[ColumnOrdinalMapping]> =
-            sstable_column_mappings(schema, &readers).into_boxed_slice();
-        let wanted: Option<Box<[u16]>> = wanted.map(Vec::into_boxed_slice);
-        // SAFETY: each reference below points into a heap allocation — the
-        // `StoreView` behind an `Arc`, or a boxed slice — that this struct
-        // owns, never mutates, and frees only after `merger` is dropped
-        // (`merger` is the first field). Moving the struct moves the `Arc` and
-        // `Box` pointers, not the allocations, so the references stay valid
-        // for as long as `merger` can use them; nothing hands them out beyond
-        // the struct. This is the stable-allocation pattern the merger itself
-        // uses for its SSTable runs (`runs_arena`). On unwind the struct drops
-        // like any other value, merger first. Checked under Miri (Tree
-        // Borrows): `owned_merger_*` tests, which a projection freed early
-        // turns into a reported use-after-free.
+        let mappings: Vec<ColumnOrdinalMapping> = sstable_column_mappings(schema, &readers);
+        // SAFETY: the memtable iterators built below borrow the `StoreView`
+        // behind `view`: `Memtable::range_iter` takes `&self` and its
+        // implementations hand out iterators that hold that borrow (a
+        // crossbeam-skiplist iterator over the map, or `ShardedRangeIter`
+        // holding `&self` and re-seeking under read locks). So the merger is
+        // `RangeMerger<'static, R>` only because of those iterators, and the
+        // view must outlive it. `_view` owns exactly that `Arc<StoreView>`,
+        // `merger` is declared first so it drops first, and moving the struct
+        // moves the `Arc` pointer, not the view — the reference stays valid
+        // for as long as `merger` can use it, and nothing hands it out beyond
+        // the struct. Nothing else is cast to `'static` any more: the
+        // SSTable sources and the column mappings are owned `Arc`s inside the
+        // merger. Checked under Miri (Tree Borrows): `owned_merger_*` tests.
         let view_ref: &'static StoreView = unsafe { &*Arc::as_ptr(&view) };
-        let readers_ref: &'static [Arc<SSTableReader<R>>] =
-            unsafe { &*(&*readers as *const [Arc<SSTableReader<R>>]) };
-        let mappings_ref: &'static [ColumnOrdinalMapping] =
-            unsafe { &*(&*mappings as *const [ColumnOrdinalMapping]) };
-        let wanted_ref: Option<&'static [u16]> = wanted
-            .as_deref()
-            .map(|wanted| unsafe { &*(wanted as *const [u16]) });
 
         let active_iter = view_ref.active.range_iter(start.as_ref(), end.as_ref());
         // Every sealed memtable still being flushed is a source, as in the
@@ -2136,12 +2126,15 @@ impl<R: ReadAt + Send + Sync + 'static> OwnedMerger<R> {
             .iter()
             .map(|sealed| sealed.memtable.range_iter(start.as_ref(), end.as_ref()))
             .collect();
-        let merger = match wanted_ref {
+        // The merger clones the readers and mappings into owned `Arc`s, so
+        // `readers`, `mappings` and `wanted` are plain locals here and drop
+        // at the end of this function.
+        let merger = match wanted.as_deref() {
             Some(wanted) => crate::range_merger::merger_for_projected_sources_with_mappings(
                 active_iter,
                 flushing_iters,
-                readers_ref,
-                mappings_ref,
+                &readers,
+                &mappings,
                 wanted,
                 start,
                 end,
@@ -2149,17 +2142,14 @@ impl<R: ReadAt + Send + Sync + 'static> OwnedMerger<R> {
             None => crate::range_merger::merger_for_sources_with_mappings(
                 active_iter,
                 flushing_iters,
-                readers_ref,
-                mappings_ref,
+                &readers,
+                &mappings,
                 start,
                 end,
             )?,
         };
         Ok(Self {
             merger,
-            _mappings: mappings,
-            _wanted: wanted,
-            _readers: readers,
             _view: view,
         })
     }
@@ -20105,7 +20095,7 @@ mod tests {
         OwnedMerger::open(view, readers, &schema, None, None, None).unwrap()
     }
 
-    /// The `OwnedMerger` self-reference (unsafe) under the conditions it must
+    /// The `OwnedMerger` self-reference (the store-view cast) under the conditions it must
     /// survive, with no async runtime so Miri can run it
     /// (`cargo +nightly miri test -p ferrosa-storage --lib owned_merger`):
     /// moved between threads mid-scan, outliving the store it came from, and

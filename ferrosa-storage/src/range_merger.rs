@@ -426,8 +426,8 @@ pub enum MergeSource<'a, R: ReadAt> {
     /// the body from the same offset and clears the cache.
     SsTable {
         iter: PartitionIter<R>,
-        mode: RunMode<'a>,
-        mapping: Option<&'a ColumnOrdinalMapping>,
+        mode: RunMode,
+        mapping: Option<Arc<ColumnOrdinalMapping>>,
         peeked_key: Option<DecoratedKey>,
         failed: bool,
     },
@@ -438,7 +438,7 @@ pub enum MergeSource<'a, R: ReadAt> {
     /// reads the current SSTable's header; `pop_partition` decodes
     /// the body.
     SsTableRun {
-        run: SsTableRunIter<'a, R>,
+        run: SsTableRunIter<R>,
         peeked_key: Option<DecoratedKey>,
     },
 }
@@ -545,6 +545,7 @@ impl<'a, R: ReadAt> MergeSource<'a, R> {
                     RunMode::Metadata => iter.next_partition_metadata(),
                     RunMode::Projected(wanted) => {
                         let source_wanted = mapping
+                            .as_deref()
                             .map(|m| m.source_regular_ordinals_for_projection(wanted))
                             .unwrap_or_else(|| wanted.to_vec());
                         iter.next_partition_projected(&source_wanted)
@@ -563,7 +564,7 @@ impl<'a, R: ReadAt> MergeSource<'a, R> {
                     }
                     Err(e) => return Err(e),
                 };
-                if let (Some(mapping), Some(partition)) = (mapping, partition.as_mut()) {
+                if let (Some(mapping), Some(partition)) = (mapping.as_deref(), partition.as_mut()) {
                     mapping.remap_partition(partition);
                 }
                 Ok(partition.map(Arc::new))
@@ -668,7 +669,7 @@ impl<'a, R: ReadAt> MergeSource<'a, R> {
                     Err(e) => return Err(e),
                 };
                 let (key, deletion, mut static_row) = header;
-                if let (Some(mapping), Some(sr)) = (*mapping, static_row.as_mut()) {
+                if let (Some(mapping), Some(sr)) = (mapping.as_deref(), static_row.as_mut()) {
                     mapping.remap_static_row(sr);
                 }
                 Ok(Some(PoppedHeader {
@@ -711,11 +712,12 @@ impl<'a, R: ReadAt> MergeSource<'a, R> {
                 if *failed {
                     return Ok(None);
                 }
-                let mode = *mode;
-                let mapping = *mapping;
-                let row = match mode {
+                let mode = mode.clone();
+                let mapping = mapping.clone();
+                let row = match &mode {
                     RunMode::Projected(wanted) => {
                         let source_wanted = mapping
+                            .as_deref()
                             .map(|m| m.source_regular_ordinals_for_projection(wanted))
                             .unwrap_or_else(|| wanted.to_vec());
                         iter.next_clustered_row_projected(&source_wanted)
@@ -735,7 +737,7 @@ impl<'a, R: ReadAt> MergeSource<'a, R> {
                     }
                     Err(e) => return Err(e),
                 };
-                if let (Some(mapping), Some(r)) = (mapping, row.as_mut()) {
+                if let (Some(mapping), Some(r)) = (mapping.as_deref(), row.as_mut()) {
                     mapping.remap_regular_row(r);
                 }
                 Ok(row)
@@ -790,28 +792,28 @@ impl<'a, R: ReadAt> MergeSource<'a, R> {
 /// `Mode` controls per-cell decoding behavior — the same `Full /
 /// Metadata / Projected` choice the merger exposes for single-
 /// SSTable sources, lifted into the run.
-pub struct SsTableRunIter<'a, R: ReadAt> {
-    sstables: &'a [Arc<SSTableReader<R>>],
-    mode: RunMode<'a>,
+pub struct SsTableRunIter<R: ReadAt> {
+    sstables: Arc<[Arc<SSTableReader<R>>]>,
+    mode: RunMode,
     cursor: usize,
     /// `partitions_iter()` for `sstables[cursor]`; `None` until
     /// first use or after the current table exhausts.
     current: Option<PartitionIter<R>>,
 }
 
-#[derive(Clone, Copy)]
-pub enum RunMode<'a> {
+#[derive(Clone)]
+pub enum RunMode {
     Full,
     Metadata,
-    Projected(&'a [u16]),
+    Projected(Arc<[u16]>),
 }
 
-impl<'a> RunMode<'a> {
-    fn is_fail_soft(self) -> bool {
+impl RunMode {
+    fn is_fail_soft(&self) -> bool {
         false
     }
 
-    fn label(self) -> &'static str {
+    fn label(&self) -> &'static str {
         match self {
             Self::Full => "full",
             Self::Metadata => "metadata",
@@ -820,8 +822,8 @@ impl<'a> RunMode<'a> {
     }
 }
 
-impl<'a, R: ReadAt> SsTableRunIter<'a, R> {
-    pub fn new(sstables: &'a [Arc<SSTableReader<R>>], mode: RunMode<'a>) -> Self {
+impl<R: ReadAt> SsTableRunIter<R> {
+    pub fn new(sstables: Arc<[Arc<SSTableReader<R>>]>, mode: RunMode) -> Self {
         Self {
             sstables,
             mode,
@@ -935,7 +937,7 @@ impl<'a, R: ReadAt> SsTableRunIter<'a, R> {
                 }
             }
             let it = self.current.as_mut().expect("just initialised");
-            let result = match self.mode {
+            let result = match &self.mode {
                 RunMode::Full => it.next_partition(),
                 RunMode::Metadata => it.next_partition_metadata(),
                 RunMode::Projected(wanted) => it.next_partition_projected(wanted),
@@ -1006,7 +1008,7 @@ impl<'a, R: ReadAt> SsTableRunIter<'a, R> {
         let Some(it) = self.current.as_mut() else {
             return Ok(None);
         };
-        match self.mode {
+        match &self.mode {
             RunMode::Full | RunMode::Metadata => it.next_clustered_row(),
             RunMode::Projected(wanted) => it.next_clustered_row_projected(wanted),
         }
@@ -1186,7 +1188,7 @@ pub fn group_disjoint_runs(bounds: &[(Vec<u8>, Vec<u8>)]) -> Vec<Vec<usize>> {
 pub fn merger_for_sources<'a, R: ReadAt + Send + Sync + 'static>(
     active_iter: Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>,
     flushing_iters: Vec<Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>>,
-    sstables: &'a [Arc<SSTableReader<R>>],
+    sstables: &[Arc<SSTableReader<R>>],
     start: Option<DecoratedKey>,
     end: Option<DecoratedKey>,
 ) -> Result<RangeMerger<'a, R>> {
@@ -1205,8 +1207,8 @@ pub fn merger_for_sources<'a, R: ReadAt + Send + Sync + 'static>(
 pub fn merger_for_sources_with_mappings<'a, R: ReadAt + Send + Sync + 'static>(
     active_iter: Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>,
     flushing_iters: Vec<Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>>,
-    sstables: &'a [Arc<SSTableReader<R>>],
-    mappings: &'a [ColumnOrdinalMapping],
+    sstables: &[Arc<SSTableReader<R>>],
+    mappings: &[ColumnOrdinalMapping],
     start: Option<DecoratedKey>,
     end: Option<DecoratedKey>,
 ) -> Result<RangeMerger<'a, R>> {
@@ -1234,8 +1236,8 @@ pub fn merger_for_sources_with_mappings<'a, R: ReadAt + Send + Sync + 'static>(
 pub fn merger_for_projected_sources<'a, R: ReadAt + Send + Sync + 'static>(
     active_iter: Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>,
     flushing_iters: Vec<Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>>,
-    sstables: &'a [Arc<SSTableReader<R>>],
-    wanted: &'a [u16],
+    sstables: &[Arc<SSTableReader<R>>],
+    wanted: &[u16],
     start: Option<DecoratedKey>,
     end: Option<DecoratedKey>,
 ) -> Result<RangeMerger<'a, R>> {
@@ -1243,7 +1245,7 @@ pub fn merger_for_projected_sources<'a, R: ReadAt + Send + Sync + 'static>(
         active_iter,
         flushing_iters,
         sstables,
-        RunMode::Projected(wanted),
+        RunMode::Projected(Arc::from(wanted)),
         start,
         end,
     )
@@ -1253,9 +1255,9 @@ pub fn merger_for_projected_sources<'a, R: ReadAt + Send + Sync + 'static>(
 pub fn merger_for_projected_sources_with_mappings<'a, R: ReadAt + Send + Sync + 'static>(
     active_iter: Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>,
     flushing_iters: Vec<Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>>,
-    sstables: &'a [Arc<SSTableReader<R>>],
-    mappings: &'a [ColumnOrdinalMapping],
-    wanted: &'a [u16],
+    sstables: &[Arc<SSTableReader<R>>],
+    mappings: &[ColumnOrdinalMapping],
+    wanted: &[u16],
     start: Option<DecoratedKey>,
     end: Option<DecoratedKey>,
 ) -> Result<RangeMerger<'a, R>> {
@@ -1274,7 +1276,7 @@ pub fn merger_for_projected_sources_with_mappings<'a, R: ReadAt + Send + Sync + 
         flushing_iters,
         sstables,
         Some(mappings),
-        RunMode::Projected(wanted),
+        RunMode::Projected(Arc::from(wanted)),
         start,
         end,
     )
@@ -1290,7 +1292,7 @@ pub fn merger_for_projected_sources_with_mappings<'a, R: ReadAt + Send + Sync + 
 pub fn merger_for_metadata_sources<'a, R: ReadAt + Send + Sync + 'static>(
     active_iter: Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>,
     flushing_iters: Vec<Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>>,
-    sstables: &'a [Arc<SSTableReader<R>>],
+    sstables: &[Arc<SSTableReader<R>>],
     start: Option<DecoratedKey>,
     end: Option<DecoratedKey>,
 ) -> Result<RangeMerger<'a, R>> {
@@ -1310,7 +1312,7 @@ pub fn merger_for_metadata_sources<'a, R: ReadAt + Send + Sync + 'static>(
 pub fn merger_for_live_single_row_count<'a, R: ReadAt + Send + Sync + 'static>(
     active_iter: Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>,
     flushing_iters: Vec<Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>>,
-    sstables: &'a [Arc<SSTableReader<R>>],
+    sstables: &[Arc<SSTableReader<R>>],
     start: Option<DecoratedKey>,
     end: Option<DecoratedKey>,
     schema: &'a TableSchema,
@@ -1335,9 +1337,9 @@ pub fn merger_for_live_single_row_count<'a, R: ReadAt + Send + Sync + 'static>(
 fn build_merger_without_runs<'a, R: ReadAt + Send + Sync + 'static>(
     active_iter: Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>,
     flushing_iters: Vec<Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>>,
-    sstables: &'a [Arc<SSTableReader<R>>],
-    mappings: Option<&'a [ColumnOrdinalMapping]>,
-    mode: RunMode<'a>,
+    sstables: &[Arc<SSTableReader<R>>],
+    mappings: Option<&[ColumnOrdinalMapping]>,
+    mode: RunMode,
     start: Option<DecoratedKey>,
     end: Option<DecoratedKey>,
 ) -> Result<RangeMerger<'a, R>> {
@@ -1353,6 +1355,18 @@ fn build_merger_without_runs<'a, R: ReadAt + Send + Sync + 'static>(
         });
     }
 
+    // The merger outlives this call (a paused scan keeps it), so the
+    // per-SSTable column mappings are owned, not borrowed from the caller's
+    // slice: one `Arc` per mapping, shared by the sources that use it.
+    let mappings: Option<Arc<[Arc<ColumnOrdinalMapping>]>> = mappings.map(|mappings| {
+        Arc::from(
+            mappings
+                .iter()
+                .map(|mapping| Arc::new(mapping.clone()))
+                .collect::<Vec<_>>(),
+        )
+    });
+
     for (idx, sstable) in sstables.iter().enumerate() {
         let iter = match sstable.partitions_iter() {
             Ok(iter) => iter,
@@ -1367,10 +1381,13 @@ fn build_merger_without_runs<'a, R: ReadAt + Send + Sync + 'static>(
             }
             Err(e) => return Err(e),
         };
-        let mapping = mappings.and_then(|m| m.get(idx));
+        let mapping = mappings
+            .as_ref()
+            .and_then(|mappings| mappings.get(idx))
+            .map(Arc::clone);
         sources.push(MergeSource::SsTable {
             iter,
-            mode,
+            mode: mode.clone(),
             mapping,
             peeked_key: None,
             failed: false,
@@ -1390,34 +1407,16 @@ fn build_merger_without_runs<'a, R: ReadAt + Send + Sync + 'static>(
 fn build_merger_with_runs<'a, R: ReadAt + Send + Sync + 'static>(
     active_iter: Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>,
     flushing_iters: Vec<Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>>,
-    sstables: &'a [Arc<SSTableReader<R>>],
-    mode: RunMode<'a>,
+    sstables: &[Arc<SSTableReader<R>>],
+    mode: RunMode,
     start: Option<DecoratedKey>,
     end: Option<DecoratedKey>,
 ) -> Result<RangeMerger<'a, R>> {
-    // We can't actually keep the runs as `Vec<Vec<Arc<...>>>` because
-    // SsTableRunIter borrows from a slice (`&'a [Arc<...>]`), and a
-    // freshly allocated Vec<Arc<...>> wouldn't have the same lifetime
-    // as the input slice. Instead, we compute the run *indices* via
-    // `partition_into_disjoint_runs`, then turn those into
-    // `&'a [Arc<...>]` sub-slices into the original `sstables` slice
-    // by detecting contiguous-after-sort groupings.
-    //
-    // The greedy interval-coloring algorithm produces runs that are
-    // not necessarily *contiguous* in the input order — so we need
-    // to either:
-    //   (a) keep the per-run Vec owned by the merger, or
-    //   (b) accept that some runs will produce non-sorted output if
-    //       not stable-sorted.
-    //
-    // Option (a) is straightforward: own the per-run Vec, pass a
-    // borrow into the SsTableRunIter. We do that here.
+    // Greedy interval-coloring: the runs are `Vec<Vec<Arc<SSTableReader>>>`,
+    // not necessarily contiguous in the input order, so each run gets its
+    // own `Arc<[Arc<SSTableReader<R>>]>`. The run holds Arcs that already
+    // exist, so this is a refcount bump per table — never a reader clone.
     let runs = partition_into_disjoint_runs(sstables);
-    // Move the Vec<Vec<Arc>> into a boxed slab the merger owns;
-    // SsTableRunIter holds `&'a [Arc<...>]` which we satisfy by
-    // leaking the slab to the merger's lifetime. We allocate it
-    // into a `Box<[Vec<Arc<...>>]>` and stash on the merger so it
-    // lives as long as the iterators borrowing from it.
     let mut sources: Vec<MergeSource<'a, R>> = Vec::with_capacity(1 + runs.len());
     sources.push(MergeSource::Memtable {
         iter: active_iter,
@@ -1429,34 +1428,13 @@ fn build_merger_with_runs<'a, R: ReadAt + Send + Sync + 'static>(
             peeked: None,
         });
     }
-    let mut owned_runs: Vec<Vec<Arc<SSTableReader<R>>>> = runs;
-    // We need a stable slice address per run. `Box<[Vec<...>]>` gives
-    // that — but borrowing from inside via `&self.runs[i]` requires
-    // the merger to own it. Stash into RangeMerger's `owned_runs`
-    // field (added below) and create SsTableRunIter borrowing from
-    // those entries.
-    //
-    // Lifetime trick: we extend the per-run slices to `'a` via the
-    // standard "self-ref with stable allocation" pattern — `Box<[T]>`
-    // owned by RangeMerger, slices into it that outlive the iters.
-    // This is sound because Vec<Arc<T>> never moves once boxed.
-    let runs_arena: Box<[Vec<Arc<SSTableReader<R>>>]> =
-        std::mem::take(&mut owned_runs).into_boxed_slice();
-    let runs_ptr: *const [Vec<Arc<SSTableReader<R>>>] = Box::leak(runs_arena);
-    // SAFETY: we own this allocation for the merger's lifetime and
-    // never move/free it until the merger is dropped (handled in
-    // RangeMerger::drop). The slices we hand to SsTableRunIter are
-    // therefore valid for `'a`.
-    let runs_ref: &'a [Vec<Arc<SSTableReader<R>>>] = unsafe { &*runs_ptr };
-    for run in runs_ref.iter() {
+    for run in runs {
         sources.push(MergeSource::SsTableRun {
-            run: SsTableRunIter::new(run.as_slice(), mode),
+            run: SsTableRunIter::new(Arc::from(run), mode.clone()),
             peeked_key: None,
         });
     }
-    let mut merger = RangeMerger::new(sources, start, end)?;
-    merger.runs_arena = Some(runs_ptr);
-    Ok(merger)
+    RangeMerger::new(sources, start, end)
 }
 
 /// Heap entry: one peeked KEY per still-active source. The heap is
@@ -1511,12 +1489,6 @@ pub struct RangeMerger<'a, R: ReadAt> {
     /// ([`Self::next_fragment`]). `None` between partitions (the
     /// whole-partition `next_merged_partition` path never sets it).
     active: Option<ActivePartition>,
-    /// Leaked allocation backing the per-run `Vec<Arc<SSTableReader>>`
-    /// slices that `SsTableRunIter`s borrow from. `Some` only when
-    /// the merger was built via `build_merger_with_runs`; freed by
-    /// the `Drop` impl below. `*const` rather than `Box` because
-    /// `Box::leak`'s output has to be re-wrapped manually.
-    runs_arena: Option<*const [Vec<Arc<SSTableReader<R>>>]>,
     live_count: Option<LiveCount<'a>>,
 }
 
@@ -1556,31 +1528,6 @@ struct ActivePartition {
     refill_srcs: Vec<usize>,
 }
 
-// SAFETY: `runs_arena` is a leaked allocation that contains only
-// `Vec<Arc<SSTableReader<R>>>`. `Arc<SSTableReader<R>>` is `Send`
-// and `Sync` when `R` is, so the pointer is safe to send across
-// thread boundaries. We only ever read from it on the thread that
-// owns the merger (the spawn_blocking task), but a `Send` bound is
-// required so the merger itself can be moved into the task.
-unsafe impl<'a, R: ReadAt + Send + Sync> Send for RangeMerger<'a, R> {}
-
-impl<'a, R: ReadAt> Drop for RangeMerger<'a, R> {
-    fn drop(&mut self) {
-        if let Some(ptr) = self.runs_arena.take() {
-            // SAFETY: ptr came from `Box::leak(Box<[Vec<...>]>)`
-            // in `build_merger_with_runs`. Reconstructing the Box
-            // here drops the leaked allocation. All `SsTableRunIter`
-            // instances that borrowed from the slab live inside
-            // `self.sources` and are dropped before this Drop impl
-            // runs (struct fields are dropped in declaration order
-            // and `sources` is before `runs_arena`).
-            unsafe {
-                drop(Box::from_raw(ptr as *mut [Vec<Arc<SSTableReader<R>>>]));
-            }
-        }
-    }
-}
-
 impl<'a, R: ReadAt> RangeMerger<'a, R> {
     pub fn new(
         sources: Vec<MergeSource<'a, R>>,
@@ -1594,7 +1541,6 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
             end,
             exhausted: false,
             active: None,
-            runs_arena: None,
             live_count: None,
         };
         // Prime the heap with one partition per non-empty source.
