@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+smallvec = "1.15"
 ferrosa-schema = { path = "../ferrosa-schema" }
 ferrosa-sql = { path = "../ferrosa-sql" }
 ferrosa-storage = { path = "../ferrosa-storage" }

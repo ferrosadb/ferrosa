@@ -2510,16 +2510,19 @@ fn spawn_resumable_range_scan<S: PausableScan>(
                 }
             };
             let pool = ferrosa_sched::global_pool();
-            let handle = match ticket.take() {
-                None => pool.submit_scan(
-                    ferrosa_sched::SchedClass::Bulk,
-                    ferrosa_sched::DEFAULT_SCAN_CHUNK_BUDGET,
-                    cancel,
-                    produce,
-                ),
-                Some(next) => pool.resubmit_scan(next, cancel, produce),
+            let outcome = match ticket.take() {
+                None => {
+                    pool.execute_scan(
+                        ferrosa_sched::SchedClass::Bulk,
+                        ferrosa_sched::DEFAULT_SCAN_CHUNK_BUDGET,
+                        cancel,
+                        produce,
+                    )
+                    .await
+                }
+                Some(next) => pool.resume_scan(next, cancel, produce).await,
             };
-            let (back, stopped, next_ticket) = match handle.await {
+            let (back, stopped, next_ticket) = match outcome {
                 Ok(ferrosa_sched::ScanOutcome::Ran(Some(stopped))) => stopped,
                 Ok(ferrosa_sched::ScanOutcome::Ran(None))
                 | Ok(ferrosa_sched::ScanOutcome::Cancelled) => return,

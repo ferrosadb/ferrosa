@@ -13,6 +13,12 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
 
 ## Done (recent)
 
+- Single-column scan/count keys avoid per-key vectors. MVCC keys use immutable
+  shared slices with borrowed lookup. Composite-key spills, hash-set growth and
+  the COUNT callback mutex remain; no throughput gain is claimed without a
+  paired benchmark. The scan-key container depends on `smallvec`.
+
+
 - **Aggregate RESULT types match PostgreSQL, and a `numeric` result is refused loud (I6/I7).**
   `SELECT count(*)` advertised `int4` (OID 23) where PostgreSQL uses `int8`, so a client
   reading `i64` failed `WrongType`; the same one-derivation defect left `SUM`/`AVG` deriving

@@ -3158,6 +3158,7 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
         ferrosa_cql::wasm_aggregate::UdfTimeSeriesAggregateExecutor::new(Arc::clone(&udf_executor)),
     ));
     let txn_registry_config = ferrosa_cql::txn_registry::TransactionRegistryConfig::from_env();
+    let table_access_tracker = Arc::new(ferrosa_cql::virtual_tables::TableAccessTracker::new());
     let shared_state = Arc::new(ferrosa_cql::router::SharedState {
         core: Arc::new(ferrosa_session::SessionCore {
             engine: storage.clone(),
@@ -3196,6 +3197,7 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
         query_tracker,
         full_scan_tracker: full_scan_tracker.clone(),
         index_usage_tracker: index_usage_tracker.clone(),
+        table_access_tracker: table_access_tracker.clone(),
         event_sender: tokio::sync::broadcast::channel(64).0,
         last_schema_event: tokio::sync::watch::channel(None).0,
         cql_metrics: Arc::new(ferrosa_cql::observability::CqlMetrics::new()),
@@ -3307,7 +3309,6 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
         .register(Arc::new(ferrosa_cql::virtual_tables::IndexUsageTable::new(
             index_usage_tracker.clone(),
         )));
-    let table_access_tracker = Arc::new(ferrosa_cql::virtual_tables::TableAccessTracker::new());
     schema.virtual_tables().register(Arc::new(
         ferrosa_cql::virtual_tables::TableAccessSummaryTable::new(table_access_tracker.clone()),
     ));

@@ -2791,6 +2791,8 @@ pub struct SharedState {
     pub full_scan_tracker: Arc<crate::virtual_tables::FullScanTracker>,
     /// Records secondary-index usage for `system_observability.index_usage`.
     pub index_usage_tracker: Arc<crate::virtual_tables::IndexUsageTracker>,
+    /// Per-table accesses, shared with the observability virtual-table reader.
+    pub table_access_tracker: Arc<crate::virtual_tables::TableAccessTracker>,
     /// Broadcast channel for CQL EVENT push notifications.
     pub event_sender: tokio::sync::broadcast::Sender<crate::event::CqlEvent>,
     /// Retains the most recent schema-change event so that control connections
@@ -5682,6 +5684,11 @@ async fn route_prepared_select_fast_inner(
             )
             .await?;
 
+        state.table_access_tracker.record_read_access(
+            ks,
+            &s.table,
+            crate::virtual_tables::table_access::TableReadKind::Point,
+        );
         let (col_names, col_types) = build_column_info(table_meta, &s.columns, ks, &state.schema)?;
         if matches!(s.columns.as_slice(), [SelectColumn::Star]) {
             let body =
@@ -6035,6 +6042,11 @@ async fn route_geo_select(
     })?;
 
     // Observability: a geo index was consulted.
+    state.table_access_tracker.record_read_access(
+        ks,
+        &s.table,
+        crate::virtual_tables::table_access::TableReadKind::Range,
+    );
     state
         .index_usage_tracker
         .record(ks, &s.table, &index_name, plan_kind);
@@ -6454,6 +6466,12 @@ async fn route_select_user_table_inner(
     // the FTI search to obtain matching partition keys, fetch each partition,
     // and apply remaining WHERE predicates as a post-filter.
     if where_has_fts_match(&s.where_clauses) {
+        state.table_access_tracker.record_read_access(
+            ks,
+            &s.table,
+            crate::virtual_tables::table_access::TableReadKind::Range,
+        );
+
         let (fts_column, fts_query) = extract_fts_match(&s.where_clauses)
             .ok_or_else(|| CqlError::Invalid("fts_match: failed to extract column/query".into()))?;
 
@@ -6790,6 +6808,11 @@ async fn route_select_user_table_inner(
                     .iter()
                     .all(|(position, want)| decoded.get(*position).is_some_and(|got| got == want))
             };
+            state.table_access_tracker.record_read_access(
+                ks,
+                &s.table,
+                crate::virtual_tables::table_access::TableReadKind::Full,
+            );
             let count = state
                 .write_path
                 .load()
@@ -6807,6 +6830,11 @@ async fn route_select_user_table_inner(
     }
 
     if count_only_select && no_where && no_order_by && no_limit && pk_result.is_err() {
+        state.table_access_tracker.record_read_access(
+            ks,
+            &s.table,
+            crate::virtual_tables::table_access::TableReadKind::Full,
+        );
         // Pass the CLIENT's consistency, not the node default. The full
         // SELECT path below threads `ctx.consistency`; if this fast path
         // does not, the same table answers COUNT(*) and SELECT at two
@@ -6839,6 +6867,12 @@ async fn route_select_user_table_inner(
     let mut order_by_already_sorted = false;
 
     let rows = if let Ok(pk_values) = pk_result {
+        state.table_access_tracker.record_read_access(
+            ks,
+            &s.table,
+            crate::virtual_tables::table_access::TableReadKind::Point,
+        );
+
         // PK present — single partition lookup
         let pk_types: Vec<CqlType> = table_meta
             .partition_key
@@ -7095,6 +7129,17 @@ async fn route_select_user_table_inner(
                 s.table,
             )));
         }
+
+        let access_kind = if s.where_clauses.iter().any(|clause| clause.token_fn) {
+            crate::virtual_tables::table_access::TableReadKind::Range
+        } else if matches!(scan_plan, ScanPlan::FullScan) {
+            crate::virtual_tables::table_access::TableReadKind::Full
+        } else {
+            crate::virtual_tables::table_access::TableReadKind::Range
+        };
+        state
+            .table_access_tracker
+            .record_read_access(ks, &s.table, access_kind);
 
         // Report the access path once, now that it is decided.
         //
@@ -9333,6 +9378,7 @@ pub async fn route_prepared_insert_fast(
             )
             .await?;
 
+        state.table_access_tracker.record_write(ks, &s.table);
         Ok(RouteResult::Result(result::encode_void()))
     }
     .await;
@@ -9575,6 +9621,7 @@ async fn route_insert(
         )
         .await?;
 
+    state.table_access_tracker.record_write(ks, &s.table);
     if s.if_not_exists {
         // Insert was applied — return [applied] = true
         encode_lwt_applied(true, ks, &s.table, table_meta, &state.schema, None)
@@ -10434,6 +10481,7 @@ async fn route_update(
             &strategy,
         )
         .await?;
+    state.table_access_tracker.record_write(ks, &s.table);
     if conditional {
         return encode_lwt_applied(true, ks, &s.table, table_meta, &state.schema, None);
     }
@@ -10672,6 +10720,7 @@ async fn route_delete(
             &strategy,
         )
         .await?;
+    state.table_access_tracker.record_write(ks, &s.table);
     if conditional {
         return encode_lwt_applied(true, ks, &s.table, table_meta, &state.schema, None);
     }
@@ -17428,6 +17477,9 @@ mod tests {
             query_tracker: Arc::new(QueryTracker::new()),
             full_scan_tracker: Arc::new(crate::virtual_tables::FullScanTracker::new()),
             index_usage_tracker: Arc::new(crate::virtual_tables::IndexUsageTracker::new()),
+            table_access_tracker: std::sync::Arc::new(
+                crate::virtual_tables::TableAccessTracker::new(),
+            ),
             event_sender: tokio::sync::broadcast::channel(64).0,
             last_schema_event: tokio::sync::watch::channel(None).0,
             cql_metrics: Arc::new(CqlMetrics::new()),
@@ -20643,6 +20695,65 @@ mod tests {
     #[test]
     fn parse_permissions_unknown_rejected() {
         assert!(parse_permissions(&["BANANA".into()]).is_err());
+    }
+
+    #[tokio::test]
+    async fn router_populates_table_access_summary_for_normal_and_prepared_paths() {
+        use ferrosa_schema::virtual_table::VirtualTable;
+
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let keyspace = Some("access_probe".to_string());
+        let ctx = test_ctx(&auth, &keyspace);
+        for query in [
+            "CREATE KEYSPACE access_probe WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}",
+            "CREATE TABLE access_probe.t (id int PRIMARY KEY, name text)",
+            "INSERT INTO access_probe.t (id, name) VALUES (7, 'seven')",
+            "SELECT name FROM access_probe.t WHERE id = 7",
+            "SELECT name FROM access_probe.t LIMIT 1",
+            "SELECT count(*) FROM access_probe.t",
+            "SELECT id FROM access_probe.t WHERE token(id) > -1 LIMIT 1",
+        ] {
+            route(&state, &ctx, crate::parser::parse(query).unwrap())
+                .await
+                .unwrap();
+        }
+        let Statement::Insert(insert) =
+            crate::parser::parse("INSERT INTO t (id, name) VALUES (?, ?)").unwrap()
+        else {
+            panic!("expected INSERT");
+        };
+        route_prepared_insert_fast(
+            &state,
+            &ctx,
+            &insert,
+            &[Term::IntegerLiteral(8), Term::StringLiteral("eight".into())],
+        )
+        .await
+        .expect("prepared insert takes fast path")
+        .unwrap();
+        let Statement::Select(select) =
+            crate::parser::parse("SELECT name FROM t WHERE id = ?").unwrap()
+        else {
+            panic!("expected SELECT");
+        };
+        route_prepared_select_fast(&state, &ctx, &select, &[Term::IntegerLiteral(8)])
+            .await
+            .expect("prepared select takes fast path")
+            .unwrap();
+
+        let table = crate::virtual_tables::TableAccessSummaryTable::new(Arc::clone(
+            &state.table_access_tracker,
+        ));
+        let rows = table.read(None);
+        assert_eq!(rows.len(), 1, "normal I/O must populate the shared tracker");
+        let counters: Vec<i64> = rows[0].cells[2..]
+            .iter()
+            .map(|cell| i64::from_be_bytes(cell.value.as_deref().unwrap().try_into().unwrap()))
+            .collect();
+        // Five reads: two PK probes, one bounded full scan, one metadata count,
+        // and one token range. Two successful INSERTs (normal + prepared).
+        assert_eq!(counters, vec![5, 2, 2, 1, 2]);
     }
 
     #[tokio::test]

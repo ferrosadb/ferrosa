@@ -33,6 +33,16 @@ CQL/PostgreSQL serializability.
 Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
 `= ANY($N)` / IN-lists.
 
+## Scan and count ownership
+
+Single-column scan keys use `smallvec` inline storage; metadata COUNT keeps its
+one eligible partition-key value inline. MVCC roots share immutable `Arc<[Value]>`
+keys and accept borrowed slices for lookup, avoiding temporary key vectors.
+Composite scan keys can still allocate, and exact MVCC deduplication retains a
+key set. These changes do not remove the COUNT callback mutex or make counting
+constant time. Inline keys enlarge hash-set entries; end-to-end gains for this
+latest change have not yet been measured.
+
 ## What's implemented
 
 - **Wire protocol (v3)** — startup, the sans-IO [`Connection`] phase machine
