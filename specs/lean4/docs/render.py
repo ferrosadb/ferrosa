@@ -61,6 +61,25 @@ def breakable(code: str) -> str:
     return "".join(out)
 
 
+# Module name -> chapter key, so prose that names a module can point at it. The corpus's headers say
+# "the two layers already specified", which is positional and stops being true the moment the parts
+# are reordered — a hyperlink to the chapter does not.
+CHAPTERS: dict[str, str] = {}
+
+
+def chapter_for(token: str) -> str | None:
+    """The chapter key a backticked name refers to, if it is a module this book contains."""
+    t = token.strip().replace(chr(92), "/")
+    for suffix in (".lean", ".md"):
+        if t.endswith(suffix):
+            t = t[: -len(suffix)]
+    dotted = t.replace("/", ".")
+    for cand in (t, dotted, "Ferrosa." + dotted, "Ferrosa." + t):
+        if cand in CHAPTERS:
+            return CHAPTERS[cand]
+    return None
+
+
 def inline(s: str) -> str:
     """Escape a line of prose: `backticked` spans in mono, **bold** and *emphatic* as themselves.
 
@@ -73,7 +92,9 @@ def inline(s: str) -> str:
         if m.group(1) is not None:
             out.append(r"\textbf{" + inline(m.group(1)) + "}")
         elif m.group(2) is not None:
-            out.append(r"\texttt{" + breakable(esc(m.group(2))) + "}")
+            target = chapter_for(m.group(2))
+            body = r"\texttt{" + breakable(esc(m.group(2))) + "}"
+            out.append(rf"\hyperref[ch:{slug(target)}]{{{body}}}" if target else body)
         else:
             out.append(r"\emph{" + inline(m.group(3)) + "}")
         i = m.end()
@@ -751,6 +772,10 @@ def main() -> None:
     parts = data["parts"] if not args.part else [p for p in data["parts"] if p["numeral"] == args.part]
 
     claims_by_module = {a["key"]: a["items"] for a in data["areas"]}
+    for m in data["modules"]:
+        CHAPTERS[m["key"]] = m["key"]
+        CHAPTERS[m["key"].replace("Ferrosa.", "")] = m["key"]
+        CHAPTERS[m["path"]] = m["key"]
     out = [PREAMBLE, r"\begin{document}", titlepage(data), PRIMER, r"\mainmatter", r"\tableofcontents",
            guarantees_chapter(data["parts"], claims_by_module)]
 
