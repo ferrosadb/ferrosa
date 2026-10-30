@@ -78,7 +78,14 @@ def inline(s: str) -> str:
             out.append(r"\emph{" + inline(m.group(3)) + "}")
         i = m.end()
     out.append(esc(s[i:]))
-    return "".join(out)
+    # Straight quotes are paired quotes in the document; babel otherwise maps every one of them to a
+    # closing quote, so a pair reads the wrong way round.
+    parts, open_q = "".join(out).split(chr(34)), True
+    fixed = parts[0]
+    for p in parts[1:]:
+        fixed += ("``" if open_q else "''") + p
+        open_q = not open_q
+    return fixed
 
 
 def dedent(text: str) -> str:
@@ -92,12 +99,37 @@ def dedent(text: str) -> str:
 
 
 def prose(text: str) -> str:
-    """A block of docstring as LaTeX paragraphs."""
+    """A block of docstring as LaTeX: paragraphs, and `*` runs as a list.
+
+    The corpus's headers use `*` bullets to state the two or three things a module is responsible
+    for. Rendered as one paragraph they read as a run-on sentence — which is how a spec stops
+    looking like a spec.
+    """
     text = dedent(text)
     if not text:
         return ""
-    paras = re.split(r"\n\s*\n", text)
-    return "\n\n".join(inline(" ".join(p.split())) for p in paras if p.strip())
+    out: list[str] = []
+    for para in re.split(r"\n\s*\n", text):
+        lines = [l.rstrip() for l in para.split("\n") if l.strip()]
+        if not lines:
+            continue
+        intro, items = [], []
+        for l in lines:
+            m = re.match(r"\s*[*-]\s+(.*)", l)
+            if m:
+                items.append([m.group(1)])
+            elif items:
+                items[-1].append(l.strip())
+            else:
+                intro.append(l.strip())
+        if items:
+            if intro:
+                out.append(inline(" ".join(intro)))
+            out.append(r"\begin{itemize}\setlength{\itemsep}{2pt}" +
+                       "".join(rf"\item {inline(chr(32).join(i))}" for i in items) + r"\end{itemize}")
+        else:
+            out.append(inline(" ".join(para.split())))
+    return "\n\n".join(out)
 
 
 def slug(s: str) -> str:
@@ -400,13 +432,19 @@ def chapter_head(mod: dict) -> str:
         # title, so drop the first line; every line that is nothing but rule characters goes too,
         # wherever it sits — a ruler left in is a single unbreakable 320pt line under the chapter
         # heading.
-        lines = [l for l in header.split("\n") if not re.fullmatch(r"\s*[=\-—~_*·]{4,}\s*", l)]
-        if lines and lines[0].strip():
-            lines = lines[1:]
-        out.append(rf"\noindent{{\sffamily\color{{quiet}}\footnotesize\texttt{{{esc(key)}}}}}\par\vspace{{4pt}}")
-        body = prose("\n".join(lines))
+        # The opening title is a *block*, not a line: it runs to the ruler. Dropping one line left
+        # the tail of the title as the chapter's first sentence, which is how "transaction shape."
+        # came to stand alone at the top of a page.
+        raw = header.split("\n")
+        cut = next((i for i, l in enumerate(raw) if re.fullmatch(r"\s*[=\-—~_*·]{4,}\s*", l)), None)
+        if cut is not None:
+            raw = raw[cut + 1:]
+        else:
+            raw = raw[1:]
+        out.append(rf"\noindent\hfill{{\sffamily\color{{quiet}}\footnotesize\texttt{{{esc(mod['path'])}}}}}\par\vspace{{2pt}}")
+        body = prose("\n".join(raw))
         if body:
-            out.append(rf"\begin{{quote}}\small {body}\end{{quote}}")
+            out.append(body)
     return "\n".join(out)
 
 
