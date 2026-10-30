@@ -1593,7 +1593,6 @@ fn streaming_agg_acc_for(
 fn aggregate_column_for(
     sc: &SelectColumn,
     all_col_names: &[String],
-    all_col_types: &[CqlType],
 ) -> Result<(AggregateKind, Option<usize>), CqlError> {
     match sc {
         SelectColumn::Aggregate(call) => {
@@ -1674,7 +1673,7 @@ fn build_agg_accumulators(
 ) -> Result<Vec<StreamingAggAcc>, CqlError> {
     let mut accs = Vec::with_capacity(s.columns.len());
     for sc in &s.columns {
-        let (kind, src_idx) = aggregate_column_for(sc, all_col_names, all_col_types)?;
+        let (kind, src_idx) = aggregate_column_for(sc, all_col_names)?;
         let acc = match src_idx {
             None => streaming_agg_acc_for(kind, 0, CqlType::Bigint),
             Some(src_idx) => {
