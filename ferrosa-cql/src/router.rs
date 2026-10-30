@@ -2088,10 +2088,12 @@ fn result_cursor_shape(
     count_only_select: bool,
     resolved_funcs: &[(usize, ResolvedFunction)],
 ) -> bool {
-    let has_function_projection = s
-        .columns
-        .iter()
-        .any(|c| matches!(c, SelectColumn::FunctionCall { .. } | SelectColumn::Aggregate(_)));
+    let has_function_projection = s.columns.iter().any(|c| {
+        matches!(
+            c,
+            SelectColumn::FunctionCall { .. } | SelectColumn::Aggregate(_)
+        )
+    });
     !count_only_select
         && s.ann_of.is_none()
         && (!s.order_by.is_empty() || s.distinct || has_function_projection)
@@ -7758,15 +7760,12 @@ async fn route_select_user_table_inner(
                     // Scalar UDFs/toJson are per-row and safe, but excluding all
                     // function calls keeps the streaming gate to plain column/star
                     // projections — exactly the unbounded `SELECT *` OOM shape.
-                    let has_function_projection = s
-                        .columns
-                        .iter()
-                        .any(|c| {
-                            matches!(
-                                c,
-                                SelectColumn::FunctionCall { .. } | SelectColumn::Aggregate(_)
-                            )
-                        });
+                    let has_function_projection = s.columns.iter().any(|c| {
+                        matches!(
+                            c,
+                            SelectColumn::FunctionCall { .. } | SelectColumn::Aggregate(_)
+                        )
+                    });
                     let distinct_partition_page_shape = s.where_clauses.is_empty()
                         && s.order_by.is_empty()
                         && s.ann_of.is_none()
@@ -13971,7 +13970,9 @@ fn build_column_info(
                 let display_name = call.result_name().to_string();
                 let cql_type = match call.kind {
                     AggregateKind::Count => CqlType::Bigint,
-                    AggregateKind::Avg | AggregateKind::Min | AggregateKind::Max
+                    AggregateKind::Avg
+                    | AggregateKind::Min
+                    | AggregateKind::Max
                     | AggregateKind::Sum => {
                         resolve_aggregate_argument_type(call, table_meta, ks, schema)?
                     }

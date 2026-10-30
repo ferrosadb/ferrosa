@@ -34,8 +34,8 @@ use std::fmt;
 ///
 /// Saturation is a storage invariant. Scanning the 64-bit hash from the bucket
 /// boundary upward, the largest reachable rank is `64 - p + 1`, which for
-/// `p >= 2` is already at most 63; the clamp in [`rank_for_hash`] and
-/// [`raise_register`] keeps every register inside six bits regardless.
+/// `p >= 2` is already at most 63; the clamps in `rank_for_hash` and
+/// `raise_register` keep every register inside six bits regardless.
 pub const REGISTER_MAX: u8 = 63;
 
 /// Smallest accepted precision, `m = 16` registers.
@@ -200,7 +200,7 @@ impl Hll {
 
     /// Build an empty sketch with precision `p`, i.e. `2^p` registers.
     pub fn with_precision(p: u8) -> Result<Self, HllError> {
-        if p < MIN_PRECISION || p > MAX_PRECISION {
+        if !(MIN_PRECISION..=MAX_PRECISION).contains(&p) {
             return Err(HllError::PrecisionOutOfRange { requested: p });
         }
         Hll::new(1usize << p)

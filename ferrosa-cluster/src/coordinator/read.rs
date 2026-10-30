@@ -739,9 +739,7 @@ fn read_quorum_progress(
         // per-DC factors to report — and reading that emptiness as "no replication configured"
         // collapses a healthy single-datacenter ring to `required: 1, received: 0`, which is the
         // `Unavailable` a well-behaved client can do nothing about.
-        if let crate::ring::strategy::ReplicationStrategy::Simple {
-            replication_factor,
-        } = strategy
+        if let crate::ring::strategy::ReplicationStrategy::Simple { replication_factor } = strategy
         {
             return super::dc_quorum::Progress {
                 required: cl.block_for_dc(*replication_factor),
@@ -4436,8 +4434,7 @@ mod tests {
         let strategy = crate::ring::strategy::ReplicationStrategy::Simple {
             replication_factor: 1,
         };
-        let coordinator =
-            make_coordinator(ring, pm, 1u64, storage, 1, ConsistencyLevel::One);
+        let coordinator = make_coordinator(ring, pm, 1u64, storage, 1, ConsistencyLevel::One);
         let partitions = coordinator
             .coordinate_index_read_in_partition(
                 &table_id,

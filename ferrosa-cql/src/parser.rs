@@ -327,8 +327,9 @@ impl<'input> Parser<'input> {
                 self.lexer.peek()?.kind,
                 TokenKind::RParen | TokenKind::Comma
             ) {
-                argument_from_flag =
-                    Some(AggregateArgument::Column(ESTIMATE_DISTINCT_FLAG.to_string()));
+                argument_from_flag = Some(AggregateArgument::Column(
+                    ESTIMATE_DISTINCT_FLAG.to_string(),
+                ));
             } else {
                 estimate_distinct = true;
             }
@@ -6527,7 +6528,10 @@ mod aggregate_node_tests {
     fn count_distinct_carries_the_distinct_flag() {
         let call = single_aggregate("SELECT COUNT(DISTINCT c) FROM ks.t");
         assert_eq!(call.kind, AggregateKind::Count);
-        assert!(call.distinct, "COUNT(DISTINCT c) must set the distinct flag");
+        assert!(
+            call.distinct,
+            "COUNT(DISTINCT c) must set the distinct flag"
+        );
         assert!(!call.estimate_distinct);
         assert_eq!(
             call.argument,

@@ -2845,7 +2845,10 @@ fn build_result_columns(
                 let cql_type = match (call.kind, table_meta) {
                     (AggregateKind::Count, _) => CqlType::Bigint,
                     (_, Some(table_meta)) => crate::router::resolve_aggregate_argument_type(
-                        call, table_meta, table_ks, &state.schema,
+                        call,
+                        table_meta,
+                        table_ks,
+                        &state.schema,
                     )
                     .unwrap_or(CqlType::Varchar),
                     (_, None) => match call.argument.column_name() {

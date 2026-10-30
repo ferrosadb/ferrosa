@@ -165,7 +165,7 @@ impl DistinctExact {
             .write(true)
             .create_new(true)
             .open(&path)?;
-        let mut this = Self {
+        let this = Self {
             file,
             path,
             capacity,
@@ -297,10 +297,7 @@ impl DistinctExact {
             i = (i + 1) & (self.capacity - 1);
             probes += 1;
             if probes >= self.capacity {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "distinct map full: probe wrapped",
-                ));
+                return Err(io::Error::other("distinct map full: probe wrapped"));
             }
         }
     }
