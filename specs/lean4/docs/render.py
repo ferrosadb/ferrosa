@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import pathlib
 import os
 import re
 import shutil
@@ -359,6 +360,14 @@ PREAMBLE = r"""
   \nopagebreak\vspace{2pt}\noindent{\footnotesize\color{quiet}#3}\par\nopagebreak\vspace{3pt}}
 \newcommand{\redwhy}[1]{%
   \par\vspace{2pt}\noindent{\footnotesize\color{red}why:}~{\footnotesize #1}\par}
+% The implementation line a red claim is about. The claim proves what the code does not do; this is
+% where it does it, so a reader can check the two against each other without leaving the page.
+\newcommand{\redsite}[2]{%
+  \par\vspace{3pt}\noindent{\footnotesize\sffamily\color{accent}#1}\par
+  \ifx\relax#2\relax\else
+  {\footnotesize\begin{Verbatim}[commandchars=\\\{\}]#2\end{Verbatim}}\fi}
+\newcommand{\redsitenote}[1]{%
+  \par\noindent{\footnotesize\itshape #1}\par}
 % No \definition macro: verbatim material cannot be passed through a macro argument, so the
 % definition blocks are written out in Python instead.
 \newcommand{\tightlist}{\setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
@@ -525,6 +534,49 @@ def claims_table(claims: list[dict]) -> str:
     )
 
 
+RED_SITES = pathlib.Path(__file__).resolve().parent / "red_sites.json"
+
+
+def rust_site(witness: str) -> str:
+    """The implementation line that fails the claim, when somebody has recorded where it is.
+
+    A red claim says what the code does not do and names the theorem that proves the absence. It
+    does not say which line does it, and nothing in the Lean corpus can know that. The pointer is
+    maintained beside the book in `red_sites.json`; a claim with no entry renders without a site
+    rather than with a guessed one.
+    """
+    if not RED_SITES.exists():
+        return ""
+    sites = json.loads(RED_SITES.read_text()).get("sites", {})
+    site = sites.get(witness)
+    if not site:
+        return ""
+    repo = pathlib.Path(__file__).resolve().parents[3]
+    f = repo / site["path"]
+    if not f.exists():
+        return rf"\redsite{{{esc(site['path'])}}}{{unresolved in this checkout}}"
+    lines = f.read_text(errors="replace").split("\n")
+    line = site.get("line")
+    if line and 1 <= line <= len(lines):
+        lo, hi = max(0, line - 2), min(len(lines), line + 2)
+        excerpt = "\n".join(f"{i + 1:>5}  {lines[i]}" for i in range(lo, hi))
+        head = f"{site['path']}:{line}"
+    else:
+        excerpt = ""
+        head = site["path"]
+    note = site.get("note", "")
+    # Emitted raw rather than through a macro: verbatim material cannot travel through macro
+    # arguments, and `\detokenize` fails on Rust that carries an unbalanced brace.
+    head_tex = rf"\par\vspace{{3pt}}\noindent{{\footnotesize\sffamily\color{{accent}}{esc(head)}}}\par"
+    # One escaped line per paragraph rather than a verbatim environment: verbatim material cannot
+    # be passed through a macro, and a claim is assembled into one, so `Verbatim` here fails the
+    # whole document at the last page of the build.
+    body = "\\par".join(
+        r"{\footnotesize\ttfamily " + esc(l) + "}" for l in excerpt.split("\n")
+    ) if excerpt else ""
+    note_tex = rf"\par\noindent{{\footnotesize\itshape {inline(note)}}}\par" if note else ""
+    return head_tex + body + note_tex
+
 def math_display(tex: str) -> str:
     """The statement, set as mathematics between two rules."""
     return (
@@ -577,6 +629,9 @@ def claim_block(c: dict, thm: str, tex: str, lean: str, doc: str,
            rf"\claim{{{mark}}}{{{inline(c['claim'])}}}{{{prov}}}"]
     if c["kind"] == "failing":
         out.append(rf"\redwhy{{{inline(c['why'])}}}")
+        site = rust_site(c.get("witness", ""))
+        if site:
+            out.append(site)
     if doc.strip():
         out.append(rf"{{\small {prose(doc)}}}")
     # The definition comes first. A reader who meets `mergeCell` in the middle of a formula and has
