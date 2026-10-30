@@ -56,3 +56,69 @@ jobs:
 
       - name: Check the unsafe ledger matches the source
         run: python3 -m unittest -q tests.ci.test_unsafe_ledger
+
+  # The PDF is not decoration: `lake exe docs` reads every ledger claim back out of the corpus and
+  # fails if one names no theorem, if a registered ledger has no chapter, or if the red count differs
+  # from `ledgerTotal` — the number the corpus pins with `decide`. So this job is a check that happens
+  # to produce a document, and the artifact is only uploaded once those checks pass.
+  book:
+    name: Build the PDF
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install elan
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -o elan-init.sh
+          sh elan-init.sh -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      # DejaVu Sans Mono is the one font the document needs from the system: Lean's statements are
+      # full of ⟨⟩ ∀ ∃ ∧ ⊆, and it is the smallest face that covers them.
+      - name: Install fonts
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fonts-dejavu-core
+
+      - name: Build the corpus
+        working-directory: specs/lean4
+        run: lake build
+
+      - name: Extract the book's data and run the drift checks
+        working-directory: specs/lean4
+        run: lake exe docs build/specs.json
+
+      - name: Install tectonic
+        id: tectonic
+        run: |
+          curl -sSfL -o tectonic.tar.gz \
+            "https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic%400.15.0/tectonic-0.15.0-x86_64-unknown-linux-musl.tar.gz"
+          tar xzf tectonic.tar.gz
+          mkdir -p "$HOME/.local/bin"
+          mv tectonic "$HOME/.local/bin/"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # Tectonic fetches its package bundle over the network on a cold runner. When that host is
+      # unreachable the job would fail on an outage that has nothing to do with the corpus, so the
+      # fallback is TeX Live from apt and the same .tex through latexmk. The document is
+      # engine-neutral by construction: unicode appears only inside `Statement` blocks, and the one
+      # system font it needs is installed above.
+      - name: Render the PDF
+        working-directory: specs/lean4
+        run: |
+          if python3 docs/render.py; then exit 0; fi
+          echo "::warning::tectonic path failed, falling back to TeX Live"
+          sudo apt-get install -y -qq texlive-xetex texlive-latex-extra latexmk
+          python3 docs/render.py
+
+      - name: The PDF must exist and have pages
+        working-directory: specs/lean4
+        run: |
+          test -s build/ferrosa-specs.pdf
+          ls -l build/ferrosa-specs.pdf
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fa1a0b # v7.0.1
+        with:
+          name: ferrosa-formal-specification
+          path: specs/lean4/build/ferrosa-specs.pdf
+          if-no-files-found: error
+          retention-days: 30
+

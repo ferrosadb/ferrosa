@@ -111,3 +111,40 @@ The Accord checker has been run against a real Elle history
 4800 events, 2400 committed transactions, 0 failures, and the first 4- and
 5-transaction windows verify as serializable by exhaustive search over orders.
 Reproducing it is the `lake env lean --run` line at the top of this file.
+
+## The book
+
+`make book` renders this corpus as a PDF: seven parts, one chapter per module, high-level claims
+first and the formal statements underneath them.
+
+There is no second document. The prose the PDF prints is the prose in this directory — the `/-!`
+sections are its headings and paragraphs, the `/-` header of each module is its chapter opening, the
+`/--` docstrings are the sentences under each claim, and the ledgers under `Unimplemented.areas` are
+its list of obligations. Adding a paragraph next to a theorem puts it in the book; the renderer
+never invents text.
+
+Statements are not scraped from the sources. `lake exe docs` reads them out of the compiled
+environment, so what the PDF shows is what the elaborator holds — and it prints them the way the
+editor does, with record fields named:
+
+```text
+Readable { r0 := Role.primary, r1 := Role.secondary, up0 := false, up1 := true } 1 ∧
+¬Writable { r0 := Role.primary, r1 := Role.secondary, up0 := false, up1 := true } 1
+```
+
+The source for that theorem says `⟨.primary, .secondary, false, true⟩`. The positional form costs a
+reader four field positions to decode; the printed form says the surviving node is the secondary and
+therefore not writable.
+
+What the build checks, beyond compiling:
+
+- every ledger claim's `.met` string names a declaration that exists (a typo was silent before this);
+- every registered area ledger has a chapter in `Ferrosa/Docs/Book.lean`;
+- the PDF's red count is `Unimplemented.ledgerTotal` — 59, pinned by `decide` — not a number the
+  renderer computed;
+- the book places exactly the modules the corpus contains (`placed_module_count`).
+
+`make part P=II` renders one part for review. Engine: `tectonic` if installed, otherwise `latexmk`
+with XeLaTeX; the `.tex` is identical either way. CI builds it in `lean-specs.yml` and uploads the
+artifact.
+
