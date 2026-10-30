@@ -636,24 +636,24 @@ pub struct SSTableReader<R: ReadAt> {
     partition_index: PartitionIndex<CachedReadAt<R>>,
     index_bounds_are_byte_comparable: bool,
     bloom_filter: BloomFilter,
-    compression_info: Option<CompressionInfo>,
+    compression_info: Option<Arc<CompressionInfo>>,
     /// As stored: the delta base every [`DataReader`] decodes against.
     stored: SerializationHeader,
     /// `stored` with its timestamp bounds normalised (t_cf637b6e); what
     /// [`Self::header`] returns.
     header: SerializationHeader,
-    data: R,
+    data: Arc<R>,
     /// Bounded cache of decompressed compressed Data.db chunks. Point reads use
     /// this to avoid decompressing the whole SSTable for one partition/row.
-    decompressed_chunks: Mutex<ChunkCache>,
+    decompressed_chunks: Arc<Mutex<ChunkCache>>,
     /// Parsed `CRC.db` (uncompressed tables only), loaded via
     /// [`Self::load_crc_table`]. `None` for compressed tables and for
     /// uncompressed tables whose `CRC.db` has not been (or cannot be)
     /// loaded — old SSTables predating T-011 keep working, "not checked".
-    crc_table: Option<ChunkCrcTable>,
+    crc_table: Option<Arc<ChunkCrcTable>>,
     /// Bounded cache of CRC-verified raw Data.db chunks, mirroring
     /// `decompressed_chunks` for the uncompressed+CRC.db path.
-    verified_uncompressed_chunks: Mutex<ChunkCache>,
+    verified_uncompressed_chunks: Arc<Mutex<ChunkCache>>,
     /// Parsed `Digest.crc32`, loaded via [`Self::load_digest`]. `None` when
     /// not loaded — [`Self::verify_digest`] then logs once and returns `Ok`.
     digest: Option<u32>,
@@ -693,7 +693,7 @@ impl<R: ReadAt> SSTableReader<R> {
         let bloom_filter = BloomFilter::read(&components.filter)?;
 
         let compression_info = match components.compression_info {
-            Some(ref ci_bytes) => Some(CompressionInfo::read(ci_bytes)?),
+            Some(ref ci_bytes) => Some(Arc::new(CompressionInfo::read(ci_bytes)?)),
             None => None,
         };
 
@@ -722,10 +722,10 @@ impl<R: ReadAt> SSTableReader<R> {
             compression_info,
             stored: header,
             header: normalised_header,
-            data: components.data,
-            decompressed_chunks: Mutex::new(ChunkCache::new(cache_config)),
+            data: Arc::new(components.data),
+            decompressed_chunks: Arc::new(Mutex::new(ChunkCache::new(cache_config))),
             crc_table: None,
-            verified_uncompressed_chunks: Mutex::new(ChunkCache::new(cache_config)),
+            verified_uncompressed_chunks: Arc::new(Mutex::new(ChunkCache::new(cache_config))),
             digest: None,
             crc_missing_warned: AtomicBool::new(false),
             digest_missing_warned: AtomicBool::new(false),
@@ -757,7 +757,7 @@ impl<R: ReadAt> SSTableReader<R> {
                 table.chunk_size
             )));
         }
-        self.crc_table = Some(table);
+        self.crc_table = Some(Arc::new(table));
         Ok(())
     }
 
@@ -827,15 +827,15 @@ impl<R: ReadAt> SSTableReader<R> {
     fn data_source(&self) -> Result<ReadSource<'_, R>> {
         if let Some(ref ci) = self.compression_info {
             Ok(ReadSource::Compressed(ChunkedCompressedData::new(
-                &self.data,
+                self.data.as_ref(),
                 ci,
-                &self.decompressed_chunks,
+                self.decompressed_chunks.as_ref(),
             )?))
         } else if let Some(ref table) = self.crc_table {
             Ok(ReadSource::Verified(ChunkedUncompressedData::new(
-                &self.data,
+                self.data.as_ref(),
                 table,
-                &self.verified_uncompressed_chunks,
+                self.verified_uncompressed_chunks.as_ref(),
             )?))
         } else {
             if !self.crc_missing_warned.swap(true, Ordering::Relaxed) {
@@ -844,7 +844,7 @@ impl<R: ReadAt> SSTableReader<R> {
                      checksum-verified (old SSTable predating T-011, or CRC.db not loaded)"
                 );
             }
-            Ok(ReadSource::Raw(&self.data))
+            Ok(ReadSource::Raw(self.data.as_ref()))
         }
     }
 
@@ -1186,7 +1186,7 @@ impl<R: ReadAt> SSTableReader<R> {
 
     /// Returns a reference to the compression info, if present.
     pub fn compression_info(&self) -> Option<&CompressionInfo> {
-        self.compression_info.as_ref()
+        self.compression_info.as_deref()
     }
 
     /// Returns the length of the Data.db file (or buffer) in bytes.
@@ -1301,9 +1301,9 @@ impl<R: ReadAt> SSTableReader<R> {
             sst: self,
             pos: 0,
             source: ReadSource::Scan(ScanData {
-                data: &self.data,
-                compression: self.compression_info.as_ref(),
-                crc: self.crc_table.as_ref(),
+                data: self.data.as_ref(),
+                compression: self.compression_info.as_deref(),
+                crc: self.crc_table.as_deref(),
                 file_len,
                 len,
                 buffers: std::cell::RefCell::new(ScanBuffers::default()),
