@@ -2332,6 +2332,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrosa-alloc-count"
+version = "0.0.0"
+
+[[package]]
 name = "ferrosa-cdc"
 version = "0.30.5"
 dependencies = [
@@ -2526,6 +2530,7 @@ dependencies = [
  "blake3",
  "bytes",
  "chrono",
+ "ferrosa-alloc-count",
  "ferrosa-cluster",
  "ferrosa-common",
  "ferrosa-index",
