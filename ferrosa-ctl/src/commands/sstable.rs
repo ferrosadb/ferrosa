@@ -17,6 +17,7 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Serialize;
 use tabled::builder::Builder;
@@ -887,7 +888,7 @@ struct GenScan<'s, 'k> {
 
 impl GenScan<'_, '_> {
     fn run(&mut self, dir: &Path) -> Result<(), CtlError> {
-        let reader = open_reader(dir, self.gen)?;
+        let reader = Arc::new(open_reader(dir, self.gen)?);
         let header = reader.header();
         let mut iter = reader.partitions_iter()?;
         while let Some((key, _deletion, static_row)) = iter.next_partition_header_only()? {
