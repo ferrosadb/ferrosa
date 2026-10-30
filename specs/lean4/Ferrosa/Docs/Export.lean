@@ -22,6 +22,8 @@
 import Lean
 import Ferrosa
 import Ferrosa.Docs.Book
+import Ferrosa.Docs.Tex
+import Ferrosa.Docs.Gloss
 
 open Lean
 
@@ -48,6 +50,11 @@ structure DeclView where
   full : String
   /-- The docstring that preceded it in the source, verbatim. Empty when there is none. -/
   doc : String
+  /-- The declaration's type as LaTeX mathematics — the form the book prints. Empty for declarations
+      that are not propositions (structures, definitions), which the book shows as code instead. -/
+  tex : String
+  /-- The same statement in English, for theorems that carry no docstring of their own. -/
+  desc : String
 
 /-- One thing in a module, in source order: a section, or a declaration. -/
 inductive Ev where
@@ -62,6 +69,16 @@ structure ModuleView where
   header : String
   evs : Array Ev
   namespaces : Array String
+
+/-- Every constant in the environment, by its short name. The scanner reconstructs a declaration's
+    name from the namespace stack, and the stack is a line-level approximation of a real scope: a
+    `section`, an `open … in`, a namespace declared on one line and closed on another can all leave
+    it one segment short. When the reconstructed name does not resolve, this is what recovers the
+    real one — and only when it is unambiguous. -/
+def shortIndex (env : Environment) : Std.HashMap String (Array Name) :=
+  env.constants.fold (init := {}) fun m n _ =>
+    let s := n.getString!
+    m.insert s (m.getD s #[] |>.push n)
 
 /-- `s` contains `sub`, tested the way `Ferrosa/Ledgers.lean` tests for a definition. -/
 def hasSub (s sub : String) : Bool := (s.splitOn sub).length > 1
@@ -117,7 +134,8 @@ def collectBlock (lines : Array String) (i : Nat) (opener : String) : String × 
   return (trim ((body.splitOn "-/").head!), j + 1)
 
 /-- Scan one module: header, sections, declarations, in source order. -/
-def scanFile (key src : String) (path : String) : IO ModuleView := do
+def scanFile (env : Environment) (idx : Std.HashMap String (Array Name)) (key src : String)
+    (path : String) : IO ModuleView := do
   let lines := (src.splitOn "\n").toArray
   let mut evs : Array Ev := #[]
   let mut header : String := ""
@@ -150,8 +168,10 @@ def scanFile (key src : String) (path : String) : IO ModuleView := do
     else if t.startsWith "namespace " then
       -- `namespace X` inside `namespace A` means `A.X`, so the stack holds full names
       let n := trim (dropStr t 10)
+      -- a module may open `namespace Ferrosa.Accord.Ts` inside `namespace Ferrosa.Accord`, so only
+      -- join when the written name is not already qualified under the enclosing one
       let full := match ns.back? with
-        | some p => if p.isEmpty then n else p ++ "." ++ n
+        | some p => if p.isEmpty || n.startsWith (p ++ ".") || n == p then n else p ++ "." ++ n
         | none => n
       ns := ns.push full
       if !nss.contains full then nss := nss.push full
@@ -174,10 +194,30 @@ def scanFile (key src : String) (path : String) : IO ModuleView := do
         if short.isEmpty || short.startsWith "_" || !(short.toList.head!.isAlpha || short.toList.head! == '_') then
           i := i + 1
         else
-          let full := String.intercalate "." (ns.toList ++ [short])
-          evs := evs.push (.decl {
-            line := i + 1, kind := kw, short, full, doc := pending.getD ""
-          })
+          -- the stack holds *fully qualified* namespaces, so only its innermost entry is a prefix:
+          -- `namespace Ferrosa.Accord` then `namespace Ts` must give `Ferrosa.Accord.Ts`, not
+          -- `Ferrosa.Accord.Ferrosa.Accord.Ts`
+          let ctx := (ns.filter (fun s => !s.isEmpty)).back?.getD ""
+          let guess := if ctx.isEmpty then short else ctx ++ "." ++ short
+          -- trust the reconstructed name only if the environment agrees it exists
+          let full := if env.find? guess.toName |>.isSome then guess
+            else match idx.get? short with
+              | some names => if names.size == 1 then names[0]!.toString else guess
+              | none => guess
+          let resolved := env.find? full.toName |>.isSome
+          let (tex, desc) :=
+            if kw == "theorem" || kw == "lemma" then
+              match env.find? full.toName with
+              | some ci => (Ferrosa.Docs.Tex.texStatement env ci.type,
+                            Ferrosa.Docs.Gloss.desc env ci.type)
+              | none => ("", "")
+            else ("", "")
+          if resolved then
+            evs := evs.push (.decl {
+              line := i + 1, kind := kw, short, full, doc := pending.getD "", tex, desc
+            })
+          else
+            IO.eprintln s!"docs: skipping {kw} {full} — no such constant"
           pending := none
           i := i + 1
   return { key, path, header, evs, namespaces := nss }
@@ -239,6 +279,11 @@ def resolve (decls : Array (String × String)) (s : String) : Option (String × 
 
 def run (args : List String) : IO UInt32 := do
   let out := args.head?.getD "build/specs.json"
+  -- `importModules` reads the search path from the process, and `lake exe` does not set it: the
+  -- compiler binary finds its own oleans, a built exe has to be told where they are.
+  initSearchPath (← findSysroot)
+  let env ← importModules #[{ module := `Ferrosa }] {}
+  let idx := shortIndex env
   let files ← leanFiles
 
   let mut mods : Array ModuleView := #[]
@@ -248,7 +293,7 @@ def run (args : List String) : IO UInt32 := do
     -- the root module is imports only, and `Ferrosa.Docs` is this machinery, not the corpus
     if key == "Ferrosa" || key.startsWith "Ferrosa.Docs" then continue
     let src ← IO.FS.readFile f
-    let m ← scanFile key src f
+    let m ← scanFile env idx key src f
     mods := mods.push m
     for e in m.evs do
       match e with
@@ -285,7 +330,7 @@ def run (args : List String) : IO UInt32 := do
         ("line", toJson line), ("text", Json.str text)]
     | .decl d => Json.mkObj [("k", Json.str "decl"), ("kind", Json.str d.kind),
         ("short", Json.str d.short), ("full", Json.str d.full), ("doc", Json.str d.doc),
-        ("line", toJson d.line)]
+        ("line", toJson d.line), ("tex", Json.str d.tex), ("desc", Json.str d.desc)]
 
   let modJson := mods.map fun m => Json.mkObj [
     ("key", Json.str m.key), ("path", Json.str m.path), ("header", Json.str m.header),

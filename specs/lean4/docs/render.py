@@ -62,11 +62,20 @@ def breakable(code: str) -> str:
 
 
 def inline(s: str) -> str:
-    """Escape a line of prose, with `backticked` spans set in mono."""
+    """Escape a line of prose: `backticked` spans in mono, **bold** and *emphatic* as themselves.
+
+    The corpus writes its docstrings in markdown, and the emphasis is doing work — `**I-27 fails in
+    the module as written.**` is the sentence the reader needs to see first.
+    """
     out, i = [], 0
-    for m in re.finditer(r"`([^`]+)`", s):
+    for m in re.finditer(r"\*\*([^*]+)\*\*|`([^`]+)`|\*([^*]+)\*", s):
         out.append(esc(s[i:m.start()]))
-        out.append(r"\texttt{" + breakable(esc(m.group(1))) + "}")
+        if m.group(1) is not None:
+            out.append(r"\textbf{" + inline(m.group(1)) + "}")
+        elif m.group(2) is not None:
+            out.append(r"\texttt{" + breakable(esc(m.group(2))) + "}")
+        else:
+            out.append(r"\emph{" + inline(m.group(3)) + "}")
         i = m.end()
     out.append(esc(s[i:]))
     return "".join(out)
@@ -180,7 +189,10 @@ def collect_prints(names: list[str]) -> dict[str, str]:
 # --------------------------------------------------------------------------------------------------
 
 PREAMBLE = r"""
-\documentclass[10pt,twoside,openright]{book}
+% openany, not openright: openright starts every chapter on a right-hand page and leaves the facing
+% verso blank, which is right for a bound book and wrong for a document read on a screen — it cost
+% 56 blank pages in 309. Chapters now start on the next page, whatever its side.
+\documentclass[10pt,twoside,openany]{book}
 \usepackage{fontspec}
 % Latin Modern ships inside the TeX bundle, so the text faces need no system font. The mono face
 % does: Lean's statements are full of ⟨⟩ ∀ ∃ ∧ ⊆ ⌜⌝, and DejaVu Sans Mono is the smallest font that
@@ -195,14 +207,52 @@ PREAMBLE = r"""
 \usepackage{xcolor}
 % One glyph in the corpus (`⊆`, in a docstring) is missing from Liberation Serif; give the maths
 % symbols a face that has them rather than dropping the character on the floor.
-\newfontfamily\symfont{DejaVu Sans}[Scale=0.97]
 \usepackage{newunicodechar}
-\newunicodechar{⊆}{{\symfont ⊆}}
-\newunicodechar{⊂}{{\symfont ⊂}}
-\newunicodechar{⊨}{{\symfont ⊨}}
-\newunicodechar{⊤}{{\symfont ⊤}}
-\newunicodechar{⊥}{{\symfont ⊥}}
+\newfontfamily\symfont{DejaVu Sans}[Scale=0.97]
+\newunicodechar{⟨}{{\symfont\symbol{"27E8}}}
+\newunicodechar{⟩}{{\symfont\symbol{"27E9}}}
+\newunicodechar{∃}{{\symfont\symbol{"2203}}}
+\newunicodechar{∀}{{\symfont\symbol{"2200}}}
+\newunicodechar{∈}{{\symfont\symbol{"2208}}}
+\newunicodechar{∧}{{\symfont\symbol{"2227}}}
+\newunicodechar{¬}{{\symfont\symbol{"00AC}}}
+\newunicodechar{≤}{{\symfont\symbol{"2264}}}
+\newunicodechar{≠}{{\symfont\symbol{"2260}}}
+\newunicodechar{→}{{\symfont\symbol{"2192}}}
+\newunicodechar{↔}{{\symfont\symbol{"2194}}}
+\newunicodechar{⇒}{{\symfont\symbol{"21D2}}}
+\newunicodechar{·}{{\symfont\symbol{"00B7}}}
+\newunicodechar{×}{{\symfont\symbol{"00D7}}}
+\newunicodechar{⊤}{{\symfont\symbol{"22A4}}}
+\newunicodechar{⊥}{{\symfont\symbol{"22A5}}}
+\newunicodechar{⊂}{{\symfont\symbol{"2282}}}
+\newunicodechar{⊆}{{\symfont\symbol{"2286}}}
+\newunicodechar{≥}{{\symfont\symbol{"2265}}}
+\newunicodechar{α}{{\symfont\symbol{"03B1}}}
+\newunicodechar{β}{{\symfont\symbol{"03B2}}}
+\newunicodechar{γ}{{\symfont\symbol{"03B3}}}
+\newunicodechar{δ}{{\symfont\symbol{"03B4}}}
+\newunicodechar{σ}{{\symfont\symbol{"03C3}}}
+\newunicodechar{μ}{{\symfont\symbol{"03BC}}}
+\newunicodechar{τ}{{\symfont\symbol{"03C4}}}
+\newunicodechar{λ}{{\symfont\symbol{"03BB}}}
+\newunicodechar{⌜}{{\symfont\symbol{"231C}}}
+\newunicodechar{⌝}{{\symfont\symbol{"231D}}}
+\newunicodechar{⊢}{{\symfont\symbol{"22A2}}}
+\newunicodechar{⊨}{{\symfont\symbol{"22A8}}}
+\newunicodechar{⊆}{{\symfont\symbol{"2286}}}
+\newunicodechar{⊂}{{\symfont\symbol{"2282}}}
+\newunicodechar{⊨}{{\symfont\symbol{"22A8}}}
+\newunicodechar{⊤}{{\symfont\symbol{"22A4}}}
+\newunicodechar{⊥}{{\symfont\symbol{"22A5}}}
 \usepackage{fvextra}
+\usepackage[fleqn]{amsmath}
+\setlength{\mathindent}{0pt}
+\setlength{\abovedisplayskip}{3pt plus 1pt minus 1pt}
+\setlength{\belowdisplayskip}{3pt plus 1pt minus 1pt}
+\setlength{\abovedisplayshortskip}{3pt}
+\setlength{\belowdisplayshortskip}{3pt}
+\usepackage{amssymb}
 \usepackage{booktabs}
 \usepackage{longtable}
 \usepackage{array}
@@ -233,6 +283,13 @@ PREAMBLE = r"""
   {\normalfont\sffamily\bfseries\color{accent}\raggedright}
   {\large\thechapter}{10pt}{\Large\raggedright}
 \titlespacing*{\chapter}{0pt}{-10pt}{14pt}
+
+% The statement itself is mathematics; the Lean it came from is printed underneath in small mono so
+% the translation can be checked against the compiler's own words.
+\DefineVerbatimEnvironment{LeanForm}{Verbatim}
+  {fontsize=\scriptsize,frame=none,formatcom=\color{quiet},xleftmargin=1pt,
+   breaklines=true,breaksymbolleft={},breaksymbolright={},breakindent=8pt}
+\newcommand{\stmtrule}{\par\vspace{1pt}\noindent\rule{\linewidth}{0.3pt}\par\vspace{1pt}}
 
 \DefineVerbatimEnvironment{Statement}{Verbatim}
   {frame=single,rulecolor=\color{rule},framerule=0.35pt,framesep=5pt,
@@ -315,7 +372,7 @@ def part_opener(p: dict) -> str:
     """
     mods = esc(", ".join(m.replace("Ferrosa.", "") for m in p["modules"]))
     return rf"""
-\cleardoublepage
+\clearpage
 \thispagestyle{{empty}}
 \phantomsection\addcontentsline{{toc}}{{part}}{{Part {p['numeral']}\quad {esc(p['title'])}}}
 \vspace*{{42mm}}
@@ -353,6 +410,46 @@ def chapter_head(mod: dict) -> str:
     return "\n".join(out)
 
 
+def guarantees_chapter(parts: list[dict], claims_by_module: dict[str, list[dict]]) -> str:
+    """The book's first page of content, and the only one written for someone who has not read the
+    code: what the database promises, part by part, each promise with the theorem that settles it.
+
+    Every sentence here is the corpus's own — the ledger claims, unaltered. The chapter adds no
+    prose about what Ferrosa is; it rearranges what the corpus already says into the order a user
+    asks the questions in.
+    """
+    out = [
+        r"\chapter*{What this database guarantees}",
+        r"\addcontentsline{toc}{chapter}{What this database guarantees}",
+        prose("Each line below is a sentence this corpus asserts about the database, and the theorem "
+              "that settles it. **Guaranteed** means the statement is proved, with no `sorry`, no "
+              "extra axiom, and nothing imported beyond Lean's core. **Not guaranteed** means the "
+              "corpus states the property and shows why the code as written does not have it — the "
+              "witness names the theorem that exhibits the failure. A red line is not a bug in the "
+              "proof: it is the proof working."),
+        prose("The parts that follow take the same material a module at a time, and explain how each "
+              "guarantee is reached. This chapter exists because that order is the author's, not "
+              "yours."),
+    ]
+    for p in parts:
+        rows = []
+        for key in p["modules"]:
+            for c in claims_by_module.get(key, []):
+                mark = r"\statuspass" if c["kind"] == "met" else r"\statusred"
+                ground = c["proof"] if c["kind"] == "met" else c["witness"]
+                rows.append(
+                    rf"{mark} & {inline(c['claim'])} & \texttt{{{breakable(esc(ground))}}} "
+                    rf"& \pageref{{cl:{slug(c['claim'])}}} \\")
+        if not rows:
+            continue
+        out.append(rf"\section*{{{esc(p['title'])}}}")
+        out.append(
+            r"{\footnotesize\begin{longtable}{@{}p{12mm}p{0.52\textwidth}p{0.30\textwidth}@{\hfill}r@{}}"
+            "\n" + "\n".join(rows) + "\n" + r"\end{longtable}}"
+        )
+    return "\n".join(out)
+
+
 def claims_table(claims: list[dict]) -> str:
     if not claims:
         return ""
@@ -369,7 +466,27 @@ def claims_table(claims: list[dict]) -> str:
     )
 
 
-def claim_block(c: dict, thm: str, stmt: str, defs: list[tuple[str, str]], src: str) -> str:
+def math_display(tex: str) -> str:
+    """The statement, set as mathematics between two rules."""
+    return (
+        "\\par\\addvspace{3pt}\\noindent\\stmtrule\\nopagebreak\n"
+        "\\[" + tex + "\\]\\nopagebreak\n"
+        "\\noindent\\stmtrule\\par"
+    )
+
+
+def lean_form(lean: str) -> str:
+    """The same statement as Lean printed it, for checking the translation above."""
+    if not lean.strip():
+        return ""
+    return (
+        "\\par\\vspace{-1pt}\\noindent{\\scriptsize\\sffamily\\color{quiet}lean}\\par\\nopagebreak\n"
+        "\\begin{LeanForm}\n" + lean + "\n\\end{LeanForm}"
+    )
+
+
+def claim_block(c: dict, thm: str, tex: str, lean: str, doc: str,
+                defs: list[tuple[str, str]], src: str) -> str:
     mark = r"\statuspass" if c["kind"] == "met" else r"\statusred"
     if c["kind"] == "met":
         prov = f"proved by \\texttt{{{breakable(esc(c['proof']))}}}"
@@ -379,9 +496,15 @@ def claim_block(c: dict, thm: str, stmt: str, defs: list[tuple[str, str]], src: 
            rf"\claim{{{mark}}}{{{inline(c['claim'])}}}{{{prov}}}"]
     if c["kind"] == "failing":
         out.append(rf"\redwhy{{{inline(c['why'])}}}")
-    if stmt:
-        out.append("\\begin{Statement}\n" + stmt + "\n\\end{Statement}")
+    if doc.strip():
+        out.append(rf"{{\small {prose(doc)}}}")
+    # The definition comes first. A reader who meets `mergeCell` in the middle of a formula and has
+    # to turn the page to learn what it means has lost the argument the page was making.
     out.extend(def_block(name, body) for name, body in defs)
+    if tex:
+        out.append(math_display(tex))
+    if lean:
+        out.append(lean_form(lean))
     if src:
         out.append(rf"\src{{{esc(src)}}}")
     return "\n".join(out)
@@ -417,6 +540,54 @@ def drop_empty_headings(blocks: list[str]) -> list[str]:
                 continue
         keep.append(b)
     return keep
+
+
+def statement_block(name: str, tex: str, lean: str, doc: str, desc: str,
+                    defs: list[tuple[str, str]], src: str) -> str:
+    """A theorem no ledger claims. The author's docstring is the sentence above it; where there is
+    none, the statement stands on its name and its mathematics rather than on a sentence this
+    renderer would have had to invent."""
+    head = (
+        r"\par\addvspace{7pt}\noindent"
+        "{\\footnotesize\\sffamily\\color{quiet}" + esc(name) + r"}\par\nopagebreak"
+    )
+    # The author's sentence when there is one; otherwise a reading of the formula itself, in the
+    # same place, so no theorem stands on its name alone.
+    if doc.strip():
+        body = "\n" + rf"{{\small {prose(doc)}}}"
+    elif desc.strip():
+        body = "\n" + rf"{{\small\itshape {desc}}}"
+    else:
+        body = ""
+    body += "".join("\n" + def_block(n, b) for n, b in defs)
+    body += "\n" + math_display(tex) + "\n" + lean_form(lean)
+    return head + body + ("\n" + rf"\src{{{esc(src)}}}" if src else "")
+
+
+def module_shape(mod: dict) -> str:
+    """One clause saying what an apparatus module contains, for the part's apparatus list."""
+    kinds: dict[str, int] = {}
+    for e in mod["events"]:
+        if e["k"] == "decl":
+            kinds[e["kind"]] = kinds.get(e["kind"], 0) + 1
+    if not kinds:
+        return "source file with no declarations"
+    parts = [f"{n} {k if n > 1 else k}" for k, n in sorted(kinds.items(), key=lambda kv: -kv[1])]
+    return ", ".join(parts)
+
+
+def apparatus_block(items: list[tuple[str, str]], p: dict) -> str:
+    rows = "\n".join(
+        rf"\texttt{{{breakable(esc(k.replace('Ferrosa.', '')))}}} & {inline(shape)} \\"
+        for k, shape in items)
+    return (
+        r"\section*{Apparatus}" + "\n"
+        + prose("Modules in this part that carry no claims and no theorems: they hold the checker, "
+                "the runners, and the syntax the rest is written in. Listed here so the book does "
+                "not spend a page saying nothing.")
+        + "\n{\\footnotesize\\begin{longtable}{@{}p{0.42\\textwidth}p{0.52\\textwidth}@{}}\\toprule\n"
+        + rows + "\n\\bottomrule\\end{longtable}}"
+    )
 
 
 def definition_block(name: str, body: str, src: str) -> str:
@@ -488,9 +659,20 @@ def main() -> None:
             else:
                 orphans.setdefault(area["key"], []).append(item)
 
-    # statements for every claimed theorem
-    claimed = [n for n in claims_by_theorem if n in decl_index or n in {e["full"] for m in data["modules"] for e in m["events"] if e["k"] == "decl"}]
-    stmts = collect_statements(sorted(claimed))
+    # Statements for every theorem the book will print. A chapter used to show only what a ledger
+    # cited, which left forty of the sixty-one modules with nothing but a header — the machinery was
+    # invisible and the book looked padded. Every theorem now appears in its own module, and the
+    # ledger claim is what turns one of them from a statement into a claim.
+    book_modules = {k for p in data["parts"] for k in p["modules"]}
+    declared = {e["full"] for m in data["modules"] for e in m["events"] if e["k"] == "decl"}
+
+    def module_theorems(key: str) -> list[dict]:
+        return [e for e in mods[key]["events"] if e["k"] == "decl" and e["kind"] == "theorem"]
+
+    unclaimed = {k: [e for e in module_theorems(k) if e["full"] not in claims_by_theorem]
+                 for k in book_modules if k in mods}
+    stmts = collect_statements(sorted({n for n in claims_by_theorem if n in declared}
+                                      | {e["full"] for v in unclaimed.values() for e in v}))
 
     # the definitions those statements mention, one level deep
     vocab = {}
@@ -506,9 +688,13 @@ def main() -> None:
                 if full and full != thm and full not in seen and decl_index[full][0] == decl_index.get(thm, (None,))[0]:
                     seen.append(full)
                     toks.append(full)
-        wanted[thm] = toks[:6]
-    all_defs = sorted({d for v in wanted.values() for d in v})
-    prints = collect_prints(all_defs) if all_defs else {}
+        wanted[thm] = toks
+    referenced = {d for v in wanted.values() for d in v}
+    # every definition the book will print: those a statement names, and those the author documented
+    documented = {e["full"] for m in data["modules"] for e in m["events"]
+                  if e["k"] == "decl" and e["kind"] in ("def", "abbrev", "structure", "inductive", "class")
+                  and e["doc"].strip()}
+    prints = collect_prints(sorted(referenced | documented)) or {}
 
     def fmt_print(name: str) -> str:
         body = strip_prefix(prints.get(name, ""))
@@ -526,11 +712,14 @@ def main() -> None:
 
     parts = data["parts"] if not args.part else [p for p in data["parts"] if p["numeral"] == args.part]
 
-    out = [PREAMBLE, r"\begin{document}", titlepage(data), PRIMER, r"\mainmatter", r"\tableofcontents"]
+    claims_by_module = {a["key"]: a["items"] for a in data["areas"]}
+    out = [PREAMBLE, r"\begin{document}", titlepage(data), PRIMER, r"\mainmatter", r"\tableofcontents",
+           guarantees_chapter(data["parts"], claims_by_module)]
 
     total_claims = 0
     for p in parts:
         out.append(part_opener(p))
+        apparatus: list[tuple[str, str]] = []
         for key in p["modules"]:
             mod = mods.get(key)
             if not mod:
@@ -553,46 +742,51 @@ def main() -> None:
                 if full in claims_by_theorem:
                     for c in claims_by_theorem[full]:
                         defs = [(d.split(".")[-1], fmt_print(d)) for d in wanted.get(full, []) if d in prints]
-                        chapter_body.append(claim_block(c, full, strip_prefix(stmts.get(full, "")), defs, src))
+                        entry = decl_index.get(full, (None, {}))[1] or {}
+                        chapter_body.append(claim_block(c, full, entry.get("tex", ""),
+                                                        strip_prefix(stmts.get(full, "")),
+                                                        entry.get("doc", ""), defs, src))
                         rendered_claims.append(c)
                     rendered.add(full)
-                elif full in {d for v in wanted.values() for d in v} and full not in rendered:
+                elif full in rendered:
+                    pass
+                elif e["kind"] in ("theorem", "lemma"):
+                    # In place, not in a trailing register: the paragraph above asserts something and
+                    # this is the statement that makes the assertion checkable.
+                    sdefs = [(d.split(".")[-1], fmt_print(d)) for d in wanted.get(full, [])
+                             if d in prints and d not in rendered]
+                    rendered.update(d for d in wanted.get(full, []) if d in prints)
+                    chapter_body.append(statement_block(e["short"], e.get("tex", ""),
+                                                        strip_prefix(stmts.get(full, "")),
+                                                        e.get("doc", ""), e.get("desc", ""),
+                                                        sdefs, src))
+                    rendered.add(full)
+                elif full in referenced or (e["doc"].strip() and e["kind"] != "instance"):
+                    # A definition earns its place if a statement leans on it, or if the author wrote
+                    # a docstring for it — the corpus's own signal that it is worth reading.
                     chapter_body.append(definition_block(e["short"], fmt_print(full), src))
                     rendered.add(full)
             for c in orphans.get(key, []):
-                chapter_body.append(claim_block(c, "", "", [], ""))
+                chapter_body.append(claim_block(c, "", "", "", "", [], ""))
                 rendered_claims.append(c)
+
+            # A module with neither a claim nor a theorem is apparatus — a `#check` file, a runner,
+            # a syntax skeleton. It gets a line in the part's apparatus list instead of a chapter
+            # with one paragraph in it.
+            rest = unclaimed.get(key, [])
+            if not rendered_claims and not rest:
+                apparatus.append((key, module_shape(mod)))
+                continue
+
             out.append(chapter_head(mod))
             total_claims += len(rendered_claims)
             if rendered_claims:
                 out.append(claims_table(rendered_claims))
             out.extend(drop_empty_headings(chapter_body))
 
-    # appendix: every theorem in the corpus, by module, whether claimed or not
-    out.append(r"\appendix")
-    out.append(r"\chapter{Every theorem in the corpus}")
-    out.append(
-        prose("The book above prints the claims. This is the register: every theorem the corpus "
-              "contains, in module order, with the claims that cite it. A theorem with no claim "
-              "beside it is supporting machinery — a step lemma, an intersection fact, a case check.")
-    )
-    cited = {full: [c["claim"] for c in cs] for full, cs in claims_by_theorem.items()}
-    for m in data["modules"]:
-        if m["key"] not in {k for p in data["parts"] for k in p["modules"]}:
-            continue
-        thms = [e for e in m["events"] if e["k"] == "decl" and e["kind"] == "theorem"]
-        if not thms:
-            continue
-        # no TOC entry: sixty-one modules in the contents would bury the seven parts
-        out.append(rf"\section*{{{esc(m['key'].replace('Ferrosa.', ''))}}}")
-        out.append(r"{\footnotesize\begin{longtable}{@{}p{0.52\textwidth}p{0.44\textwidth}@{}}")
-        for e in thms:
-            claims = cited.get(e["full"], [])
-            mark = r"\statuspass" if claims else ""
-            out.append(
-                rf"{mark}~\texttt{{{breakable(esc(e['short']))}}} & "
-                + (inline(claims[0]) if claims else r"{\color{quiet}—}") + r" \\")
-        out.append(r"\end{longtable}}")
+        if apparatus:
+            out.append(apparatus_block(apparatus, p))
+            apparatus = []
 
     out.append(r"\end{document}")
 

@@ -34,24 +34,12 @@ structure Part where
 
 /-- The book. -/
 def parts : List Part := [
-  ⟨"I", "Foundations", "Everything in the corpus rests on one counting lemma, and on a ledger that records what is proved and what is not. This part is those two things, plus the vocabulary the topology rungs are stated in. Read it first; the rest of the book assumes it and does not repeat it.", [
-    "Ferrosa.Core",
-    "Ferrosa.Ledger",
-    "Ferrosa.Witnesses",
-    "Ferrosa.Commons.Tactics",
-    "Ferrosa.Topology.Basic"
-  ]⟩,
-
-  ⟨"II", "The write path", "A write is admitted, appended to the commit log, replicated to the sync-mode target, applied to the memtable, acknowledged, and only then flushed to an SSTable. Each arrow in that sentence is a constructor of `Step` in `WritePath`, which is why the trace can be checked rather than described. The storage modules then take the path apart: the cell format, the visibility rule, what survives a crash, and what a delete leaves behind.", [
-    "Ferrosa.WritePath",
-    "Ferrosa.Storage.Format",
-    "Ferrosa.Storage.Mvcc",
-    "Ferrosa.Storage.Recovery",
-    "Ferrosa.Storage.Tombstone",
-    "Ferrosa.Storage.Streaming"
-  ]⟩,
-
-  ⟨"III", "The query surface", "Four front ends — CQL, SQL, SPARQL and the Bolt session — over the same storage and the same consistency rules. The claims here are about what a query means, which statements can be refused at parse time, and how a subscription's ordering relates to the write path. Where the answer depends on replication, the theorem names the topology module that decides it.", [
+  ⟨"I", "The query surface",
+   "Start here if you are using Ferrosa rather than building it. Four front ends — CQL, SQL, " ++
+   "SPARQL and the Bolt session — over the same storage and the same consistency rules. The claims " ++
+   "are about what a query means: which statements are refused at parse time, what an aggregate " ++
+   "returns when a shard is unreachable, and how a subscription's order relates to the write path. " ++
+   "Nothing here asks you to know how a write is stored.", [
     "Ferrosa.Cql.Syntax",
     "Ferrosa.Cql.Classify",
     "Ferrosa.Cql.Collections",
@@ -70,14 +58,12 @@ def parts : List Part := [
     "Ferrosa.Bolt.Session"
   ]⟩,
 
-  ⟨"IV", "Replication and topology", "The escalation ladder, one rung per module: a single node, a pair, three nodes at RF=2, five at RF=quorum, two datacenters over one WAN link, three in a ring. Each rung is a concrete `Topo`, so its quorum properties are finite and checked by enumeration rather than argued. The Accord modules sit above them and specify the apply order and the recovery path.", [
-    "Ferrosa.Accord.Protocol",
-    "Ferrosa.Accord.Strict",
-    "Ferrosa.Accord.Serializable",
-    "Ferrosa.Accord.History",
-    "Ferrosa.Accord.Recovery",
-    "Ferrosa.Accord.Edn",
-    "Ferrosa.Accord.AccordMultiDcLean",
+  ⟨"II", "Consistency, replication and topology",
+   "What you are allowed to assume once the cluster is more than one node. The escalation ladder, " ++
+   "one rung per module: a single node, a pair, three at RF=2, five at RF=quorum, two datacenters " ++
+   "over one WAN link, three in a ring. Each rung is a concrete `Topo`, so its quorum properties are " ++
+   "finite and checked by enumeration rather than argued. The Accord modules sit above them and " ++
+   "specify the apply order and the recovery path a client actually observes.", [
     "Ferrosa.Topology.Single",
     "Ferrosa.Topology.Pair",
     "Ferrosa.Topology.ThreeNode",
@@ -86,10 +72,21 @@ def parts : List Part := [
     "Ferrosa.Topology.ThreeDcRing",
     "Ferrosa.Topology.Ladder",
     "Ferrosa.Topology.DcQuorum",
-    "Ferrosa.Topology.ConsistencyLevels"
+    "Ferrosa.Topology.ConsistencyLevels",
+    "Ferrosa.Accord.Protocol",
+    "Ferrosa.Accord.Strict",
+    "Ferrosa.Accord.Serializable",
+    "Ferrosa.Accord.History",
+    "Ferrosa.Accord.Recovery",
+    "Ferrosa.Accord.Edn",
+    "Ferrosa.Accord.AccordMultiDcLean"
   ]⟩,
 
-  ⟨"V", "Change and control", "What leaves the cluster once a write lands: change-data-capture and flight-style subscribers, the streaming reader they page through, and the three feedback loops that decide how much goes out per tick. The loops are specified as recurrences, so statements about overshoot and steady-state offset are arithmetic on a closed form, not simulation results.", [
+  ⟨"III", "What leaves the cluster",
+   "What an operator subscribes to once a write lands: change-data-capture and flight-style " ++
+   "subscribers, the streaming reader they page through, and the three feedback loops that decide " ++
+   "how much goes out per tick. The loops are specified as recurrences, so statements about " ++
+   "overshoot and steady-state offset are arithmetic on a closed form, not simulation results.", [
     "Ferrosa.Cdc.Subscribe",
     "Ferrosa.Flight.Subscribe",
     "Ferrosa.Commons.Stream",
@@ -98,7 +95,39 @@ def parts : List Part := [
     "Ferrosa.Commons.FrontEnd"
   ]⟩,
 
-  ⟨"VI", "Evidence", "A specification that only compiles has not been tested against a real history. This part is the machinery that closes that gap: Jepsen's checker models transcribed, the history type they read, the guarantee table, and two harnesses — one that runs every invariant over an enumerated case space, one that checks a recorded Elle history against the Accord model. A claim in this part names what would falsify it.", [
+  ⟨"IV", "The write path",
+   "Now the inside. A write is admitted, appended to the commit log, replicated to the sync-mode " ++
+   "target, applied to the memtable, acknowledged, and only then flushed to an SSTable. Each arrow " ++
+   "in that sentence is a constructor of `Step` in `WritePath`, which is why the trace can be " ++
+   "checked rather than described. The storage modules then take the path apart: the cell format, " ++
+   "the visibility rule, what survives a crash, and what a delete leaves behind.", [
+    "Ferrosa.WritePath",
+    "Ferrosa.Storage.Format",
+    "Ferrosa.Storage.Mvcc",
+    "Ferrosa.Storage.Recovery",
+    "Ferrosa.Storage.Tombstone",
+    "Ferrosa.Storage.Streaming"
+  ]⟩,
+
+  ⟨"V", "Foundations",
+   "Reference, not an introduction, kept near the back deliberately: the counting lemma every " ++
+   "quorum proof rests on, the vocabulary the topology rungs are stated in, and the ledger that " ++
+   "records what is proved and what is not. Nothing in this part describes anything a user can " ++
+   "observe — it is the apparatus the four parts above are written with, and the place to look when " ++
+   "a term in an earlier chapter needs defining.", [
+    "Ferrosa.Core",
+    "Ferrosa.Ledger",
+    "Ferrosa.Witnesses",
+    "Ferrosa.Commons.Tactics",
+    "Ferrosa.Topology.Basic"
+  ]⟩,
+
+  ⟨"VI", "Evidence",
+   "A specification that only compiles has not been tested against a real history. This part is the " ++
+   "machinery that closes that gap: Jepsen's checker models transcribed, the history type they " ++
+   "read, the guarantee table, and two harnesses — one that runs every invariant over an enumerated " ++
+   "case space, one that checks a recorded Elle history against the Accord model. A claim in this " ++
+   "part names what would falsify it.", [
     "Ferrosa.Testing.Jepsen",
     "Ferrosa.Testing.JepsenModels",
     "Ferrosa.Testing.Histories",
@@ -108,7 +137,12 @@ def parts : List Part := [
     "Ferrosa.TlaCheck"
   ]⟩,
 
-  ⟨"VII", "Limits and accounting", "Not everything here is proved, and the corpus is built so that the unproved part cannot be guessed at. Every red item in every ledger is classified exactly once — unimplemented, requirement, proof, measurement, inherited, undecided — and the counts are pinned by theorems. This part is the audit: the classification, the trusted base under every `unsafe` block, and the items still owed.", [
+  ⟨"VII", "Limits and accounting",
+   "Not everything here is proved, and the corpus is built so that the unproved part cannot be " ++
+   "guessed at. Every red item in every ledger is classified exactly once — unimplemented, " ++
+   "requirement, proof, measurement, inherited, undecided — and the counts are pinned by theorems. " ++
+   "This part is the audit: the classification, the trusted base under every `unsafe` block, and " ++
+   "the items still owed.", [
     "Ferrosa.Unimplemented",
     "Ferrosa.Broken",
     "Ferrosa.Unsafe.Invariants",
