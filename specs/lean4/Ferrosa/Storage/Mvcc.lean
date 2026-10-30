@@ -85,7 +85,15 @@ theorem gc_never_grows_a_chain (c : Chain) (oldest : Nat) :
   · exact List.length_filter_le _ _
   · exact List.length_filter_le _ _
 
-/-! ## The cost of putting versions in files instead of in the record -/
+/-! ## The cost of putting versions in files instead of in the record
+
+When each SSTable holds one version of a cell, a snapshot lookup touches every overlapping file, so a row
+rewritten ten times and never compacted costs ten probes — compaction lowers that number but never bounds
+it. Holding a bounded chain of versions inside the record makes the visible version a single record read,
+because the version the snapshot needs is in the cell that was already fetched. The chain is bounded by the
+number of live snapshots rather than by elapsed time, so retention follows the oldest reader and that count
+is the only thing limiting a record's version list.
+-/
 
 /-- Reads per snapshot lookup when each SSTable holds one version: every overlapping file. -/
 def probesPerRead (files : Nat) : Nat := files
@@ -160,8 +168,6 @@ def probesFor (spilled : Bool) : Nat := if spilled then 2 else 1
     overflowing chain is paid for by the rows that overflowed and by no others. -/
 theorem a_spilled_row_costs_one_extra_probe :
     probesFor false = 1 ∧ probesFor true = 2 := by decide
-
-/-! ## The ledger -/
 
 /-! ## Read-set capture: predicate locks, not dirty bits
 
@@ -436,6 +442,15 @@ theorem the_chain_makes_a_covered_snapshot_one_read :
     SSTable in the view is probed either way. -/
 theorem the_chain_does_not_reduce_the_bloom_fan_out :
     snapshotLookupProbes 40 3 = 43 := by decide
+
+/-! ## The ledger
+
+Every claim about snapshots and version retention is listed here with the theorem behind it, and the five items
+recorded red are the ones a user meets today: no vacuum runs, the read path takes no predicate lock, a cell holds
+one value rather than an in-record chain, a spill pointer no compaction carries, and a lookup that may not stop
+at the first file holding the key. Reading the table is the fastest way to see which half of the design exists in the
+engine. The red count is pinned, so closing one of them without updating the table fails the build.
+-/
 
 def ledger : List SpecItem := [
   ⟨"a snapshot reads the newest version at or below it",

@@ -101,7 +101,16 @@ theorem pull_and_discard_both_release :
       ∧ step (.streaming 1) .discard = .streaming 1 := by
   decide
 
-/-! ## The ledger -/
+/-! ## The ledger
+
+Six obligations a driver would want from a Bolt session are listed against the declaration that
+decides each one, and three of them are red: reply pairing, bounded queuing, and attributing a
+failure to a statement. A red item carries the sentence a client observes — a desynchronised reply
+stream, a run queue with no backpressure, a failure with no statement identity to recover from — so
+the ledger reads as the protocol's limits as much as its features. `redCount ledger` counts the red
+items and `bolt_has_three_red_items` fixes the number at three.
+
+-/
 
 def ledger : List SpecItem := [
   ⟨"only RESET leaves the failed state",

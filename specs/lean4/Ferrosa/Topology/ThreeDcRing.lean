@@ -19,7 +19,13 @@ namespace Ferrosa.Topology.ThreeDcRing
 open Ferrosa
 open Ferrosa.Topology
 
-/-! ## Which datacenters can still reach each other once a link is cut -/
+/-! ## Which datacenters can still reach each other once a link is cut
+
+  Reachability between datacenters is a two-hop question on a three-DC graph, so a link list and
+  its subsets answer it for every cut. The ring is wired 0–1, 1–2, 2–0: any one link may go with all
+  three DCs still mutually reachable, and two cuts isolate at most one DC, leaving the other two
+  still talking to each other.
+-/
 
 /-- A direct WAN link between DCs `a` and `b`, in either direction. -/
 def dcLink (links : List (Nat × Nat)) (a b : Nat) : Bool :=
@@ -70,7 +76,13 @@ theorem isolating_one_dc_keeps_the_other_two_connected :
       dcReach (afterCut [(1, 2), (0, 2)]) 1 2 = false := by
   decide
 
-/-! ## What a quorum of six needs, and which datacenter losses it survives -/
+/-! ## What a quorum of six needs, and which datacenter losses it survives
+
+  Nine nodes at three per DC and a replication factor of six need four acknowledgements, and no
+  single datacenter holds four replicas, so every cross-DC quorum spans at least two datacenters.
+  Losing one whole datacenter leaves the other two contributing exactly the four acks required, for
+  every key; losing two leaves one DC contributing two against a threshold of four.
+-/
 
 /-- 9 nodes, 3 per DC, RF = 6 (NTS 2 + 2 + 2). -/
 def threeDc : Topo where
@@ -106,7 +118,12 @@ theorem two_dc_loss_breaks_quorum :
 theorem each_quorum_never_survives_dc_loss :
     threeDc.localOkAtB (downOf [6, 7, 8]) 2 0 .eachQuorum 2 = false := by decide
 
-/-! ## Where the redundancy stops: one datacenter may go, two may not -/
+/-! ## Where the redundancy stops: one datacenter may go, two may not
+
+  The boundary is exactly one datacenter: one loss is free for `QUORUM` on every key, two take it
+  with them and cross-DC writes stop rather than under-acknowledge. Anyone sizing `{2,2,2}` should
+  read that as a guarantee about a single DC outage and no more.
+-/
 
 /-- The ring tolerates exactly one DC loss: one is free, two take `QUORUM` with
     them.  That is the boundary of the last rung. -/

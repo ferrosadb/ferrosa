@@ -23,7 +23,10 @@ namespace Ferrosa.Testing.Jepsen
 
 open Ferrosa Ferrosa.Ledger Ferrosa.Accord
 
-/-! ## What a green run licenses -/
+/-! ## What a green run licenses
+
+A verdict is only a claim about the run that produced it, and three shapes a run can take make that claim smaller than it sounds. A run must have witnessed a read and an acknowledged write, its reads must not have been local across a failover, and its checker must have kept the read-only transactions. `Run` carries exactly those three facts, and `establishesStrictSerializability` holds only when all three do.
+-/
 
 /-- A run of the suite, described by what it actually witnessed. -/
 structure Run where
@@ -67,7 +70,10 @@ theorem the_only_qualifying_run_shape :
   simp only [establishesStrictSerializability, Bool.and_eq_true, decide_eq_true_eq, Bool.not_eq_true] at h
   exact ⟨h.1.1.1, h.1.1.2⟩
 
-/-! ## The stale-read shape, which is what a local read produces -/
+/-! ## The stale-read shape, which is what a local read produces
+
+A local read across a failover returns a value that a write elsewhere already superseded, and that history is legal under serializability and illegal under strict serializability. The witness is reused rather than rebuilt: `hStaleRead` from `Ferrosa/Accord/Serializable.lean` is the same history, and this section names why it applies to a multi-DC run. Reading it as a defect misreads the consistency level the operator chose.
+-/
 
 /-- A multi-DC run with local reads and a failover produces exactly the history shape that is
     serializable but not strictly serializable: the read saw the pre-write value and real time says it
@@ -76,7 +82,10 @@ theorem a_local_read_across_a_failover_produces_the_stale_read_shape :
     serializableB hStaleRead = true ∧ strictlySerializableB hStaleRead = false :=
   hStaleRead_serial_but_not_strict
 
-/-! ## The dependency graph, and why read-only transactions must stay in it -/
+/-! ## The dependency graph, and why read-only transactions must stay in it
+
+A history is convicted by finding a cycle in the graph of transaction dependencies, so a transaction left out of that graph takes its edges with it. A read-only transaction writes nothing, but its reads still order it against the writers, and in a write-skew history it can carry the only cycle there is. `reachIn` is fuel-bounded rather than a general closure, so the claim is about the direction of the error — dropping an edge can hide a violation, never invent one — and not about every graph a checker might build.
+-/
 
 inductive EdgeKind where
   | ww

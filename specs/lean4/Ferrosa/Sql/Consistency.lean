@@ -176,7 +176,16 @@ theorem levels_trade_acknowledgements_for_failures :
       ∧ Level.all.failuresTolerated 3 3 < Level.quorum.failuresTolerated 3 3 := by
   decide
 
-/-! ## Read and write levels: when does a read see an acknowledged write? -/
+/-! ## Read and write levels: when does a read see an acknowledged write?
+
+A read sees an acknowledged write exactly when the replicas that acknowledged the write and the
+replicas that answer the read overlap, which is what `QUORUM` on three replicas buys and `ONE` does
+not. At `ONE` on each side the two sets need never meet, so a value the client has just been told is
+written can be absent from its very next read; at `ALL` every write is met by every read level.
+`LOCAL_QUORUM` overlaps only inside its own datacenter, so the guarantee stops at the datacenter
+boundary rather than at the edge of the cluster.
+
+-/
 
 def intersects (a b : List Nat) : Bool := a.any fun x => b.any fun y => x == y
 
@@ -208,7 +217,16 @@ theorem all_writes_are_seen_by_every_read :
 theorem local_quorum_does_not_cross_dcs :
     intersects [0, 1] [3, 4] = false := by decide
 
-/-! ## The decision level must cover the data level -/
+/-! ## The decision level must cover the data level
+
+A commit decision acknowledged at `ONE` while the data it decides sits at `QUORUM` can be lost on its
+own: the one replica holding the verdict goes and the data it committed stays, so the transaction's
+outcome is on record and its decision is not. The rule is that the decision's level covers every
+statement's level, which `decisionCoversStatements` makes checkable, and it cannot be read off an
+ordering of the enum. `LOCAL_QUORUM` needs two acknowledgements on six replicas where `QUORUM` needs
+four, so which level is strongest depends on the configuration rather than on the name.
+
+-/
 
 /-- A commit decision acknowledged at ONE while the data is at QUORUM: if that one replica is
     lost, the verdict is gone and the data is not. -/
@@ -643,7 +661,16 @@ theorem no_window_when_the_decision_rides_the_data (l : Level) (globalRf localRf
     decisionIsCoveredByCarrier [l] l globalRf localRf = true := by
   simp [decisionIsCoveredByCarrier, decisionCoversStatements]
 
-/-! ## Consistency is agreement, not validation -/
+/-! ## Consistency is agreement, not validation
+
+A consistency level chooses which replicas answer, and every level from `ONE` to `ALL` records exactly
+the same broken state when two transactions each preserve an invariant alone and break it together.
+Raising the level makes more replicas agree on the same write, not a different write, so no level
+expressible as an acknowledgement count prevents write skew — the anomaly's derivation never mentions
+the level at all. What prevents it is read-set validation at commit, which refuses one of the two
+writers, and that is an obligation on the transaction protocol in `Ferrosa/Sql/Txn.lean`.
+
+-/
 
 /-- The invariant a client believes it is maintaining: every column zero. -/
 def inv (s : List Nat) : Bool := s.all fun x => x == 0
@@ -686,7 +713,17 @@ theorem read_set_validation_is_what_prevents_write_skew :
 theorem all_does_not_prevent_write_skew :
     inv [0, 0] = true ∧ inv writeSkewOutcome = false ∧ writeSkewOutcome = [1, 1] := by decide
 
-/-! ## The ledger -/
+/-! ## The ledger
+
+Two of the obligations here are red: the truncate path at `coordinator/write.rs:753` counts a bare
+total instead of a per-datacenter one, so five acknowledgements in the primary and none in the
+secondary satisfy it on `{5,3}`; and no write path captures a read set or validates it before commit,
+so a write skew commits with no exception raised. Every other row is discharged by a named theorem,
+from the default `QUORUM` and the acceptance table through the per-datacenter delegations to the
+`DC_QUORUM` results in `Ferrosa/Topology/DcQuorum.lean`. `consistency_has_two_red_items` pins the red
+count so a CI check can require it to fall and never to rise.
+
+-/
 
 def ledger : List SpecItem := [
   ⟨"the level is configurable with QUORUM as the default",

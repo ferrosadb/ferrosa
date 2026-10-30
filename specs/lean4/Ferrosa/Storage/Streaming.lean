@@ -80,7 +80,15 @@ theorem socket_to_disk_costs_two_copies_and_no_more :
 theorem a_mutation_is_transformed_without_being_copied :
     pipelineCopies [.view .inbound 24, .view .inbound 8, .view .inbound 64] = 0 := by decide
 
-/-! ## Peak memory -/
+/-! ## Peak memory
+
+Peak resident memory for a scan is the chunk size plus a fixed working set, so the same code path holds 64
+KiB whether the table is 64 KiB or 64 TiB. Materialising first instead multiplies the chunk size by the number
+of chunks, which is what a row buffer does, and that is the difference between a memory ceiling and a memory
+curve. The page bound is where this breaks in the engine: the default page is 5 000 rows, which is 5 MB of
+narrow rows and 5 GB of 1 MiB rows on the same coordinator, so the budget has to be stated in bytes with the
+row count derived from it.
+-/
 
 /-- Peak resident bytes when the input is consumed one chunk at a time. -/
 def peakStreaming (chunkSize fixed : Nat) : Nat := chunkSize + fixed
@@ -114,7 +122,14 @@ theorem a_row_count_page_bound_is_not_a_memory_bound :
 theorem the_page_bound_has_no_byte_ceiling :
     pageBytes 5000 1024 > 1000 * pageBytes 5000 1 := by decide
 
-/-! ## Lifetimes: a view is only valid while its buffer is live -/
+/-! ## Lifetimes: a view is only valid while its buffer is live
+
+A stage does not own the bytes it reads; it holds an offset and a length into a buffer someone else refills.
+Reading the next chunk into that buffer invalidates every view of the previous contents, so a refill is
+allowed only when no view is outstanding — and that rule is what backpressure is, rather than an optimisation
+on top of it. Break it and the consumer is handed bytes it never asked for: stale data rather than an error,
+which is the harder failure to notice.
+-/
 
 /-- A view into a buffer. -/
 structure View where
@@ -140,7 +155,14 @@ def mayRefill (outstandingViews : Nat) : Bool := outstandingViews == 0
 theorem refill_is_allowed_only_when_nothing_is_outstanding :
     mayRefill 0 = true ∧ mayRefill 1 = false := by decide
 
-/-! ## The API shape decides whether it can stream -/
+/-! ## The API shape decides whether it can stream
+
+Whether a reader streams is decided by its return type before any code runs: a function returning a vector of
+rows has already committed to holding them all, so the memory a scan uses is set by the caller's limit rather
+than by the data. A decoder that allocates a fresh buffer per chunk copies the whole input through the
+allocator, and taking the uncompressed length while ignoring it is how that happens. Streaming has to be in the
+signature, because a caller who already holds the vector cannot add it back.
+-/
 
 /-- Rows alive at once: streamed one at a time versus returned as a vector. -/
 def liveRows (streamed materialised : Nat) : Nat := streamed
@@ -170,7 +192,13 @@ theorem a_per_chunk_decoder_copies_the_whole_input (chunks chunkSize : Nat) :
 theorem a_byte_budget_pins_the_memory (budget rowWidth : Nat) :
     (budget / rowWidth) * rowWidth ≤ budget := Nat.div_mul_le_self budget rowWidth
 
-/-! ## Backpressure: a slow consumer must not become the producer's memory bill -/
+/-! ## Backpressure: a slow consumer must not become the producer's memory bill
+
+A bounded queue either takes a row into a free slot or refuses the push, so it never grows and never drops.
+Refusal is the backpressure signal and it means the producer waits, which turns a slow consumer into a slower
+producer rather than into coordinator memory. The one thing the queue may not do is drop, because a dropped row
+on this path is a row missing from a result set whose response still reports itself as complete.
+-/
 
 /-- A bounded queue. -/
 structure Queue where
@@ -377,7 +405,14 @@ theorem a_short_response_must_say_there_is_more :
     honest ⟨10, true⟩ 100 = true ∧ honest ⟨10, false⟩ 100 = false ∧ honest ⟨100, false⟩ 100 = true := by
   decide
 
-/-! ## The ledger -/
+/-! ## The ledger
+
+Every memory and streaming claim is listed here with the theorem behind it, and the gaps sit in the same table:
+the scan's page bound is counted in rows rather than bytes, a decoder that allocates per chunk copies the whole
+input, and the other shortfalls against the tree are named the same way. Reading it
+answers what a client is promised about memory when it pulls a result, and where that promise stops. The item
+count and the red count are both pinned, so a shortfall fixed without a table update fails the build.
+-/
 
 def ledger : List SpecItem := [
   ⟨"parsing a row copies none of its bytes",

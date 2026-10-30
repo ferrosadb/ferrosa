@@ -64,7 +64,13 @@ def overlaps (a b : List Node) : Bool :=
 def quorumOf (rf : Nat) (cl : ConsistencyLevel) (ack : List Node) : Prop :=
   blockFor cl rf ≤ ack.length
 
-/-! ## Node / DC helpers for the concrete rungs -/
+/-! ## Node / DC helpers for the concrete rungs
+
+  Nodes are numbered `0 … n-1`, a datacenter map assigns each to a DC by integer division, and the
+  powerset of the node set lists every failure a deployment can face. Because the failures are
+  enumerated rather than chosen, a claim that a rung survives any single node loss is checked
+  against every node, and a claim that it survives no two is checked against every pair.
+-/
 
 /-- `k` consecutive nodes starting at `start`. -/
 def block (start k : Nat) : List Node := (List.range k).map (· + start)

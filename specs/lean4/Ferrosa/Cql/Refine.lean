@@ -61,7 +61,15 @@ def State.last (s : State) (k : Key) : Option Val := (s k).getLast?
     in terms of this, never in terms of state equality. -/
 def Simulates (s : State) (c : LCell) : Prop := ∀ k, State.last s k = c k
 
-/-! ## The encoding is a section of the abstraction -/
+/-! ## The encoding is a section of the abstraction
+
+A cell embeds in the keyspace as a singleton list at every key, and reading the last element back
+returns the cell exactly, so nothing the scalar model can express is lost on the way in.
+`decode_unique` adds that any two states which simulate the same cell agree on it, which makes the
+abstraction determined by the keyspace rather than chosen for convenience. That is what lets a
+property proved of a cell be read as a property of the keyspace it encodes.
+
+-/
 
 /-- Embed a cell into the keyspace: `none` is the empty list, `some v` a singleton.
     A cell carries no history, so the encoding has none to lose. -/
@@ -109,7 +117,15 @@ theorem decode_unique (s : State) (c₁ c₂ : LCell)
 /-- Every state simulates its own decoding — the relation is total on the right. -/
 theorem simulates_decode (s : State) : Simulates s (decode s) := fun _ => rfl
 
-/-! ## Appending refines writing -/
+/-! ## Appending refines writing
+
+Appending `v` at a key in the keyspace is setting that key to `v` in the cell: the list's last element
+becomes `v` and every other key is left alone, so a state that simulated a cell still simulates the
+cell it becomes. `simulates_append` is that step-by-step correspondence and `simulates_append_far`
+keeps the keys the cell does not look at unchanged. One append does not reproduce the list's history,
+but it does reproduce every question the scalar model can ask of it.
+
+-/
 
 /-- Running a single op is stepping once. -/
 theorem State.runOps_singleton (s : State) (op : Op) : s.runOps [op] = (s.step op).1 := rfl
@@ -157,7 +173,15 @@ theorem simulates_append_far (s : State) (c : LCell) (h : Simulates s c)
   rw [State.runOps_singleton, step_append_other s k j v hjk]
   exact h j
 
-/-! ## Whole lightweight transactions refine -/
+/-! ## Whole lightweight transactions refine
+
+A whole conditional write refines its scalar execution in both branches: applied, the keyspace appends
+the value and simulates the written cell; rejected, the keyspace is untouched and still simulates the
+cell that did not change. `lwt_refines` is that statement and `failed_lwt_leaves_keyspace` is the abort
+rule at keyspace level, so a rejected compare-and-set cannot make a replica diverge. This is what lets
+`at_most_one_applies` and `serializableB` be two statements about one system rather than two systems.
+
+-/
 
 /-- The condition, evaluated against the keyspace's last values. -/
 def condOn (s : State) (l : LWT) : Bool := State.last s l.key == l.expected

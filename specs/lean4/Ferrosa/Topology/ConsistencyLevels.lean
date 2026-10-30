@@ -22,7 +22,13 @@ namespace Ferrosa.Topology.ConsistencyLevels
 
 open Ferrosa
 
-/-! ## The ack rule, and why nothing about transactions appears in it -/
+/-! ## The ack rule, and why nothing about transactions appears in it
+
+  A write is acknowledged when the number of replicas that answered reaches the level's block-for
+  value, and the test reads nothing else: no dependency set, no ballot, no transaction order. The
+  client is therefore told the write succeeded on a count of replicas, and a count one short
+  refuses the write outright rather than acknowledging a partial one.
+-/
 
 /-- A write is acknowledged when the acknowledgement count reaches the level's
     block-for value.  This is the whole of the consistency-level contract. -/
@@ -55,7 +61,13 @@ theorem quorum_rf3_needs_two : blockFor .quorum 3 = 2 := by decide
 /-- `LOCAL_QUORUM` in a three-replica DC needs two *local* acks. -/
 theorem local_quorum_rf3_needs_two : blockForDc .localQuorum 3 = 2 := by decide
 
-/-! ## A transaction's ack is a conjunction of per-key acks -/
+/-! ## A transaction's ack is a conjunction of per-key acks
+
+  A multi-statement transaction is acknowledged when every key it wrote has met its own level, and
+  that conjunction is the whole of the composition: the keys do not order one another. A
+  transaction writing five keys costs the slowest of five independent waits, and one that wrote no
+  key is acknowledged at once.
+-/
 
 /-- A multi-statement transaction is acknowledged when every key it wrote has
     met its own consistency level.  Still topology: the rule composes over the
@@ -81,7 +93,13 @@ theorem txnAckOk_nil (acksOf : Key → Nat) (cl : ConsistencyLevel) (rf : Nat) :
 theorem txnAckOk_single (k : Key) (acksOf : Key → Nat) (cl : ConsistencyLevel) (rf : Nat) :
     txnAckOk [k] acksOf cl rf = ackOk (acksOf k) cl rf := by simp [txnAckOk]
 
-/-! ## `LOCAL_QUORUM` is a function of the local RF only -/
+/-! ## `LOCAL_QUORUM` is a function of the local RF only
+
+  On a keyspace with per-datacenter replication, `LOCAL_QUORUM` in a three-replica DC needs two
+  acknowledgements from that DC and takes no interest in the replica count elsewhere. Feeding the
+  global factor to `blockFor` instead asks four where two will do, so a deployment that mixes the
+  two entry points refuses writes its own replicas could have served.
+-/
 
 /-- The local quorum of a DC holding `localRf` replicas.  Note the absence of any
     global replication factor from the signature: on an NTS keyspace the global
@@ -104,7 +122,14 @@ theorem global_rf_would_over_ask_2_2 : blockFor .localQuorum 4 > localQuorumThre
 theorem global_rf_would_over_ask_3_3 : blockFor .localQuorum 6 > localQuorumThreshold 3 := by
   decide
 
-/-! ## QUORUM on two uniform datacenters, and the parity that decides whether the numbers agree -/
+/-! ## QUORUM on two uniform datacenters, and the parity that decides whether the numbers agree
+
+  Computing `QUORUM` from the global replication factor and summing two per-DC quorums agree when
+  each DC holds an odd replica count, which is why `{3,3}` looked right. At `{2,2}` the global
+  threshold is three against a per-DC sum of four, so a write can be acknowledged with no quorum in
+  the second datacenter. The even sizes are the unsafe direction, and there the two numbers agreed
+  only by accident of arithmetic.
+-/
 
 /-- `{3, 3}`: the global-RF threshold (4) coincides with `quorum_local_1 +
     quorum_local_2` (2 + 2).  This is why the numbers looked right. -/
@@ -127,7 +152,13 @@ theorem quorum_threshold_parity :
       (blockFor .quorum 8 < blockForDc .quorum 4 + blockForDc .quorum 4) := by
   decide
 
-/-! ## A threshold is a count, not a set condition -/
+/-! ## A threshold is a count, not a set condition
+
+  A count cannot say which datacenters acknowledged, so `{3,3}` accepts three answers from dc0 and
+  one from dc1 although dc1 has not reached its own quorum of two. `{2,2}` accepts the same shape:
+  both replicas of one DC plus one of the other. Requiring a quorum in each datacenter needs a
+  per-DC condition, which the counting rule does not have.
+-/
 
 /-- For `{3, 3}`, four acknowledgements satisfy QUORUM while dc2 has contributed
     only one — fewer than its own quorum of two.  Nothing in the counting rule

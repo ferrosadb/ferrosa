@@ -25,7 +25,15 @@ namespace Ferrosa.Cql.Lwt
 open Ferrosa
 open Ferrosa.Accord
 
-/-! ## A key that holds one value, which is what a condition compares -/
+/-! ## A key that holds one value, which is what a condition compares
+
+A key holds at most one value, so a condition is a comparison: the stored option is tested against the
+expected one, and `none` as the expectation is `IF NOT EXISTS`. `Lwt.ops` gives such a statement a read
+of the key it conditions on ahead of its write, which is the invariant everything here rests on.
+Because the test is against the value itself and not against a version or a timestamp, what one client
+conditions on is exactly what another client's write would replace.
+
+-/
 
 abbrev Cell := Key → Option Val
 
@@ -56,7 +64,15 @@ def Lwt.ops (l : Lwt) : List Op := [.read l.key, .append l.key l.newValue]
 def Lwt.execute (s : Cell) (l : Lwt) : Cell × Bool :=
   if l.cond s then (s.set l.key (some l.newValue), true) else (s, false)
 
-/-! ### What a conditional write does to the value it tests -/
+/-! ### What a conditional write does to the value it tests
+
+A conditional write has two outcomes and the client is told which: applied puts the new value in the
+cell, and rejected leaves the cell exactly as it was. Because the applied flag is the condition itself,
+an aborted conditional statement leaves no trace on the row, and the two surface forms differ where it
+matters — `INSERT … IF NOT EXISTS` applies on a fresh key, while `UPDATE … IF` on a fresh key is
+rejected rather than creating the row it conditions on.
+
+-/
 
 /-- An applied CAS wrote its value. -/
 theorem applied_writes (s : Cell) (l : Lwt) (h : (l.execute s).2 = true) :
@@ -91,7 +107,15 @@ theorem update_if_on_empty_fails (k : Key) (v0 v : Val) :
     (⟨k, some v0, v⟩ : Lwt).execute Cell.empty = (Cell.empty, false) := by
   simp [Lwt.execute, Lwt.cond, Cell.empty]
 
-/-! ## Two CAS with the same expectation cannot both apply -/
+/-! ## Two CAS with the same expectation cannot both apply
+
+Two clients that send the same expectation against the same key cannot both succeed: whichever runs
+first applies and the second finds a value that no longer matches, in either order. The rejected
+client is handed back the state it tested, which is the state the next transaction in the serial
+order will see, so a retry built on that answer is not built on a stale one. One winner and a loser
+told the truth is what lets compare-and-set serve as a lock without a lock.
+
+-/
 
 /-- **The CAS guarantee.**  Starting from a cell that holds `v0` at `k`, with
     `va ≠ v0`, a first CAS `IF k = v0 SET k = va` applies; a second CAS with the

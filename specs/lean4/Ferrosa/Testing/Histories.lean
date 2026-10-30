@@ -21,7 +21,10 @@ namespace Ferrosa.Testing.Histories
 
 open Ferrosa Ferrosa.Ledger
 
-/-! ## Multisets -/
+/-! ## Multisets
+
+Loss accounting is multiset arithmetic, and the order of a multiset must not matter for the arithmetic to be about values rather than about the history that produced them. `cnt` counts occurrences, `msSub` removes one copy per element of the subtrahend, and `msLe` is inclusion. `cnt_append` and `multiset_union_is_commutative` are the two facts everything after them leans on: multiplicity through concatenation is the sum, so a union has no preferred order.
+-/
 
 /-- How many copies of `v` a multiset holds. -/
 def cnt (v : Nat) : List Nat → Nat
@@ -48,7 +51,10 @@ theorem multiset_union_is_commutative (v : Nat) (a b : List Nat) :
     cnt v (a ++ b) = cnt v (b ++ a) := by
   rw [cnt_append, cnt_append]; omega
 
-/-! ## The book -/
+/-! ## The book
+
+`Book` records three multisets — what was attempted, what was acknowledged, and what the final read recovered — and `silentLoss` and every theorem that follows are statements about the difference between them. `duplicated` is declared but no theorem here uses it; the load-bearing pair is `lost` and `unexpected`, which `a_loss_and_a_fabrication_do_not_cancel` shows are independent. Silent loss is the case where the first is non-empty and the second is empty.
+-/
 
 /-- What a run recorded. `attempts` counts invocations, `acknowledged` counts `ok` completions,
     `recovered` is what the final read observed. -/
@@ -115,7 +121,10 @@ theorem a_run_without_acknowledged_writes_cannot_lose_anything (r : List Nat) :
 theorem a_run_without_a_final_read_loses_every_acknowledged_write :
     lost ⟨[1, 2], [1, 2], []⟩ = [1, 2] := by decide
 
-/-! ## The verdict, which is a function of the profile -/
+/-! ## The verdict, which is a function of the profile
+
+A verdict has three outcomes because two would force the suite either to call an inconclusive run green or to call a semantics consequence a failure. `verdictFor` reads the profile first and the book second: a profile that cannot see every acknowledged write yields `notTested` with the reason attached, and only a profile that can yields `confirmed` or `refuted`. `NotTested` records which of the two ways the run was blind, so the excuse stays inspectable rather than collapsing into a single word.
+-/
 
 /-- Any anomaly at all: something lost or something fabricated. -/
 def anomalous (b : Book) : Bool := !(lost b).isEmpty || !(unexpected b).isEmpty
@@ -225,7 +234,10 @@ theorem a_write_free_generator_cannot_test_durability (r : List Nat) :
 theorem a_generator_without_a_final_read_cannot_measure_loss :
     lost ⟨[1], [1], []⟩ = [1] ∧ lost ⟨[], [], []⟩ = [] := by decide
 
-/-! ## Nemeses, and what the verdict may attribute to them -/
+/-! ## Nemeses, and what the verdict may attribute to them
+
+A crash is an excuse only when it fell before the write was acknowledged, because the acknowledgement is the promise that the write survives that crash. `CrashTime` has two cases for that reason and `excusesMissingWrite` is true for exactly one of them. `attributable` then requires the fault to have been logged as well, since a red verdict against an unlogged fault cannot tell an anomaly from an injected failure and a log without a qualifying crash excuses nothing.
+-/
 
 /-- When a crash fell relative to the acknowledgement of a write. -/
 inductive CrashTime where

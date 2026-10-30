@@ -18,7 +18,13 @@ import Ferrosa.Accord.Serializable
 
 namespace Ferrosa.Accord
 
-/-! ## What a replica has applied, and what it hands back to a client -/
+/-! ## What a replica has applied, and what it hands back to a client
+
+  A replica's durable state is its apply log, its keyspace and the read results it returned, and
+  applying a transaction folds the ops into the keyspace in order while recording what each read
+  saw. Dep-wait holds a transaction back until every lower-timestamped dependency is already in the
+  log, so the order the log records is the order the keyspace saw.
+-/
 
 /-- The durable transaction state of one replica (§3.2): the apply log, the
     keyspace, and the read results handed back to clients. -/
@@ -47,7 +53,14 @@ def Replica.apply (txns : List Txn) (r : Replica) (τ : TxnId) : Replica :=
 def depWait (pos : TxnId → Nat) (deps : TxnId → List TxnId) (r : Replica) (τ : TxnId) : Bool :=
   (deps τ).all (fun γ => !(decide (pos γ < pos τ)) || r.applied.contains γ)
 
-/-! ## The certificate a dep-respecting log carries -/
+/-! ## The certificate a dep-respecting log carries
+
+  A log is dep-respecting when every transaction it appends had each lower-timestamped dependency
+  already present at that point, and the certificate carries that as an inductive structure rather
+  than an assertion about the finished list. The executable form of the same rule is what the
+  enumerator at the end of the module runs, so a certified log and a checked log are the same
+  objects.
+-/
 
 /-- A sequence of applies that respected dep-wait at every step. -/
 inductive LogOk (txns : List Txn) (pos : TxnId → Nat) (deps : TxnId → List TxnId) :
@@ -65,7 +78,13 @@ def logOkB (pos : TxnId → Nat) (deps : TxnId → List TxnId) (l : List TxnId) 
       !(decide (pos γ < pos iτ.2)) ||
         (idxFrom 0 l).any (fun jγ => jγ.2 == γ && jγ.1 < iτ.1)))
 
-/-! ## Store equals the fold of the log -/
+/-! ## Store equals the fold of the log
+
+  A replica's keyspace is exactly the fold of its apply log over the empty database, so replaying
+  the log from scratch reproduces the state a client was served from. That is what makes the log
+  the durable artifact, and it spares a separate snapshot that would have to be kept in agreement
+  with it.
+-/
 
 def foldTxnsFrom (s : State) (txns : List Txn) : List TxnId → State
   | [] => s
@@ -98,7 +117,13 @@ theorem run_log_eq_fold (txns : List Txn) (l : List TxnId) :
     (l.foldl (fun r τ => r.apply txns τ) Replica.init).store = foldTxns txns l :=
   foldl_apply_store txns Replica.init l
 
-/-! ## Dependency completeness, the premise the safety argument stands on -/
+/-! ## Dependency completeness, the premise the safety argument stands on
+
+  Every conflicting transaction with a lower timestamp must appear in a transaction's dependency
+  set, and the safety argument rests on that premise rather than on the protocol. It is a refutable
+  property of a concrete run, not an axiom: `Accord/Recovery.lean` exhibits a run that violates it
+  together with the unserializable history that follows.
+-/
 
 /-- §6.3: every conflicting transaction with a lower timestamp is a dependency. -/
 def DepComplete (txns : List Txn) (pos : TxnId → Nat) (deps : TxnId → List TxnId)
@@ -106,7 +131,13 @@ def DepComplete (txns : List Txn) (pos : TxnId → Nat) (deps : TxnId → List T
   ∀ δ τ, δ ∈ committed → τ ∈ committed → δ ≠ τ →
     (txnOf txns δ).conflicts (txnOf txns τ) = true → pos δ < pos τ → δ ∈ deps τ
 
-/-! ## Order in the log, and the decomposition `Before` is defined over -/
+/-! ## Order in the log, and the decomposition `Before` is defined over
+
+  One transaction precedes another when the log splits around the first with the second still
+  ahead of it, so the order is witnessed by a decomposition rather than by a position. Appending to
+  a log leaves every order already established alone, which is what makes the sequence stable under
+  the late arrivals a coordinator cannot prevent.
+-/
 
 /-- `x` occurs before `y` in `l`. -/
 def Before (l : List TxnId) (x y : TxnId) : Prop :=

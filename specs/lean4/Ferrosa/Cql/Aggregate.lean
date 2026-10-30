@@ -50,7 +50,15 @@ theorem estimate_is_the_only_inexact :
       ∧ Agg.isExact .count = true := by
   decide
 
-/-! ## `COUNT(*)` — an accumulator that retains no row -/
+/-! ## `COUNT(*)` — an accumulator that retains no row
+
+A `COUNT(*)` over a list of rows is the length of that list plus whatever the accumulator started
+at, so the answer is exact and costs one addition per row. Two different row lists of the same
+length produce the same accumulator, which is what a state of a single `Nat` means for an operator:
+a count that has passed a million rows holds one number, and no row it has seen can be recovered
+from it.
+
+-/
 
 /-- One counter, one step per row. The state is a `Nat`; there is nowhere for a row
     to be kept. -/
@@ -113,7 +121,15 @@ theorem exact_distinct_is_cardinality (rows : List Val) :
     (walkExactPair rows (0, [])).1 = (walkExactPair rows (0, [])).2.length :=
   walkExactPair_fst rows 0 [] rfl
 
-/-! ## `COUNT(ESTIMATE_DISTINCT v)` — a Bloom filter, and a lower bound -/
+/-! ## `COUNT(ESTIMATE_DISTINCT v)` — a Bloom filter, and a lower bound
+
+The estimate's state is `Fin m → Bool`, `m` bits fixed at construction, so its memory does not grow
+with the data however many rows pass through. A Bloom filter has no false negatives and a set bit is
+never cleared, so a distinct value that has been counted stays counted and the answer can come up
+short but never long. `estimate_le_exact` makes that one-sidedness a theorem: over the same rows the
+estimate never exceeds the exact count.
+
+-/
 
 /-- A Bloom filter over `m` bits. The state's *size* is the type: `Fin m → Bool`, fixed
     at construction. -/

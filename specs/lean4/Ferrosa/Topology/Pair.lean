@@ -74,7 +74,13 @@ inductive Reachable (op : Bool) : Pair → Prop where
   | t1 : Reachable op ⟨.none, .none, true, true⟩
   | step : Reachable op s → Step op s s' → Reachable op s'
 
-/-! ## The pair is single-primary by construction, with no election to run -/
+/-! ## The pair is single-primary by construction, with no election to run
+
+  The first connection assigns both roles in one step, so there is no interleaving in which two
+  nodes call themselves primary and no election to lose. What an operator gets is a pair that
+  cannot split on its own: with the primary down, the surviving node serves reads and refuses
+  writes until someone promotes it.
+-/
 
 /-- T1 assigns both roles at once: the receiver is primary, the initiator is
     secondary.  There is no interleaving in which both call themselves primary. -/
@@ -115,7 +121,13 @@ theorem no_two_writable {op : Bool} {s : Pair} (h : Reachable op s) :
       | demote0 | demote1 | rejoin0 _ | rejoin1 _ | fail0 | fail1 =>
           simp_all [Writable]
 
-/-! ## What the operator gate buys, and what dropping it would cost -/
+/-! ## What the operator gate buys, and what dropping it would cost
+
+  Promotion is available only to the operator and only once the peer is confirmed dead, and both
+  halves of that gate are load-bearing. Drop the confirmation and one promotion from the initial
+  state leaves both nodes primary and accepting writes for the same key, which a client experiences
+  as two successful writes to one key holding different values.
+-/
 
 /-- Dropping the "peer is confirmed dead" guard makes split brain reachable:
 both nodes end up primary and up, so both accept writes.  This is the theorem

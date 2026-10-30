@@ -24,7 +24,14 @@ open Ferrosa.Ledger
 abbrev Key := Nat
 abbrev Val := Nat
 
-/-! ## The framed record -/
+/-! ## The framed record
+
+A record is usable only when its own length field matches the bytes present and its CRC matches the
+bytes read, and both checks read the record itself, so a reader needs no index and no external metadata
+to decide whether it can trust a partition. A short record — the declared length overruns the file — and
+a record whose stored CRC disagrees with its bytes are both unusable. That is the unit of damage the
+module is built around: one bad record costs that record, not the file.
+-/
 
 /-- One partition record as the scanner sees it. `declaredLen` comes from the record's own
     `len` field; `actualLen` is how many bytes are actually there; `crcStored` and
@@ -54,7 +61,15 @@ theorem corrupt_record_is_not_verified (f : Frame) (h : f.crcStored ≠ f.crcCom
     f.verified = false := by
   simp [Frame.verified, h]
 
-/-! ## Scanning: the recovery path -/
+/-! ## Scanning: the recovery path
+
+Recovery reads a table by taking records until the first one that does not verify, so a damaged file
+yields a verified prefix rather than an error: nothing before the damage is skipped and nothing after it
+is decoded. The reader trusts no boundary except the one a record states about itself, which is why a file
+needs no index at all to be readable. For an operator this is what makes a partially written SSTable
+servable — the rows in the verified prefix answer reads, and the file is reported as recoverable rather
+than lost.
+-/
 
 /-- The records a scan accepts: everything up to the first record that does not verify. -/
 def scanPrefix : List Frame → List Frame
@@ -119,7 +134,14 @@ theorem scan_finds_every_verified_frame (pre : List Frame)
     · simp only [scan, scanPrefix, h.1, if_true, List.map_cons, List.mem_cons]
       exact Or.inr (ih h.2 hmem)
 
-/-! ## The trie on the fast path -/
+/-! ## The trie on the fast path
+
+The index maps a key to a record offset, and nothing more is assumed of it: it may be stale, wrong, or
+rebuilt from scratch, and a lookup that follows it can only confirm a record or miss. An offset a damaged
+index names is refused unless the file really holds a record at that position, so a bad index costs a scan
+and never invents a value. That is why the trie is kept rather than trusted: the fast path reads at most
+one record where rebuilding reads every record in the file.
+-/
 
 /-- The index: key → record offset. Nothing more is assumed about it — it may be wrong,
     stale, or rebuilt from scratch. -/
@@ -202,7 +224,14 @@ theorem trie_reads_at_most_one_record (t : Trie) (k : Key) : readsTrie t k ≤ 1
 theorem rebuild_reads_every_record (frames : List Frame) :
     readsRebuild frames = frames.length := rfl
 
-/-! ## Trie block checksums -/
+/-! ## Trie block checksums
+
+A trie block carries its own CRC, checked the first time the block is touched, so a damaged index is
+refused at the moment a lookup would use it rather than trusted for that lookup. The cost is one
+comparison per block; what it buys is that index damage is detected on the read path instead of surfacing
+later as a missing row. The failure a user meets is a lookup that falls back to the scan, not a value that
+was never written.
+-/
 
 /-- A trie block carries its own CRC. It is checked when the block is first touched, which is
     the same point at which a decompression CRC would be checked. -/
@@ -219,7 +248,15 @@ theorem corrupt_trie_block_is_detected (b : TrieBlock) (h : b.stored ≠ b.compu
     b.ok = false := by
   simp [TrieBlock.ok, h]
 
-/-! ## File state: three outcomes, not two -/
+/-! ## File state: three outcomes, not two
+
+A reader finds a file complete, recoverable, or torn, and a file with a footer is called complete only
+when the count in that footer matches what the scan actually verified — a mismatch downgrades the file to
+its verified prefix rather than trusting the footer. An absent footer is a normal state rather than a
+crash state, because the index is a function of the data: a file whose rows are all durable is servable
+before its footer exists. Only a file that fails from its first record is torn, and that is the one case
+in which nothing is served.
+-/
 
 /-- The states a reader can find. `recoverable n` has no meaning in BTI: a torn BTI index does
     not open at all. -/
@@ -377,7 +414,14 @@ theorem collectAt_complete (frames : List Frame) (offs : List Nat) (off : Nat)
         · exact ih hmem
       · exact ih hmem
 
-/-! ## Local deletion times cannot wrap -/
+/-! ## Local deletion times cannot wrap
+
+A local deletion time is stored as an unsigned 64-bit second count, so the `i32` wrap that
+`Storage/Tombstone.lean` shows for a TTL reaching past `2^31` seconds cannot arise here: the same value
+that goes negative at 32 bits is comfortably inside 64. An operator writing a twelve-year TTL gets a cell
+that expires in twelve years rather than one that reads as expired on arrival. The wrap stays a real
+hazard only for a format that stores the field signed and narrow.
+-/
 
 /-- `fnf` stores the local deletion time as an unsigned 64-bit second count, so the `i32` wrap
     that `Storage.Tombstone.ldt_overflows_before_2038_reachable_now` exhibits cannot arise. The
@@ -446,7 +490,14 @@ def Partition.meta (p : Partition) : List Nat := p.exceptions.map Exception.ts
 theorem meta_reads_do_not_touch_the_arena (p : Partition) (arena : List Nat) :
     ({ p with arena := arena } : Partition).meta = p.meta := rfl
 
-/-! ## The bitmap: cell index → exception slot, in one popcount -/
+/-! ## The bitmap: cell index → exception slot, in one popcount
+
+Each row carries a bitmap with one bit per cell saying whether that cell took an exception entry, so the
+slot of a cell is the number of set bits before it — one popcount of a single 32-bit word. That count never
+decreases as cells are walked, so slots are handed out in cell order and two exception cells cannot share
+one, which is what lets a cell that shares its row's timestamp stay at 12 bytes while only the cells that
+need more pay for it. A 32-cell row is the case that matters, and it fits exactly one word.
+-/
 
 /-- Number of exception cells strictly before cell `n`. This is the exception slot index. -/
 def popcountUpTo (bits : List Bool) : Nat → Nat
@@ -489,7 +540,14 @@ theorem exception_slots_differ :
     popcountUpTo [true, false, true] 0 = 0 ∧ popcountUpTo [true, false, true] 2 = 1 := by
   decide
 
-/-! ## Size: the two-tier cell is never larger than the flat one -/
+/-! ## Size: the two-tier cell is never larger than the flat one
+
+A common cell is 12 bytes and an exception cell 16, so a row costs `12c + 16e` against `28c` for a flat
+layout that repeats the row timestamp in every cell — never more while the exceptions are no more numerous
+than the cells, and strictly less as soon as one cell takes the row's timestamp. The bitmap adds one
+4-byte word per 32 cells, so the saving survives it for any row wider than a handful of columns. A
+projection therefore reads the narrow cell it asked for without paying for the columns it did not.
+-/
 
 def commonCellBytes : Nat := 12
 def exceptionBytes : Nat := 16
@@ -671,7 +729,14 @@ theorem ack_at_data_fsync_is_recoverable (durable : List Frame)
     simp only [scanPrefix, hall.1, if_true]
     rw [ih hall.2]
 
-/-! ## The ledger -/
+/-! ## The ledger
+
+Every claim the format makes is listed here with the theorem that carries it, from the verified prefix a
+scan yields to the 12-byte cell, so a promise and its statement can be read together. Three items are
+recorded red: a flush with no resume path, a BTI-to-Cassandra export the writer cannot select a format for,
+and a CRC budget that is a measurement rather than a theorem. The count is pinned, so none of them can be
+dropped from the table quietly.
+-/
 
 def ledger : List SpecItem := [
   ⟨"a torn file yields a verified prefix",

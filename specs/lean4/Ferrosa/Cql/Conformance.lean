@@ -56,7 +56,16 @@ def qBatchMixed : Statement :=
   .batch .logged [.insert "users" [⟨"id", .literal 1⟩] false,
                   .insert "users" [⟨"id", .literal 2⟩] true]
 
-/-! ## Every statement above, with the answer the classifier gives it -/
+/-! ## Every statement above, with the answer the classifier gives it
+
+Each statement is pinned to a four-part answer — reads, writes, tests a condition, takes the blind path
+— so a row produced by the parser can be compared with the specification without reading either. The
+rows separate the cases a client notices: a plain `INSERT` is blind, an `IF` clause on an insert,
+update or delete puts the statement on the read path, and a batch is blind only when every member is.
+A disagreement on any row names either a parser bug or a specification bug, and the row says which
+statement is at fault.
+
+-/
 
 /-- `(reads, writes, conditional, blind)` for the statement. -/
 def classify (s : Statement) : Bool × Bool × Bool × Bool :=
@@ -96,7 +105,15 @@ theorem qBatchBlind_classified :
 theorem qBatchMixed_classified :
     classify qBatchMixed = (true, true, true, false) := by decide
 
-/-! ## The ack plans for a `{3, 3}` keyspace -/
+/-! ## The ack plans for a `{3, 3}` keyspace
+
+On a keyspace with three replicas in each of two datacenters, `QUORUM` asks for four acknowledgements
+— two in each — `LOCAL_QUORUM` in dc1 asks for two, all in dc1, and `ALL` asks for six. `EACH_QUORUM`
+produces the same plan as `QUORUM` on this shape, which is why the two are easy to conflate even
+though they differ elsewhere. The last theorem here sets the plan for `{2,2}` beside the
+implementation's global-majority arithmetic: the plan asks four and the code computes three.
+
+-/
 
 def threeThree : Strategy := .nts [("dc1", 3), ("dc2", 3)]
 
@@ -131,7 +148,16 @@ theorem plan_quorum_2_2_differs :
     planFor .quorum (.nts [("dc1", 2), ("dc2", 2)]) "dc1" = ⟨4, [("dc1", 2), ("dc2", 2)]⟩
       ∧ blockFor .quorum 4 = 3 := by decide
 
-/-! ## The transaction shape a `BEGIN … COMMIT` produces -/
+/-! ## The transaction shape a `BEGIN … COMMIT` produces
+
+A transaction of blind inserts produces an empty read set and no condition, which is the shape that
+can be committed on the write path alone. Adding one conditional statement puts a key in the read set
+and a condition in the shape, so the same run needs a read phase before its writes can be
+acknowledged — the front-end half of the argument `Ferrosa/Cql/Lwt.lean` completes. The keys are
+supplied one per statement here; deriving them from the parsed terms is the real path's job and not
+part of this table.
+
+-/
 
 /-- A partition key per statement: `id` for these, whatever the value.  In the
     real path this is `transaction_keys.rs` on the parsed terms. -/
