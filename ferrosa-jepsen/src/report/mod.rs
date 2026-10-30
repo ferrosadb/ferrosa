@@ -18,13 +18,20 @@ pub struct RunReport {
     pub total: usize,
     pub passed: usize,
     pub failed: usize,
+    /// Runs whose consistency profile could not support either claim: neither a pass nor a failure.
+    #[serde(default)]
+    pub not_tested: usize,
 }
 
 impl RunReport {
     pub fn from_results(run_id: &str, results: Vec<CombinationResult>) -> Self {
         let total = results.len();
         let passed = results.iter().filter(|r| r.passed).count();
-        let failed = total - passed;
+        // A run whose profile cannot support a claim is neither a pass nor a failure. Counting it as
+        // either would over-claim (a weak configuration called green) or under-claim (the semantics
+        // of that configuration called a defect).
+        let not_tested = results.iter().filter(|r| r.is_inconclusive()).count();
+        let failed = total - passed - not_tested;
 
         Self {
             run_id: run_id.to_string(),
@@ -33,11 +40,20 @@ impl RunReport {
             total,
             passed,
             failed,
+            not_tested,
         }
     }
 
+    /// True when nothing failed. Inconclusive runs are not failures — failing them would punish a
+    /// deliberate configuration — but they are not confirmations either; see
+    /// [`Self::fully_confirmed`].
     pub fn all_passed(&self) -> bool {
         self.failed == 0
+    }
+
+    /// True only when every run was confirmed at its profile. This is what a green badge may mean.
+    pub fn fully_confirmed(&self) -> bool {
+        self.failed == 0 && self.not_tested == 0
     }
 
     pub fn failures(&self) -> Vec<&CombinationResult> {
@@ -127,6 +143,8 @@ mod tests {
             setup_error: None,
             duration_secs: 1.0,
             op_count: 10,
+            profile: Default::default(),
+            assurance: Default::default(),
         }
     }
 

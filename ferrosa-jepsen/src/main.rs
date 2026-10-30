@@ -156,6 +156,34 @@ async fn main() -> Result<()> {
                 println!("  Total:  {}", report.total);
                 println!("  Passed: {}", report.passed);
                 println!("  Failed: {}", report.failed);
+                // A run whose consistency profile cannot support a claim is neither. Saying so is the
+                // difference between asserting the configured guarantees and asserting one we never
+                // made: CL=ONE on three nodes cannot show that a read sees every acknowledged write.
+                if report.not_tested > 0 {
+                    println!(
+                        "  Not tested: {} (the profile cannot support a claim)",
+                        report.not_tested
+                    );
+                    if let Some(p) = report
+                        .results
+                        .iter()
+                        .find(|r| r.is_inconclusive())
+                        .map(|r| r.profile)
+                    {
+                        println!(
+                            "    profile: RF={} write={} read={} cross_dc_read={} ({})",
+                            p.replication_factor,
+                            p.write_level.as_str(),
+                            p.read_level.as_str(),
+                            p.cross_datacenter_read,
+                            if p.overlaps() {
+                                "W + R > RF"
+                            } else {
+                                "W + R <= RF"
+                            }
+                        );
+                    }
+                }
                 if !report.all_passed() {
                     println!("\nFailures:");
                     for f in report.failures() {

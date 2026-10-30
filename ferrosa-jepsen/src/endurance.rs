@@ -162,6 +162,8 @@ pub async fn run_endurance(config: &RunConfig, endurance: &EnduranceConfig) -> R
             setup_error: None,
             duration_secs: endurance.pattern_duration.as_secs_f64(),
             op_count: history.len(),
+            profile: Default::default(),
+            assurance: Default::default(),
         });
 
         state.patterns_completed += 1;
