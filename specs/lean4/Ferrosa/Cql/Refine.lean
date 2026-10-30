@@ -39,12 +39,18 @@ def lwtCond (c : LCell) (l : LWT) : Bool := Ferrosa.Cql.Lwt.Lwt.cond c l
 /-- Execute a CAS, i.e. `Ferrosa.Cql.Lwt.Lwt.execute`. -/
 def lwtExec (c : LCell) (l : LWT) : LCell × Bool := Ferrosa.Cql.Lwt.Lwt.execute c l
 
+/-- The local `SET` and the specification's are the same operation, by definition: the refinement
+    wrapper adds no behaviour of its own, only a name in this module's vocabulary. -/
 @[simp] theorem cellSet_eq (c : LCell) (k : Key) (v : Option Val) :
     cellSet c k v = Ferrosa.Cql.Lwt.Cell.set c k v := rfl
 
+/-- The local condition test is the specification's, by definition — so a conditional statement's
+    decision here is the same decision the transaction spec makes there. -/
 @[simp] theorem lwtCond_eq (c : LCell) (l : LWT) :
     lwtCond c l = Ferrosa.Cql.Lwt.Lwt.cond c l := rfl
 
+/-- Executing a conditional here is executing it there, by definition; the pair returned is the
+    cell and whether the condition held. -/
 @[simp] theorem lwtExec_eq (c : LCell) (l : LWT) :
     lwtExec c l = Ferrosa.Cql.Lwt.Lwt.execute c l := rfl
 

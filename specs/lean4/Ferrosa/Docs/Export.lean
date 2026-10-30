@@ -100,6 +100,13 @@ def takeWhileStr (s : String) (p : Char → Bool) : String := (s.takeWhile p).to
 def stripMods (s : String) : String := Id.run do
   let mut t := s
   for _ in [0:6] do
+    -- An attribute is not a modifier and does not end at the first space: `@[simp] theorem x`
+    -- was invisible to the scanner, so a theorem carrying one could sit in the book with no
+    -- docstring and the check would call the corpus clean.
+    if t.startsWith "@[" then
+      match t.splitOn "]" with
+      | _ :: rest => if !rest.isEmpty then t := trim (String.intercalate "]" rest)
+      | [] => pure ()
     for p in ["private ", "protected ", "noncomputable ", "partial ", "unsafe ", "@[unimplemented] "] do
       if t.startsWith p then t := trim (dropStr t p.length)
   return t

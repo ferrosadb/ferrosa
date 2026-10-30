@@ -40,11 +40,17 @@ def empty : SetU := fun _ => false
 
 def singleton (i : Node) : SetU := fun j => j == i
 
+/-- Every node counts: the whole cluster, enumerated, is `n` nodes. This is the baseline the quorum
+    arithmetic in the topology modules subtracts from — a quorum is `card_univ` less the nodes
+    allowed to be missing. -/
 @[simp] theorem card_univ (n : Nat) : (univ).card n = n := by
   have h : (List.range n).filter univ = List.range n :=
     List.filter_eq_self.mpr (by intro a _; rfl)
   simp [card, h, List.length_range]
 
+/-- No node is in the empty set, so a set that admits nobody admits zero nodes. Read with
+    `card_univ` it is the statement that the sets used here are ordinary finite subsets of the
+    cluster, not something that can admit one node twice. -/
 @[simp] theorem card_empty (n : Nat) : (empty).card n = 0 := by
   have h : (List.range n).filter empty = [] := by
     rw [List.filter_eq_nil_iff]
