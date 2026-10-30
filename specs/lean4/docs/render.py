@@ -552,6 +552,14 @@ def rust_site(witness: str) -> str:
     if not site:
         return ""
     repo = pathlib.Path(__file__).resolve().parents[3]
+    if "span" in site:
+        # Derived, not written down: the Lean item and its Rust location both come from the Aeneas
+        # extract, so the pointer cannot rot without the extraction saying so.
+        spans = json.loads((RED_SITES.parent / "rust_spans.json").read_text()).get("spans", {})
+        got = spans.get(site["span"])
+        if not got:
+            return ""
+        site = {"path": got["path"], "line": got["line"], "note": site.get("note", "")}
     f = repo / site["path"]
     if not f.exists():
         return rf"\redsite{{{esc(site['path'])}}}{{unresolved in this checkout}}"

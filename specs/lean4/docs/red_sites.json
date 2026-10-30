@@ -22,9 +22,8 @@
       "note": "the only ticket type is a token-range SELECT; no stream ticket exists"
     },
     "Commons.Hll.merge_is_commutative": {
-      "path": "ferrosa-storage/src/count.rs",
-      "line": 449,
-      "note": "a Bloom filter plus a counter: it cannot merge, because bits do not determine a count"
+      "span": "ferrosa_storage::count::DistinctEstimate",
+      "note": "a Bloom filter plus a counter of values new to it: bits do not determine a count, so two shards cannot merge"
     },
     "Jepsen.a_read_only_transaction_can_carry_the_only_cycle": {
       "path": "ferrosa-jepsen/src/orchestrator.rs",
