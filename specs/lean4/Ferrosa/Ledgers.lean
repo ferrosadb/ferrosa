@@ -7,6 +7,11 @@
   ```text
   lake env lean --run Ferrosa/Ledgers.lean
   ```
+
+  The area ledgers printed here are exactly `Ferrosa.Unimplemented.areas` — the same list
+  `ledgerTotal` sums — so a ledger cannot print without being counted or be counted without
+  printing. `main` also re-scans the source tree and fails if a file defining
+  `def ledger : List SpecItem` is missing from that registry.
 -/
 import Ferrosa.Cql.AggregateObligations
 import Ferrosa.Storage.Recovery
@@ -35,55 +40,75 @@ import Ferrosa.Todo
 import Ferrosa.Broken
 import Ferrosa.Unimplemented
 
-/-- Print every ledger: the CQL aggregate obligations, then crash recovery, then
-    tombstones/TTL/purge. -/
+namespace Ferrosa.Runner
+
+/-- The module key of a path under `Ferrosa/`: `Ferrosa/Storage/Mvcc.lean` → `Ferrosa.Storage.Mvcc`. -/
+def moduleKeyOf (path : System.FilePath) : String :=
+  let parts := path.components
+  match parts.reverse with
+    | last :: revInit =>
+      match last.splitOn "." with
+      | [stem, "lean"] => String.intercalate "." (revInit.reverse ++ [stem])
+      | _ => String.intercalate "." parts
+    | [] => String.intercalate "." parts
+
+/-- Whether a source file defines an area ledger. -/
+def definesLedger (path : System.FilePath) : IO Bool := do
+  if path.extension == some "lean" then
+    let src ← IO.FS.readFile path
+    -- a definition at column zero, not the phrase in a docstring
+    return (src.splitOn "\ndef ledger : List SpecItem := [").length > 1
+  else
+    return false
+
+/-- The module keys of every file under `Ferrosa/` that defines an area ledger, discovered from the
+    tree rather than from a list. -/
+def ledgerModules : IO (List String) := do
+  let files ← System.FilePath.walkDir "Ferrosa" fun _ => pure true
+  let mut keys : List String := []
+  for f in files.toList do
+    if (← definesLedger f) then
+      keys := moduleKeyOf f :: keys
+  return keys
+
+/-- Registry drift: a ledger module the registry does not hold (so it prints nothing and is counted
+    by nothing), a registered key that names no ledger module, or a scan that found nothing and
+    would otherwise pass vacuously. -/
+def driftReport : IO (List String) := do
+  let found ← ledgerModules
+  let registered := Ferrosa.Unimplemented.areas.map (·.key)
+  let missing := found.filter fun k => !registered.contains k
+  let dangling := registered.filter fun k => !found.contains k
+  let vacuous :=
+    if found.length < 2 then
+      ["the ledger scan found no modules; refusing to pass vacuously (run from specs/lean4)"]
+    else []
+  return vacuous
+    ++ (missing.map fun k =>
+      s!"ledger module {k} defines a ledger but is not in Ferrosa.Unimplemented.areas: it prints nothing and is counted by nothing")
+    ++ (dangling.map fun k =>
+      s!"Ferrosa.Unimplemented.areas names {k}, but no file under Ferrosa/ defines a ledger for it")
+
+/-- Print every registered ledger, then the classification, then fail on registry drift. -/
 def main : IO Unit := do
-  Ferrosa.Cql.AggregateObligations.main
-  IO.println ""
-  Ferrosa.Storage.Recovery.main
-  IO.println ""
-  Ferrosa.Storage.Tombstone.main
-  IO.println ""
-  Ferrosa.Storage.Format.main
-  IO.println ""
-  Ferrosa.Cdc.main
-  IO.println ""
-  Ferrosa.Cql.Subscribe.main
-  IO.println ""
-  Ferrosa.Flight.main
-  IO.println ""
+  Ferrosa.Unimplemented.printAllLedgers
   Ferrosa.Todo.main
   IO.println ""
-  Ferrosa.Testing.Jepsen.main
-  IO.println ""
-  Ferrosa.Testing.Models.main
-  IO.println ""
-  Ferrosa.Testing.Histories.main
-  IO.println ""
-  Ferrosa.Testing.Guarantees.main
-  IO.println ""
-  Ferrosa.Unsafe.main
-  IO.println ""
-  Ferrosa.Commons.Hll.main
-  IO.println ""
   Ferrosa.Commons.Refactors.main
-  IO.println ""
-  Ferrosa.Sql.main
-  IO.println ""
-  Ferrosa.Bolt.main
-  IO.println ""
-  Ferrosa.Sparql.main
-  IO.println ""
-  Ferrosa.Sql.Index.main
-  IO.println ""
-  Ferrosa.Sql.Txn.main
-  IO.println ""
-  Ferrosa.Storage.Mvcc.main
-  IO.println ""
-  Ferrosa.Storage.Streaming.main
-  IO.println ""
-  Ferrosa.Sql.Consistency.main
   IO.println ""
   Ferrosa.Broken.main
   IO.println ""
   Ferrosa.Unimplemented.main
+  IO.println ""
+  let drift ← driftReport
+  if drift.isEmpty then
+    IO.println s!"registry OK — {Ferrosa.Unimplemented.areas.length} ledgers, printed and counted from one list"
+  else
+    IO.println "REGISTRY DRIFT"
+    for d in drift do
+      IO.println s!"  {d}"
+    IO.Process.exit 1
+
+end Ferrosa.Runner
+
+def main : IO Unit := Ferrosa.Runner.main

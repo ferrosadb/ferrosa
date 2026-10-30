@@ -32,6 +32,37 @@ def render (i : SpecItem) : String :=
 def redCount (items : List SpecItem) : Nat :=
   items.countP (fun i => match i.status with | .failing _ _ => true | _ => false)
 
+/-- The same predicate as `redCount`, as an explicit function, so a ledger can be filtered. -/
+def isRed : SpecItem → Bool
+  | ⟨_, .failing _ _⟩ => true
+  | _ => false
+
+/-- The complementary predicate: discharged by a named theorem. -/
+def isMet : SpecItem → Bool
+  | ⟨_, .met _⟩ => true
+  | _ => false
+
+/-- `isRed` is the predicate `redCount` counts, spelled as a function. -/
+theorem isRed_eq_status_test (i : SpecItem) :
+    isRed i = (match i.status with | .failing _ _ => true | _ => false) := by
+  obtain ⟨n, s⟩ := i
+  cases s <;> rfl
+
+theorem redCount_eq_filter_length (items : List SpecItem) :
+    redCount items = (items.filter isRed).length := by
+  have hfun : (fun i => match i.status with | .failing _ _ => true | _ => false) = isRed := by
+    funext i
+    exact (isRed_eq_status_test i).symm
+  unfold redCount
+  rw [List.countP_eq_length_filter, hfun]
+
+/-- The names of the red items, in ledger order. This is what the classification bookkeeping in
+    `Ferrosa/Unimplemented.lean` is keyed on: a row names one of these, or it names nothing. -/
+def redNames (items : List SpecItem) : List String := (items.filter isRed).map (·.name)
+
+theorem redNames_length (items : List SpecItem) : (redNames items).length = redCount items := by
+  simp [redNames, redCount_eq_filter_length]
+
 def printLedger (title : String) (items : List SpecItem) : IO Unit := do
   IO.println s!"{title} ({items.length} items, {redCount items} red)\n"
   IO.println (String.intercalate "\n\n" (items.map render))
