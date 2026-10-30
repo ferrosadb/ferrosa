@@ -135,7 +135,7 @@ mod tests {
             duration_secs: 1.0,
             op_count: 10,
             profile: Default::default(),
-            assurance: Default::default(),
+            assurance: crate::checker::profile::Assurance::Refuted,
         }];
         let report = RunReport::from_results("test-fail", results);
         let alert = alert_from_report(&report, "full");
@@ -173,7 +173,7 @@ mod tests {
             duration_secs: 0.0,
             op_count: 0,
             profile: Default::default(),
-            assurance: Default::default(),
+            assurance: crate::checker::profile::Assurance::Refuted,
         }];
         let report = RunReport::from_results("test-setup-fail", results);
         let alert = alert_from_report(&report, "multi-dc");

@@ -26,12 +26,29 @@ pub struct RunReport {
 impl RunReport {
     pub fn from_results(run_id: &str, results: Vec<CombinationResult>) -> Self {
         let total = results.len();
-        let passed = results.iter().filter(|r| r.passed).count();
         // A run whose profile cannot support a claim is neither a pass nor a failure. Counting it as
         // either would over-claim (a weak configuration called green) or under-claim (the semantics
         // of that configuration called a defect).
+        //
+        // Each count is taken by construction rather than derived by subtraction. Deriving `failed`
+        // as `total - passed - not_tested` assumed the three sets were disjoint, and they are not:
+        // a result can be `passed` and inconclusive at the same time, and the subtraction then
+        // underflows and panics the report. Counting the classes directly keeps the partition exact
+        // whatever the inputs say.
         let not_tested = results.iter().filter(|r| r.is_inconclusive()).count();
-        let failed = total - passed - not_tested;
+        let passed = results
+            .iter()
+            .filter(|r| r.passed && !r.is_inconclusive())
+            .count();
+        let failed = results
+            .iter()
+            .filter(|r| !r.passed && !r.is_inconclusive())
+            .count();
+        debug_assert_eq!(
+            total,
+            passed + failed + not_tested,
+            "a run must be exactly one of passed, failed, or not tested"
+        );
 
         Self {
             run_id: run_id.to_string(),
@@ -144,7 +161,13 @@ mod tests {
             duration_secs: 1.0,
             op_count: 10,
             profile: Default::default(),
-            assurance: Default::default(),
+            // An unset assurance means "not tested", which is the right default in production and
+            // the wrong one in a fixture: a fixture has to say what it is an example of.
+            assurance: if passed {
+                crate::checker::profile::Assurance::Confirmed
+            } else {
+                crate::checker::profile::Assurance::Refuted
+            },
         }
     }
 
@@ -157,6 +180,34 @@ mod tests {
         assert_eq!(report.failed, 1);
         assert!(!report.all_passed());
         assert_eq!(report.failures().len(), 1);
+    }
+
+    /// An inconclusive run is neither a pass nor a failure, and the three counts must partition the
+    /// total. A passed run that is also inconclusive used to underflow the subtraction that derived
+    /// `failed`, which panicked the report instead of reporting it.
+    #[test]
+    fn an_inconclusive_run_is_neither_a_pass_nor_a_failure() {
+        let mut inconclusive = make_result("e", "f", true);
+        inconclusive.assurance = crate::checker::profile::Assurance::NotTested(
+            crate::checker::profile::NotTested::ReadsDoNotOverlapWrites,
+        );
+
+        let results = vec![
+            make_result("a", "b", true),
+            make_result("c", "d", false),
+            inconclusive,
+        ];
+        let report = RunReport::from_results("test-003", results);
+
+        assert_eq!(report.total, 3);
+        assert_eq!(report.passed, 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.not_tested, 1);
+        assert_eq!(
+            report.passed + report.failed + report.not_tested,
+            report.total,
+            "every run is exactly one of passed, failed, or not tested"
+        );
     }
 
     #[test]
