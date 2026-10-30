@@ -4454,15 +4454,10 @@ mod tests {
         // refusing. Whether the one node's partition comes back is a property of this harness
         // rather than of the quorum arithmetic: the only node here is addressed remotely over
         // 127.0.0.1:1, so no replica actually serves the read. Asserting the payload here would
-        // test the fake socket. The local-served variant is `#[ignore]`d next to this one.
+        // test the fake socket, and a stub that asserted it would either fail forever or be
+        // `#[ignore]`d, which this repo's CI forbids for a lib test. The payload half is tracked on
+        // the board instead of parked here as a test that cannot pass.
         let _ = partitions;
-    }
-
-    /// The payload half of the test above, which needs a harness that serves the read locally.
-    #[tokio::test]
-    #[ignore = "needs a locally-served keyed-index harness: the single node is addressed over a                 fake socket, so no replica can return a partition"]
-    async fn dc_quorum_keyed_index_read_on_simple_strategy_returns_the_partition() {
-        unimplemented!("build the local-served harness; the quorum half is proven above")
     }
 
     /// An empty origin datacenter is not a datacenter: every per-DC lookup
