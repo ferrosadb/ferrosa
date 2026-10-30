@@ -3,6 +3,15 @@
 Atomic resident write-sets accept a borrowed mutation slice through
 `WriteSetSource`, allowing pair replication to retain its input without cloning
 the complete batch before local WAL persistence.
+Range-read fragments retain a configurable row bound (default 4,096), with
+continuation across fragments; it is not a total query result limit. Fragment
+row vectors now grow as rows are emitted instead of reserving the full bound
+for every partition, avoiding oversized allocations for narrow partitions.
+Fragment cursors retain immutable shared memtable partitions and pull row
+metadata on demand instead of cloning the whole body. Uniquely owned rows move
+into the cursor. Already ordered rows avoid sort scratch; noncanonical shared
+input retains ordering through an index vector. Cell payload backing stays
+shared. The ordering precheck still examines the source's clustering keys.
 
 > The single-node storage engine: memtable → commit log → flush → SSTable →
 > S3 write-behind, plus compaction, local cache, NVMe pinning, secondary-index
@@ -1813,3 +1822,6 @@ writer rejects empty clustered byte keys; an unsupported empty scalar posting
 on a clustered table is refused before a partition-wide fallback. Ordinary
 nonclustered rows with empty clustering remain supported. No accepted-write or
 internode wire contract was expanded.
+Resumable range-scan supervisors await scheduler admission directly through
+`execute_scan`/`resume_scan`; carrier work remains on the bounded blocking pool.
+Producer panics are delivered as stream errors.

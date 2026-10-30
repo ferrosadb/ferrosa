@@ -3778,6 +3778,9 @@ mod tests {
                 query_tracker: Arc::new(crate::virtual_tables::QueryTracker::new()),
                 full_scan_tracker: Arc::new(crate::virtual_tables::FullScanTracker::new()),
                 index_usage_tracker: Arc::new(crate::virtual_tables::IndexUsageTracker::new()),
+                table_access_tracker: std::sync::Arc::new(
+                    crate::virtual_tables::TableAccessTracker::new(),
+                ),
                 event_sender: tokio::sync::broadcast::channel(64).0,
                 last_schema_event: tokio::sync::watch::channel(None).0,
                 cql_metrics: Arc::new(crate::observability::CqlMetrics::new()),

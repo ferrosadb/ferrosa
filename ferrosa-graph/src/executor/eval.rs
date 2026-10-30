@@ -25,14 +25,10 @@ pub fn eval_expr(expr: &Expr, bindings: &HashMap<String, Value>) -> Result<Value
 
         Expr::Var(name) => Ok(bindings.get(name.as_str()).cloned().unwrap_or(Value::Null)),
 
-        Expr::Property { var, name } => {
-            let obj = bindings.get(var.as_str()).cloned().unwrap_or(Value::Null);
-            match obj {
-                Value::Object(map) => Ok(map.get(name.as_str()).cloned().unwrap_or(Value::Null)),
-                Value::Null => Ok(Value::Null),
-                _ => Ok(Value::Null),
-            }
-        }
+        Expr::Property { var, name } => match bindings.get(var.as_str()) {
+            Some(Value::Object(map)) => Ok(map.get(name.as_str()).cloned().unwrap_or(Value::Null)),
+            _ => Ok(Value::Null),
+        },
 
         Expr::Comparison { left, op, right } => {
             let lv = eval_expr(left, bindings)?;
@@ -714,6 +710,39 @@ mod tests {
     use super::*;
     use crate::parser::{ArithOp, CompareOp, Expr, Literal};
     use serde_json::json;
+
+    #[test]
+    fn scalar_property_lookup_does_not_copy_unselected_payload() {
+        let bindings = HashMap::from([(
+            "n".to_string(),
+            json!({"age": 42, "payload": "x".repeat(1024 * 1024)}),
+        )]);
+        let property = Expr::Property {
+            var: "n".to_string(),
+            name: "age".to_string(),
+        };
+        let (result, bytes) =
+            crate::allocation_test_support::allocated_bytes(|| eval_expr(&property, &bindings));
+        assert_eq!(result.unwrap(), json!(42));
+        assert_eq!(bytes, 0, "scalar lookup allocated {bytes} bytes");
+    }
+
+    #[test]
+    fn property_lookup_retains_selected_value_and_null_semantics() {
+        let property = Expr::Property {
+            var: "n".to_string(),
+            name: "name".to_string(),
+        };
+        for node in [Value::Null, json!(7), json!([]), json!({"other": 1})] {
+            let bindings = HashMap::from([("n".to_string(), node)]);
+            assert_eq!(eval_expr(&property, &bindings).unwrap(), Value::Null);
+        }
+        assert_eq!(eval_expr(&property, &HashMap::new()).unwrap(), Value::Null);
+        let bindings = HashMap::from([("n".to_string(), json!({"name": "Alice"}))]);
+        let selected = eval_expr(&property, &bindings).unwrap();
+        drop(bindings);
+        assert_eq!(selected, json!("Alice"));
+    }
 
     fn empty_bindings() -> HashMap<String, Value> {
         HashMap::new()

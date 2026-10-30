@@ -433,3 +433,6 @@ failed binds keep readiness false. This closes the startup window where an
 empty listener-status map could briefly make an occupied-port node look ready.
 
 SPARQL receives the same live write-path source as the session core. Role transitions therefore apply to subsequent SPARQL operations; a pair replica refuses updates while continuing to serve reads.
+CQL routing and `system_views.table_access` share one `Arc<TableAccessTracker>`
+created by the binary. The counters describe routed CQL reads/writes, including
+prepared statements; they do not represent every protocol or physical disk I/O.

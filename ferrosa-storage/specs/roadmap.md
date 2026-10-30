@@ -13,6 +13,17 @@ open work lives in specs and the items below.
 
 ## Done (recent)
 
+- **Narrow-partition fragment allocation.** `RangeMerger` grows the output row
+  vector on demand rather than reserving the full fragment bound per partition.
+  The per-fragment row bound and continuation are retained; one-row capacity
+  regression and wide-partition equivalence tests cover both invariants.
+- **Shared memtable fragment cursors.** Retain the immutable source Arc and
+  copy only requested row metadata; move rows when the source is unique.
+  Already sorted rows avoid stable-sort scratch. A 20,000-row source's first
+  one-row pull stays below 64 KiB of allocation traffic in regression tests.
+  Noncanonical source ordering retains a sorted-index fallback; validating
+  source order still scans its clustering keys before the first fragment.
+
 - **Streaming write-set staging (`write_set_stage.rs`).** `WriteSetStage` is the
   streaming twin of `WriteSetSpill`: driven one payload at a time as rows arrive, it
   keeps a bounded resident prefix and spills the rest to a private temp file, so the

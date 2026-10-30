@@ -27,3 +27,6 @@ pub mod parser;
 pub mod planner;
 
 mod transaction;
+
+#[cfg(test)]
+mod allocation_test_support;
