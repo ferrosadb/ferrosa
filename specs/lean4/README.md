@@ -9,7 +9,7 @@ Formal, machine-checked models of the two traces requested:
    no split brain) → 3 nodes at RF=2 → 5 nodes at RF=quorum → 2 DCs over one WAN
    link → 3 DCs in a ring.
 
-Plus an audit of the two existing TLA+ models in `specs/tla/`, which have never
+Plus an audit of the two existing TLA+ models in [`specs/tla/`](../tla), which have never
 been model-checked.
 
 Everything is Lean core only — **no Mathlib**, no network dependency at build
@@ -30,43 +30,43 @@ over a concrete configuration, and each use says so above it.
 
 | # | File | What to read it for |
 |---|------|--------------------|
-| 1 | `Ferrosa/Core.lean` | The one counting lemma every quorum claim rests on: `filter_and_length_le`, then `quorum_intersects`, `no_two_disjoint_quorums`, `quorum_wr_intersects`. Then `blockFor`/`blockForDc`, transcribed from `consistency.rs`. |
-| 2 | `Ferrosa/WritePath.lean` | Trace 1. `Step` has one constructor per arrow in `ferrosa-storage/specs/data-flow.md`; `Reachable` + step lemmas carry the invariants. |
-| 3 | `Ferrosa/TlaCheck.lean` | `raft.tla`'s named actions, encoded; the invariants that are tautologies. |
-| 4 | `Ferrosa/Accord/AccordMultiDcLean.lean` | `multi-dc.tla`'s Accord layer; the apply-order violation and the vacuous I-30. |
-| 5 | `Ferrosa/Topology/Basic.lean` | Shared vocabulary: `Topo`, `okAt`, `localOkAt`, `mayMiss`, failure-pattern enumerators. |
-| 6 | `Ferrosa/Topology/Pair.lean` | The no-split-brain machine: `Step` is parameterised by the operator policy, so "no automatic role swap" is a theorem, not a comment. |
-| 7 | `Ferrosa/Topology/Single.lean` → `ThreeNode` → `FiveNode` → `TwoDc` → `ThreeDcRing` | One rung each, in ladder order. |
-| 8 | `Ferrosa/Topology/Ladder.lean` | The threshold table, fault tolerance per rung, and the properties escalation must preserve. |
-| 9 | `Ferrosa/Accord/History.lean` | Transactions, ops, histories, the keyspace. Read `State.runOps` / `State.readsOf` and the composition lemma `runOps_append` — everything downstream rests on it. |
-| 10 | `Ferrosa/Accord/Serializable.lean` | The Jepsen statement: `Serializable`, `StrictlySerializable`, and their executable checkers. Then the five demo histories. |
-| 11 | `Ferrosa/Accord/Protocol.lean` | Accord's apply layer: `Replica.apply`, the dep-wait guard, `LogOk` as a certificate, `DepComplete` as the hypothesis, and the exhaustive check over apply interleavings. |
-| 12 | `Ferrosa/Accord/Recovery.lean` | §6.1's two ballots. `recovery_correct` vs `recovery_diverges`, and the write-skew history that a dropped dependency produces. |
-| 13 | `Ferrosa/Accord/Strict.lean` | §7's deadline formula, and `deadline_yields_dependency` — why the buffer is what makes `DepComplete` true. |
-| 14 | `Ferrosa/Accord/Edn.lean` | A dependency-free EDN reader for the dialect `elle_check.clj` consumes. |
-| 15 | `Ferrosa/Topology/ConsistencyLevels.lean` | The ack rule as a *topology* guarantee: `RF=1` acks on one ack, `LOCAL_QUORUM` on the local quorum, a transaction's ack as a conjunction over its keys. Plus the NTS `QUORUM` analysis and the retraction recorded in FINDINGS A3. |
-| 16 | `Ferrosa/Cql/Lwt.lean` | LWT as compare-and-set: `at_most_one_applies`, the failure contract, and the unprotected-CAS history that the checker rejects. |
-| 17 | `Ferrosa/Cql/Refine.lean` | The `Cell`/`State` refinement: `Simulates`, `decode_encode`, `simulates_append`, `lwt_refines`. |
-| 18 | `Ferrosa/Cql/Collections.lean` | Collections: set adds commute, list appends do not, and `blind` never looks at the assignment terms. |
-| 19 | `Ferrosa/Cql/Index.lean` | Secondary indexes: readiness is a preference (`reorder_never_filters`), and the stale indexed read is not serializable. |
-| 20 | `Ferrosa/Cql/Aggregate.lean` | Aggregates: `COUNT(*)` is an accumulator that forgets which rows; `COUNT(DISTINCT)` is exact; `COUNT(ESTIMATE_DISTINCT)` is a proved lower bound, and `estimate_can_be_strict` is why the two names cannot be swapped. |
-| 21 | `Ferrosa/Cql/AggregateObligations.lean` | The red list: ten aggregate obligations, six unmet, each red item carrying the theorem that shows why. `lake env lean --run` prints it. |
-| 22 | `Ferrosa/Storage/Recovery.lean` | Crash recovery: the record format has no checksum, so truncation is caught and corruption is not; the stop-policy replays a *prefix* and skipping does not; durability is a configuration (`periodic_sync_loses_acked_writes`); a zero `mutation_id` double-applies counters. |
-| 23 | `Ferrosa/Storage/Tombstone.lean` | Tombstones, TTL, purge. Both tie-breaks are required, proved by counterexample; a cell's `i32` local deletion time wraps past 2038; purge without propagation resurrects deleted data. |
-| 24 | `Ferrosa/Storage/Format.lean` | The `fnf` record framing (ADR-022): a torn file yields a prefix, one bad byte costs one record, the trie can only miss and never lie, and an absent footer is a named state rather than a failure. |
-| 25 | `Ferrosa/Sql/Semantics.lean` | The Postgres surface: `COMMIT` is a prefix, not atomic; a naive `<>` admits NULL rows; `SUM` over no rows returns 0 where SQL says NULL. |
-| 26 | `Ferrosa/Bolt/Session.lean` | The Bolt session: only RESET leaves FAILED, RESET is total, and replies **cannot** be paired to messages by index — a failed session silently shifts the whole stream. |
-| 27 | `Ferrosa/Sparql/Semantics.lean` | SPARQL: bag multiplicity; `p+` without a visited set returns one row per path; the natural RDF-star term encoding aliases a quoted triple with an IRI. |
-| 28 | `Ferrosa/Sql/Index.lean` | What the layer under Postgres must supply for indexes: equality is O(1) in nodes and records, a range **cannot** be, and one-sided index maintenance is inconsistent. |
-| 29 | `Ferrosa/Sql/Txn.lean` | ACID split by letter: atomicity is one durable decision, durability is the commitlog premise moved to the decision, isolation is a priced choice (SNAPSHOT admits write skew). |
-| 30 | `Ferrosa/Storage/Mvcc.lean` | Versions over `fnf`: the naive GC rule destroys a version a live snapshot needs; one version per SSTable costs a probe per file, which is exactly the O(1) guarantee the index work needs. |
-| 30a | `Ferrosa/Topology/DcQuorum.lean` | DC_QUORUM for **every** topology, transcribed from `dc_quorum.rs`: any two writes share a replica (`dc_quorum_writes_share_a_replica`, `no_partition_admits_two_dc_quorum_writes`), the node gate alone intersects Cassandra's QUORUM, a same-origin read sees the write and a remote one can miss it, verdicts are monotone in acks, a dark majority of DCs blocks writes, and an `rf = 0` DC is inert. `Sql/Consistency.lean`'s DC rules delegate here. |
-| 31 | `Ferrosa/Sql/Consistency.lean` | Consistency as configuration: ALL/QUORUM/LOCAL_QUORUM/ONE, default QUORUM, an acceptance table the tests check against, and the read/write overlap results. |
-| 32 | `Ferrosa/Broken.lean` | The red inventory, classified: 38 red items as code / requirement / proof / measurement / inherited / undecided, with the table pinned to the ledgers by count. |
-| 33 | `Ferrosa/Unimplemented.lean` | What is absent rather than wrong, plus the ledger items that are requirements, missing proofs, measurements, inherited protocol behaviour, or closed. |
-| 34 | `Ferrosa/Witnesses.lean` | One `#check` per witness any ledger names. Ledger witnesses are strings, so without this a deleted theorem leaves the ledger citing a name that no longer exists. |
-| 35 | `Ferrosa/Storage/Streaming.lean` | Memory and the pipeline: zero-copy transforms, `inbound` bytes never written, peak memory independent of input size, and the page bound that is in rows rather than bytes. |
-| 36 | `FINDINGS.md` | Every inconsistency, with the theorem that exhibits it. |
+| 1 | [`Ferrosa/Core.lean`](Ferrosa/Core.lean) | The one counting lemma every quorum claim rests on: `filter_and_length_le`, then `quorum_intersects`, `no_two_disjoint_quorums`, `quorum_wr_intersects`. Then `blockFor`/`blockForDc`, transcribed from [`consistency.rs`](../../ferrosa-cluster/src/consistency.rs). |
+| 2 | [`Ferrosa/WritePath.lean`](Ferrosa/WritePath.lean) | Trace 1. `Step` has one constructor per arrow in [`ferrosa-storage/specs/data-flow.md`](../../ferrosa-storage/specs/data-flow.md); `Reachable` + step lemmas carry the invariants. |
+| 3 | [`Ferrosa/TlaCheck.lean`](Ferrosa/TlaCheck.lean) | `raft.tla`'s named actions, encoded; the invariants that are tautologies. |
+| 4 | [`Ferrosa/Accord/AccordMultiDcLean.lean`](Ferrosa/Accord/AccordMultiDcLean.lean) | `multi-dc.tla`'s Accord layer; the apply-order violation and the vacuous I-30. |
+| 5 | [`Ferrosa/Topology/Basic.lean`](Ferrosa/Topology/Basic.lean) | Shared vocabulary: `Topo`, `okAt`, `localOkAt`, `mayMiss`, failure-pattern enumerators. |
+| 6 | [`Ferrosa/Topology/Pair.lean`](Ferrosa/Topology/Pair.lean) | The no-split-brain machine: `Step` is parameterised by the operator policy, so "no automatic role swap" is a theorem, not a comment. |
+| 7 | [`Ferrosa/Topology/Single.lean`](Ferrosa/Topology/Single.lean) → [`ThreeNode`](Ferrosa/Topology/ThreeNode.lean) → [`FiveNode`](Ferrosa/Topology/FiveNode.lean) → [`TwoDc`](Ferrosa/Topology/TwoDc.lean) → [`ThreeDcRing`](Ferrosa/Topology/ThreeDcRing.lean) | One rung each, in ladder order. |
+| 8 | [`Ferrosa/Topology/Ladder.lean`](Ferrosa/Topology/Ladder.lean) | The threshold table, fault tolerance per rung, and the properties escalation must preserve. |
+| 9 | [`Ferrosa/Accord/History.lean`](Ferrosa/Accord/History.lean) | Transactions, ops, histories, the keyspace. Read `State.runOps` / `State.readsOf` and the composition lemma `runOps_append` — everything downstream rests on it. |
+| 10 | [`Ferrosa/Accord/Serializable.lean`](Ferrosa/Accord/Serializable.lean) | The Jepsen statement: `Serializable`, `StrictlySerializable`, and their executable checkers. Then the five demo histories. |
+| 11 | [`Ferrosa/Accord/Protocol.lean`](Ferrosa/Accord/Protocol.lean) | Accord's apply layer: `Replica.apply`, the dep-wait guard, `LogOk` as a certificate, `DepComplete` as the hypothesis, and the exhaustive check over apply interleavings. |
+| 12 | [`Ferrosa/Accord/Recovery.lean`](Ferrosa/Accord/Recovery.lean) | §6.1's two ballots. `recovery_correct` vs `recovery_diverges`, and the write-skew history that a dropped dependency produces. |
+| 13 | [`Ferrosa/Accord/Strict.lean`](Ferrosa/Accord/Strict.lean) | §7's deadline formula, and `deadline_yields_dependency` — why the buffer is what makes `DepComplete` true. |
+| 14 | [`Ferrosa/Accord/Edn.lean`](Ferrosa/Accord/Edn.lean) | A dependency-free EDN reader for the dialect `elle_check.clj` consumes. |
+| 15 | [`Ferrosa/Topology/ConsistencyLevels.lean`](Ferrosa/Topology/ConsistencyLevels.lean) | The ack rule as a *topology* guarantee: `RF=1` acks on one ack, `LOCAL_QUORUM` on the local quorum, a transaction's ack as a conjunction over its keys. Plus the NTS `QUORUM` analysis and the retraction recorded in FINDINGS A3. |
+| 16 | [`Ferrosa/Cql/Lwt.lean`](Ferrosa/Cql/Lwt.lean) | LWT as compare-and-set: `at_most_one_applies`, the failure contract, and the unprotected-CAS history that the checker rejects. |
+| 17 | [`Ferrosa/Cql/Refine.lean`](Ferrosa/Cql/Refine.lean) | The `Cell`/`State` refinement: `Simulates`, `decode_encode`, `simulates_append`, `lwt_refines`. |
+| 18 | [`Ferrosa/Cql/Collections.lean`](Ferrosa/Cql/Collections.lean) | Collections: set adds commute, list appends do not, and `blind` never looks at the assignment terms. |
+| 19 | [`Ferrosa/Cql/Index.lean`](Ferrosa/Cql/Index.lean) | Secondary indexes: readiness is a preference (`reorder_never_filters`), and the stale indexed read is not serializable. |
+| 20 | [`Ferrosa/Cql/Aggregate.lean`](Ferrosa/Cql/Aggregate.lean) | Aggregates: `COUNT(*)` is an accumulator that forgets which rows; `COUNT(DISTINCT)` is exact; `COUNT(ESTIMATE_DISTINCT)` is a proved lower bound, and `estimate_can_be_strict` is why the two names cannot be swapped. |
+| 21 | [`Ferrosa/Cql/AggregateObligations.lean`](Ferrosa/Cql/AggregateObligations.lean) | The red list: ten aggregate obligations, six unmet, each red item carrying the theorem that shows why. `lake env lean --run` prints it. |
+| 22 | [`Ferrosa/Storage/Recovery.lean`](Ferrosa/Storage/Recovery.lean) | Crash recovery: the record format has no checksum, so truncation is caught and corruption is not; the stop-policy replays a *prefix* and skipping does not; durability is a configuration (`periodic_sync_loses_acked_writes`); a zero `mutation_id` double-applies counters. |
+| 23 | [`Ferrosa/Storage/Tombstone.lean`](Ferrosa/Storage/Tombstone.lean) | Tombstones, TTL, purge. Both tie-breaks are required, proved by counterexample; a cell's `i32` local deletion time wraps past 2038; purge without propagation resurrects deleted data. |
+| 24 | [`Ferrosa/Storage/Format.lean`](Ferrosa/Storage/Format.lean) | The `fnf` record framing (ADR-022): a torn file yields a prefix, one bad byte costs one record, the trie can only miss and never lie, and an absent footer is a named state rather than a failure. |
+| 25 | [`Ferrosa/Sql/Semantics.lean`](Ferrosa/Sql/Semantics.lean) | The Postgres surface: `COMMIT` is a prefix, not atomic; a naive `<>` admits NULL rows; `SUM` over no rows returns 0 where SQL says NULL. |
+| 26 | [`Ferrosa/Bolt/Session.lean`](Ferrosa/Bolt/Session.lean) | The Bolt session: only RESET leaves FAILED, RESET is total, and replies **cannot** be paired to messages by index — a failed session silently shifts the whole stream. |
+| 27 | [`Ferrosa/Sparql/Semantics.lean`](Ferrosa/Sparql/Semantics.lean) | SPARQL: bag multiplicity; `p+` without a visited set returns one row per path; the natural RDF-star term encoding aliases a quoted triple with an IRI. |
+| 28 | [`Ferrosa/Sql/Index.lean`](Ferrosa/Sql/Index.lean) | What the layer under Postgres must supply for indexes: equality is O(1) in nodes and records, a range **cannot** be, and one-sided index maintenance is inconsistent. |
+| 29 | [`Ferrosa/Sql/Txn.lean`](Ferrosa/Sql/Txn.lean) | ACID split by letter: atomicity is one durable decision, durability is the commitlog premise moved to the decision, isolation is a priced choice (SNAPSHOT admits write skew). |
+| 30 | [`Ferrosa/Storage/Mvcc.lean`](Ferrosa/Storage/Mvcc.lean) | Versions over `fnf`: the naive GC rule destroys a version a live snapshot needs; one version per SSTable costs a probe per file, which is exactly the O(1) guarantee the index work needs. |
+| 30a | [`Ferrosa/Topology/DcQuorum.lean`](Ferrosa/Topology/DcQuorum.lean) | DC_QUORUM for **every** topology, transcribed from [`dc_quorum.rs`](../../ferrosa-cluster/src/coordinator/dc_quorum.rs): any two writes share a replica (`dc_quorum_writes_share_a_replica`, `no_partition_admits_two_dc_quorum_writes`), the node gate alone intersects Cassandra's QUORUM, a same-origin read sees the write and a remote one can miss it, verdicts are monotone in acks, a dark majority of DCs blocks writes, and an `rf = 0` DC is inert. [`Ferrosa/Sql/Consistency.lean`](Ferrosa/Sql/Consistency.lean)'s DC rules delegate here. |
+| 31 | [`Ferrosa/Sql/Consistency.lean`](Ferrosa/Sql/Consistency.lean) | Consistency as configuration: ALL/QUORUM/LOCAL_QUORUM/ONE, default QUORUM, an acceptance table the tests check against, and the read/write overlap results. |
+| 32 | [`Ferrosa/Broken.lean`](Ferrosa/Broken.lean) | The red inventory, classified: 38 red items as code / requirement / proof / measurement / inherited / undecided, with the table pinned to the ledgers by count. |
+| 33 | [`Ferrosa/Unimplemented.lean`](Ferrosa/Unimplemented.lean) | What is absent rather than wrong, plus the ledger items that are requirements, missing proofs, measurements, inherited protocol behaviour, or closed. |
+| 34 | [`Ferrosa/Witnesses.lean`](Ferrosa/Witnesses.lean) | One `#check` per witness any ledger names. Ledger witnesses are strings, so without this a deleted theorem leaves the ledger citing a name that no longer exists. |
+| 35 | [`Ferrosa/Storage/Streaming.lean`](Ferrosa/Storage/Streaming.lean) | Memory and the pipeline: zero-copy transforms, `inbound` bytes never written, peak memory independent of input size, and the page bound that is in rows rather than bytes. |
+| 36 | [`FINDINGS.md`](FINDINGS.md) | Every inconsistency, with the theorem that exhibits it. |
 
 ## How to read a spec file
 
