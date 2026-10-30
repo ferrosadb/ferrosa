@@ -58,8 +58,48 @@ def cfg_test_ranges(lines: list[str]) -> list[tuple[int, int]]:
     return ranges
 
 
+CFG_TEST_MOD = re.compile(r"\bmod\s+(\w+)\s*;")
+
+
+def test_only_module_files(root: Path) -> set[str]:
+    """Files reachable only through a `#[cfg(test)] mod name;` declaration.
+
+    The block scan above sees a module's body only when the body is in the same file. A test module
+    declared as `#[cfg(test)] mod allocation_test_support;` lives in another file, so its `unsafe`
+    sites were counted as production even though no non-test build compiles them. Resolve those
+    declarations, and follow them transitively.
+    """
+    candidates = sorted(root.glob("*/src/**/*.rs"))
+    resolved: set[str] = set()
+    pending = list(candidates)
+    seen: set[Path] = set()
+    while pending:
+        path = pending.pop()
+        if path in seen:
+            continue
+        seen.add(path)
+        armed = False
+        for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            code = _strip_line_comment(raw)
+            if CFG_TEST.search(code):
+                armed = True
+                continue
+            declaration = CFG_TEST_MOD.search(code)
+            if armed and declaration:
+                armed = False
+                name = declaration.group(1)
+                for candidate in (path.parent / f"{name}.rs", path.parent / name / "mod.rs"):
+                    if candidate.is_file():
+                        resolved.add(candidate.relative_to(root).as_posix())
+                        pending.append(candidate)
+            elif code.strip() and not code.strip().startswith("#["):
+                armed = False
+    return resolved
+
+
 def scan(root: Path) -> tuple[dict[str, int], dict[str, int]]:
     """(production, test-only) unsafe counts per crate-relative file path."""
+    whole_file_test_modules = test_only_module_files(root)
     production: dict[str, int] = {}
     test_only: dict[str, int] = {}
     for path in sorted(root.glob("*/src/**/*.rs")):
@@ -72,7 +112,10 @@ def scan(root: Path) -> tuple[dict[str, int], dict[str, int]]:
             code = _strip_line_comment(line)
             if not UNSAFE.search(code):
                 continue
-            bucket = test_only if any(a <= number <= b for a, b in ranges) else production
+            if rel in whole_file_test_modules or any(a <= number <= b for a, b in ranges):
+                bucket = test_only
+            else:
+                bucket = production
             bucket[rel] = bucket.get(rel, 0) + 1
     return production, test_only
 
