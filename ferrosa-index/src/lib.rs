@@ -18,6 +18,8 @@
 //! - **HNSW** ([`vector::hnsw`]): Hierarchical Navigable Small World graph for ANN search.
 //! - **IVFFlat** ([`vector::ivfflat`]): Inverted File with Flat vectors for ANN search.
 
+#![forbid(unsafe_code)]
+
 pub mod btree;
 pub mod composite;
 pub mod filtered;

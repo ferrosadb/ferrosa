@@ -4,6 +4,8 @@
 //! storage reads against ferrosa's CQL-backed triple store, and serializes
 //! results with its own writers (JSON, XML, CSV/TSV, N-Triples).
 
+#![forbid(unsafe_code)]
+
 mod aggregate;
 mod bind;
 pub mod engine;

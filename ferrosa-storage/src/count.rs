@@ -229,11 +229,7 @@ impl DistinctExact {
         let base = dir
             .map(|p| p.to_path_buf())
             .unwrap_or_else(std::env::temp_dir);
-        base.join(format!(
-            "ferrosa-distinct-{}-{}.bin",
-            std::process::id(),
-            n
-        ))
+        base.join(format!("ferrosa-distinct-{}-{}.bin", std::process::id(), n))
     }
 
     /// Distinct values observed. Exact.
@@ -387,8 +383,7 @@ impl DistinctExact {
             let n = ((arena - copied) as usize).min(buf.len());
             self.file
                 .read_exact_at(&mut buf[..n], old_arena_base + copied)?;
-            new_file
-                .write_all_at(&buf[..n], new_arena_base + copied)?;
+            new_file.write_all_at(&buf[..n], new_arena_base + copied)?;
             copied += n as u64;
         }
 
@@ -761,7 +756,10 @@ mod tests {
             total += d.last_probes();
         }
         let avg = total as f64 / 10_000.0;
-        assert!(avg < 8.0, "average probes {avg} suggests the insert is not O(1)");
+        assert!(
+            avg < 8.0,
+            "average probes {avg} suggests the insert is not O(1)"
+        );
     }
 
     #[test]
@@ -857,7 +855,10 @@ mod tests {
             est.estimate() < 10_000,
             "an estimate must not be passed off as exact"
         );
-        assert!(est.is_saturated(), "saturation must be visible to the caller");
+        assert!(
+            est.is_saturated(),
+            "saturation must be visible to the caller"
+        );
     }
 
     #[test]

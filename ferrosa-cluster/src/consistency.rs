@@ -50,7 +50,6 @@ impl ConsistencyLevel {
             Self::EachQuorum => {
                 panic!("use block_for_dc() for EACH_QUORUM");
             }
-
         }
     }
 

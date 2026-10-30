@@ -304,9 +304,11 @@ async fn verification_nts_range_needs_only_the_local_quorum() {
 }
 #[tokio::test]
 async fn verification_nts_range_requires_origin() {
-    assert!(range_case(&[1, 4, 5, 6, 7, 8, 9], ConsistencyLevel::DcQuorum)
-        .await
-        .is_err());
+    assert!(
+        range_case(&[1, 4, 5, 6, 7, 8, 9], ConsistencyLevel::DcQuorum)
+            .await
+            .is_err()
+    );
 }
 #[tokio::test]
 async fn verification_nts_range_local() {

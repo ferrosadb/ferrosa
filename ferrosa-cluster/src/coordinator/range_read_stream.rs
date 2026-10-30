@@ -1498,9 +1498,7 @@ impl RangeCertificate {
                 let count_in_dc = |dc: &str| {
                     scope
                         .iter()
-                        .filter(|(host, replica_dc)| {
-                            replica_dc == dc && admitted.contains(host)
-                        })
+                        .filter(|(host, replica_dc)| replica_dc == dc && admitted.contains(host))
                         .count()
                 };
                 if self.cl == crate::ConsistencyLevel::DcQuorum {

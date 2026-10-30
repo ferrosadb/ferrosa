@@ -24,6 +24,8 @@
 //!   (`partition_to_rows_with_storage_mapping` and friends) and the partition /
 //!   clustering key decoders.
 
+#![forbid(unsafe_code)]
+
 pub mod codec;
 pub mod collection;
 pub mod row;

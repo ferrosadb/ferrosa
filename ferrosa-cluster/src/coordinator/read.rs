@@ -688,7 +688,8 @@ fn read_quorum_progress(
     // write until replication catches up. This is the deliberate cost of the hop-free read — see
     // `Consistency.a_local_read_does_not_consult_remote_datacenters`.
     if matches!(cl, ConsistencyLevel::DcQuorum) {
-        let configured = crate::ring::strategy::ReplicationStrategy::dc_replication_factors(strategy);
+        let configured =
+            crate::ring::strategy::ReplicationStrategy::dc_replication_factors(strategy);
         let Some(&rf) = configured.get(origin).filter(|rf| **rf > 0) else {
             return super::dc_quorum::Progress {
                 required: 1,
@@ -4494,7 +4495,7 @@ mod tests {
             noop_peer_manager(),
             local_node_id,
             storage.clone(),
-            3,                        // RF=3 (default)
+            3,                          // RF=3 (default)
             ConsistencyLevel::DcQuorum, // default CL
         );
 
@@ -6466,7 +6467,8 @@ mod tests {
     async fn verification_nts_read_requires_origin_majority() {
         assert!(
             matches!(
-                verification_nts_read_case(&[1, 4, 5, 6, 7, 8, 9], ConsistencyLevel::DcQuorum).await,
+                verification_nts_read_case(&[1, 4, 5, 6, 7, 8, 9], ConsistencyLevel::DcQuorum)
+                    .await,
                 Err(ClusterError::ReadTimeout {
                     required: 2,
                     received: 1,

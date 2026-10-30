@@ -20,6 +20,8 @@
 //! events — it is never silently skipped (FMEA F16/F18). A slow subscriber can
 //! therefore never block a producer (the write path).
 
+#![forbid(unsafe_code)]
+
 use std::sync::Arc;
 
 use ferrosa_common::accord::Timestamp as AccordTimestamp;
