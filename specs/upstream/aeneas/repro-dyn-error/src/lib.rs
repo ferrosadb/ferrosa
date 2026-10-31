@@ -1,9 +1,11 @@
 //! The smallest shape that produces a Lean file which cannot elaborate.
 //!
 //! `Error::InvalidData("...".into())` appears in every crate that reports parse failures with a
-//! `Box<dyn Error>` behind the message. Extracted with a narrowed `--start-from`, the trait impl is
-//! emitted but its trait declaration is not, and the resulting file fails with a message about a
-//! `Singleton` instance that has nothing to do with the cause.
+//! `Box<dyn Error>` behind the message. The `.into()` here is `impl From<&str> for Box<dyn Error>`
+//! from `alloc`, which is the trait impl Aeneas emits without the declaration it names.
+//!
+//! Note the `.into()` must target `Box<dyn Error>` directly: `Err("x".into())` on a `Result<_, Error>`
+//! asks for `From<&str> for Error`, which is a different (and non-existent) impl.
 
 #[derive(Debug)]
 pub enum Error {
@@ -18,7 +20,7 @@ impl From<Box<dyn std::error::Error>> for Error {
 
 pub fn check(n: usize) -> Result<usize, Error> {
     if n == 0 {
-        return Err("n must be non-zero".into());
+        return Err(Error::InvalidData("n must be non-zero".into()));
     }
     Ok(n)
 }
