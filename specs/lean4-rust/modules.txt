@@ -14,10 +14,12 @@
 #
 # The scope below is deliberately the narrow one. The full scope
 #   ferrosa_sstable::compression::*,ferrosa_sstable::compression::Compression::*
-# does bring `Compression::decompress` -- the function the ledger's decompression row is about -- but
-# aeneas then hits two internal errors (`alloc::io::error::Error::other`, `alloc::boxed::From`) and
-# the emitted module references `core.io.error.Error` without declaring it: 8 Lean errors,
-# `synthInstanceFailed` and a type mismatch. Fix the translator first, then widen this row.
+# does bring `Compression::decompress` -- the function the ledger's decompression row is about; the
+# emitted module mentions it 99 times -- but aeneas then hits 7 internal errors
+# (`alloc::io::error::Error::other`, `alloc::boxed::From`, the zstd RefCell wrapper) and the module
+# does not elaborate: 16 Lean errors, all of the shape `core.result.Result Usize
+# ferrosa_common.error.Error` in a position that expects a product type, plus `synthInstanceFailed`
+# on `core.convert.From (Dyn …) Str`. Fix the translator first, then widen this row.
 #
 # Regenerate one with `./extract.sh <module>`; check them all with `./check-sync.sh`.
 
