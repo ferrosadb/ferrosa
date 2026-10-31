@@ -28,6 +28,23 @@ column of `modules.txt` — against the hash recorded in `sync.lock`. It needs n
 aeneas, so it runs on every pull request. When it fires, the generated file is making claims about
 code that no longer exists; regenerate, read the diff, and re-prove whatever the diff broke.
 
+A row's status is `ok` or `stale:<reason>`. `stale` means the extraction cannot be regenerated under
+the installed toolchain, and the reason names what blocks it. The check reports it every run rather
+than passing silently, because a generated file nobody can reproduce is a claim resting on nothing.
+
+## What is verified, and what is only asserted
+
+  - `Sstable` (from `ferrosa-sstable/src/compression.rs`) regenerated at aeneas `a4c75c4`, twice,
+    byte-identical. The copy committed before this work differed only as the translator changed:
+    `axiom` became `def … := sorry`, plus the const closures the current scope reaches.
+  - `Storage` (from `ferrosa-storage/src/count.rs`) is **stale**. Its committed content was
+    produced by an earlier translator. Regenerating it under `a4c75c4` emits a call to
+    `core.iter.Iterator.count`, which the Aeneas Std library has no model for, so the module does
+    not elaborate and `extract.sh` restores the previous file. The three theorems in
+    `Link/Count.lean` are about constants in `count.rs` that have not changed, so they still hold;
+    what does not hold is any claim that this file is what today's toolchain produces.
+
+
 ## What "linked" does and does not mean yet
 
 Three theorems in `Link/Count.lean` are stated over extracted constants, and two of the three

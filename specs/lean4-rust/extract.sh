@@ -52,8 +52,26 @@ llbc=$work/extract.llbc
 generated=$(ls "$work"/out/*.lean 2>/dev/null | head -1)
 [ -n "$generated" ] || { echo "FAIL: aeneas produced no .lean for $crate"; tail -5 "$work/aeneas.log"; exit 1; }
 
+# A committed file that does not compile is worse than a stale one, so prove it here -- and put the
+# previous file back when it fails. `tail -3` on a build log reports "build failed" and the failing
+# target but never the error that caused it, so the failure is captured whole.
+previous=$work/previous.lean
+had_previous=0
+[ -f "$pkg/FerrosaRust/$module.lean" ] && { cp "$pkg/FerrosaRust/$module.lean" "$previous"; had_previous=1; }
 cp "$generated" "$pkg/FerrosaRust/$module.lean"
 rm -f "$llbc"
+
+LEAN_NUM_THREADS=2 lake build > "$work/build.log" 2>&1 || {
+  echo "FAIL: the regenerated FerrosaRust/$module.lean does not elaborate"
+  grep -E "error:|Unknown identifier|unknown identifier" "$work/build.log" | head -10
+  if [ $had_previous -eq 1 ]; then
+    cp "$previous" "$pkg/FerrosaRust/$module.lean"
+    echo "      previous FerrosaRust/$module.lean restored -- the recorded extraction still stands"
+  else
+    rm -f "$pkg/FerrosaRust/$module.lean"
+  fi
+  exit 1
+}
 
 # Record what the file was produced from, so a later run can tell whether it is still that. The
 # toolchain belongs in the record: the same sources under a different translator are a different
