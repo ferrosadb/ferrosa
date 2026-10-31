@@ -40,3 +40,5 @@ examples/build/
 *.llbc
 FerrosaStorage.lean
 specs/lean4/rust-extract/
+# Lake build products and packages for the extraction library
+specs/lean4-rust/.lake/
