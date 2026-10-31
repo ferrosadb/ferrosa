@@ -1,0 +1,24 @@
+{
+  "stage": "aeneas-crash",
+  "error": "\u001b[?25hFatal error: exception Not_found",
+  "trace": [
+    "\u001b[?25hFatal error: exception Not_found",
+    "Raised at Stdlib__Map.Make.find in file \"map.ml\", line 141, characters 10-25",
+    "Called from Aeneas__Translate.trait_impl_is_builtin in file \"Translate.ml\", lines 1079-1080, characters 4-27",
+    "Called from Aeneas__Translate.export_trait_impl in file \"Translate.ml\", line 1120, characters 9-50",
+    "Called from Aeneas__Translate.extract_definitions.(fun) in file \"Translate.ml\", line 1293, characters 10-29",
+    "Called from Stdlib__List.iter in file \"list.ml\", line 112, characters 12-15",
+    "Called from Aeneas__Translate.extract_file in file \"Translate.ml\", line 1461, characters 2-36",
+    "Called from Aeneas__Translate.extract_translated_crate in file \"Translate.ml\", line 2162, characters 5-42"
+  ],
+  "llbc": "/home/bkearns/src/ferrosa-suite/ferrosa/ferrosa_ctl.llbc",
+  "log": "\nPost-processed translated transparent functions:  [##############----] 122/154 \u2819\n\nPost-processed translated transparent functions:  [##############----] 124/154 \u2839\n\nPost-processed translated transparent functions:  [###############---] 130/154 \u2839\n\nPost-processed translated transparent functions:  [###############---] 132/154 \u2838\n\nPost-processed translated transparent functions:  [###############---] 136/154 \u2838\n\nPost-processed translated transparent functions:  [################--] 138/154 \u2838\n\nPost-processed translated transparent functions:  [################--] 140/154 \u2838\n\nPost-processed translated transparent functions:  [################--] 143/154 \u283c\n\nPost-processed translated transparent functions:  [#################-] 147/154 \u283c\n\nPost-processed translated transparent functions:  [#################-] 148/154 \u283c\n\nPost-processed translated transparent functions:  [#################-] 149/154 \u2834\n\nPost-processed translated transparent functions:  [#################-] 150/154 \u2834\n\nPost-processed translated transparent functions:  [#################-] 151/154 \u2826\n\nPost-processed translated transparent functions:  [#################-] 153/154 \u2826\n\nPost-processed translated transparent functions:  [##################] 154/154 \u2826\nPost-processed translated transparent functions:  [##################] 154/154 \u2714\ufe0f\n\u001b[?25hFatal error: exception Not_found\nRaised at Stdlib__Map.Make.find in file \"map.ml\", line 141, characters 10-25\nCalled from Aeneas__Translate.trait_impl_is_builtin in file \"Translate.ml\", lines 1079-1080, characters 4-27\nCalled from Aeneas__Translate.export_trait_impl in file \"Translate.ml\", line 1120, characters 9-50\nCalled from Aeneas__Translate.extract_definitions.(fun) in file \"Translate.ml\", line 1293, characters 10-29\nCalled from Stdlib__List.iter in file \"list.ml\", line 112, characters 12-15\nCalled from Aeneas__Translate.extract_file in file \"Translate.ml\", line 1461, characters 2-36\nCalled from Aeneas__Translate.extract_translated_crate in file \"Translate.ml\", line 2162, characters 5-42\nCalled from Dune__exe__Main in file \"Main.ml\", lines 765-766, characters 8-37",
+  "crate": "ferrosa-ctl",
+  "prefix": "ferrosa_ctl::commands::sstable::*",
+  "generated_at": "2026-10-31T03:44:10+00:00",
+  "toolchain": {
+    "charon": "/home/bkearns/src/aeneas/charon/bin/charon",
+    "aeneas": "/home/bkearns/src/aeneas/src/_build/default/main.exe",
+    "lean_pkg": "/home/bkearns/.local/aeneas/backends/lean"
+  }
+}

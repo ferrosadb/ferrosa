@@ -1,21 +1,374 @@
 {
-  "stage": "aeneas-crash",
-  "error": "Fatal error: exception Failure(\"ty_regions shouldn't be called on erased or body regions\")",
-  "trace": [
-    "Fatal error: exception Failure(\"ty_regions shouldn't be called on erased or body regions\")",
-    "Raised at Aeneas__TypesUtils.ty_regions.add_region in file \"llbc/TypesUtils.ml\", lines 98-99, characters 8-78",
-    "Called from Charon__Generated_Types.iter_ty#visit_dyn_predicate.(fun) in file \"charon/charon-ml/src/generated/Generated_Types.ml\", lines 179-931, characters 0-6",
-    "Called from VisitorsRuntime.iter#visit_list in file \"runtime/VisitorsRuntime.ml\", line 165, characters 10-17",
-    "Called from Charon__Generated_Types.iter_ty#visit_generic_args.(fun) in file \"charon/charon-ml/src/generated/Generated_Types.ml\", lines 179-931, characters 0-6",
-    "Called from Charon__Generated_Types.iter_ty#visit_type_decl_ref.(fun) in file \"charon/charon-ml/src/generated/Generated_Types.ml\", lines 179-931, characters 0-6",
-    "Called from Charon__Generated_Types.iter_ty#visit_BKTraitMethod.(fun) in file \"charon/charon-ml/src/generated/Generated_Types.ml\", lines 179-931, characters 0-6",
-    "Called from Charon__Generated_Types.map_ty#visit_trait_impl_ref.(fun) in file \"charon/charon-ml/src/generated/Generated_Types.ml\", lines 179-931, characters 0-6"
-  ],
+  "stage": "aeneas",
   "llbc": "/home/bkearns/src/ferrosa-suite/ferrosa/ferrosa_cql.llbc",
-  "log": "Called from Stdlib__List.map in file \"list.ml\", line 83, characters 15-19\nCalled from Aeneas__InterpStatements.eval_statement_list.(fun) in file \"interp/InterpStatements.ml\", lines 677-685, characters 8-18\nCalled from Stdlib__List.map in file \"list.ml\", line 83, characters 15-19\nCalled from Aeneas__InterpStatements.eval_statement_list.(fun) in file \"interp/InterpStatements.ml\", lines 677-685, characters 8-18\nCalled from Aeneas__InterpStatements.eval_switch_raw.(fun) in file \"interp/InterpStatements.ml\", line 911, characters 28-65\nCalled from Aeneas__InterpStatements.eval_switch.(fun) in file \"interp/InterpStatements.ml\", line 848, characters 10-57\nCalled from Aeneas__InterpStatements.eval_statement.(fun) in file \"interp/InterpStatements.ml\", line 663, characters 10-44\nCalled from Aeneas__InterpStatements.eval_statement_list.(fun) in file \"interp/InterpStatements.ml\", line 672, characters 29-57\nCalled from Stdlib__List.map in file \"list.ml\", line 83, characters 15-19\nCalled from Aeneas__InterpStatements.eval_statement_list.(fun) in file \"interp/InterpStatements.ml\", lines 677-685, characters 8-18\nCalled from Stdlib__List.map in file \"list.ml\", line 83, characters 15-19\nCalled from Aeneas__InterpStatements.eval_statement_list.(fun) in file \"interp/InterpStatements.ml\", lines 677-685, characters 8-18\nCalled from Stdlib__List.map in file \"list.ml\", line 83, characters 15-19\nCalled from Aeneas__InterpStatements.eval_statement_list.(fun) in file \"interp/InterpStatements.ml\", lines 677-685, characters 8-18\nCalled from Stdlib__List.map in file \"list.ml\", line 83, characters 15-19\nCalled from Aeneas__InterpStatements.eval_statement_list.(fun) in file \"interp/InterpStatements.ml\", lines 677-685, characters 8-18\nCalled from Stdlib__List.map in file \"list.ml\", line 83, characters 15-19\nCalled from Aeneas__InterpStatements.eval_statement_list.(fun) in file \"interp/InterpStatements.ml\", lines 677-685, characters 8-18\nCalled from Stdlib__List.map in file \"list.ml\", line 83, characters 15-19\nCalled from Aeneas__InterpStatements.eval_statement_list.(fun) in file \"interp/InterpStatements.ml\", lines 677-685, characters 8-18\nCalled from Stdlib__List.map in file \"list.ml\", line 83, characters 15-19\nCalled from Aeneas__InterpStatements.eval_statement_list.(fun) in file \"interp/InterpStatements.ml\", lines 677-685, characters 8-18\nCalled from Stdlib__List.map in file \"list.ml\", line 83, characters 15-19\nCalled from Aeneas__InterpStatements.eval_statement_list.(fun) in file \"interp/InterpStatements.ml\", lines 677-685, characters 8-18\nCalled from Stdlib__List.map in file \"list.ml\", line 83, characters 15-19\nCalled from Aeneas__InterpStatements.eval_statement_list.(fun) in file \"interp/InterpStatements.ml\", lines 677-685, characters 8-18\nCalled from Aeneas__InterpStatements.eval_function_body.(fun) in file \"interp/InterpStatements.ml\", line 1555, characters 26-52\nCalled from Aeneas__Interp.evaluate_function_symbolic in file \"interp/Interp.ml\", line 671, characters 25-64\nCalled from Aeneas__Translate.translate_function_to_symbolics in file \"Translate.ml\", line 34, characters 8-71\nCalled from Aeneas__Translate.translate_function_to_pure_aux in file \"Translate.ml\", line 131, characters 4-61\nCalled from Aeneas__Translate.translate_function_to_pure in file \"Translate.ml\", lines 287-288, characters 6-41\nCalled from Aeneas__Translate.translate_crate_to_pure.process.(fun) in file \"Translate.ml\", lines 502-503, characters 16-45\nCalled from Aeneas__Parallel.run_with_backtrace in file \"Parallel.ml\", line 14, characters 6-9\nRe-raised at Aeneas__Parallel.catch_reraise in file \"Parallel.ml\", line 17, characters 31-65\nCalled from Progress_engine__Renderer.Make.Reporters.apply_all in file \"src/progress/engine/renderer.ml\", line 507, characters 54-59\nCalled from Stdlib__Fun.protect in file \"fun.ml\", line 34, characters 8-15\nRe-raised at Stdlib__Fun.protect in file \"fun.ml\", line 39, characters 6-52\nCalled from Aeneas__Translate.translate_crate_to_pure in file \"Translate.ml\", line 520, characters 22-62\nCalled from Aeneas__Translate.translate_crate in file \"Translate.ml\", line 2371, characters 31-71\nCalled from Dune__exe__Main in file \"Main.ml\", lines 797-798, characters 8-37",
+  "lean": "/home/bkearns/.hermes/cache/scratch/leangap-ferrosa-cql-3ew9wunv/FerrosaCql.lean",
+  "translation_errors": 0,
+  "translation_unique_reported": null,
+  "translation_messages": [],
+  "aeneas_exit": 1,
+  "lean_errors": 71,
+  "errors": [
+    {
+      "location": "FerrosaCql.lean:470:18",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_cql.core.array.iter.IntoIter.Insts.CoreIterTraitsIteratorIterator`"
+    },
+    {
+      "location": "FerrosaCql.lean:7378:36",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:7387:33",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:11190:54",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:11602:54",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:11640:5",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:11795:55",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:12001:31",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:12167:65",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:12177:67",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:12247:51",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:13442:31",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaCql.lean:13443:32",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaCql.lean:13472:31",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaCql.lean:13473:32",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaCql.lean:13508:31",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaCql.lean:13509:32",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaCql.lean:13611:19",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `openraft.node.NodeId`"
+    },
+    {
+      "location": "FerrosaCql.lean:13624:19",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `openraft.node.NodeId`"
+    },
+    {
+      "location": "FerrosaCql.lean:13641:19",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `openraft.node.NodeId`"
+    },
+    {
+      "location": "FerrosaCql.lean:13724:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `openraft.type_config.RaftTypeConfig`"
+    },
+    {
+      "location": "FerrosaCql.lean:13795:35",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `openraft.type_config.RaftTypeConfig`"
+    },
+    {
+      "location": "FerrosaCql.lean:13812:35",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `openraft.type_config.RaftTypeConfig`"
+    },
+    {
+      "location": "FerrosaCql.lean:13828:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `openraft.type_config.RaftTypeConfig`"
+    },
+    {
+      "location": "FerrosaCql.lean:13830:12",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `openraft.entry.payload.EntryPayload`"
+    },
+    {
+      "location": "FerrosaCql.lean:14266:40",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:14316:71",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:14439:77",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:14450:5",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:14460:37",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:14470:37",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:14480:38",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:14490:38",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:14513:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaCql.lean:14523:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaCql.lean:14647:32",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:14704:68",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:14714:60",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:14819:36",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:14829:32",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:15032:66",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:15042:35",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:15062:49",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:15079:39",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:15089:39",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:15245:4",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_cql.ferrosa_schema.auth.permission.Permission.Insts.CoreCmpPartialEqPermission`"
+    },
+    {
+      "location": "FerrosaCql.lean:15256:62",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:15266:64",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:15276:62",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:15286:60",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:15306:38",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:15393:40",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:15666:71",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:15697:36",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:15806:61",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:15817:20",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaCql.lean:15826:31",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaCql.lean:15835:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaCql.lean:15835:32",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaCql.lean:15845:4",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaCql.lean:15845:34",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaCql.lean:15854:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaCql.lean:15864:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaCql.lean:15864:33",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaCql.lean:15875:21",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaCql.lean:15875:52",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaCql.lean:16040:32",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:16080:54",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:16114:30",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:16123:24",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaCql.lean:16132:24",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    }
+  ],
+  "sorry_declarations": 849,
+  "compiled": false,
   "crate": "ferrosa-cql",
   "prefix": "ferrosa_cql::*",
-  "generated_at": "2026-10-31T16:20:39+00:00",
+  "generated_at": "2026-10-31T18:31:26+00:00",
   "memory_max": "18G",
   "toolchain": {
     "charon": "/home/bkearns/src/aeneas/charon/bin/charon",

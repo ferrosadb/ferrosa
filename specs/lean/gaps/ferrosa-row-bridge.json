@@ -1,0 +1,353 @@
+{
+  "stage": "aeneas",
+  "llbc": "/home/bkearns/src/ferrosa-suite/ferrosa/ferrosa_row_bridge.llbc",
+  "lean": "/home/bkearns/.hermes/cache/scratch/leangap-ferrosa-row-bridge-8re6de46/FerrosaRowBridge.lean",
+  "translation_errors": 0,
+  "translation_unique_reported": null,
+  "translation_messages": [],
+  "aeneas_exit": 1,
+  "lean_errors": 66,
+  "errors": [
+    {
+      "location": "FerrosaRowBridge.lean:4208:69",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4223:51",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4243:47",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4256:76",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4271:49",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4286:49",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4301:49",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4316:20",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4331:20",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4346:49",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4361:49",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4376:49",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4391:49",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4406:49",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4421:49",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4436:47",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4451:47",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4466:45",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4481:45",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4496:68",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4511:49",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4532:40",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4540:40",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4557:40",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4575:40",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4600:29",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4608:29",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4631:72",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4657:5",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4686:35",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4714:68",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4741:68",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4767:65",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4775:30",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4782:69",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4790:30",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4805:16",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4813:74",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4838:40",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4853:40",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4873:30",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4898:38",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4927:50",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4955:35",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4980:35",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:4987:77",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:5002:45",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:5014:31",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:5045:5",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:5076:14",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:5108:31",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:5138:64",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:5166:40",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:5201:40",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:5230:30",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:5245:30",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:5260:30",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:5275:45",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:5290:45",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:5305:43",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:5333:70",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:5348:40",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:5375:40",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:5403:18",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:5418:40",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaRowBridge.lean:5445:40",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    }
+  ],
+  "sorry_declarations": 266,
+  "compiled": false,
+  "crate": "ferrosa-row-bridge",
+  "prefix": "ferrosa_row_bridge::*",
+  "generated_at": "2026-10-31T14:51:54+00:00",
+  "memory_max": "18G",
+  "toolchain": {
+    "charon": "/home/bkearns/src/aeneas/charon/bin/charon",
+    "aeneas": "/home/bkearns/src/aeneas/src/_build/default/main.exe",
+    "lean_pkg": "/home/bkearns/.local/aeneas/backends/lean"
+  }
+}

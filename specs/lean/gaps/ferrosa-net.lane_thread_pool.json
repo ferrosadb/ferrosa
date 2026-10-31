@@ -1,0 +1,28 @@
+{
+  "stage": "aeneas",
+  "llbc": "/home/bkearns/src/ferrosa-suite/ferrosa/ferrosa_net.llbc",
+  "lean": "/home/bkearns/.hermes/cache/scratch/leangap-ferrosa-net-yjm_3hob/FerrosaNet.lean",
+  "translation_errors": 0,
+  "translation_unique_reported": null,
+  "translation_messages": [],
+  "aeneas_exit": 1,
+  "lean_errors": 1,
+  "errors": [
+    {
+      "location": "FerrosaNet.lean:591:6",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `\u00absorry /- Could not find: type name: ferrosa_net::lane_thread_pool::Worker-/\u00bb`"
+    }
+  ],
+  "sorry_declarations": 1,
+  "compiled": false,
+  "crate": "ferrosa-net",
+  "prefix": "ferrosa_net::lane_thread_pool::*",
+  "generated_at": "2026-10-31T06:48:25+00:00",
+  "memory_max": "8G",
+  "toolchain": {
+    "charon": "/home/bkearns/src/aeneas/charon/bin/charon",
+    "aeneas": "/home/bkearns/src/aeneas/src/_build/default/main.exe",
+    "lean_pkg": "/home/bkearns/.local/aeneas/backends/lean"
+  }
+}
