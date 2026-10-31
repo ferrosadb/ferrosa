@@ -31,7 +31,7 @@ def broken : List Item := [
    "commitlog/mutation.rs: a zero mutation_id is always re-applied, so a non-idempotent mutation duplicates",
    "Ferrosa.Storage.Recovery", "replay is idempotent"⟩,
   ⟨"Tombstone", "a local deletion time is representable for every TTL",
-   "the field is i32, so it wraps at 2038-01-19 and a long TTL expires immediately",
+   "ferrosa-common/src/cell.rs:52 and ferrosa-sstable/src/types.rs:90: the field is i32 (`i32::MAX` = not deleted), so it wraps at 2038-01-19 and a long TTL expires immediately",
    "Ferrosa.Storage.Tombstone", "a local deletion time is representable for every valid TTL"⟩,
   ⟨"SQL", "three-valued logic is preserved",
    "NOT (b = 5) is translated to b <> 5, which admits the NULL rows SQL's UNKNOWN excludes",
