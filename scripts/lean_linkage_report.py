@@ -124,7 +124,15 @@ def resolve_rs(name: str) -> list[str]:
 
     The crate name has to survive: `classify` reads it off the first path segment, and a path that
     started at `src/` made every such row look like a crate called `src`, i.e. unmeasured.
+
+    A site written as a FULL crate-relative path (`ferrosa-storage/src/store.rs`) is taken as given
+    when the file exists. Matching it by basename instead made a correct citation resolve to a
+    namesake in another crate -- the commit row's `engine.rs` came back as `ferrosa-graph/src/engine.rs`
+    and the index row's `store.rs` as `ferrosa-postgres/src/store.rs` -- and `classify` then reported
+    the distance for a file the row never named.
     """
+    if "/" in name and (ROOT / name).is_file():
+        return [name]
     out = []
     for crate_dir in ROOT.glob("*/src"):
         crate = crate_dir.parent.name
@@ -141,7 +149,15 @@ def anchors_of(site: str, index: dict[str, set[str]]) -> tuple[list[str], list[s
     A prose site is not a citation, so the rule is: an identifier counts only if it is long and is
     defined in at most three files. Without that, `mod`, `router` and `convert` matched half the
     workspace and every row looked anchored to a file that had nothing to do with it.
+
+    A site beginning `unverified:` is the opposite of a citation: it exists to record that the row
+    was checked against the shipping code and no implementation of the defect was found, so the paths
+    it cites are the ones that *disprove* the claim. Counting them as anchors would invert the
+    report -- five rows whose whole point is "this does not happen in the code" would sort as the
+    best-anchored rows in the list. Such a row stays `no-code-anchor`.
     """
+    if site.startswith("unverified:"):
+        return [], []
     explicit = []
     for m in re.finditer(r"([\w./-]+\.rs)", site):
         explicit += resolve_rs(m.group(1))

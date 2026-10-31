@@ -10,35 +10,36 @@ Ledger items: **310** (251 met, 59 failing). Classified reds: 15 broken, 37 with
 | Storage | ferrosa-storage | src/count.rs | stale | 5 |
 
 Files under extraction: `ferrosa-sstable/src/compression.rs`
-Files named by a broken row: 9 — overlap: **1**
+Files named by a broken row: 19 — overlap: **1**
 
 ## The broken rows, by distance from the extraction
 
 | class | count |
 |---|---|
-| no-code-anchor | 9 |
-| crate-unmeasured | 2 |
-| crate-oom | 1 |
+| no-code-anchor | 5 |
+| crate-aeneas-crash | 4 |
+| crate-charon | 2 |
+| crate-measured-file-not-extracted | 1 |
+| crate-unmeasured | 1 |
 | crate-modules-partial | 1 |
-| crate-aeneas-crash | 1 |
 | extracted | 1 |
 
 | area | what | anchor(s) | how | named symbol extracted? | class |
 |---|---|---|---|---|---|
-| Recovery | replay is idempotent | `ferrosa-storage/src/commitlog/mutation.rs` | explicit | **no** | crate-oom |
-| Tombstone | a local deletion time is representable for every TTL | — | none | **no** | no-code-anchor |
+| Recovery | replay is idempotent | `ferrosa-storage/src/commitlog/mutation.rs` | explicit | **no** | crate-charon |
+| Tombstone | a local deletion time is representable for every TTL | `ferrosa-common/src/cell.rs`, `ferrosa-row-bridge/src/row.rs` | explicit | **no** | crate-measured-file-not-extracted |
 | SQL | three-valued logic is preserved | — | none | **no** | no-code-anchor |
 | SQL | aggregates follow the empty-set rules | — | none | **no** | no-code-anchor |
-| SQL | the commit decision is durable before the acknowledgement | — | none | **no** | no-code-anchor |
+| SQL | the commit decision is durable before the acknowledgement | `ferrosa-postgres/src/query.rs`, `ferrosa-postgres/src/server.rs` | explicit | **no** | crate-unmeasured |
 | SPARQL | `p+` returns each pair once | — | none | **no** | no-code-anchor |
 | SPARQL | RDF-star terms are distinct from IRIs in the store | — | none | **no** | no-code-anchor |
-| Index | index and table cannot diverge | — | none | **no** | no-code-anchor |
+| Index | index and table cannot diverge | `ferrosa-storage/src/engine.rs`, `ferrosa-storage/src/store.rs` | explicit | **no** | crate-charon |
 | Consistency | the coordinator enforces the per-datacenter requirement | `ferrosa-cluster/src/coordinator/write.rs` | explicit | **no** | crate-modules-partial |
-| Streaming | a page bound in rows is a bound in memory | `ferrosa-cql/src/paging.rs` | ident | **no** | crate-unmeasured |
-| Streaming | the scan never materialises a page of rows before encoding | `ferrosa-cql/src/result.rs` | ident | **no** | crate-unmeasured |
+| Streaming | a page bound in rows is a bound in memory | `ferrosa-cql/src/paging.rs` | ident | **no** | crate-aeneas-crash |
+| Streaming | the scan never materialises a page of rows before encoding | `ferrosa-cql/src/result.rs` | ident | **no** | crate-aeneas-crash |
 | Streaming | the reader streams partitions to the caller | `ferrosa-sstable/src/reader.rs`, `ferrosa-sstable/src/types.rs` | ident | **no** | crate-aeneas-crash |
 | Streaming | a decoded chunk is written into a caller-supplied buffer | `ferrosa-cluster/src/accord/compression.rs`, `ferrosa-sstable/src/compression.rs` | explicit | **no** | extracted |
-| Streaming | a slow client cannot grow the coordinator's memory | — | none | **no** | no-code-anchor |
+| Streaming | a slow client cannot grow the coordinator's memory | `ferrosa-cql/src/connection.rs`, `ferrosa-cql/src/result.rs` | explicit | **no** | crate-aeneas-crash |
 | Streaming | acks are coalesced so a high-latency pipe is not ack-starv | — | none | **no** | no-code-anchor |
 
 ## What this says
