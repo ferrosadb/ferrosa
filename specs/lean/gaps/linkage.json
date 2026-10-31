@@ -1,0 +1,246 @@
+{
+  "ledger_items": 310,
+  "broken": [
+    {
+      "area": "Recovery",
+      "what": "replay is idempotent",
+      "ledger": "Ferrosa.Storage.Recovery",
+      "item": "replay is idempotent",
+      "site": "commitlog/mutation.rs: a zero mutation_id is always re-applied, so a non-idempotent mutation duplicates",
+      "anchors": [
+        "ferrosa-storage/src/commitlog/mutation.rs"
+      ],
+      "confidence": "explicit",
+      "symbol_named_in_site": [],
+      "symbols_from_same_file": [],
+      "class": "crate-oom"
+    },
+    {
+      "area": "Tombstone",
+      "what": "a local deletion time is representable for every TTL",
+      "ledger": "Ferrosa.Storage.Tombstone",
+      "item": "a local deletion time is representable for every valid TTL",
+      "site": "the field is i32, so it wraps at 2038-01-19 and a long TTL expires immediately",
+      "anchors": [],
+      "confidence": "none",
+      "symbol_named_in_site": [],
+      "symbols_from_same_file": [],
+      "class": "no-code-anchor"
+    },
+    {
+      "area": "SQL",
+      "what": "three-valued logic is preserved",
+      "ledger": "Ferrosa.Sql.Semantics",
+      "item": "three-valued logic is preserved",
+      "site": "NOT (b = 5) is translated to b <> 5, which admits the NULL rows SQL's UNKNOWN excludes",
+      "anchors": [],
+      "confidence": "none",
+      "symbol_named_in_site": [],
+      "symbols_from_same_file": [],
+      "class": "no-code-anchor"
+    },
+    {
+      "area": "SQL",
+      "what": "aggregates follow the empty-set rules",
+      "ledger": "Ferrosa.Sql.Semantics",
+      "item": "aggregates follow SQL's empty-set rules",
+      "site": "SUM over no rows returns 0 where SQL requires NULL",
+      "anchors": [],
+      "confidence": "none",
+      "symbol_named_in_site": [],
+      "symbols_from_same_file": [],
+      "class": "no-code-anchor"
+    },
+    {
+      "area": "SQL",
+      "what": "the commit decision is durable before the acknowledgement",
+      "ledger": "Ferrosa.Sql.Txn",
+      "item": "the commit decision is durable before the acknowledgement",
+      "site": "COMMIT reports success with no durable decision recorded anywhere",
+      "anchors": [],
+      "confidence": "none",
+      "symbol_named_in_site": [],
+      "symbols_from_same_file": [],
+      "class": "no-code-anchor"
+    },
+    {
+      "area": "SPARQL",
+      "what": "`p+` returns each pair once",
+      "ledger": "Ferrosa.Sparql.Semantics",
+      "item": "`p+` returns each pair once",
+      "site": "path expansion emits one row per path, so a two-node cycle gives three rows for two pairs",
+      "anchors": [],
+      "confidence": "none",
+      "symbol_named_in_site": [],
+      "symbols_from_same_file": [],
+      "class": "no-code-anchor"
+    },
+    {
+      "area": "SPARQL",
+      "what": "RDF-star terms are distinct from IRIs in the store",
+      "ledger": "Ferrosa.Sparql.Semantics",
+      "item": "RDF-star terms are distinct from IRIs in the store",
+      "site": "Term.quoted 1 2 3 and Term.iri 1002003 hash to the same key",
+      "anchors": [],
+      "confidence": "none",
+      "symbol_named_in_site": [],
+      "symbols_from_same_file": [],
+      "class": "no-code-anchor"
+    },
+    {
+      "area": "Index",
+      "what": "index and table cannot diverge",
+      "ledger": "Ferrosa.Sql.Index",
+      "item": "index and table cannot diverge",
+      "site": "index maintenance sits outside the atomic boundary, so a crash between the two leaves them disagreeing",
+      "anchors": [],
+      "confidence": "none",
+      "symbol_named_in_site": [],
+      "symbols_from_same_file": [],
+      "class": "no-code-anchor"
+    },
+    {
+      "area": "Consistency",
+      "what": "the coordinator enforces the per-datacenter requirement",
+      "ledger": "Ferrosa.Sql.Consistency",
+      "item": "the coordinator enforces the per-datacenter requirement for every write, not a total",
+      "site": "write.rs:753 compares a total ack count, so five acks in the primary and none in the secondary passes QUORUM",
+      "anchors": [
+        "ferrosa-cluster/src/coordinator/write.rs"
+      ],
+      "confidence": "explicit",
+      "symbol_named_in_site": [],
+      "symbols_from_same_file": [],
+      "class": "crate-modules-partial"
+    },
+    {
+      "area": "Streaming",
+      "what": "a page bound in rows is a bound in memory",
+      "ledger": "Ferrosa.Storage.Streaming",
+      "item": "the scan's page bound is a bound in bytes",
+      "site": "DEFAULT_SCAN_PAGE_SIZE is 5000 rows: 5 MB of narrow rows and 5 GB of 1 MiB rows on the same coordinator",
+      "anchors": [
+        "ferrosa-cql/src/paging.rs"
+      ],
+      "confidence": "ident",
+      "symbol_named_in_site": [],
+      "symbols_from_same_file": [],
+      "class": "crate-unmeasured"
+    },
+    {
+      "area": "Streaming",
+      "what": "the scan never materialises a page of rows before encoding",
+      "ledger": "Ferrosa.Storage.Streaming",
+      "item": "the row buffer is never built as Vec<Vec<Option<CqlValue>>> on the scan path",
+      "site": "encode_rows_with_writer visits one row at a time, but all_rows accumulates a whole page before it is called",
+      "anchors": [
+        "ferrosa-cql/src/result.rs"
+      ],
+      "confidence": "ident",
+      "symbol_named_in_site": [],
+      "symbols_from_same_file": [],
+      "class": "crate-unmeasured"
+    },
+    {
+      "area": "Streaming",
+      "what": "the reader streams partitions to the caller",
+      "ledger": "Ferrosa.Storage.Streaming",
+      "item": "the reader hands partitions to the caller instead of a vector of them",
+      "site": "read_partitions_limited returns Vec<Partition>, so the page is already materialised when the caller sees it",
+      "anchors": [
+        "ferrosa-sstable/src/reader.rs",
+        "ferrosa-sstable/src/types.rs",
+        "ferrosa-storage/src/memtable/skiplist.rs"
+      ],
+      "confidence": "ident",
+      "symbol_named_in_site": [],
+      "symbols_from_same_file": [],
+      "class": "crate-aeneas-crash"
+    },
+    {
+      "area": "Streaming",
+      "what": "a decoded chunk is written into a caller-supplied buffer",
+      "ledger": "Ferrosa.Storage.Streaming",
+      "item": "a decoded chunk is written into a caller-supplied buffer rather than returned as a new Vec",
+      "site": "compression.rs decompress ignores its uncompressed-length argument and returns a fresh Vec per chunk: one allocation and one copy for every byte read",
+      "anchors": [
+        "ferrosa-cluster/src/accord/compression.rs",
+        "ferrosa-sstable/src/compression.rs"
+      ],
+      "confidence": "explicit",
+      "symbol_named_in_site": [],
+      "symbols_from_same_file": [
+        "compression.CompressionInfo",
+        "compression.LZ4_TABLES",
+        "compression.ZSTD_CCTX.const.closure.as_fn",
+        "compression.take_array",
+        "compression.take_array.closure",
+        "compression.take_array.closure.Insts.CoreOpsFunctionFnOnceTupleTryFromSliceErrorError",
+        "compression.take_array.closure.Insts.CoreOpsFunctionFnOnceTupleTryFromSliceErrorError.call_once",
+        "compression.take_bytes",
+        "compression.take_bytes.closure",
+        "compression.take_bytes.closure.Insts.CoreOpsFunctionFnOnceTupleError",
+        "compression.take_bytes.closure.Insts.CoreOpsFunctionFnOnceTupleError.call_once",
+        "compression.take_bytes.closure_1",
+        "compression.take_bytes.closure_1.Insts.CoreOpsFunctionFnOnceTupleError",
+        "compression.take_bytes.closure_1.Insts.CoreOpsFunctionFnOnceTupleError.call_once",
+        "compression.zstd_error",
+        "zstd_safe.get_error_name"
+      ],
+      "class": "extracted"
+    },
+    {
+      "area": "Streaming",
+      "what": "a slow client cannot grow the coordinator's memory",
+      "ledger": "Ferrosa.Storage.Streaming",
+      "item": "a slow client cannot grow the coordinator's memory",
+      "site": "the response is encoded into one BytesMut and written afterwards, so a slow client parks the whole page in the coordinator instead of applying backpressure",
+      "anchors": [],
+      "confidence": "none",
+      "symbol_named_in_site": [],
+      "symbols_from_same_file": [],
+      "class": "no-code-anchor"
+    },
+    {
+      "area": "Streaming",
+      "what": "acks are coalesced so a high-latency pipe is not ack-starved",
+      "ledger": "Ferrosa.Storage.Streaming",
+      "item": "acks are coalesced so a high-latency pipe is not ack-starved",
+      "site": "TCP_NODELAY exists only as c38add89, which is not an ancestor of main, and it batches nothing: replies are still several small writes, so main pays ~46 ms per statement over a real network",
+      "anchors": [],
+      "confidence": "none",
+      "symbol_named_in_site": [],
+      "symbols_from_same_file": [],
+      "class": "no-code-anchor"
+    }
+  ],
+  "classes": {
+    "crate-oom": 1,
+    "no-code-anchor": 9,
+    "crate-modules-partial": 1,
+    "crate-unmeasured": 2,
+    "crate-aeneas-crash": 1,
+    "extracted": 1
+  },
+  "extracted_files": [
+    "ferrosa-sstable/src/compression.rs"
+  ],
+  "overlap": [
+    "ferrosa-sstable/src/compression.rs"
+  ],
+  "symbols": 69,
+  "sync": [
+    {
+      "module": "Sstable",
+      "crate": "ferrosa-sstable",
+      "sources": "src/compression.rs",
+      "status": "ok"
+    },
+    {
+      "module": "Storage",
+      "crate": "ferrosa-storage",
+      "sources": "src/count.rs",
+      "status": "stale:regenerating under the current toolchain emits a call to core.iter.Iterator.count, which the Aeneas Std library does not model, so the module does not elaborate"
+    }
+  ]
+}
