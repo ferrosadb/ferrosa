@@ -105,7 +105,7 @@ checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 
 [[package]]
 name = "ferrosa-common"
-version = "0.30.6"
+version = "0.30.7"
 dependencies = [
  "bytes",
  "bytestring",
@@ -119,7 +119,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-jsonb"
-version = "0.30.6"
+version = "0.30.7"
 dependencies = [
  "bytes",
  "num-bigint",
@@ -129,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-sstable"
-version = "0.30.6"
+version = "0.30.7"
 dependencies = [
  "crc32fast",
  "crossbeam-channel",
