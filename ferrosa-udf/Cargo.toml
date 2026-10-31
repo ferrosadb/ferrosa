@@ -10,7 +10,7 @@ description = "WASM-sandboxed User-Defined Function execution for Ferrosa"
 ferrosa-common = { path = "../ferrosa-common" }
 # Preserve Wasmtime 48 defaults except the unused on-disk compilation cache.
 # That feature pulls zstd 0.13; UdfExecutor uses its own in-memory registry/pool.
-wasmtime = { version = "48.0.7", default-features = false, features = [
+wasmtime = { version = "48.0.8", default-features = false, features = [
     "anyhow",
     "async",
     "backtrace",
