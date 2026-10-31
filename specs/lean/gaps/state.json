@@ -2118,14 +2118,14 @@
       }
     },
     "ferrosa-storage": {
-      "fingerprint": "4dd77dc233b050c1",
-      "measured_at": "2026-10-31T06:08:38+00:00",
+      "fingerprint": "bdd592be1ac2a71a",
+      "measured_at": "2026-10-31T16:31:05+00:00",
       "measurement": {
-        "stage": "oom",
+        "stage": "charon",
         "translation_errors": null,
         "lean_errors": null,
         "sorry": null,
-        "seconds": 346,
+        "seconds": 28,
         "scope": "crate"
       }
     },
@@ -2197,5 +2197,5 @@
       }
     }
   },
-  "updated_at": "2026-10-31T16:28:22+00:00"
+  "updated_at": "2026-10-31T16:31:05+00:00"
 }
