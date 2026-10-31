@@ -653,6 +653,15 @@ equally gone from the application's point of view, and nothing can ever repair i
 has the pieces (`quarantine.rs`, `self_heal/`) but no theorem connects them to this
 obligation yet, so the item is red.
 
+**Extraction status, measured 2026-10-31.** The crate as a whole cannot be measured:
+`ferrosa-storage` fails in charon at crate scope on `failed to translate drop glue for
+Ty { kind: Coroutine(…) }` (`engine.rs:11749`), so the ledger row above stays
+`crate-charon` in the gap inventory. Narrowing to `commitlog::mutation` does produce an
+LLBC — the record layout and the replay helpers translate — but aeneas then raises 33
+internal errors and the emitted module carries 8 Lean errors, so nothing about this file is
+machine-checked and the claims in this section rest on reading the code. A charon pass is
+not a translation; do not record this module as extracted until the elaboration is clean.
+
 ## G13 — tombstones and TTL: the tie-breaks are requirements
 
 Three facts about the stored shapes decide this section. TTL is materialised as a stored
