@@ -1,0 +1,13 @@
+name = "ferrosa_rust"
+version = "0.1.0"
+defaultTargets = ["FerrosaRust"]
+
+# The Aeneas Lean backend, which the extracted code imports. It is a local path rather than a git
+# requirement because the extraction and the library must be the same release: an Aeneas bump that
+# moves `Std.U64` underneath the generated file is a rebuild of everything here.
+[[require]]
+name = "aeneas"
+path = "/home/bkearns/.local/aeneas/backends/lean"
+
+[[lean_lib]]
+name = "FerrosaRust"
