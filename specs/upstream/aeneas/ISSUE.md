@@ -75,3 +75,42 @@ disappear from a narrowed extraction in the same way `core::convert::From` does.
 ## Environment
 
 charon `nightly-2026.10.30`, aeneas `nightly-2026.10.30-de16f3c`, Lean `v4.35.0`.
+
+# Update after building the toolchain
+
+Two earlier readings of this were wrong, and the corrected one is narrower and more useful.
+
+1. `core.convert.From` is **not** missing. It is declared in `Aeneas/Std/Core/Convert.lean`, and
+   `#check` confirms `core.convert.From : Type u_1 → Type u_2 → Type (max u_1 u_2)`.
+2. `core.error.Error` is **not** missing either: `Aeneas/Std/Core/Error.lean:8` declares
+   `structure core.error.Error (Self : Type _)`.
+3. Charon is **not** dropping the trait declaration. In the `.llbc` for the repro,
+   `trait_decls[4]` is `core::error::Error` (opacity `Foreign`) and `ordered_decls` contains
+   `TraitDecl {"NonRec": 4}`. Charon PR #1562 (merged, and already present in the pinned charon
+   `7b462d9`) is doing its job.
+
+What actually fails is forming the type, and it is a **universe-level mismatch**:
+
+```
+core.convert.From : Type u_1 -> Type u_2 -> Type (max u_1 u_2)
+Dyn (fun _dyn => core.error.Error _dyn) : Type (u_1 + 1)
+
+error: Application type mismatch: The argument
+  Dyn fun _dyn => core.error.Error _dyn
+has type Type (?u.5 + 1) of sort `Type (?u.5 + 2)` but is expected to have type
+  Type of sort `Type 1` in the application
+  core.convert.From (Dyn fun _dyn => core.error.Error _dyn)
+```
+
+The builtin encoding of `From` takes its `Self` at a fixed universe while a `Dyn` trait object sits
+one level above it. Once the type fails to elaborate, the body is parsed as singleton notation, and
+the failure surfaces as `failed to synthesize Singleton ?m.2 (...)`: a message naming neither the
+universe mismatch nor the type it belongs to.
+
+Suggested fixes, in order:
+
+1. Make the builtin trait structures universe-polymorphic in the same way `Dyn` is, so a trait
+   object can be the `Self` of `From` / `Into`.
+2. Regardless: print an explicit `sorry` constructor (angle brackets) rather than braces for
+   `rust_trait_impl` bodies, so an unelaborable type is reported on its own line instead of as a
+   `Singleton` synthesis failure three lines away from the cause.
