@@ -9,6 +9,7 @@ on:
   pull_request:
     paths:
       - "specs/lean4/**"
+      - "specs/lean4-rust/**"
       - "docs/unsafe-*.md"
       - "tests/ci/test_unsafe_ledger.py"
       - ".github/workflows/lean-specs.yml"
@@ -16,6 +17,7 @@ on:
     branches: [main]
     paths:
       - "specs/lean4/**"
+      - "specs/lean4-rust/**"
   workflow_dispatch:
 
 concurrency:
@@ -56,6 +58,13 @@ jobs:
 
       - name: Check the unsafe ledger matches the source
         run: python3 -m unittest -q tests.ci.test_unsafe_ledger
+
+      # The extraction package (`specs/lean4-rust`) proves things about code Aeneas produced, so its
+      # generated modules are committed. That is only sound while the generated file still belongs to
+      # the Rust beside it: this check hashes the sources each extraction is a function of and fails
+      # when they moved, which no `lake build` can see. Seconds, no charon.
+      - name: The committed extractions still match their sources
+        run: specs/lean4-rust/check-sync.sh
 
   # The PDF is not decoration: `lake exe docs` reads every ledger claim back out of the corpus and
   # fails if one names no theorem, if a registered ledger has no chapter, or if the red count differs

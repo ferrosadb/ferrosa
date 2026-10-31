@@ -1,0 +1,15 @@
+# Modules of this package that are extracted Rust rather than prose.
+#
+#   module   crate              sources        charon scope
+#
+# `sources` is what the extraction is a function of: the extraction is in sync when the hash of
+# those files matches the one recorded in `sync.lock`. Keep it as narrow as the scope really is --
+# a wider glob costs false alarms on every unrelated edit, a narrower one lets the generated file
+# go stale without the check noticing.
+#
+# `scope` is the `--start-from` pattern, so the module holds only what its chapter is about.
+#
+# Regenerate one with `./extract.sh <module>`; check them all with `./check-sync.sh`.
+
+Storage   ferrosa-storage   src/count.rs       ferrosa_storage::count::*
+Sstable   ferrosa-sstable   src/compression.rs ferrosa_sstable::compression::*

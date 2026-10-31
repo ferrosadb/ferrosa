@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Regenerate one extracted module of this package from the Rust it is about.
+#
+# The generated file is committed, because a chapter in the book cites it and a review reads the
+# Lean the toolchain actually produced. Committed generated code is only honest if something can
+# reproduce it: this script is that something, and `check-sync.sh` is what notices when it has not
+# been run. Between them, "the extraction is part of the build" stops being a claim and becomes a
+# file comparison.
+#
+# Usage: extract.sh <module>          (modules are listed in modules.txt)
+# Env:   CHARON, AENEAS               pinned tools; see SYNC.md
+set -uo pipefail
+cd "$(dirname "$0")" || exit 2
+
+# sha256 over the sorted (path, content) pairs of the sources an extraction is a function of.
+source_hash() {
+  ( cd "$1" && find $2 -type f -name '*.rs' -print0 2>/dev/null \
+      | sort -z | xargs -0 sha256sum 2>/dev/null | sha256sum | cut -d' ' -f1 )
+}
+
+pkg=$PWD
+root=$(git -C "$pkg" rev-parse --show-toplevel) || exit 2
+CHARON=${CHARON:-$HOME/src/aeneas/charon/bin/charon}
+AENEAS=${AENEAS:-$HOME/src/aeneas/src/_build/default/main.exe}
+# Charon must not share the workspace's cargo target dir: the rustc artifacts it needs are the ones
+# it built, and mixing them with a normal `cargo build` produced `E0463 can't find crate` on a
+# dependency that compiles fine on its own. The gap sweep isolates it the same way.
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/charon-target}"
+export PATH="$HOME/.local/aeneas:$PATH"
+mkdir -p "$CARGO_TARGET_DIR"
+
+module=${1:?usage: extract.sh <module>    (see modules.txt)}
+row=$(awk -v m="$module" '$1==m && $0 !~ /^#/ {print; exit}' modules.txt)
+[ -n "$row" ] || { echo "FAIL: '$module' is not in modules.txt"; exit 2; }
+read -r _ crate sources scope <<<"$row"
+crate_dir=$root/$crate
+[ -d "$crate_dir" ] || { echo "FAIL: no crate at $crate_dir"; exit 2; }
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+# Charon compiles the crate and records spans; the scope keeps the module to its own chapter.
+# `--dest-file` names the output, because a glob over the workspace root picks up whatever an earlier
+# sweep left there: the first run of this script regenerated `Storage.lean` from a stale
+# `ferrosa_alloc_count.llbc` and the diff was the only thing that said so.
+llbc=$work/extract.llbc
+( cd "$crate_dir" && "$CHARON" cargo --preset=aeneas --dest-file "$llbc" \
+    --start-from "$scope" -- --lib ) > "$work/charon.log" 2>&1
+[ -f "$llbc" ] || { echo "FAIL: charon produced no .llbc for $crate"; tail -5 "$work/charon.log"; exit 1; }
+
+"$AENEAS" -backend lean -dest "$work/out" "$llbc" > "$work/aeneas.log" 2>&1
+generated=$(ls "$work"/out/*.lean 2>/dev/null | head -1)
+[ -n "$generated" ] || { echo "FAIL: aeneas produced no .lean for $crate"; tail -5 "$work/aeneas.log"; exit 1; }
+
+cp "$generated" "$pkg/FerrosaRust/$module.lean"
+rm -f "$llbc"
+
+# Record what the file was produced from, so a later run can tell whether it is still that. The
+# toolchain belongs in the record: the same sources under a different translator are a different
+# extraction, and the diff between the two files is the only place that shows.
+hash=$(source_hash "$crate_dir" "$sources")
+tools=$(printf 'aeneas %s charon %s' \
+  "$(git -C "$HOME/src/aeneas" rev-parse --short HEAD 2>/dev/null || echo unknown)" \
+  "$(awk '!/^#/ && NF {print $1; exit}' "$HOME/src/aeneas/charon-pin" 2>/dev/null || echo unknown)")
+tmp=$work/sync.lock
+if [ -f sync.lock ]; then grep -vE "^$module[[:space:]]" sync.lock > "$tmp"; else : > "$tmp"; fi
+printf '%-10s %-16s %s  %s  %s  %s\n' "$module" "$crate" "$hash" "$sources" "$scope" "$tools" >> "$tmp"
+sort -o "$tmp" "$tmp"
+mv "$tmp" sync.lock
+
+# A committed file that does not compile is worse than a stale one, so prove it here.
+LEAN_NUM_THREADS=2 lake build 2>&1 | tail -3
+echo "regenerated FerrosaRust/$module.lean from $crate ($sources)"

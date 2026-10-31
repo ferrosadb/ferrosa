@@ -1,0 +1,2 @@
+Sstable    ferrosa-sstable  e36d67872f1f01fdddd32e68e4c936fd0a2c541f4bfe88231c3df33110564fb6  src/compression.rs  ferrosa_sstable::compression::*  aeneas a4c75c4 charon 7b462d9159db2ed3015162352183906a30bfafc6
+Storage    ferrosa-storage  58c82b90e0f6efd910109fa2f493bc9f4420aefcddc69e15b7022c6612f89814  src/count.rs  ferrosa_storage::count::*  aeneas a4c75c4 charon 7b462d9159db2ed3015162352183906a30bfafc6
