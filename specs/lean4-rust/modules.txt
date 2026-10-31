@@ -8,6 +8,16 @@
 # go stale without the check noticing.
 #
 # `scope` is the `--start-from` pattern, so the module holds only what its chapter is about.
+# `*` matches one path segment, not a subtree: `m::*` takes the module's own items and leaves every
+# `impl Type` block out, because a method is named `m::Type::method` -- two segments deeper. Give a
+# comma-separated list to include them, e.g. `m::*,m::Type::*`; each pattern is passed separately.
+#
+# The scope below is deliberately the narrow one. The full scope
+#   ferrosa_sstable::compression::*,ferrosa_sstable::compression::Compression::*
+# does bring `Compression::decompress` -- the function the ledger's decompression row is about -- but
+# aeneas then hits two internal errors (`alloc::io::error::Error::other`, `alloc::boxed::From`) and
+# the emitted module references `core.io.error.Error` without declaring it: 8 Lean errors,
+# `synthInstanceFailed` and a type mismatch. Fix the translator first, then widen this row.
 #
 # Regenerate one with `./extract.sh <module>`; check them all with `./check-sync.sh`.
 

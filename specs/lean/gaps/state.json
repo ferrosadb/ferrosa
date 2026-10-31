@@ -2183,7 +2183,19 @@
         "seconds": 7,
         "scope": "crate"
       }
+    },
+    "ferrosa-cql": {
+      "fingerprint": "efcb579493a87657",
+      "measured_at": "2026-10-31T16:28:22+00:00",
+      "measurement": {
+        "stage": "aeneas-crash",
+        "translation_errors": null,
+        "lean_errors": null,
+        "sorry": null,
+        "seconds": 463,
+        "scope": "crate"
+      }
     }
   },
-  "updated_at": "2026-10-31T15:32:16+00:00"
+  "updated_at": "2026-10-31T16:28:22+00:00"
 }

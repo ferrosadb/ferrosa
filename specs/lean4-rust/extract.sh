@@ -36,6 +36,15 @@ read -r _ crate sources scope <<<"$row"
 crate_dir=$root/$crate
 [ -d "$crate_dir" ] || { echo "FAIL: no crate at $crate_dir"; exit 2; }
 
+# `*` matches one path segment, not a subtree: `m::*` picks the module's own items and leaves every
+# `impl Type` block out, because a method's name is `m::Type::method` — two segments deep. That is
+# why the first extraction of `compression` had the `Compression` enum and none of its methods, and
+# why the claim about `decompress` had no symbol to be about. A scope is therefore a comma-separated
+# list, and each pattern is passed to charon separately.
+IFS=',' read -r -a scopes <<<"$scope"
+scope_args=()
+for s in "${scopes[@]}"; do scope_args+=(--start-from "$s"); done
+
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
@@ -45,12 +54,17 @@ trap 'rm -rf "$work"' EXIT
 # `ferrosa_alloc_count.llbc` and the diff was the only thing that said so.
 llbc=$work/extract.llbc
 ( cd "$crate_dir" && "$CHARON" cargo --preset=aeneas --dest-file "$llbc" \
-    --start-from "$scope" -- --lib ) > "$work/charon.log" 2>&1
+    "${scope_args[@]}" -- --lib ) > "$work/charon.log" 2>&1
 [ -f "$llbc" ] || { echo "FAIL: charon produced no .llbc for $crate"; tail -5 "$work/charon.log"; exit 1; }
 
 "$AENEAS" -backend lean -dest "$work/out" "$llbc" > "$work/aeneas.log" 2>&1
 generated=$(ls "$work"/out/*.lean 2>/dev/null | head -1)
 [ -n "$generated" ] || { echo "FAIL: aeneas produced no .lean for $crate"; tail -5 "$work/aeneas.log"; exit 1; }
+
+# Aeneas exits non-zero on an internal error in a *reachable* item while still writing the module, so
+# its exit status alone does not say the output is sound. The internal errors are recorded because
+# they are what makes the emitted Lean reference an external type it never declared.
+internal=$(grep -c "Internal error" "$work/aeneas.log" 2>/dev/null || echo 0)
 
 # A committed file that does not compile is worse than a stale one, so prove it here -- and put the
 # previous file back when it fails. `tail -3` on a build log reports "build failed" and the failing
@@ -82,9 +96,10 @@ tools=$(printf 'aeneas %s charon %s' \
   "$(awk '!/^#/ && NF {print $1; exit}' "$HOME/src/aeneas/charon-pin" 2>/dev/null || echo unknown)")
 tmp=$work/sync.lock
 if [ -f sync.lock ]; then grep -vE "^$module[[:space:]]" sync.lock > "$tmp"; else : > "$tmp"; fi
-printf '%-10s %-16s %s  %s  %s  %s\n' "$module" "$crate" "$hash" "$sources" "$scope" "$tools" >> "$tmp"
+printf '%-10s %-16s %s  %s  %s  %s  ok\n' "$module" "$crate" "$hash" "$sources" "$scope" "$tools" >> "$tmp"
 sort -o "$tmp" "$tmp"
 mv "$tmp" sync.lock
+[ "${internal:-0}" -gt 0 ] && echo "note: aeneas reported $internal internal error(s); the module elaborated anyway, but see SYNC.md"
 
 # A committed file that does not compile is worse than a stale one, so prove it here.
 LEAN_NUM_THREADS=2 lake build 2>&1 | tail -3
