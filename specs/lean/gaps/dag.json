@@ -1,0 +1,189 @@
+{
+  "order": [
+    "ferrosa-alloc-count",
+    "ferrosa-jsonb",
+    "ferrosa-common",
+    "ferrosa-sstable",
+    "ferrosa-cdc",
+    "ferrosa-index",
+    "ferrosa-net",
+    "ferrosa-schema",
+    "ferrosa-row-bridge",
+    "ferrosa-sched",
+    "ferrosa-storage",
+    "ferrosa-cluster",
+    "ferrosa-udf",
+    "ferrosa-session",
+    "ferrosa-cql",
+    "ferrosa-ctl",
+    "ferrosa-flight",
+    "ferrosa-graph",
+    "ferrosa-index-builder",
+    "ferrosa-sim",
+    "ferrosa-jepsen",
+    "ferrosa-loadgen",
+    "ferrosa-sql",
+    "ferrosa-postgres",
+    "ferrosa-sparql",
+    "ferrosa-view",
+    "red-ledger"
+  ],
+  "edges": {
+    "ferrosa-alloc-count": [],
+    "ferrosa-jsonb": [],
+    "ferrosa-common": [
+      "ferrosa-jsonb"
+    ],
+    "ferrosa-sstable": [
+      "ferrosa-common"
+    ],
+    "ferrosa-cdc": [
+      "ferrosa-common",
+      "ferrosa-sstable"
+    ],
+    "ferrosa-index": [
+      "ferrosa-common"
+    ],
+    "ferrosa-net": [
+      "ferrosa-common"
+    ],
+    "ferrosa-schema": [
+      "ferrosa-common",
+      "ferrosa-index",
+      "ferrosa-sstable"
+    ],
+    "ferrosa-row-bridge": [
+      "ferrosa-common",
+      "ferrosa-jsonb",
+      "ferrosa-schema",
+      "ferrosa-sstable"
+    ],
+    "ferrosa-sched": [],
+    "ferrosa-storage": [
+      "ferrosa-cdc",
+      "ferrosa-common",
+      "ferrosa-index",
+      "ferrosa-jsonb",
+      "ferrosa-row-bridge",
+      "ferrosa-sched",
+      "ferrosa-schema",
+      "ferrosa-sstable"
+    ],
+    "ferrosa-cluster": [
+      "ferrosa-cdc",
+      "ferrosa-common",
+      "ferrosa-index",
+      "ferrosa-net",
+      "ferrosa-schema",
+      "ferrosa-sstable",
+      "ferrosa-storage"
+    ],
+    "ferrosa-udf": [
+      "ferrosa-common"
+    ],
+    "ferrosa-session": [
+      "ferrosa-cluster",
+      "ferrosa-common",
+      "ferrosa-net",
+      "ferrosa-schema",
+      "ferrosa-storage",
+      "ferrosa-udf"
+    ],
+    "ferrosa-cql": [
+      "ferrosa-cdc",
+      "ferrosa-cluster",
+      "ferrosa-common",
+      "ferrosa-index",
+      "ferrosa-jsonb",
+      "ferrosa-net",
+      "ferrosa-row-bridge",
+      "ferrosa-sched",
+      "ferrosa-schema",
+      "ferrosa-session",
+      "ferrosa-sstable",
+      "ferrosa-storage",
+      "ferrosa-udf"
+    ],
+    "ferrosa-ctl": [
+      "ferrosa-cluster",
+      "ferrosa-common",
+      "ferrosa-cql",
+      "ferrosa-schema",
+      "ferrosa-session",
+      "ferrosa-sstable",
+      "ferrosa-storage",
+      "ferrosa-udf"
+    ],
+    "ferrosa-flight": [
+      "ferrosa-cluster",
+      "ferrosa-common",
+      "ferrosa-cql",
+      "ferrosa-net",
+      "ferrosa-schema"
+    ],
+    "ferrosa-graph": [
+      "ferrosa-alloc-count",
+      "ferrosa-cluster",
+      "ferrosa-common",
+      "ferrosa-index",
+      "ferrosa-net",
+      "ferrosa-schema",
+      "ferrosa-sstable",
+      "ferrosa-storage"
+    ],
+    "ferrosa-index-builder": [
+      "ferrosa-common",
+      "ferrosa-index",
+      "ferrosa-sstable",
+      "ferrosa-storage"
+    ],
+    "ferrosa-sim": [
+      "ferrosa-common"
+    ],
+    "ferrosa-jepsen": [
+      "ferrosa-sim"
+    ],
+    "ferrosa-loadgen": [
+      "ferrosa-common",
+      "ferrosa-cql",
+      "ferrosa-schema",
+      "ferrosa-sstable",
+      "ferrosa-storage"
+    ],
+    "ferrosa-sql": [
+      "ferrosa-common",
+      "ferrosa-jsonb",
+      "ferrosa-storage"
+    ],
+    "ferrosa-postgres": [
+      "ferrosa-cluster",
+      "ferrosa-common",
+      "ferrosa-jsonb",
+      "ferrosa-net",
+      "ferrosa-row-bridge",
+      "ferrosa-sched",
+      "ferrosa-schema",
+      "ferrosa-sql",
+      "ferrosa-sstable",
+      "ferrosa-storage"
+    ],
+    "ferrosa-sparql": [
+      "ferrosa-cluster",
+      "ferrosa-common",
+      "ferrosa-index",
+      "ferrosa-net",
+      "ferrosa-schema",
+      "ferrosa-sstable",
+      "ferrosa-storage"
+    ],
+    "ferrosa-view": [
+      "ferrosa-schema"
+    ],
+    "red-ledger": []
+  },
+  "toolchain": {
+    "charon": "7b462d9159db2ed3015162352183906a30bfafc6",
+    "aeneas": "ef8b0be",
+    "lean": "Lean (version 4.35.0, x86_64-unknown-linux-gnu, commit eb6cafb7290e8bd5f2937522d8d804f58f02bafc, Release)"
+  }
+}
