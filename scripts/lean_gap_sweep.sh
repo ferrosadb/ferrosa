@@ -3,11 +3,20 @@
 #
 # One JSON per crate in specs/lean/gaps/ plus a roll-up line in $OUT. Each run is bounded so a
 # crate that OOMs in charon or hangs in elaboration cannot stall the sweep.
+#
+# Crates are swept one at a time, and lean_gap_report.py holds a machine-wide flock while it
+# extracts, so a sweep sharing this host with another session's run waits its turn instead of
+# putting two charon/aeneas pairs in memory at once.
 set -uo pipefail
 cd "$(dirname "$0")" >/dev/null 2>&1 || true
 REPO=${REPO:-$HOME/src/ferrosa-suite/ferrosa}
 OUT=${OUT:-/tmp/gapsweep.tsv}
 PER_CRATE_TIMEOUT=${PER_CRATE_TIMEOUT:-900}
+# lean_gap_report.py serializes extractions machine-wide. Its lock wait must expire BEFORE the
+# `timeout` below, or a queued crate is killed mid-wait (rc 124) and blamed as `timeout` -- a
+# measure of nothing. Give up just inside the wrapper so it reports `locked` instead.
+LEAN_GAP_LOCK_TIMEOUT=${LEAN_GAP_LOCK_TIMEOUT:-$(( PER_CRATE_TIMEOUT > 10 ? PER_CRATE_TIMEOUT - 5 : PER_CRATE_TIMEOUT ))}
+export LEAN_GAP_LOCK_TIMEOUT
 
 cd "$REPO" || exit 2
 if [ "${RESUME:-0}" = "1" ] && [ -s "$OUT" ]; then
@@ -43,6 +52,8 @@ for c in $crates; do
   secs=$(( $(date +%s) - start ))
   if [ $rc -eq 124 ]; then
     stage=timeout; te=-; le=-; so=-
+  elif grep -q "gave up waiting for the extraction lock" "$log"; then
+    stage=locked; te=-; le=-; so=-
   elif [ -f "specs/lean/gaps/$c.json" ]; then
     read -r stage te le so <<<"$(python3 - "$c" <<'PY'
 import json, sys

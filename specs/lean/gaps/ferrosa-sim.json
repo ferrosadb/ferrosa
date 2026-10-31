@@ -1,0 +1,448 @@
+{
+  "stage": "aeneas",
+  "llbc": "/home/bkearns/src/ferrosa-suite/ferrosa/ferrosa_sim.llbc",
+  "lean": "/home/bkearns/.hermes/cache/scratch/leangap-ferrosa-sim-ej3_qjw_/FerrosaSim.lean",
+  "translation_errors": 0,
+  "translation_unique_reported": null,
+  "translation_messages": [],
+  "aeneas_exit": 1,
+  "lean_errors": 85,
+  "errors": [
+    {
+      "location": "FerrosaSim.lean:2009:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaSim.lean:2030:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserializer`"
+    },
+    {
+      "location": "FerrosaSim.lean:2041:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaSim.lean:2056:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserializer`"
+    },
+    {
+      "location": "FerrosaSim.lean:2064:40",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaSim.lean:2078:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaSim.lean:2078:51",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserializer`"
+    },
+    {
+      "location": "FerrosaSim.lean:2089:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaSim.lean:2089:33",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaSim.lean:2164:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Visitor`"
+    },
+    {
+      "location": "FerrosaSim.lean:2176:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Visitor`"
+    },
+    {
+      "location": "FerrosaSim.lean:2188:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Visitor`"
+    },
+    {
+      "location": "FerrosaSim.lean:2200:25",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Visitor`"
+    },
+    {
+      "location": "FerrosaSim.lean:2201:19",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.SeqAccess`"
+    },
+    {
+      "location": "FerrosaSim.lean:2212:25",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Visitor`"
+    },
+    {
+      "location": "FerrosaSim.lean:2213:19",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.MapAccess`"
+    },
+    {
+      "location": "FerrosaSim.lean:2224:52",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Visitor`"
+    },
+    {
+      "location": "FerrosaSim.lean:2225:35",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.EnumAccess`"
+    },
+    {
+      "location": "FerrosaSim.lean:2237:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.SeqAccess`"
+    },
+    {
+      "location": "FerrosaSim.lean:2238:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaSim.lean:2249:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.MapAccess`"
+    },
+    {
+      "location": "FerrosaSim.lean:2250:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaSim.lean:2261:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.MapAccess`"
+    },
+    {
+      "location": "FerrosaSim.lean:2262:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaSim.lean:2273:28",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.EnumAccess`"
+    },
+    {
+      "location": "FerrosaSim.lean:2274:38",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaSim.lean:2507:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serializer`"
+    },
+    {
+      "location": "FerrosaSim.lean:2518:39",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSim.lean:2543:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSim.lean:2543:48",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serializer`"
+    },
+    {
+      "location": "FerrosaSim.lean:2557:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSim.lean:2557:32",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSim.lean:3112:7",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_sim.alloc.collections.btree.map.Values.Insts.CoreIterTraitsIteratorIteratorSharedAV`"
+    },
+    {
+      "location": "FerrosaSim.lean:3144:7",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_sim.alloc.collections.btree.map.Keys.Insts.CoreIterTraitsIteratorIteratorSharedAK`"
+    },
+    {
+      "location": "FerrosaSim.lean:3146:7",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_sim.alloc.collections.btree.map.Keys.Insts.CoreIterTraitsIteratorIteratorSharedAK`"
+    },
+    {
+      "location": "FerrosaSim.lean:3149:5",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_sim.core.iter.adapters.copied.Copied.Insts.CoreIterTraitsIteratorIterator`"
+    },
+    {
+      "location": "FerrosaSim.lean:3187:23",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `SimulatedCluster`: The environment does not contain `ferrosa_sim.cluster.SimulatedCluster.SimulatedCluster`, so it is not possible to project the field `SimulatedCluster` from an expression"
+    },
+    {
+      "location": "FerrosaSim.lean:3191:14",
+      "kind": "lean.invalidField",
+      "message": "Invalid field notation: Type of"
+    },
+    {
+      "location": "FerrosaSim.lean:3191:14",
+      "kind": "lean.invalidField",
+      "message": "Invalid field notation: Type of"
+    },
+    {
+      "location": "FerrosaSim.lean:3229:20",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `SimulatedCluster`: The environment does not contain `ferrosa_sim.cluster.SimulatedCluster.SimulatedCluster`, so it is not possible to project the field `SimulatedCluster` from an expression"
+    },
+    {
+      "location": "FerrosaSim.lean:3236:20",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `SimulatedCluster`: The environment does not contain `ferrosa_sim.cluster.SimulatedCluster.SimulatedCluster`, so it is not possible to project the field `SimulatedCluster` from an expression"
+    },
+    {
+      "location": "FerrosaSim.lean:3252:22",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `SimulatedCluster`: The environment does not contain `ferrosa_sim.cluster.SimulatedCluster.SimulatedCluster`, so it is not possible to project the field `SimulatedCluster` from an expression"
+    },
+    {
+      "location": "FerrosaSim.lean:3265:22",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `SimulatedCluster`: The environment does not contain `ferrosa_sim.cluster.SimulatedCluster.SimulatedCluster`, so it is not possible to project the field `SimulatedCluster` from an expression"
+    },
+    {
+      "location": "FerrosaSim.lean:3267:22",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `SimulatedCluster`: The environment does not contain `ferrosa_sim.cluster.SimulatedCluster.SimulatedCluster`, so it is not possible to project the field `SimulatedCluster` from an expression"
+    },
+    {
+      "location": "FerrosaSim.lean:3570:7",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_sim.alloc.collections.btree.map.Keys.Insts.CoreIterTraitsIteratorIteratorSharedAK`"
+    },
+    {
+      "location": "FerrosaSim.lean:3572:7",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_sim.alloc.collections.btree.map.Keys.Insts.CoreIterTraitsIteratorIteratorSharedAK`"
+    },
+    {
+      "location": "FerrosaSim.lean:3576:7",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_sim.core.iter.adapters.copied.Copied.Insts.CoreIterTraitsIteratorIterator`"
+    },
+    {
+      "location": "FerrosaSim.lean:3582:5",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_sim.core.iter.adapters.filter.Filter.Insts.CoreIterTraitsIteratorIterator`"
+    },
+    {
+      "location": "FerrosaSim.lean:4636:12",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `SimulatedCluster`: The environment does not contain `ferrosa_sim.cluster.SimulatedCluster.SimulatedCluster`, so it is not possible to project the field `SimulatedCluster` from an expression"
+    },
+    {
+      "location": "FerrosaSim.lean:4639:12",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `SimulatedCluster`: The environment does not contain `ferrosa_sim.cluster.SimulatedCluster.SimulatedCluster`, so it is not possible to project the field `SimulatedCluster` from an expression"
+    },
+    {
+      "location": "FerrosaSim.lean:5005:30",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `SeededRng`: The environment does not contain `ferrosa_sim.rng.SeededRng.SeededRng`, so it is not possible to project the field `SeededRng` from an expression"
+    },
+    {
+      "location": "FerrosaSim.lean:5008:56",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `SeededRng`: The environment does not contain `ferrosa_sim.rng.SeededRng.SeededRng`, so it is not possible to project the field `SeededRng` from an expression"
+    },
+    {
+      "location": "FerrosaSim.lean:5020:25",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `SeededRng`: The environment does not contain `ferrosa_sim.rng.SeededRng.SeededRng`, so it is not possible to project the field `SeededRng` from an expression"
+    },
+    {
+      "location": "FerrosaSim.lean:5058:30",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `SeededRng`: The environment does not contain `ferrosa_sim.rng.SeededRng.SeededRng`, so it is not possible to project the field `SeededRng` from an expression"
+    },
+    {
+      "location": "FerrosaSim.lean:5338:44",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `Role`: The environment does not contain `ferrosa_sim.node.SimulatedNode.Role`, so it is not possible to project the field `Role` from an expression"
+    },
+    {
+      "location": "FerrosaSim.lean:5424:7",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_sim.alloc.collections.btree.map.Keys.Insts.CoreIterTraitsIteratorIteratorSharedAK`"
+    },
+    {
+      "location": "FerrosaSim.lean:5426:7",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_sim.alloc.collections.btree.map.Keys.Insts.CoreIterTraitsIteratorIteratorSharedAK`"
+    },
+    {
+      "location": "FerrosaSim.lean:5430:7",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_sim.core.iter.adapters.copied.Copied.Insts.CoreIterTraitsIteratorIterator`"
+    },
+    {
+      "location": "FerrosaSim.lean:5493:9",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_sim.alloc.collections.btree.set.Difference.Insts.CoreIterTraitsIteratorIteratorSharedAT`"
+    },
+    {
+      "location": "FerrosaSim.lean:5496:9",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_sim.alloc.collections.btree.set.Difference.Insts.CoreIterTraitsIteratorIteratorSharedAT`"
+    },
+    {
+      "location": "FerrosaSim.lean:5500:9",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_sim.core.iter.adapters.copied.Copied.Insts.CoreIterTraitsIteratorIterator`"
+    },
+    {
+      "location": "FerrosaSim.lean:5624:9",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_sim.alloc.collections.btree.set.Intersection.Insts.CoreIterTraitsIteratorIteratorSharedAT`"
+    },
+    {
+      "location": "FerrosaSim.lean:5632:9",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_sim.alloc.collections.btree.set.Intersection.Insts.CoreIterTraitsIteratorIteratorSharedAT`"
+    },
+    {
+      "location": "FerrosaSim.lean:5605:9",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_sim.alloc.collections.btree.set.Iter.Insts.CoreIterTraitsIteratorIteratorSharedAT`"
+    },
+    {
+      "location": "FerrosaSim.lean:5611:9",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_sim.alloc.collections.btree.set.Iter.Insts.CoreIterTraitsIteratorIteratorSharedAT`"
+    },
+    {
+      "location": "FerrosaSim.lean:5943:7",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `Aeneas.Std.core.iter.adapters.map.Map.Insts.CoreIterTraitsIteratorIterator`"
+    },
+    {
+      "location": "FerrosaSim.lean:5969:5",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_sim.alloc.collections.btree.map.Values.Insts.CoreIterTraitsIteratorIteratorSharedAV`"
+    },
+    {
+      "location": "FerrosaSim.lean:6279:7",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `Aeneas.Std.core.iter.adapters.map.Map.Insts.CoreIterTraitsIteratorIterator`"
+    },
+    {
+      "location": "FerrosaSim.lean:6290:7",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `Aeneas.Std.core.iter.adapters.map.Map.Insts.CoreIterTraitsIteratorIterator`"
+    },
+    {
+      "location": "FerrosaSim.lean:7021:7",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_sim.core.iter.adapters.chain.Chain.Insts.CoreIterTraitsIteratorIterator`"
+    },
+    {
+      "location": "FerrosaSim.lean:7224:12",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `SimulatedCluster`: The environment does not contain `ferrosa_sim.cluster.SimulatedCluster.SimulatedCluster`, so it is not possible to project the field `SimulatedCluster` from an expression"
+    },
+    {
+      "location": "FerrosaSim.lean:7224:38",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `SimulatedCluster`: The environment does not contain `ferrosa_sim.cluster.SimulatedCluster.SimulatedCluster`, so it is not possible to project the field `SimulatedCluster` from an expression"
+    },
+    {
+      "location": "FerrosaSim.lean:7230:27",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `SimulatedCluster`: The environment does not contain `ferrosa_sim.cluster.SimulatedCluster.SimulatedCluster`, so it is not possible to project the field `SimulatedCluster` from an expression"
+    },
+    {
+      "location": "FerrosaSim.lean:7240:17",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `SimulatedCluster`: The environment does not contain `ferrosa_sim.cluster.SimulatedCluster.SimulatedCluster`, so it is not possible to project the field `SimulatedCluster` from an expression"
+    },
+    {
+      "location": "FerrosaSim.lean:7256:12",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `SimulatedCluster`: The environment does not contain `ferrosa_sim.cluster.SimulatedCluster.SimulatedCluster`, so it is not possible to project the field `SimulatedCluster` from an expression"
+    },
+    {
+      "location": "FerrosaSim.lean:7256:38",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `SimulatedCluster`: The environment does not contain `ferrosa_sim.cluster.SimulatedCluster.SimulatedCluster`, so it is not possible to project the field `SimulatedCluster` from an expression"
+    },
+    {
+      "location": "FerrosaSim.lean:7277:17",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `SimulatedCluster`: The environment does not contain `ferrosa_sim.cluster.SimulatedCluster.SimulatedCluster`, so it is not possible to project the field `SimulatedCluster` from an expression"
+    },
+    {
+      "location": "FerrosaSim.lean:7290:44",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `SimulatedCluster`: The environment does not contain `ferrosa_sim.cluster.SimulatedCluster.SimulatedCluster`, so it is not possible to project the field `SimulatedCluster` from an expression"
+    },
+    {
+      "location": "FerrosaSim.lean:7309:12",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `SimulatedCluster`: The environment does not contain `ferrosa_sim.cluster.SimulatedCluster.SimulatedCluster`, so it is not possible to project the field `SimulatedCluster` from an expression"
+    },
+    {
+      "location": "FerrosaSim.lean:7309:38",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `SimulatedCluster`: The environment does not contain `ferrosa_sim.cluster.SimulatedCluster.SimulatedCluster`, so it is not possible to project the field `SimulatedCluster` from an expression"
+    },
+    {
+      "location": "FerrosaSim.lean:7315:27",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `SimulatedCluster`: The environment does not contain `ferrosa_sim.cluster.SimulatedCluster.SimulatedCluster`, so it is not possible to project the field `SimulatedCluster` from an expression"
+    },
+    {
+      "location": "FerrosaSim.lean:7325:17",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `SimulatedCluster`: The environment does not contain `ferrosa_sim.cluster.SimulatedCluster.SimulatedCluster`, so it is not possible to project the field `SimulatedCluster` from an expression"
+    },
+    {
+      "location": "FerrosaSim.lean:7341:12",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `SimulatedCluster`: The environment does not contain `ferrosa_sim.cluster.SimulatedCluster.SimulatedCluster`, so it is not possible to project the field `SimulatedCluster` from an expression"
+    },
+    {
+      "location": "FerrosaSim.lean:7341:38",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `SimulatedCluster`: The environment does not contain `ferrosa_sim.cluster.SimulatedCluster.SimulatedCluster`, so it is not possible to project the field `SimulatedCluster` from an expression"
+    },
+    {
+      "location": "FerrosaSim.lean:7362:17",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `SimulatedCluster`: The environment does not contain `ferrosa_sim.cluster.SimulatedCluster.SimulatedCluster`, so it is not possible to project the field `SimulatedCluster` from an expression"
+    }
+  ],
+  "sorry_declarations": 149,
+  "compiled": false,
+  "crate": "ferrosa-sim",
+  "prefix": "ferrosa_sim::*",
+  "generated_at": "2026-10-31T19:33:34+00:00",
+  "memory_max": "18G",
+  "toolchain": {
+    "charon": "/home/bkearns/src/aeneas/charon/bin/charon",
+    "aeneas": "/home/bkearns/src/aeneas/src/_build/default/main.exe",
+    "lean_pkg": "/home/bkearns/.local/aeneas/backends/lean"
+  }
+}

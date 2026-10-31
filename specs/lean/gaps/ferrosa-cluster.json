@@ -5,7 +5,7 @@
   "error": "aeneas killed at the 18G memory ceiling",
   "crate": "ferrosa-cluster",
   "prefix": "ferrosa_cluster::*",
-  "generated_at": "2026-10-31T14:52:08+00:00",
+  "generated_at": "2026-10-31T18:45:01+00:00",
   "toolchain": {
     "charon": "/home/bkearns/src/aeneas/charon/bin/charon",
     "aeneas": "/home/bkearns/src/aeneas/src/_build/default/main.exe",

@@ -1,0 +1,138 @@
+# Eliminating the Lean elaboration reds
+
+Status: in progress. Measured 2026-10-31 with aeneas `9b1eec9` (branch
+`fix/unsupported-sig-is-not-fatal`, merged as ferrosadb/aeneas#1 at
+`90110883`), charon `7b462d9159db2ed3015162352183906a30bfafc6`.
+
+Source of the numbers: `ferrosa/specs/lean/gaps/*.json`, produced by
+`scripts/lean_gap_inventory.py` (charon -> aeneas -> `lake env lean`). 1057 reds.
+
+## What the reds actually are
+
+Grouped by mechanism, not by Lean error kind:
+
+| count | share | mechanism | owner |
+|---|---|---|---|
+| 414 | 39% | foreign trait declared inside a `mutual` block whose members have different parameter lists | aeneas printer (design) |
+| 251 | 24% | reference to `<Type>.Insts.<Trait>…` with no matching declaration (242 crate-local, 195 of them `ferrosa-net`) | aeneas naming |
+| 242 | 23% | `synthInstanceFailed`, mostly echoes of the two above | downstream |
+| 89 | 8% | `noncomputable` missing on definitions that use `*.ctorElim` (all `ferrosa-net`) | aeneas header |
+| 40 | 4% | crate-local structure field missing | aeneas / model |
+| 13 | 1% | `Aeneas.Std` field missing (`write_u8`, `write_usize`, `Limits`, `record_fault`) | Lean std library |
+| 8 | 1% | crate-local name missing | aeneas |
+
+The serde case is the clearest instance of the first row. Lean rejects the group
+outright:
+
+```
+error: Invalid mutually inductive types: `B` has 3 parameter(s), but the previous ...
+Note: All inductive types declared in the same `mutual` block must have the same parameters
+```
+
+and a serde group has members with 1, 10 and 3 parameters, so the block never
+elaborates and every later reference to any member reports `Unknown identifier`.
+One fault, hundreds of reds.
+
+## Step 1 — `noncomputable` (89 reds)
+
+Root cause: the machinery exists and is unreachable. `Translate.ml:1544` emits
+
+```ocaml
+if fi.noncomputable then Printf.fprintf out "... noncomputable section\n";
+```
+
+but `fi.noncomputable` is hardcoded `false` at every construction site
+(`Translate.ml:2096`, `:2136`, and the function-file config), and
+`Config.all_computable` — the flag whose help text promises exactly this
+section — is never read.
+
+Fix: `noncomputable = not !Config.all_computable` at the construction sites, so
+the CLI flag controls it as documented. `noncomputable` affects only code
+generation, not proofs, and aeneas output is a model, so the default (emit the
+section) is the honest one.
+
+Acceptance: `ferrosa-net` drops from 93/87/17/5 reds to their remainder; the
+generated header contains `noncomputable section` unless `-all-computable`.
+
+## Step 2 — instance naming (251 reds, plus echoes)
+
+Two conventions for the same instance name: the reference uses Charon's raw
+item name (`ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`), the
+declaration uses `ExtractBase.ctx_compute_trait_impl_name_raw`
+(`<self type><Trait><Args>`). One name function, used by both sides, is the fix;
+then re-measure. `ferrosa-net` carries 195 of the 251 and is the cheapest
+target.
+
+Acceptance: for every generated file, every referenced `.Insts.` name has a
+matching declaration. Checkable by parsing the emitted file, no Lean needed.
+
+## Step 3 — the trait model (414 reds)
+
+Decision: a trait is a **record of methods parameterised by its associated
+types**, not an inductive family. `mutual` stays for RecGroups of data types and
+is removed for trait groups.
+
+Recursion between traits is interface recursion — `Serialize::serialize` takes
+a `Serializer`, whose parent clauses name `SerializeSeq`, whose
+`serialize_element` is generic over `Serialize`. Lean requires uniform
+parameters for a mutual block precisely because it models one indexed family, so
+the construct cannot accept a family whose parameters are by definition
+non-uniform. Two candidate resolutions:
+
+1. **Parameterise the sibling reference** (correct model): turn the forward
+   reference inside the cycle into a parameter supplied at each use site, so the
+   declarations become acyclic. Cost: every instantiation and impl gains an
+   argument.
+2. **Opaque cut** (triage): declare the cut member `def … := sorry`, keep the
+   rest real, count the hole. Cost: every impl of the cut trait becomes `…
+   := sorry` — the holes scale with impl count, not method count.
+
+Do 1 where it is affordable, 2 elsewhere, and record which was used per group in
+the generated file.
+
+Acceptance: no `mutual` block contains members with differing parameter counts
+(parseable check), and the serde crate drops its 343 reds.
+
+## Step 4 — field and instance models (53 reds)
+
+Crate-local fields (40) are emission bugs; `Aeneas.Std` fields (13) are library
+gaps of the same shape as the deferred `t_6b9baa8a` (`core::str::pattern`).
+
+## Blocking hole: the other backends
+
+`Translate.ml` emits boundary stubs as Lean text (`def X … : Type := sorry`)
+for **every** backend. A Coq run of `jsonb.llbc` produced a 20724-line file
+containing 31 Lean-syntax lines — Coq cannot parse them.
+
+Gating the printing is not a small change: the same block is what registers the
+trait and instance names in the extraction context, and the rest of the
+extraction resolves them through it. Measured, deterministically:
+
+```
+unmodified binary   : 20724 lines      (twice)
+trait block gated   :    41 lines
+impl block gated    :    11 lines
+both gated          :    11 lines
+```
+
+So the fix is to separate *registration* from *printing* — register
+unconditionally, print per backend — not to guard the block. Until that is
+done, any trait work risks silently emptying the Coq, F* and HOL4 output while
+`dune build` stays green.
+
+## Verification recipe
+
+```bash
+# one crate
+python3 scripts/lean_gap_inventory.py --only ferrosa-net        # ferrosa repo
+# one llbc, no toolchain
+~/src/aeneas/src/_build/default/main.exe -backend lean -dest /tmp/x ./foo.llbc
+# cross-backend regression (must not be empty, must not contain `def `)
+~/src/aeneas/src/_build/default/main.exe -backend coq  -dest /tmp/y ./foo.llbc
+```
+
+CI: `ferrosadb/aeneas` now runs workflows (run 41248564230). `lean`,
+`diff_lean_files`, `charon-pin-*`, `userdocs`, `select-runner` pass; `nix` fails
+on `aeneas-check-tidiness` from formatting drift in files untouched by this
+work (`dune build @fmt` reports `Config.ml`, `interp/InterpExpressions.mli`,
+`llbc/TypesAnalysis.ml` and six more). Pinned formatter is 0.27.0.

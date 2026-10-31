@@ -124,6 +124,31 @@ jobs:
       - name: Guard tests
         run: python3 -m unittest -q tests/ci/test_guard_no_python_data_writes.py
 
+  # Charon and Aeneas' Lean backend are what exhaust this host: charon reached
+  # 21.5 GB and 24.4 GB resident on ferrosa-common, and on 2026-10-30 three
+  # concurrent `aeneas main.exe -backend lean` runs took a 30 GB machine to a
+  # global OOM that killed an unrelated CI rustc. Two ceilings now stand in the
+  # way. lean_gap_report.py holds a machine-wide flock across extract+elaborate,
+  # so only one crate is extracted at a time; and it runs every child inside a
+  # user cgroup scope with MemoryMax (60% of RAM by default), so one extraction
+  # cannot do it alone either -- the scan that took the box down was started by a
+  # systemd user unit with no limits of its own, which is why the ceiling lives in
+  # the script and not in a launcher.
+  # Cheap to check: no cargo, no toolchain, just processes, cgroups and a lock
+  # file. The cgroup cases skip where there is no user manager, as in this runner.
+  lean-gap-extraction-limits:
+    name: Lean gap extraction is serialized and capped
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Extraction lock, memory ceiling and exclusion tests
+        run: >-
+          python3 -m unittest -q
+          tests/ci/test_lean_gap_single_extraction.py
+          tests/ci/test_lean_gap_memory_cap.py
+          tests/ci/test_lean_gap_exclusions.py
+          tests/ci/test_lean_gap_inventory_state.py
+
   # Every `--all-features --workspace` lane must exclude the tests behind
   # `live-infra-tests`: they are absent from the default target and panic by
   # policy without FERROSA_TEST_CLUSTER_NODES / _CONTAINERS / _FIRECRACKER, so a

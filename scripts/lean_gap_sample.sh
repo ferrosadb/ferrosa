@@ -10,6 +10,10 @@ set -uo pipefail
 REPO=${REPO:-$HOME/src/ferrosa-suite/ferrosa}
 OUT=${OUT:-/tmp/gapsweep-sample.tsv}
 PER_MODULE_TIMEOUT=${PER_MODULE_TIMEOUT:-110}
+# Same lock budget as lean_gap_sweep.sh, for the same reason: the lock wait expires inside the
+# `timeout` wrapper, so a queued module reports `locked` instead of a phantom `timeout`.
+LEAN_GAP_LOCK_TIMEOUT=${LEAN_GAP_LOCK_TIMEOUT:-$(( PER_MODULE_TIMEOUT > 10 ? PER_MODULE_TIMEOUT - 5 : PER_MODULE_TIMEOUT ))}
+export LEAN_GAP_LOCK_TIMEOUT
 
 cd "$REPO" || exit 2
 [ -s "$OUT" ] || printf 'crate\tmodule\tstage\ttranslation_errors\tlean_errors\tsorry\tseconds\n' > "$OUT"
@@ -55,6 +59,8 @@ PY
   secs=$(( $(date +%s) - start ))
   if [ $rc -eq 124 ]; then
     printf '%s\t%s\ttimeout\t-\t-\t-\t%s\n' "$c" "$mod" "$secs" >> "$OUT"
+  elif grep -q "gave up waiting for the extraction lock" "/tmp/gapsample-$c.log"; then
+    printf '%s\t%s\tlocked\t-\t-\t-\t%s\n' "$c" "$mod" "$secs" >> "$OUT"
   else
     row=$(python3 - "$c" <<'PY'
 import json, sys

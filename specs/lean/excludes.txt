@@ -1,0 +1,15 @@
+# Generated items excluded from Lean extraction.
+#
+# Format: <cargo package> <charon name pattern>   (whitespace separated, `#` starts a comment)
+#
+# These are files a build script writes and the crate `include!`s: schema output, not product
+# code. Translating them is what took `ferrosa-net` past 22 GiB -- aeneas emitted 13,295
+# "Internal error: please file an issue" records in five minutes on that crate, 11,147 of them from
+# the capnproto bindings below. Excluding them keeps the measurement about Ferrosa's own code.
+#
+# A pattern is a charon name path: `crate::module::item` selects the item and its subitems, and a
+# trailing `::_` selects the subitems only. Adding a line here narrows what a crate's row means, so
+# say why in the comment above it.
+
+# ferrosa-net: capnproto envelope bindings (capnp build output, 31k lines, include!'d by protocol)
+ferrosa-net ferrosa_net::protocol::envelope_capnp

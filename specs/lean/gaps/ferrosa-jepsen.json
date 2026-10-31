@@ -1,0 +1,473 @@
+{
+  "stage": "aeneas",
+  "llbc": "/home/bkearns/src/ferrosa-suite/ferrosa/ferrosa_jepsen.llbc",
+  "lean": "/home/bkearns/.hermes/cache/scratch/leangap-ferrosa-jepsen-tme_c3ck/FerrosaJepsen.lean",
+  "translation_errors": 0,
+  "translation_unique_reported": null,
+  "translation_messages": [],
+  "aeneas_exit": 1,
+  "lean_errors": 90,
+  "errors": [
+    {
+      "location": "FerrosaJepsen.lean:340:18",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_jepsen.core.array.iter.IntoIter.Insts.CoreIterTraitsIteratorIterator`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7119:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7140:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserializer`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7151:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7166:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserializer`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7174:41",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7188:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserializer`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7196:40",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7210:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserializer`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7218:40",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7232:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserializer`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7240:40",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7254:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserializer`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7262:42",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7277:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserializer`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7285:40",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7299:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserializer`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7309:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7324:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7324:51",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserializer`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7335:21",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7335:52",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7352:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7353:40",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserializer`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7365:34",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7366:53",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7382:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7382:51",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserializer`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7393:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7393:33",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7409:21",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7410:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7410:52",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserializer`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7420:21",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7421:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7421:34",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7437:21",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7438:38",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7439:22",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserializer`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7450:47",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7452:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7452:33",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7469:46",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7471:22",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7473:46",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserializer`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7486:21",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7488:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7490:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7507:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserializer`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7517:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7591:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Visitor`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7603:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Visitor`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7615:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Visitor`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7627:25",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Visitor`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7628:19",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.SeqAccess`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7639:25",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Visitor`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7640:19",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.MapAccess`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7651:52",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Visitor`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7652:35",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.EnumAccess`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7664:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.SeqAccess`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7665:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7676:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.MapAccess`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7677:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7688:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.MapAccess`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7689:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7700:28",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.EnumAccess`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7701:38",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7712:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.VariantAccess`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7713:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7946:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serializer`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7957:40",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7982:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serializer`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:7993:39",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:8018:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serializer`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:8029:41",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:8055:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serializer`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:8066:39",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:8091:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serializer`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:8102:39",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:8127:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serializer`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:8138:39",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:8163:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serializer`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:8175:55",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:8201:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:8201:48",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serializer`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:8215:4",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:8215:34",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:8242:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:8242:48",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serializer`"
+    },
+    {
+      "location": "FerrosaJepsen.lean:8257:29",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    }
+  ],
+  "sorry_declarations": 450,
+  "compiled": false,
+  "crate": "ferrosa-jepsen",
+  "prefix": "ferrosa_jepsen::*",
+  "generated_at": "2026-10-31T19:33:49+00:00",
+  "memory_max": "18G",
+  "toolchain": {
+    "charon": "/home/bkearns/src/aeneas/charon/bin/charon",
+    "aeneas": "/home/bkearns/src/aeneas/src/_build/default/main.exe",
+    "lean_pkg": "/home/bkearns/.local/aeneas/backends/lean"
+  }
+}

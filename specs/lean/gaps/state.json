@@ -1,7 +1,7 @@
 {
   "toolchain": {
     "charon": "7b462d9159db2ed3015162352183906a30bfafc6",
-    "aeneas": "9b1eec9",
+    "aeneas": "a470700",
     "lean": "Lean (version 4.35.0, x86_64-unknown-linux-gnu, commit eb6cafb7290e8bd5f2937522d8d804f58f02bafc, Release)"
   },
   "budgets": {
@@ -83,14 +83,14 @@
       }
     },
     "ferrosa-net": {
-      "fingerprint": "3dfdecf33bbfab52",
-      "measured_at": "2026-10-31T17:51:40+00:00",
+      "fingerprint": "652c5db314f66076",
+      "measured_at": "2026-10-31T22:14:10+00:00",
       "measurement": {
         "stage": "aeneas-crash",
         "translation_errors": null,
         "lean_errors": null,
         "sorry": null,
-        "seconds": 512,
+        "seconds": 1253,
         "scope": "crate"
       }
     },
@@ -158,38 +158,38 @@
       }
     },
     "ferrosa-row-bridge": {
-      "fingerprint": "25c2104da08af9f7",
-      "measured_at": "2026-10-31T14:52:08+00:00",
+      "fingerprint": "00d3a8774e3b0ca0",
+      "measured_at": "2026-10-31T18:44:20+00:00",
       "measurement": {
         "stage": "aeneas",
         "translation_errors": 0,
         "lean_errors": 66,
         "sorry": 266,
-        "seconds": 14,
+        "seconds": 15,
         "scope": "crate"
       }
     },
     "ferrosa-sched": {
-      "fingerprint": "c56553d5982e869e",
-      "measured_at": "2026-10-31T14:43:40+00:00",
+      "fingerprint": "57604d51cd33082d",
+      "measured_at": "2026-10-31T18:44:34+00:00",
       "measurement": {
         "stage": "aeneas",
         "translation_errors": 0,
         "lean_errors": 2,
         "sorry": 130,
-        "seconds": 17,
+        "seconds": 14,
         "scope": "crate"
       }
     },
     "ferrosa-storage": {
-      "fingerprint": "bdd592be1ac2a71a",
-      "measured_at": "2026-10-31T16:31:05+00:00",
+      "fingerprint": "17ed2faed9e52e23",
+      "measured_at": "2026-10-31T19:29:28+00:00",
       "measurement": {
         "stage": "charon",
         "translation_errors": null,
         "lean_errors": null,
         "sorry": null,
-        "seconds": 28,
+        "seconds": 32,
         "scope": "crate"
       }
     },
@@ -225,26 +225,26 @@
       }
     },
     "ferrosa-udf": {
-      "fingerprint": "a7f20f3ed343592e",
-      "measured_at": "2026-10-31T14:51:54+00:00",
+      "fingerprint": "7d549758d392917a",
+      "measured_at": "2026-10-31T19:29:59+00:00",
       "measurement": {
         "stage": "aeneas",
         "translation_errors": 0,
         "lean_errors": 62,
         "sorry": 264,
-        "seconds": 38,
+        "seconds": 31,
         "scope": "crate"
       }
     },
     "ferrosa-session": {
-      "fingerprint": "1aef8ab4cb2bd1f0",
-      "measured_at": "2026-10-31T15:32:16+00:00",
+      "fingerprint": "8992c3af12ad1afe",
+      "measured_at": "2026-10-31T19:30:04+00:00",
       "measurement": {
         "stage": "aeneas",
         "translation_errors": 0,
         "lean_errors": 16,
         "sorry": 74,
-        "seconds": 7,
+        "seconds": 5,
         "scope": "crate"
       }
     },
@@ -259,7 +259,162 @@
         "seconds": 606,
         "scope": "crate"
       }
+    },
+    "ferrosa-ctl": {
+      "fingerprint": "45c17de57b4f6427",
+      "measured_at": "2026-10-31T19:30:30+00:00",
+      "measurement": {
+        "stage": "aeneas-crash",
+        "translation_errors": null,
+        "lean_errors": null,
+        "sorry": null,
+        "seconds": 26,
+        "scope": "crate"
+      }
+    },
+    "ferrosa-flight": {
+      "fingerprint": "2dab168d85e884e6",
+      "measured_at": "2026-10-31T19:31:04+00:00",
+      "measurement": {
+        "stage": "aeneas",
+        "translation_errors": 0,
+        "lean_errors": 29,
+        "sorry": 622,
+        "seconds": 34,
+        "scope": "crate"
+      }
+    },
+    "ferrosa-graph": {
+      "fingerprint": "746e6023d383f390",
+      "measured_at": "2026-10-31T19:31:28+00:00",
+      "measurement": {
+        "stage": "aeneas-crash",
+        "translation_errors": null,
+        "lean_errors": null,
+        "sorry": null,
+        "seconds": 24,
+        "scope": "crate"
+      }
+    },
+    "ferrosa-index-builder": {
+      "fingerprint": "cd2fa8d3f2b5be0f",
+      "measured_at": "2026-10-31T19:33:34+00:00",
+      "measurement": {
+        "stage": "aeneas-crash",
+        "translation_errors": null,
+        "lean_errors": null,
+        "sorry": null,
+        "seconds": 127,
+        "scope": "crate"
+      }
+    },
+    "ferrosa-sim": {
+      "fingerprint": "b3e34f81709ba226",
+      "measured_at": "2026-10-31T19:33:49+00:00",
+      "measurement": {
+        "stage": "aeneas",
+        "translation_errors": 0,
+        "lean_errors": 85,
+        "sorry": 149,
+        "seconds": 15,
+        "scope": "crate"
+      }
+    },
+    "ferrosa-jepsen": {
+      "fingerprint": "fe368969fc8b8907",
+      "measured_at": "2026-10-31T19:55:30+00:00",
+      "measurement": {
+        "stage": "aeneas",
+        "translation_errors": 0,
+        "lean_errors": 90,
+        "sorry": 450,
+        "seconds": 1301,
+        "scope": "crate"
+      }
+    },
+    "ferrosa-loadgen": {
+      "fingerprint": "a8f6674030383fd4",
+      "measured_at": "2026-10-31T19:56:28+00:00",
+      "measurement": {
+        "stage": "aeneas",
+        "translation_errors": 0,
+        "lean_errors": 1,
+        "sorry": 396,
+        "seconds": 58,
+        "scope": "crate"
+      }
+    },
+    "ferrosa-sql": {
+      "fingerprint": "f2c1b7f371e47c8a",
+      "measured_at": "2026-10-31T19:57:40+00:00",
+      "measurement": {
+        "stage": "aeneas-crash",
+        "translation_errors": null,
+        "lean_errors": null,
+        "sorry": null,
+        "seconds": 72,
+        "scope": "crate"
+      }
+    },
+    "ferrosa-postgres": {
+      "fingerprint": "30d4c129df8abc23",
+      "measured_at": "2026-10-31T19:59:14+00:00",
+      "measurement": {
+        "stage": "aeneas",
+        "translation_errors": 0,
+        "lean_errors": 72,
+        "sorry": 777,
+        "seconds": 94,
+        "scope": "crate"
+      }
+    },
+    "ferrosa-sparql": {
+      "fingerprint": "73f7bf1e5881fbd7",
+      "measured_at": "2026-10-31T20:00:33+00:00",
+      "measurement": {
+        "stage": "aeneas",
+        "translation_errors": 0,
+        "lean_errors": 83,
+        "sorry": 477,
+        "seconds": 79,
+        "scope": "crate"
+      }
+    },
+    "ferrosa-view": {
+      "fingerprint": "e766704b4bb98c08",
+      "measured_at": "2026-10-31T20:40:03+00:00",
+      "measurement": {
+        "scope": "modules (1 measured)",
+        "stage": "modules",
+        "translation_errors": null,
+        "lean_errors": null,
+        "sorry": null,
+        "seconds": 12,
+        "crate_level": "oom",
+        "modules": {
+          "delta": {
+            "stage": "aeneas",
+            "translation_errors": 0,
+            "lean_errors": 0,
+            "sorry": 40,
+            "seconds": 12,
+            "scope": "module delta"
+          }
+        }
+      }
+    },
+    "red-ledger": {
+      "fingerprint": "d83c37b2a1abaf8f",
+      "measured_at": "2026-10-31T21:11:13+00:00",
+      "measurement": {
+        "stage": "aeneas",
+        "translation_errors": 0,
+        "lean_errors": 0,
+        "sorry": 0,
+        "seconds": 2,
+        "scope": "crate"
+      }
     }
   },
-  "updated_at": "2026-10-31T18:41:32+00:00"
+  "updated_at": "2026-10-31T22:14:10+00:00"
 }
