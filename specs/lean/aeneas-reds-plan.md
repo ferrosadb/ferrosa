@@ -172,28 +172,29 @@ tagged enum is printed by the inductive-shape path today, so the printer must em
 comparisons and `Option` unwrapping instead, and `Discriminant`/`read_discriminant` must be
 generated from the tag rather than from constructor indices.
 
-### Implementation map for (a)
+Built, in aeneas branch `wide-enum-integration` (merge of `ab342d17` type emission and
+`eb0f90b7` match/discriminant, deduplicated onto one predicate `src/extract/WideEnum.ml`).
+Measured on the same `llbc`, end to end: **101 → 39 errors, no error mentions the enum**.
+The 39 are the other classes this plan already tracks (21 `rustls.error.Error` holes, 4
+doc-comment-in-`def` parse errors, 3 constructor-field holes, 2 type mismatches, 2 `map`
+not a field of `Iterator`, 2 unresolved instances).
 
-Threshold: `List.length variants > 244`, Lean backend only. The two halves are coupled —
-landing the type without the match half converts "tag too big" into "match on a structure"
-at every use site, so they have to move together.
+Two facts from the implementation that the next reader needs:
 
-- `src/extract/ExtractTypes.ml:1611` — `type_decl_kind_to_qualif` returns `inductive`; the
-  wide case needs `structure`.
-- `src/extract/ExtractTypes.ml:977` — `extract_type_decl_enum_body` prints variants through
-  `extract_type_decl_variant`; the wide body is `disc : Std.U16` plus one
-  `Option <payload>` field per variant that has fields.
-- Constructor `def`s: emitted after the declaration group, next to the trait-instance
-  stubs in `src/Translate.ml:1346`, which is the only place that already prints bare Lean
-  declarations outside the type/function printers.
-- `src/extract/Extract.ml:1530` — the `| Match branches ->` arm of `extract_texpr` is the
-  single match site; for a tagged scrutinee it must become a chain of
-  `if x.disc = k then … else …` with payload projection. This is the part that needs a
-  typed scrutinee (`texpr.ty`) resolved to a wide type id, so it also needs the predicate
-  shared with the emitter.
-- `src/extract/ExtractBase.ml:1266` — `Discriminant` / `read_discriminant` are looked up as
-  builtins; for a tagged enum the tag *is* the discriminant, so the builtin path can stay
-  and the generated `read_discriminant` has to read `disc` rather than index constructors.
+- `Option.get` is not usable — Lean 4.35 requires a proof of `isSome`. Payload projection
+  emits `Option.get!`, which needs `Inhabited` on the payload types. `CipherSuite` is fine
+  (`Std.U16` is inhabited, and its payload variant is never projected in this crate), but a
+  wide enum whose payloads are not inhabited cannot be matched.
+- A branch chain of ~600 nested `if`s — a derived `PartialEq` over a 300-variant enum —
+  exceeds the emitted `maxRecDepth 2048`; elaboration then needs `-max-recdepth 16384`.
+  A single match over `CipherSuite` stays under the default.
+
+Open decision, recorded rather than decided: the emitted `@[discriminant isize]` on a wide
+enum's structure is degenerate — a structure is a single-constructor inductive, so the
+attribute's `read_discriminant` always yields `0`. Nothing depends on it today (aeneas
+substitutes `self.disc` for `Discriminant` calls), but an attribute that silently returns
+the wrong discriminant is the kind of quiet lie the repo's own rules forbid. Either drop it
+for wide enums or take the degenerate case into account.
 
 ## Step 3 — the trait model (414 reds)
 
