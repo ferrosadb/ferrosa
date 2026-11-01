@@ -93,23 +93,29 @@ target.
 Acceptance: for every generated file, every referenced `.Insts.` name has a
 matching declaration. Checkable by parsing the emitted file, no Lean needed.
 
-Measured on `ferrosa_net`'s `tls` module: 39 distinct `.Insts.` references, 8 with no
-declaration in the file, and only 3 of those are real gaps —
-`rustls_pki_types.{PrivateKeyDerStatic,CertificateDerStatic}.Insts.Rustls_pki_typesPemPemObject{,Filter}`,
-`rustls_pki_types.pem.ReadIter.Insts.CoreIterTraitsIteratorIteratorResultTError`,
-`tokio_rustls.server.TlsAcceptor.Insts.CoreConvertFromArcServerConfig`,
-`tracing_core.metadata.Level.Insts.CoreCmpPartialOrdLevelFilter`. The rest
-(`core.iter.adapters.map.Map.Insts…`, `core.result.Result.Insts.CoreOpsTry…`) are
-declared in the Aeneas library under `Aeneas.Std` and resolve there.
+Measured on `ferrosa_net`'s `tls` module, and this supersedes an earlier reading of the
+same file: a regex over `.Insts.` names reports 8 undeclared references, but every one of
+them **is** declared — `impl_def` sits on the line above the name, and the signature wraps
+across lines, so a pattern that expects `def <name> :` on one line misses them. The five
+that looked like foreign-type gaps (`PrivateKeyDerStatic…PemPemObject`,
+`CertificateDerStatic…PemPemObjectFilter`, `pem.ReadIter…`,
+`tokio_rustls.server.TlsAcceptor…`, `tracing_core.metadata.Level…`) all resolve. Lean's
+own error list agrees: after the external-type holes are given declarations, that module
+has **no** instance-naming red left.
 
-The gaps share one property: they are impls on *foreign* types, and they are absent from
-`crate.trait_impls` entirely — charon never emitted them, because the extraction was
-narrowed to this crate. So no iteration over the crate can stub them, and a condition
-change inside the existing stub pass (stub when the *impl* is untranslated rather than
-when the *trait* is) is a no-op here: it produced a byte-identical file, and was
-reverted for want of a test that fires. The stub has to be collected at the *reference*
-site, where the printed name and its trait application are already known, and flushed
-after the declaration loop.
+So the acceptance test cannot be a text scan of the shape `def X.Insts.Y :`. Parse the
+declaration keywords the printer actually emits (`implemented_impl`, `impl_def`, `def`,
+`instance`, `axiom`, `opaque`, allowing the name to sit at the end of a wrapped line), or
+— cheaper and authoritative — take the reds from `lake env lean` and look only for
+`unknownIdentifier` naming a `.Insts.` path.
+
+Instrumenting the stub pass on that module shows the machinery working: 75 impls visited,
+55 with a translated trait, 17 classified builtin, 3 emitting a `def … := sorry` stub. The
+one real defect the probe exposed is in the classifier, not the printer:
+`trait_impl_is_builtin` matches on the trait *name and generics* only, so
+`tracing_core::metadata::Level: PartialOrd<LevelFilter>` is classified `builtin` and never
+stubbed even though the library has no instance for it. That misclassification is the
+shape to fix, and it is checkable by Lean, not by grep.
 
 ## Step 2b — wide enums: the 245-constructor ceiling (dominant red in `ferrosa_net`)
 
