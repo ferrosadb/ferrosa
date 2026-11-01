@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use rand::seq::IndexedRandom;
 
 use super::{
-    machine_state_from_json, probe_says_serving, MachineAction, NemesisAction, NemesisContext,
-    NemesisExecutor, SERVING_PROBE,
+    probe_says_serving, MachineAction, NemesisAction, NemesisContext, NemesisExecutor,
+    SERVING_PROBE,
 };
 
 /// Polls for a SIGKILLed Fly machine to report `stopped` (1 s apart).
@@ -87,7 +87,7 @@ impl NemesisAction for KillMinority {
 async fn wait_for_stopped(ctx: &NemesisContext, node: usize) -> Result<()> {
     let mut last = String::new();
     for _ in 0..STOP_POLLS {
-        last = machine_state_from_json(&ctx.fly_machine(node, MachineAction::Status).await?)?;
+        last = ctx.fly_machine_state(node).await?;
         if last == "stopped" {
             tracing::info!(node, "kill-minority: machine is stopped");
             return Ok(());

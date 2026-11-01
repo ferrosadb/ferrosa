@@ -123,16 +123,14 @@ impl NemesisContext {
     /// not a graceful one: a clean shutdown could flush state a real crash would not.
     fn fly_machine_args(&self, node_index: usize, action: MachineAction) -> Result<Vec<String>> {
         let (app_name, machine_id) = self.fly_target(node_index)?;
-        let mut args: Vec<String> = ["machine", action.verb(), machine_id, "--app", app_name]
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-        match action {
-            MachineAction::Kill => args.extend(["--signal".to_string(), "SIGKILL".to_string()]),
-            MachineAction::Status => args.push("--json".to_string()),
-            MachineAction::Start => {}
-        }
-        Ok(args)
+        let args: &[&str] = match action {
+            MachineAction::Kill => &[
+                "machine", "stop", machine_id, "--app", app_name, "--signal", "SIGKILL",
+            ],
+            MachineAction::Start => &["machine", "start", machine_id, "--app", app_name],
+            MachineAction::List => &["machine", "list", "--app", app_name, "--json"],
+        };
+        Ok(args.iter().map(|arg| arg.to_string()).collect())
     }
 
     /// Run a Machines API action from this host (the guest cannot stop itself observably). Fails
@@ -156,6 +154,13 @@ impl NemesisContext {
             );
         }
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    /// The Machines API state (`started`, `stopped`, …) of one ordered node.
+    pub(crate) async fn fly_machine_state(&self, node_index: usize) -> Result<String> {
+        let (_, machine_id) = self.fly_target(node_index)?;
+        let list = self.fly_machine(node_index, MachineAction::List).await?;
+        machine_state_from_json(&list, machine_id)
     }
 
     /// Execute a command on one ordered cluster node through the configured
@@ -242,30 +247,25 @@ pub enum MachineAction {
     Kill,
     /// `fly machine start`.
     Start,
-    /// `fly machine status --json`.
-    Status,
+    /// `fly machine list --json`, the app's machines with their states (`fly machine status` has
+    /// no JSON output).
+    List,
 }
 
-impl MachineAction {
-    fn verb(self) -> &'static str {
-        match self {
-            MachineAction::Kill => "stop",
-            MachineAction::Start => "start",
-            MachineAction::Status => "status",
-        }
-    }
-}
-
-/// The `state` field of `fly machine status --json`. A document without one is an error, never
-/// an assumed state.
-pub(crate) fn machine_state_from_json(json: &str) -> Result<String> {
-    let value: serde_json::Value = serde_json::from_str(json)
-        .map_err(|e| anyhow::anyhow!("machine status is not JSON ({e}): {json}"))?;
-    value
+/// The `state` of one machine in `fly machine list --json`. A machine missing from the list, or
+/// one without a state, is an error, never an assumed state.
+pub(crate) fn machine_state_from_json(json: &str, machine_id: &str) -> Result<String> {
+    let machines: Vec<serde_json::Value> = serde_json::from_str(json)
+        .map_err(|e| anyhow::anyhow!("machine list is not a JSON array ({e}): {json}"))?;
+    let machine = machines
+        .iter()
+        .find(|m| m.get("id").and_then(serde_json::Value::as_str) == Some(machine_id))
+        .ok_or_else(|| anyhow::anyhow!("machine {machine_id} is not in the app's machine list"))?;
+    machine
         .get("state")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
-        .ok_or_else(|| anyhow::anyhow!("machine status has no `state`: {json}"))
+        .ok_or_else(|| anyhow::anyhow!("machine {machine_id} has no `state`: {machine}"))
 }
 
 /// Shell probe that prints `UP` when the node's own `/readyz` answers and `DOWN` otherwise. It
@@ -700,22 +700,29 @@ mod tests {
             vec!["machine", "start", "m3", "--app", "ferrosa-je6"]
         );
         assert_eq!(
-            ctx.fly_machine_args(0, MachineAction::Status)
-                .expect("status args"),
-            vec!["machine", "status", "m1", "--app", "ferrosa-je6", "--json"]
+            ctx.fly_machine_args(0, MachineAction::List)
+                .expect("list args"),
+            vec!["machine", "list", "--app", "ferrosa-je6", "--json"],
+            "`fly machine status` has no JSON output; the state comes from the list"
         );
         assert!(ctx.fly_machine_args(3, MachineAction::Kill).is_err());
     }
 
     #[test]
-    fn machine_state_is_read_from_the_status_json_and_a_missing_state_is_an_error() {
+    fn machine_state_is_read_from_the_list_json_and_a_missing_machine_or_state_is_an_error() {
+        let list =
+            r#"[{"id":"m1","state":"started"},{"id":"m3","state":"stopped","name":"ferrosa-3"}]"#;
         assert_eq!(
-            machine_state_from_json(r#"{"id":"m3","state":"stopped","name":"ferrosa-3"}"#)
-                .expect("state"),
+            machine_state_from_json(list, "m3").expect("state"),
             "stopped"
         );
-        assert!(machine_state_from_json(r#"{"id":"m3"}"#).is_err());
-        assert!(machine_state_from_json("not json").is_err());
+        assert_eq!(
+            machine_state_from_json(list, "m1").expect("state"),
+            "started"
+        );
+        assert!(machine_state_from_json(list, "m2").is_err());
+        assert!(machine_state_from_json(r#"[{"id":"m3"}]"#, "m3").is_err());
+        assert!(machine_state_from_json("not json", "m3").is_err());
     }
 
     #[test]
