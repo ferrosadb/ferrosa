@@ -29,6 +29,11 @@ external checkers.
   post-resume replica catch-up and histories that mix CQL writes with PostgreSQL
   transactions before claiming those guarantees.
 
+- **Run the `set` workload live (JE-6).** The book, the paged final read and
+  the orchestrator wiring are unit-tested against fakes and the mock; the
+  clustering-range page query and the error classification have not yet met a
+  real cluster under a nemesis.
+
 ## Next
 
 - **Give Elle a workload.** `checker::elle` now runs elle-checker by exit code
