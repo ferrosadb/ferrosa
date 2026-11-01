@@ -19,6 +19,10 @@ PYTHON ?= python3
 TECTONIC ?= tectonic
 P ?=
 
+# A Lean `panic!` prints a line and returns a default value, so an exporter that panics still exits
+# 0 with that default in its output. Aborting on panic makes it a failed build instead.
+export LEAN_ABORT_ON_PANIC := 1
+
 .PHONY: book data pdf check clean
 
 book: data pdf

@@ -29,6 +29,18 @@ open Lean
 
 /-! ## Names -/
 
+/-- The readable last component of a name. `Name.getString!` panics on any name that does not end
+    in a string, and a compiled environment is full of them: a hygienic binder ends in the macro
+    scope's number, an auxiliary constant may end in an index. The panic was printed and the
+    exporter carried on with `""`, so a statement could be indexed or printed under an empty name
+    while the run reported success. Macro scopes are erased first, because `a✝` is `a` to a reader;
+    a numeric component that remains is printed as `_<n>` after its prefix. -/
+def lastComponent (n : Name) : String :=
+  match n.eraseMacroScopes with
+  | .str _ s => s
+  | .num p i => (match p with | .str _ s => s | _ => "") ++ "_" ++ toString i
+  | .anonymous => ""
+
 /-- Escape the characters LaTeX reads as syntax. -/
 def escape (s : String) : String :=
   String.join <| s.toList.map fun c =>
@@ -62,7 +74,7 @@ def greekize (s : String) : String :=
     word, `primary` a \texttt{\textbackslash mathsf} one. That split is the corpus's own: capitalised
     names are predicates and types, lowercase ones are constructors and alternatives. -/
 def texName (n : Name) : String :=
-  let s := greekize n.getString!
+  let s := greekize (lastComponent n)
   let qualified := n.components.length > 1
   match s.toList.head? with
   | some c =>
@@ -168,16 +180,16 @@ partial def tex (env : Environment) (e : Expr) : String :=
   | .forallE n ty b bi =>
     if bi == .implicit || bi == .instImplicit then tex env b
     else if isPropTy env ty then s!"{tex env ty} \\to {tex env b}"
-    else s!"\\forall {greekize (escape n.getString!)} : {tex env ty},\\ {tex env b}"
+    else s!"\\forall {greekize (escape (lastComponent n))} : {tex env ty},\\ {tex env b}"
   | .lam n ty b bi =>
     if bi == .implicit || bi == .instImplicit then tex env b
     else
-      let nm := if n.toString == "_" then "x" else n.getString!
+      let nm := if n.toString == "_" then "x" else lastComponent n
       let c := Expr.const (.str .anonymous nm) []
       s!"\\lambda {greekize (escape nm)} : {tex env ty},\\ {tex env (b.instantiate1 c)}"
   | .letE n _ v b _ => s!"{tex env b}"
   | .bvar i => s!"x\\_{i}"
-  | .fvar id => s!"v_{id.name.getString!}"
+  | .fvar id => s!"v_{lastComponent id.name}"
   | .app .. => texApp env e
   | .mvar _ => "\\square"
   | .proj _ _ _ => "\\pi"
@@ -195,7 +207,7 @@ partial def texApp (env : Environment) (e : Expr) : String :=
     else if n.toString.endsWith "Exists" && args.size >= 2 then
       match args[args.size - 1]! with
       | .lam nm _ b _ =>
-        let nm := if nm.toString == "_" then "x" else nm.getString!
+        let nm := if nm.toString == "_" then "x" else lastComponent nm
         let c := Expr.const (.str .anonymous nm) []
         s!"\\exists {greekize (escape nm)},\\ {tex env (b.instantiate1 c)}"
       | other => s!"\\exists {tex env other}"
@@ -216,9 +228,9 @@ partial def texApp (env : Environment) (e : Expr) : String :=
     else if env.find? n |>.any (fun _ => false) then texName n
     else if (explicitArgs env n args).size == 1 && n.components.length >= 2
             && !classMethod n
-            && (n.getString!.toList.head?).any (fun c => c.isLower) then
+            && ((lastComponent n).toList.head?).any (fun c => c.isLower) then
       -- a projection: `s.acked` reads as mathematics where `acked(s)` reads as code
-      tex env (explicitArgs env n args)[0]! ++ ".\\mathsf{" ++ escape n.getString! ++ "}"
+      tex env (explicitArgs env n args)[0]! ++ ".\\mathsf{" ++ escape (lastComponent n) ++ "}"
     else
       match n with
       | .str _ "OfNat" => ""
@@ -256,7 +268,7 @@ partial def texStatement (env : Environment) (ty : Expr) : String :=
       Array String × Array String × Expr :=
     match e with
     | .forallE n t b bi =>
-      let nm := n.getString!
+      let nm := lastComponent n
       let nm := if nm == "_" || nm.isEmpty then "x" else nm
       let t := t.instantiate subst
       let c := Expr.const (.str .anonymous nm) []

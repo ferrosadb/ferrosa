@@ -77,7 +77,7 @@ structure ModuleView where
     real one — and only when it is unambiguous. -/
 def shortIndex (env : Environment) : Std.HashMap String (Array Name) :=
   env.constants.fold (init := {}) fun m n _ =>
-    let s := n.getString!
+    let s := Ferrosa.Docs.Tex.lastComponent n
     m.insert s (m.getD s #[] |>.push n)
 
 /-- `s` contains `sub`, tested the way `Ferrosa/Ledgers.lean` tests for a definition. -/
