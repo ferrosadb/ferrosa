@@ -82,10 +82,13 @@ def a0' : Acceptor := prepareConflated a0 5
     committed. -/
 theorem recovery_diverges : recoveryChoice [a0', a1, a2] = some (5, 1) := by native_decide
 
-/-- **Red: the conflated acceptor proposes a value no quorum ever accepted.**  The same
-    three acceptors, after one Prepare at ballot 5, yield `1` where the correct recovery
+/-- **Counterexample: the conflated acceptor proposes a value no quorum ever accepted.**  The
+    same three acceptors, after one Prepare at ballot 5, yield `1` where the correct recovery
     yields the committed `2` — so two replicas recovering from this state would agree on
-    a value that contradicts the one the client was told was committed. -/
+    a value that contradicts the one the client was told was committed.  The Accord replica
+    keeps the two ballots apart (`PromisedBallot`, `AcceptedBallot`), and
+    `accord::recovery::tests::recover_updates_promised_not_accepted` and
+    `recovery_selects_by_accepted_ballot` pin this exact case. -/
 theorem recovery_wrong_value : recoveryChoice [a0', a1, a2] ≠ recoveryChoice [a0, a1, a2] := by
   rw [recovery_diverges, recovery_correct]
   simp

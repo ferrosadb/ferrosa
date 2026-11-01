@@ -10,8 +10,10 @@
   seen every acknowledged write, and a missing value is excused only by a fault that was logged and
   that fell before the acknowledgement. A generator is part of the claim too, since a generator that
   never overlaps two operations cannot convict an ordering model and one that never writes cannot
-  test durability. One row is red: the endurance and alert paths summarise a verdict as pass/fail,
-  which is exactly the cancellation the multisets forbid.
+  test durability. A timed-out write may have landed, so reading it back is reported but convicts
+  nothing; a write that failed definitively and was read back is a fabrication. Three rows are red:
+  no workload in the Rust suite keeps this book, records which writes were indeterminate, or issues
+  a final read, so no run's verdict is computed from these multisets at all.
 -/
 import Ferrosa.Core
 import Ferrosa.Ledger
@@ -53,25 +55,36 @@ theorem multiset_union_is_commutative (v : Nat) (a b : List Nat) :
 
 /-! ## The book
 
-`Book` records three multisets — what was attempted, what was acknowledged, and what the final read recovered — and `silentLoss` and every theorem that follows are statements about the difference between them. `duplicated` is declared but no theorem here uses it; the load-bearing pair is `lost` and `unexpected`, which `a_loss_and_a_fabrication_do_not_cancel` shows are independent. Silent loss is the case where the first is non-empty and the second is empty.
+`Book` records four multisets — what was attempted, what was acknowledged, what ended without a definite answer, and what the final read recovered — and `silentLoss` and every theorem that follows are statements about the difference between them. The load-bearing pair is `lost` and `fabricated`, which `a_loss_and_a_fabrication_do_not_cancel` shows are independent. Silent loss is the case where something is lost and nothing unexpected was read.
+
+A write that timed out may or may not have landed, so recovering it is not evidence of anything. `unexpected` is everything read that was not acknowledged; `fabricated` is the part of it no indeterminate write explains, and only that part convicts a run. A write that failed definitively is not indeterminate: recovering it is fabrication, because the database said it did not happen. This is decision D7 of `specs/jepsen-evidence/decisions.md` in the suite repository.
 -/
 
 /-- What a run recorded. `attempts` counts invocations, `acknowledged` counts `ok` completions,
-    `recovered` is what the final read observed. -/
+    `recovered` is what the final read observed, and `indeterminate` counts writes that timed out or
+    failed after being sent, whose effect the client cannot know. A write that failed definitively
+    is in `attempts` and in neither `acknowledged` nor `indeterminate`. -/
 structure Book where
   attempts : List Nat
   acknowledged : List Nat
   recovered : List Nat
+  indeterminate : List Nat
   deriving DecidableEq, Repr
 
 /-- Acknowledged but not observed: the write was promised and the read did not return it. -/
 def lost (b : Book) : List Nat := msSub b.acknowledged b.recovered
 
-/-- Observed but never acknowledged: corruption, or a retry that was not attributed. -/
+/-- Observed but never acknowledged: a timed-out write that landed, corruption, or a retry that
+    was not attributed. -/
 def unexpected (b : Book) : List Nat := msSub b.recovered b.acknowledged
 
-/-- Attempts that were acknowledged. -/
-def duplicated (b : Book) : List Nat := msSub b.recovered b.attempts
+/-- Observed, never acknowledged, and not explained by any write whose outcome was unknown: a value
+    the database returned that no successful or possibly-successful write put there. A definite
+    failure that was read back lands here, because the database said it did not happen. -/
+def fabricated (b : Book) : List Nat := msSub (unexpected b) b.indeterminate
+
+/-- The part of `unexpected` that an indeterminate write explains. Reported, never convicting. -/
+def recoveredIndeterminate (b : Book) : List Nat := msSub (unexpected b) (fabricated b)
 
 /-- **A silent loss is `lost` without `unexpected`**: the data is gone and the read revealed nothing
     that would explain it. This is the shape of the failure the product forbids. -/
@@ -79,37 +92,56 @@ def silentLoss (b : Book) : Bool := !(lost b).isEmpty && (unexpected b).isEmpty
 
 /-- A write that was acknowledged and then read back is not lost. -/
 theorem an_acknowledged_write_that_is_read_back_is_not_lost :
-    lost ⟨[7], [7], [7]⟩ = [] := by decide
+    lost ⟨[7], [7], [7], []⟩ = [] := by decide
 
 /-- A write acknowledged and never read back is lost. -/
 theorem an_acknowledged_write_that_is_never_read_back_is_lost :
-    lost ⟨[7], [7], []⟩ = [7] := by decide
+    lost ⟨[7], [7], [], []⟩ = [7] := by decide
 
 /-- A value the read returns without any acknowledgement is unexpected — nothing in the run explains
     where it came from. -/
 theorem a_value_that_no_write_acknowledged_is_unexpected :
-    unexpected ⟨[7], [], [7]⟩ = [7] := by decide
+    unexpected ⟨[7], [], [7], []⟩ = [7] := by decide
 
-/-- **`lost` and `unexpected` are independent, so they cannot cancel**: a run can lose one value and
+/-- **`lost` and `fabricated` are independent, so they cannot cancel**: a run can lose one value and
     fabricate another, and the two multisets stay separate. Summing them into one error count would
     hide the loss behind the fabrication. -/
 theorem a_loss_and_a_fabrication_do_not_cancel :
-    lost ⟨[1, 2], [1, 2], [1, 3]⟩ = [2]
-      ∧ unexpected ⟨[1, 2], [1, 2], [1, 3]⟩ = [3] := by decide
+    lost ⟨[1, 2], [1, 2], [1, 3], []⟩ = [2]
+      ∧ fabricated ⟨[1, 2], [1, 2], [1, 3], []⟩ = [3] := by decide
+
+/-- **A timed-out write that landed is not a fabrication.** The client could not know whether it
+    applied, so reading it back is consistent with every correct execution; it is reported as
+    recovered-indeterminate and convicts nothing. -/
+theorem a_timed_out_write_that_landed_is_not_fabricated :
+    fabricated ⟨[1], [], [1], [1]⟩ = []
+      ∧ recoveredIndeterminate ⟨[1], [], [1], [1]⟩ = [1]
+      ∧ unexpected ⟨[1], [], [1], [1]⟩ = [1] := by decide
+
+/-- **A write that failed definitively and was read back is a fabrication.** The database said it
+    did not happen. Counting every attempt as an excuse, rather than only the indeterminate ones,
+    would hide exactly this. -/
+theorem a_definite_failure_that_landed_is_fabricated :
+    fabricated ⟨[1], [], [1], []⟩ = [1] := by decide
+
+/-- **An indeterminate write never hides a loss.** A run that lost an acknowledged value and also
+    recovered a timed-out one still reports the loss. -/
+theorem an_indeterminate_write_never_hides_a_loss :
+    lost ⟨[1, 2], [1], [2], [2]⟩ = [1] ∧ fabricated ⟨[1, 2], [1], [2], [2]⟩ = [] := by decide
 
 /-- **A clean read plus a missing write is the silent-loss shape.** -/
 theorem a_missing_write_with_a_clean_read_is_a_silent_loss :
-    silentLoss ⟨[1, 2], [1, 2], [1]⟩ = true := by decide
+    silentLoss ⟨[1, 2], [1, 2], [1], []⟩ = true := by decide
 
 /-- A run that lost nothing is not a silent loss, however many values it fabricated. -/
 theorem a_fabrication_alone_is_not_silent_loss :
-    silentLoss ⟨[1], [1], [1, 2]⟩ = false := by decide
+    silentLoss ⟨[1], [1], [1, 2], []⟩ = false := by decide
 
 /-- **A run that acknowledged nothing cannot lose anything.** This is the multiset form of the
     vacuity result: `lost` is empty by construction, so a no-write run reports a clean bill of health
     without having tested durability. -/
-theorem a_run_without_acknowledged_writes_cannot_lose_anything (r : List Nat) :
-    lost ⟨[], [], r⟩ = [] := by
+theorem a_run_without_acknowledged_writes_cannot_lose_anything (r i : List Nat) :
+    lost ⟨[], [], r, i⟩ = [] := by
   simp only [lost]
   induction r with
   | nil => rfl
@@ -119,15 +151,16 @@ theorem a_run_without_acknowledged_writes_cannot_lose_anything (r : List Nat) :
     write counts as lost. A suite that reads nothing fails loudly rather than passing quietly — which
     is the argument for always issuing a final read. -/
 theorem a_run_without_a_final_read_loses_every_acknowledged_write :
-    lost ⟨[1, 2], [1, 2], []⟩ = [1, 2] := by decide
+    lost ⟨[1, 2], [1, 2], [], []⟩ = [1, 2] := by decide
 
 /-! ## The verdict, which is a function of the profile
 
 A verdict has three outcomes because two would force the suite either to call an inconclusive run green or to call a semantics consequence a failure. `verdictFor` reads the profile first and the book second: a profile that cannot see every acknowledged write yields `notTested` with the reason attached, and only a profile that can yields `confirmed` or `refuted`. `NotTested` records which of the two ways the run was blind, so the excuse stays inspectable rather than collapsing into a single word.
 -/
 
-/-- Any anomaly at all: something lost or something fabricated. -/
-def anomalous (b : Book) : Bool := !(lost b).isEmpty || !(unexpected b).isEmpty
+/-- Any anomaly at all: something lost or something fabricated. A recovered indeterminate write is
+    not one. -/
+def anomalous (b : Book) : Bool := !(lost b).isEmpty || !(fabricated b).isEmpty
 
 /-- Why a run could not decide anything. -/
 inductive NotTested where
@@ -178,21 +211,29 @@ theorem nothing_is_excused_that_the_profile_can_convict
 
 /-- A run under CL=ONE/CL=ONE on three nodes is not confirmed, however clean the book looks. -/
 theorem a_clean_book_under_one_one_is_not_confirmed :
-    verdictFor (Guarantees.profile 3 .one .one false) ⟨[1], [1], [1]⟩
+    verdictFor (Guarantees.profile 3 .one .one false) ⟨[1], [1], [1], []⟩
       = .notTested .readsDoNotOverlapWrites := by decide
 
 /-- The same book under CL=QUORUM/CL=QUORUM is confirmed. -/
 theorem the_same_clean_book_under_quorum_is_confirmed :
-    verdictFor (Guarantees.profile 3 .quorum .quorum false) ⟨[1], [1], [1]⟩ = .confirmed := by decide
+    verdictFor (Guarantees.profile 3 .quorum .quorum false) ⟨[1], [1], [1], []⟩ = .confirmed := by
+  decide
+
+/-- Under CL=QUORUM a timed-out write that landed does not refute the run; it is reported, and the
+    run is confirmed on the strength of everything that was acknowledged. -/
+theorem a_landed_timeout_under_quorum_is_confirmed :
+    verdictFor (Guarantees.profile 3 .quorum .quorum false) ⟨[1, 2], [1], [1, 2], [2]⟩
+      = .confirmed := by decide
 
 /-- And under CL=ALL/CL=ALL a lost write is refuted, not excused. -/
 theorem a_lost_write_under_all_all_is_refuted :
-    verdictFor (Guarantees.profile 3 .all .all false) ⟨[1, 2], [1, 2], [1]⟩ = .refuted := by decide
+    verdictFor (Guarantees.profile 3 .all .all false) ⟨[1, 2], [1, 2], [1], []⟩ = .refuted := by
+  decide
 
 /-- A cross-datacenter read is inconclusive even at CL=ALL, and the reason is recorded rather than
     collapsed into "not tested". -/
 theorem a_cross_datacenter_read_is_inconclusive_at_every_level :
-    verdictFor (Guarantees.profile 3 .all .all true) ⟨[1], [1], [1]⟩
+    verdictFor (Guarantees.profile 3 .all .all true) ⟨[1], [1], [1], []⟩
       = .notTested .crossDatacenterRead := by decide
 
 /-! ## Generators
@@ -225,14 +266,14 @@ theorem a_sequential_generator_cannot_expose_an_ordering_anomaly :
 
 /-- **A generator that never writes cannot lose anything**, so a green durability result from it is
     vacuous. -/
-theorem a_write_free_generator_cannot_test_durability (r : List Nat) :
-    lost ⟨[], [], r⟩ = [] := a_run_without_acknowledged_writes_cannot_lose_anything r
+theorem a_write_free_generator_cannot_test_durability (r i : List Nat) :
+    lost ⟨[], [], r, i⟩ = [] := a_run_without_acknowledged_writes_cannot_lose_anything r i
 
 /-- **A generator that omits the final read cannot detect a loss at all**: every acknowledged write
     counts as lost, so the run is either red for the wrong reason or — if it never wrote — green for
     no reason. -/
 theorem a_generator_without_a_final_read_cannot_measure_loss :
-    lost ⟨[1], [1], []⟩ = [1] ∧ lost ⟨[], [], []⟩ = [] := by decide
+    lost ⟨[1], [1], [], []⟩ = [1] ∧ lost ⟨[], [], [], []⟩ = [] := by decide
 
 /-! ## Nemeses, and what the verdict may attribute to them
 
@@ -278,6 +319,12 @@ def ledger : List SpecItem := [
    .met "Histories.a_value_that_no_write_acknowledged_is_unexpected"⟩,
   ⟨"a loss and a fabrication are independent multisets and do not cancel",
    .met "Histories.a_loss_and_a_fabrication_do_not_cancel"⟩,
+  ⟨"a timed-out write that landed is reported, not counted as a fabrication",
+   .met "Histories.a_timed_out_write_that_landed_is_not_fabricated"⟩,
+  ⟨"a definite failure that was read back is a fabrication",
+   .met "Histories.a_definite_failure_that_landed_is_fabricated"⟩,
+  ⟨"an indeterminate write never hides a loss",
+   .met "Histories.an_indeterminate_write_never_hides_a_loss"⟩,
   ⟨"a missing write with a clean read is a silent loss",
    .met "Histories.a_missing_write_with_a_clean_read_is_a_silent_loss"⟩,
   ⟨"a fabrication alone, with nothing lost, is not a silent loss",
@@ -300,13 +347,22 @@ def ledger : List SpecItem := [
    .met "Histories.nothing_is_confirmed_that_the_profile_cannot_support"⟩,
   ⟨"every run records lost, unexpected and recovered as multisets, not as a single error count",
    .failing
-     "unverified: `check` returns the multisets, but the endurance and alert paths summarise a verdict as pass/fail. A summary that collapses them is exactly the cancellation this file forbids"
-     "Histories.a_loss_and_a_fabrication_do_not_cancel"⟩
+     "not implemented: no workload in ferrosa-jepsen issues a final read or keeps an attempted/acknowledged/recovered book, so there are no lost or unexpected multisets to preserve; a run reports conservation and linearizability verdicts, and the alert summarises those as pass/fail/inconclusive (specs/jepsen-evidence D7, packet JE-5)"
+     "Histories.a_loss_and_a_fabrication_do_not_cancel"⟩,
+  ⟨"every run separates recovered indeterminate writes from fabricated values, and only fabrication refutes",
+   .failing
+     "not implemented: no workload records which writes ended without a definite answer, so a timed-out write that landed cannot be told from a fabrication (specs/jepsen-evidence D7, packet JE-5)"
+     "Histories.a_timed_out_write_that_landed_is_not_fabricated"⟩,
+  ⟨"every durability run issues a final read after healing, and a final read that fails is a run failure, not a verdict",
+   .failing
+     "not implemented: no workload issues a final read, so loss is never measured; without one every acknowledged write would count as lost (specs/jepsen-evidence D8, packet JE-5)"
+     "Histories.a_run_without_a_final_read_loses_every_acknowledged_write"⟩
 ]
 
-/-- One red in this ledger, and it is the summary path: `check` returns the multisets, but a verdict
-    printed as pass/fail has already collapsed them. -/
-theorem histories_has_one_red_item : redCount ledger = 1 := by decide
+/-- Three reds in this ledger, all for one reason: no Rust workload keeps the book, records which
+    writes were indeterminate, or issues a final read, so the multisets this file reasons about are
+    never computed for a real run. -/
+theorem histories_has_three_red_items : redCount ledger = 3 := by decide
 
 def main : IO Unit :=
   printLedger "bookkeeping, generators and fault attribution" ledger

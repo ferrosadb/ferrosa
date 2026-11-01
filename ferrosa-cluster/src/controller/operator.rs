@@ -26,6 +26,7 @@ impl ModeController {
                 "pair promotion cannot bypass Raft membership".into(),
             ));
         }
+        self.refuse_promotion_over_a_connected_peer()?;
         if self.pair_context.lock().is_none() {
             if let Some(record) = crate::pair::authority::PairAuthority::read(
                 self.storage.data_dir(),
@@ -113,6 +114,37 @@ impl ModeController {
         *self.pair_context.lock() = None;
         self.connected_peers.store(Arc::new(Vec::new()));
         tracing::info!(epoch, "force promoted to standalone primary");
+        Ok(())
+    }
+
+    /// Promotion takes the operator's word that the peer is dead; a peer this node is still
+    /// connected to is evidence it is not. Overriding a live primary leaves two nodes accepting
+    /// writes for one key (`Topology/Pair.lean`, `unguarded_promotion_splits_brain`), so a connected
+    /// peer is handed off with a switchover instead. Checked before anything changes.
+    fn refuse_promotion_over_a_connected_peer(&self) -> Result<()> {
+        let peer = match self.pair_context.lock().as_ref() {
+            Some(ctx) => Some(ctx.peer_host_id),
+            None => crate::pair::authority::PairAuthority::read(
+                self.storage.data_dir(),
+                self.local_host_id,
+            )?
+            .map(|record| record.peer),
+        };
+        let Some(peer) = peer else {
+            return Ok(());
+        };
+        if self
+            .connected_peers
+            .load()
+            .iter()
+            .any(|(id, _)| *id == peer)
+        {
+            tracing::warn!(%peer, "refused operator promotion: the pair peer is still connected");
+            return Err(ClusterError::ModeTransitionRejected(format!(
+                "pair peer {peer} is still connected; promotion is only for a peer confirmed \
+                 dead — use switchover to move authority to this node"
+            )));
+        }
         Ok(())
     }
 

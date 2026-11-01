@@ -50,6 +50,9 @@ pub const AUDIT_CRATES: &[&str] = &[
     // Parses and encodes documents up to the 256 MiB read ceiling and serves
     // set-returning-function cursors, so it owns query-sized paths (jsonb D14).
     "ferrosa-jsonb",
+    // A generated table of the Lean corpus's reds. It owns no serving path, but scanning it is
+    // free and keeps a later addition from entering the workspace unaudited.
+    "red-ledger",
 ];
 
 /// Workspace members deliberately outside the audit, each paired with the

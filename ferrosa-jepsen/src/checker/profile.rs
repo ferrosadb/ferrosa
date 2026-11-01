@@ -143,28 +143,43 @@ impl ConsistencyProfile {
     /// Reading it here rather than inferring it from a level name is deliberate: a level name cannot
     /// express whether a read was served locally, and that single bit is what separates a real loss
     /// from an expected one.
-    pub fn from_env() -> Self {
+    pub fn from_env() -> Result<Self, String> {
+        Self::from_vars(|key| std::env::var(key).ok())
+    }
+
+    /// The profile from a variable lookup. An unset variable keeps the default; a set one that does
+    /// not parse is refused, because the default (QUORUM/QUORUM) can convict and silently standing
+    /// it in for a weaker declared profile turns a typo into a `Confirmed` run.
+    pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
         let mut p = ConsistencyProfile::default();
-        if let Ok(v) = std::env::var("FERROSA_JEPSEN_RF") {
-            if let Ok(n) = v.trim().parse::<u32>() {
-                p.replication_factor = n.max(1);
+        if let Some(v) = var("FERROSA_JEPSEN_RF") {
+            p.replication_factor = match v.trim().parse::<u32>() {
+                Ok(n) if n > 0 => n,
+                _ => return Err(format!("FERROSA_JEPSEN_RF={v:?} is not a positive integer")),
+            };
+        }
+        for (key, level) in [
+            ("FERROSA_JEPSEN_WRITE_CL", &mut p.write_level),
+            ("FERROSA_JEPSEN_READ_CL", &mut p.read_level),
+        ] {
+            if let Some(v) = var(key) {
+                *level = Level::parse(&v).ok_or_else(|| {
+                    format!("{key}={v:?} is not one of ONE, QUORUM, LOCAL_QUORUM, ALL")
+                })?;
             }
         }
-        if let Ok(v) = std::env::var("FERROSA_JEPSEN_WRITE_CL") {
-            if let Some(l) = Level::parse(&v) {
-                p.write_level = l;
-            }
+        if let Some(v) = var("FERROSA_JEPSEN_CROSS_DC_READ") {
+            p.cross_datacenter_read = match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" => true,
+                "0" | "false" | "no" => false,
+                _ => {
+                    return Err(format!(
+                        "FERROSA_JEPSEN_CROSS_DC_READ={v:?} is not true/false, yes/no or 1/0"
+                    ))
+                }
+            };
         }
-        if let Ok(v) = std::env::var("FERROSA_JEPSEN_READ_CL") {
-            if let Some(l) = Level::parse(&v) {
-                p.read_level = l;
-            }
-        }
-        if let Ok(v) = std::env::var("FERROSA_JEPSEN_CROSS_DC_READ") {
-            let v = v.trim().to_ascii_lowercase();
-            p.cross_datacenter_read = matches!(v.as_str(), "1" | "true" | "yes");
-        }
-        p
+        Ok(p)
     }
 }
 
@@ -345,6 +360,56 @@ mod tests {
             p(3, Level::One, Level::One, false).classify(false),
             Assurance::NotTested(NotTested::ReadsDoNotOverlapWrites)
         );
+    }
+
+    fn vars<'a>(set: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key| {
+            set.iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    /// An unset variable keeps the suite's default.
+    #[test]
+    fn an_undeclared_profile_is_the_default() {
+        assert_eq!(
+            ConsistencyProfile::from_vars(vars(&[])),
+            Ok(ConsistencyProfile::default())
+        );
+    }
+
+    /// A declared profile is read as declared.
+    #[test]
+    fn a_declared_profile_is_read() {
+        let declared = ConsistencyProfile::from_vars(vars(&[
+            ("FERROSA_JEPSEN_RF", "5"),
+            ("FERROSA_JEPSEN_WRITE_CL", "one"),
+            ("FERROSA_JEPSEN_READ_CL", "ALL"),
+            ("FERROSA_JEPSEN_CROSS_DC_READ", "true"),
+        ]));
+        assert_eq!(declared, Ok(p(5, Level::One, Level::All, true)));
+    }
+
+    /// **A value that does not parse is refused, not replaced by the default.** The default is
+    /// QUORUM/QUORUM, which can convict, so a typo in a run made at ONE/ONE would otherwise be
+    /// classified as `Confirmed` — the over-claim `nothing_is_confirmed_that_the_profile_cannot_support`
+    /// rules out.
+    #[test]
+    fn a_value_that_does_not_parse_is_refused() {
+        for (key, value) in [
+            ("FERROSA_JEPSEN_RF", "three"),
+            ("FERROSA_JEPSEN_RF", "0"),
+            ("FERROSA_JEPSEN_WRITE_CL", "quorom"),
+            ("FERROSA_JEPSEN_READ_CL", ""),
+            ("FERROSA_JEPSEN_CROSS_DC_READ", "maybe"),
+        ] {
+            let result = ConsistencyProfile::from_vars(vars(&[(key, value)]));
+            assert!(
+                matches!(&result, Err(e) if e.contains(key)),
+                "{key}={value:?} must be refused naming the variable: {result:?}"
+            );
+        }
     }
 
     #[test]
