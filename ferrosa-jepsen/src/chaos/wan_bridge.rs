@@ -1,33 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-use super::{NemesisAction, NemesisContext};
-
-/// Execute a WAN-chaos command through the context's configured transport and
-/// fail loudly if the remote node rejects it. This keeps Fly and direct-SSH
-/// runs on the same fault semantics.
-async fn exec_required(ctx: &NemesisContext, node_index: usize, command: &str) -> Result<()> {
-    let output = ctx.exec_on(node_index, command).await?;
-    if output.exit_code != 0 {
-        anyhow::bail!(
-            "WAN chaos command failed on node {node_index} with {}: {}",
-            output.exit_code,
-            output.stderr
-        );
-    }
-    Ok(())
-}
-
-/// Select the netfilter family for a peer address. Docker's T3 bridge uses
-/// IPv4, while Fly private addresses are IPv6; invoking `iptables` for the
-/// latter either rejects the address or leaves the WAN path untouched.
-fn iptables_binary_for(address: &str) -> &'static str {
-    if address.contains(':') {
-        "ip6tables"
-    } else {
-        "iptables"
-    }
-}
+use super::{exec_required, iptables_binary_for, NemesisAction, NemesisContext};
 
 /// WAN bridge sidecar for injecting inter-DC failures.
 pub struct WanBridge {

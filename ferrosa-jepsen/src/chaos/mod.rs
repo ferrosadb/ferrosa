@@ -89,7 +89,8 @@ impl NemesisContext {
         })
     }
 
-    fn fly_ssh_args(&self, node_index: usize, command: &str) -> Result<Vec<String>> {
+    /// The Fly app and the machine ID of one ordered node.
+    fn fly_target(&self, node_index: usize) -> Result<(&str, &str)> {
         let NemesisExecutor::Fly {
             app_name,
             machine_ids,
@@ -100,17 +101,61 @@ impl NemesisContext {
         let machine_id = machine_ids
             .get(node_index)
             .ok_or_else(|| anyhow::anyhow!("missing Fly machine ID for node index {node_index}"))?;
+        Ok((app_name, machine_id))
+    }
+
+    fn fly_ssh_args(&self, node_index: usize, command: &str) -> Result<Vec<String>> {
+        let (app_name, machine_id) = self.fly_target(node_index)?;
         let quoted = command.replace('\'', "'\"'\"'");
         Ok(vec![
             "ssh".to_string(),
             "console".to_string(),
             "--app".to_string(),
-            app_name.clone(),
+            app_name.to_string(),
             "--machine".to_string(),
-            machine_id.clone(),
+            machine_id.to_string(),
             "--command".to_string(),
             format!("sh -lc '{quoted}'"),
         ])
+    }
+
+    /// `fly` arguments for a Machines API action on one ordered node. A kill is a SIGKILL stop,
+    /// not a graceful one: a clean shutdown could flush state a real crash would not.
+    fn fly_machine_args(&self, node_index: usize, action: MachineAction) -> Result<Vec<String>> {
+        let (app_name, machine_id) = self.fly_target(node_index)?;
+        let mut args: Vec<String> = ["machine", action.verb(), machine_id, "--app", app_name]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        match action {
+            MachineAction::Kill => args.extend(["--signal".to_string(), "SIGKILL".to_string()]),
+            MachineAction::Status => args.push("--json".to_string()),
+            MachineAction::Start => {}
+        }
+        Ok(args)
+    }
+
+    /// Run a Machines API action from this host (the guest cannot stop itself observably). Fails
+    /// loud on a non-zero exit; returns stdout.
+    pub(crate) async fn fly_machine(
+        &self,
+        node_index: usize,
+        action: MachineAction,
+    ) -> Result<String> {
+        let args = self.fly_machine_args(node_index, action)?;
+        let output = tokio::process::Command::new("fly")
+            .args(&args)
+            .output()
+            .await?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "`fly {}` failed with {:?}: {}",
+                args.join(" "),
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
     /// Execute a command on one ordered cluster node through the configured
@@ -167,6 +212,11 @@ impl NemesisContext {
         }
     }
 
+    /// Indices of the minority nodes (the last `n - (n/2 + 1)`), matching [`Self::minority_ips`].
+    pub fn minority_indices(&self) -> std::ops::Range<usize> {
+        (self.node_ips.len() / 2) + 1..self.node_ips.len()
+    }
+
     /// Get IPs for "majority" partition (more than half).
     pub fn majority_ips(&self) -> Vec<String> {
         let n = (self.node_ips.len() / 2) + 1;
@@ -183,6 +233,125 @@ impl NemesisContext {
     pub async fn ssh_to(&self, ip: &str) -> Result<crate::ssh::SshClient> {
         crate::ssh::SshClient::connect(ip, self.ssh_port, &self.ssh_user, &self.ssh_key_path).await
     }
+}
+
+/// A Machines API action a Fly nemesis takes against one node from outside the guest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineAction {
+    /// `fly machine stop --signal SIGKILL`: process death without a clean shutdown.
+    Kill,
+    /// `fly machine start`.
+    Start,
+    /// `fly machine status --json`.
+    Status,
+}
+
+impl MachineAction {
+    fn verb(self) -> &'static str {
+        match self {
+            MachineAction::Kill => "stop",
+            MachineAction::Start => "start",
+            MachineAction::Status => "status",
+        }
+    }
+}
+
+/// The `state` field of `fly machine status --json`. A document without one is an error, never
+/// an assumed state.
+pub(crate) fn machine_state_from_json(json: &str) -> Result<String> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| anyhow::anyhow!("machine status is not JSON ({e}): {json}"))?;
+    value
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("machine status has no `state`: {json}"))
+}
+
+/// Shell probe that prints `UP` when the node's own `/readyz` answers and `DOWN` otherwise. It
+/// always exits 0, so a transport failure and a node that is not ready stay distinguishable.
+pub(crate) const SERVING_PROBE: &str =
+    "curl -sf --max-time 3 http://localhost:9090/readyz >/dev/null && echo UP || echo DOWN";
+
+/// Whether [`SERVING_PROBE`] output says the node serves. Only an exact `UP` line counts.
+pub(crate) fn probe_says_serving(stdout: &str) -> bool {
+    stdout.lines().any(|line| line.trim() == "UP")
+}
+
+/// One shell command for one node, by its index in [`NemesisContext::node_ips`].
+pub type NodeCommand = (usize, String);
+
+/// Select the netfilter family for a peer address. Docker bridges use IPv4, while Fly private
+/// addresses are IPv6; invoking `iptables` for the latter either rejects the address or leaves
+/// the path untouched.
+pub(crate) fn iptables_binary_for(address: &str) -> &'static str {
+    if address.contains(':') {
+        "ip6tables"
+    } else {
+        "iptables"
+    }
+}
+
+/// Execute a chaos command through the context's configured transport (SSH, Fly SSH or a
+/// container runtime) and fail loudly if the node rejects it, so a fault that did not apply never
+/// reads as one that did.
+pub(crate) async fn exec_required(
+    ctx: &NemesisContext,
+    node_index: usize,
+    command: &str,
+) -> Result<()> {
+    let output = ctx.exec_on(node_index, command).await?;
+    if output.exit_code != 0 {
+        anyhow::bail!(
+            "chaos command `{command}` failed on node {node_index} with {}: {}",
+            output.exit_code,
+            output.stderr
+        );
+    }
+    Ok(())
+}
+
+/// Run every command of a plan, in order, failing on the first that does not apply.
+pub(crate) async fn run_plan(ctx: &NemesisContext, plan: &[NodeCommand]) -> Result<()> {
+    for (node_index, command) in plan {
+        exec_required(ctx, *node_index, command).await?;
+    }
+    Ok(())
+}
+
+/// Commands that cut every node in `isolated` off from every other node, in both directions and
+/// on both ends, with the netfilter family of each peer address.
+pub fn isolate_plan(node_ips: &[String], isolated: &[usize]) -> Vec<NodeCommand> {
+    let mut plan = Vec::new();
+    let others: Vec<usize> = (0..node_ips.len())
+        .filter(|i| !isolated.contains(i))
+        .collect();
+    for (side, peers) in [(isolated, others.as_slice()), (others.as_slice(), isolated)] {
+        for &node in side {
+            for &peer in peers {
+                let ip = &node_ips[peer];
+                let iptables = iptables_binary_for(ip);
+                plan.push((node, format!("{iptables} -A INPUT -s {ip} -j DROP")));
+                plan.push((node, format!("{iptables} -A OUTPUT -d {ip} -j DROP")));
+            }
+        }
+    }
+    plan
+}
+
+/// Commands that flush the INPUT and OUTPUT chains on every node, in each node's own family.
+pub fn flush_plan(node_ips: &[String]) -> Vec<NodeCommand> {
+    node_ips
+        .iter()
+        .enumerate()
+        .flat_map(|(node, ip)| {
+            let iptables = iptables_binary_for(ip);
+            [
+                (node, format!("{iptables} -F INPUT")),
+                (node, format!("{iptables} -F OUTPUT")),
+            ]
+        })
+        .collect()
 }
 
 /// Schedule for running nemeses during a test.
@@ -438,6 +607,123 @@ mod tests {
             ],
             "the WAN action must execute on the selected Fly machine, not the local runner"
         );
+    }
+
+    fn fly_ips() -> Vec<String> {
+        vec![
+            "fdaa:0:1::1".into(),
+            "fdaa:0:1::2".into(),
+            "fdaa:0:1::3".into(),
+        ]
+    }
+
+    #[test]
+    fn isolating_the_minority_drops_both_directions_on_both_ends_in_ip6tables() {
+        let plan = isolate_plan(&fly_ips(), &[2]);
+        let expected: Vec<NodeCommand> = vec![
+            (2, "ip6tables -A INPUT -s fdaa:0:1::1 -j DROP".into()),
+            (2, "ip6tables -A OUTPUT -d fdaa:0:1::1 -j DROP".into()),
+            (2, "ip6tables -A INPUT -s fdaa:0:1::2 -j DROP".into()),
+            (2, "ip6tables -A OUTPUT -d fdaa:0:1::2 -j DROP".into()),
+            (0, "ip6tables -A INPUT -s fdaa:0:1::3 -j DROP".into()),
+            (0, "ip6tables -A OUTPUT -d fdaa:0:1::3 -j DROP".into()),
+            (1, "ip6tables -A INPUT -s fdaa:0:1::3 -j DROP".into()),
+            (1, "ip6tables -A OUTPUT -d fdaa:0:1::3 -j DROP".into()),
+        ];
+        assert_eq!(plan, expected);
+    }
+
+    #[test]
+    fn isolating_an_ipv4_node_uses_iptables_and_never_touches_the_majority_link() {
+        let ips: Vec<String> = vec!["10.0.0.1".into(), "10.0.0.2".into(), "10.0.0.3".into()];
+        let plan = isolate_plan(&ips, &[2]);
+        assert_eq!(plan.len(), 8);
+        assert!(plan.iter().all(|(_, c)| c.starts_with("iptables ")));
+        assert!(
+            !plan
+                .iter()
+                .any(|(node, c)| *node == 0 && c.contains("10.0.0.2")),
+            "the majority must keep talking to itself: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn healing_flushes_every_node_in_its_own_family() {
+        let ips: Vec<String> = vec!["10.0.0.1".into(), "fdaa:0:1::2".into()];
+        assert_eq!(
+            flush_plan(&ips),
+            vec![
+                (0, "iptables -F INPUT".to_string()),
+                (0, "iptables -F OUTPUT".to_string()),
+                (1, "ip6tables -F INPUT".to_string()),
+                (1, "ip6tables -F OUTPUT".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn minority_indices_match_minority_ips() {
+        let ctx = NemesisContext::fly(
+            fly_ips(),
+            "app",
+            vec!["m1".into(), "m2".into(), "m3".into()],
+        )
+        .expect("context");
+        assert_eq!(ctx.minority_indices(), 2..3);
+        assert_eq!(ctx.minority_ips(), vec!["fdaa:0:1::3".to_string()]);
+    }
+
+    #[test]
+    fn a_fly_kill_is_a_sigkill_stop_of_the_matching_machine_and_a_start_brings_it_back() {
+        let ctx = NemesisContext::fly(
+            fly_ips(),
+            "ferrosa-je6",
+            vec!["m1".into(), "m2".into(), "m3".into()],
+        )
+        .expect("context");
+        assert_eq!(
+            ctx.fly_machine_args(2, MachineAction::Kill)
+                .expect("kill args"),
+            vec![
+                "machine",
+                "stop",
+                "m3",
+                "--app",
+                "ferrosa-je6",
+                "--signal",
+                "SIGKILL"
+            ]
+        );
+        assert_eq!(
+            ctx.fly_machine_args(2, MachineAction::Start)
+                .expect("start args"),
+            vec!["machine", "start", "m3", "--app", "ferrosa-je6"]
+        );
+        assert_eq!(
+            ctx.fly_machine_args(0, MachineAction::Status)
+                .expect("status args"),
+            vec!["machine", "status", "m1", "--app", "ferrosa-je6", "--json"]
+        );
+        assert!(ctx.fly_machine_args(3, MachineAction::Kill).is_err());
+    }
+
+    #[test]
+    fn machine_state_is_read_from_the_status_json_and_a_missing_state_is_an_error() {
+        assert_eq!(
+            machine_state_from_json(r#"{"id":"m3","state":"stopped","name":"ferrosa-3"}"#)
+                .expect("state"),
+            "stopped"
+        );
+        assert!(machine_state_from_json(r#"{"id":"m3"}"#).is_err());
+        assert!(machine_state_from_json("not json").is_err());
+    }
+
+    #[test]
+    fn only_an_up_line_counts_as_serving() {
+        assert!(probe_says_serving("Connecting to fdaa...\nUP\n"));
+        assert!(!probe_says_serving("DOWN\n"));
+        assert!(!probe_says_serving(""));
+        assert!(!probe_says_serving("UPGRADE\n"));
     }
 
     #[test]

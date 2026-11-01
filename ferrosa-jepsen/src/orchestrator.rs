@@ -90,6 +90,48 @@ fn cluster_from_preprovisioned_nodes(
     Ok(ClusterInfo::external(nodes))
 }
 
+/// The addresses Fly nemeses partition by. They default to the CQL contact hosts, but a client
+/// outside Fly reaches the cluster through `fly proxy` on loopback, and a DROP rule for loopback
+/// severs nothing, so `FERROSA_JEPSEN_FLY_NODE_IPS` (comma-separated, in contact order) supplies
+/// the machines' private addresses. A loopback target or a count mismatch is refused.
+fn fly_nemesis_node_ips(
+    contact_hosts: Vec<String>,
+    override_ips: Option<&str>,
+) -> Result<Vec<String>> {
+    let node_ips = match override_ips {
+        None => contact_hosts,
+        Some(list) => {
+            let ips: Vec<String> = list
+                .split(',')
+                .map(str::trim)
+                .filter(|ip| !ip.is_empty())
+                .map(str::to_string)
+                .collect();
+            if ips.len() != contact_hosts.len() {
+                bail!(
+                    "FERROSA_JEPSEN_FLY_NODE_IPS names {} addresses for {} contact points",
+                    ips.len(),
+                    contact_hosts.len()
+                );
+            }
+            ips
+        }
+    };
+    let loopback = |ip: &str| {
+        ip == "localhost"
+            || ip
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|addr| addr.is_loopback())
+    };
+    if let Some(ip) = node_ips.iter().find(|ip| loopback(ip)) {
+        bail!(
+            "Fly nemesis target {ip} is loopback, so a partition would sever nothing; \
+             set FERROSA_JEPSEN_FLY_NODE_IPS to the machines' private addresses"
+        );
+    }
+    Ok(node_ips)
+}
+
 /// Build the command transport for a live nemesis run. Fly machine IDs are
 /// required when the caller selects the Fly transport; otherwise this retains
 /// the direct-SSH path used by Firecracker-based tests.
@@ -107,6 +149,8 @@ fn nemesis_context_for_cluster(cluster: &ClusterInfo) -> Result<NemesisContext> 
             .filter(|id| !id.is_empty())
             .map(str::to_string)
             .collect();
+        let override_ips = std::env::var("FERROSA_JEPSEN_FLY_NODE_IPS").ok();
+        let node_ips = fly_nemesis_node_ips(node_ips, override_ips.as_deref())?;
         return NemesisContext::fly(node_ips, app_name, machine_ids);
     }
 
@@ -726,6 +770,47 @@ fn combine_assurance(history: Assurance, durability: Option<Assurance>) -> Assur
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hosts(list: &[&str]) -> Vec<String> {
+        list.iter().map(|h| h.to_string()).collect()
+    }
+
+    #[test]
+    fn fly_nemeses_target_the_contact_hosts_when_no_override_is_given() {
+        let contacts = hosts(&["fdaa:0:1::1", "fdaa:0:1::2", "fdaa:0:1::3"]);
+        assert_eq!(
+            fly_nemesis_node_ips(contacts.clone(), None).expect("contacts are real"),
+            contacts
+        );
+    }
+
+    #[test]
+    fn fly_nemeses_target_the_override_when_clients_go_through_local_proxies() {
+        let contacts = hosts(&["127.0.0.1", "127.0.0.1", "127.0.0.1"]);
+        assert_eq!(
+            fly_nemesis_node_ips(contacts, Some(" fdaa:0:1::1, fdaa:0:1::2 ,fdaa:0:1::3"))
+                .expect("override"),
+            hosts(&["fdaa:0:1::1", "fdaa:0:1::2", "fdaa:0:1::3"])
+        );
+    }
+
+    #[test]
+    fn a_fly_nemesis_aimed_at_loopback_is_refused_rather_than_partitioning_nothing() {
+        let error = fly_nemesis_node_ips(hosts(&["127.0.0.1", "127.0.0.1", "127.0.0.1"]), None)
+            .expect_err("loopback targets sever nothing");
+        assert!(
+            error.to_string().contains("FERROSA_JEPSEN_FLY_NODE_IPS"),
+            "{error}"
+        );
+        assert!(fly_nemesis_node_ips(hosts(&["localhost", "::1"]), None).is_err());
+    }
+
+    #[test]
+    fn a_fly_node_ip_override_with_the_wrong_count_is_refused() {
+        let contacts = hosts(&["127.0.0.1", "127.0.0.1", "127.0.0.1"]);
+        assert!(fly_nemesis_node_ips(contacts.clone(), Some("fdaa::1,fdaa::2")).is_err());
+        assert!(fly_nemesis_node_ips(contacts, Some("")).is_err());
+    }
 
     #[test]
     fn a_book_refutation_or_blind_spot_overrides_a_clean_history() {

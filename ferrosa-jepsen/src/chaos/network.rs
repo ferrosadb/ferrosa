@@ -15,49 +15,22 @@ impl NemesisAction for PartitionHalves {
         "partition-halves"
     }
 
+    /// Cut the minority off from the majority on both ends. Runs through the context's transport
+    /// (SSH, Fly SSH or a container runtime) with each peer's netfilter family, and fails loud on
+    /// a command that does not apply.
     async fn inject(&self, ctx: &NemesisContext) -> Result<()> {
-        let majority = ctx.majority_ips();
-        let minority = ctx.minority_ips();
-
-        // On each minority node, drop packets to/from majority nodes.
-        for minority_ip in &minority {
-            let ssh = ctx.ssh_to(minority_ip).await?;
-            for majority_ip in &majority {
-                // Drop incoming from majority.
-                ssh.exec(&format!("iptables -A INPUT -s {majority_ip} -j DROP"))
-                    .await?;
-                // Drop outgoing to majority.
-                ssh.exec(&format!("iptables -A OUTPUT -d {majority_ip} -j DROP"))
-                    .await?;
-            }
-        }
-
-        // Also on majority nodes, drop packets from minority.
-        for majority_ip in &majority {
-            let ssh = ctx.ssh_to(majority_ip).await?;
-            for minority_ip in &minority {
-                ssh.exec(&format!("iptables -A INPUT -s {minority_ip} -j DROP"))
-                    .await?;
-                ssh.exec(&format!("iptables -A OUTPUT -d {minority_ip} -j DROP"))
-                    .await?;
-            }
-        }
-
+        let minority: Vec<usize> = ctx.minority_indices().collect();
+        super::run_plan(ctx, &super::isolate_plan(&ctx.node_ips, &minority)).await?;
         tracing::info!(
-            majority = ?majority,
-            minority = ?minority,
+            majority = ?ctx.majority_ips(),
+            minority = ?ctx.minority_ips(),
             "Injected partition-halves"
         );
         Ok(())
     }
 
     async fn heal(&self, ctx: &NemesisContext) -> Result<()> {
-        // Flush all iptables rules on all nodes.
-        for ip in &ctx.node_ips {
-            let ssh = ctx.ssh_to(ip).await?;
-            ssh.exec("iptables -F INPUT").await?;
-            ssh.exec("iptables -F OUTPUT").await?;
-        }
+        super::run_plan(ctx, &super::flush_plan(&ctx.node_ips)).await?;
         tracing::info!("Healed partition-halves");
         Ok(())
     }

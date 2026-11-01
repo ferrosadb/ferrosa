@@ -138,6 +138,14 @@ graph. It calls `ferrosa-sim` for the simulator-backed endurance path.
     node's **WAN-network IP** (resolved via `container_runtime inspect`), not the
     host-mapped `localhost` CQL contacts — otherwise the injected `iptables`
     DROP rules would hit loopback and silently sever nothing.
+    `partition-halves` and `dc-partition` run through the same transport and
+    pick `iptables` or `ip6tables` per peer address (Fly's private network is
+    IPv6). On Fly, `kill-minority` is a host-side `fly machine stop --signal
+    SIGKILL`, proven by the machine reaching `stopped`; heal runs `fly machine
+    start` and waits up to 300 s for `/readyz`, failing the combination if the
+    node never rejoins. When the client reaches Fly through `fly proxy` on
+    loopback, set `FERROSA_JEPSEN_FLY_NODE_IPS` (the machines' private
+    addresses, in contact order); a loopback nemesis target is refused.
 - **Endurance sim** (`endurance_sim.rs`) — the **sim-equivalent endurance run**
   (W8.9, ADR-016). Drives `ferrosa_sim::multi_dc::DualDcBankSim` (voters +
   per-DC learners) over a 24-simulated-hour horizon with periodic rolling-window
