@@ -111,6 +111,12 @@ gaps of the same shape as the deferred `t_6b9baa8a` (`core::str::pattern`).
 for **every** backend. A Coq run of `jsonb.llbc` produced a 20724-line file
 containing 31 Lean-syntax lines — Coq cannot parse them.
 
+The obvious repair, making the Coq registration of `Prop`-inductive eliminators a
+fatal error so the offending definitions are skipped, is worse than the disease: the
+same input then produced an 11-line file, an empty module, because the abort takes the
+rest of the crate with it. The Lean-syntax leak has to be fixed at emission, not by
+refusing the input.
+
 Gating the printing is not a small change: the same block is what registers the
 trait and instance names in the extraction context, and the rest of the
 extraction resolves them through it. Measured, deterministically:
