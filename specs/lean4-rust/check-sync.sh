@@ -21,7 +21,14 @@ source_hash() {
 }
 
 root=$(git -C "$PWD" rev-parse --show-toplevel) || exit 2
-current_aeneas=$(git -C "$HOME/src/aeneas" rev-parse --short HEAD 2>/dev/null || echo unknown)
+# The translator comparison needs an aeneas checkout. Without one (every CI runner) it cannot be
+# made: say so once and keep checking the sources, rather than report every row's translator as
+# having moved to "unknown".
+aeneas_dir=${AENEAS_DIR:-$HOME/src/aeneas}
+current_aeneas=$(git -C "$aeneas_dir" rev-parse --short HEAD 2>/dev/null) || current_aeneas=
+if [ -z "$current_aeneas" ]; then
+  echo "TOOL    not compared: no aeneas checkout at $aeneas_dir (set AENEAS_DIR); sources still checked"
+fi
 drift=0
 stale=0
 checked=0
@@ -51,7 +58,7 @@ while read -r line; do
     echo "        run: specs/lean4-rust/extract.sh $module"
     drift=1
   fi
-  if [ "$record_aeneas" != "$current_aeneas" ]; then
+  if [ -n "$current_aeneas" ] && [ "$record_aeneas" != "$current_aeneas" ]; then
     echo "TOOL    $module: extracted at aeneas $record_aeneas, current is $current_aeneas"
     echo "        the translator moved under a committed extraction; regenerate to compare"
     drift=1
