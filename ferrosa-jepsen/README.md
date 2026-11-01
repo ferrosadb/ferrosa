@@ -83,6 +83,15 @@ graph. It calls `ferrosa-sim` for the simulator-backed endurance path.
     and a JDK 17+ (`brew install leiningen openjdk@17`, then `lein deps` in
     `elle-checker/`). The CI Jepsen smoke tier installs a checksum-pinned
     `lein` 2.11.2 for them.
+  - **Durability book** (`checker/book.rs`) — four multisets kept as
+    value→count maps: `attempted`, `acknowledged`, `indeterminate` (timed out or
+    failed after send) and `recovered` (the final read). It derives
+    `lost = acknowledged − recovered`, `unexpected = recovered − acknowledged`,
+    `fabricated = unexpected − indeterminate` and
+    `recovered_indeterminate = unexpected − fabricated`. Only `lost` and
+    `fabricated` refute, each reported separately and never summed; a run with no
+    acknowledged write is `NotTested("no acknowledged writes")`. Each Lean witness
+    in `specs/lean4/Ferrosa/Testing/Histories.lean` has a test of the same name.
 - **Drivers** (`driver/`) — `rust_driver` connects to a real cluster via the
   `scylla` driver (`phase1`, the only wired driver). Its single-coordinator
   policy first lets the workload session discover topology, selects a stable

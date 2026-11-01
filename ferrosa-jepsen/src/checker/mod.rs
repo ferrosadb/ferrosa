@@ -1,3 +1,4 @@
+pub mod book;
 pub mod elle;
 pub mod knossos;
 pub mod membership;
