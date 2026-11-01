@@ -191,11 +191,15 @@ pub enum NotTested {
     ReadsDoNotOverlapWrites,
     /// The read may be answered by a datacenter that does not hold the write.
     CrossDatacenterRead,
+    /// The run acknowledged no write, so nothing could have been lost (decision D9 of
+    /// `specs/jepsen-evidence`; Lean `a_write_free_generator_cannot_test_durability`).
+    NoAcknowledgedWrites,
 }
 
 impl NotTested {
     pub fn reason(self) -> &'static str {
         match self {
+            NotTested::NoAcknowledgedWrites => "no acknowledged writes",
             NotTested::ReadsDoNotOverlapWrites => {
                 "W + R <= RF: a read need not intersect every write's replica set"
             }
