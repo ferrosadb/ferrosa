@@ -93,6 +93,31 @@ target.
 Acceptance: for every generated file, every referenced `.Insts.` name has a
 matching declaration. Checkable by parsing the emitted file, no Lean needed.
 
+## Step 2b — wide enums: the 245-constructor ceiling (dominant red in `ferrosa_net`)
+
+Measured on Lean 4.35, by generating inductives directly (one payload constructor so
+the scalar and boxed representations are both covered):
+
+```
+244 constructors  ok
+245 constructors  error: tag for constructor 'Wide.c244' is too big,
+                  this is a limitation of the current runtime
+```
+
+The runtime reserves the top of the scalar tag space, so an inductive carries at most
+244 constructors. `rustls::enums::CipherSuite` has **377**, which is why the whole
+enum fails to compile and every later mention reports a phantom dependency on the
+`CipherSuite.ctorElim` Lean would have generated — 94 of the 101 elaboration errors in
+`ferrosa_net`'s `tls` module are that one cascade.
+
+No printer change can fix this: the construct cannot be represented as an inductive at
+all. The options are (a) a non-inductive model — a tag field over `Std.U16` plus
+constructor `def`s, which changes what pattern matching compiles to; (b) `opaque` with
+axioms for its operations, losing constructors; (c) `--opaque`/`--exclude` for such enums
+at charon, which is user-side and leaves the type unmodelled. Choosing is a design
+decision, not a bug fix, and (a) has the widest blast radius because `Discriminant` and
+every `match` over the enum are generated from the inductive shape.
+
 ## Step 3 — the trait model (414 reds)
 
 Decision: a trait is a **record of methods parameterised by its associated
