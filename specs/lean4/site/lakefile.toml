@@ -1,0 +1,32 @@
+# The specification as a web site: Verso's literate renderer over the corpus in `..`.
+#
+# A separate package so the corpus keeps its promise of core Lean only. `specs/lean4` builds with no
+# dependency and no network; this package is the only place Verso is required, and it compiles the
+# same sources (`srcDir = ".."`) rather than a copy, so the site cannot say anything the corpus does
+# not. The prose is the `/-!` sections and `/--` docstrings next to each theorem, exactly as for the
+# PDF; `literate.toml` only orders and titles the pages.
+#
+#   lake query :literateHtml     build, then print the site's directory
+#
+# Verso's tag tracks the Lean release, so its rev must name the tag matching `lean-toolchain`.
+
+name = "ferrosaSpecSite"
+version = "0.1.0"
+defaultTargets = ["FerrosaProduct", "Ferrosa"]
+
+[[require]]
+name = "verso"
+git = "https://github.com/leanprover/verso"
+rev = "v4.35.0"
+
+[[lean_lib]]
+name = "Ferrosa"
+srcDir = ".."
+globs = ["Ferrosa", "Ferrosa.*"]
+
+# The product pages: the introduction, one page per ferrosa.ai feature citing the theorems that back
+# it, and the generated theorem register. Every `#check` on them fails the build if the theorem it
+# cites is renamed or removed.
+[[lean_lib]]
+name = "FerrosaProduct"
+globs = ["FerrosaProduct", "FerrosaProduct.*"]
