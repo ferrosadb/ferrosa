@@ -27,6 +27,11 @@ concurrency:
 permissions:
   contents: read
 
+# A Lean `panic!` prints and returns a default value, so a harness or exporter that panics would
+# still exit 0. Abort instead, so a panic fails the job.
+env:
+  LEAN_ABORT_ON_PANIC: "1"
+
 jobs:
   specs:
     name: Build and run the harness
@@ -134,7 +139,9 @@ jobs:
           test -s build/ferrosa-specs.pdf
           ls -l build/ferrosa-specs.pdf
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fa1a0b # v7.0.1
+      # The pin every other workflow in this repo uses; the previous SHA does not resolve, which
+      # failed the job before its first step ran.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ferrosa-formal-specification
           path: specs/lean4/build/ferrosa-specs.pdf

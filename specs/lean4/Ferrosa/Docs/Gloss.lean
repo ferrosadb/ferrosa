@@ -82,7 +82,7 @@ partial def peel (env : Environment) (e : Expr) (subst : Array Expr) (vars : Arr
     (hyps : Array String) : Array String × Array String × Expr :=
   match e with
   | .forallE n t b bi =>
-    let nm := if n.toString == "_" then "x" else n.getString!
+    let nm := if n.toString == "_" then "x" else Ferrosa.Docs.Tex.lastComponent n
     let t := t.instantiate subst
     let c := Expr.const (.str .anonymous nm) []
     let b := b.instantiate (#[c] ++ subst)
