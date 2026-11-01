@@ -67,9 +67,15 @@ use std::collections::HashSet;
 fn red_names_are_unique_identifiers() {
     let mut seen = HashSet::new();
     for red in REDS {
-        assert!(seen.insert(red.name), "two reds share the name {}", red.name);
         assert!(
-            red.name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+            seen.insert(red.name),
+            "two reds share the name {}",
+            red.name
+        );
+        assert!(
+            red.name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
             "{} is not a snake_case identifier",
             red.name
         );
@@ -82,7 +88,11 @@ fn red_names_are_unique_identifiers() {
 fn every_red_names_its_reason_and_witness() {
     for red in REDS {
         assert!(!red.claim.is_empty(), "{}: empty claim", red.name);
-        assert!(!red.why.is_empty(), "{}: no reason the code fails it", red.name);
+        assert!(
+            !red.why.is_empty(),
+            "{}: no reason the code fails it",
+            red.name
+        );
         assert!(!red.witness.is_empty(), "{}: no witness theorem", red.name);
     }
 }
@@ -91,7 +101,11 @@ fn every_red_names_its_reason_and_witness() {
 /// ledger without the number moving. Update it in the same commit that adds or closes a red.
 #[test]
 fn red_count_is_pinned() {
-    assert_eq!(REDS.len(), __COUNT__, "the number of reds changed; update this pin and say why");
+    assert_eq!(
+        REDS.len(),
+        __COUNT__,
+        "the number of reds changed; update this pin and say why"
+    );
 }
 """
 

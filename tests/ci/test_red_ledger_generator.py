@@ -7,6 +7,8 @@ reds -- plus tests that assert something about that data on every run.
 """
 
 import importlib.util
+import shutil
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -60,12 +62,27 @@ class GeneratedJoin(unittest.TestCase):
 
     def test_the_count_is_pinned_to_the_number_of_reds(self):
         tests = self.files["red-ledger/tests/reds.rs"]
-        self.assertIn("assert_eq!(REDS.len(), 2,", tests)
+        self.assertIn("REDS.len(),\n        2,\n", tests)
 
     def test_no_red_becomes_a_test_function(self):
         tests = self.files["red-ledger/tests/reds.rs"]
         self.assertNotIn("fn testing_jepsen__", tests)
         self.assertNotIn("fn storage_recovery__", tests)
+
+    def test_generated_files_are_already_rustfmt_clean(self):
+        # CI runs both `cargo fmt --check` and `red_ledger.py --check`. If rustfmt would rewrite
+        # the generated text, one of the two must fail: formatting breaks the staleness check, and
+        # not formatting breaks the format check.
+        rustfmt = shutil.which("rustfmt")
+        if rustfmt is None:
+            self.fail("rustfmt is not on PATH; install it with `rustup component add rustfmt`")
+        # Compare the formatted text rather than trusting `--check`'s exit code: on stdin it prints
+        # the diff and still exits 0.
+        for path, text in self.files.items():
+            out = subprocess.run([rustfmt, "--edition", "2021", "--emit", "stdout"], input=text,
+                                 capture_output=True, text=True)
+            self.assertEqual(out.returncode, 0, f"rustfmt failed on {path}: {out.stderr}")
+            self.assertEqual(out.stdout, text, f"{path} is not rustfmt-clean")
 
 
 if __name__ == "__main__":
