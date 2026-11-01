@@ -1,0 +1,135 @@
+# Page order and presentation for the literate site. No prose lives here: every sentence on the site
+# comes from the corpus sources, as it does for the PDF.
+#
+# The order follows the PDF's parts (`Ferrosa/Docs/Book.lean`): the query surface a user meets
+# first, then consistency and topology, what leaves the cluster, the write path and storage
+# internals, foundations, evidence, and last the accounting of what is not yet proved.
+
+hide_commands = ["import", "open", "set_option", "namespace", "end", "section", "variable"]
+docstrings_as_text = true
+extra_css = ["ferrosa.css"]
+extra_js = ["a11y.js", "review.js"]
+landing_page = "FerrosaProduct"
+order = ["FerrosaProduct", "Ferrosa"]
+
+# The book generator is tooling, not specification.
+exclude = ["Ferrosa.Docs"]
+
+[[targets]]
+library = "FerrosaProduct"
+
+[[targets]]
+library = "Ferrosa"
+
+# The product pages import the whole corpus; the list says nothing to a reader.
+[modules."FerrosaProduct"]
+title = "Introduction"
+url = "product"
+show_imports = false
+
+[modules."FerrosaProduct.ObjectStorage"]
+title = "Durable storage"
+
+[modules."FerrosaProduct.Cql"]
+title = "CQL compatibility"
+
+[modules."FerrosaProduct.Transactions"]
+title = "Transactions"
+
+[modules."FerrosaProduct.Scaling"]
+title = "Replication and consistency"
+
+[modules."FerrosaProduct.QuerySurfaces"]
+title = "Postgres, Bolt and SPARQL"
+
+[modules."FerrosaProduct.Streaming"]
+title = "Complete results, bounded memory"
+
+[modules."FerrosaProduct.Subscriptions"]
+title = "Subscriptions and CDC"
+
+[modules."FerrosaProduct.KnownDefects"]
+title = "Known defects"
+
+[modules."FerrosaProduct.Uncovered"]
+title = "Not yet specified"
+
+[modules."FerrosaProduct.Register"]
+title = "Theorem register"
+
+[modules."FerrosaProduct.Register.Part1"]
+title = "I. The query surface"
+
+[modules."FerrosaProduct.Register.Part2"]
+title = "II. Consistency and topology"
+
+[modules."FerrosaProduct.Register.Part3"]
+title = "III. What leaves the cluster"
+
+[modules."FerrosaProduct.Register.Part4"]
+title = "IV. The write path"
+
+[modules."FerrosaProduct.Register.Part5"]
+title = "V. Foundations"
+
+[modules."FerrosaProduct.Register.Part6"]
+title = "VI. Evidence"
+
+[modules."FerrosaProduct.Register.Part7"]
+title = "VII. Limits and accounting"
+
+[metadata]
+title = "Ferrosa specification"
+description = "What Ferrosa guarantees, machine-checked in Lean 4, with the internals that carry each guarantee."
+favicon = "assets/favicon.svg"
+
+[order_children]
+"FerrosaProduct" = [
+  "FerrosaProduct.ObjectStorage", "FerrosaProduct.Cql", "FerrosaProduct.Transactions",
+  "FerrosaProduct.Scaling", "FerrosaProduct.QuerySurfaces", "FerrosaProduct.Streaming",
+  "FerrosaProduct.Subscriptions", "FerrosaProduct.KnownDefects", "FerrosaProduct.Uncovered",
+  "FerrosaProduct.Register",
+]
+"FerrosaProduct.Register" = [
+  "FerrosaProduct.Register.Part1", "FerrosaProduct.Register.Part2", "FerrosaProduct.Register.Part3",
+  "FerrosaProduct.Register.Part4", "FerrosaProduct.Register.Part5", "FerrosaProduct.Register.Part6",
+  "FerrosaProduct.Register.Part7",
+]
+# Verso orders modules, not bare namespaces, so `Ferrosa.Cql` and the other directories with no
+# module of their own keep alphabetical order among themselves; only the top-level modules are
+# placed, in part order.
+"Ferrosa" = [
+  "Ferrosa.WritePath",
+  "Ferrosa.Core", "Ferrosa.Ledger", "Ferrosa.Witnesses",
+  "Ferrosa.Harness", "Ferrosa.TlaCheck",
+  "Ferrosa.Unimplemented", "Ferrosa.Broken", "Ferrosa.Todo", "Ferrosa.Ledgers",
+]
+"Ferrosa.Cql" = [
+  "Ferrosa.Cql.Syntax", "Ferrosa.Cql.Classify", "Ferrosa.Cql.Collections", "Ferrosa.Cql.Conformance",
+  "Ferrosa.Cql.Aggregate", "Ferrosa.Cql.AggregateObligations", "Ferrosa.Cql.Lwt", "Ferrosa.Cql.Refine",
+  "Ferrosa.Cql.Index", "Ferrosa.Cql.Subscribe",
+]
+"Ferrosa.Sql" = ["Ferrosa.Sql.Semantics", "Ferrosa.Sql.Index", "Ferrosa.Sql.Txn", "Ferrosa.Sql.Consistency"]
+"Ferrosa.Topology" = [
+  "Ferrosa.Topology.Single", "Ferrosa.Topology.Pair", "Ferrosa.Topology.ThreeNode",
+  "Ferrosa.Topology.FiveNode", "Ferrosa.Topology.TwoDc", "Ferrosa.Topology.ThreeDcRing",
+  "Ferrosa.Topology.Ladder", "Ferrosa.Topology.DcQuorum", "Ferrosa.Topology.ConsistencyLevels",
+  "Ferrosa.Topology.Basic",
+]
+"Ferrosa.Accord" = [
+  "Ferrosa.Accord.Protocol", "Ferrosa.Accord.Strict", "Ferrosa.Accord.Serializable",
+  "Ferrosa.Accord.History", "Ferrosa.Accord.Recovery", "Ferrosa.Accord.Edn",
+  "Ferrosa.Accord.AccordMultiDcLean", "Ferrosa.Accord.RunCheck",
+]
+"Ferrosa.Commons" = [
+  "Ferrosa.Commons.Stream", "Ferrosa.Commons.Hll", "Ferrosa.Commons.Flow",
+  "Ferrosa.Commons.FrontEnd", "Ferrosa.Commons.Tactics",
+]
+"Ferrosa.Storage" = [
+  "Ferrosa.Storage.Format", "Ferrosa.Storage.Mvcc", "Ferrosa.Storage.Recovery",
+  "Ferrosa.Storage.Tombstone", "Ferrosa.Storage.Streaming",
+]
+"Ferrosa.Testing" = [
+  "Ferrosa.Testing.Jepsen", "Ferrosa.Testing.JepsenModels", "Ferrosa.Testing.Histories",
+  "Ferrosa.Testing.Guarantees",
+]
