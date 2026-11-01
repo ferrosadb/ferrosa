@@ -650,18 +650,10 @@ impl ModeController {
                 op: RaftOp::JoinNode(node_info),
                 schema_version,
             };
-            if let Err(e) = raft.client_write(join_cmd).await {
-                clear_pending_join(&pending_joins, host_id);
-                tracing::warn!(peer = %host_id, leader, %e, "JoinNode proposal failed");
-                return;
-            }
-
-            // Propose AssignTokens via Raft.
             let num_tokens = config_clone.num_tokens as usize;
             let tokens: Vec<i64> = (0..num_tokens)
                 .map(|i| generate_deterministic_token(peer_node_id, i))
                 .collect();
-
             let assign_cmd = RaftCommand {
                 op: RaftOp::AssignTokens {
                     node_id: peer_node_id,
@@ -669,13 +661,22 @@ impl ModeController {
                 },
                 schema_version,
             };
-            if let Err(e) = raft.client_write(assign_cmd).await {
-                clear_pending_join(&pending_joins, host_id);
-                tracing::warn!(peer = %host_id, leader, %e, "AssignTokens proposal failed");
+            // Leadership can move between the leader check above and this write;
+            // a refused proposal is forwarded to the leader, never dropped
+            // (t_9c219a2b).
+            let admitted = crate::raft_forward::propose_ring_member_via_raft(
+                &raft,
+                admission_node_map.as_deref(),
+                peer_manager.as_deref(),
+                join_cmd,
+                assign_cmd,
+            )
+            .await;
+            clear_pending_join(&pending_joins, host_id);
+            if let Err(e) = admitted {
+                tracing::warn!(peer = %host_id, leader, %e, "ring admission (JoinNode + AssignTokens) failed");
                 return;
             }
-
-            clear_pending_join(&pending_joins, host_id);
 
             tracing::info!(
                 peer = %host_id,

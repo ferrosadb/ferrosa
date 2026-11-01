@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cluster
 doc: fmea
-last_updated: 2026-10-23
+last_updated: 2026-11-01
 ---
 # ferrosa-cluster — FMEA / Known Issues
 Failure modes are ranked by **RPN = Severity × Occurrence × Detection** (1–10
@@ -241,6 +241,39 @@ Direct/Forming/Cluster publication controls. Previously queued operations still
 return errors to their callers and retain their existing replay semantics; this
 change does not claim durable WAN repair of a previously acknowledged divergent
 schema.
+
+## CL-78 — a refused ring admission was dropped during formation
+
+Every node that sees a voter connect proposes its ring admission (`JoinNode`,
+then `AssignTokens`), and the seed proposes its own and its peers' after the
+election. Only the Raft leader commits them. Both sites called `client_write`
+directly and on any error logged a warning and moved on, so a proposal refused
+with `ForwardToLeader` was dropped. That happens to a non-leader, and to a node
+whose leadership moved between its leader check and the write. Nothing replayed
+the admission until a reconnect, so the initial voter topology never published
+token ownership. After `formation_deadline_secs` the node logged `initial voter
+topology did not publish token ownership; refusing client admission` and stayed
+`Forming` with no Cluster DDL path. Observed in CI as
+`data_center_process::a_ddl_created_in_one_dc_reaches_the_other` waiting 120 s
+on `{"waiting_for":"ddl_path"}` (`t_9c219a2b`). Severity 8, occurrence 3,
+detection 4 (RPN 96 before mitigation).
+
+Both sites now call `raft_forward::propose_ring_member_via_raft`, which forwards
+a refused proposal to the leader. It resolves the leader's host id through the
+Raft node map, because during formation the leader's own `NodeInfo` may not be
+in the token ring yet. A failed `JoinNode` stops before `AssignTokens`, so tokens
+are never assigned to a member that did not join. Red first:
+`raft_forward::tests::propose_ring_member_forwards_both_commands_when_not_leader`,
+taken against the extracted sequence before forwarding was added. Guards:
+`propose_ring_member_on_the_leader_commits_both_locally`,
+`propose_ring_member_never_assigns_tokens_after_a_failed_join`,
+`propose_ring_member_surfaces_a_non_forward_raft_error`.
+
+**Residual, open:** the formation deadline still ends in a bare `return` before
+the Cluster DDL path is stored, so any other cause of an incomplete initial
+topology leaves the node `Forming` permanently, with readiness naming
+`ddl_path` rather than the topology. The six-process test is the acceptance
+check; it passed before this change too, so its green is not evidence of the fix.
 
 
 ### PostgreSQL table incarnation isolation (2026-10-26)

@@ -2981,14 +2981,6 @@ impl ModeController {
                             op: crate::raft::RaftOp::JoinNode(local_node_info),
                             schema_version: Uuid::new_v4(),
                         };
-                        if let Err(e) = raft_arc.client_write(self_join_cmd).await {
-                            tracing::warn!(
-                                local = local_node_id,
-                                leader = lid,
-                                %e,
-                                "seed: JoinNode for self failed after leader election"
-                            );
-                        }
                         let self_tokens = crate::controller::token::deterministic_tokens_for_node(
                             local_node_id,
                             seed_num_tokens,
@@ -3000,12 +2992,23 @@ impl ModeController {
                             },
                             schema_version: Uuid::new_v4(),
                         };
-                        if let Err(e) = raft_arc.client_write(self_assign_cmd).await {
+                        // The seed initialized Raft but need not win the election:
+                        // its own admission is forwarded to whoever did
+                        // (t_9c219a2b).
+                        if let Err(e) = crate::raft_forward::propose_ring_member_via_raft(
+                            &raft_arc,
+                            Some(&*node_map_for_bootstrap),
+                            Some(&*peer_manager_for_bootstrap),
+                            self_join_cmd,
+                            self_assign_cmd,
+                        )
+                        .await
+                        {
                             tracing::warn!(
                                 local = local_node_id,
                                 leader = lid,
                                 %e,
-                                "seed: AssignTokens for self failed after leader election"
+                                "seed: ring admission for self failed after leader election"
                             );
                         }
 
@@ -3030,14 +3033,6 @@ impl ModeController {
                                 op: crate::raft::RaftOp::JoinNode(node_info),
                                 schema_version: Uuid::new_v4(),
                             };
-                            if let Err(e) = raft_arc.client_write(join_cmd).await {
-                                tracing::warn!(
-                                    peer = %peer_uuid,
-                                    leader = lid,
-                                    %e,
-                                    "seed: JoinNode for peer failed after leader election"
-                                );
-                            }
                             let peer_tokens = crate::controller::token::deterministic_tokens_for_node(
                                 peer_node_id,
                                 seed_num_tokens,
@@ -3049,12 +3044,20 @@ impl ModeController {
                                 },
                                 schema_version: Uuid::new_v4(),
                             };
-                            if let Err(e) = raft_arc.client_write(assign_cmd).await {
+                            if let Err(e) = crate::raft_forward::propose_ring_member_via_raft(
+                                &raft_arc,
+                                Some(&*node_map_for_bootstrap),
+                                Some(&*peer_manager_for_bootstrap),
+                                join_cmd,
+                                assign_cmd,
+                            )
+                            .await
+                            {
                                 tracing::warn!(
                                     peer = %peer_uuid,
                                     leader = lid,
                                     %e,
-                                    "seed: AssignTokens for peer failed after leader election"
+                                    "seed: ring admission for peer failed after leader election"
                                 );
                             }
                         }
