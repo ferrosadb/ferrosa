@@ -50,8 +50,8 @@ jobs:
         include:
           - os: ubuntu-latest
             runner: ubuntu-latest
-          - os: macos-14
-            runner: macos-14
+          - os: macos-15
+            runner: macos-15
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
@@ -136,8 +136,8 @@ jobs:
         include:
           - os: ubuntu-latest
             runner: ubuntu-latest
-          - os: macos-14
-            runner: macos-14
+          - os: macos-15
+            runner: macos-15
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     steps:
@@ -171,8 +171,8 @@ jobs:
         include:
           - os: ubuntu-latest
             runner: ubuntu-latest
-          - os: macos-14
-            runner: macos-14
+          - os: macos-15
+            runner: macos-15
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
