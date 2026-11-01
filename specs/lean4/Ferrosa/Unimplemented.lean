@@ -132,7 +132,7 @@ theorem registered_ledger_count : areas.length = 21 := by decide
 
 /-! ## The total, derived
 
-`ledgerTotal` is the sum of the registered ledgers' red counts and contains no literal term, so there is nothing for it to fall out of step with and `ledgerTotal_is_the_registry_sum` records only its definition. The pin at sixty-two guards the opposite failure: dropping a whole ledger from `areas` shrinks the total without changing any local count. `ledgerTotal_pinned` makes that a build failure rather than a quieter number.
+`ledgerTotal` is the sum of the registered ledgers' red counts and contains no literal term, so there is nothing for it to fall out of step with and `ledgerTotal_is_the_registry_sum` records only its definition. The pin at sixty guards the opposite failure: dropping a whole ledger from `areas` shrinks the total without changing any local count. `ledgerTotal_pinned` makes that a build failure rather than a quieter number.
 -/
 
 /-- The number of red items across the corpus: the sum of the registered ledgers' `redCount`.
@@ -146,7 +146,7 @@ theorem ledgerTotal_is_the_registry_sum :
 
 /-- Pinned so that removing a ledger from the registry — the drift that has recurred here — is a
     build failure rather than a silently smaller total. -/
-theorem ledgerTotal_pinned : ledgerTotal = 62 := by decide
+theorem ledgerTotal_pinned : ledgerTotal = 60 := by decide
 
 /-- Print every registered ledger, with the header its area module prints. -/
 def printAllLedgers : IO Unit := do
@@ -205,8 +205,6 @@ def unimplemented : List Item := [
    "Ferrosa.Testing.Histories", "every run separates recovered indeterminate writes from fabricated values, and only fabrication refutes"⟩,
   ⟨"Jepsen", "a durability run issues a final read, and a failed one is a run failure",
    "Ferrosa.Testing.Histories", "every durability run issues a final read after healing, and a final read that fails is a run failure, not a verdict"⟩,
-  ⟨"Jepsen", "the Elle verdict is the checker's exit code",
-   "Ferrosa.Testing.Jepsen", "the Elle verdict is the checker's exit code, not a search of its output"⟩,
   ⟨"Unsafe", "every unsafe site is discharged by a Kani harness rather than by review",
    "Ferrosa.Unsafe.Invariants", "every `unsafe` site in `docs/unsafe-ledger.md` is discharged by a Kani harness, not by review"⟩,
   ⟨"Unsafe", "the truncation contract is enforced in the safe rename and GC paths",
@@ -402,17 +400,17 @@ theorem every_ledger_item_is_classified :
     Ferrosa.Broken.broken.length + unimplemented.length + nonDefects.length = ledgerTotal := by
   native_decide
 
-/-- Thirty-nine items have no code path yet, and the count is pinned so a row cannot disappear
+/-- Thirty-eight items have no code path yet, and the count is pinned so a row cannot disappear
     between commits without this failing. The local-read Jepsen row left for `discharged`; the
     Jepsen-evidence spec added three (the indeterminate split, the final read, and Elle's exit
-    code). -/
-theorem unimplemented_has_the_right_length : unimplemented.length = 39 := by native_decide
+    code), and packet JE-2 closed the exit-code row. -/
+theorem unimplemented_has_the_right_length : unimplemented.length = 38 := by native_decide
 
 /-- Seven, not eight: two rows were discharged into the ledger itself (see `discharged`), and one
     new row records the refuted constant-probe claim in the MVCC ledger. -/
 theorem twelve_are_not_defects : nonDefects.length = 7 := by native_decide
 
-/-- **Live defects now outnumber everything else.**  Sixteen reds against seven requirements,
+/-- **Live defects now outnumber everything else.**  Fifteen reds against seven requirements,
     proofs, measurements, inherited protocol behaviour and closures. This theorem had the opposite
     direction until the memory specs found three more: the closer the specs get to the code, the
     more of it turns out to be shipping something that is not true. -/

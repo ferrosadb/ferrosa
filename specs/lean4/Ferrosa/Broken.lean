@@ -6,10 +6,10 @@
   a different category from a feature that was never written — an unimplemented item can be scheduled
   against a milestone, a broken one is already lying to someone. Each row names a witness theorem in
   its area's ledger, so the claim is not a mood. The damage concentrates on the surfaces a client
-  trusts: five of the sixteen are SQL or SPARQL, the two places where a confidently wrong answer is
+  trusts: five of the fifteen are SQL or SPARQL, the two places where a confidently wrong answer is
   most likely to be acted on.
 
-  **A row's `site` is either a Rust location or the word `unverified:`.** Eleven rows point at code
+  **A row's `site` is either a Rust location or the word `unverified:`.** Ten rows point at code
   that was read at this revision. Five were checked on 2026-10-31 and describe a hazard that exists
   in the Lean model but **not in the shipping implementation**: the code does the correct thing and
   has tests pinning it. Those rows say so in place, because a row claiming a site that does not
@@ -100,23 +100,19 @@ def broken : List Item := [
   ⟨"Streaming", "acks are coalesced so a high-latency pipe is not ack-starved",
    "Model only: this row is stale. The socket setting it says is missing, TCP_NODELAY, is set on every client and internode socket. Whether replies still go out as several small writes, and what that costs, has not been measured.",
    "unverified: stale as written. The premise that NODELAY exists only on unmerged c38add89 is false — `git merge-base --is-ancestor c38add89 HEAD` exits 0, and ferrosa-cql/src/server.rs:303-311 sets `stream.set_nodelay(true)` on every accepted CQL socket (same at ferrosa-postgres/src/server.rs:2237-2245, ferrosa-graph/src/bolt/server.rs:136-142, ferrosa-net/src/rpc/server.rs:267-273). Whether replies are still several small writes, and what that costs per statement, has not been re-measured. Do not re-site this row before measuring",
-   "Ferrosa.Storage.Streaming", "acks are coalesced so a high-latency pipe is not ack-starved"⟩,
-  ⟨"Jepsen", "a required checker that did not run fails the run",
-   "A green Jepsen run of a multi-key workload such as bank has not been checked for serializability. The run passes on linearizability and a balance total, and nothing marks the transactional check as required, so its absence looks the same as a clean result.",
-   "ferrosa-jepsen/src/orchestrator.rs:522-526 skips linearizability for non-register workloads and orchestrator.rs:539 sets the verdict to `all_linear && invariant_passed`; no workload can declare a required checker, `UnifiedChecker::check_all` is not called on a suite run, and where it is called ferrosa-jepsen/src/checker/mod.rs:344 leaves Elle `None`, which checker/mod.rs:386 counts as a pass",
-   "Ferrosa.Testing.Jepsen", "a checker the workload requires that did not run fails the run"⟩
+   "Ferrosa.Storage.Streaming", "acks are coalesced so a high-latency pipe is not ack-starved"⟩
 ]
 
-/-- Sixteen built-and-wrong items, pinned so a defect cannot be dropped from the list without the
+/-- Fifteen built-and-wrong items, pinned so a defect cannot be dropped from the list without the
     corpus classification breaking. -/
-theorem broken_has_sixteen_items : broken.length = 16 := by native_decide
+theorem broken_has_fifteen_items : broken.length = 15 := by native_decide
 
-/-- The surfaces are where the damage concentrates: five of the sixteen are SQL or SPARQL, which are
+/-- The surfaces are where the damage concentrates: five of the fifteen are SQL or SPARQL, which are
     the two places a client is most likely to be told something confidently wrong. -/
 theorem the_surfaces_carry_five : (broken.filter fun i => i.area == "SQL").length
     + (broken.filter fun i => i.area == "SPARQL").length = 5 := by native_decide
 
-/-- Five of the sixteen could not be anchored to the shipping code: four describe an implementation
+/-- Five of the fifteen could not be anchored to the shipping code: four describe an implementation
     that does the correct thing at this revision (with tests pinning it) and one is stale because the
     fix it says is unmerged has been merged since. Counted, so a later edit cannot quietly turn a
     model-only hazard back into an assertion about code. -/
@@ -125,8 +121,8 @@ theorem five_rows_have_no_verified_site :
 
 /-- The remainder — the rows that name a real location — are what the list's opening claim is about:
     code that was read, not inferred. -/
-theorem eleven_rows_name_a_site :
-    (broken.filter fun i => !i.site.startsWith "unverified:").length = 11 := by native_decide
+theorem ten_rows_name_a_site :
+    (broken.filter fun i => !i.site.startsWith "unverified:").length = 10 := by native_decide
 
 /-- What a reader of the specification is shown for a row: the sentence that says what is wrong. -/
 def readerText (i : Item) : String := i.plain

@@ -9,7 +9,7 @@ import FerrosaProduct.Register.Part7
 /-!
 # The theorem register
 
-Every theorem in the specification, 740 in all, in the book's order. 52 are red: they prove that
+Every theorem in the specification, 740 in all, in the book's order. 50 are red: they prove that
 a property the product needs does not hold yet, and each is tracked by a ledger in
 `Ferrosa.Unimplemented` until the code is fixed. A theorem marked *counterexample* shows what goes
 wrong in a design the code does not use, or a history the checker must reject; it is evidence for a
@@ -24,6 +24,6 @@ corpus contains.
 - [III. What leaves the cluster](FerrosaProduct/Register/Part3/): 62 theorems, 7 red
 - [IV. The write path](FerrosaProduct/Register/Part4/): 175 theorems, 19 red
 - [V. Foundations](FerrosaProduct/Register/Part5/): 30 theorems, 0 red
-- [VI. Evidence](FerrosaProduct/Register/Part6/): 75 theorems, 7 red
+- [VI. Evidence](FerrosaProduct/Register/Part6/): 75 theorems, 5 red
 - [VII. Limits and accounting](FerrosaProduct/Register/Part7/): 44 theorems, 3 red
 -/

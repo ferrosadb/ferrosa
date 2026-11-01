@@ -1,6 +1,6 @@
 # Where the corpus and the extraction overlap
 
-Ledger items: **317** (255 met, 62 failing). Classified reds: 16 broken, 39 with no code path, 7 not defects.
+Ledger items: **317** (257 met, 60 failing). Classified reds: 15 broken, 38 with no code path, 7 not defects.
 
 ## The extracted surface
 
@@ -10,13 +10,13 @@ Ledger items: **317** (255 met, 62 failing). Classified reds: 16 broken, 39 with
 | Storage | ferrosa-storage | src/count.rs | stale | 5 |
 
 Files under extraction: `ferrosa-sstable/src/compression.rs`
-Files named by a broken row: 22 — overlap: **1**
+Files named by a broken row: 19 — overlap: **1**
 
 ## The broken rows, by distance from the extraction
 
 | class | count |
 |---|---|
-| crate-measured-file-not-extracted | 6 |
+| crate-measured-file-not-extracted | 5 |
 | no-code-anchor | 5 |
 | crate-charon | 2 |
 | crate-modules-partial | 1 |
@@ -40,7 +40,6 @@ Files named by a broken row: 22 — overlap: **1**
 | Streaming | a decoded chunk is written into a caller-supplied buffer | `ferrosa-cluster/src/accord/compression.rs`, `ferrosa-sstable/src/compression.rs` | explicit | **no** | extracted |
 | Streaming | a slow client cannot grow the coordinator's memory | `ferrosa-cql/src/connection.rs`, `ferrosa-cql/src/result.rs` | explicit | **no** | crate-measured-file-not-extracted |
 | Streaming | acks are coalesced so a high-latency pipe is not ack-starv | — | none | **no** | no-code-anchor |
-| Jepsen | a required checker that did not run fails the run | `ferrosa-jepsen/src/checker/mod.rs`, `ferrosa-jepsen/src/orchestrator.rs` | explicit | **no** | crate-measured-file-not-extracted |
 
 ## What this says
 

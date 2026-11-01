@@ -17,11 +17,11 @@ Tick a theorem once you have reviewed its statement and docstring on its module 
 - [`a_read_only_transaction_can_carry_the_only_cycle`](Ferrosa/Testing/Jepsen/#Ferrosa___Testing___Jepsen___a_read_only_transaction_can_carry_the_only_cycle): **Red.** The cycle is invisible if the read-only transaction is dropped.
 - [`dropping_a_transaction_can_only_hide_violations`](Ferrosa/Testing/Jepsen/#Ferrosa___Testing___Jepsen___dropping_a_transaction_can_only_hide_violations): Removing edges never creates a cycle, so a checker that omits a transaction can only under-report violations, never over-report them.
 - [`an_empty_graph_cannot_report_a_violation`](Ferrosa/Testing/Jepsen/#Ferrosa___Testing___Jepsen___an_empty_graph_cannot_report_a_violation): A graph with no edges has no cycle, so the vacuous case agrees with `an_empty_run_establishes_nothing`.
-- [`an_absent_required_checker_must_fail_the_run`](Ferrosa/Testing/Jepsen/#Ferrosa___Testing___Jepsen___an_absent_required_checker_must_fail_the_run): **Red.** A required checker that did not run must fail the run.
+- [`an_absent_required_checker_must_fail_the_run`](Ferrosa/Testing/Jepsen/#Ferrosa___Testing___Jepsen___an_absent_required_checker_must_fail_the_run): A required checker that did not run must fail the run.
 - [`the_rules_agree_when_every_checker_ran`](Ferrosa/Testing/Jepsen/#Ferrosa___Testing___Jepsen___the_rules_agree_when_every_checker_ran): The two rules agree whenever every checker ran, so requiring the result costs nothing on a run that produced one.
-- [`a_scraped_verdict_passes_an_invalid_result`](Ferrosa/Testing/Jepsen/#Ferrosa___Testing___Jepsen___a_scraped_verdict_passes_an_invalid_result): **Red.** A verdict searched for in the output passes an invalid result.
+- [`a_scraped_verdict_passes_an_invalid_result`](Ferrosa/Testing/Jepsen/#Ferrosa___Testing___Jepsen___a_scraped_verdict_passes_an_invalid_result): A verdict searched for in the output passes an invalid result.
 - [`a_lower_cased_anomaly_search_finds_nothing`](Ferrosa/Testing/Jepsen/#Ferrosa___Testing___Jepsen___a_lower_cased_anomaly_search_finds_nothing): And a case-folded search never finds an anomaly.
-- [`jepsen_has_four_red_items`](Ferrosa/Testing/Jepsen/#Ferrosa___Testing___Jepsen___jepsen_has_four_red_items): The ledger carries four reds: the multi-key assertion and the read-only inclusion, because no transactional checker runs on a suite run; an absent checker counted as a pass; and a verdict read by searching text.
+- [`jepsen_has_two_red_items`](Ferrosa/Testing/Jepsen/#Ferrosa___Testing___Jepsen___jepsen_has_two_red_items): The ledger carries two reds: the multi-key assertion and the read-only inclusion, because no in-tree workload yet requires the transactional checker, so no suite run's verdict depends on it.
 
 ## `Ferrosa.Testing.JepsenModels`
 

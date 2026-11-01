@@ -384,25 +384,11 @@ pub const REDS: &[Red] = &[
         witness: "Histories.a_timed_out_write_that_landed_is_not_fabricated",
     },
     Red {
-        name: "testing_jepsen__a_checker_the_workload_requires_that_did_not_run_fails_the_run",
-        module: "Ferrosa.Testing.Jepsen",
-        claim: "a checker the workload requires that did not run fails the run",
-        why: "not true: the suite's verdict is linearizability and the workload's invariant, and nothing a workload declares makes a transactional checker required, so a multi-key run whose transactional checker never ran is green. `AllCheckResults::all_passed` also counts an absent Elle result as a pass, though no suite run reaches it (specs/jepsen-evidence D2, packet JE-1)",
-        witness: "Jepsen.an_absent_required_checker_must_fail_the_run",
-    },
-    Red {
         name: "testing_jepsen__the_checker_runs_elle_with_read_only_transactions_in_the_graph",
         module: "Ferrosa.Testing.Jepsen",
         claim: "the checker runs Elle with read-only transactions in the graph",
         why: "not run: the in-process checker `checker::strict_serializable` keeps read-only transactions, and its test `a_read_only_transaction_can_carry_the_only_cycle` rejects this file's history; but neither it nor Elle is invoked on a suite run, so no run's verdict depends on it",
         witness: "Jepsen.a_read_only_transaction_can_carry_the_only_cycle",
-    },
-    Red {
-        name: "testing_jepsen__the_elle_verdict_is_the_checker_s_exit_code_not_a_search_of_its_output",
-        module: "Ferrosa.Testing.Jepsen",
-        claim: "the Elle verdict is the checker's exit code, not a search of its output",
-        why: "not true: `ElleChecker::run_check` decides validity by searching stdout for `:valid? true` and looks for anomaly names in lower case, so a nested sub-result passes an invalid history and no anomaly type is ever reported. The code is not reached on a suite run today, which is the previous row (specs/jepsen-evidence D3, packet JE-2)",
-        witness: "Jepsen.a_scraped_verdict_passes_an_invalid_result",
     },
     Red {
         name: "testing_jepsen__the_jepsen_suite_asserts_strict_serializability_for_multi_key_transactions",

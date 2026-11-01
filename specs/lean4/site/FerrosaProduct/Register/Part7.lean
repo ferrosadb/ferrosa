@@ -26,7 +26,7 @@ Tick a theorem once you have reviewed its statement and docstring on its module 
 - [`nothing_discharged_is_still_classified`](Ferrosa/Unimplemented/#Ferrosa___Unimplemented___nothing_discharged_is_still_classified): A discharged row is not also a classification row, so the partition cannot hide a red here.
 - [`rows_are_the_ledger_reds`](Ferrosa/Unimplemented/#Ferrosa___Unimplemented___rows_are_the_ledger_reds): The totals agree, which is now a consequence of (a), (b) and (c) rather than a coincidence.
 - [`every_ledger_item_is_classified`](Ferrosa/Unimplemented/#Ferrosa___Unimplemented___every_ledger_item_is_classified): Every red item in every ledger appears here or in `Broken.broken`, exactly once.
-- [`unimplemented_has_the_right_length`](Ferrosa/Unimplemented/#Ferrosa___Unimplemented___unimplemented_has_the_right_length): Thirty-nine items have no code path yet, and the count is pinned so a row cannot disappear between commits without this failing.
+- [`unimplemented_has_the_right_length`](Ferrosa/Unimplemented/#Ferrosa___Unimplemented___unimplemented_has_the_right_length): Thirty-eight items have no code path yet, and the count is pinned so a row cannot disappear between commits without this failing.
 - [`twelve_are_not_defects`](Ferrosa/Unimplemented/#Ferrosa___Unimplemented___twelve_are_not_defects): Seven, not eight: two rows were discharged into the ledger itself (see `discharged`), and one new row records the refuted constant-probe claim in the MVCC ledger.
 - [`live_defects_outnumber_the_rest`](Ferrosa/Unimplemented/#Ferrosa___Unimplemented___live_defects_outnumber_the_rest): Live defects now outnumber everything else.
 
@@ -34,10 +34,10 @@ Tick a theorem once you have reviewed its statement and docstring on its module 
 
 [The module page](Ferrosa/Broken/)
 
-- [`broken_has_sixteen_items`](Ferrosa/Broken/#Ferrosa___Broken___broken_has_sixteen_items): Sixteen built-and-wrong items, pinned so a defect cannot be dropped from the list without the corpus classification breaking.
-- [`the_surfaces_carry_five`](Ferrosa/Broken/#Ferrosa___Broken___the_surfaces_carry_five): The surfaces are where the damage concentrates: five of the sixteen are SQL or SPARQL, which are the two places a client is most likely to be told something confidently wrong.
-- [`five_rows_have_no_verified_site`](Ferrosa/Broken/#Ferrosa___Broken___five_rows_have_no_verified_site): Five of the sixteen could not be anchored to the shipping code: four describe an implementation that does the correct thing at this revision (with tests pinning it) and one is stale because the fix it says is unmerged…
-- [`eleven_rows_name_a_site`](Ferrosa/Broken/#Ferrosa___Broken___eleven_rows_name_a_site): The remainder — the rows that name a real location — are what the list's opening claim is about: code that was read, not inferred.
+- [`broken_has_fifteen_items`](Ferrosa/Broken/#Ferrosa___Broken___broken_has_fifteen_items): Fifteen built-and-wrong items, pinned so a defect cannot be dropped from the list without the corpus classification breaking.
+- [`the_surfaces_carry_five`](Ferrosa/Broken/#Ferrosa___Broken___the_surfaces_carry_five): The surfaces are where the damage concentrates: five of the fifteen are SQL or SPARQL, which are the two places a client is most likely to be told something confidently wrong.
+- [`five_rows_have_no_verified_site`](Ferrosa/Broken/#Ferrosa___Broken___five_rows_have_no_verified_site): Five of the fifteen could not be anchored to the shipping code: four describe an implementation that does the correct thing at this revision (with tests pinning it) and one is stale because the fix it says is unmerged…
+- [`ten_rows_name_a_site`](Ferrosa/Broken/#Ferrosa___Broken___ten_rows_name_a_site): The remainder — the rows that name a real location — are what the list's opening claim is about: code that was read, not inferred.
 - [`every_row_reads_as_prose`](Ferrosa/Broken/#Ferrosa___Broken___every_row_reads_as_prose): Every row says what is wrong in words a product reader can follow.
 - [`model_only_rows_say_so`](Ferrosa/Broken/#Ferrosa___Broken___model_only_rows_say_so): A reader is told when a row is about the model, not the shipping code.
 

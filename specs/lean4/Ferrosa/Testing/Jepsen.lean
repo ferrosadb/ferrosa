@@ -13,11 +13,11 @@
   cycle carried by a read-only transaction vanishes from the dependency graph when the checker graphs
   only writers, so dropping a transaction can only ever under-report a violation. A checker that did
   not run must fail the run rather than count as a pass, and a verdict must be the checker's exit
-  code rather than a search of its output. Four ledger rows are red. No transactional checker runs on
-  a suite run, so the suite neither asserts strict serializability for multi-key transactions nor
-  depends on a checker that keeps read-only transactions; and the Rust suite both counts an absent
-  checker as a pass and reads Elle's verdict by searching text. A local-read run across a failover is
-  classified as not tested, not failed.
+  code rather than a search of its output; the Rust suite now does both. Two ledger rows are red. No
+  in-tree workload yet requires the transactional checker, so the suite neither asserts strict
+  serializability for multi-key transactions nor has a run whose verdict depends on a checker that
+  keeps read-only transactions. A local-read run across a failover is classified as not tested, not
+  failed.
 -/
 import Ferrosa.Accord.Serializable
 import Ferrosa.Sql.Consistency
@@ -145,13 +145,14 @@ theorem an_empty_graph_cannot_report_a_violation : hasCycle [] 4 = false := by d
 
 /-! ## A checker that did not run, and a verdict read from text
 
-A run is green only if every checker it needed said so. Two ways to get that wrong are modelled here, because both are present in the Rust suite. The first treats a checker that produced no result as a pass, so a run whose transactional checker never started is indistinguishable from one it cleared. The second reads the verdict by searching the checker's output for `:valid? true`, which a nested result inside an invalid verdict also contains. The specification's rules are the opposite of both: a required checker that did not run fails the run, and the verdict is the checker's exit code. These are decisions D2 and D3 of `specs/jepsen-evidence/decisions.md` in the suite repository.
+A run is green only if every checker it needed said so. Two ways to get that wrong are modelled here, because the Rust suite did both until packets JE-1 and JE-2. The first treats a checker that produced no result as a pass, so a run whose transactional checker never started is indistinguishable from one it cleared. The second reads the verdict by searching the checker's output for `:valid? true`, which a nested result inside an invalid verdict also contains. The specification's rules are the opposite of both: a required checker that did not run fails the run, and the verdict is the checker's exit code. These are decisions D2 and D3 of `specs/jepsen-evidence/decisions.md` in the suite repository.
 -/
 
 /-- A checker outcome: `none` when it did not run, `some v` when it ran and returned `v`. -/
 abbrev Outcome := Option Bool
 
-/-- The rule the Rust suite uses for an optional checker: one that did not run counts as a pass. -/
+/-- The rule for an optional checker: one that did not run counts as a pass. Before JE-1 the Rust
+    suite applied it to every checker. -/
 def passesTreatingAbsentAsPass (results : List Outcome) : Bool :=
   results.all (fun r => r.getD true)
 
@@ -176,7 +177,8 @@ theorem the_rules_agree_when_every_checker_ran (results : List Bool) :
   | cons b bs ih =>
       cases b <;> simp_all [passesTreatingAbsentAsPass, passesRequiringEveryChecker]
 
-/-- A verdict read by searching the output for a marker, as the Rust `ElleChecker` does. -/
+/-- A verdict read by searching the output for a marker, as the Rust `ElleChecker` did before
+    JE-2. -/
 def scrapedValid (output : String) : Bool := (output.splitOn ":valid? true").length > 1
 
 /-- **A verdict searched for in the output passes an invalid result.** Elle reports per-checker
@@ -213,21 +215,22 @@ def ledger : List SpecItem := [
   ⟨"a multi-DC run under LOCAL_QUORUM or DC_QUORUM must expect strict-serializability violations after a failover",
    .met "Jepsen.a_local_read_run_cannot_establish_strict_serializability"⟩,
   ⟨"a checker the workload requires that did not run fails the run",
-   .failing
-     "not true: the suite's verdict is linearizability and the workload's invariant, and nothing a workload declares makes a transactional checker required, so a multi-key run whose transactional checker never ran is green. `AllCheckResults::all_passed` also counts an absent Elle result as a pass, though no suite run reaches it (specs/jepsen-evidence D2, packet JE-1)"
-     "Jepsen.an_absent_required_checker_must_fail_the_run"⟩,
+   .met "Jepsen.an_absent_required_checker_must_fail_the_run"⟩,
   ⟨"the Elle verdict is the checker's exit code, not a search of its output",
-   .failing
-     "not true: `ElleChecker::run_check` decides validity by searching stdout for `:valid? true` and looks for anomaly names in lower case, so a nested sub-result passes an invalid history and no anomaly type is ever reported. The code is not reached on a suite run today, which is the previous row (specs/jepsen-evidence D3, packet JE-2)"
-     "Jepsen.a_scraped_verdict_passes_an_invalid_result"⟩
+   .met "Jepsen.a_scraped_verdict_passes_an_invalid_result"⟩
 ]
 
-/-- The ledger carries four reds: the multi-key assertion and the read-only inclusion, because no
-    transactional checker runs on a suite run; an absent checker counted as a pass; and a verdict
-    read by searching text. This pins the count, so a row cannot be dropped quietly. The local-read
-    row is met: `checker::profile` classifies a declared cross-datacenter read as not tested rather
-    than failed, and refuses a profile it cannot parse. -/
-theorem jepsen_has_four_red_items : redCount ledger = 4 := by decide
+/-- The ledger carries two reds: the multi-key assertion and the read-only inclusion, because no
+    in-tree workload yet requires the transactional checker, so no suite run's verdict depends on
+    it. This pins the count, so a row cannot be dropped quietly. The required-checker and exit-code
+    rows are met: `AllCheckResults::all_passed` refuses an absent result for a checker the workload
+    requires and the orchestrator records a setup error (Rust test
+    `a_required_checker_that_did_not_run_fails_the_run`), and `checker::elle` takes the verdict from
+    elle-checker's exit code and names anomalies from its anomalies file
+    (`elle_verdict_comes_from_the_exit_code`, run against both committed control histories). The
+    local-read row is met: `checker::profile` classifies a declared cross-datacenter read as not
+    tested rather than failed, and refuses a profile it cannot parse. -/
+theorem jepsen_has_two_red_items : redCount ledger = 2 := by decide
 
 def main : IO Unit :=
   printLedger "Jepsen/Elle: what a green run licenses" ledger

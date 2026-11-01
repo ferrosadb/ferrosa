@@ -232,27 +232,11 @@
       "symbol_named_in_site": [],
       "symbols_from_same_file": [],
       "class": "no-code-anchor"
-    },
-    {
-      "area": "Jepsen",
-      "what": "a required checker that did not run fails the run",
-      "ledger": "Ferrosa.Testing.Jepsen",
-      "item": "a checker the workload requires that did not run fails the run",
-      "site": "ferrosa-jepsen/src/orchestrator.rs:522-526 skips linearizability for non-register workloads and orchestrator.rs:539 sets the verdict to `all_linear && invariant_passed`; no workload can declare a required checker, `UnifiedChecker::check_all` is not called on a suite run, and where it is called ferrosa-jepsen/src/checker/mod.rs:344 leaves Elle `None`, which checker/mod.rs:386 counts as a pass",
-      "anchors": [
-        "ferrosa-jepsen/src/checker/mod.rs",
-        "ferrosa-jepsen/src/orchestrator.rs",
-        "ferrosa-loadgen/src/orchestrator.rs"
-      ],
-      "confidence": "explicit",
-      "symbol_named_in_site": [],
-      "symbols_from_same_file": [],
-      "class": "crate-measured-file-not-extracted"
     }
   ],
   "classes": {
     "crate-charon": 2,
-    "crate-measured-file-not-extracted": 6,
+    "crate-measured-file-not-extracted": 5,
     "no-code-anchor": 5,
     "crate-modules-partial": 1,
     "crate-aeneas-crash": 1,
