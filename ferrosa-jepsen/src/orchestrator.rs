@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::chaos::{NemesisAction, NemesisContext, NemesisRegistry};
+use crate::checker::profile::Assurance;
 use crate::checker::{check_linearizability, CheckResult};
 use crate::config::{Concurrency, RunConfig, Tier, Topology};
 use crate::cql_session::ScyllaCqlSession;
@@ -11,7 +12,7 @@ use crate::docker_provision::{provision_docker_cluster, teardown_docker_cluster,
 use crate::driver::DriverRegistry;
 use crate::history::HistoryRecorder;
 use crate::report::RunReport;
-use crate::workload::{CqlSession, MockCqlSession, WorkloadRegistry};
+use crate::workload::{CqlSession, DurabilityVerdict, MockCqlSession, WorkloadRegistry};
 
 /// Where the CQL session for a single combination came from.
 ///
@@ -527,19 +528,39 @@ async fn run_single_combination(
     };
     let all_linear = linearizability.iter().all(|r| r.valid);
 
-    // Check workload-specific invariants.
-    let invariant_result = workload.check_invariant(&history);
+    // `run` has already parsed the same variables and refused a bad one, so this cannot fail
+    // differently; it is re-read rather than passed to stay under clippy's argument limit.
+    let profile =
+        crate::checker::profile::ConsistencyProfile::from_env().map_err(anyhow::Error::msg)?;
+
+    // D7/D8: a durability workload's final read, issued now that the workload and the nemesis
+    // have both ended (the nemesis cycle heals before it returns). A final read that fails is a
+    // run failure (`?`), never a verdict.
+    let durability = workload
+        .final_read(session.as_ref(), &history, &profile)
+        .await?;
+    if let Some(d) = &durability {
+        write_book_summary(
+            &run_dir.join(format!(
+                "{topology:?}-{nemesis_name}-{workload_name}.book.json"
+            )),
+            d,
+        )?;
+    }
+
+    // Check workload-specific invariants; a durability anomaly (lost or fabricated values, each
+    // named) is a failed invariant too.
+    let invariant_result = fold_durability(workload.check_invariant(&history), durability.as_ref());
     let invariant_passed = invariant_result.is_ok();
     let invariant_error = invariant_result.err().map(|e| e.to_string());
 
     let duration = start.elapsed();
 
-    // `run` has already parsed the same variables and refused a bad one, so this cannot fail
-    // differently; it is re-read rather than passed to stay under clippy's argument limit.
-    let profile =
-        crate::checker::profile::ConsistencyProfile::from_env().map_err(anyhow::Error::msg)?;
     let observed_clean = all_linear && invariant_passed;
-    let assurance = profile.classify(observed_clean);
+    let assurance = combine_assurance(
+        profile.classify(observed_clean),
+        durability.as_ref().map(|d| d.assurance),
+    );
 
     Ok(CombinationResult {
         workload: workload_name.into(),
@@ -559,9 +580,108 @@ async fn run_single_combination(
     })
 }
 
+/// Persist a durability workload's book summary beside its history.
+fn write_book_summary(path: &std::path::Path, verdict: &DurabilityVerdict) -> Result<()> {
+    let json = serde_json::to_vec_pretty(verdict).context("serializing the book summary")?;
+    std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))
+}
+
+/// A durability anomaly fails the invariant, named, alongside any invariant failure the workload
+/// reported; neither message hides the other.
+fn fold_durability(invariant: Result<()>, durability: Option<&DurabilityVerdict>) -> Result<()> {
+    let anomaly = durability.and_then(|d| d.summary.anomaly_message());
+    match (invariant, anomaly) {
+        (Ok(()), None) => Ok(()),
+        (Ok(()), Some(a)) => Err(anyhow::anyhow!(a)),
+        (Err(e), None) => Err(e),
+        (Err(e), Some(a)) => Err(anyhow::anyhow!("{e:#}; {a}")),
+    }
+}
+
+/// The combination's assurance: the history checkers' and, when the workload keeps a book, the
+/// book's. A refutation from either refutes; otherwise any reason the run could not decide wins
+/// over a confirmation, so a write-free durability run is never confirmed (D9).
+fn combine_assurance(history: Assurance, durability: Option<Assurance>) -> Assurance {
+    match (history, durability) {
+        (h, None) => h,
+        (Assurance::Refuted, _) | (_, Some(Assurance::Refuted)) => Assurance::Refuted,
+        (Assurance::NotTested(why), _) | (_, Some(Assurance::NotTested(why))) => {
+            Assurance::NotTested(why)
+        }
+        (Assurance::Confirmed, Some(Assurance::Confirmed)) => Assurance::Confirmed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_book_refutation_or_blind_spot_overrides_a_clean_history() {
+        use crate::checker::profile::NotTested;
+        let no_acks = Assurance::NotTested(NotTested::NoAcknowledgedWrites);
+        assert_eq!(
+            combine_assurance(Assurance::Confirmed, None),
+            Assurance::Confirmed
+        );
+        assert_eq!(
+            combine_assurance(Assurance::Confirmed, Some(Assurance::Refuted)),
+            Assurance::Refuted
+        );
+        assert_eq!(
+            combine_assurance(Assurance::Confirmed, Some(no_acks)),
+            no_acks
+        );
+        assert_eq!(
+            combine_assurance(Assurance::Refuted, Some(no_acks)),
+            Assurance::Refuted
+        );
+        assert_eq!(
+            combine_assurance(Assurance::Confirmed, Some(Assurance::Confirmed)),
+            Assurance::Confirmed
+        );
+    }
+
+    /// The set workload on the mock: the mock stores nothing, so every acknowledged insert is
+    /// read back as missing. The orchestrator must run the final read and refute, naming the loss
+    /// and writing the book beside the history — not pass the run on an empty invariant.
+    #[tokio::test]
+    async fn the_set_workload_is_judged_by_its_final_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = RunConfig {
+            tier: Tier::Smoke,
+            topology: None,
+            nemesis: None,
+            pattern: None,
+            driver: None,
+            concurrency: None,
+            run_id: "set-run".into(),
+            output_dir: dir.path().to_path_buf(),
+            fly_regions: vec![],
+            alert_webhook: None,
+            output_json: false,
+        };
+        let result = run_single_combination(
+            Topology::T1,
+            "noop",
+            "set",
+            "rust",
+            Concurrency::Low,
+            &config,
+            None,
+        )
+        .await
+        .expect("the mock run completes");
+        assert!(!result.passed);
+        assert_eq!(result.assurance, Assurance::Refuted);
+        let error = result.invariant_error.expect("a loss is reported");
+        assert!(error.starts_with("lost "), "{error}");
+        assert!(dir
+            .path()
+            .join("set-run")
+            .join("T1-noop-set.book.json")
+            .exists());
+    }
 
     #[test]
     fn combination_result_serialization() {

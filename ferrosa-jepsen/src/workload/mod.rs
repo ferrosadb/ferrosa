@@ -4,12 +4,15 @@ pub mod late_join_flood;
 pub mod lwt;
 pub mod membership_churn;
 pub mod register;
+pub mod set;
 
 use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
 
+use crate::checker::book::BookSummary;
+use crate::checker::profile::{Assurance, ConsistencyProfile, Level};
 use crate::history::{History, HistoryRecorder};
 
 /// A CQL session abstraction (will be backed by cdrs-tokio or mock).
@@ -17,6 +20,19 @@ use crate::history::{History, HistoryRecorder};
 #[async_trait]
 pub trait CqlSession: Send + Sync {
     async fn execute(&self, query: &str) -> Result<Vec<Vec<(String, String)>>>;
+
+    /// Execute `query` at an explicit consistency level. A workload whose verdict is scoped to the
+    /// run's [`ConsistencyProfile`] must issue its writes and reads at the profile's levels, not the
+    /// driver's default. The default implementation REFUSES rather than falling back to
+    /// [`execute`](CqlSession::execute): silently running at another level would make the verdict
+    /// describe a configuration the run never used.
+    async fn execute_at(&self, query: &str, level: Level) -> Result<Vec<Vec<(String, String)>>> {
+        anyhow::bail!(
+            "this CQL session cannot set a per-statement consistency level \
+             (wanted {} for `{query}`)",
+            level.as_str()
+        )
+    }
 
     /// Execute `statements` as one **connection-affine** unit — used for a
     /// `BEGIN TRANSACTION; …; COMMIT` block, whose buffer lives on a single
@@ -74,6 +90,30 @@ pub trait Workload: Send + Sync {
     fn register_linearizable(&self) -> bool {
         true
     }
+
+    /// The durability check: a final read after the run, and the verdict computed from the
+    /// workload's book (decisions D7–D9 of `specs/jepsen-evidence`). The orchestrator calls it
+    /// after the workload and its nemesis have both ended, so every fault has been healed.
+    ///
+    /// `Ok(None)` (the default) for a workload that keeps no book. An `Err` is a run failure — a
+    /// final read that could not complete is never turned into a verdict, because a missing read
+    /// would count every acknowledged write as lost.
+    async fn final_read(
+        &self,
+        _session: &dyn CqlSession,
+        _history: &History,
+        _profile: &ConsistencyProfile,
+    ) -> Result<Option<DurabilityVerdict>> {
+        Ok(None)
+    }
+}
+
+/// What a durability workload's book licenses: the counts (with samples) and the assurance the
+/// book and profile give together.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DurabilityVerdict {
+    pub summary: BookSummary,
+    pub assurance: Assurance,
 }
 
 /// Registry of all available workloads.
@@ -127,6 +167,9 @@ impl WorkloadRegistry {
             membership_churn::MembershipChurnWorkload::default(),
         ));
         reg.register(Box::new(late_join_flood::LateJoinFloodWorkload::default()));
+        // Durability: a book of attempted/acknowledged/indeterminate/recovered values and a
+        // final read (specs/jepsen-evidence D7–D9).
+        reg.register(Box::new(set::SetWorkload::new()));
         reg
     }
 }
@@ -141,6 +184,11 @@ pub struct MockCqlSession;
 impl CqlSession for MockCqlSession {
     async fn execute(&self, _query: &str) -> Result<Vec<Vec<(String, String)>>> {
         Ok(vec![])
+    }
+
+    /// The mock has no replicas, so every level answers the same way.
+    async fn execute_at(&self, query: &str, _level: Level) -> Result<Vec<Vec<(String, String)>>> {
+        self.execute(query).await
     }
 }
 
@@ -214,6 +262,15 @@ pub mod testutil {
             // Plain mutation (INSERT without IF, UPDATE without IF): success, no rows.
             Ok(vec![])
         }
+
+        /// The mock has no replicas, so every level answers the same way.
+        async fn execute_at(
+            &self,
+            query: &str,
+            _level: crate::checker::profile::Level,
+        ) -> Result<Vec<Vec<(String, String)>>> {
+            self.execute(query).await
+        }
     }
 }
 
@@ -225,8 +282,9 @@ mod tests {
     fn workload_registry_phase1() {
         let reg = WorkloadRegistry::phase1();
         // register + bank + 16 LWT + Sprint 2 workloads
-        // (forward-probe, membership-churn, late-join-flood).
-        assert_eq!(reg.names().len(), 21);
+        // (forward-probe, membership-churn, late-join-flood) + set.
+        assert_eq!(reg.names().len(), 22);
+        assert!(reg.get("set").is_some());
         assert!(reg.get("register").is_some());
         assert!(reg.get("bank").is_some());
         assert!(reg.get("lwt-1-insert-if-not-exists").is_some());

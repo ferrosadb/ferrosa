@@ -1,8 +1,9 @@
 //! CQL transport for Jepsen workloads with stable coordinator affinity.
 //! Correctness: every transaction statement uses one coordinator selected from
 //! the executing session's own metadata, and CQL results preserve row values.
-//! Last revised: 2026-08-08
-//! Last changed: Select the pinned coordinator from the destination session.
+//! Last revised: 2026-10-31
+//! Last changed: Per-statement consistency (`execute_at`) and a typed driver error kept in the
+//! chain, so the set workload reads at the profile's level and classifies write outcomes.
 
 use std::num::NonZeroUsize;
 
@@ -13,9 +14,11 @@ use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use scylla::client::PoolSize;
 use scylla::policies::load_balancing::{NodeIdentifier, SingleTargetLoadBalancingPolicy};
+use scylla::statement::{Consistency, Statement};
 use scylla::value::{CqlValue, Row};
 use uuid::Uuid;
 
+use crate::checker::profile::Level;
 use crate::workload::CqlSession;
 
 /// A real CQL session backed by the scylla driver.
@@ -123,19 +126,50 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The driver's consistency level for a profile [`Level`].
+fn consistency_for(level: Level) -> Consistency {
+    match level {
+        Level::One => Consistency::One,
+        Level::Quorum => Consistency::Quorum,
+        Level::LocalQuorum => Consistency::LocalQuorum,
+        Level::All => Consistency::All,
+    }
+}
+
 #[async_trait]
 impl CqlSession for ScyllaCqlSession {
     async fn execute(&self, query: &str) -> Result<Vec<Vec<(String, String)>>> {
+        self.run_statement(query, Statement::new(query)).await
+    }
+
+    async fn execute_at(&self, query: &str, level: Level) -> Result<Vec<Vec<(String, String)>>> {
+        let mut statement = Statement::new(query);
+        statement.set_consistency(consistency_for(level));
+        self.run_statement(query, statement).await
+    }
+}
+
+impl ScyllaCqlSession {
+    async fn run_statement(
+        &self,
+        query: &str,
+        statement: Statement,
+    ) -> Result<Vec<Vec<(String, String)>>> {
         assert!(!query.is_empty(), "query must not be empty");
-        // Flatten the driver error into the message (not just an anyhow context)
-        // so the workload's `e.to_string()` surfaces the ROOT cause — a bare
-        // "executing query: …" with the real failure hidden is a fail-loud gap
-        // that masked a connectivity regression once already.
+        // Flatten the driver error into the message so the workload's
+        // `e.to_string()` surfaces the ROOT cause — a bare "executing query: …"
+        // with the real failure hidden is a fail-loud gap that masked a
+        // connectivity regression once already. The typed `ExecutionError` stays
+        // in the chain (`downcast_ref`) so a caller can tell a definite refusal
+        // from an indeterminate outcome (`workload::set::classify_write_error`).
         let result = self
             .session
-            .query_unpaged(query, &[])
+            .query_unpaged(statement, &[])
             .await
-            .map_err(|e| anyhow::anyhow!("executing query `{query}`: {e}"))?;
+            .map_err(|e| {
+                let message = format!("executing query `{query}`: {e}");
+                anyhow::Error::new(e).context(message)
+            })?;
 
         // Non-SELECT statements (CREATE, INSERT, UPDATE, DELETE) produce no rows.
         let rows_result = match result.into_rows_result() {

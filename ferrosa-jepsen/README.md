@@ -29,7 +29,26 @@ graph. It calls `ferrosa-sim` for the simulator-backed endurance path.
 - **Workloads** (`workload/`) — `register` (single-value register),
   `bank` (conservation-of-money), 16 `lwt-*` LWT patterns, plus the Sprint 2
   membership/forwarding workloads `forward-probe`, `membership-churn`,
-  `late-join-flood`. 21 workloads in the `phase1` registry.
+  `late-join-flood`, and the durability workload `set`. 22 workloads in the
+  `phase1` registry.
+- **`set` workload** (`workload/set.rs`, decisions D7–D9 of
+  `specs/jepsen-evidence`) — inserts unique integers (`nonce << 32 | n`, so a
+  run's values never collide with an earlier run's rows) into
+  `jepsen.set (bucket int, v bigint, PRIMARY KEY (bucket, v))` across
+  `SET_BUCKETS` partitions, at the profile's write level. Each INSERT is
+  acknowledged, indeterminate (timeout or error after send — the default for any
+  error not recognised), or a definite refusal (`Unavailable`, `Overloaded`,
+  invalid/unauthorised, or a driver error raised before sending), recorded in the
+  history. After the workload and nemesis end, `Workload::final_read` waits
+  `FINAL_READ_SETTLE`, then pages every bucket at the profile's read level with a
+  clustering-range query of `FINAL_READ_PAGE` rows, retrying a failing page up to
+  `FINAL_READ_RETRIES` times with logged, doubling backoff. A bucket that still
+  fails is a run failure (`setup_error` "final read failed: bucket N"), never a
+  verdict. The verdict is the durability book's, combined with the history
+  checkers'; the book summary is written to
+  `<topology>-<nemesis>-set.book.json` beside the history. Parameters parse like
+  the consistency profile: unset takes the default (16 buckets, 10 s, 1,000
+  rows, 5 retries), unparseable is refused naming the variable.
 - **Nemeses / fault injection** (`chaos/`) — `NemesisAction` trait
   (`inject`/`heal`). Network (partition halves/ring/one, slow, jitter, packet
   loss — via `iptables`/`tc` over SSH), process (kill minority/majority, pause),

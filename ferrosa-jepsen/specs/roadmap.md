@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-jepsen
 doc: roadmap
-last_updated: 2026-09-27
+last_updated: 2026-10-31
 ---
 
 # ferrosa-jepsen — Roadmap
@@ -28,6 +28,11 @@ external checkers.
   serializability checker and active-quorum pause workload are wired. Verify
   post-resume replica catch-up and histories that mix CQL writes with PostgreSQL
   transactions before claiming those guarantees.
+
+- **Run the `set` workload live (JE-6).** The book, the paged final read and
+  the orchestrator wiring are unit-tested against fakes and the mock; the
+  clustering-range page query and the error classification have not yet met a
+  real cluster under a nemesis.
 
 ## Next
 
