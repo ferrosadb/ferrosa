@@ -58,8 +58,28 @@ Two bugs surfaced on the way, both worth keeping in mind for the rest:
   the old generator and diffs them against your new ones. That is exactly how
   the first attempt failed.
 
-Acceptance: `ferrosa-net` drops from 93/87/17/5 reds to their remainder; the
-generated header contains `noncomputable section` unless `-all-computable`.
+Acceptance: the generated header contains `noncomputable section` unless
+`-all-computable`, and a crate that previously failed to elaborate for want of the
+section elaborates.
+
+Measured, and this is the correction worth reading before trusting the counts:
+`ferrosa-net`'s `tls` module does **not** drop its 89 `lean.dependsOnNoncomputable`
+reds. All 89 point at one line — `inductive rustls.enums.CipherSuite` — and they
+survive with and without the section (89 errors either way on the same `llbc`). The
+underlying message is
+
+```
+tag for constructor 'ferrosa_net.rustls.enums.CipherSuite.Unknown' is too big,
+this is a limitation of the current compilation scheme
+```
+
+so the enum cannot be compiled at all, and every reference then reports a
+`noncomputable` dependency on the generated `CipherSuite.ctorElim` that Lean would
+have built. The inventory labels these `lean.dependsOnNoncomputable` because of the
+wording, which is why they looked like this step's business. They are not: Rust
+discriminants in the thousands (`0x1301` and up) exceed Lean's constructor tag limit.
+That is its own fault, and it needs `discriminant` values or a different model for
+wide enums — not a section.
 
 ## Step 2 — instance naming (251 reds, plus echoes)
 
