@@ -52,6 +52,12 @@ DAG_MD = GAPS / "dag.md"
 CHARON = os.environ.get("CHARON", str(Path.home() / "src/aeneas/charon/bin/charon"))
 AENEAS = os.environ.get("AENEAS", str(Path.home() / "src/aeneas/src/_build/default/main.exe"))
 LEAN_PKG = os.environ.get("LEAN_PKG", str(Path.home() / ".local/aeneas/backends/lean"))
+# The sources the two binaries were built from. CI builds a pinned commit in a clone, so
+# the identity has to come from wherever that clone is, not from `$HOME/src/aeneas` on the
+# developer's machine -- a state.json that names the wrong build is the drift the ratchet
+# exists to catch.
+AENEAS_SRC = Path(os.environ.get("AENEAS_SRC") or Path.home() / "src/aeneas")
+CHARON_SRC = Path(os.environ.get("CHARON_SRC") or AENEAS_SRC / "charon")
 # No time budget by default. A cap turns "this crate needs eleven minutes" into "this crate is
 # unmeasured", and the sweep exists for coverage, not for a fast report. The bound that actually
 # protects the host is memory: lean_gap_report.py puts every extraction in a cgroup with a ceiling
@@ -134,16 +140,26 @@ def toolchain() -> dict:
     `lean` is asked through `lake env lean` first, because that is what elaborates a measurement,
     then through the elan shim, which needs no package directory and still answers while the host
     is busy extracting. A timeout in the first form says the host was loaded, not that Lean moved.
+
+    charon and aeneas are identified by the *sources* their binaries were built from, read from
+    the checkouts named by CHARON_SRC and AENEAS_SRC. A version string cannot do this job for
+    either tool, and a developer's `$HOME/src/aeneas` is not the build CI ran.
     """
-    pin = Path.home() / "src/aeneas/charon-pin"
-    if pin.is_file():
-        # The pin file carries a comment line above the commit it names.
-        charon_id = next((ln.strip() for ln in reversed(pin.read_text().splitlines())
-                          if ln.strip() and not ln.lstrip().startswith("#")), "")
-        if not charon_id:
-            raise SystemExit(f"lean_gap_inventory: {pin} names no charon commit")
-    else:
-        charon_id = tool_identity([CHARON, "--version"], "charon")
+    charon_id = git_identity(CHARON_SRC, "charon")
+    if charon_id is None:
+        pin = AENEAS_SRC / "charon-pin"
+        if pin.is_file():
+            # The pin file carries a comment line above the commit it names.
+            charon_id = next((ln.strip() for ln in reversed(pin.read_text().splitlines())
+                              if ln.strip() and not ln.lstrip().startswith("#")), "")
+            if not charon_id:
+                raise SystemExit(f"lean_gap_inventory: {pin} names no charon commit")
+        else:
+            charon_id = tool_identity([CHARON, "--version"], "charon")
+    aeneas_id = git_identity(AENEAS_SRC, "aeneas")
+    if aeneas_id is None:
+        raise SystemExit(f"lean_gap_inventory: {AENEAS_SRC} is not a git checkout; set AENEAS_SRC "
+                         f"to the source the aeneas binary was built from")
     lean = None
     for cmd in (["lake", "env", "lean", "--version"], ["lean", "--version"]):
         try:
@@ -155,10 +171,22 @@ def toolchain() -> dict:
         raise SystemExit("lean_gap_inventory: cannot identify lean through lake or through elan")
     return {
         "charon": charon_id,
-        "aeneas": tool_identity(["git", "-C", str(Path.home() / "src/aeneas"),
-                                 "rev-parse", "--short", "HEAD"], "aeneas"),
+        "aeneas": aeneas_id,
         "lean": lean,
     }
+
+
+def git_identity(repo: Path, what: str) -> str | None:
+    """The full commit of a checkout, or None when it is not one."""
+    try:
+        r = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                           capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    sha = (r.stdout or "").strip()
+    if r.returncode != 0 or not sha:
+        return None
+    return sha
 
 
 def crate_fingerprint(name: str, crates: dict[str, dict], tc: dict) -> str:

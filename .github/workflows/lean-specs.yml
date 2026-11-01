@@ -4,21 +4,43 @@ name: Lean specs
 # invariant predicate over its enumerated case space and fails when a ledger obligation has no harness
 # or a harness has no obligation. Without this job the corpus can drift from the obligations it names
 # while still compiling.
+#
+# The `ratchet` job below is the other half of "the Lean side is honest": the gap inventory
+# (specs/lean/gaps/) records what does not elaborate yet, and that job re-measures it against
+# the pinned aeneas/charon and fails when any error class grew. It is weekly, not per-push:
+# one measurement is charon -> aeneas -> `lake env lean` per crate, tens of minutes and more
+# memory than a hosted runner has for the largest crates. Gated crates are whatever
+# specs/lean/gaps/baseline.json holds; specs/lean/gaps/ratchet-scope.txt names the ones
+# deliberately outside the gate and why.
 
 on:
   pull_request:
     paths:
       - "specs/lean4/**"
       - "specs/lean4-rust/**"
+      - "specs/lean/**"
+      - "scripts/lean_gap_*.py"
       - "docs/unsafe-*.md"
       - "tests/ci/test_unsafe_ledger.py"
+      - "tests/ci/test_lean_gap_*.py"
       - ".github/workflows/lean-specs.yml"
   push:
     branches: [main]
     paths:
       - "specs/lean4/**"
       - "specs/lean4-rust/**"
+  schedule:
+    # Weekly, and deliberately outside the 03:00-08:00 UTC block the nightlies occupy
+    # (nightly-fuzz 03:00, driver-tests 03:30, nightly-slow-tests 04:00, nightly-sim
+    # 05:00, jepsen-multi-dc 06:00, elle 07:00, oom-audit 08:00). A measurement that
+    # queues behind them reports a toolchain that was starved, not one that regressed.
+    - cron: '40 9 * * 1' # Mondays, 9:40 UTC
   workflow_dispatch:
+    inputs:
+      record_shrink:
+        description: "Ratchet only: rewrite the baseline from this measurement (shrink only; uploads an artifact)"
+        type: boolean
+        default: false
 
 concurrency:
   group: lean-specs-${{ github.ref }}
@@ -33,8 +55,11 @@ env:
   LEAN_ABORT_ON_PANIC: "1"
 
 jobs:
+  # The weekly schedule is for the ratchet; rebuilding the corpus and the PDF every week
+  # would spend runner time to learn nothing new.
   specs:
     name: Build and run the harness
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -77,6 +102,7 @@ jobs:
   # to produce a document, and the artifact is only uploaded once those checks pass.
   book:
     name: Build the PDF
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -148,3 +174,118 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  # A ratchet, not a report: reds may shrink, never grow.
+  #
+  # `baseline.json` is a ceiling in error classes per crate. This job rebuilds the pinned
+  # toolchain, re-measures the gated crates, and fails when a class grew -- a class that
+  # appeared counts as growth from zero, and a crate that used to elaborate and now crashes
+  # or times out is a coverage regression, not a fix. Shrinking always passes and is
+  # recorded with `scripts/lean_gap_ratchet.py update`, which refuses to raise a count.
+  #
+  # Nothing here may run on every push: a measurement is tens of minutes. tests/ci/
+  # test_lean_gap_ratchet_workflow.py pins the schedule, the pins below, and the commands.
+  ratchet:
+    name: The gap inventory may shrink, never grow
+    if: github.event_name == 'schedule' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      # The pin. `baseline.json` says which build the numbers in it came from, and the
+      # check fails when these disagree with it -- comparing counts across toolchains is
+      # meaningless, and a meaningless comparison must not pass.
+      AENEAS_REPO: https://github.com/ferrosadb/aeneas
+      AENEAS_COMMIT: 80b690a9ad1ef1fb97fee23ef1e1c9486ff8f8b9
+      CHARON_REPO: https://github.com/AeneasVerif/charon
+      CHARON_COMMIT: 7b462d9159db2ed3015162352183906a30bfafc6
+      # The inventory defaults REPO to the maintainer's checkout; on a runner it has to be
+      # the checkout this job is measuring, or `cargo metadata` runs in a directory that
+      # does not exist.
+      REPO: ${{ github.workspace }}
+      AENEAS_SRC: ${{ github.workspace }}/aeneas
+      CHARON_SRC: ${{ github.workspace }}/aeneas/charon
+      AENEAS: ${{ github.workspace }}/aeneas/src/_build/default/main.exe
+      CHARON: ${{ github.workspace }}/aeneas/charon/bin/charon
+      LEAN_PKG: ${{ github.workspace }}/aeneas/backends/lean
+      # A hosted runner's memory is the ceiling a whole-crate charon run must fit in; the
+      # inventory's default (60% of RAM) makes an over-large crate die in its own scope and
+      # be recorded as `oom`. The time budgets are the other half: unbounded by default,
+      # because a cap turns "slow" into "unmeasured", but in CI a cap is the difference
+      # between a job that reports and a job that hangs until its timeout.
+      LEAN_GAP_MEM_SWAP_MAX: 1G
+      WHOLE_BUDGET: 1800
+      MODULE_BUDGET: 900
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # libgmp is what zarith links against. Without it aeneas' bootstrap builds gmp from
+      # source, which works but costs minutes for a package apt already has.
+      - name: System packages the toolchain links against
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libgmp-dev m4
+
+      - name: Install elan
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -o elan-init.sh
+          sh elan-init.sh -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      # aeneas' own bootstrap builds everything from whatever state the machine is in: it
+      # installs opam, creates a switch, installs the OCaml dependencies, clones charon at
+      # `charon-pin` and builds it, then `dune build`s aeneas. Running it from the pinned
+      # checkout is what keeps this job off a developer's `~/src/aeneas` and makes the
+      # measurement reproducible from the two commits above.
+      - name: Fetch the pinned aeneas
+        run: |
+          git clone --filter=blob:none --no-checkout "$AENEAS_REPO" aeneas
+          git -C aeneas checkout "$AENEAS_COMMIT"
+          test "$(git -C aeneas rev-parse HEAD)" = "$AENEAS_COMMIT"
+          echo "aeneas at $(git -C aeneas rev-parse HEAD)"
+          grep -v '^#' aeneas/charon-pin | tail -1
+
+      - name: Cache the OCaml switch and the charon build
+        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.2
+        with:
+          path: |
+            ~/.local/opam
+            aeneas/charon/charon/target
+          key: lean-gap-${{ env.AENEAS_COMMIT }}-${{ env.CHARON_COMMIT }}
+
+      - name: Build the pinned toolchain
+        run: |
+          ./aeneas/bootstrap.sh
+          test -x "$AENEAS"
+          test -x "$CHARON"
+
+      # Elaboration is checked against the Aeneas Lean library, so it has to be built
+      # before a single crate is measured. Core Lean only: no Mathlib, no cache download.
+      - name: Build the Aeneas Lean backend
+        working-directory: aeneas/backends/lean
+        run: |
+          cat lean-toolchain
+          lake build
+
+      - name: What the baseline holds
+        run: python3 scripts/lean_gap_ratchet.py show
+
+      - name: Re-measure the gated crates
+        run: |
+          crates=$(python3 scripts/lean_gap_ratchet.py list-crates)
+          echo "gated: $crates"
+          python3 scripts/lean_gap_inventory.py --only $crates
+
+      - name: Ratchet -- a class may shrink, never grow
+        run: python3 scripts/lean_gap_ratchet.py check
+
+      # Shrinking is a result, not a failure. This records it into an artifact and refuses
+      # if anything grew or a crate left the gate, so the artifact is a decision, not a dump.
+      - name: Record a shrink (dispatch only)
+        if: ${{ inputs.record_shrink }}
+        run: python3 scripts/lean_gap_ratchet.py update
+
+      - name: Upload the recorded baseline
+        if: ${{ inputs.record_shrink }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lean-gap-baseline
+          path: specs/lean/gaps/baseline.json
+          if-no-files-found: error
+          retention-days: 30
