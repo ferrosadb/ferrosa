@@ -114,8 +114,9 @@ containing 31 Lean-syntax lines — Coq cannot parse them.
 The obvious repair, making the Coq registration of `Prop`-inductive eliminators a
 fatal error so the offending definitions are skipped, is worse than the disease: the
 same input then produced an 11-line file, an empty module, because the abort takes the
-rest of the crate with it. The Lean-syntax leak has to be fixed at emission, not by
-refusing the input.
+rest of the crate with it. Two independent variants — aborting at the registration
+site, and recording the eliminator before aborting — both produced the same 11 lines.
+The Lean-syntax leak has to be fixed at emission, not by refusing the input.
 
 Gating the printing is not a small change: the same block is what registers the
 trait and instance names in the extraction context, and the rest of the
