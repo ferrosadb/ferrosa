@@ -33,23 +33,30 @@ and a serde group has members with 1, 10 and 3 parameters, so the block never
 elaborates and every later reference to any member reports `Unknown identifier`.
 One fault, hundreds of reds.
 
-## Step 1 — `noncomputable` (89 reds)
+## Step 1 — `noncomputable` (89 reds) — DONE (PR #2)
 
-Root cause: the machinery exists and is unreachable. `Translate.ml:1544` emits
+Root cause: the machinery existed and was unreachable. `Translate.ml` emitted
 
 ```ocaml
 if fi.noncomputable then Printf.fprintf out "... noncomputable section\n";
 ```
 
-but `fi.noncomputable` is hardcoded `false` at every construction site
-(`Translate.ml:2096`, `:2136`, and the function-file config), and
-`Config.all_computable` — the flag whose help text promises exactly this
-section — is never read.
+but `fi.noncomputable` was hardcoded `false` at four construction sites and
+`has_opaque && not all_computable` at two others — and `Config.all_computable`,
+the flag whose help text promises exactly this section, was only half read.
 
-Fix: `noncomputable = not !Config.all_computable` at the construction sites, so
-the CLI flag controls it as documented. `noncomputable` affects only code
-generation, not proofs, and aeneas output is a model, so the default (emit the
-section) is the honest one.
+Fix: the section is controlled by `-all-computable` alone, everywhere.
+
+Two bugs surfaced on the way, both worth keeping in mind for the rest:
+
+- The section was **never closed**. The footer only emitted `end <namespace>`,
+  so any file that received the section was left with an unclosed section. It
+  had never been noticed because the section was only emitted under
+  `has_opaque`, which no test crate satisfied. The footer now emits `end`.
+- Regenerating `tests/lean` from a binary that has a change is not enough: the
+  source change must be in the same commit, or CI regenerates the fixtures with
+  the old generator and diffs them against your new ones. That is exactly how
+  the first attempt failed.
 
 Acceptance: `ferrosa-net` drops from 93/87/17/5 reds to their remainder; the
 generated header contains `noncomputable section` unless `-all-computable`.
