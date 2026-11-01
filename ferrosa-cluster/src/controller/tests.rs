@@ -1,7 +1,7 @@
 use super::cluster::{
     build_recovered_topology_refresh_plan, build_recovered_topology_token_repair_plan,
     drain_ddl_queue, keyspace_needs_cluster_replay, peer_topology, resolve_missing_voters,
-    ring_admission, seed_join_node_info, should_claim_seed_role, should_initialize_seed_membership,
+    seed_join_node_info, should_claim_seed_role, should_initialize_seed_membership,
     should_run_bootstrap_streaming, MissingVoters,
 };
 use super::*;
@@ -1780,12 +1780,9 @@ async fn unapproved_node_rejected() {
         ModeController::new(config, net_config, local_id, storage, schema, registry);
 
     let peer_host_id = Uuid::new_v4();
-    let peer_node_id = uuid_to_node_id(peer_host_id);
 
     // auto_join=false, node not in approved_nodes -> Err(NotApproved)
-    let result = controller
-        .handle_join_request(peer_host_id, peer_node_id, None)
-        .await;
+    let result = controller.handle_join_request(peer_host_id, None).await;
     assert!(
         matches!(result, Err(ClusterError::NotApproved(id)) if id == peer_host_id),
         "unapproved node must be rejected"
@@ -1809,16 +1806,13 @@ async fn approved_node_passes_approval_check() {
         ModeController::new(config, net_config, local_id, storage, schema, registry);
 
     let peer_host_id = Uuid::new_v4();
-    let peer_node_id = uuid_to_node_id(peer_host_id);
 
     // Approve the node first
     controller.approve_node(peer_host_id);
 
     // auto_join=false, node in approved_nodes -> passes approval,
     // but fails at raft check (expected — raft not initialized in standalone)
-    let result = controller
-        .handle_join_request(peer_host_id, peer_node_id, None)
-        .await;
+    let result = controller.handle_join_request(peer_host_id, None).await;
     assert!(
         matches!(result, Err(ClusterError::Internal(_))),
         "approved node should pass approval check but fail on raft: got {result:?}"
@@ -1842,12 +1836,9 @@ async fn auto_join_bypasses_approval() {
         ModeController::new(config, net_config, local_id, storage, schema, registry);
 
     let peer_host_id = Uuid::new_v4();
-    let peer_node_id = uuid_to_node_id(peer_host_id);
 
     // auto_join=true -> bypasses approval, but fails at raft check
-    let result = controller
-        .handle_join_request(peer_host_id, peer_node_id, None)
-        .await;
+    let result = controller.handle_join_request(peer_host_id, None).await;
     // Should NOT be NotApproved — should be Internal (raft not initialized)
     assert!(
         matches!(result, Err(ClusterError::Internal(_))),
@@ -6998,47 +6989,6 @@ fn nothing_missing_resolves_to_nothing() {
             unresolved: vec![],
         }
     );
-}
-
-#[test]
-fn a_ring_admission_joins_then_assigns_the_members_own_deterministic_tokens() {
-    let host = Uuid::from_u128(0x6666);
-    let node_id = crate::raft::uuid_to_node_id(host);
-    let info = NodeInfo {
-        host_id: host,
-        addr: "127.0.0.1:7006".to_string(),
-        data_center: "eu-west-1".to_string(),
-        rack: "rack-east-a".to_string(),
-        state: NodeState::Normal,
-        cql_broadcast: None,
-    };
-    let (join, assign) = ring_admission(info.clone(), 4);
-    match join.op {
-        crate::raft::RaftOp::JoinNode(joined) => {
-            assert_eq!(joined.host_id, info.host_id);
-            assert_eq!(joined.addr, info.addr);
-            assert_eq!(
-                (joined.data_center.as_str(), joined.rack.as_str()),
-                (info.data_center.as_str(), info.rack.as_str()),
-                "the member is placed in its own DC and rack"
-            );
-        }
-        other => panic!("first command must be JoinNode, got {other:?}"),
-    }
-    match assign.op {
-        crate::raft::RaftOp::AssignTokens {
-            node_id: id,
-            tokens,
-        } => {
-            assert_eq!(id, node_id, "tokens go to the member that joined");
-            assert_eq!(
-                tokens,
-                crate::controller::token::deterministic_tokens_for_node(node_id, 4),
-                "re-proposing must assign the SAME tokens, or it would move ownership"
-            );
-        }
-        other => panic!("second command must be AssignTokens, got {other:?}"),
-    }
 }
 
 // ---------------------------------------------------------------------------

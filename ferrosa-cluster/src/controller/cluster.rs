@@ -3149,26 +3149,24 @@ impl ModeController {
                         // load tests then see roughly N-1 owners instead of
                         // N, and the "diabolical" single-owner pattern
                         // persists from the follower side.
-                        let (self_join_cmd, self_assign_cmd) = ring_admission(
-                            crate::raft::NodeInfo {
-                                host_id: local_host_id_for_refresh,
-                                addr: local_addr_for_refresh.clone(),
-                                data_center: config_for_promotion.data_center.clone(),
-                                rack: config_for_promotion.rack.clone(),
-                                state: crate::raft::NodeState::Normal,
-                                cql_broadcast: local_cql_broadcast_for_refresh.clone(),
-                            },
-                            seed_num_tokens,
-                        );
+                        let self_info = crate::raft::NodeInfo {
+                            host_id: local_host_id_for_refresh,
+                            addr: local_addr_for_refresh.clone(),
+                            data_center: config_for_promotion.data_center.clone(),
+                            rack: config_for_promotion.rack.clone(),
+                            state: crate::raft::NodeState::Normal,
+                            cql_broadcast: local_cql_broadcast_for_refresh.clone(),
+                        };
                         // The seed initialized Raft but need not win the election.
                         // When it did not, these proposals come back
                         // `LeftToLeader`, and the leader re-proposes every voter
                         // missing from its ring in the topology wait below
                         // (t_9c219a2b).
-                        if let Err(e) = crate::raft_forward::propose_ring_member_via_raft(
+                        if let Err(e) = crate::raft_forward::admit_to_ring(
                             &raft_arc,
-                            self_join_cmd,
-                            self_assign_cmd,
+                            self_info,
+                            seed_num_tokens,
+                            schema_for_replay.snapshot().version,
                         )
                         .await
                         {
@@ -3183,7 +3181,6 @@ impl ModeController {
                         let initialized_dcs = peer_dcs_for_init.load_full();
                         let initialized_racks = peer_racks_for_init.load_full();
                         for (peer_uuid, addr) in &initialized_peers {
-                            let peer_node_id = uuid_to_node_id(*peer_uuid);
                             let peer_internode_broadcast = peer_manager_for_bootstrap.get_peer_internode_broadcast_sync(*peer_uuid);
                             let node_info = seed_join_node_info(
                                 *peer_uuid,
@@ -3197,34 +3194,30 @@ impl ModeController {
                                     &config_for_promotion.rack,
                                 ),
                             );
-                            let join_cmd = crate::raft::RaftCommand {
-                                op: crate::raft::RaftOp::JoinNode(node_info),
-                                schema_version: Uuid::new_v4(),
-                            };
-                            let peer_tokens = crate::controller::token::deterministic_tokens_for_node(
-                                peer_node_id,
-                                seed_num_tokens,
-                            );
-                            let assign_cmd = crate::raft::RaftCommand {
-                                op: crate::raft::RaftOp::AssignTokens {
-                                    node_id: peer_node_id,
-                                    tokens: peer_tokens,
-                                },
-                                schema_version: Uuid::new_v4(),
-                            };
-                            if let Err(e) = crate::raft_forward::propose_ring_member_via_raft(
+                            match crate::raft_forward::admit_to_ring(
                                 &raft_arc,
-                                join_cmd,
-                                assign_cmd,
+                                node_info,
+                                seed_num_tokens,
+                                schema_for_replay.snapshot().version,
                             )
                             .await
                             {
-                                tracing::warn!(
-                                    peer = %peer_uuid,
-                                    leader = lid,
-                                    %e,
-                                    "seed: ring admission for peer failed after leader election"
-                                );
+                                Ok(crate::raft_forward::RingAdmission::Committed) => {}
+                                Ok(crate::raft_forward::RingAdmission::LeftToLeader) => {
+                                    tracing::warn!(
+                                        peer = %peer_uuid,
+                                        leader = lid,
+                                        "seed: not the raft leader; peer ring admission left to the leader"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        peer = %peer_uuid,
+                                        leader = lid,
+                                        %e,
+                                        "seed: ring admission for peer failed after leader election"
+                                    );
+                                }
                             }
                         }
                         tracing::info!(
@@ -3251,21 +3244,19 @@ impl ModeController {
                         // now, and while the topology is incomplete re-proposes
                         // every voter missing from its ring. Followers wait.
                         if lid == local_node_id {
-                            let (join_cmd, assign_cmd) = ring_admission(
-                                crate::raft::NodeInfo {
-                                    host_id: local_host_id_for_refresh,
-                                    addr: local_addr_for_refresh.clone(),
-                                    data_center: config_for_promotion.data_center.clone(),
-                                    rack: config_for_promotion.rack.clone(),
-                                    state: crate::raft::NodeState::Normal,
-                                    cql_broadcast: local_cql_broadcast_for_refresh.clone(),
-                                },
-                                config_for_promotion.num_tokens as usize,
-                            );
-                            if let Err(e) = crate::raft_forward::propose_ring_member_via_raft(
+                            let self_info = crate::raft::NodeInfo {
+                                host_id: local_host_id_for_refresh,
+                                addr: local_addr_for_refresh.clone(),
+                                data_center: config_for_promotion.data_center.clone(),
+                                rack: config_for_promotion.rack.clone(),
+                                state: crate::raft::NodeState::Normal,
+                                cql_broadcast: local_cql_broadcast_for_refresh.clone(),
+                            };
+                            if let Err(e) = crate::raft_forward::admit_to_ring(
                                 &raft_arc,
-                                join_cmd,
-                                assign_cmd,
+                                self_info,
+                                config_for_promotion.num_tokens as usize,
+                                schema_for_replay.snapshot().version,
                             )
                             .await
                             {
@@ -3310,9 +3301,26 @@ impl ModeController {
                             let now = tokio::time::Instant::now();
                             if !overdue && now >= deadline {
                                 overdue = true;
+                                // Say WHY each voter is missing: absent from the ring,
+                                // present in a non-voter state, or owning no tokens.
+                                let ring_view: Vec<(u64, Option<crate::raft::NodeState>, usize)> = {
+                                    let ring_guard = ring_for_bootstrap.load();
+                                    let ring = ring_guard.as_ref().as_ref();
+                                    missing
+                                        .iter()
+                                        .map(|id| {
+                                            (
+                                                *id,
+                                                ring.and_then(|r| r.get_node(*id).map(|n| n.state)),
+                                                ring.map_or(0, |r| r.tokens_for_node(*id).len()),
+                                            )
+                                        })
+                                        .collect()
+                                };
                                 tracing::error!(
                                     voters = voters.len(),
                                     missing = ?missing,
+                                    ring_view = ?ring_view,
                                     deadline_secs = formation_deadline_secs,
                                     "initial voter topology did not publish token ownership; refusing \
                                      client admission and still waiting"
@@ -3339,6 +3347,7 @@ impl ModeController {
                                     (&peer_dcs_for_init.load_full(), &peer_racks_for_init.load_full()),
                                     (&config_for_promotion.data_center, &config_for_promotion.rack),
                                     config_for_promotion.num_tokens as usize,
+                                    schema_for_replay.snapshot().version,
                                 )
                                 .await;
                                 // Report the edges: a new failure, and the first
@@ -3951,31 +3960,6 @@ impl ModeController {
 const INITIAL_TOPOLOGY_READMISSION_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(2);
 
-/// A member's ring admission: `JoinNode` for `node_info`, then `AssignTokens`
-/// with that member's deterministic tokens.
-///
-/// Re-proposing it is safe. `JoinNode` upserts the member and `AssignTokens`
-/// inserts the same deterministic tokens again, so the formation wait can repeat
-/// it until the admission lands instead of giving up after one attempt.
-pub(super) fn ring_admission(
-    node_info: NodeInfo,
-    num_tokens: usize,
-) -> (crate::raft::RaftCommand, crate::raft::RaftCommand) {
-    let node_id = uuid_to_node_id(node_info.host_id);
-    let tokens = crate::controller::token::deterministic_tokens_for_node(node_id, num_tokens);
-    debug_assert_eq!(tokens.len(), num_tokens, "one token per vnode");
-    (
-        crate::raft::RaftCommand {
-            op: crate::raft::RaftOp::JoinNode(node_info),
-            schema_version: Uuid::new_v4(),
-        },
-        crate::raft::RaftCommand {
-            op: crate::raft::RaftOp::AssignTokens { node_id, tokens },
-            schema_version: Uuid::new_v4(),
-        },
-    )
-}
-
 /// The voters the leader can re-admit, and the ones it cannot describe.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct MissingVoters {
@@ -4031,6 +4015,7 @@ async fn redrive_ring_admissions(
     ),
     local_topology: (&str, &str),
     num_tokens: usize,
+    schema_version: Uuid,
 ) -> std::result::Result<(), String> {
     let mut first_error: Option<String> = None;
     for (host, addr) in missing.admissible {
@@ -4044,9 +4029,8 @@ async fn redrive_ring_admissions(
             peer_topology.1,
             local_topology,
         );
-        let (join_cmd, assign_cmd) = ring_admission(info, num_tokens);
         let outcome =
-            crate::raft_forward::propose_ring_member_via_raft(raft, join_cmd, assign_cmd).await;
+            crate::raft_forward::admit_to_ring(raft, info, num_tokens, schema_version).await;
         match outcome {
             Ok(crate::raft_forward::RingAdmission::Committed) => {}
             // Leadership moved mid-pass; the new leader re-drives.

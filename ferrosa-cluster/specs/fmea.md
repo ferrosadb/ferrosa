@@ -267,7 +267,9 @@ admission is refused there instead of here. Its unit test pinned the forward,
 not the commit, and the six-process test passed before that change too, so
 neither was evidence for it.
 
-Ring admission is now the leader's job. `raft_forward::propose_ring_member_via_raft`
+Ring admission is now the leader's job. `raft_forward::admit_to_ring` builds a
+member's `JoinNode` + `AssignTokens` (carrying the proposer's current schema
+version) and is the only production code that proposes them (ADR-013). It
 commits both commands on the leader and returns `RingAdmission::LeftToLeader`
 on a follower (or when leadership moves between the two writes) without
 forwarding anything. A failed `JoinNode` stops before `AssignTokens`, so tokens
@@ -277,7 +279,8 @@ the topology wait (below). Guards:
 `a_follower_leaves_ring_admission_to_the_leader`,
 `propose_ring_member_on_the_leader_commits_both_locally`,
 `leadership_lost_between_join_and_assign_is_left_to_the_leader`,
-`propose_ring_member_surfaces_a_non_forward_raft_error`.
+`propose_ring_member_surfaces_a_non_forward_raft_error`,
+`admitting_a_member_proposes_its_join_then_its_tokens`.
 
 ### The formation deadline gave up instead of reporting (closed)
 
@@ -307,8 +310,17 @@ Edges are logged (deadline crossed, re-drive failure changed, published after
 the deadline); individual attempts are not.
 
 The re-drive of a missing FOLLOWER has guard tests
-(`resolve_missing_voters`, `ring_admission`) but no process-level red yet: in
-the reproduction only the leader's own admission was missing.
+(`resolve_missing_voters`,
+`a_ring_admission_joins_then_assigns_the_members_own_deterministic_tokens`) but
+no deterministic process-level red (t_6d0c2b09). Mutation evidence, 2026-11-01:
+with the re-drive disabled,
+`data_center_process::a_ddl_created_in_one_dc_reaches_the_other` failed 2 of 3
+runs, each time with a follower (not the leader) missing from the ring; with it
+enabled it passed every run. How a follower's admission is lost in the first
+place is not identified: every admission path traced is idempotent for an
+existing voter. The topology-deadline ERROR now carries `ring_view` (each missing
+voter's ring state and token count) and the seed logs a peer admission left to
+the leader, so the next occurrence reports which step lost it.
 
 **Residual:** a voter that never returns keeps its DC unready with the ERROR
 line above as its only signal. The `Direct` DDL path the election deadline

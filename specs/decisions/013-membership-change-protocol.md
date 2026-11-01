@@ -33,7 +33,7 @@ These stores are updated by **different code paths with no transactional API spa
 
 ## Decision
 
-Introduce a single transactional API for all membership changes. No code outside this module may call `raft.client_write(JoinNode|LeaveNode|UpdateNodeInfo)`, `raft.add_learner`, `raft.change_membership`, `network_factory.register_node`, or directly mutate `state.members`. CI gate enforces this via grep-based lint.
+Introduce a single transactional API for all membership changes. No code outside this module may call `raft.client_write(JoinNode|LeaveNode|UpdateNodeInfo)`, `raft.add_learner`, `raft.change_membership`, `network_factory.register_node`, or directly mutate `state.members`. `scripts/ci-gates/no-raw-membership-mutation.py` enforces this (on any receiver, with no allowlist; its tests run in CI). The ring admission (`JoinNode` + `AssignTokens`) is proposed only by `raft_forward::admit_to_ring`. The gate itself is not yet in CI: nine production sites still need a decision each (forge task t_bb34e7d9).
 
 ### Module: `ferrosa-cluster/src/membership/`
 

@@ -435,7 +435,9 @@ build; the codec's own cost is its delta against `none`.
   3 MiB chunks, 60 s per-chunk timeout.
 - `multi_dc_apply.rs` / `group_id.rs` — per-DC Raft groups (UUID-v5 group ids),
   HLC reorder buffer + applied-txn ledger for cross-DC Accord apply (ADR-015).
-- `raft_forward.rs` — forward client writes / membership updates to the leader.
+- `raft_forward.rs` — forward client writes / membership updates to the leader,
+  and `admit_to_ring`, the one production path that proposes a member's
+  `JoinNode` + `AssignTokens` (ADR-013; `scripts/ci-gates/no-raw-membership-mutation.py`).
 - `raft_forward_codec.rs` — the Cap'n Proto frame for the forwarded `RaftCommand`
   (`ForwardedRaftCommand` in `ferrosa-net`'s `envelope.capnp`). The
   `ClusterMembershipForward` body today is a bincode blob on a shipped contract

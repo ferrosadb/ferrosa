@@ -32,9 +32,10 @@ use ferrosa_net::codec::Lane;
 use ferrosa_net::message::Message;
 use ferrosa_net::peer::PeerManager;
 use ferrosa_net::rpc::handler::{PeerId, RpcHandler};
+use uuid::Uuid;
 
 use crate::error::{ClusterError, Result};
-use crate::raft::{FerrosRaft, RaftCommand};
+use crate::raft::{uuid_to_node_id, FerrosRaft, NodeInfo, RaftCommand, RaftOp};
 
 /// Outcome of a Raft `client_write` call as seen by code that needs to react
 /// to a [`openraft::error::ForwardToLeader`] hint.
@@ -146,13 +147,64 @@ where
     Ok(RingAdmission::Committed)
 }
 
-/// [`propose_ring_member`] against a live Raft.
-pub async fn propose_ring_member_via_raft(
+/// A member's ring admission: `JoinNode` for `node_info`, then `AssignTokens`
+/// with that member's deterministic tokens. Both carry `schema_version`, which
+/// should be the proposer's CURRENT version: a topology command changes no
+/// schema (t_7dda9421).
+///
+/// Re-proposing it is safe. `JoinNode` upserts the member and `AssignTokens`
+/// inserts the same deterministic tokens again, so the formation wait can repeat
+/// it until the admission lands instead of giving up after one attempt.
+fn ring_admission(
+    node_info: NodeInfo,
+    num_tokens: usize,
+    schema_version: Uuid,
+) -> (RaftCommand, RaftCommand) {
+    let node_id = uuid_to_node_id(node_info.host_id);
+    let tokens = crate::controller::deterministic_tokens_for_node(node_id, num_tokens);
+    debug_assert_eq!(tokens.len(), num_tokens, "one token per vnode");
+    (
+        RaftCommand {
+            op: RaftOp::JoinNode(node_info),
+            schema_version,
+        },
+        RaftCommand {
+            op: RaftOp::AssignTokens { node_id, tokens },
+            schema_version,
+        },
+    )
+}
+
+/// Build `node_info`'s ring admission and propose it through `propose`, the
+/// local `client_write` already classified. See [`propose_ring_member`] for
+/// what each outcome means.
+async fn admit_to_ring_with<P, PFut>(
+    node_info: NodeInfo,
+    num_tokens: usize,
+    schema_version: Uuid,
+    propose: P,
+) -> Result<RingAdmission>
+where
+    P: Fn(RaftCommand) -> PFut,
+    PFut: Future<Output = std::result::Result<(), ProposeError>>,
+{
+    let (join, assign) = ring_admission(node_info, num_tokens, schema_version);
+    propose_ring_member(join, assign, propose).await
+}
+
+/// Admit `node_info` to the ring through a live Raft: build its `JoinNode` and
+/// `AssignTokens` and propose both on this node.
+///
+/// This is the only production path that proposes a `JoinNode` (ADR-013,
+/// enforced by `scripts/ci-gates/no-raw-membership-mutation.py`). Callers say
+/// WHO to admit; they never construct the commands.
+pub async fn admit_to_ring(
     raft: &FerrosRaft,
-    join: RaftCommand,
-    assign: RaftCommand,
+    node_info: NodeInfo,
+    num_tokens: usize,
+    schema_version: Uuid,
 ) -> Result<RingAdmission> {
-    propose_ring_member(join, assign, |cmd| async move {
+    admit_to_ring_with(node_info, num_tokens, schema_version, |cmd| async move {
         raft.client_write(cmd)
             .await
             .map(|_| ())
@@ -687,6 +739,75 @@ mod tests {
         .unwrap();
 
         assert_eq!(outcome, RingAdmission::LeftToLeader);
+        assert_eq!(*proposed.lock().unwrap(), vec!["JoinNode", "AssignTokens"]);
+    }
+
+    /// ADR-013: the forwarding helper builds a member's admission AND proposes
+    /// it, so no caller outside the membership boundary constructs a `JoinNode`.
+    #[test]
+    fn a_ring_admission_joins_then_assigns_the_members_own_deterministic_tokens() {
+        let host = Uuid::from_u128(0x6666);
+        let node_id = crate::raft::uuid_to_node_id(host);
+        let info = NodeInfo {
+            host_id: host,
+            addr: "127.0.0.1:7006".to_string(),
+            data_center: "eu-west-1".to_string(),
+            rack: "rack-east-a".to_string(),
+            state: NodeState::Normal,
+            cql_broadcast: None,
+        };
+        let version = Uuid::from_u128(0x5c4e);
+        let (join, assign) = ring_admission(info.clone(), 4, version);
+        assert_eq!(
+            (join.schema_version, assign.schema_version),
+            (version, version),
+            "topology commands carry the caller's schema version (t_7dda9421)"
+        );
+        match join.op {
+            RaftOp::JoinNode(joined) => assert_eq!(
+                (joined.host_id, joined.addr, joined.data_center, joined.rack),
+                (info.host_id, info.addr, info.data_center, info.rack),
+                "the member as described, in its own DC and rack"
+            ),
+            other => panic!("first command must be JoinNode, got {other:?}"),
+        }
+        match assign.op {
+            RaftOp::AssignTokens {
+                node_id: id,
+                tokens,
+            } => {
+                assert_eq!(id, node_id, "tokens go to the member that joined");
+                assert_eq!(
+                    tokens,
+                    crate::controller::deterministic_tokens_for_node(node_id, 4),
+                    "re-proposing must assign the SAME tokens, or it would move ownership"
+                );
+            }
+            other => panic!("second command must be AssignTokens, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn admitting_a_member_proposes_its_join_then_its_tokens() {
+        let proposed: Arc<Mutex<Vec<&'static str>>> = Arc::default();
+        let sink = proposed.clone();
+        let info = NodeInfo {
+            host_id: Uuid::from_u128(0x7777),
+            addr: "127.0.0.1:7007".to_string(),
+            data_center: "dc1".to_string(),
+            rack: "rack1".to_string(),
+            state: NodeState::Normal,
+            cql_broadcast: None,
+        };
+
+        let outcome = admit_to_ring_with(info, 2, Uuid::nil(), move |cmd| {
+            sink.lock().unwrap().push(op_name(&cmd));
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, RingAdmission::Committed);
         assert_eq!(*proposed.lock().unwrap(), vec!["JoinNode", "AssignTokens"]);
     }
 

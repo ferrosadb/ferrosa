@@ -14,8 +14,10 @@
 //!
 //! This module introduces [`MembershipChanger`]: a single API which is
 //! the only sanctioned way to mutate any of those four maps from
-//! outside the apply path.  CI gate
-//! `scripts/ci-gates/no-raw-client-write.sh` enforces the ban (W1.9).
+//! outside the apply path.  `scripts/ci-gates/no-raw-membership-mutation.py`
+//! checks the ban: no raw `add_learner` / `change_membership` /
+//! `register_node`, and no `JoinNode` / `LeaveNode` / `UpdateNodeInfo`
+//! proposed outside this module and the forwarding helper.
 //!
 //! # API surface (Sprint 1)
 //!

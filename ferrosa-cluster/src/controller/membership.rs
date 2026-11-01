@@ -12,7 +12,6 @@ use crate::raft::{uuid_to_node_id, NodeInfo, NodeState, RaftCommand, RaftOp};
 use crate::ring::TokenRing;
 
 use super::cluster::peer_topology;
-use super::token::generate_deterministic_token;
 use super::ModeController;
 
 fn clear_pending_join(pending_joins: &Arc<Mutex<Vec<Uuid>>>, host_id: Uuid) {
@@ -104,12 +103,11 @@ impl ModeController {
     /// 1. Check `approved_nodes` unless `auto_join=true`.
     /// 2. Compute delta mutations (for now: empty — S3 bootstrap covers most data).
     /// 3. If delta needed, stream via `StreamSender`.
-    /// 4. Generate deterministic tokens for the new node.
-    /// 5. Propose `JoinNode` + `AssignTokens` via Raft.
+    /// 4. Admit it to the ring (`raft_forward::admit_to_ring`): `JoinNode`,
+    ///    then `AssignTokens` with its deterministic tokens.
     pub async fn handle_join_request(
         &self,
         peer_host_id: Uuid,
-        peer_node_id: u64,
         _manifest_state: Option<()>, // placeholder for ManifestState
     ) -> Result<()> {
         // 1. Approval check — unless auto_join is enabled.
@@ -130,13 +128,7 @@ impl ModeController {
 
         // 3. No delta streaming needed for MVP.
 
-        // 4. Generate deterministic tokens for the new node.
-        let num_tokens = self.config.num_tokens as usize;
-        let tokens: Vec<i64> = (0..num_tokens)
-            .map(|i| generate_deterministic_token(peer_node_id, i))
-            .collect();
-
-        // 5. Propose JoinNode via Raft.
+        // 4. Admit the node to the ring.
         //
         // The committed entry must carry THE PEER's announced dc/rack, never
         // ours: this node authors the joiner's identity, so stamping it with
@@ -168,34 +160,24 @@ impl ModeController {
         // last real DDL put it; a random version here would be wrong even though
         // that gate currently ignores it.
         let schema_version = self.schema.snapshot().version;
+        let num_tokens = self.config.num_tokens as usize;
 
-        let join_cmd = RaftCommand {
-            op: RaftOp::JoinNode(node_info),
-            schema_version,
-        };
-        raft.client_write(join_cmd)
-            .await
-            .map_err(|e| ClusterError::RaftError(format!("JoinNode proposal failed: {e}")))?;
-
-        // Propose AssignTokens via Raft.
-        let assign_cmd = RaftCommand {
-            op: RaftOp::AssignTokens {
-                node_id: peer_node_id,
-                tokens,
-            },
-            schema_version,
-        };
-        raft.client_write(assign_cmd)
-            .await
-            .map_err(|e| ClusterError::RaftError(format!("AssignTokens proposal failed: {e}")))?;
-
-        tracing::info!(
-            host_id = %peer_host_id,
-            node_id = peer_node_id,
-            "node join complete: JoinNode + AssignTokens committed"
-        );
-
-        Ok(())
+        match crate::raft_forward::admit_to_ring(&raft, node_info, num_tokens, schema_version)
+            .await?
+        {
+            crate::raft_forward::RingAdmission::Committed => {
+                tracing::info!(
+                    host_id = %peer_host_id,
+                    node_id = uuid_to_node_id(peer_host_id),
+                    "node join complete: JoinNode + AssignTokens committed"
+                );
+                Ok(())
+            }
+            // Only the leader admits; this node lost or never held leadership.
+            crate::raft_forward::RingAdmission::LeftToLeader => Err(ClusterError::RaftError(
+                format!("join of {peer_host_id} not committed: this node is not the raft leader"),
+            )),
+        }
     }
 
     /// Decommission this node (P0-2).
@@ -636,7 +618,6 @@ impl ModeController {
                 return;
             }
 
-            // Propose JoinNode via Raft.
             let node_info = NodeInfo {
                 host_id,
                 addr: desired_addr.clone(),
@@ -645,29 +626,17 @@ impl ModeController {
                 state: NodeState::Normal,
                 cql_broadcast,
             };
-
-            let join_cmd = RaftCommand {
-                op: RaftOp::JoinNode(node_info),
-                schema_version,
-            };
-            let num_tokens = config_clone.num_tokens as usize;
-            let tokens: Vec<i64> = (0..num_tokens)
-                .map(|i| generate_deterministic_token(peer_node_id, i))
-                .collect();
-            let assign_cmd = RaftCommand {
-                op: RaftOp::AssignTokens {
-                    node_id: peer_node_id,
-                    tokens,
-                },
-                schema_version,
-            };
             // Leadership can move between the leader check above and this write.
             // A follower cannot admit anyone (the leader refuses a forwarded
             // admission), so a refusal leaves it to the leader, which re-proposes
             // every voter missing from the initial topology (t_9c219a2b).
-            let admitted =
-                crate::raft_forward::propose_ring_member_via_raft(&raft, join_cmd, assign_cmd)
-                    .await;
+            let admitted = crate::raft_forward::admit_to_ring(
+                &raft,
+                node_info,
+                config_clone.num_tokens as usize,
+                schema_version,
+            )
+            .await;
             clear_pending_join(&pending_joins, host_id);
             match admitted {
                 Ok(crate::raft_forward::RingAdmission::Committed) => {}
