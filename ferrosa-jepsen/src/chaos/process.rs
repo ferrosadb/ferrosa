@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use rand::seq::IndexedRandom;
 
 use super::{
-    probe_says_serving, MachineAction, NemesisAction, NemesisContext, NemesisExecutor,
-    SERVING_PROBE,
+    exec_required, ferrosa_process, probe_says_serving, started_during, MachineAction,
+    NemesisAction, NemesisContext, NemesisExecutor, FERROSA_PROCESS, SERVING_PROBE,
 };
 
 /// Polls for a SIGKILLed Fly machine to report `stopped` (1 s apart).
@@ -20,9 +20,10 @@ const REJOIN_INTERVAL: Duration = Duration::from_secs(5);
 /// Kill ferrosa process on minority nodes, restart after heal.
 ///
 /// Over SSH this is `pkill -9` and a relaunch. On Fly it is a SIGKILL stop of each minority
-/// machine through the Machines API, proven by the machine reaching `stopped`, and heal starts it
-/// and waits until it serves `/readyz`. A container transport is refused loudly rather than
-/// faked.
+/// machine through the Machines API, proven by the machine reaching `stopped`, and heal starts it,
+/// waits until it serves `/readyz` and requires the ferrosa process to be younger than the heal
+/// (a PID can repeat in a freshly booted machine, an age cannot). The PID and age before and
+/// after are logged. A container transport is refused loudly rather than faked.
 pub struct KillMinority;
 
 #[async_trait]
@@ -43,6 +44,8 @@ impl NemesisAction for KillMinority {
             }
             NemesisExecutor::Fly { .. } => {
                 for node in ctx.minority_indices() {
+                    let (pid, age) = ferrosa_on(ctx, node).await?;
+                    tracing::info!(node, pid, age_secs = age, "kill-minority: SIGKILL target");
                     ctx.fly_machine(node, MachineAction::Kill).await?;
                     wait_for_stopped(ctx, node).await?;
                 }
@@ -70,8 +73,23 @@ impl NemesisAction for KillMinority {
             }
             NemesisExecutor::Fly { .. } => {
                 for node in ctx.minority_indices() {
+                    let heal_started = Instant::now();
                     ctx.fly_machine(node, MachineAction::Start).await?;
                     wait_until_serving(ctx, node).await?;
+                    let (pid, age) = ferrosa_on(ctx, node).await?;
+                    if !started_during(age, heal_started.elapsed()) {
+                        anyhow::bail!(
+                            "kill-minority: node {node} ferrosa pid {pid} is {age}s old, older than \
+                             the {}s heal; the process survived the kill",
+                            heal_started.elapsed().as_secs()
+                        );
+                    }
+                    tracing::info!(
+                        node,
+                        pid,
+                        age_secs = age,
+                        "kill-minority: a new ferrosa serves"
+                    );
                 }
             }
             NemesisExecutor::Docker { .. } => {
@@ -81,6 +99,11 @@ impl NemesisAction for KillMinority {
         tracing::info!(nodes = ?ctx.minority_ips(), "Restarted ferrosa on minority nodes");
         Ok(())
     }
+}
+
+/// The ferrosa PID and age on one node; exactly one process must be running.
+async fn ferrosa_on(ctx: &NemesisContext, node: usize) -> Result<(u32, u64)> {
+    ferrosa_process(&exec_required(ctx, node, FERROSA_PROCESS).await?.stdout)
 }
 
 /// Prove the kill bit: the machine must report `stopped` within [`STOP_POLLS`] seconds.

@@ -145,6 +145,14 @@ impl NemesisContext {
             .args(&args)
             .output()
             .await?;
+        if action != MachineAction::List {
+            tracing::info!(
+                node = node_index,
+                command = %format!("fly {}", args.join(" ")),
+                exit_code = ?output.status.code(),
+                "chaos machine command"
+            );
+        }
         if !output.status.success() {
             anyhow::bail!(
                 "`fly {}` failed with {:?}: {}",
@@ -295,12 +303,19 @@ pub(crate) fn iptables_binary_for(address: &str) -> &'static str {
 /// Execute a chaos command through the context's configured transport (SSH, Fly SSH or a
 /// container runtime) and fail loudly if the node rejects it, so a fault that did not apply never
 /// reads as one that did.
+/// Every command and its exit code is logged, so the evidence shows what the nemesis did.
 pub(crate) async fn exec_required(
     ctx: &NemesisContext,
     node_index: usize,
     command: &str,
-) -> Result<()> {
+) -> Result<crate::ssh::CommandOutput> {
     let output = ctx.exec_on(node_index, command).await?;
+    tracing::info!(
+        node = node_index,
+        command,
+        exit_code = output.exit_code,
+        "chaos command"
+    );
     if output.exit_code != 0 {
         anyhow::bail!(
             "chaos command `{command}` failed on node {node_index} with {}: {}",
@@ -308,7 +323,7 @@ pub(crate) async fn exec_required(
             output.stderr
         );
     }
-    Ok(())
+    Ok(output)
 }
 
 /// Run every command of a plan, in order, failing on the first that does not apply.
@@ -317,6 +332,77 @@ pub(crate) async fn run_plan(ctx: &NemesisContext, plan: &[NodeCommand]) -> Resu
         exec_required(ctx, *node_index, command).await?;
     }
     Ok(())
+}
+
+/// The presence check for an appended netfilter rule: the same rule with `-C`, printing a marker
+/// so it exits 0 either way (the Fly transport treats any non-zero exit as a transport failure).
+pub(crate) fn rule_check_command(append: &str) -> Result<String> {
+    let Some((binary, rule)) = append.split_once(" -A ") else {
+        anyhow::bail!("`{append}` does not append a rule, so it has no presence check");
+    };
+    Ok(format!("{binary} -C {rule} && echo PRESENT || echo ABSENT"))
+}
+
+/// Read [`rule_check_command`] output: `PRESENT` or `ABSENT` on a line of its own, else an error.
+pub(crate) fn rule_presence(stdout: &str) -> Result<bool> {
+    let mut lines = stdout.lines().map(str::trim);
+    if lines.clone().any(|line| line == "PRESENT") {
+        return Ok(true);
+    }
+    if lines.any(|line| line == "ABSENT") {
+        return Ok(false);
+    }
+    anyhow::bail!("rule check printed neither PRESENT nor ABSENT: {stdout:?}")
+}
+
+/// Check every appended rule of `plan` on its node and fail unless each is present (after
+/// inject) or absent (after heal). A nemesis that silently did nothing would otherwise make the
+/// run's verdict worthless.
+pub(crate) async fn verify_rules(
+    ctx: &NemesisContext,
+    plan: &[NodeCommand],
+    expect_present: bool,
+) -> Result<()> {
+    for (node_index, append) in plan {
+        let check = rule_check_command(append)?;
+        let present = rule_presence(&exec_required(ctx, *node_index, &check).await?.stdout)?;
+        if present != expect_present {
+            anyhow::bail!(
+                "node {node_index}: rule `{append}` is {} after {}",
+                if present { "still present" } else { "absent" },
+                if expect_present { "inject" } else { "heal" }
+            );
+        }
+    }
+    tracing::info!(
+        rules = plan.len(),
+        expect_present,
+        "verified every partition rule on its node"
+    );
+    Ok(())
+}
+
+/// `ps -o pid=,etimes= -C ferrosa`: the node's ferrosa PID and its age in seconds.
+pub(crate) const FERROSA_PROCESS: &str = "ps -o pid=,etimes= -C ferrosa";
+
+/// Parse [`FERROSA_PROCESS`] output. Exactly one ferrosa process is expected; none or several is
+/// an error, not a guess.
+pub(crate) fn ferrosa_process(stdout: &str) -> Result<(u32, u64)> {
+    let mut lines = stdout.lines().filter(|line| !line.trim().is_empty());
+    let (Some(line), None) = (lines.next(), lines.next()) else {
+        anyhow::bail!("expected exactly one ferrosa process, `ps` printed {stdout:?}");
+    };
+    let mut fields = line.split_whitespace();
+    match (fields.next(), fields.next(), fields.next()) {
+        (Some(pid), Some(age), None) => Ok((pid.parse()?, age.parse()?)),
+        _ => anyhow::bail!("`ps` line {line:?} is not `pid etimes`"),
+    }
+}
+
+/// Whether a process `age_secs` old started during a heal that has run for `heal_elapsed`. A
+/// PID can repeat in a freshly booted machine, so a restart is proven by age, not by PID.
+pub(crate) fn started_during(age_secs: u64, heal_elapsed: Duration) -> bool {
+    age_secs <= heal_elapsed.as_secs()
 }
 
 /// Commands that cut every node in `isolated` off from every other node, in both directions and
@@ -731,6 +817,44 @@ mod tests {
         assert!(!probe_says_serving("DOWN\n"));
         assert!(!probe_says_serving(""));
         assert!(!probe_says_serving("UPGRADE\n"));
+    }
+
+    #[test]
+    fn an_appended_rule_is_checked_with_the_same_rule_and_an_output_that_always_exits_zero() {
+        assert_eq!(
+            rule_check_command("ip6tables -A INPUT -s fdaa:0:1::1 -j DROP").expect("check"),
+            "ip6tables -C INPUT -s fdaa:0:1::1 -j DROP && echo PRESENT || echo ABSENT"
+        );
+        assert!(
+            rule_check_command("ip6tables -F INPUT").is_err(),
+            "only an appended rule has a presence check"
+        );
+    }
+
+    #[test]
+    fn rule_presence_is_read_from_an_exact_marker_line_and_anything_else_is_an_error() {
+        assert!(rule_presence("Connecting...\nPRESENT\n").expect("marker"));
+        assert!(!rule_presence("ABSENT\n").expect("marker"));
+        assert!(rule_presence("").is_err());
+        assert!(rule_presence("PRESENTLY\n").is_err());
+    }
+
+    #[test]
+    fn the_ferrosa_process_is_one_pid_and_age_line_and_none_or_several_is_an_error() {
+        assert_eq!(ferrosa_process("  412    37\n").expect("one"), (412, 37));
+        assert!(ferrosa_process("").is_err(), "no ferrosa process");
+        assert!(ferrosa_process("412 37\n413 2\n").is_err(), "two processes");
+        assert!(ferrosa_process("412\n").is_err(), "no age");
+    }
+
+    #[test]
+    fn only_a_process_younger_than_the_heal_counts_as_restarted() {
+        assert!(started_during(30, Duration::from_secs(45)));
+        assert!(started_during(45, Duration::from_secs(45)));
+        assert!(
+            !started_during(600, Duration::from_secs(45)),
+            "a process older than the heal survived the kill"
+        );
     }
 
     #[test]

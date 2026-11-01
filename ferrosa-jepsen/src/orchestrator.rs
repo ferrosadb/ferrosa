@@ -93,23 +93,33 @@ fn cluster_from_preprovisioned_nodes(
 /// The addresses Fly nemeses partition by. They default to the CQL contact hosts, but a client
 /// outside Fly reaches the cluster through `fly proxy` on loopback, and a DROP rule for loopback
 /// severs nothing, so `FERROSA_JEPSEN_FLY_NODE_IPS` (comma-separated, in contact order) supplies
-/// the machines' private addresses. A loopback target or a count mismatch is refused.
+/// the machines' private addresses. Like the other `from_vars` parsers it reads through `var`, so
+/// it is tested without touching the process environment; every entry must be a bare IP address
+/// (an empty entry is malformed, not skipped), and a malformed value, a count mismatch or a
+/// loopback target is refused naming the variable.
 fn fly_nemesis_node_ips(
     contact_hosts: Vec<String>,
-    override_ips: Option<&str>,
+    var: impl Fn(&str) -> Option<String>,
 ) -> Result<Vec<String>> {
-    let node_ips = match override_ips {
+    const KEY: &str = "FERROSA_JEPSEN_FLY_NODE_IPS";
+    let node_ips = match var(KEY) {
         None => contact_hosts,
-        Some(list) => {
-            let ips: Vec<String> = list
+        Some(raw) => {
+            let ips = raw
                 .split(',')
-                .map(str::trim)
-                .filter(|ip| !ip.is_empty())
-                .map(str::to_string)
-                .collect();
+                .map(|entry| {
+                    entry
+                        .trim()
+                        .parse::<std::net::IpAddr>()
+                        .map(|ip| ip.to_string())
+                        .map_err(|e| {
+                            anyhow::anyhow!("{KEY}={raw:?}: {:?} is not an IP address ({e})", entry)
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
             if ips.len() != contact_hosts.len() {
                 bail!(
-                    "FERROSA_JEPSEN_FLY_NODE_IPS names {} addresses for {} contact points",
+                    "{KEY}={raw:?} names {} addresses for {} contact points",
                     ips.len(),
                     contact_hosts.len()
                 );
@@ -149,8 +159,7 @@ fn nemesis_context_for_cluster(cluster: &ClusterInfo) -> Result<NemesisContext> 
             .filter(|id| !id.is_empty())
             .map(str::to_string)
             .collect();
-        let override_ips = std::env::var("FERROSA_JEPSEN_FLY_NODE_IPS").ok();
-        let node_ips = fly_nemesis_node_ips(node_ips, override_ips.as_deref())?;
+        let node_ips = fly_nemesis_node_ips(node_ips, |key| std::env::var(key).ok())?;
         return NemesisContext::fly(node_ips, app_name, machine_ids);
     }
 
@@ -775,41 +784,84 @@ mod tests {
         list.iter().map(|h| h.to_string()).collect()
     }
 
+    /// A variable source holding at most `FERROSA_JEPSEN_FLY_NODE_IPS`.
+    fn node_ips_var(value: Option<&str>) -> impl Fn(&str) -> Option<String> + '_ {
+        move |key| {
+            assert_eq!(
+                key, "FERROSA_JEPSEN_FLY_NODE_IPS",
+                "unexpected variable read"
+            );
+            value.map(str::to_string)
+        }
+    }
+
+    fn loopback_contacts() -> Vec<String> {
+        hosts(&["127.0.0.1", "127.0.0.1", "127.0.0.1"])
+    }
+
     #[test]
     fn fly_nemeses_target_the_contact_hosts_when_no_override_is_given() {
         let contacts = hosts(&["fdaa:0:1::1", "fdaa:0:1::2", "fdaa:0:1::3"]);
         assert_eq!(
-            fly_nemesis_node_ips(contacts.clone(), None).expect("contacts are real"),
+            fly_nemesis_node_ips(contacts.clone(), node_ips_var(None)).expect("contacts are real"),
             contacts
         );
     }
 
     #[test]
     fn fly_nemeses_target_the_override_when_clients_go_through_local_proxies() {
-        let contacts = hosts(&["127.0.0.1", "127.0.0.1", "127.0.0.1"]);
         assert_eq!(
-            fly_nemesis_node_ips(contacts, Some(" fdaa:0:1::1, fdaa:0:1::2 ,fdaa:0:1::3"))
-                .expect("override"),
+            fly_nemesis_node_ips(
+                loopback_contacts(),
+                node_ips_var(Some(" fdaa:0:1::1, fdaa:0:1::2 ,fdaa:0:1::3"))
+            )
+            .expect("override"),
             hosts(&["fdaa:0:1::1", "fdaa:0:1::2", "fdaa:0:1::3"])
         );
     }
 
     #[test]
     fn a_fly_nemesis_aimed_at_loopback_is_refused_rather_than_partitioning_nothing() {
-        let error = fly_nemesis_node_ips(hosts(&["127.0.0.1", "127.0.0.1", "127.0.0.1"]), None)
+        let error = fly_nemesis_node_ips(loopback_contacts(), node_ips_var(None))
             .expect_err("loopback targets sever nothing");
         assert!(
             error.to_string().contains("FERROSA_JEPSEN_FLY_NODE_IPS"),
             "{error}"
         );
-        assert!(fly_nemesis_node_ips(hosts(&["localhost", "::1"]), None).is_err());
+        assert!(fly_nemesis_node_ips(hosts(&["localhost", "::1"]), node_ips_var(None)).is_err());
+        assert!(fly_nemesis_node_ips(
+            loopback_contacts(),
+            node_ips_var(Some("fdaa::1,::1,fdaa::3"))
+        )
+        .is_err());
     }
 
     #[test]
-    fn a_fly_node_ip_override_with_the_wrong_count_is_refused() {
-        let contacts = hosts(&["127.0.0.1", "127.0.0.1", "127.0.0.1"]);
-        assert!(fly_nemesis_node_ips(contacts.clone(), Some("fdaa::1,fdaa::2")).is_err());
-        assert!(fly_nemesis_node_ips(contacts, Some("")).is_err());
+    fn a_fly_node_ip_override_with_the_wrong_count_is_refused_naming_the_variable() {
+        let error =
+            fly_nemesis_node_ips(loopback_contacts(), node_ips_var(Some("fdaa::1,fdaa::2")))
+                .expect_err("two addresses for three contacts");
+        assert!(
+            error.to_string().contains("FERROSA_JEPSEN_FLY_NODE_IPS"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_fly_node_ip_override_is_refused_naming_the_variable() {
+        for raw in [
+            "",
+            "fdaa::1,not-an-ip,fdaa::3",
+            "fdaa::1,,fdaa::2,fdaa::3",
+            "[fdaa::1],fdaa::2,fdaa::3",
+        ] {
+            let error = fly_nemesis_node_ips(loopback_contacts(), node_ips_var(Some(raw)))
+                .expect_err("malformed override");
+            assert!(
+                error.to_string().contains("FERROSA_JEPSEN_FLY_NODE_IPS"),
+                "{raw:?}: {error}"
+            );
+        }
     }
 
     #[test]

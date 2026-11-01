@@ -18,9 +18,13 @@ impl NemesisAction for PartitionHalves {
     /// Cut the minority off from the majority on both ends. Runs through the context's transport
     /// (SSH, Fly SSH or a container runtime) with each peer's netfilter family, and fails loud on
     /// a command that does not apply.
+    ///
+    /// After inject every DROP rule is checked present on its node, and after heal checked
+    /// absent, so a partition that never applied (or never lifted) fails the run.
     async fn inject(&self, ctx: &NemesisContext) -> Result<()> {
-        let minority: Vec<usize> = ctx.minority_indices().collect();
-        super::run_plan(ctx, &super::isolate_plan(&ctx.node_ips, &minority)).await?;
+        let plan = minority_isolation(ctx);
+        super::run_plan(ctx, &plan).await?;
+        super::verify_rules(ctx, &plan, true).await?;
         tracing::info!(
             majority = ?ctx.majority_ips(),
             minority = ?ctx.minority_ips(),
@@ -31,9 +35,15 @@ impl NemesisAction for PartitionHalves {
 
     async fn heal(&self, ctx: &NemesisContext) -> Result<()> {
         super::run_plan(ctx, &super::flush_plan(&ctx.node_ips)).await?;
+        super::verify_rules(ctx, &minority_isolation(ctx), false).await?;
         tracing::info!("Healed partition-halves");
         Ok(())
     }
+}
+
+fn minority_isolation(ctx: &NemesisContext) -> Vec<super::NodeCommand> {
+    let minority: Vec<usize> = ctx.minority_indices().collect();
+    super::isolate_plan(&ctx.node_ips, &minority)
 }
 
 /// Partition into a ring: each node can only talk to its neighbors.
