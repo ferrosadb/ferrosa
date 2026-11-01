@@ -139,9 +139,29 @@ class CiBuildsEachShippedBinaryOnce(unittest.TestCase):
         self.assertEqual(sorted(selection.findall(harness[0])), sorted(selection.findall(main[0])))
         excluded = set(re.findall(r"not binary\((\w+_process)\)", main[0]))
         selected = set(re.findall(r"binary\((\w+)\)", harness[0]))
-        self.assertEqual(len(excluded), 6)
         self.assertEqual(selected, excluded)
         self.assertIn("package(ferrosa) and (", harness[0])
+
+    def test_every_real_process_harness_runs_in_the_isolated_step(self):
+        # A `*_process` binary boots real `ferrosa` node processes and waits on
+        # their readiness. Inside the main parallel run a node can be starved
+        # for its whole readiness budget, so every such binary is excluded
+        # there and run on its own. The set used to be a hand-kept count of
+        # six, and data_center_process / data_dir_lock_process were added
+        # without joining it (t_98f192af): they ran in the main run, and
+        # data_center_process failed 1 of 3 at its 120 s deadline under load
+        # while passing 3/3 in 8 s alone. Derive the set from the tree instead.
+        on_disk = {p.stem for p in (REPO_ROOT / "ferrosa" / "tests").glob("*_process.rs")}
+        self.assertTrue(on_disk, "no ferrosa/tests/*_process.rs found; the glob is wrong")
+        job = self.jobs["test"]
+        main = [c for c in cargo_commands(job) if "--skip ::slow::" in c]
+        harness = [c for c in cargo_commands(job) if "package(ferrosa) and (" in c]
+        self.assertEqual(len(main), 1)
+        self.assertEqual(len(harness), 1)
+        excluded = set(re.findall(r"not binary\((\w+_process)\)", main[0]))
+        selected = set(re.findall(r"binary\((\w+)\)", harness[0]))
+        self.assertEqual(excluded, on_disk, "main run must exclude every *_process binary")
+        self.assertEqual(selected, on_disk, "isolated step must run every *_process binary")
 
     def test_the_from_source_install_smokes_do_not_run_per_pr(self):
         # install-smoke.yml compiles ferrosa on Linux and macOS and ferrosa-memory
