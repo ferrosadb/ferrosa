@@ -277,6 +277,8 @@ import Ferrosa.Flight.Subscribe
 #check Ferrosa.Testing.Jepsen.a_local_read_run_cannot_establish_strict_serializability
 #check Ferrosa.Testing.Jepsen.a_local_read_across_a_failover_produces_the_stale_read_shape
 #check Ferrosa.Testing.Jepsen.a_read_only_transaction_can_carry_the_only_cycle
+#check Ferrosa.Testing.Jepsen.an_absent_required_checker_must_fail_the_run
+#check Ferrosa.Testing.Jepsen.a_scraped_verdict_passes_an_invalid_result
 #check Ferrosa.Testing.Models.a_failed_add_need_not_have_taken_effect
 #check Ferrosa.Testing.Models.an_incomplete_add_may_take_effect_between_reads
 #check Ferrosa.Testing.Models.an_incomplete_add_need_not_take_effect
@@ -290,6 +292,9 @@ import Ferrosa.Flight.Subscribe
 #check Ferrosa.Testing.Histories.an_acknowledged_write_that_is_never_read_back_is_lost
 #check Ferrosa.Testing.Histories.a_value_that_no_write_acknowledged_is_unexpected
 #check Ferrosa.Testing.Histories.a_loss_and_a_fabrication_do_not_cancel
+#check Ferrosa.Testing.Histories.a_timed_out_write_that_landed_is_not_fabricated
+#check Ferrosa.Testing.Histories.a_definite_failure_that_landed_is_fabricated
+#check Ferrosa.Testing.Histories.an_indeterminate_write_never_hides_a_loss
 #check Ferrosa.Testing.Histories.a_missing_write_with_a_clean_read_is_a_silent_loss
 #check Ferrosa.Testing.Histories.a_fabrication_alone_is_not_silent_loss
 #check Ferrosa.Testing.Histories.a_run_without_acknowledged_writes_cannot_lose_anything

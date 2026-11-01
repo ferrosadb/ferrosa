@@ -261,6 +261,10 @@ impl CombinationResult {
 
 /// Run the full test suite per the config.
 pub async fn run(config: &RunConfig) -> Result<RunReport> {
+    // The profile scopes every verdict, so a declaration that does not parse stops the run before
+    // any cluster is provisioned rather than after it has produced verdicts under the wrong one.
+    let profile =
+        crate::checker::profile::ConsistencyProfile::from_env().map_err(anyhow::Error::msg)?;
     let topologies = config.topologies();
     let concurrency_levels = config.concurrency_levels();
 
@@ -365,7 +369,7 @@ pub async fn run(config: &RunConfig) -> Result<RunReport> {
                                     setup_error: Some(e.to_string()),
                                     duration_secs: 0.0,
                                     op_count: 0,
-                                    profile: Default::default(),
+                                    profile,
                                     assurance: Default::default(),
                                 });
                             }
@@ -511,8 +515,11 @@ async fn run_single_combination(
     // writes and multi-key snapshot reads cannot be modelled as a single-value
     // register, and per-key linearizability is not a guarantee the
     // eventually-consistent base makes. Their safety is judged by
-    // `check_invariant` (conservation) and, for transactions, strict
-    // serializability (Elle). An empty result vector is vacuously all-linear.
+    // `check_invariant` (conservation) ONLY: no transactional checker runs
+    // here — Elle is not wired (`UnifiedChecker::check_all` leaves it None)
+    // and `checker::strict_serializable` is not called — so a green bank run
+    // does not establish strict serializability. An empty result vector is
+    // vacuously all-linear.
     let linearizability = if workload.register_linearizable() {
         check_linearizability(&history)
     } else {
@@ -527,7 +534,10 @@ async fn run_single_combination(
 
     let duration = start.elapsed();
 
-    let profile = crate::checker::profile::ConsistencyProfile::from_env();
+    // `run` has already parsed the same variables and refused a bad one, so this cannot fail
+    // differently; it is re-read rather than passed to stay under clippy's argument limit.
+    let profile =
+        crate::checker::profile::ConsistencyProfile::from_env().map_err(anyhow::Error::msg)?;
     let observed_clean = all_linear && invariant_passed;
     let assurance = profile.classify(observed_clean);
 

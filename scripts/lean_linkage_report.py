@@ -54,6 +54,33 @@ def rows_of(path: Path, block_name: str) -> list[list[str]]:
     return [QUOTED.findall(chunk.split("⟩")[0]) for chunk in m.group(1).split("⟨")[1:]]
 
 
+def structure_fields(text: str, name: str) -> list[str]:
+    """The field names of `structure <name> where`, in declaration order."""
+    m = re.search(rf"^structure {name} where\n(.*?)(?=^\S)", text, re.S | re.M)
+    if not m:
+        raise ValueError(f"no `structure {name} where` to read the row fields from")
+    return re.findall(r"^  (\w+)\s*:", m.group(1), re.M)
+
+
+def broken_rows(path: Path) -> list[dict[str, str]]:
+    """Each row of `def broken`, keyed by the `Item` field it fills.
+
+    A `⟨...⟩` row fills the structure's fields in declaration order, so the order is read from the
+    declaration rather than written down here: a field added to `Item` cannot shift the site into
+    another field's slot. A row whose string count differs from the field count is refused, because
+    every field of `Item` is a `String` and a mismatch means the parse, not the row, is wrong.
+    """
+    text = path.read_text()
+    fields = structure_fields(text, "Item")
+    rows = []
+    for row in rows_of(path, "broken"):
+        if len(row) != len(fields):
+            raise ValueError(f"{path}: a broken row has {len(row)} strings for the "
+                             f"{len(fields)} fields {fields}: {row[:2]}")
+        rows.append(dict(zip(fields, row)))
+    return rows
+
+
 def ledger_items() -> list[dict]:
     out = []
     for path in sorted(LEAN4.rglob("*.lean")):
@@ -176,7 +203,7 @@ def anchors_of(site: str, index: dict[str, set[str]]) -> tuple[list[str], list[s
 
 def main() -> int:
     items = ledger_items()
-    broken = [r for r in rows_of(LEAN4 / "Ferrosa/Broken.lean", "broken") if len(r) >= 5]
+    broken = broken_rows(LEAN4 / "Ferrosa/Broken.lean")
     unimplemented = [r for r in rows_of(LEAN4 / "Ferrosa/Unimplemented.lean", "unimplemented")
                      if len(r) >= 4]
     nondefects = [r for r in rows_of(LEAN4 / "Ferrosa/Unimplemented.lean", "nonDefects")
@@ -211,7 +238,8 @@ def main() -> int:
 
     gaps = []
     for row in broken:
-        area, what, site, ledger, item = row[:5]
+        area, what, site = row["area"], row["what"], row["site"]
+        ledger, item = row["ledger"], row["item"]
         explicit, ident_files = anchors_of(site, index)
         files = explicit or ident_files
         tokens = set(IDENT.findall(site))

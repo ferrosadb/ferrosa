@@ -1,30 +1,22 @@
-//! Tests for red ledger items that have been fixed.
+//! Reds that have a closing test but are still listed as red.
 //!
-//! The stub in `reds.rs` names the gap and asserts nothing; this file holds the assertion that
-//! closes it. The order is: fix the code, move the test here under the same name, then flip the
-//! ledger item in the Lean source so the generator stops emitting the stub. `cargo test -p
-//! red-ledger` fails if a name appears in both files, which is the state where somebody has
-//! written the test but not closed the ledger, or closed the ledger but left the stub.
-//!
-//! Nothing is here yet: every red in the corpus is still red.
+//! A closing test lives in the crate that owns the code and carries the red's name. Once it exists,
+//! the Lean item is flipped to `.met` and the generator drops the row from [`red_ledger::REDS`].
+//! `CLOSED` lists the names whose closing tests have landed; a name in both lists is the state where
+//! somebody has written the test but not closed the ledger.
 
-/// A closed item: its name must match a red stub in `reds.rs` until the Lean ledger is updated.
+use red_ledger::REDS;
+
+/// Names of reds whose closing test has landed in the owning crate. Empty: every red is still red.
+const CLOSED: &[&str] = &[];
+
 #[test]
-fn closed_tests_do_not_overlap_open_reds() {
-    let open = include_str!("reds.rs");
-    let closed = include_str!("closed.rs");
-    let names = |src: &'static str| -> Vec<&'static str> {
-        src.lines()
-            .filter_map(|l| l.trim().strip_prefix("fn "))
-            .filter_map(|l| l.split('(').next())
-            .filter(|n| !n.starts_with("closed_tests_do_not_overlap"))
-            .collect()
-    };
-    for name in names(closed) {
+fn a_closed_red_is_no_longer_listed_as_red() {
+    for name in CLOSED {
         assert!(
-            !names(open).contains(&name),
-            "{name} has been fixed and tested, but the Lean ledger still lists it as red — \
-             close the claim in the specification so the stub stops being generated"
+            !REDS.iter().any(|red| red.name == *name),
+            "{name} has a closing test, but the Lean ledger still lists it as red — close the \
+             claim in the specification so the row leaves the table"
         );
     }
 }

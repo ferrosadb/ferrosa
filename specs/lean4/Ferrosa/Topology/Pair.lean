@@ -136,11 +136,15 @@ inductive UnguardedStep : Pair → Pair → Prop where
   | t1 : UnguardedStep ⟨.none, .none, true, true⟩ ⟨.primary, .secondary, true, true⟩
   | promote1 {s : Pair} (hn : s.r1 ≠ .primary) : UnguardedStep s { s with r1 := .primary }
 
-/-- **Red: without the guard, one promotion splits the brain.**  A single
+/-- **Counterexample: without the guard, one promotion splits the brain.**  A single
     `promote1` step from the T1 state leaves both nodes primary and up, so both
     accept writes for the same key and a client can be told two different values
     succeeded.  Nothing in the unguarded system can tell a dead peer from a
-    partitioned one, so there is no state at which the promotion is safe. -/
+    partitioned one, so there is no state at which the promotion is safe.  The code
+    keeps the half of the guard it can observe: `ModeController::force_promote`
+    refuses while the pair peer is still connected
+    (`force_promote_is_refused_while_the_primary_is_still_connected`), and a live
+    primary hands authority over with a fenced switchover instead. -/
 theorem unguarded_promotion_splits_brain :
     ∃ s s', UnguardedStep s s' ∧ Writable s' 0 ∧ Writable s' 1 := by
   refine ⟨⟨.primary, .secondary, true, true⟩, ⟨.primary, .primary, true, true⟩,

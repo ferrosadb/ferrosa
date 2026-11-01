@@ -5359,8 +5359,21 @@ fn verification_replica(storage: Arc<StorageEngine>, schema: Arc<Schema>) -> Arc
     controller
 }
 
+/// Whether the replica's own storage holds the verification row. A secondary hands client writes
+/// to the primary (c22ab9d6) and must never apply or confirm one on its own authority, so when the
+/// primary is unreachable the forward fails and this stays false.
+fn replica_holds_verification_row(controller: &ModeController) -> bool {
+    let mutation = verification_mutation();
+    let table = ferrosa_storage::TableId::new(&mutation.keyspace, &mutation.table);
+    controller
+        .storage
+        .read(&table, &mutation.key)
+        .expect("the replica's storage answers reads")
+        .is_some()
+}
+
 #[tokio::test]
-async fn read_only_pair_replica_rejects_mutations_before_any_forwarding() {
+async fn pair_replica_never_applies_a_client_write_on_its_own_authority() {
     let dir = tempfile::tempdir().unwrap();
     let storage = test_storage(dir.path());
     let schema = test_schema();
@@ -5386,8 +5399,12 @@ async fn read_only_pair_replica_rejects_mutations_before_any_forwarding() {
     };
     let result = coordinator.coordinate_write(&verification_mutation()).await;
     assert!(
-        matches!(result, Err(ClusterError::NotPrimary)),
-        "replica must reject at the authority boundary, not attempt forwarding: {result:?}"
+        result.is_err(),
+        "a replica whose primary is unreachable cannot confirm a write: {result:?}"
+    );
+    assert!(
+        !replica_holds_verification_row(&controller),
+        "the replica applied a client write on its own authority"
     );
 }
 
@@ -5451,7 +5468,7 @@ async fn pair_replica_admits_reads_without_admitting_client_writes() {
 }
 
 #[tokio::test]
-async fn pair_replica_rejects_ddl_at_authority_boundary() {
+async fn pair_replica_never_applies_ddl_on_its_own_authority() {
     let dir = tempfile::tempdir().unwrap();
     let storage = test_storage(dir.path());
     let schema = test_schema();
@@ -5460,22 +5477,32 @@ async fn pair_replica_rejects_ddl_at_authority_boundary() {
         DdlPath::Pair(coordinator) => coordinator.clone(),
         _ => panic!("fixture must use real pair DDL dispatch"),
     };
+    let mut table = switchover_kv_table(false);
+    table.name = "replica_must_not_create".into();
+    table.id = Uuid::new_v4();
     let result = coordinator
-        .coordinate_ddl(crate::pair::ddl::DdlOperation::DropKeyspace(
-            "forbidden".into(),
-        ))
+        .coordinate_ddl(crate::pair::ddl::DdlOperation::CreateTable(Box::new(table)))
         .await;
     assert!(
-        matches!(result, Err(ClusterError::NotPrimary)),
-        "replica DDL must never forward: {result:?}"
+        result.is_err(),
+        "a replica whose primary is unreachable cannot confirm DDL: {result:?}"
+    );
+    assert!(
+        !controller
+            .schema
+            .snapshot()
+            .tables
+            .contains_key(&("smoke_ks".into(), "replica_must_not_create".into())),
+        "the replica applied DDL on its own authority"
     );
 }
 
 #[tokio::test]
-async fn pair_replica_rejects_atomic_batch_at_authority_boundary() {
+async fn pair_replica_never_applies_an_atomic_batch_on_its_own_authority() {
     let dir = tempfile::tempdir().unwrap();
     let storage = test_storage(dir.path());
     let schema = test_schema();
+    install_kv(&schema, &storage, false);
     let controller = verification_replica(storage, schema);
     let coordinator = match &**controller.write_path.load() {
         WritePath::Pair(coordinator) => coordinator.clone(),
@@ -5485,8 +5512,12 @@ async fn pair_replica_rejects_atomic_batch_at_authority_boundary() {
         .coordinate_batch(vec![verification_mutation()], Uuid::new_v4())
         .await;
     assert!(
-        matches!(result, Err(ClusterError::NotPrimary)),
-        "replica atomic batch must never forward: {result:?}"
+        result.is_err(),
+        "a replica whose primary is unreachable cannot confirm a batch: {result:?}"
+    );
+    assert!(
+        !replica_holds_verification_row(&controller),
+        "the replica applied an atomic batch on its own authority"
     );
 }
 
@@ -5553,6 +5584,58 @@ async fn promoted_pair_survivor_refuses_all_rf2_without_a_follower() {
         .await
         .expect("the authorized survivor must permit guaranteed ONE and QUORUM writes");
     }
+}
+
+/// `Topology/Pair.lean`, `promote1`: promotion needs the operator AND the peer
+/// down. Taking the operator's word alone is `UnguardedStep`, and
+/// `unguarded_promotion_splits_brain` shows one such step leaves two writers.
+/// The half this node can observe is whether the peer is still connected, so
+/// that half is enforced here: a connected primary is handed off with a
+/// switchover, never overridden.
+#[tokio::test]
+async fn force_promote_is_refused_while_the_primary_is_still_connected() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    install_kv(&schema, &storage, false);
+    let net = Arc::new(NetConfig::default());
+    let (controller, _handles) = ModeController::new(
+        Arc::new(ClusterConfig::default()),
+        net.clone(),
+        Uuid::from_u128(2),
+        storage,
+        schema,
+        Arc::new(HandlerRegistry::new()),
+    );
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net,
+        Uuid::from_u128(2),
+        controller.as_peer_listener(),
+    ));
+    controller.set_peer_manager(pm);
+    let primary = (Uuid::from_u128(1), "127.0.0.1:9".parse().unwrap());
+    controller.on_peer_connected(primary);
+    assert_eq!(controller.role(), Some(PairRole::Secondary));
+    assert!(
+        controller
+            .connected_peers_for_test()
+            .iter()
+            .any(|(id, _)| *id == primary.0),
+        "precondition: the primary is tracked as connected"
+    );
+
+    let result = controller.force_promote();
+
+    assert!(
+        matches!(result, Err(ClusterError::ModeTransitionRejected(_))),
+        "a promotion over a connected primary must be refused: {result:?}"
+    );
+    assert_eq!(
+        controller.role(),
+        Some(PairRole::Secondary),
+        "a refused promotion leaves this node a secondary"
+    );
+    assert_eq!(controller.promote_epoch(), 0, "nothing was promoted");
 }
 
 #[tokio::test]
@@ -5794,7 +5877,12 @@ async fn promoted_pair_handoff_revokes_previously_loaded_ddl_authority() {
     ));
     let peer = start_switchover_peer(peer_id, sync, peer_role).await;
     let controller = primary_paired_with(peer_id, &peer, storage, schema).await;
+    // A promotion is only for a peer that is gone, so the peer drops, the operator promotes,
+    // and the peer comes back before the handoff under test.
+    controller.on_peer_disconnected((peer_id, peer.addr));
     controller.force_promote().unwrap();
+    controller.on_peer_connected((peer_id, peer.addr));
+    assert_eq!(controller.role(), Some(PairRole::Primary));
     let previously_loaded = controller.ddl_path.load_full();
     controller.switchover().await.unwrap();
     assert_eq!(controller.role(), Some(PairRole::Secondary));

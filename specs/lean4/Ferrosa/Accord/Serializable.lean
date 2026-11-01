@@ -200,10 +200,11 @@ theorem hStaleRead_serial_but_not_strict :
     serializableB hStaleRead = true ∧ strictlySerializableB hStaleRead = false := by
   native_decide
 
-/-- **Red: a read of a value nothing ever wrote is not serializable in any order.**
+/-- **Counterexample: a read of a value nothing ever wrote is not serializable in any order.**
     The transaction returns `9` from a key no transaction appended to, so no replay
     from the empty database reproduces it — the shape a phantom or a lost write takes
-    when it reaches a client. -/
+    when it reaches a client.  The Rust checker rejects the same history:
+    `checker::strict_serializable::rejects_a_read_of_a_value_no_transaction_wrote`. -/
 theorem hPhantom_not_serializable : serializableB hPhantom = false := by native_decide
 
 /-- A transaction whose read observes its own earlier append is strictly serializable:
@@ -211,9 +212,10 @@ theorem hPhantom_not_serializable : serializableB hPhantom = false := by native_
     atomicity rather than a separate guarantee. -/
 theorem hReadYourWrites_ok : strictlySerializableB hReadYourWrites = true := by native_decide
 
-/-- **Red: and the same transaction observed not seeing its own append is rejected.**
+/-- **Counterexample: and the same transaction observed not seeing its own append is rejected.**
     An atomic transaction cannot read a state that excludes its own write, so the
-    history has no serial order at all. -/
+    history has no serial order at all.  The Rust checker rejects it too:
+    `checker::strict_serializable::rejects_a_transaction_that_misses_its_own_write`. -/
 theorem hReadYourWritesBroken_rejected :
     serializableB hReadYourWritesBroken = false := by native_decide
 

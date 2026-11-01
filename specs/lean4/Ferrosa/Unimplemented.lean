@@ -132,7 +132,7 @@ theorem registered_ledger_count : areas.length = 21 := by decide
 
 /-! ## The total, derived
 
-`ledgerTotal` is the sum of the registered ledgers' red counts and contains no literal term, so there is nothing for it to fall out of step with and `ledgerTotal_is_the_registry_sum` records only its definition. The pin at fifty-nine guards the opposite failure: dropping a whole ledger from `areas` shrinks the total without changing any local count. `ledgerTotal_pinned` makes that a build failure rather than a quieter number.
+`ledgerTotal` is the sum of the registered ledgers' red counts and contains no literal term, so there is nothing for it to fall out of step with and `ledgerTotal_is_the_registry_sum` records only its definition. The pin at sixty-two guards the opposite failure: dropping a whole ledger from `areas` shrinks the total without changing any local count. `ledgerTotal_pinned` makes that a build failure rather than a quieter number.
 -/
 
 /-- The number of red items across the corpus: the sum of the registered ledgers' `redCount`.
@@ -146,7 +146,7 @@ theorem ledgerTotal_is_the_registry_sum :
 
 /-- Pinned so that removing a ledger from the registry — the drift that has recurred here — is a
     build failure rather than a silently smaller total. -/
-theorem ledgerTotal_pinned : ledgerTotal = 59 := by decide
+theorem ledgerTotal_pinned : ledgerTotal = 62 := by decide
 
 /-- Print every registered ledger, with the header its area module prints. -/
 def printAllLedgers : IO Unit := do
@@ -201,6 +201,12 @@ def unimplemented : List Item := [
    "Ferrosa.Commons.Hll", "a HyperLogLog estimator backs COUNT(ESTIMATE_DISTINCT)"⟩,
   ⟨"Jepsen", "every run's verdict preserves lost, unexpected and recovered as multisets",
    "Ferrosa.Testing.Histories", "every run records lost, unexpected and recovered as multisets, not as a single error count"⟩,
+  ⟨"Jepsen", "a run tells a recovered timed-out write from a fabricated value",
+   "Ferrosa.Testing.Histories", "every run separates recovered indeterminate writes from fabricated values, and only fabrication refutes"⟩,
+  ⟨"Jepsen", "a durability run issues a final read, and a failed one is a run failure",
+   "Ferrosa.Testing.Histories", "every durability run issues a final read after healing, and a final read that fails is a run failure, not a verdict"⟩,
+  ⟨"Jepsen", "the Elle verdict is the checker's exit code",
+   "Ferrosa.Testing.Jepsen", "the Elle verdict is the checker's exit code, not a search of its output"⟩,
   ⟨"Unsafe", "every unsafe site is discharged by a Kani harness rather than by review",
    "Ferrosa.Unsafe.Invariants", "every `unsafe` site in `docs/unsafe-ledger.md` is discharged by a Kani harness, not by review"⟩,
   ⟨"Unsafe", "the truncation contract is enforced in the safe rename and GC paths",
@@ -217,8 +223,6 @@ def unimplemented : List Item := [
    "Ferrosa.Testing.Jepsen", "the Jepsen suite asserts strict serializability for multi-key transactions"⟩,
   ⟨"Jepsen", "the checker runs Elle with read-only transactions in the graph",
    "Ferrosa.Testing.Jepsen", "the checker runs Elle with read-only transactions in the graph"⟩,
-  ⟨"Jepsen", "a multi-DC run with local reads treats a semantics consequence as a failure",
-   "Ferrosa.Testing.Jepsen", "a multi-DC run under LOCAL_QUORUM or DC_QUORUM must expect strict-serializability violations after a failover"⟩,
   ⟨"MVCC", "versions are stored in the fnf record",
    "Ferrosa.Storage.Mvcc", "versions are stored in the fnf record so the probe stays constant"⟩,
   ⟨"MVCC", "compaction carries the spill pointer forward",
@@ -281,7 +285,7 @@ def nonDefects : List Other := [
 
 /-! ## Rows that are discharged now
 
-Two rows below classify items that have since been proved: the ledger absorbed the claim. They are
+Three rows below classify items that have since been met: the ledger absorbed the claim. They are
 kept, not deleted — deleting a row is how the count stayed balanced while the bookkeeping went
 wrong — and each one is required to name a real ledger item whose status is `.met`. They are not
 part of the classification: `nothing_discharged_is_still_classified` keeps the two lists apart.
@@ -303,7 +307,10 @@ def discharged : List Discharged := [
    "Ferrosa.Storage.Recovery", "an acknowledged write survives a crash under every mode except periodic, which the operator opts into"⟩,
   ⟨"Index", "a range lookup on an indexed column is constant in nodes",
    "discharged: the claim was narrowed to one round trip per node, which is what a BTree costs, and `Sql.Index.scatter_gather_is_the_accepted_shape` proves that narrower claim; the O(1) version was never implementable",
-   "Ferrosa.Sql.Index", "a range lookup on an indexed column costs one round trip per node, which is accepted"⟩
+   "Ferrosa.Sql.Index", "a range lookup on an indexed column costs one round trip per node, which is accepted"⟩,
+  ⟨"Jepsen", "a multi-DC run with local reads treats a semantics consequence as a failure",
+   "discharged: `ferrosa-jepsen/src/checker/profile.rs` classifies a run that declares a cross-datacenter read as not tested rather than failed (`cross_datacenter_read_defeats_the_overlap`), a report with any not-tested run is not all-passed, and a profile declaration that does not parse is refused before the run (`a_value_that_does_not_parse_is_refused`) instead of falling back to QUORUM/QUORUM",
+   "Ferrosa.Testing.Jepsen", "a multi-DC run under LOCAL_QUORUM or DC_QUORUM must expect strict-serializability violations after a failover"⟩
 ]
 
 /-! ## The checks
@@ -395,15 +402,17 @@ theorem every_ledger_item_is_classified :
     Ferrosa.Broken.broken.length + unimplemented.length + nonDefects.length = ledgerTotal := by
   native_decide
 
-/-- Thirty-seven items have no code path yet, and the count is pinned so a row cannot disappear
-    between commits without this failing. -/
-theorem unimplemented_has_the_right_length : unimplemented.length = 37 := by native_decide
+/-- Thirty-nine items have no code path yet, and the count is pinned so a row cannot disappear
+    between commits without this failing. The local-read Jepsen row left for `discharged`; the
+    Jepsen-evidence spec added three (the indeterminate split, the final read, and Elle's exit
+    code). -/
+theorem unimplemented_has_the_right_length : unimplemented.length = 39 := by native_decide
 
 /-- Seven, not eight: two rows were discharged into the ledger itself (see `discharged`), and one
     new row records the refuted constant-probe claim in the MVCC ledger. -/
 theorem twelve_are_not_defects : nonDefects.length = 7 := by native_decide
 
-/-- **Live defects now outnumber everything else.**  Fifteen reds against seven requirements,
+/-- **Live defects now outnumber everything else.**  Sixteen reds against seven requirements,
     proofs, measurements, inherited protocol behaviour and closures. This theorem had the opposite
     direction until the memory specs found three more: the closer the specs get to the code, the
     more of it turns out to be shipping something that is not true. -/
