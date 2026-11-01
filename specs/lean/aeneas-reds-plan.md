@@ -172,6 +172,29 @@ tagged enum is printed by the inductive-shape path today, so the printer must em
 comparisons and `Option` unwrapping instead, and `Discriminant`/`read_discriminant` must be
 generated from the tag rather than from constructor indices.
 
+### Implementation map for (a)
+
+Threshold: `List.length variants > 244`, Lean backend only. The two halves are coupled —
+landing the type without the match half converts "tag too big" into "match on a structure"
+at every use site, so they have to move together.
+
+- `src/extract/ExtractTypes.ml:1611` — `type_decl_kind_to_qualif` returns `inductive`; the
+  wide case needs `structure`.
+- `src/extract/ExtractTypes.ml:977` — `extract_type_decl_enum_body` prints variants through
+  `extract_type_decl_variant`; the wide body is `disc : Std.U16` plus one
+  `Option <payload>` field per variant that has fields.
+- Constructor `def`s: emitted after the declaration group, next to the trait-instance
+  stubs in `src/Translate.ml:1346`, which is the only place that already prints bare Lean
+  declarations outside the type/function printers.
+- `src/extract/Extract.ml:1530` — the `| Match branches ->` arm of `extract_texpr` is the
+  single match site; for a tagged scrutinee it must become a chain of
+  `if x.disc = k then … else …` with payload projection. This is the part that needs a
+  typed scrutinee (`texpr.ty`) resolved to a wide type id, so it also needs the predicate
+  shared with the emitter.
+- `src/extract/ExtractBase.ml:1266` — `Discriminant` / `read_discriminant` are looked up as
+  builtins; for a tagged enum the tag *is* the discriminant, so the builtin path can stay
+  and the generated `read_discriminant` has to read `disc` rather than index constructors.
+
 ## Step 3 — the trait model (414 reds)
 
 Decision: a trait is a **record of methods parameterised by its associated
