@@ -5054,6 +5054,133 @@ async fn co_occurs_merge_on_tiny_agent_memory_graph_is_immediately_matchable() {
     );
 }
 
+/// POST one Cypher statement to the agent_memory graph and return the status
+/// and body.
+async fn agent_memory_query(
+    schema: &Arc<Schema>,
+    storage: &Arc<StorageEngine>,
+    query: &str,
+) -> (StatusCode, Value) {
+    let app = build_app(Arc::clone(schema), Arc::clone(storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({ "query": query, "keyspace": "agent_memory" })),
+    );
+    let resp = tokio::time::timeout(HANG_GUARD, app.oneshot(req))
+        .await
+        .unwrap_or_else(|_| panic!("query must not hang: {query}"))
+        .unwrap();
+    let status = resp.status();
+    (status, response_json(resp).await)
+}
+
+/// DETACH DELETE of one agent_memory Entity must delete that entity and its
+/// CO_OCCURS_WITH edge, and nothing else.
+///
+/// `entity_store` is keyed `((tenant_id, session_id), entity_id)`: one session's
+/// entities share a partition and differ by clustering. `co_occurs_with` is
+/// keyed `((entity_a), entity_b)`, which is neither endpoint's storage key.
+/// ferrosa-memory's retention purge deletes an entity this way; on a live
+/// cluster the purge left the edge row behind.
+#[tokio::test]
+async fn detach_delete_of_a_clustered_vertex_removes_its_schema_keyed_edge_and_only_that_vertex() {
+    let tenant_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+    let session_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let doomed = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+    let neighbour = Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").unwrap();
+    let bystander = Uuid::parse_str("bbbbbbbb-cccc-dddd-eeee-ffffffffffff").unwrap();
+
+    let (schema, storage, _dir) = setup();
+    create_agent_memory_real_graph_schema(&schema);
+    register_agent_memory_real_tables_with_storage(&storage);
+    for (id, name) in [
+        (doomed, "doomed"),
+        (neighbour, "neighbour"),
+        (bystander, "bystander"),
+    ] {
+        seed_agent_memory_entity(&storage, tenant_id, session_id, id, name);
+    }
+    let scope = format!("tenant_id: '{tenant_id}', session_id: '{session_id}'");
+    let (status, body) = agent_memory_query(
+        &schema,
+        &storage,
+        &format!(
+            "MERGE (a:Entity {{{scope}, entity_id: '{doomed}'}}) \
+             MERGE (b:Entity {{{scope}, entity_id: '{neighbour}'}}) \
+             MERGE (a)-[r:CO_OCCURS_WITH {{{scope}}}]->(b) \
+             SET r.strength = 0.5 RETURN r"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "MERGE: {body:#}");
+    assert_eq!(
+        live_row_count(
+            &storage,
+            "agent_memory",
+            "co_occurs_with",
+            doomed.as_bytes()
+        ),
+        1,
+        "precondition: the edge row is stored under entity_a"
+    );
+    let session_entities = format!("MATCH (n:Entity {{{scope}}}) RETURN n.entity_id");
+    let (_, before) = agent_memory_query(&schema, &storage, &session_entities).await;
+    assert_eq!(
+        before["rows"].as_array().map(Vec::len),
+        Some(3),
+        "precondition: the session MATCH sees all three entities: {before:#}"
+    );
+
+    let (status, body) = agent_memory_query(
+        &schema,
+        &storage,
+        &format!("MATCH (n:Entity {{{scope}, entity_id: '{doomed}'}}) DETACH DELETE n"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "DETACH DELETE: {body:#}");
+
+    let (_, edges) = agent_memory_query(
+        &schema,
+        &storage,
+        &format!(
+            "MATCH (a:Entity)-[r:CO_OCCURS_WITH {{tenant_id: '{tenant_id}'}}]->(b:Entity) \
+             RETURN a.entity_id, b.entity_id"
+        ),
+    )
+    .await;
+    assert_eq!(
+        edges["rows"].as_array().map(Vec::len),
+        Some(0),
+        "no CO_OCCURS_WITH survives its source's DETACH DELETE: {edges:#}"
+    );
+    // Read by CQL, the table is what a client sees: the edge must be gone from
+    // it, not only unreachable through its deleted endpoint.
+    let stored_edge_rows = live_row_count(
+        &storage,
+        "agent_memory",
+        "co_occurs_with",
+        doomed.as_bytes(),
+    );
+
+    let (_, entities) = agent_memory_query(&schema, &storage, &session_entities).await;
+    let mut survivors: Vec<String> = entities["rows"]
+        .as_array()
+        .expect("MATCH returns rows")
+        .iter()
+        .map(|row| row[0].as_str().expect("entity_id is text").to_string())
+        .collect();
+    survivors.sort();
+    let mut expected = vec![neighbour.to_string(), bystander.to_string()];
+    expected.sort();
+    assert_eq!(
+        (stored_edge_rows, survivors),
+        (0, expected),
+        "(live co_occurs_with rows under the deleted entity, surviving entities of its \
+         session): the edge row must be tombstoned, and only the matched entity deleted"
+    );
+}
+
 #[tokio::test]
 async fn migration_proof_typed_edge_upsert_no_direct_table_ref() {
     let (schema, storage, _dir) = setup();
