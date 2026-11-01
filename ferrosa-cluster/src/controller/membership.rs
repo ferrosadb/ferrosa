@@ -661,21 +661,28 @@ impl ModeController {
                 },
                 schema_version,
             };
-            // Leadership can move between the leader check above and this write;
-            // a refused proposal is forwarded to the leader, never dropped
-            // (t_9c219a2b).
-            let admitted = crate::raft_forward::propose_ring_member_via_raft(
-                &raft,
-                admission_node_map.as_deref(),
-                peer_manager.as_deref(),
-                join_cmd,
-                assign_cmd,
-            )
-            .await;
+            // Leadership can move between the leader check above and this write.
+            // A follower cannot admit anyone (the leader refuses a forwarded
+            // admission), so a refusal leaves it to the leader, which re-proposes
+            // every voter missing from the initial topology (t_9c219a2b).
+            let admitted =
+                crate::raft_forward::propose_ring_member_via_raft(&raft, join_cmd, assign_cmd)
+                    .await;
             clear_pending_join(&pending_joins, host_id);
-            if let Err(e) = admitted {
-                tracing::warn!(peer = %host_id, leader, %e, "ring admission (JoinNode + AssignTokens) failed");
-                return;
+            match admitted {
+                Ok(crate::raft_forward::RingAdmission::Committed) => {}
+                Ok(crate::raft_forward::RingAdmission::LeftToLeader) => {
+                    tracing::debug!(
+                        peer = %host_id,
+                        leader,
+                        "not the raft leader; ring admission is left to the leader"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(peer = %host_id, leader, %e, "ring admission (JoinNode + AssignTokens) failed");
+                    return;
+                }
             }
 
             tracing::info!(

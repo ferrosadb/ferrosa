@@ -103,72 +103,61 @@ where
     }
 }
 
-/// Propose a peer's ring membership: `join` (a `JoinNode`), then `assign`
-/// (its `AssignTokens`).
+/// What became of a ring admission this node proposed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RingAdmission {
+    /// This node led and committed both commands.
+    Committed,
+    /// This node is not the leader. Admission is the leader's job: it proposes
+    /// voters' admissions itself and re-proposes any that are missing from the
+    /// initial topology (`controller::cluster`, t_9c219a2b).
+    LeftToLeader,
+}
+
+/// Propose a member's ring admission: `join` (a `JoinNode`), then `assign`
+/// (its `AssignTokens`). `propose` is the local `client_write`, already
+/// classified.
 ///
-/// `propose` is the local `client_write`, already classified. Every node that
-/// sees a voter connect proposes its admission, and only the Raft leader can
-/// commit it, so a proposal refused with `ForwardToLeader` must reach the leader.
-pub async fn propose_ring_member<P, PFut, R, F, FFut>(
+/// Only the leader can admit a member, and a follower has no way to make it
+/// happen. Forwarding the commands does not work: the leader's membership
+/// control refuses a forwarded `JoinNode` or `AssignTokens` by design ("legacy
+/// ownership/promotion requires verified membership admission",
+/// `controller::membership_control`). That refusal was observed on real
+/// processes when this function did forward. So a `ForwardToLeader` refusal is
+/// [`RingAdmission::LeftToLeader`], not an error and not a forward. A failed
+/// `JoinNode` stops before `AssignTokens`, so tokens are never assigned to a
+/// member that did not join.
+pub async fn propose_ring_member<P, PFut>(
     join: RaftCommand,
     assign: RaftCommand,
     propose: P,
-    resolve_leader: R,
-    forward: F,
-) -> Result<()>
+) -> Result<RingAdmission>
 where
     P: Fn(RaftCommand) -> PFut,
     PFut: Future<Output = std::result::Result<(), ProposeError>>,
-    R: Fn(u64) -> Option<uuid::Uuid>,
-    F: Fn(uuid::Uuid, RaftCommand) -> FFut,
-    FFut: Future<Output = Result<()>>,
 {
     for cmd in [join, assign] {
-        let outcome = propose(cmd.clone()).await;
-        dispatch_propose_outcome(outcome, cmd, &resolve_leader, &forward).await?;
+        match propose(cmd).await {
+            Ok(()) => {}
+            Err(ProposeError::Forward { .. }) => return Ok(RingAdmission::LeftToLeader),
+            Err(ProposeError::Other(msg)) => return Err(ClusterError::RaftError(msg)),
+        }
     }
-    Ok(())
+    Ok(RingAdmission::Committed)
 }
 
 /// [`propose_ring_member`] against a live Raft.
-///
-/// The leader's host id comes from the Raft node map, not the token ring: during
-/// initial formation the leader's own `NodeInfo` may not be in the ring yet, and
-/// that is exactly when admissions are being proposed. Without a peer manager or
-/// node map a refused proposal fails loud instead of being dropped.
 pub async fn propose_ring_member_via_raft(
     raft: &FerrosRaft,
-    node_map: Option<&std::sync::RwLock<std::collections::HashMap<u64, uuid::Uuid>>>,
-    peer_manager: Option<&PeerManager>,
     join: RaftCommand,
     assign: RaftCommand,
-) -> Result<()> {
-    propose_ring_member(
-        join,
-        assign,
-        |cmd| async move {
-            raft.client_write(cmd)
-                .await
-                .map(|_| ())
-                .map_err(|error| classify_client_write_error(&error))
-        },
-        |leader_node_id| {
-            node_map.and_then(|map| {
-                map.read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .get(&leader_node_id)
-                    .copied()
-            })
-        },
-        |leader_uuid, cmd| async move {
-            match peer_manager {
-                Some(pm) => forward_raft_command_to_leader(pm, leader_uuid, cmd).await,
-                None => Err(ClusterError::Internal(
-                    "raft forward: peer_manager not set, cannot forward to leader".into(),
-                )),
-            }
-        },
-    )
+) -> Result<RingAdmission> {
+    propose_ring_member(join, assign, |cmd| async move {
+        raft.client_write(cmd)
+            .await
+            .map(|_| ())
+            .map_err(|error| classify_client_write_error(&error))
+    })
     .await
 }
 
@@ -627,41 +616,33 @@ mod tests {
         }
     }
 
-    /// t_9c219a2b: a node that is not the Raft leader proposes a connecting
-    /// voter's admission and openraft refuses it with `ForwardToLeader`. The
-    /// formation log showed that refusal followed by a dropped admission, and
-    /// the node never published its DDL path. Both commands must reach the
-    /// leader instead.
+    /// t_9c219a2b: a follower's admission proposal is refused with
+    /// `ForwardToLeader`. It must not be forwarded (the leader's membership
+    /// control refuses forwarded admissions, as real processes showed), and it
+    /// must not assign tokens to a member whose join did not commit. The leader
+    /// owns admission.
     #[tokio::test]
-    async fn propose_ring_member_forwards_both_commands_when_not_leader() {
-        let leader_uuid = Uuid::from_u128(0x3333);
-        let forwarded: Arc<Mutex<Vec<(Uuid, &'static str)>>> = Arc::default();
+    async fn a_follower_leaves_ring_admission_to_the_leader() {
+        let proposed: Arc<Mutex<Vec<&'static str>>> = Arc::default();
+        let sink = proposed.clone();
         let (join, assign) = join_and_assign(Uuid::from_u128(0x2222));
-        let sink = forwarded.clone();
 
-        let result = propose_ring_member(
-            join,
-            assign,
-            |_cmd| async {
+        let outcome = propose_ring_member(join, assign, move |cmd| {
+            sink.lock().unwrap().push(op_name(&cmd));
+            async {
                 Err(ProposeError::Forward {
                     leader_node_id: Some(42),
                 })
-            },
-            |node_id| (node_id == 42).then_some(leader_uuid),
-            move |uuid, cmd| {
-                let sink = sink.clone();
-                async move {
-                    sink.lock().unwrap().push((uuid, op_name(&cmd)));
-                    Ok(())
-                }
-            },
-        )
-        .await;
+            }
+        })
+        .await
+        .expect("a refusal to a follower is not an error");
 
-        result.expect("a forwarded admission must succeed");
+        assert_eq!(outcome, RingAdmission::LeftToLeader);
         assert_eq!(
-            *forwarded.lock().unwrap(),
-            vec![(leader_uuid, "JoinNode"), (leader_uuid, "AssignTokens")]
+            *proposed.lock().unwrap(),
+            vec!["JoinNode"],
+            "tokens must never be assigned after the join was refused"
         );
     }
 
@@ -671,58 +652,50 @@ mod tests {
         let sink = proposed.clone();
         let (join, assign) = join_and_assign(Uuid::from_u128(0x2222));
 
-        propose_ring_member(
-            join,
-            assign,
-            move |cmd| {
-                sink.lock().unwrap().push(op_name(&cmd));
-                async { Ok(()) }
-            },
-            |_| panic!("the leader must not resolve a leader to forward to"),
-            |_uuid, _cmd| async { panic!("the leader must not forward") },
-        )
+        let outcome = propose_ring_member(join, assign, move |cmd| {
+            sink.lock().unwrap().push(op_name(&cmd));
+            async { Ok(()) }
+        })
         .await
         .unwrap();
 
+        assert_eq!(outcome, RingAdmission::Committed);
         assert_eq!(*proposed.lock().unwrap(), vec!["JoinNode", "AssignTokens"]);
     }
 
+    /// Leadership can move between the two commands: the join commits here and
+    /// the assignment is refused. That is still the leader's job to finish.
     #[tokio::test]
-    async fn propose_ring_member_never_assigns_tokens_after_a_failed_join() {
+    async fn leadership_lost_between_join_and_assign_is_left_to_the_leader() {
         let proposed: Arc<Mutex<Vec<&'static str>>> = Arc::default();
         let sink = proposed.clone();
         let (join, assign) = join_and_assign(Uuid::from_u128(0x2222));
 
-        let result = propose_ring_member(
-            join,
-            assign,
-            move |cmd| {
-                sink.lock().unwrap().push(op_name(&cmd));
-                async {
-                    Err(ProposeError::Forward {
-                        leader_node_id: Some(42),
-                    })
+        let outcome = propose_ring_member(join, assign, move |cmd| {
+            let name = op_name(&cmd);
+            sink.lock().unwrap().push(name);
+            async move {
+                match name {
+                    "JoinNode" => Ok(()),
+                    _ => Err(ProposeError::Forward {
+                        leader_node_id: None,
+                    }),
                 }
-            },
-            |_| Some(Uuid::from_u128(0x3333)),
-            |_uuid, _cmd| async { Err(ClusterError::RaftError("leader refused".into())) },
-        )
-        .await;
+            }
+        })
+        .await
+        .unwrap();
 
-        assert!(matches!(result, Err(ClusterError::RaftError(m)) if m == "leader refused"));
-        assert_eq!(*proposed.lock().unwrap(), vec!["JoinNode"]);
+        assert_eq!(outcome, RingAdmission::LeftToLeader);
+        assert_eq!(*proposed.lock().unwrap(), vec!["JoinNode", "AssignTokens"]);
     }
 
     #[tokio::test]
     async fn propose_ring_member_surfaces_a_non_forward_raft_error() {
         let (join, assign) = join_and_assign(Uuid::from_u128(0x2222));
-        let result = propose_ring_member(
-            join,
-            assign,
-            |_cmd| async { Err(ProposeError::Other("storage failed".into())) },
-            |_| panic!("only a ForwardToLeader refusal resolves a leader"),
-            |_uuid, _cmd| async { panic!("only a ForwardToLeader refusal forwards") },
-        )
+        let result = propose_ring_member(join, assign, |_cmd| async {
+            Err(ProposeError::Other("storage failed".into()))
+        })
         .await;
         assert!(matches!(result, Err(ClusterError::RaftError(m)) if m == "storage failed"));
     }

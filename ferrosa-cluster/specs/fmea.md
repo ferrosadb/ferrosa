@@ -223,6 +223,7 @@ cluster-wide and severities run high. Several entries are *evidence* gaps
 | CL-75 | **A non-leader's forwarded schema/membership `RaftCommand` travelled to the leader as a bincode blob inside `Message::ClusterMembershipForward`, so the schema metadata on that path could not be Cap'n Proto — and bincode there is a shipped contract (`raft/mod.rs`'s `raft_op_variant_tag_stability` pins `RaftOp`'s variant tags and a peer on the previous build sends bincode only), so a naive re-encode would have broken every older node.** | A torn or truncated body decoded by `bincode::deserialize` is either refused (fine) or, on bytes that happen to be valid bincode, silently yields a WRONG `RaftCommand` that the leader then proposes — schema divergence with no error. | 8 | 2 | 2 | 32 | **Fixed — frame ADDED alongside bincode, dual-read kept.** `raft_forward_codec` frames the ops whose payload is structured schema metadata (`CreateKeyspace`/`DropKeyspace`/`CreateTable`/`DropTable`/`AlterKeyspace`/`AlterTable` + the membership ops the path carries: `JoinNode`/`UpdateNodeInfo`/`ApproveNode`/`SetNodeState`/`RecordBootstrapComplete`) in the `ForwardedRaftCommand` family (`ferrosa-net`'s `envelope.capnp`); every other admin variant keeps the bincode body. The body carries a **versioned magic** (`[magic:u32 BE][version:u8]`, `FORWARD_RAFT_FRAME_MAGIC` = `FRWF`) because a Cap'n Proto message's segment framing conceals a leading struct field, so the receiver cannot peek the payload to tell the two apart; `decode_forwarded_command` reads the magic and dual-reads. The sender chooses capnp ONLY for a peer that advertised `CAP_RAFT_SCHEMA_CAPNP` (`1<<7`), so a previous-build peer is sent the bincode it already understands. An unreadable frame is refused by name (`ForwardFrameError::{BadMagic, UnsupportedVersion, Truncated, Malformed}`) and is NEVER retried as bincode. Tests (`raft_forward.rs`): `forwarded_capnp_frame_proposes_the_schema_values` (RED first at the real handler entry point, with a hand-built schema fixture that names no production seam), `forwarded_frame_round_trips_a_rich_table_metadata`, `forwarded_frame_round_trips_the_membership_ops`, `forwarded_frame_round_trips_drop_and_alter_ops`, `forwarded_frame_preserves_alter_keyspace_none_options`, `unreadable_forward_frame_is_refused_by_name` (asserts the refusal NAMES the frame), `bincode_body_still_decodes_through_the_forward_handler` (dual-read), `encode_falls_back_to_bincode_without_the_capability`, `non_framed_op_stays_bincode_even_with_capnp_allowed`; and in `raft_forward_codec.rs`, `frame_magic_and_version_are_the_pinned_wire_constants`, `corrupt_frame_is_refused_as_a_frame_not_retried_as_bincode`, `magic_only_prefix_is_refused_as_truncated`. **Negative control SHOWN to fail:** reducing `decode_forwarded_command` to "always treat the body as a frame" turns the three bincode/dual-read guards red (24 passed; 5 failed). **Residual:** `AccordApply` and the remaining role/grant/index/type/function/aggregate/`UpdateConfig`/`LeaveNode`/`AssignTokens` variants are still bincode on this path; the frame carries the schema family only. **Freshness (t_d853fa2a):** this gate — like every `CAP_*` gate — reads `PeerManager::peer_capabilities`, which now returns the NEWEST of the outbound pool's snapshot and the peer's most recent INBOUND handshake (the accept path records the latter via `InboundPeerCallback::on_inbound_peer` → `PeerManager::record_inbound_capabilities`), so a peer that restarts with a newer build is seen as advertising without the observer restarting; latest-wins keeps a peer on an older build seen as lacking. Covered by `ferrosa-net`'s `peer.rs` unit tests `an_inbound_advertisement_is_reported_without_a_pool` and `an_inbound_advertisement_for_an_unregistered_peer_is_ignored`; the jsonb-era freshness integration test was removed with the jsonb capability gate (T-300/D24/D32), which this mechanism no longer serves. |
 | CL-76 | **A data center whose own Raft group is smaller than `FERROSA_EXPECTED_CLUSTER_SIZE` can never accept native-protocol connections, so a multi-DC deployment must size EVERY DC to `expected`, not just the cluster.** `ModeController::accepts_cql_connections` compares `expected_cluster_size` against the node's LOCAL group's `metrics.membership_config.membership().voter_ids().count()`, and Raft groups are per-DC (`partition_peers_by_dc` excludes cross-DC peers from the local ring). Verified against two live processes declared `expected=1` in `us-west-2` / `eu-west-1`: `/readyz` passes at once (each node is `Standalone`), then the peer connection logs `mode transition: -> pair` and `reverse connection established`, the Bulk/Data lanes are torn down, and a client that connects during the transition gets `CQL handshake: Protocol("unexpected startup response: Error")`. `declared_topology_is_ready` additionally maps `expected == 2` to Pair + Primary, so a two-node cluster is the pair path BY DESIGN and is a different replication model. | The smallest two-DC cluster in which BOTH DCs answer CQL is `2 x expected_cluster_size` nodes — six at the default three. A deployment that sizes the cluster but not each DC gets a DC that accepts internode work (including a relayed DDL) and refuses every client. This is NOT a defect in the cross-DC relay above it, which never touches CQL; it is the reason the end-to-end two-DC acceptance proof needs six processes. | 7 | 4 | 5 | 140 | **Topology constraint remains.** The active acceptance proof in `ferrosa/tests/data_center_process.rs` runs six real processes, three voters per DC. Its wide-run failure exposed the separate DDL publication race documented in CL-77; the relay and per-DC groups have lower-level coverage in `tests/cross_dc_ddl_relay.rs`. A two-node deployment still exercises pair mode rather than this topology. |
 | CL-77 | DDL acknowledged on Direct before Cluster path publication | Local replay reaches only its own DC; the remote DC never receives the acknowledged schema. | 8 | 4 | 3 | 96 | Mitigated: keep Forming DDL until Cluster publication, gate declared admission and readiness, and verify real transition/admission/HTTP controls plus the active six-process cross-DC proof. Prior divergent schema and old queued replay/WAN repair remain outside this change (`t_9a8b88de`). |
+| CL-78 | A refused ring admission was dropped during formation | The initial voter topology never published token ownership, so the node stayed `Forming` with no Cluster DDL path and readiness waited on `ddl_path` for good. | 8 | 3 | 4 | 96 | Fixed: ring admission is owned by the Raft leader (forwarded admissions are refused by the leader's membership-control guard, so forwarding was ineffective). Neither formation deadline ends the wait any more: each is reported once, a late leader completes formation and admits itself, and the leader re-proposes every voter missing from its ring. Details and residuals are in the CL-78 section below (`t_9c219a2b`). |
 
 ## CL-77 — acknowledged DDL before Raft path publication
 
@@ -258,22 +259,61 @@ topology did not publish token ownership; refusing client admission` and stayed
 on `{"waiting_for":"ddl_path"}` (`t_9c219a2b`). Severity 8, occurrence 3,
 detection 4 (RPN 96 before mitigation).
 
-Both sites now call `raft_forward::propose_ring_member_via_raft`, which forwards
-a refused proposal to the leader. It resolves the leader's host id through the
-Raft node map, because during formation the leader's own `NodeInfo` may not be
-in the token ring yet. A failed `JoinNode` stops before `AssignTokens`, so tokens
-are never assigned to a member that did not join. Red first:
-`raft_forward::tests::propose_ring_member_forwards_both_commands_when_not_leader`,
-taken against the extracted sequence before forwarding was added. Guards:
+A first fix forwarded the refused proposal to the leader. That was ineffective:
+the leader's membership-control guard (`controller/membership_control.rs`)
+refuses every forwarded `JoinNode` and `AssignTokens` ("legacy
+ownership/promotion requires verified membership admission"), so a forwarded
+admission is refused there instead of here. Its unit test pinned the forward,
+not the commit, and the six-process test passed before that change too, so
+neither was evidence for it.
+
+Ring admission is now the leader's job. `raft_forward::propose_ring_member_via_raft`
+commits both commands on the leader and returns `RingAdmission::LeftToLeader`
+on a follower (or when leadership moves between the two writes) without
+forwarding anything. A failed `JoinNode` stops before `AssignTokens`, so tokens
+are never assigned to a member that did not join. The leader admits itself as
+soon as it is elected, and re-drives every voter missing from its ring during
+the topology wait (below). Guards:
+`a_follower_leaves_ring_admission_to_the_leader`,
 `propose_ring_member_on_the_leader_commits_both_locally`,
-`propose_ring_member_never_assigns_tokens_after_a_failed_join`,
+`leadership_lost_between_join_and_assign_is_left_to_the_leader`,
 `propose_ring_member_surfaces_a_non_forward_raft_error`.
 
-**Residual, open:** the formation deadline still ends in a bare `return` before
-the Cluster DDL path is stored, so any other cause of an incomplete initial
-topology leaves the node `Forming` permanently, with readiness naming
-`ddl_path` rather than the topology. The six-process test is the acceptance
-check; it passed before this change too, so its green is not evidence of the fix.
+### The formation deadline gave up instead of reporting (closed)
+
+Both formation waits treated their deadline as a verdict. The election wait
+ended at `formation_deadline_secs`, so the late CL-76 initialise and the leader
+arm (ring admission, Cluster DDL path) never ran again. The topology wait ended
+in a bare `return` before the Cluster DDL path was stored. Reproduced on real
+processes by
+`data_center_process::a_data_center_that_missed_its_formation_deadline_forms_when_its_peers_arrive`.
+An east-DC seed with a 2 s deadline timed out alone. When its peers arrived, a
+peer event initialised the group and won the election, but nothing proposed a
+ring admission. Both peers then logged `initial voter topology did not publish
+token ownership` and stayed unready for good (RED: `/readyz` not ready within
+120 s).
+
+Each deadline is now reported once and the wait continues, bounded by shutdown.
+The election deadline still counts the timeout, degrades and arms the rejoin, and
+a leader elected afterwards completes formation and restores `Cluster`. The
+leader proposes its own ring admission on entering the topology wait; that is
+the step whose absence the test caught (a control run without it stayed RED).
+While any voter is missing from the ring, the current leader resolves it through
+the Raft node map to a live peer connection and re-proposes its admission every
+`INITIAL_TOPOLOGY_READMISSION_INTERVAL` (2 s); a voter it cannot describe is
+named in the error instead of dropped. `JoinNode` upserts and `AssignTokens`
+re-inserts the same deterministic tokens, so re-proposal never moves ownership.
+Edges are logged (deadline crossed, re-drive failure changed, published after
+the deadline); individual attempts are not.
+
+The re-drive of a missing FOLLOWER has guard tests
+(`resolve_missing_voters`, `ring_admission`) but no process-level red yet: in
+the reproduction only the leader's own admission was missing.
+
+**Residual:** a voter that never returns keeps its DC unready with the ERROR
+line above as its only signal. The `Direct` DDL path the election deadline
+installs remains open until the late leader swaps in `Cluster`. DDL accepted in
+that window reaches the group only through the ReplaySchema phase (CL-77 shape).
 
 
 ### PostgreSQL table incarnation isolation (2026-10-26)

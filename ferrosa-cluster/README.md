@@ -731,6 +731,15 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   add/remove voter, learner-only join, promote/demote, DC swap drain.
 - `controller/cluster_rejoin.rs` — P0-21 rejoin after formation timeout;
   `CLUSTER_REJOIN_ATTEMPTS_TOTAL` / `_FAILURES_TOTAL`.
+- Formation deadlines (`controller/cluster.rs`, `FERROSA_FORMATION_TIMEOUT_SECS`,
+  default 30 s) are reported, not obeyed. A missed election deadline degrades
+  the node and arms the rejoin, but the wait goes on and a late leader completes
+  formation. Ring admission belongs to the Raft leader: it admits itself when
+  elected and, during the initial-topology wait, re-proposes every voter missing
+  from its ring every 2 s. A follower's admission attempt is left to the leader
+  (`RingAdmission::LeftToLeader`), never forwarded, because the leader's
+  membership-control guard refuses forwarded admissions. Only shutdown ends
+  either wait (CL-78).
 - `pair/` — two-node primary/secondary coordination (deterministic host-ID
   ordering, independent of which TCP direction wins), switchover, catch-up.
   Schema catch-up (`PairSchemaSyncHandler`) is applied only by a receiver: a
