@@ -142,6 +142,36 @@ at charon, which is user-side and leaves the type unmodelled. Choosing is a desi
 decision, not a bug fix, and (a) has the widest blast radius because `Discriminant` and
 every `match` over the enum are generated from the inductive shape.
 
+Chosen: (a). Priced by hand-editing the emitted file before touching OCaml — replacing the
+`inductive` with
+
+```
+structure rustls.enums.CipherSuite where
+  disc : Std.U16
+  unknownPayload : Option Std.U16 := none
+def rustls.enums.CipherSuite.Unknown (x : Std.U16) : rustls.enums.CipherSuite :=
+  { disc := UScalar.ofNatCore 375 (by decide), unknownPayload := some x }
+```
+
+and the other 375 constructors as nullary `def`s carrying their index. Result on the same
+module: **101 elaboration errors → 40, with the entire 94-error cascade gone**. What
+remains is not about the enum: 21 `Unknown identifier rustls.error.Error` (the
+external-type holes of the next section), four `unexpected token '/--'` (a doc comment
+printed inside a `def` body — previously hidden behind `maxErrors` truncation that stopped
+at the enum at line 1246), two each of `map`/`collect` not a field of `Iterator` (Step 3),
+and two type mismatches.
+
+Two practical constraints the hand-edit established, both needed by the real emitter: the
+attribute line (`@[discriminant isize, rust_type …]`) must stay attached to the
+declaration, so a doc comment cannot be inserted between them; and numerals need
+`UScalar.ofNatCore n (by decide)` — there is no `OfNat U16`, so `{ disc := 3 }` fails to
+synthesize.
+
+Still to build for (a): the constructor `def`s are the easy half. Every `match` over a
+tagged enum is printed by the inductive-shape path today, so the printer must emit tag
+comparisons and `Option` unwrapping instead, and `Discriminant`/`read_discriminant` must be
+generated from the tag rather than from constructor indices.
+
 ## Step 3 — the trait model (414 reds)
 
 Decision: a trait is a **record of methods parameterised by its associated
