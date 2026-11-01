@@ -355,6 +355,7 @@ impl UnifiedChecker {
             knossos: knossos_result,
             elle: elle_result,
             membership_violations,
+            transactional_checker_required: false,
         }
     }
 }
@@ -376,14 +377,24 @@ pub struct AllCheckResults {
     /// snapshots were attached.
     #[serde(default)]
     pub membership_violations: Vec<membership::InvariantViolation>,
+    /// The workload declared that only the transactional checker can judge its history
+    /// ([`crate::workload::Workload::requires_transactional_checker`]).
+    #[serde(default)]
+    pub transactional_checker_required: bool,
 }
 
 impl AllCheckResults {
-    /// True when every checker that ran reports clean.
+    /// True when every checker that ran reports clean and every checker the workload requires
+    /// ran. An absent result passes only for an optional checker: a required one that did not run
+    /// fails the run (Lean `Jepsen.passesRequiringEveryChecker`, `specs/jepsen-evidence` D2).
     pub fn all_passed(&self) -> bool {
+        let elle_passed = match &self.elle {
+            Some(r) => r.valid,
+            None => !self.transactional_checker_required,
+        };
         self.linearizability.iter().all(|r| r.valid)
             && self.knossos.as_ref().is_none_or(|r| r.valid)
-            && self.elle.as_ref().is_none_or(|r| r.valid)
+            && elle_passed
             && self.membership_violations.is_empty()
     }
 }
@@ -731,6 +742,7 @@ mod tests {
             knossos: None,
             elle: None,
             membership_violations: vec![],
+            transactional_checker_required: false,
         };
         let json = serde_json::to_string(&results).unwrap();
         let back: AllCheckResults = serde_json::from_str(&json).unwrap();
@@ -1402,6 +1414,52 @@ mod tests {
         let checker = UnifiedChecker::new();
         let results = checker.check_all(&History { operations: vec![] });
         assert!(results.all_passed());
+    }
+
+    /// Results in which the only checker of interest is Elle: `elle` is `None` when it did not
+    /// run and `Some(valid)` when it ran and returned `valid` (Lean `Jepsen.Outcome`).
+    fn results_with_elle(elle: Option<bool>, required: bool) -> AllCheckResults {
+        AllCheckResults {
+            linearizability: vec![],
+            knossos: None,
+            elle: elle.map(|valid| elle::ElleResult {
+                valid,
+                consistency_model: "strict-serializable".into(),
+                anomaly_types: vec![],
+                anomaly_count: 0,
+                ok_count: 0,
+            }),
+            membership_violations: vec![],
+            transactional_checker_required: required,
+        }
+    }
+
+    /// Mirrors Lean `Jepsen.an_absent_required_checker_must_fail_the_run`: an absent result
+    /// passes only for a checker the workload did not require.
+    #[test]
+    fn an_absent_required_checker_must_fail_the_run() {
+        assert!(
+            results_with_elle(None, false).all_passed(),
+            "an optional checker that did not run must not fail the run"
+        );
+        assert!(
+            !results_with_elle(None, true).all_passed(),
+            "a required checker that did not run must fail the run, not count as a pass"
+        );
+    }
+
+    /// Mirrors Lean `Jepsen.the_rules_agree_when_every_checker_ran`: when Elle produced a
+    /// result, requiring it changes nothing, so the stricter rule costs a run that ran nothing.
+    #[test]
+    fn the_rules_agree_when_every_checker_ran() {
+        for valid in [true, false] {
+            assert_eq!(
+                results_with_elle(Some(valid), false).all_passed(),
+                results_with_elle(Some(valid), true).all_passed(),
+                "required and optional must agree when Elle returned valid={valid}"
+            );
+            assert_eq!(results_with_elle(Some(valid), true).all_passed(), valid);
+        }
     }
 
     /// UnifiedChecker with_jepsen_dir stores the path for future use.

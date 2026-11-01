@@ -233,6 +233,27 @@ mod tests {
         );
     }
 
+    /// A combination that could not be judged — the cluster did not come up, or a checker the
+    /// workload requires did not run — is a failed run, whatever its assurance says. Both setup
+    /// paths leave the assurance at its `NotTested` default, so classifying by assurance alone
+    /// counted them as untested and the suite exited 0 on a run that decided nothing.
+    #[test]
+    fn a_setup_failure_fails_the_run_rather_than_going_untested() {
+        let mut setup = make_result("txn", "noop", false);
+        setup.invariant_error = None;
+        setup.setup_error = Some("required transactional checker did not run".into());
+        setup.assurance = Default::default();
+
+        let report = RunReport::from_results("test-005", vec![setup]);
+
+        assert_eq!(report.failed, 1, "a setup failure is a failure");
+        assert_eq!(
+            report.not_tested, 0,
+            "a setup failure is not an untested run"
+        );
+        assert!(!report.all_passed(), "the run must exit non-zero");
+    }
+
     #[test]
     fn report_all_passed() {
         let results = vec![make_result("a", "b", true), make_result("c", "d", true)];

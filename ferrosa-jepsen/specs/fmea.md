@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-jepsen
 doc: fmea
-last_updated: 2026-10-13
+last_updated: 2026-10-31
 ---
 
 # ferrosa-jepsen — Failure Modes and Effects Analysis
@@ -21,6 +21,8 @@ last_updated: 2026-10-13
 | A serialization retry re-enters in the same instant as the attempt that lost | Because a refusal changes no state, the retry re-reads exactly what lost and re-enters the same conflict window, so it loses until the budget is spent — the workload's progress assertion fails without the engine being wrong. | The retry budget (`SERIALIZATION_RETRIES`) is consumed with no commit; measured 13, 7 and 7 consecutive refusals in three runs against a usual one. | Pace the retry: bounded exponential backoff (10 ms base, 160 ms max, five-step cap) with jitter from the refused attempt's OWN invocation sequence, so it lands in a different conflict window. This bounds WHEN a retry is issued, never how many. |
 | A refusal whose outcome is unknown is re-issued | A statement that may already have applied could be applied twice. | n/a — the workload never re-issues this class. | Retry only the class the server documents as "not applied": SQLSTATE `40001` for a transaction, `Unavailable`/0x1000 for the teardown DDL. A `RequestTimeout` outcome is unknown and is reported where it stands. |
 | A DDL proposal with a stuck leader hangs the teardown to the driver's 30 s deadline | The teardown reports `ExecutionError::RequestTimeout(30s)` — a failure the workload cannot retry, because its outcome is unknown. | Engine log: `ddl_path: ddl_agreement: timed out waiting for all voters to replicate the DDL log entry … lagging_voters=1`. | `ferrosa-cluster` bounds the DDL proposal to the existing 5 s agreement budget and returns the retryable class, which the driver's default retry policy re-issues unconditionally. No deadline is widened, and the teardown's own re-issue is limited to the not-applied class. |
+| A checker the workload requires does not run | The run is judged by the remaining checks, which a transactional workload passes vacuously, so a history nothing judged reads green. | `a_required_checker_that_did_not_run_fails_the_run`, `an_absent_required_checker_must_fail_the_run` (mirrors Lean `Jepsen.an_absent_required_checker_must_fail_the_run`). | `AllCheckResults::all_passed` passes an absent result only for an optional checker; the orchestrator records a `setup_error` naming the checker. |
+| A setup failure is counted as "not tested" | Setup failures carry the default `NotTested` assurance, so the report counted them as untested and the suite exited 0 on a run that decided nothing. | `a_setup_failure_fails_the_run_rather_than_going_untested`. | `CombinationResult::is_inconclusive` is false for a setup failure, so `RunReport` counts it as failed. |
 
 The controls above deliberately prefer a loud, diagnosable failure to a
 successful-looking test that did not use its requested topology or fault.

@@ -57,6 +57,13 @@ graph. It calls `ferrosa-sim` for the simulator-backed endurance path.
     when a `jepsen_dir` *and* a written history file are both supplied.
   - **Elle** (`checker/elle.rs`) — types exist; `UnifiedChecker` always sets the
     Elle result to `None` (not wired to a running checker).
+  - **Required checkers.** A workload declares that only the transactional
+    checker can judge its history with `Workload::requires_transactional_checker()`
+    (default `false`; no in-tree workload declares it yet). For such a workload an
+    absent Elle result is not a pass: `AllCheckResults::all_passed` refuses it,
+    and the orchestrator records a `setup_error` so the combination — and the
+    run's exit status — fails (`specs/jepsen-evidence` D2). A setup failure is
+    always counted as failed in `RunReport`, never as not tested.
 - **Drivers** (`driver/`) — `rust_driver` connects to a real cluster via the
   `scylla` driver (`phase1`, the only wired driver). Its single-coordinator
   policy first lets the workload session discover topology, selects a stable

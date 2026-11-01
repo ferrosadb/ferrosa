@@ -74,6 +74,16 @@ pub trait Workload: Send + Sync {
     fn register_linearizable(&self) -> bool {
         true
     }
+
+    /// Whether this workload's history can only be judged by the transactional checker (Elle).
+    ///
+    /// `false` (the default) leaves the verdict to linearizability and [`Self::check_invariant`].
+    /// A workload that returns `true` cannot be judged without that checker: when it does not run,
+    /// the combination is a setup failure and the run fails, never a pass
+    /// (`specs/jepsen-evidence` D2; Lean `Jepsen.an_absent_required_checker_must_fail_the_run`).
+    fn requires_transactional_checker(&self) -> bool {
+        false
+    }
 }
 
 /// Registry of all available workloads.
