@@ -28,6 +28,11 @@ column of `modules.txt` — against the hash recorded in `sync.lock`. It needs n
 aeneas, so it runs on every pull request. When it fires, the generated file is making claims about
 code that no longer exists; regenerate, read the diff, and re-prove whatever the diff broke.
 
+Where an aeneas checkout exists (`$AENEAS_DIR`, default `~/src/aeneas`), the check also compares
+each row's recorded translator against it and fails on a mismatch. Where none exists, as on every CI
+runner, it prints `TOOL    not compared` once and checks the sources alone. It never reports a
+translator as having moved to a version it could not read.
+
 A row's status is `ok` or `stale:<reason>`. `stale` means the extraction cannot be regenerated under
 the installed toolchain, and the reason names what blocks it. The check reports it every run rather
 than passing silently, because a generated file nobody can reproduce is a claim resting on nothing.
