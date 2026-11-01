@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-jepsen
 doc: roadmap
-last_updated: 2026-09-27
+last_updated: 2026-10-31
 ---
 
 # ferrosa-jepsen — Roadmap
@@ -31,10 +31,11 @@ external checkers.
 
 ## Next
 
-- **Decide Elle's fate.** `checker/elle.rs` types exist but `UnifiedChecker`
-  hard-codes `elle_result = None`. Either wire Elle against a running Jepsen/lein
-  cluster or document it as explicitly out of scope so it isn't mistaken for an
-  active checker.
+- **Give Elle a workload.** `checker::elle` now runs elle-checker by exit code
+  and the orchestrator runs it for any workload that requires it, but no
+  workload requires it yet. `txn-register` with an `rw-register` EDN export,
+  and an elle-checker that accepts that model, are `specs/jepsen-evidence`
+  JE-7 (suite repository).
 - **Exercise the container drivers in a tier.** `phase2` registers
   Python/Go/Node/Java/C# `ContainerDriver`s, but `resolve_driver_registry`
   returns `phase1` (Rust only) for every tier. Add a tier (or flag) that runs

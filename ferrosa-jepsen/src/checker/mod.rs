@@ -340,7 +340,9 @@ impl UnifiedChecker {
             _ => None,
         };
 
-        // Elle requires a running Jepsen cluster with lein; not yet wired.
+        // Elle needs an Elle-native EDN history, which only a workload can export; the
+        // orchestrator runs it for a workload that requires it (`judge_history`). This
+        // in-process entry point never does, and never marks it required.
         let elle_result: Option<elle::ElleResult> = None;
 
         // Run Sprint 2 W2.4 structural-invariant checks if snapshots present.
@@ -1426,8 +1428,6 @@ mod tests {
                 valid,
                 consistency_model: "strict-serializable".into(),
                 anomaly_types: vec![],
-                anomaly_count: 0,
-                ok_count: 0,
             }),
             membership_violations: vec![],
             transactional_checker_required: required,

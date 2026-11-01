@@ -55,15 +55,34 @@ graph. It calls `ferrosa-sim` for the simulator-backed endurance path.
     I-06–I-10, I-13 over per-node membership snapshots.
   - **Knossos** (`checker/knossos.rs`) — shells out to Clojure/`lein`; only runs
     when a `jepsen_dir` *and* a written history file are both supplied.
-  - **Elle** (`checker/elle.rs`) — types exist; `UnifiedChecker` always sets the
-    Elle result to `None` (not wired to a running checker).
+  - **Elle** (`checker/elle.rs`) — `ElleChecker::check` runs the
+    [`elle-checker`](elle-checker/) project (`lein run <history.edn>`) on an
+    Elle-native EDN history. The verdict is the **exit code** alone: 0 valid,
+    1 invalid or `:unknown`. Any other exit, a missing or unparseable
+    `<history>.anomalies.edn`, or a `lein` that cannot start is a checker
+    error, never a verdict. Anomaly types are the top-level keys of the
+    anomalies file, in Elle's own spelling (`G0-realtime`, `G-single`); stdout
+    is never read (`specs/jepsen-evidence` D3). The project directory comes
+    from `ELLE_CHECKER_DIR` (unset → `ferrosa-jepsen/elle-checker`, relative to
+    the repository root; blank → refused naming the variable). The checker
+    still hard-codes Elle's `list-append` model, so a `rw-register` workload
+    needs a checker change first (JE-7).
   - **Required checkers.** A workload declares that only the transactional
     checker can judge its history with `Workload::requires_transactional_checker()`
-    (default `false`; no in-tree workload declares it yet). For such a workload an
-    absent Elle result is not a pass: `AllCheckResults::all_passed` refuses it,
-    and the orchestrator records a `setup_error` so the combination — and the
-    run's exit status — fails (`specs/jepsen-evidence` D2). A setup failure is
-    always counted as failed in `RunReport`, never as not tested.
+    (default `false`; no in-tree workload declares it yet) and exports that
+    history with `Workload::elle_history_edn` (default: refuses). The
+    orchestrator then writes `<combination>.edn` beside the JSONL history and
+    runs Elle on it; Elle's verdict and anomaly types land in
+    `CombinationResult::elle`. If the checker does not run or reaches no
+    verdict, `AllCheckResults::all_passed` refuses the absent result and the
+    orchestrator records a `setup_error`, so the combination — and the run's
+    exit status — fails (D2). A setup failure is always counted as failed in
+    `RunReport`, never as not tested.
+  - **Running the Elle tests.** `checker::elle` and the orchestrator's
+    transactional tests run the real checker and fail loudly without `lein`
+    and a JDK 17+ (`brew install leiningen openjdk@17`, then `lein deps` in
+    `elle-checker/`). The CI Jepsen smoke tier installs a checksum-pinned
+    `lein` 2.11.2 for them.
 - **Drivers** (`driver/`) — `rust_driver` connects to a real cluster via the
   `scylla` driver (`phase1`, the only wired driver). Its single-coordinator
   policy first lets the workload session discover topology, selects a stable

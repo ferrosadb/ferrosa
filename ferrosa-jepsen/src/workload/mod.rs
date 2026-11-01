@@ -84,6 +84,18 @@ pub trait Workload: Send + Sync {
     fn requires_transactional_checker(&self) -> bool {
         false
     }
+
+    /// This workload's history as Elle-native EDN, the input `checker::elle` runs elle-checker
+    /// on. Consulted only when [`Self::requires_transactional_checker`] is `true`.
+    ///
+    /// The default refuses: a workload that requires the checker but cannot export its history
+    /// makes the combination a setup failure, never a pass.
+    fn elle_history_edn(&self, _history: &History) -> Result<String> {
+        anyhow::bail!(
+            "workload `{}` has no Elle history export, so the transactional checker cannot run",
+            self.name()
+        )
+    }
 }
 
 /// Registry of all available workloads.

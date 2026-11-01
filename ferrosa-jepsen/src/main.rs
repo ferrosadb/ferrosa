@@ -197,6 +197,11 @@ async fn main() -> Result<()> {
                                 "  - {} / {}: SETUP FAILED (no invariant evaluated): {}",
                                 f.workload, f.nemesis, setup
                             );
+                        } else if let Some(elle) = f.elle.as_ref().filter(|e| !e.valid) {
+                            println!(
+                                "  - {} / {}: ELLE INVALID ({}): anomalies {:?}",
+                                f.workload, f.nemesis, elle.consistency_model, elle.anomaly_types
+                            );
                         } else {
                             println!(
                                 "  - {} / {}: INVARIANT VIOLATED: {:?}",

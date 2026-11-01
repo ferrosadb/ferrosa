@@ -735,6 +735,40 @@ jobs:
           scripts/pull-images.sh \
             "downloads.ferrosa.ai/rustfs@sha256:58c589bedfab28d001fc6176735872ac84323dddc6c5313cc95260600ed1ae8d" \
             "downloads.ferrosa.ai/aws-cli@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed"
+      # The Elle checker tests (`checker::elle`, the orchestrator's transactional
+      # path) run the real elle-checker project under lein, and panic with setup
+      # instructions when lein is missing — they are never skipped. So this job
+      # provides a JDK, a pinned lein, and the checker's deps before the tests.
+      - uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Cache lein/Elle deps
+        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.2
+        with:
+          path: |
+            ~/.m2
+            ~/.lein/self-installs
+          key: lein-2.11.2-m2-${{ hashFiles('ferrosa-jepsen/elle-checker/project.clj') }}
+      - name: Install Leiningen (pinned, checksum-verified) and prefetch Elle deps
+        working-directory: ferrosa-jepsen/elle-checker
+        env:
+          LEIN_VERSION: "2.11.2"
+          # sha256 of bin/lein at the 2.11.2 tag. The script in turn verifies the
+          # standalone jar it self-installs against its own embedded LEIN_CHECKSUM,
+          # so this one digest pins both.
+          LEIN_SHA256: f83e3de252cb09d301f18f1912acffa807b54c1c9a96772ae63847a946032bd4
+        run: |
+          set -euo pipefail
+          if ! command -v lein >/dev/null; then
+            curl -fsSL -o "$RUNNER_TEMP/lein" \
+              "https://raw.githubusercontent.com/technomancy/leiningen/${LEIN_VERSION}/bin/lein"
+            echo "${LEIN_SHA256}  $RUNNER_TEMP/lein" | sha256sum -c -
+            sudo install -m 0755 "$RUNNER_TEMP/lein" /usr/local/bin/lein
+          fi
+          lein version
+          # Fetch jepsen/Elle and Clojure, which the fake-checker tests reuse.
+          lein deps
       - name: Run Jepsen smoke tier
         env:
           FERROSA_TEST_CONTAINERS: "1"

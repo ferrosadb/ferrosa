@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::chaos::{NemesisAction, NemesisContext, NemesisRegistry};
+use crate::checker::elle::{ElleChecker, ElleResult};
 use crate::checker::{check_linearizability, CheckResult};
 use crate::config::{Concurrency, RunConfig, Tier, Topology};
 use crate::cql_session::ScyllaCqlSession;
@@ -230,6 +231,10 @@ pub struct CombinationResult {
     /// the bank invariant it named had never been tested).
     #[serde(default)]
     pub setup_error: Option<String>,
+    /// The transactional checker's verdict and anomaly types, for a workload that requires it
+    /// and whose checker reached a verdict. `None` otherwise.
+    #[serde(default)]
+    pub elle: Option<ElleResult>,
     pub duration_secs: f64,
     pub op_count: usize,
     /// The consistency configuration these assertions are scoped to. A verdict without it is not a
@@ -371,6 +376,7 @@ pub async fn run(config: &RunConfig) -> Result<RunReport> {
                                     invariant_passed: false,
                                     invariant_error: None,
                                     setup_error: Some(e.to_string()),
+                                    elle: None,
                                     duration_secs: 0.0,
                                     op_count: 0,
                                     profile,
@@ -517,7 +523,15 @@ async fn run_single_combination(
     // differently; it is re-read rather than passed to stay under clippy's argument limit.
     let profile =
         crate::checker::profile::ConsistencyProfile::from_env().map_err(anyhow::Error::msg)?;
-    let judgement = judge_history(workload, &history, profile);
+    let elle = workload.requires_transactional_checker().then(|| {
+        run_transactional_checker(
+            ElleChecker::from_env(),
+            workload,
+            &history,
+            &history_path.with_extension("edn"),
+        )
+    });
+    let judgement = judge_history(workload, &history, profile, elle);
 
     Ok(CombinationResult {
         workload: workload_name.into(),
@@ -530,6 +544,7 @@ async fn run_single_combination(
         invariant_passed: judgement.invariant_passed,
         invariant_error: judgement.invariant_error,
         setup_error: judgement.setup_error,
+        elle: judgement.elle,
         duration_secs: start.elapsed().as_secs_f64(),
         op_count: history.len(),
         profile,
@@ -548,6 +563,7 @@ struct Judgement {
     /// Set when a checker the workload requires could not produce a verdict. The history
     /// exists, but nothing was decided about it, so the run fails without claiming a violation.
     setup_error: Option<String>,
+    elle: Option<ElleResult>,
     assurance: crate::checker::profile::Assurance,
 }
 
@@ -556,6 +572,7 @@ fn judge_history(
     workload: &dyn crate::workload::Workload,
     history: &crate::history::History,
     profile: crate::checker::profile::ConsistencyProfile,
+    elle: Option<Result<ElleResult>>,
 ) -> Judgement {
     // Check linearizability — only for workloads whose history is a set of
     // single-value register operations (register/LWT). Transactional workloads
@@ -563,8 +580,8 @@ fn judge_history(
     // writes and multi-key snapshot reads cannot be modelled as a single-value
     // register, and per-key linearizability is not a guarantee the
     // eventually-consistent base makes. Their safety is judged by
-    // `check_invariant` (conservation) ONLY: no transactional checker runs
-    // here — Elle is not wired (`UnifiedChecker::check_all` leaves it None)
+    // `check_invariant` (conservation) ONLY: bank does not require the
+    // transactional checker (its history carries deltas, not the values written)
     // and `checker::strict_serializable` is not called — so a green bank run
     // does not establish strict serializability. An empty result vector is
     // vacuously all-linear.
@@ -579,24 +596,14 @@ fn judge_history(
     let invariant_passed = invariant_result.is_ok();
     let invariant_error = invariant_result.err().map(|e| e.to_string());
 
-    // The transactional checker is not invoked yet (`checker::elle` reads its verdict from
-    // text, D3), so a workload that requires it gets no result and the run fails below.
+    let (elle, setup_error) = transactional_outcome(workload, elle);
     let checks = crate::checker::AllCheckResults {
         linearizability,
         knossos: None,
-        elle: None,
+        elle,
         membership_violations: Vec::new(),
         transactional_checker_required: workload.requires_transactional_checker(),
     };
-    let setup_error = (checks.transactional_checker_required && checks.elle.is_none()).then(|| {
-        let message = format!(
-            "workload `{}` requires the transactional checker (Elle) and it did not run, so \
-             nothing judged this history",
-            workload.name()
-        );
-        tracing::error!("{message}");
-        message
-    });
     if setup_error.is_some() {
         // A run nothing judged is neither confirmed nor refuted: it fails as a setup failure
         // and keeps the default `NotTested` assurance, as the provisioning-failure path does.
@@ -606,6 +613,7 @@ fn judge_history(
             invariant_passed,
             invariant_error,
             setup_error,
+            elle: checks.elle,
             assurance: Default::default(),
         };
     }
@@ -617,8 +625,47 @@ fn judge_history(
         invariant_passed,
         invariant_error,
         setup_error: None,
+        elle: checks.elle,
         assurance: profile.classify(observed_clean),
     }
+}
+
+/// Split the transactional checker's outcome into a verdict and a setup error. A required
+/// checker that did not run, or ran without reaching a verdict, is a setup error (D2), logged
+/// where it is decided.
+fn transactional_outcome(
+    workload: &dyn crate::workload::Workload,
+    elle: Option<Result<ElleResult>>,
+) -> (Option<ElleResult>, Option<String>) {
+    let required = workload.requires_transactional_checker();
+    let failure = match elle {
+        Some(Ok(result)) => return (Some(result), None),
+        Some(Err(e)) => format!("could not run: {e:#}"),
+        None if required => "did not run".to_string(),
+        None => return (None, None),
+    };
+    let message = format!(
+        "workload `{}`: the transactional checker (Elle) {failure}; nothing judged this history",
+        workload.name()
+    );
+    tracing::error!("{message}");
+    (None, Some(message))
+}
+
+/// Run elle-checker on the workload's exported history, written beside the JSONL history.
+/// `Err` means no verdict was reached: the checker is misconfigured, the workload cannot export
+/// its history, or the checker itself failed (D2).
+fn run_transactional_checker(
+    checker: Result<ElleChecker, String>,
+    workload: &dyn crate::workload::Workload,
+    history: &crate::history::History,
+    edn_path: &std::path::Path,
+) -> Result<ElleResult> {
+    let checker = checker.map_err(anyhow::Error::msg)?;
+    let edn = workload.elle_history_edn(history)?;
+    std::fs::write(edn_path, edn)
+        .with_context(|| format!("cannot write Elle history {}", edn_path.display()))?;
+    checker.check(edn_path)
 }
 
 #[cfg(test)]
@@ -638,6 +685,7 @@ mod tests {
             invariant_passed: true,
             invariant_error: None,
             setup_error: None,
+            elle: None,
             duration_secs: 1.5,
             op_count: 42,
             profile: Default::default(),
@@ -872,6 +920,7 @@ mod tests {
             &RequiresTransactionalChecker,
             &history,
             crate::checker::profile::ConsistencyProfile::default(),
+            None,
         );
         assert!(
             !judgement.passed,
@@ -919,9 +968,112 @@ mod tests {
             &Optional,
             &crate::history::History { operations: vec![] },
             crate::checker::profile::ConsistencyProfile::default(),
+            None,
         );
         assert!(judgement.passed);
         assert!(judgement.setup_error.is_none());
+    }
+
+    /// A workload that requires the checker and exports one of elle-checker's committed control
+    /// histories as its Elle history, so the real checker decides the run.
+    struct ExportsControlHistory(&'static str);
+
+    #[async_trait::async_trait]
+    impl crate::workload::Workload for ExportsControlHistory {
+        fn name(&self) -> &str {
+            self.0
+        }
+        async fn setup(&self, _session: &dyn CqlSession) -> Result<()> {
+            Ok(())
+        }
+        async fn run(
+            &self,
+            _session: &dyn CqlSession,
+            _recorder: &mut HistoryRecorder,
+            _duration: Duration,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn check_invariant(&self, _history: &crate::history::History) -> Result<()> {
+            Ok(())
+        }
+        fn register_linearizable(&self) -> bool {
+            false
+        }
+        fn requires_transactional_checker(&self) -> bool {
+            true
+        }
+        fn elle_history_edn(&self, _history: &crate::history::History) -> Result<String> {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("elle-checker/test/histories")
+                .join(self.0);
+            std::fs::read_to_string(&path)
+                .with_context(|| format!("read control history {}", path.display()))
+        }
+    }
+
+    /// Run the real elle-checker for `workload` and judge the run by its outcome.
+    fn judge_with_elle(workload: &dyn crate::workload::Workload) -> Judgement {
+        let dir = tempfile::tempdir().unwrap();
+        let history = crate::history::History { operations: vec![] };
+        let checker = Ok(ElleChecker::new(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("elle-checker"),
+        ));
+        let elle =
+            run_transactional_checker(checker, workload, &history, &dir.path().join("h.edn"));
+        judge_history(
+            workload,
+            &history,
+            crate::checker::profile::ConsistencyProfile::default(),
+            Some(elle),
+        )
+    }
+
+    /// JE-2: the orchestrator's verdict for a requiring workload is Elle's, both ways round.
+    #[test]
+    fn the_transactional_checker_decides_a_run_that_requires_it() {
+        let valid = judge_with_elle(&ExportsControlHistory("known-valid.edn"));
+        assert!(valid.setup_error.is_none(), "{:?}", valid.setup_error);
+        assert!(valid.passed, "Elle found the control history valid");
+        assert!(valid.assurance.is_confirmed());
+
+        let invalid = judge_with_elle(&ExportsControlHistory("known-invalid-realtime.edn"));
+        assert!(invalid.setup_error.is_none(), "{:?}", invalid.setup_error);
+        assert!(!invalid.passed, "Elle found the control history invalid");
+        let elle = invalid.elle.expect("the verdict is kept for the report");
+        assert_eq!(elle.anomaly_types, vec!["G0-realtime".to_string()]);
+    }
+
+    /// D2: a requiring workload with no Elle export is a setup failure naming why.
+    #[test]
+    fn a_required_checker_that_could_not_run_is_a_setup_failure() {
+        let judgement = judge_with_elle(&RequiresTransactionalChecker);
+        assert!(!judgement.passed);
+        let setup = judgement.setup_error.expect("a setup error");
+        assert!(setup.contains("no Elle history export"), "{setup}");
+    }
+
+    /// D2: a checker directory that does not parse is a setup failure, never a skipped check.
+    #[test]
+    fn an_unparseable_checker_directory_is_a_setup_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = crate::history::History { operations: vec![] };
+        let checker = ElleChecker::from_vars(|_| Some(String::new()));
+        let elle = run_transactional_checker(
+            checker,
+            &ExportsControlHistory("known-valid.edn"),
+            &history,
+            &dir.path().join("h.edn"),
+        );
+        let judgement = judge_history(
+            &ExportsControlHistory("known-valid.edn"),
+            &history,
+            crate::checker::profile::ConsistencyProfile::default(),
+            Some(elle),
+        );
+        assert!(!judgement.passed);
+        let setup = judgement.setup_error.expect("a setup error");
+        assert!(setup.contains(crate::checker::elle::DIR_VAR), "{setup}");
     }
 
     #[tokio::test]

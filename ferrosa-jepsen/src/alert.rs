@@ -132,6 +132,7 @@ mod tests {
             invariant_passed: false,
             invariant_error: Some("invariant violated".into()),
             setup_error: None,
+            elle: None,
             duration_secs: 1.0,
             op_count: 10,
             profile: Default::default(),
@@ -170,6 +171,7 @@ mod tests {
             setup_error: Some(
                 "executing query `CREATE KEYSPACE ...`: Failed to await schema agreement".into(),
             ),
+            elle: None,
             duration_secs: 0.0,
             op_count: 0,
             profile: Default::default(),

@@ -160,6 +160,7 @@ pub async fn run_endurance(config: &RunConfig, endurance: &EnduranceConfig) -> R
             invariant_passed: passed,
             invariant_error: None,
             setup_error: None,
+            elle: None,
             duration_secs: endurance.pattern_duration.as_secs_f64(),
             op_count: history.len(),
             profile: Default::default(),
