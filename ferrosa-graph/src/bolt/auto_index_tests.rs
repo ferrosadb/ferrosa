@@ -707,10 +707,7 @@ async fn bolt_index_setup_failure_happens_before_unwind_writes_and_can_retry() {
 
 #[tokio::test]
 async fn bolt_waiting_for_first_access_stays_inside_the_query_timeout() {
-    let f = Fixture::with_config(crate::executor::expand::GraphEngineConfig {
-        query_timeout: std::time::Duration::from_millis(50),
-        ..Default::default()
-    });
+    let mut f = Fixture::new();
     f.engine
         .execute(
             "CREATE (n:Blocked {age: 42}) RETURN 1 AS inserted",
@@ -719,7 +716,23 @@ async fn bolt_waiting_for_first_access_stays_inside_the_query_timeout() {
         )
         .await
         .unwrap();
+    // Data preparation is not the operation whose deadline is under test.
+    // Apply the unchanged 50ms limit to the fresh reader after seeding, then
+    // use Tokio's clock to exercise waiting on the setup gate deterministically.
+    f.engine = Arc::new(GraphEngine::new_with_coordinator(
+        Arc::clone(&f.schema),
+        Arc::clone(&f.storage),
+        Arc::clone(&f.path),
+        crate::executor::expand::GraphEngineConfig {
+            query_timeout: std::time::Duration::from_millis(50),
+            ..Default::default()
+        },
+        std::time::Duration::ZERO,
+        f.coordinator.clone(),
+    ));
+    tokio::time::pause();
     let _blocked = f.engine.hold_bolt_index_setup_for_test().await;
+    let started = tokio::time::Instant::now();
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(1),
         f.engine.execute_bolt_stream_with_params(
@@ -732,6 +745,7 @@ async fn bolt_waiting_for_first_access_stays_inside_the_query_timeout() {
     .await
     .expect("the query timeout must include waiting for the setup gate");
     assert!(result.is_err());
+    assert!(started.elapsed() >= std::time::Duration::from_millis(50));
 }
 
 #[tokio::test]
