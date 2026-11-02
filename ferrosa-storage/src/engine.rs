@@ -27373,29 +27373,46 @@ mod tests {
     }
 
     /// Drive `vec_idx`'s repair to completion: run it here, or wait for the
-    /// background run registration started. Bounded; fails loud if it never
-    /// finishes.
+    /// background run registration starts (`reload_indexes_from_system_schema`
+    /// → `add_vector_index_with_method` → `spawn_vector_repair_if_needed`),
+    /// whose `run/{index}` claim makes
+    /// [`StorageEngine::repair_vector_index`] return `Ok(None)` while it holds
+    /// the index.
+    ///
+    /// Bounded by progress, not by attempts: one generation's build is the
+    /// unit of work (minutes at production scale), so the wait ends when
+    /// `pending` drains and fails loud only when it stops shrinking. A count of
+    /// attempts cannot see that — 1,000 iterations of a 10 ms sleep is ten
+    /// seconds, less than one generation takes, so a background run doing
+    /// exactly the right thing was reported as one that "never finished".
     fn finish_vector_repair(engine: &StorageEngine) {
-        for _ in 0..1_000 {
-            if engine
-                .vector_generations_pending(&table_id(), "vec_idx")
-                .unwrap()
-                .is_empty()
-            {
-                return;
-            }
-            if engine
+        const NO_PROGRESS: std::time::Duration = std::time::Duration::from_secs(900);
+        let mut pending = engine
+            .vector_generations_pending(&table_id(), "vec_idx")
+            .unwrap();
+        let mut last_progress = std::time::Instant::now();
+        while !pending.is_empty() {
+            assert!(
+                last_progress.elapsed() < NO_PROGRESS,
+                "vector repair made no progress for {NO_PROGRESS:?}; pending: {pending:?}"
+            );
+            // `None` means another run holds the index: wait for it rather
+            // than counting that as "nothing happened".
+            let ran_here = engine
                 .repair_vector_index(&table_id(), "vec_idx")
                 .unwrap()
-                .is_none()
-            {
+                .is_some();
+            let now = engine
+                .vector_generations_pending(&table_id(), "vec_idx")
+                .unwrap();
+            if now.len() < pending.len() {
+                last_progress = std::time::Instant::now();
+            }
+            pending = now;
+            if !ran_here {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
-        panic!(
-            "vector repair never finished; pending: {:?}",
-            engine.vector_generations_pending(&table_id(), "vec_idx")
-        );
     }
 
     /// Flush `rows` as one SSTable each batch, then compact them into one.
