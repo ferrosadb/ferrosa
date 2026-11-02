@@ -1,132 +1,122 @@
 //! Text analyzers for full-text indexing.
 //!
 //! An analyzer converts raw text into a sequence of tokens suitable for
-//! indexing. The pipeline is: normalize → tokenize → filter (stop words, stem).
+//! indexing. The pipeline is: normalize → tokenize → filter (stop words).
 //!
 //! Provided analyzers:
-//! - [`StandardAnalyzer`]: lowercase, split on whitespace/punctuation, configurable stop words.
-//! - [`SimpleAnalyzer`]: lowercase + split on non-alpha characters, no stop words.
-//! - [`KeywordAnalyzer`]: treats entire field as one token (no tokenization).
+//! - [`Analyzer::Standard`]: lowercase, split on non-alphanumeric, configurable stop words.
+//! - [`Analyzer::Simple`]: lowercase + split on non-alpha characters, no stop words.
+//! - [`Analyzer::Keyword`]: treats entire field as one token (no tokenization).
 
 use std::collections::{HashMap, HashSet};
 
-// ── Analyzer trait ────────────────────────────────────────────────────────────
+// ── Analyzer ──────────────────────────────────────────────────────────────────
 
-/// Converts a text string into a sequence of normalized tokens.
-pub trait Analyzer: Send + Sync {
-    /// Analyze `text` and return the resulting tokens.
-    fn analyze(&self, text: &str) -> Vec<String>;
-
-    /// Analyze `text`, appending tokens to `out` instead of allocating a fresh
-    /// `Vec` per call.
-    ///
-    /// The index build analyzes one row at a time and only needs the tokens
-    /// long enough to fold them into a term-frequency map, so a caller that
-    /// loops over rows must not pay an allocation per row. `out` is cleared and
-    /// reused. Term strings are still owned (`Vec<String>`), so this removes the
-    /// container allocation, not the per-token one — a full borrowed-token API
-    /// would need `Cow<'_, str>` and is a larger change.
-    ///
-    /// Default: fall back to [`Analyzer::analyze`], so an implementation that
-    /// does not override this stays correct (it just keeps the old allocation).
-    fn analyze_into(&self, text: &str, out: &mut Vec<String>) {
-        out.extend(self.analyze(text));
-    }
-}
-
-// ── StandardAnalyzer ─────────────────────────────────────────────────────────
-
-/// Default English-language analyzer.
+/// The analyzer an index was built with.
 ///
-/// Pipeline: lowercase → split on non-alphanumeric → remove stop words.
-/// Stop words default to a small English set; override with `with_stop_words`.
-pub struct StandardAnalyzer {
-    stop_words: HashSet<String>,
+/// A closed set of variants rather than a trait object. Two reasons:
+///
+/// 1. The choice of analyzer is part of an index's identity. A query term
+///    normalized differently from the documents looks up a posting list that
+///    can never exist, so the build side and the query side must be handed the
+///    same analyzer *kind* — a comparison a value supports and a `dyn` does not.
+/// 2. Every implementation lives in this crate, so closing the set loses no
+///    supported configuration, and the pipeline becomes a branch on data the
+///    extraction tool can model instead of a vtable it cannot see.
+///
+/// [`Analyzer::Standard`] carries its stop-word set because stop words are the
+/// only configurable behaviour; the other variants are parameterless.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Analyzer {
+    /// Lowercase → split on non-alphanumeric → drop stop words.
+    Standard { stop_words: HashSet<String> },
+
+    /// Lowercase → split on non-alphabetic characters. No stop-word removal.
+    Simple,
+
+    /// The whole field value as a single lowercased token.
+    ///
+    /// Useful for exact-match fields such as email addresses or product codes.
+    Keyword,
 }
 
-impl StandardAnalyzer {
-    /// Create a new `StandardAnalyzer` with default English stop words.
-    pub fn new() -> Self {
-        let defaults = [
-            "a", "an", "and", "are", "as", "at", "be", "been", "but", "by", "for", "from", "has",
-            "he", "in", "is", "it", "its", "of", "on", "or", "that", "the", "their", "there",
-            "they", "this", "to", "was", "were", "will", "with",
-        ];
-        Self {
-            stop_words: defaults.iter().map(|s| (*s).to_string()).collect(),
+impl Analyzer {
+    /// The default English-language analyzer.
+    ///
+    /// Pipeline: lowercase → split on non-alphanumeric → remove stop words.
+    /// Stop words default to a small English set; override with
+    /// [`Analyzer::standard_with_stop_words`].
+    pub fn standard() -> Self {
+        Analyzer::Standard {
+            stop_words: DEFAULT_STOP_WORDS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
         }
     }
 
-    /// Create a `StandardAnalyzer` with a custom set of stop words.
-    pub fn with_stop_words(stop_words: impl IntoIterator<Item = String>) -> Self {
-        Self {
+    /// A [`Analyzer::Standard`] with a custom set of stop words.
+    pub fn standard_with_stop_words(stop_words: impl IntoIterator<Item = String>) -> Self {
+        Analyzer::Standard {
             stop_words: stop_words.into_iter().collect(),
         }
     }
-}
 
-impl Default for StandardAnalyzer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Analyzer for StandardAnalyzer {
-    fn analyze(&self, text: &str) -> Vec<String> {
-        text.to_lowercase()
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|t| !t.is_empty())
-            .filter(|t| !self.stop_words.contains(*t))
-            .map(|t| t.to_string())
-            .collect()
+    /// Analyze `text` and return the resulting tokens.
+    pub fn analyze(&self, text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        self.analyze_into(text, &mut out);
+        out
     }
 
-    /// Native buffer-reusing form: same tokens, same order, same filtering as
-    /// [`StandardAnalyzer::analyze`], but the caller's `Vec` is reused across
-    /// calls instead of a fresh one per row.
-    fn analyze_into(&self, text: &str, out: &mut Vec<String>) {
-        let lowered = text.to_lowercase();
-        for token in lowered.split(|c: char| !c.is_alphanumeric()) {
-            if token.is_empty() || self.stop_words.contains(token) {
-                continue;
+    /// Analyze `text`, appending tokens to `out`.
+    ///
+    /// **Appends**: the caller is responsible for clearing `out` when it wants
+    /// a fresh result. [`super::builder::FullTextIndexBuilder::add_document_with_tf`]
+    /// clears on entry and reuses the allocation across rows, so a scan over N
+    /// rows does not allocate N token vectors.
+    pub fn analyze_into(&self, text: &str, out: &mut Vec<String>) {
+        match self {
+            Analyzer::Standard { stop_words } => {
+                let lowered = text.to_lowercase();
+                for token in lowered.split(|c: char| !c.is_alphanumeric()) {
+                    if token.is_empty() || stop_words.contains(token) {
+                        continue;
+                    }
+                    out.push(token.to_string());
+                }
             }
-            out.push(token.to_string());
+            Analyzer::Simple => {
+                let lowered = text.to_lowercase();
+                for token in lowered.split(|c: char| !c.is_alphabetic()) {
+                    if token.is_empty() {
+                        continue;
+                    }
+                    out.push(token.to_string());
+                }
+            }
+            Analyzer::Keyword => {
+                let trimmed = text.trim().to_lowercase();
+                if !trimmed.is_empty() {
+                    out.push(trimmed);
+                }
+            }
         }
     }
 }
 
-// ── SimpleAnalyzer ────────────────────────────────────────────────────────────
-
-/// Lowercase + split on non-alphabetic characters. No stop-word removal.
-pub struct SimpleAnalyzer;
-
-impl Analyzer for SimpleAnalyzer {
-    fn analyze(&self, text: &str) -> Vec<String> {
-        text.to_lowercase()
-            .split(|c: char| !c.is_alphabetic())
-            .filter(|t| !t.is_empty())
-            .map(|t| t.to_string())
-            .collect()
+impl Default for Analyzer {
+    fn default() -> Self {
+        Analyzer::standard()
     }
 }
 
-// ── KeywordAnalyzer ───────────────────────────────────────────────────────────
-
-/// Treats the entire field value as a single token (lowercased).
-///
-/// Useful for exact-match fields such as email addresses or product codes.
-pub struct KeywordAnalyzer;
-
-impl Analyzer for KeywordAnalyzer {
-    fn analyze(&self, text: &str) -> Vec<String> {
-        let trimmed = text.trim().to_lowercase();
-        if trimmed.is_empty() {
-            vec![]
-        } else {
-            vec![trimmed]
-        }
-    }
-}
+/// Default English stop words for [`Analyzer::Standard`].
+const DEFAULT_STOP_WORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "been", "but", "by", "for", "from", "has", "he",
+    "in", "is", "it", "its", "of", "on", "or", "that", "the", "their", "there", "they", "this",
+    "to", "was", "were", "will", "with",
+];
 
 // ── Factory ───────────────────────────────────────────────────────────────────
 
@@ -138,9 +128,9 @@ impl Analyzer for KeywordAnalyzer {
 /// stay in lock-step. If they diverge, a query term the analyzer would drop or
 /// rewrite looks up a posting list that can never exist → a deterministic
 /// false-empty result. When a per-index analyzer option is eventually persisted
-/// and threaded, both sides must be handed the *same* analyzer instance kind.
-pub fn default_analyzer() -> Box<dyn Analyzer> {
-    Box::new(StandardAnalyzer::new())
+/// and threaded, both sides must be handed the *same* analyzer kind.
+pub fn default_analyzer() -> Analyzer {
+    Analyzer::standard()
 }
 
 /// Select an analyzer from a CQL index `WITH OPTIONS` map.
@@ -148,10 +138,10 @@ pub fn default_analyzer() -> Box<dyn Analyzer> {
 /// Recognized option keys:
 /// - `"analyzer"` → `"standard"` (default), `"simple"`, `"keyword"`
 /// - `"stop_words_list"` → comma-separated list of stop words (standard only)
-pub fn analyzer_from_options(options: &HashMap<String, String>) -> Box<dyn Analyzer> {
+pub fn analyzer_from_options(options: &HashMap<String, String>) -> Analyzer {
     match options.get("analyzer").map(|s| s.as_str()) {
-        Some("simple") => Box::new(SimpleAnalyzer),
-        Some("keyword") => Box::new(KeywordAnalyzer),
+        Some("simple") => Analyzer::Simple,
+        Some("keyword") => Analyzer::Keyword,
         _ => {
             // Standard (default) — optionally with custom stop words.
             if let Some(stops) = options.get("stop_words_list") {
@@ -160,9 +150,9 @@ pub fn analyzer_from_options(options: &HashMap<String, String>) -> Box<dyn Analy
                     .map(|s| s.trim().to_lowercase())
                     .filter(|s| !s.is_empty())
                     .collect();
-                Box::new(StandardAnalyzer::with_stop_words(custom))
+                Analyzer::standard_with_stop_words(custom)
             } else {
-                Box::new(StandardAnalyzer::new())
+                Analyzer::standard()
             }
         }
     }
@@ -174,9 +164,49 @@ pub fn analyzer_from_options(options: &HashMap<String, String>) -> Box<dyn Analy
 mod tests {
     use super::*;
 
+    /// The analyzer is a value from a closed set, not a trait object.
+    ///
+    /// This pins the shape the extraction needs: the build side and the query
+    /// side must be handed the same analyzer kind, and choosing it must not
+    /// require a heap allocation or a vtable.
+    #[test]
+    fn analyzer_is_a_value_from_a_closed_set() {
+        let keyword = Analyzer::Keyword;
+        assert_eq!(
+            keyword.analyze("  Hello World  "),
+            vec!["hello world".to_string()]
+        );
+
+        let simple = Analyzer::Simple;
+        assert_eq!(
+            simple.analyze("Hello World"),
+            vec!["hello".to_string(), "world".to_string()]
+        );
+
+        let standard = Analyzer::standard();
+        let tokens = standard.analyze("the quick fox");
+        assert!(!tokens.contains(&"the".to_string()), "stop word survives");
+        assert!(tokens.contains(&"quick".to_string()));
+    }
+
+    /// Appending is the contract: the caller clears, the analyzer adds.
+    #[test]
+    fn analyze_into_appends_without_clearing() {
+        let mut out = vec!["sentinel".to_string()];
+        Analyzer::Simple.analyze_into("Hello World", &mut out);
+        assert_eq!(
+            out,
+            vec![
+                "sentinel".to_string(),
+                "hello".to_string(),
+                "world".to_string()
+            ]
+        );
+    }
+
     #[test]
     fn standard_analyzer_lowercases_and_splits() {
-        let a = StandardAnalyzer::new();
+        let a = Analyzer::standard();
         let tokens = a.analyze("Hello World");
         assert!(tokens.contains(&"hello".to_string()));
         assert!(tokens.contains(&"world".to_string()));
@@ -184,7 +214,7 @@ mod tests {
 
     #[test]
     fn standard_analyzer_removes_stop_words() {
-        let a = StandardAnalyzer::new();
+        let a = Analyzer::standard();
         let tokens = a.analyze("the quick brown fox");
         assert!(
             !tokens.contains(&"the".to_string()),
@@ -227,29 +257,29 @@ mod tests {
         let options: HashMap<String, String> = [("analyzer".into(), "keyword".into())].into();
         let analyzer = analyzer_from_options(&options);
         let tokens = analyzer.analyze("Hello World");
-        // KeywordAnalyzer preserves the whole string as one token.
+        // KeywordAnalysis preserves the whole string as one token.
         assert_eq!(tokens, vec!["hello world".to_string()]);
     }
 
     #[test]
     fn simple_analyzer_no_stop_words() {
-        let a = SimpleAnalyzer;
+        let a = Analyzer::Simple;
         let tokens = a.analyze("The quick brown fox");
-        // "the" is not filtered by SimpleAnalyzer.
+        // "the" is not filtered by the simple analyzer.
         assert!(tokens.contains(&"the".to_string()));
         assert!(tokens.contains(&"quick".to_string()));
     }
 
     #[test]
     fn keyword_analyzer_single_token() {
-        let a = KeywordAnalyzer;
+        let a = Analyzer::Keyword;
         let tokens = a.analyze("  Hello World  ");
         assert_eq!(tokens, vec!["hello world".to_string()]);
     }
 
     #[test]
     fn keyword_analyzer_empty() {
-        let a = KeywordAnalyzer;
+        let a = Analyzer::Keyword;
         let tokens = a.analyze("   ");
         assert!(tokens.is_empty());
     }
