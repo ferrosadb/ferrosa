@@ -5458,6 +5458,22 @@ async fn route_select(
                 return encode_virtual_rows_streaming(ks, &s.table, vtable.as_ref(), None);
             }
 
+            // Drivers probe optional metadata tables to discover capabilities.
+            // An absent system table must report Invalid rather than suggesting
+            // that a restricted runtime role needs broader data permissions.
+            if ks == "system_schema"
+                && !state
+                    .schema
+                    .snapshot()
+                    .tables
+                    .contains_key(&(ks.to_string(), s.table.clone()))
+            {
+                return Err(CqlError::Invalid(format!(
+                    "table {ks}.{} not found",
+                    s.table
+                )));
+            }
+
             // User table: permission check + bridge + storage
             let raw = route_select_user_table(state, ctx, ks, &s).await?;
             Ok(raw.encode())
@@ -20090,6 +20106,64 @@ mod tests {
             }
             _ => panic!("expected Result"),
         }
+    }
+
+    /// A driver probes this optional Scylla table even against Cassandra-shaped
+    /// servers. Its metadata reader treats Invalid as table absence, while
+    /// Unauthorized keeps control-connection repair running. The same runtime
+    /// principal must still be able to read the supported metadata surface.
+    #[tokio::test]
+    async fn unsupported_system_metadata_is_invalid_for_runtime_role() {
+        let (state, _dir) = setup();
+        let auth = AuthContext {
+            role: "metadata_reader".into(),
+            is_superuser: false,
+            must_change_password: false,
+        };
+        let keyspace = None;
+        let ctx = test_ctx(&auth, &keyspace);
+
+        // Positive control through the identical principal and production route.
+        let supported =
+            crate::parser::parse("SELECT keyspace_name, replication FROM system_schema.keyspaces")
+                .unwrap();
+        assert!(matches!(
+            route(&state, &ctx, supported).await,
+            Ok(RouteResult::Result(_))
+        ));
+
+        let optional = crate::parser::parse(
+            "SELECT keyspace_name, table_name, partitioner FROM system_schema.scylla_tables",
+        )
+        .unwrap();
+        let error = match route(&state, &ctx, optional).await {
+            Err(error) => error,
+            Ok(_) => panic!("unsupported optional metadata must return an absence error"),
+        };
+        assert_eq!(
+            error.error_code(),
+            0x2200,
+            "missing optional metadata is Invalid, not a privilege failure: {error}"
+        );
+        assert!(matches!(error, CqlError::Invalid(ref message)
+            if message.contains("system_schema.scylla_tables")));
+
+        // Absence classification for metadata must not grant application reads.
+        let admin = dev_auth();
+        let admin_ctx = test_ctx(&admin, &keyspace);
+        for cql in [
+            "CREATE KEYSPACE restricted WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE restricted.private_rows (id int PRIMARY KEY)",
+        ] {
+            route(&state, &admin_ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+        let denied = crate::parser::parse("SELECT * FROM restricted.private_rows").unwrap();
+        assert!(matches!(
+            route(&state, &ctx, denied).await,
+            Err(CqlError::Unauthorized(_))
+        ));
     }
 
     #[tokio::test]

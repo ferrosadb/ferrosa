@@ -190,6 +190,10 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   projections expose exactly the requested metadata, and `count(*)` returns one
   `bigint` row instead of a zero-column frame that standard drivers cannot
   decode.
+  Probes for absent optional `system_schema` tables return native `Invalid`
+  (`0x2200`), allowing drivers to detect unsupported metadata without retrying
+  an authorization failure. Registered virtual tables and application-table
+  permissions retain their normal routing.
 - **Bridge** (`bridge.rs`) — parser `Term` → wire `CqlValue` → storage
   `CellValue`/`Row` conversions, server-side function eval (`now()`,
   `toTimestamp()`), and the **re-export** of the row codec from
