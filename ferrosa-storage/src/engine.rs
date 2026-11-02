@@ -11236,7 +11236,7 @@ impl StorageEngine {
         // normalize internally; this keeps the fast path in parity. A query
         // that analyzes away entirely matches nothing.
         let analyzer = default_analyzer();
-        let parsed = match analyze_query(&parsed, analyzer.as_ref()) {
+        let parsed = match analyze_query(&parsed, &analyzer) {
             Some(q) => q,
             None => return Ok(vec![]),
         };
@@ -11503,7 +11503,7 @@ impl StorageEngine {
         // Analyzer parity for the single-`Term` streaming fast path (see
         // `fulltext_search`). A query that analyzes away matches nothing.
         let analyzer = default_analyzer();
-        let parsed = match analyze_query(&parsed, analyzer.as_ref()) {
+        let parsed = match analyze_query(&parsed, &analyzer) {
             Some(q) => q,
             None => return Ok(()),
         };

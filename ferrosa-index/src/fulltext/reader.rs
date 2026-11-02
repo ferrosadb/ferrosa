@@ -30,7 +30,7 @@ pub struct FullTextIndexReader {
     /// format does not record the analyzer, so callers that build with a
     /// non-default analyzer must open with the matching `*_with_analyzer`
     /// constructor.
-    analyzer: Box<dyn Analyzer>,
+    analyzer: Analyzer,
 }
 
 impl FullTextIndexReader {
@@ -45,7 +45,7 @@ impl FullTextIndexReader {
     ///
     /// Use this when the index was built with a non-default analyzer, to keep
     /// query-term normalization in parity with document indexing.
-    pub fn open_with_analyzer(bytes: Vec<u8>, analyzer: Box<dyn Analyzer>) -> Result<Self, String> {
+    pub fn open_with_analyzer(bytes: Vec<u8>, analyzer: Analyzer) -> Result<Self, String> {
         let fti = deserialize_fti(&bytes)?;
         Ok(Self {
             index: fti,
@@ -65,7 +65,7 @@ impl FullTextIndexReader {
 
     /// Wrap an already-built in-memory [`FullTextIndex`] with an explicit
     /// query-side analyzer (parity with a non-default index analyzer).
-    pub fn from_index_with_analyzer(index: FullTextIndex, analyzer: Box<dyn Analyzer>) -> Self {
+    pub fn from_index_with_analyzer(index: FullTextIndex, analyzer: Analyzer) -> Self {
         Self { index, analyzer }
     }
 
@@ -98,7 +98,7 @@ impl FullTextIndexReader {
         // the index dropped/rewrote (e.g. a stop word) can't silently force a
         // false-empty result. A query that analyzes away entirely matches
         // nothing (without erroring).
-        let Some(normalized) = analyze_query(query, self.analyzer.as_ref()) else {
+        let Some(normalized) = analyze_query(query, &self.analyzer) else {
             return vec![];
         };
         let mut score_map: HashMap<&[u8], f64> = HashMap::new();
@@ -150,7 +150,7 @@ impl FullTextIndexReader {
         }
         // Analyzer parity (same as `search`): normalize before evaluating so a
         // stop-word/punctuation term can't force a false-empty result.
-        let Some(normalized) = analyze_query(query, self.analyzer.as_ref()) else {
+        let Some(normalized) = analyze_query(query, &self.analyzer) else {
             return vec![];
         };
         let mut topk = TopK::new(k);

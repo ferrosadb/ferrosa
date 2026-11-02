@@ -129,19 +129,24 @@ Memory model (t_ee98faa0 layer 2 — the replica-side `fts_match` OOM):
   scans in `ferrosa-storage`).
 
 **Analyzer parity (query side == index side).** Documents are indexed through
-the index's `analyzer`, which for the default `StandardAnalyzer` strips English
-stop words and splits on punctuation. The query side must apply the *same*
-analyzer to its terms, or a token the analyzer would drop/rewrite looks up a
-posting list that can never exist. `query::analyze_query(query, analyzer)`
-re-analyzes a parsed `FtsQuery` before evaluation: a term that analyzes to
-nothing (a stop word) is **dropped** from a conjunction rather than required, a
-term that splits on punctuation becomes a conjunction of its tokens, `Prefix` is
-left untouched, and a query that reduces to no searchable terms returns `None`
-(matches nothing, without erroring). `FullTextIndexReader` carries its analyzer
-(`open`/`from_index` default to the shared `analyzer::default_analyzer()`;
-`open_with_analyzer`/`from_index_with_analyzer` accept a non-default one) and
-normalizes inside `search`/`search_top_k`, so every caller — memtable, sidecar,
-and missing-sidecar scans — inherits parity. The single-`Term` streaming fast
+the index's `analyzer`, a closed set of variants (`Analyzer::Standard { stop_words }`,
+`Analyzer::Simple`, `Analyzer::Keyword`) rather than a trait object — the choice
+of analyzer is part of an index's identity, and every implementation lives in
+this crate, so closing the set costs no supported configuration while making the
+build side and the query side comparable as values. For the default
+`Analyzer::standard()` it strips English stop words and splits on punctuation.
+The query side must apply the *same* analyzer to its terms, or a token the
+analyzer would drop/rewrite looks up a posting list that can never exist.
+`query::analyze_query(query, analyzer)` re-analyzes a parsed `FtsQuery` before
+evaluation: a term that analyzes to nothing (a stop word) is **dropped** from a
+conjunction rather than required, a term that splits on punctuation becomes a
+conjunction of its tokens, `Prefix` is left untouched, and a query that reduces
+to no searchable terms returns `None` (matches nothing, without erroring).
+`FullTextIndexReader` carries its analyzer (`open`/`from_index` default to the
+shared `analyzer::default_analyzer()`; `open_with_analyzer`/
+`from_index_with_analyzer` accept a non-default one) and normalizes inside
+`search`/`search_top_k`, so every caller — memtable, sidecar, and
+missing-sidecar scans — inherits parity. The single-`Term` streaming fast
 path in `ferrosa-storage` normalizes the term with the same analyzer before the
 `stream` walk. Without this, `fts_match('reports were emitted')` returned zero
 rows even when documents contained "reports … emitted" (live repro:
