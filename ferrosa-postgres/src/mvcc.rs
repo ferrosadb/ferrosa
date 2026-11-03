@@ -1444,7 +1444,7 @@ pub(crate) enum MvccCommitError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     // Count only allocations made by the current test thread. Other tests and
     // background runtimes must not affect this allocation regression.
@@ -2480,8 +2480,14 @@ mod tests {
 
     #[test]
     fn expiring_an_old_snapshot_releases_history_and_rejects_commit() {
-        let config = MvccConfig::from_overrides(None, Some("5"), None).unwrap();
-        let manager = MvccManager::with_config(config);
+        // A 5 ms maximum age made the SETUP race the same wall clock the test
+        // then advances by hand. `commit` refuses a snapshot older than the
+        // configured age (README: "Maximum lifetime of an active snapshot/
+        // transaction; later use fails with 40001"), so on a loaded runner the
+        // first commit was refused as `SnapshotExpired` before the test reached
+        // the expiry it asserts. Keep the age far outside the work the test
+        // does, and advance the clock past it explicitly below.
+        let manager = MvccManager::with_max_age_for_test(Duration::from_secs(60));
         let setup = manager.snapshot();
         manager
             .commit(
@@ -2506,7 +2512,7 @@ mod tests {
         drop(writer);
         assert_eq!(manager.retained_version_count(), 2);
 
-        let expired = manager.expire_snapshots_before(Instant::now() + Duration::from_millis(6));
+        let expired = manager.expire_all_snapshots_for_test();
         assert_eq!(expired, 1);
         assert_eq!(manager.active_snapshot_count(), 0);
         assert_eq!(manager.retained_version_count(), 1);
