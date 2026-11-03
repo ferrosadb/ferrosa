@@ -1322,3 +1322,11 @@ Fallback verification reads exactly one clustering row at a time. Healthy
 positive certificates add no row-refetch RPCs; ambiguous candidates add canonical
 read/repair work proportional to candidate count.
 The existing point-read planner and wire shapes are unchanged.
+
+Pair-mode local writes and commit-log syncs run on TaskPool blocking workers.
+The admitted caller and local I/O job share the existing handoff read lease: the
+worker retains admission until I/O finishes when the caller is cancelled, and a
+live caller retains its share through peer ACK and the strict archive barrier.
+Inbound handlers retain their existing primary apply/replicate-back and secondary
+apply-only behavior; they acquire no nested handoff read lease. Cancellation
+produces no successful ACK and can leave an unacknowledged local write.

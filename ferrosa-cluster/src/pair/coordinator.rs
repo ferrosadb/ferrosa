@@ -26,6 +26,7 @@ use crate::pair::PairRole;
 ///
 /// Primary: writes locally, then replicates to secondary.
 /// Secondary client writes are rejected until authority is explicitly granted.
+#[derive(Clone)]
 pub struct PairCoordinator {
     role: Arc<ArcSwap<PairRole>>,
     peer_host_id: Uuid,
@@ -91,7 +92,7 @@ impl PairCoordinator {
         cl: ConsistencyLevel,
         rf: usize,
     ) -> Result<()> {
-        let _admitted_write = self.handoff_gate.read().await;
+        let _admitted_write = Arc::new(self.handoff_gate.clone().read_owned().await);
         // A secondary does not apply writes on its own authority, but it does not refuse them
         // either: it hands the write to the primary, which fences it through its own
         // `handoff_gate` and replicates it back. Answering `NotPrimary` here breaks every client
@@ -118,7 +119,8 @@ impl PairCoordinator {
                 alive: available,
             });
         }
-        self.apply_locally(mutation)?;
+        self.apply_locally_async(mutation.clone(), Some(Arc::clone(&_admitted_write)))
+            .await?;
         let replicated = if available > 1 {
             let result = self.replicate_to_peer(mutation).await;
             if required > 1 {
@@ -154,6 +156,25 @@ impl PairCoordinator {
         self.storage
             .force_commit_log_sync()
             .map_err(ClusterError::Storage)
+    }
+
+    /// The detached blocking job retains admission until real storage I/O
+    /// finishes, even if the waiting client drops its own share of the lease.
+    /// Peer handlers deliberately pass no new admission lease: adding a nested
+    /// read behind a queued handoff writer would deadlock a forwarded roundtrip.
+    pub(crate) async fn apply_locally_async(
+        &self,
+        mutation: Mutation,
+        admission: Option<Arc<tokio::sync::OwnedRwLockReadGuard<()>>>,
+    ) -> Result<()> {
+        let coordinator = self.clone();
+        ferrosa_net::task_pool::TaskPool::current("pair-storage")
+            .spawn_blocking(move || {
+                let _admission = admission;
+                coordinator.apply_locally(&mutation)
+            })
+            .await
+            .map_err(|error| ClusterError::Internal(format!("pair storage task failed: {error}")))?
     }
 
     /// Send a mutation to the peer and wait for ACK.
@@ -243,7 +264,7 @@ impl PairCoordinator {
         cl: ConsistencyLevel,
         rf: usize,
     ) -> Result<()> {
-        let _admitted_write = self.handoff_gate.read().await;
+        let _admitted_write = Arc::new(self.handoff_gate.clone().read_owned().await);
         // As for single writes: a secondary forwards the batch so the primary applies it atomically.
         if **self.role.load() != PairRole::Primary {
             return self.forward_batch_to_primary(&mutations, _batch_id).await;
@@ -267,12 +288,23 @@ impl PairCoordinator {
                 alive: available,
             });
         }
-        self.storage
-            .write_atomic_batch(mutations.as_slice())
-            .map_err(ClusterError::Storage)?;
-        self.storage
-            .force_commit_log_sync()
-            .map_err(ClusterError::Storage)?;
+        let storage = Arc::clone(&self.storage);
+        let admission = Arc::clone(&_admitted_write);
+        let mutations = ferrosa_net::task_pool::TaskPool::current("pair-storage")
+            .spawn_blocking(move || {
+                let _admission = admission;
+                storage
+                    .write_atomic_batch(mutations.as_slice())
+                    .map_err(ClusterError::Storage)?;
+                storage
+                    .force_commit_log_sync()
+                    .map_err(ClusterError::Storage)?;
+                Ok::<_, ClusterError>(mutations)
+            })
+            .await
+            .map_err(|error| {
+                ClusterError::Internal(format!("pair batch storage task failed: {error}"))
+            })??;
         let mut replicated = available > 1;
         if replicated {
             for mutation in &mutations {
@@ -590,6 +622,254 @@ mod tests {
         let coordinator = PairCoordinator::new(role, peer_id, storage, peer_manager);
 
         (coordinator, peer_id)
+    }
+
+    /// The holder owns the actual segment file mutex, not a delayed mock write.
+    fn hold_pair_flush(
+        storage: Arc<StorageEngine>,
+        progressed: std::sync::mpsc::Receiver<()>,
+    ) -> std::thread::JoinHandle<bool> {
+        let (locked, entered) = std::sync::mpsc::sync_channel(0);
+        let holder = std::thread::spawn(move || {
+            let mut observed = false;
+            storage.with_commit_log_flush_held_for_test(|| {
+                locked.send(()).expect("announce held file mutex");
+                // A deadlock escape for the historical synchronous path; no
+                // timing/latency threshold is measured by the assertion.
+                observed = progressed
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .is_ok();
+            });
+            observed
+        });
+        entered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("fixture must own the flush mutex before write admission");
+        holder
+    }
+
+    async fn pair_progress_with_held_flush(control: bool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (coordinator, _) = primary_coordinator_with_unreachable_peer(dir.path()).await;
+        let coordinator = Arc::new(coordinator);
+        let storage = Arc::clone(coordinator.local_storage());
+        let mutation = test_mutation();
+        let table = TableId::new(&mutation.keyspace, &mutation.table);
+        let key = mutation.key.clone();
+        let (progressed, progress) = std::sync::mpsc::sync_channel(1);
+        let holder = hold_pair_flush(Arc::clone(&storage), progress);
+        let probe_gate = Arc::clone(coordinator.handoff_gate());
+        let probe = tokio::spawn(async move {
+            // The actual admission lease proves the writer has entered. With
+            // Batch sync, append itself waits on this same real flush mutex,
+            // so the row becomes visible only after durability is released.
+            while probe_gate.try_write().is_ok() {
+                tokio::task::yield_now().await;
+            }
+            // Old code can only run this task after the escape releases the
+            // file mutex; a disconnected receiver there is expected evidence.
+            let _ = progressed.send(());
+        });
+        let result = if control {
+            // Existing TaskPool establishes a positive fixture/control path.
+            ferrosa_net::task_pool::TaskPool::current("pair-write-control")
+                .spawn_blocking(move || {
+                    let _admitted = coordinator.handoff_gate().blocking_read();
+                    coordinator.apply_locally(&mutation)
+                })
+                .await
+                .expect("control storage job")
+        } else {
+            coordinator
+                .coordinate_write_with(&mutation, ConsistencyLevel::One, 1)
+                .await
+        };
+        probe.abort();
+        let _ = probe.await;
+        let progressed_before_release = holder.join().expect("file mutex holder");
+        result.expect("real local write must complete successfully");
+        assert!(storage
+            .read(&table, &key)
+            .expect("read applied mutation")
+            .is_some());
+        assert!(
+            progressed_before_release,
+            "async pair write blocked its sole runtime worker while the real commit-log flush mutex was held"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn held_pair_fsync_allows_runtime_progress() {
+        pair_progress_with_held_flush(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn held_pair_fsync_control_allows_runtime_progress() {
+        pair_progress_with_held_flush(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_pair_write_cancellation_retains_admission_until_fsync() {
+        let dir = tempfile::tempdir().unwrap();
+        let (coordinator, _) = primary_coordinator_with_unreachable_peer(dir.path()).await;
+        let (release, release_rx) = std::sync::mpsc::sync_channel(1);
+        let holder = hold_pair_flush(coordinator.storage.clone(), release_rx);
+        let mutation = test_mutation();
+        // This fresh fixture has no other gate users. This temporary lease is
+        // dropped at the semicolon before the first poll of the request.
+        assert!(coordinator.handoff_gate().try_write().is_ok());
+        let mut request =
+            Box::pin(coordinator.coordinate_write_with(&mutation, ConsistencyLevel::One, 1));
+        let first_poll = std::future::poll_fn(|context| {
+            std::task::Poll::Ready(std::future::Future::poll(request.as_mut(), context))
+        })
+        .await;
+        let submitted = first_poll.is_pending();
+        let admitted = coordinator.handoff_gate().try_write().is_err();
+        drop(request); // Drops waiting JoinHandle, not the admitted blocking job.
+        let retained_after_cancel = coordinator.handoff_gate().try_write().is_err();
+        // Release and join before any assertion may unwind, to preserve cleanup
+        // even under a negative control. The existing 5s holder escape is unchanged.
+        let _ = release.send(());
+        let explicitly_released = holder.join().unwrap();
+        let drained = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            coordinator.handoff_gate().write(),
+        )
+        .await
+        .expect("submitted storage job must drain after fsync release");
+        drop(drained);
+        assert!(
+            submitted && admitted && explicitly_released,
+            "one Pending request poll must submit an admitted job while real fsync is held"
+        );
+        assert!(
+            retained_after_cancel,
+            "dropping the waiting request released admission before its blocking I/O completed"
+        );
+        assert!(
+            coordinator
+                .storage
+                .read(
+                    &TableId::new(&mutation.keyspace, &mutation.table),
+                    &mutation.key,
+                )
+                .unwrap()
+                .is_some(),
+            "detached admitted job must finish the actual local write"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_pair_write_forward_roundtrip_progresses_with_handoff_queued() {
+        use ferrosa_net::codec::MsgType;
+        use ferrosa_net::pool::PriorityPool;
+        use ferrosa_net::rpc::{server::RpcServer, HandlerRegistry};
+        use std::future::Future;
+        let primary_dir = tempfile::tempdir().unwrap();
+        let secondary_dir = tempfile::tempdir().unwrap();
+        let (primary, _) = primary_coordinator_with_unreachable_peer(primary_dir.path()).await;
+        let (secondary, _) = primary_coordinator_with_unreachable_peer(secondary_dir.path()).await;
+        secondary.role.store(Arc::new(PairRole::Secondary));
+        let primary = Arc::new(primary);
+        let secondary = Arc::new(secondary);
+        let config = Arc::new(NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        });
+        let primary_registry = HandlerRegistry::new();
+        primary_registry.register(
+            MsgType::PairWriteForward,
+            Arc::new(crate::pair::handler::PairWriteForwardHandler::new(
+                primary.role.clone(),
+                primary.clone(),
+            )),
+        );
+        let secondary_registry = HandlerRegistry::new();
+        secondary_registry.register(
+            MsgType::PairWriteForward,
+            Arc::new(crate::pair::handler::PairWriteForwardHandler::new(
+                secondary.role.clone(),
+                secondary.clone(),
+            )),
+        );
+        let primary_server = Arc::new(RpcServer::new(
+            (*config).clone(),
+            secondary.peer_host_id,
+            Arc::new(primary_registry),
+        ));
+        let secondary_server = Arc::new(RpcServer::new(
+            (*config).clone(),
+            primary.peer_host_id,
+            Arc::new(secondary_registry),
+        ));
+        let primary_addr = primary_server.start_and_get_addr().await.unwrap();
+        let secondary_addr = secondary_server.start_and_get_addr().await.unwrap();
+        let to_primary = PriorityPool::connect(
+            config.clone(),
+            Uuid::new_v4(),
+            &primary_addr.to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let to_secondary = PriorityPool::connect(
+            config,
+            Uuid::new_v4(),
+            &secondary_addr.to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        secondary
+            .peer_manager
+            .add_peer((secondary.peer_host_id, primary_addr), to_primary)
+            .await;
+        primary
+            .peer_manager
+            .add_peer((primary.peer_host_id, secondary_addr), to_secondary)
+            .await;
+        let (release, release_rx) = std::sync::mpsc::sync_channel(1);
+        let holder = hold_pair_flush(primary.storage.clone(), release_rx);
+        let client = secondary.clone();
+        let write = tokio::spawn(async move { client.coordinate_write(&test_mutation()).await });
+        while secondary.handoff_gate().try_write().is_ok() {
+            tokio::task::yield_now().await;
+        }
+        // Polling once enqueues the actual fair writer while preserving the
+        // secondary's admitted forwarding read until the complete roundtrip.
+        let gate = secondary.handoff_gate().clone();
+        let mut handoff = Box::pin(gate.write_owned());
+        std::future::poll_fn(|cx| {
+            assert!(handoff.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        release.send(()).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), write)
+            .await
+            .expect("forward/replication/ACK roundtrip deadlocked behind queued handoff")
+            .unwrap();
+        assert!(
+            holder.join().unwrap(),
+            "fixture release must precede its deadlock escape"
+        );
+        result.expect("forwarded write must retain both-copy ACK semantics");
+        let handoff = tokio::time::timeout(std::time::Duration::from_secs(5), handoff)
+            .await
+            .expect("handoff must acquire after admitted write ACK");
+        drop(handoff);
+        let mutation = test_mutation();
+        let table = TableId::new(&mutation.keyspace, &mutation.table);
+        for coordinator in [&primary, &secondary] {
+            assert!(coordinator
+                .storage
+                .read(&table, &mutation.key)
+                .unwrap()
+                .is_some());
+        }
     }
 
     #[derive(Debug)]

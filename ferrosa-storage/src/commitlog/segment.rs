@@ -757,6 +757,13 @@ impl Segment {
         buf[offset + 4..offset + 8].copy_from_slice(&crc.to_be_bytes());
     }
 
+    /// Hold the real flush/file mutex while a deterministic cross-crate test runs.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn with_flush_held_for_test(&self, hold: impl FnOnce()) {
+        let _file = self.file_handle.lock();
+        hold();
+    }
+
     /// Flushes the written portion of the buffer to disk and fsyncs.
     ///
     /// Uses incremental flush: only writes bytes since the last flush.

@@ -1825,3 +1825,7 @@ internode wire contract was expanded.
 Resumable range-scan supervisors await scheduler admission directly through
 `execute_scan`/`resume_scan`; carrier work remains on the bounded blocking pool.
 Producer panics are delivered as stream errors.
+
+The `test-support` feature exposes a callback that holds the active commit-log
+segment's existing file mutex. Sibling-crate progress tests use it to exercise
+real flush/fsync contention with deterministic release and ordinary storage I/O.
