@@ -225,7 +225,10 @@ jobs:
       # libgmp is what zarith links against. Without it aeneas' bootstrap builds gmp from
       # source, which works but costs minutes for a package apt already has.
       - name: System packages the toolchain links against
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libgmp-dev m4
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libgmp-dev m4 python3-yaml
+
+      - name: Ratchet and bootstrap contracts
+        run: /usr/bin/python3 -m unittest -q tests.ci.test_lean_gap_ratchet tests.ci.test_lean_gap_ratchet_workflow
 
       - name: Install elan
         run: |
@@ -245,6 +248,10 @@ jobs:
           test "$(git -C aeneas rev-parse HEAD)" = "$AENEAS_COMMIT"
           echo "aeneas at $(git -C aeneas rev-parse HEAD)"
           grep -v '^#' aeneas/charon-pin | tail -1
+          git clone --filter=blob:none --no-checkout "$CHARON_REPO" aeneas/charon
+          git -C aeneas/charon checkout "$CHARON_COMMIT"
+          test "$(git -C aeneas/charon rev-parse HEAD)" = "$CHARON_COMMIT"
+          git -C aeneas/charon submodule update --init --recursive
 
       - name: Cache the OCaml switch and the charon build
         uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.2
@@ -256,6 +263,11 @@ jobs:
 
       - name: Build the pinned toolchain
         run: |
+          # Charon's minimal toolchain manifest omits rustfmt, but its make
+          # entry point runs cargo fmt before compiling. Install that component
+          # for the manifest's own channel, without changing either source pin.
+          toolchain=$(python3 -c 'import tomllib; from pathlib import Path; print(tomllib.loads(Path("aeneas/charon/charon/rust-toolchain").read_text())["toolchain"]["channel"])')
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt
           ./aeneas/bootstrap.sh
           test -x "$AENEAS"
           test -x "$CHARON"

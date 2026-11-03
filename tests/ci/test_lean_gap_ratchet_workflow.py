@@ -8,6 +8,9 @@ catch), the measurement stays off the every-push path, and the gate runs `check`
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import tempfile
 import re
 import unittest
 from pathlib import Path
@@ -65,6 +68,33 @@ class RatchetWorkflowTest(unittest.TestCase):
         self.assertIn("./aeneas/bootstrap.sh", runs)
         self.assertIn("lake build", runs)
         self.assertIn("python3 scripts/lean_gap_inventory.py --only", runs)
+
+    def test_bootstrap_installs_the_pinned_charon_formatter_first(self):
+        step = next(s for s in self.job["steps"] if s.get("name") == "Build the pinned toolchain")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            charon = root / "aeneas/charon/charon"
+            charon.mkdir(parents=True)
+            (charon / "rust-toolchain").write_text('[toolchain]\nchannel = "nightly-2026-09-17"\n')
+            tools = root / "tools"
+            tools.mkdir()
+            rustup = tools / "rustup"
+            rustup.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$FORMATTER_RECEIPT"\n')
+            rustup.chmod(0o755)
+            bootstrap = root / "aeneas/bootstrap.sh"
+            bootstrap.write_text('#!/bin/sh\nset -eu\ntest -s "$FORMATTER_RECEIPT"\ntouch "$AENEAS" "$CHARON"\nchmod +x "$AENEAS" "$CHARON"\n')
+            bootstrap.chmod(0o755)
+            receipt = root / "formatter-receipt"
+            env = {**os.environ, "PATH": str(tools) + os.pathsep + os.environ["PATH"],
+                   "AENEAS": str(root / "built-aeneas"), "CHARON": str(root / "built-charon"),
+                   "FORMATTER_RECEIPT": str(receipt)}
+            result = subprocess.run(["bash", "-euo", "pipefail", "-c", step["run"]],
+                                    cwd=root, env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            args = receipt.read_text().splitlines()
+            self.assertEqual(args[:3], ["toolchain", "install", "nightly-2026-09-17"])
+            self.assertIn("--component", args)
+            self.assertIn("rustfmt", args)
 
     def test_update_only_runs_on_a_dispatch_that_asked_for_it(self):
         for step in self.job["steps"]:
