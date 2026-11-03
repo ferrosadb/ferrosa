@@ -228,7 +228,7 @@ def scanFile (env : Environment) (idx : Std.HashMap String (Array Name)) (key sr
               line := i + 1, kind := kw, short, full, doc := pending.getD "", tex, desc
             })
           else
-            IO.eprintln s!"docs: skipping {kw} {full} — no such constant"
+            IO.eprintln s!"export: skipping {kw} {full} — no such constant"
           pending := none
           i := i + 1
   return { key, path, header, evs, namespaces := nss }
@@ -310,10 +310,10 @@ def check (mods : Array ModuleView) : IO UInt32 := do
   for b in bad do
     IO.eprintln b
   if bad.isEmpty then
-    IO.println s!"docs --check: {mods.size} modules clean"
+    IO.println s!"export --check: {mods.size} modules clean"
     pure 0
   else
-    IO.eprintln s!"docs --check: {bad.size} problem(s)"
+    IO.eprintln s!"export --check: {bad.size} problem(s)"
     pure 1
 
 def run (args : List String) : IO UInt32 := do
@@ -397,12 +397,12 @@ def run (args : List String) : IO UInt32 := do
 
   IO.FS.createDirAll "build"
   IO.FS.writeFile out (root.pretty 80 ++ "\n")
-  IO.println s!"docs: {mods.size} modules, {items} claims, {reds} red, {decls.size} declarations → {out}"
+  IO.println s!"export: {mods.size} modules, {items} claims, {reds} red, {decls.size} declarations → {out}"
   if !unresolved.isEmpty then
-    IO.println s!"docs: {unresolved.size} ledger claims name no declaration:"
+    IO.println s!"export: {unresolved.size} ledger claims name no declaration:"
     for u in unresolved do IO.println s!"  ! {u}"
   if !unplaced.isEmpty then
-    IO.println s!"docs: {unplaced.length} ledgers unplaced in Book.parts:"
+    IO.println s!"export: {unplaced.length} ledgers unplaced in Ferrosa.Outline.parts:"
     for a in unplaced do IO.println s!"  ! {a.key}"
   if !unresolved.isEmpty || !unplaced.isEmpty then return 1
   if checking then return (← check mods)
