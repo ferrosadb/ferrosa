@@ -18,7 +18,513 @@ set_option maxHeartbeats 1000000
 /- You can set the `maxRecDepth` value with the `-max-recdepth` CLI option -/
 set_option maxRecDepth 2048
 
+/- You can remove the following line by using the CLI option `-all-computable`: -/
+noncomputable section
+
 namespace ferrosa_storage
+def core.num.nonzero.ZeroablePrimitive (Self : Type _) (T1 : Type _) : Type := sorry
+def core.cmp.clamp.ClampBounds (Self : Type _) (T1 : Type _) : Type := sorry
+def core.error.Erased (Self : Type _) : Type := sorry
+def alloc.string.ToString (Self : Type _) : Type := sorry
+
+/-- Trait declaration: [core::borrow::Borrow]
+    Source: '/rustc/library/core/src/borrow.rs', lines 158:0-158:40
+    Name pattern: [core::borrow::Borrow]
+    Visibility: public -/
+@[rust_trait "core::borrow::Borrow"]
+structure core.borrow.Borrow (Self : Type) (Borrowed : Type) where
+  borrow : Self → Result Borrowed
+
+/-- [core::convert::{impl core::convert::AsRef<U> for &'_0 T}::as_ref]:
+    Source: '/rustc/library/core/src/convert/mod.rs', lines 719:4-719:26
+    Name pattern: [core::convert::{core::convert::AsRef<&'0 @T, @U>}::as_ref]
+    Visibility: public -/
+@[rust_fun "core::convert::{core::convert::AsRef<&'0 @T, @U>}::as_ref"]
+def Shared0T.Insts.CoreConvertAsRef.as_ref
+  {T : Type _} {U : Type _} (AsRefInst : core.convert.AsRef T U) :
+  T → Result U
+  := sorry
+
+/-- Trait implementation: [core::convert::{impl core::convert::AsRef<U> for &'_0 T}]
+    Source: '/rustc/library/core/src/convert/mod.rs', lines 714:0-716:24
+    Name pattern: [core::convert::AsRef<&'0 @T, @U>] -/
+@[reducible, rust_trait_impl "core::convert::AsRef<&'0 @T, @U>"]
+def Shared0T.Insts.CoreConvertAsRef {T : Type _} {U : Type _} (AsRefInst :
+  core.convert.AsRef T U) : core.convert.AsRef T U := {
+  as_ref := Shared0T.Insts.CoreConvertAsRef.as_ref AsRefInst
+}
+
+/-- [core::fmt::{impl core::fmt::Display for str}::fmt]:
+    Source: '/rustc/library/core/src/fmt/mod.rs', lines 2965:4-2965:50
+    Name pattern: [core::fmt::{core::fmt::Display<str>}::fmt]
+    Visibility: public -/
+@[rust_fun "core::fmt::{core::fmt::Display<str>}::fmt"]
+def Str.Insts.CoreFmtDisplay.fmt
+  :
+  Str → core.fmt.Formatter → Result ((core.result.Result Unit
+    core.fmt.Error) × core.fmt.Formatter)
+  := sorry
+
+/-- Trait implementation: [core::fmt::{impl core::fmt::Display for str}]
+    Source: '/rustc/library/core/src/fmt/mod.rs', lines 2964:0-2964:20
+    Name pattern: [core::fmt::Display<str>] -/
+@[reducible, rust_trait_impl "core::fmt::Display<str>"]
+def Str.Insts.CoreFmtDisplay : core.fmt.Display Str := {
+  fmt := Str.Insts.CoreFmtDisplay.fmt
+}
+
+/-- [core::hint::must_use]:
+    Source: '/rustc/library/core/src/hint.rs', lines 613:0-613:39
+    Name pattern: [core::hint::must_use]
+    Visibility: public -/
+@[rust_fun "core::hint::must_use"]
+def core.hint.must_use {T : Type _} : T → Result T := sorry
+
+/-- [core::io::error::Error]
+    Source: '/rustc/library/core/src/io/error.rs', lines 87:0-87:16
+    Name pattern: [core::io::error::Error]
+    Visibility: public -/
+@[rust_type "core::io::error::Error"]
+def core.io.error.Error : Type := sorry
+
+/-- [core::option::{core::option::Option<T>}::unwrap_or_else]:
+    Source: '/rustc/library/core/src/option.rs', lines 1061:4-1063:52
+    Name pattern: [core::option::{core::option::Option<@T>}::unwrap_or_else]
+    Visibility: public -/
+@[rust_fun "core::option::{core::option::Option<@T>}::unwrap_or_else"]
+def core.option.Option.unwrap_or_else
+  {T : Type _} {F : Type _} (opsfunctionFnOnceFTupleTInst :
+  core.ops.function.FnOnce F Unit T) :
+  Option T → F → Result T
+  := sorry
+
+/-- [core::result::{core::result::Result<T, E>}::ok]:
+    Source: '/rustc/library/core/src/result.rs', lines 709:4-712:28
+    Name pattern: [core::result::{core::result::Result<@T, @E>}::ok]
+    Visibility: public -/
+@[rust_fun "core::result::{core::result::Result<@T, @E>}::ok"]
+def core.result.Result.ok
+  {T : Type _} {E : Type _} :
+  core.result.Result T E → Result (Option T)
+  := sorry
+
+/-- [std::ffi::os_str::OsStr]
+    Source: '/rustc/library/std/src/ffi/os_str.rs', lines 115:0-115:16
+    Name pattern: [std::ffi::os_str::OsStr]
+    Visibility: public -/
+@[rust_type "std::ffi::os_str::OsStr"]
+def std.ffi.os_str.OsStr : Type := sorry
+
+/-- [alloc::borrow::Cow]
+    Source: '/rustc/library/alloc/src/borrow.rs', lines 169:0-169:32
+    Name pattern: [alloc::borrow::Cow]
+    Visibility: public -/
+@[discriminant isize, rust_type "alloc::borrow::Cow"]
+inductive alloc.borrow.Cow (B : Type _) (Clause0_Owned : Type _) where
+| Borrowed : B → alloc.borrow.Cow B Clause0_Owned
+| Owned : Clause0_Owned → alloc.borrow.Cow B Clause0_Owned
+
+/-- [std::ffi::os_str::{std::ffi::os_str::OsStr}::to_string_lossy]:
+    Source: '/rustc/library/std/src/ffi/os_str.rs', lines 964:4-964:49
+    Name pattern: [std::ffi::os_str::{std::ffi::os_str::OsStr}::to_string_lossy]
+    Visibility: public -/
+@[rust_fun "std::ffi::os_str::{std::ffi::os_str::OsStr}::to_string_lossy"]
+def std.ffi.os_str.OsStr.to_string_lossy
+  : std.ffi.os_str.OsStr → Result (alloc.borrow.Cow Str String) := sorry
+
+/-- [std::ffi::os_str::{impl core::convert::AsRef<std::ffi::os_str::OsStr> for alloc::string::String}::as_ref]:
+    Source: '/rustc/library/std/src/ffi/os_str.rs', lines 1779:4-1779:30
+    Name pattern: [std::ffi::os_str::{core::convert::AsRef<alloc::string::String, std::ffi::os_str::OsStr>}::as_ref]
+    Visibility: public -/
+@[rust_fun
+  "std::ffi::os_str::{core::convert::AsRef<alloc::string::String, std::ffi::os_str::OsStr>}::as_ref"]
+def alloc.string.String.Insts.CoreConvertAsRefOsStr.as_ref
+  : String → Result std.ffi.os_str.OsStr := sorry
+
+/-- Trait implementation: [std::ffi::os_str::{impl core::convert::AsRef<std::ffi::os_str::OsStr> for alloc::string::String}]
+    Source: '/rustc/library/std/src/ffi/os_str.rs', lines 1777:0-1777:28
+    Name pattern: [core::convert::AsRef<alloc::string::String, std::ffi::os_str::OsStr>] -/
+@[reducible, rust_trait_impl
+  "core::convert::AsRef<alloc::string::String, std::ffi::os_str::OsStr>"]
+def alloc.string.String.Insts.CoreConvertAsRefOsStr : core.convert.AsRef String
+  std.ffi.os_str.OsStr := {
+  as_ref := alloc.string.String.Insts.CoreConvertAsRefOsStr.as_ref
+}
+
+/-- [std::fs::File]
+    Source: '/rustc/library/std/src/fs.rs', lines 135:0-135:15
+    Name pattern: [std::fs::File]
+    Visibility: public -/
+@[rust_type "std::fs::File"]
+def std.fs.File : Type := sorry
+
+/-- [std::fs::OpenOptions]
+    Source: '/rustc/library/std/src/fs.rs', lines 279:0-279:22
+    Name pattern: [std::fs::OpenOptions]
+    Visibility: public -/
+@[rust_type "std::fs::OpenOptions"]
+def std.fs.OpenOptions : Type := sorry
+
+/-- [std::fs::{std::fs::File}::set_len]:
+    Source: '/rustc/library/std/src/fs.rs', lines 1124:4-1124:54
+    Name pattern: [std::fs::{std::fs::File}::set_len]
+    Visibility: public -/
+@[rust_fun "std::fs::{std::fs::File}::set_len"]
+def std.fs.File.set_len
+  :
+  std.fs.File → Std.U64 → Result (core.result.Result Unit
+    core.io.error.Error)
+  := sorry
+
+/-- [std::fs::{std::fs::OpenOptions}::new]:
+    Source: '/rustc/library/std/src/fs.rs', lines 1914:4-1914:24
+    Name pattern: [std::fs::{std::fs::OpenOptions}::new]
+    Visibility: public -/
+@[rust_fun "std::fs::{std::fs::OpenOptions}::new"]
+def std.fs.OpenOptions.new : Result std.fs.OpenOptions := sorry
+
+/-- [std::fs::{std::fs::OpenOptions}::read]:
+    Source: '/rustc/library/std/src/fs.rs', lines 1931:4-1931:51
+    Name pattern: [std::fs::{std::fs::OpenOptions}::read]
+    Visibility: public -/
+@[rust_fun "std::fs::{std::fs::OpenOptions}::read"]
+def std.fs.OpenOptions.read
+  :
+  std.fs.OpenOptions → Bool → Result (std.fs.OpenOptions ×
+    (std.fs.OpenOptions → std.fs.OpenOptions))
+  := sorry
+
+/-- [std::fs::{std::fs::OpenOptions}::write]:
+    Source: '/rustc/library/std/src/fs.rs', lines 1952:4-1952:53
+    Name pattern: [std::fs::{std::fs::OpenOptions}::write]
+    Visibility: public -/
+@[rust_fun "std::fs::{std::fs::OpenOptions}::write"]
+def std.fs.OpenOptions.write
+  :
+  std.fs.OpenOptions → Bool → Result (std.fs.OpenOptions ×
+    (std.fs.OpenOptions → std.fs.OpenOptions))
+  := sorry
+
+/-- [std::fs::{std::fs::OpenOptions}::truncate]:
+    Source: '/rustc/library/std/src/fs.rs', lines 2025:4-2025:59
+    Name pattern: [std::fs::{std::fs::OpenOptions}::truncate]
+    Visibility: public -/
+@[rust_fun "std::fs::{std::fs::OpenOptions}::truncate"]
+def std.fs.OpenOptions.truncate
+  :
+  std.fs.OpenOptions → Bool → Result (std.fs.OpenOptions ×
+    (std.fs.OpenOptions → std.fs.OpenOptions))
+  := sorry
+
+/-- [std::fs::{std::fs::OpenOptions}::create]:
+    Source: '/rustc/library/std/src/fs.rs', lines 2050:4-2050:55
+    Name pattern: [std::fs::{std::fs::OpenOptions}::create]
+    Visibility: public -/
+@[rust_fun "std::fs::{std::fs::OpenOptions}::create"]
+def std.fs.OpenOptions.create
+  :
+  std.fs.OpenOptions → Bool → Result (std.fs.OpenOptions ×
+    (std.fs.OpenOptions → std.fs.OpenOptions))
+  := sorry
+
+/-- [std::path::Path]
+    Source: '/rustc/library/std/src/path.rs', lines 2356:0-2356:15
+    Name pattern: [std::path::Path]
+    Visibility: public -/
+@[rust_type "std::path::Path"]
+def std.path.Path : Type := sorry
+
+/-- [std::fs::{std::fs::OpenOptions}::open]:
+    Source: '/rustc/library/std/src/fs.rs', lines 2137:4-2137:67
+    Name pattern: [std::fs::{std::fs::OpenOptions}::open]
+    Visibility: public -/
+@[rust_fun "std::fs::{std::fs::OpenOptions}::open"]
+def std.fs.OpenOptions.open
+  {P : Type _} (coreconvertAsRefPPathInst : core.convert.AsRef P std.path.Path)
+  :
+  std.fs.OpenOptions → P → Result (core.result.Result std.fs.File
+    core.io.error.Error)
+  := sorry
+
+/-- [std::fs::remove_file]:
+    Source: '/rustc/library/std/src/fs.rs', lines 2923:0-2923:61
+    Name pattern: [std::fs::remove_file]
+    Visibility: public -/
+@[rust_fun "std::fs::remove_file"]
+def std.fs.remove_file
+  {P : Type _} (coreconvertAsRefPPathInst : core.convert.AsRef P std.path.Path)
+  :
+  P → Result (core.result.Result Unit core.io.error.Error)
+  := sorry
+
+/-- Trait declaration: [std::os::unix::fs::FileExt]
+    Source: '/rustc/library/std/src/os/unix/fs.rs', lines 27:0-27:17
+    Name pattern: [std::os::unix::fs::FileExt]
+    Visibility: public -/
+@[rust_trait "std::os::unix::fs::FileExt"]
+structure std.os.unix.fs.FileExt (Self : Type) where
+  read_at : Self → Slice Std.U8 → Std.U64 → Result ((core.result.Result
+    Std.Usize core.io.error.Error) × (Slice Std.U8))
+  read_exact_at : Self → Slice Std.U8 → Std.U64 → Result
+    ((core.result.Result Unit core.io.error.Error) × (Slice Std.U8))
+  write_at : Self → Slice Std.U8 → Std.U64 → Result (core.result.Result
+    Std.Usize core.io.error.Error)
+  write_all_at : Self → Slice Std.U8 → Std.U64 → Result
+    (core.result.Result Unit core.io.error.Error)
+
+/-- [std::os::unix::fs::FileExt::read_exact_at]:
+    Source: '/rustc/library/std/src/os/unix/fs.rs', lines 120:4-120:82
+    Name pattern: [std::os::unix::fs::FileExt::read_exact_at]
+    Visibility: public -/
+@[trait_default, rust_fun "std::os::unix::fs::FileExt::read_exact_at"]
+def std.os.unix.fs.FileExt.read_exact_at.default
+  {Self : Type _} (FileExtInst : std.os.unix.fs.FileExt Self) :
+  Self → Slice Std.U8 → Std.U64 → Result ((core.result.Result Unit
+    core.io.error.Error) × (Slice Std.U8))
+  := sorry
+
+/-- [std::os::unix::fs::FileExt::write_all_at]:
+    Source: '/rustc/library/std/src/os/unix/fs.rs', lines 342:4-342:77
+    Name pattern: [std::os::unix::fs::FileExt::write_all_at]
+    Visibility: public -/
+@[trait_default, rust_fun "std::os::unix::fs::FileExt::write_all_at"]
+def std.os.unix.fs.FileExt.write_all_at.default
+  {Self : Type _} (FileExtInst : std.os.unix.fs.FileExt Self) :
+  Self → Slice Std.U8 → Std.U64 → Result (core.result.Result Unit
+    core.io.error.Error)
+  := sorry
+
+/-- [std::os::unix::fs::{impl std::os::unix::fs::FileExt for std::fs::File}::write_at]:
+    Source: '/rustc/library/std/src/os/unix/fs.rs', lines 371:4-371:68
+    Name pattern: [std::os::unix::fs::{std::os::unix::fs::FileExt<std::fs::File>}::write_at]
+    Visibility: public -/
+@[rust_fun
+  "std::os::unix::fs::{std::os::unix::fs::FileExt<std::fs::File>}::write_at"]
+def std.fs.File.Insts.StdOsUnixFsFileExt.write_at
+  :
+  std.fs.File → Slice Std.U8 → Std.U64 → Result (core.result.Result
+    Std.Usize core.io.error.Error)
+  := sorry
+
+/-- [std::os::unix::fs::{impl std::os::unix::fs::FileExt for std::fs::File}::read_at]:
+    Source: '/rustc/library/std/src/os/unix/fs.rs', lines 362:4-362:71
+    Name pattern: [std::os::unix::fs::{std::os::unix::fs::FileExt<std::fs::File>}::read_at]
+    Visibility: public -/
+@[rust_fun
+  "std::os::unix::fs::{std::os::unix::fs::FileExt<std::fs::File>}::read_at"]
+def std.fs.File.Insts.StdOsUnixFsFileExt.read_at
+  :
+  std.fs.File → Slice Std.U8 → Std.U64 → Result ((core.result.Result
+    Std.Usize core.io.error.Error) × (Slice Std.U8))
+  := sorry
+
+/-- Trait implementation: [std::os::unix::fs::{impl std::os::unix::fs::FileExt for std::fs::File}]
+    Source: '/rustc/library/std/src/os/unix/fs.rs', lines 361:0-361:25
+    Name pattern: [std::os::unix::fs::FileExt<std::fs::File>] -/
+@[reducible, rust_trait_impl "std::os::unix::fs::FileExt<std::fs::File>"]
+impl_def std.fs.File.Insts.StdOsUnixFsFileExt : std.os.unix.fs.FileExt
+  std.fs.File := {
+  read_at := std.fs.File.Insts.StdOsUnixFsFileExt.read_at
+  read_exact_at := std.os.unix.fs.FileExt.read_exact_at.default
+    std.fs.File.Insts.StdOsUnixFsFileExt
+  write_at := std.fs.File.Insts.StdOsUnixFsFileExt.write_at
+  write_all_at := std.os.unix.fs.FileExt.write_all_at.default
+    std.fs.File.Insts.StdOsUnixFsFileExt
+}
+
+/-- [std::path::PathBuf]
+    Source: '/rustc/library/std/src/path.rs', lines 1214:0-1214:18
+    Name pattern: [std::path::PathBuf]
+    Visibility: public -/
+@[rust_type "std::path::PathBuf"]
+def std.path.PathBuf : Type := sorry
+
+/-- [std::path::{impl core::clone::Clone for std::path::PathBuf}::clone]:
+    Source: '/rustc/library/std/src/path.rs', lines 1903:4-1903:27
+    Name pattern: [std::path::{core::clone::Clone<std::path::PathBuf>}::clone]
+    Visibility: public -/
+@[rust_fun "std::path::{core::clone::Clone<std::path::PathBuf>}::clone"]
+def std.path.PathBuf.Insts.CoreCloneClone.clone
+  : std.path.PathBuf → Result std.path.PathBuf := sorry
+
+/-- [std::path::{impl core::ops::deref::Deref<std::path::Path> for std::path::PathBuf}::deref]:
+    Source: '/rustc/library/std/src/path.rs', lines 2095:4-2095:28
+    Name pattern: [std::path::{core::ops::deref::Deref<std::path::PathBuf, std::path::Path>}::deref]
+    Visibility: public -/
+@[rust_fun
+  "std::path::{core::ops::deref::Deref<std::path::PathBuf, std::path::Path>}::deref"]
+def std.path.PathBuf.Insts.CoreOpsDerefDerefPath.deref
+  : std.path.PathBuf → Result std.path.Path := sorry
+
+/-- [std::path::{std::path::Path}::file_stem]:
+    Source: '/rustc/library/std/src/path.rs', lines 2900:4-2900:45
+    Name pattern: [std::path::{std::path::Path}::file_stem]
+    Visibility: public -/
+@[rust_fun "std::path::{std::path::Path}::file_stem"]
+def std.path.Path.file_stem
+  : std.path.Path → Result (Option std.ffi.os_str.OsStr) := sorry
+
+/-- [std::path::{std::path::Path}::with_file_name]:
+    Source: '/rustc/library/std/src/path.rs', lines 3107:4-3107:74
+    Name pattern: [std::path::{std::path::Path}::with_file_name]
+    Visibility: public -/
+@[rust_fun "std::path::{std::path::Path}::with_file_name"]
+def std.path.Path.with_file_name
+  {S : Type _} (coreconvertAsRefSOsStrInst : core.convert.AsRef S
+  std.ffi.os_str.OsStr) :
+  std.path.Path → S → Result std.path.PathBuf
+  := sorry
+
+/-- [std::path::{impl core::convert::AsRef<std::path::Path> for std::path::PathBuf}::as_ref]:
+    Source: '/rustc/library/std/src/path.rs', lines 3926:4-3926:29
+    Name pattern: [std::path::{core::convert::AsRef<std::path::PathBuf, std::path::Path>}::as_ref]
+    Visibility: public -/
+@[rust_fun
+  "std::path::{core::convert::AsRef<std::path::PathBuf, std::path::Path>}::as_ref"]
+def std.path.PathBuf.Insts.CoreConvertAsRefPath.as_ref
+  : std.path.PathBuf → Result std.path.Path := sorry
+
+/-- Trait implementation: [std::path::{impl core::convert::AsRef<std::path::Path> for std::path::PathBuf}]
+    Source: '/rustc/library/std/src/path.rs', lines 3924:0-3924:28
+    Name pattern: [core::convert::AsRef<std::path::PathBuf, std::path::Path>] -/
+@[reducible, rust_trait_impl
+  "core::convert::AsRef<std::path::PathBuf, std::path::Path>"]
+def std.path.PathBuf.Insts.CoreConvertAsRefPath : core.convert.AsRef
+  std.path.PathBuf std.path.Path := {
+  as_ref := std.path.PathBuf.Insts.CoreConvertAsRefPath.as_ref
+}
+
+/-- Trait declaration: [alloc::borrow::ToOwned]
+    Source: '/rustc/library/alloc/src/borrow.rs', lines 27:0-27:17
+    Name pattern: [alloc::borrow::ToOwned]
+    Visibility: public -/
+@[rust_trait "alloc::borrow::ToOwned"
+  (parentClauses := ["coreborrowBorrowInst"])]
+structure alloc.borrow.ToOwned (Self : Type) (Self_Owned : Type) where
+  coreborrowBorrowInst : core.borrow.Borrow Self_Owned Self
+  to_owned : Self → Result Self_Owned
+
+/-- [alloc::borrow::{impl core::fmt::Display for alloc::borrow::Cow<'_0, B, Clause1_Owned>}::fmt]:
+    Source: '/rustc/library/alloc/src/borrow.rs', lines 425:4-425:60
+    Name pattern: [alloc::borrow::{core::fmt::Display<alloc::borrow::Cow<'0, @B, @Clause1_Owned>>}::fmt]
+    Visibility: public -/
+@[rust_fun
+  "alloc::borrow::{core::fmt::Display<alloc::borrow::Cow<'0, @B, @Clause1_Owned>>}::fmt"]
+def alloc.borrow.Cow.Insts.CoreFmtDisplay.fmt
+  {B : Type _} {Clause1_Owned : Type _} (corefmtDisplayInst : core.fmt.Display
+  B) (ToOwnedInst : alloc.borrow.ToOwned B Clause1_Owned) (corefmtDisplayInst1
+  : core.fmt.Display Clause1_Owned) :
+  alloc.borrow.Cow B Clause1_Owned → core.fmt.Formatter → Result
+    ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := sorry
+
+/-- Trait implementation: [alloc::borrow::{impl core::fmt::Display for alloc::borrow::Cow<'_0, B, Clause1_Owned>}]
+    Source: '/rustc/library/alloc/src/borrow.rs', lines 421:0-423:51
+    Name pattern: [core::fmt::Display<alloc::borrow::Cow<'0, @B, @Clause1_Owned>>] -/
+@[reducible, rust_trait_impl
+  "core::fmt::Display<alloc::borrow::Cow<'0, @B, @Clause1_Owned>>"]
+def alloc.borrow.Cow.Insts.CoreFmtDisplay {B : Type _} {Clause1_Owned : Type _}
+  (corefmtDisplayInst : core.fmt.Display B) (ToOwnedInst : alloc.borrow.ToOwned
+  B Clause1_Owned) (corefmtDisplayInst1 : core.fmt.Display Clause1_Owned) :
+  core.fmt.Display (alloc.borrow.Cow B Clause1_Owned) := {
+  fmt := alloc.borrow.Cow.Insts.CoreFmtDisplay.fmt corefmtDisplayInst
+    ToOwnedInst corefmtDisplayInst1
+}
+
+/-- Trait implementation: [alloc::boxed::convert::{impl core::convert::From<&'_1 str> for alloc::boxed::Box<(dyn core::error::Error + 'a)>}]
+    Source: '/rustc/library/alloc/src/boxed/convert.rs', lines 631:0-631:57
+    Name pattern: [core::convert::From<Box<@>, &'0 str>] -/
+@[reducible, rust_trait_impl "core::convert::From<Box<@>, &'0 str>"]
+def Box.Insts.CoreConvertFromShared0Str : core.convert.From (Dyn (fun _dyn =>
+  core.error.Error _dyn)) Str := {
+  «from» := sorry
+}
+
+/-- [alloc::fmt::format]:
+    Source: '/rustc/library/alloc/src/fmt.rs', lines 651:0-651:52
+    Name pattern: [alloc::fmt::format]
+    Visibility: public -/
+@[rust_fun "alloc::fmt::format"]
+def alloc.fmt.format : core.fmt.Arguments → Result String := sorry
+
+/-- [alloc::str::{impl core::borrow::Borrow<str> for alloc::string::String}::borrow]:
+    Source: '/rustc/library/alloc/src/str.rs', lines 233:4-233:28
+    Name pattern: [alloc::str::{core::borrow::Borrow<alloc::string::String, str>}::borrow]
+    Visibility: public -/
+@[rust_fun
+  "alloc::str::{core::borrow::Borrow<alloc::string::String, str>}::borrow"]
+def alloc.string.String.Insts.CoreBorrowBorrowStr.borrow
+  : String → Result Str := sorry
+
+/-- Trait implementation: [alloc::str::{impl core::borrow::Borrow<str> for alloc::string::String}]
+    Source: '/rustc/library/alloc/src/str.rs', lines 231:0-231:27
+    Name pattern: [core::borrow::Borrow<alloc::string::String, str>] -/
+@[reducible, rust_trait_impl
+  "core::borrow::Borrow<alloc::string::String, str>"]
+def alloc.string.String.Insts.CoreBorrowBorrowStr : core.borrow.Borrow String
+  Str := {
+  borrow := alloc.string.String.Insts.CoreBorrowBorrowStr.borrow
+}
+
+/-- [alloc::str::{impl alloc::borrow::ToOwned<alloc::string::String> for str}::to_owned]:
+    Source: '/rustc/library/alloc/src/str.rs', lines 252:4-252:32
+    Name pattern: [alloc::str::{alloc::borrow::ToOwned<str, alloc::string::String>}::to_owned]
+    Visibility: public -/
+@[rust_fun
+  "alloc::str::{alloc::borrow::ToOwned<str, alloc::string::String>}::to_owned"]
+def Str.Insts.AllocBorrowToOwnedString.to_owned
+  : Str → Result String := sorry
+
+/-- Trait implementation: [alloc::str::{impl alloc::borrow::ToOwned<alloc::string::String> for str}]
+    Source: '/rustc/library/alloc/src/str.rs', lines 248:0-248:20
+    Name pattern: [alloc::borrow::ToOwned<str, alloc::string::String>] -/
+@[reducible, rust_trait_impl
+  "alloc::borrow::ToOwned<str, alloc::string::String>"]
+def Str.Insts.AllocBorrowToOwnedString : alloc.borrow.ToOwned Str String := {
+  coreborrowBorrowInst := alloc.string.String.Insts.CoreBorrowBorrowStr
+  to_owned := Str.Insts.AllocBorrowToOwnedString.to_owned
+}
+
+/-- [alloc::string::{impl core::fmt::Display for alloc::string::String}::fmt]:
+    Source: '/rustc/library/alloc/src/string.rs', lines 2785:4-2785:60
+    Name pattern: [alloc::string::{core::fmt::Display<alloc::string::String>}::fmt]
+    Visibility: public -/
+@[rust_fun "alloc::string::{core::fmt::Display<alloc::string::String>}::fmt"]
+def alloc.string.String.Insts.CoreFmtDisplay.fmt
+  :
+  String → core.fmt.Formatter → Result ((core.result.Result Unit
+    core.fmt.Error) × core.fmt.Formatter)
+  := sorry
+
+/-- Trait implementation: [alloc::string::{impl core::fmt::Display for alloc::string::String}]
+    Source: '/rustc/library/alloc/src/string.rs', lines 2783:0-2783:28
+    Name pattern: [core::fmt::Display<alloc::string::String>] -/
+@[reducible, rust_trait_impl "core::fmt::Display<alloc::string::String>"]
+def alloc.string.String.Insts.CoreFmtDisplay : core.fmt.Display String := {
+  fmt := alloc.string.String.Insts.CoreFmtDisplay.fmt
+}
+
+/-- [alloc::string::{impl alloc::string::ToString for T}::to_string]:
+    Source: '/rustc/library/alloc/src/string.rs', lines 2965:4-2965:33
+    Name pattern: [alloc::string::{alloc::string::ToString<@T>}::to_string]
+    Visibility: public -/
+@[rust_fun "alloc::string::{alloc::string::ToString<@T>}::to_string"]
+def alloc.string.ToString.Blanket.to_string
+  {T : Type _} (corefmtDisplayInst : core.fmt.Display T) :
+  T → Result String
+  := sorry
+
+/-- [alloc::vec::partial_eq::{impl core::cmp::PartialEq<&'_0 [U]> for alloc::vec::Vec<T>}::eq]:
+    Source: '/rustc/library/alloc/src/vec/partial_eq.rs', lines 15:12-15:46; this code is generated from a macro invocation at: '/rustc/library/alloc/src/vec/partial_eq.rs', lines 23:0-23:171
+    Name pattern: [alloc::vec::partial_eq::{core::cmp::PartialEq<alloc::vec::Vec<@T>, &'0 [@U]>}::eq]
+    Visibility: public -/
+@[rust_fun
+  "alloc::vec::partial_eq::{core::cmp::PartialEq<alloc::vec::Vec<@T>, &'0 [@U]>}::eq"]
+def alloc.vec.Vec.Insts.CoreCmpPartialEqShared0Slice.eq
+  {T : Type _} {U : Type _} (A : Type _) (corecmpPartialEqInst :
+  core.cmp.PartialEq T U) :
+  alloc.vec.Vec T → Slice U → Result Bool
+  := sorry
 
 /-- [ferrosa_storage::count::RowCounter]
     Source: 'ferrosa-storage/src/count.rs', lines 61:0-65:1
@@ -27,6 +533,17 @@ structure count.RowCounter where
   live : Std.U64
   inserts : Std.U64
   overwrites : Std.U64
+
+/-- [ferrosa_storage::count::count_stream]:
+    Source: 'ferrosa-storage/src/count.rs', lines 120:0-122:1
+    Visibility: public -/
+def count.count_stream
+  {I : Type _} {Clause0_Item : Type _} (coreitertraitsiteratorIteratorInst :
+  core.iter.traits.iterator.Iterator I Clause0_Item) (it : I) :
+  Result Std.U64
+  := do
+  let i ← coreitertraitsiteratorIteratorInst.count it
+  ok (UScalar.cast .U64 i)
 
 /-- [ferrosa_storage::count::MAGIC]
     Source: 'ferrosa-storage/src/count.rs', lines 126:0-126:41 -/
@@ -45,4 +562,452 @@ def count.MAGIC : Std.U64 := 5063543869334442836#u64
     Source: 'ferrosa-storage/src/count.rs', lines 129:0-129:29 -/
 @[global_simps, irreducible] def count.MIN_CAPACITY : Std.U64 := 64#u64
 
+/-- [ferrosa_storage::count::LOAD_NUM]
+    Source: 'ferrosa-storage/src/count.rs', lines 131:0-131:24 -/
+@[global_simps, irreducible] def count.LOAD_NUM : Std.U64 := 7#u64
+
+/-- [ferrosa_storage::count::LOAD_DEN]
+    Source: 'ferrosa-storage/src/count.rs', lines 132:0-132:25 -/
+@[global_simps, irreducible] def count.LOAD_DEN : Std.U64 := 10#u64
+
+/-- [ferrosa_storage::count::COPY_BUF]
+    Source: 'ferrosa-storage/src/count.rs', lines 134:0-134:35 -/
+@[global_simps, irreducible]
+def count.COPY_BUF : Result Std.Usize := 256#usize * 1024#usize
+
+/-- [ferrosa_storage::count::DistinctExact]
+    Source: 'ferrosa-storage/src/count.rs', lines 141:0-151:1
+    Visibility: public -/
+structure count.DistinctExact where
+  file : std.fs.File
+  path : std.path.PathBuf
+  capacity : Std.U64
+  used : Std.U64
+  arena_end : Std.U64
+  last_probes : Std.U64
+  peak_buffer : Std.Usize
+  remove_on_drop : Bool
+
+/-- [ferrosa_storage::count::{impl core::ops::drop::Drop for ferrosa_storage::count::DistinctExact}::drop]:
+    Source: 'ferrosa-storage/src/count.rs', lines 428:4-432:5
+    Visibility: public -/
+def count.DistinctExact.Insts.CoreOpsDropDrop.drop
+  (self : count.DistinctExact) : Result count.DistinctExact := do
+  if self.remove_on_drop
+  then
+    let r ←
+      std.fs.remove_file (Shared0T.Insts.CoreConvertAsRef
+        std.path.PathBuf.Insts.CoreConvertAsRefPath) self.path
+    let _ ← core.result.Result.ok r
+    ok self
+  else ok self
+
+/-- [ferrosa_storage::count::{ferrosa_storage::count::DistinctExact}::count]:
+    Source: 'ferrosa-storage/src/count.rs', lines 236:4-238:5
+    Visibility: public -/
+def count.DistinctExact.count
+  (self : count.DistinctExact) : Result Std.U64 := do
+  ok self.used
+
+/-- [ferrosa_storage::count::fnv1a]: loop body 0:
+    Source: 'ferrosa-storage/src/count.rs', lines 612:4-615:5 -/
+@[rust_loop_body]
+def count.fnv1a_loop.body
+  (iter : core.slice.iter.Iter Std.U8) (h : Std.U64) :
+  Result (ControlFlow ((core.slice.iter.Iter Std.U8) × Std.U64) Std.U64)
+  := do
+  let (o, iter1) ← core.slice.iter.IteratorSliceIter.next iter
+  match o with
+  | none => ok (done h)
+  | some b =>
+    let i ← lift (UScalar.cast .U64 b)
+    let h1 ← lift (h ^^^ i)
+    let h2 ← lift (core.num.U64.wrapping_mul h1 1099511628211#u64)
+    ok (cont (iter1, h2))
+
+/-- [ferrosa_storage::count::fnv1a]: loop 0:
+    Source: 'ferrosa-storage/src/count.rs', lines 612:4-615:5 -/
+@[rust_loop]
+def count.fnv1a_loop
+  (iter : core.slice.iter.Iter Std.U8) (h : Std.U64) : Result Std.U64 := do
+  loop
+    (fun (iter1, h1) => count.fnv1a_loop.body iter1 h1)
+    (iter, h)
+
+/-- [ferrosa_storage::count::fnv1a]:
+    Source: 'ferrosa-storage/src/count.rs', lines 610:0-617:1 -/
+def count.fnv1a (bytes : Slice Std.U8) : Result Std.U64 := do
+  let iter ←
+    SharedSlice.Insts.CoreIterTraitsCollectIntoIteratorSharedIter.into_iter
+      bytes
+  count.fnv1a_loop iter 14695981039346656037#u64
+
+/-- [ferrosa_storage::count::tag_of]:
+    Source: 'ferrosa-storage/src/count.rs', lines 438:0-445:1 -/
+def count.tag_of (value : Slice Std.U8) : Result Std.U64 := do
+  let h ← count.fnv1a value
+  if h = 0#u64
+  then ok 1#u64
+  else ok h
+
+/-- [ferrosa_storage::count::{ferrosa_storage::count::DistinctExact}::grow::{closure#1}]
+    Source: 'ferrosa-storage/src/count.rs', lines 365:32-365:57 -/
+@[reducible]
+def count.DistinctExact.grow.closure_1 := Unit
+
+/-- [ferrosa_storage::count::{ferrosa_storage::count::DistinctExact}::grow::{impl core::ops::function::FnOnce<(), alloc::string::String> for ferrosa_storage::count::{ferrosa_storage::count::DistinctExact}::grow::{closure#1}}::call_once]:
+    Source: 'ferrosa-storage/src/count.rs', lines 365:32-365:57 -/
+def
+  count.DistinctExact.grow.closure_1.Insts.CoreOpsFunctionFnOnceTupleString.call_once
+  (c : count.DistinctExact.grow.closure_1) (_ : Unit) : Result String := do
+  alloc.string.ToString.Blanket.to_string Str.Insts.CoreFmtDisplay (toStr
+    "distinct")
+
+/-- Trait implementation: [ferrosa_storage::count::{ferrosa_storage::count::DistinctExact}::grow::{impl core::ops::function::FnOnce<(), alloc::string::String> for ferrosa_storage::count::{ferrosa_storage::count::DistinctExact}::grow::{closure#1}}]
+    Source: 'ferrosa-storage/src/count.rs', lines 365:32-365:57 -/
+@[reducible]
+def count.DistinctExact.grow.closure_1.Insts.CoreOpsFunctionFnOnceTupleString :
+  core.ops.function.FnOnce count.DistinctExact.grow.closure_1 Unit String := {
+  call_once :=
+    count.DistinctExact.grow.closure_1.Insts.CoreOpsFunctionFnOnceTupleString.call_once
+}
+
+/-- [ferrosa_storage::count::{ferrosa_storage::count::DistinctExact}::grow::{closure}]
+    Source: 'ferrosa-storage/src/count.rs', lines 364:21-364:56 -/
+@[reducible]
+def count.DistinctExact.grow.closure := Unit
+
+/-- [ferrosa_storage::count::{ferrosa_storage::count::DistinctExact}::grow::{impl core::ops::function::FnOnce<(&'_0 std::ffi::os_str::OsStr,), alloc::string::String> for ferrosa_storage::count::{ferrosa_storage::count::DistinctExact}::grow::{closure}<'_0>}::call_once]:
+    Source: 'ferrosa-storage/src/count.rs', lines 364:21-364:56 -/
+def
+  count.DistinctExact.grow.closure.Insts.CoreOpsFunctionFnOnceTupleShared0OsStrString.call_once
+  (c : count.DistinctExact.grow.closure) (tupled_args : std.ffi.os_str.OsStr) :
+  Result String
+  := do
+  let c1 ← std.ffi.os_str.OsStr.to_string_lossy tupled_args
+  alloc.string.ToString.Blanket.to_string
+    (alloc.borrow.Cow.Insts.CoreFmtDisplay Str.Insts.CoreFmtDisplay
+    Str.Insts.AllocBorrowToOwnedString
+    alloc.string.String.Insts.CoreFmtDisplay) c1
+
+/-- Trait implementation: [ferrosa_storage::count::{ferrosa_storage::count::DistinctExact}::grow::{impl core::ops::function::FnOnce<(&'_0 std::ffi::os_str::OsStr,), alloc::string::String> for ferrosa_storage::count::{ferrosa_storage::count::DistinctExact}::grow::{closure}<'_0>}]
+    Source: 'ferrosa-storage/src/count.rs', lines 364:21-364:56 -/
+@[reducible]
+def
+  count.DistinctExact.grow.closure.Insts.CoreOpsFunctionFnOnceTupleShared0OsStrString
+  : core.ops.function.FnOnce count.DistinctExact.grow.closure
+  std.ffi.os_str.OsStr String := {
+  call_once :=
+    count.DistinctExact.grow.closure.Insts.CoreOpsFunctionFnOnceTupleShared0OsStrString.call_once
+}
+
+/-- [ferrosa_storage::count::{ferrosa_storage::count::DistinctExact}::write_header]:
+    Source: 'ferrosa-storage/src/count.rs', lines 344:4-351:5 -/
+def count.DistinctExact.write_header
+  :
+  count.DistinctExact → Result (core.result.Result Unit core.io.error.Error)
+  := sorry
+
+/-- [ferrosa_storage::count::{ferrosa_storage::count::DistinctExact}::write_slot]:
+    Source: 'ferrosa-storage/src/count.rs', lines 336:4-342:5 -/
+def count.DistinctExact.write_slot
+  :
+  count.DistinctExact → Std.U64 → Std.U64 → Std.U64 → Std.U32 →
+    Result (core.result.Result Unit core.io.error.Error)
+  := sorry
+
+/-- [ferrosa_storage::count::{ferrosa_storage::count::DistinctExact}::read_slot]:
+    Source: 'ferrosa-storage/src/count.rs', lines 326:4-334:5 -/
+def count.DistinctExact.read_slot
+  :
+  count.DistinctExact → Std.U64 → Result (core.result.Result (Std.U64 ×
+    Std.U64 × Std.U32) core.io.error.Error)
+  := sorry
+
+/-- [ferrosa_storage::count::{ferrosa_storage::count::DistinctExact}::grow]:
+    Source: 'ferrosa-storage/src/count.rs', lines 355:4-424:5 -/
+def count.DistinctExact.grow
+  (self : count.DistinctExact) :
+  Result ((core.result.Result Unit core.io.error.Error) × count.DistinctExact)
+  := do
+  sorry
+
+/-- [ferrosa_storage::count::{ferrosa_storage::count::DistinctExact}::insert]:
+    Source: 'ferrosa-storage/src/count.rs', lines 267:4-303:5
+    Visibility: public -/
+def count.DistinctExact.insert
+  :
+  count.DistinctExact → Slice Std.U8 → Result ((core.result.Result Bool
+    core.io.error.Error) × count.DistinctExact)
+  := sorry
+
+/-- [ferrosa_storage::count::DistinctEstimate]
+    Source: 'ferrosa-storage/src/count.rs', lines 455:0-462:1
+    Visibility: public -/
+structure count.DistinctEstimate where
+  bits : alloc.vec.Vec Std.U64
+  bit_count : Std.U64
+  hash_count : Std.U32
+  seen : Std.U64
+  target_fp_rate : Float
+
+/-- [ferrosa_storage::count::MAX_BITS]
+    Source: 'ferrosa-storage/src/count.rs', lines 466:0-466:43 -/
+@[global_simps, irreducible]
+def count.MAX_BITS : Result Std.U64 := do
+  let i ← 64#u64 * 1024#u64
+  let i1 ← i * 1024#u64
+  i1 * 8#u64
+
+/-- [ferrosa_storage::count::MIN_BITS]
+    Source: 'ferrosa-storage/src/count.rs', lines 467:0-467:25 -/
+@[global_simps, irreducible] def count.MIN_BITS : Std.U64 := 64#u64
+
+/-- [ferrosa_storage::count::{ferrosa_storage::count::DistinctEstimate}::estimate]:
+    Source: 'ferrosa-storage/src/count.rs', lines 501:4-503:5
+    Visibility: public -/
+def count.DistinctEstimate.estimate
+  (self : count.DistinctEstimate) : Result Std.U64 := do
+  ok self.seen
+
+/-- [ferrosa_storage::count::splitmix64]:
+    Source: 'ferrosa-storage/src/count.rs', lines 619:0-625:1 -/
+def count.splitmix64 (x : Std.U64) : Result Std.U64 := do
+  let x1 ← lift (core.num.U64.wrapping_add x 11400714819323198485#u64)
+  let i ← x1 >>> 30#i32
+  let i1 ← lift (x1 ^^^ i)
+  let z ← lift (core.num.U64.wrapping_mul i1 13787848793156543929#u64)
+  let i2 ← z >>> 27#i32
+  let i3 ← lift (z ^^^ i2)
+  let z1 ← lift (core.num.U64.wrapping_mul i3 10723151780598845931#u64)
+  let i4 ← z1 >>> 31#i32
+  ok (z1 ^^^ i4)
+
+/-- [ferrosa_storage::count::{ferrosa_storage::count::DistinctEstimate}::double_hash]:
+    Source: 'ferrosa-storage/src/count.rs', lines 562:4-567:5 -/
+def count.DistinctEstimate.double_hash
+  (item : Slice Std.U8) : Result (Std.U64 × Std.U64) := do
+  let h1 ← count.fnv1a item
+  let i ← lift (h1 ^^^ 11400714819323198485#u64)
+  let i1 ← count.splitmix64 i
+  let h2 ← lift (i1 ||| 1#u64)
+  ok (h1, h2)
+
+/-- [ferrosa_storage::count::{ferrosa_storage::count::DistinctEstimate}::nth_bit]:
+    Source: 'ferrosa-storage/src/count.rs', lines 558:4-560:5 -/
+def count.DistinctEstimate.nth_bit
+  (h1 : Std.U64) (h2 : Std.U64) (i : Std.U32) (m : Std.U64) :
+  Result Std.U64
+  := do
+  let i1 ← lift (UScalar.cast .U64 i)
+  let i2 ← lift (core.num.U64.wrapping_mul i1 h2)
+  let i3 ← lift (core.num.U64.wrapping_add h1 i2)
+  i3 % m
+
+/-- [ferrosa_storage::count::{ferrosa_storage::count::DistinctEstimate}::set_bit]:
+    Source: 'ferrosa-storage/src/count.rs', lines 552:4-555:5 -/
+def count.DistinctEstimate.set_bit
+  :
+  count.DistinctEstimate → Std.U64 → Result count.DistinctEstimate
+  := sorry
+
+/-- [ferrosa_storage::count::{ferrosa_storage::count::DistinctEstimate}::test_bit]:
+    Source: 'ferrosa-storage/src/count.rs', lines 547:4-550:5 -/
+def count.DistinctEstimate.test_bit
+  (self : count.DistinctEstimate) (bit : Std.U64) : Result Bool := do
+  let i ← bit / 64#u64
+  let w ← lift (UScalar.cast .Usize i)
+  let s ← bit % 64#u64
+  let i1 ←
+    alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice Std.U64)
+      self.bits w
+  let i2 ← 1#u64 <<< s
+  let i3 ← lift (i1 &&& i2)
+  ok (i3 != 0#u64)
+
+/-- [ferrosa_storage::count::{ferrosa_storage::count::DistinctEstimate}::insert]: loop body 0:
+    Source: 'ferrosa-storage/src/count.rs', lines 527:8-533:9
+    Visibility: public -/
+@[rust_loop_body]
+def count.DistinctEstimate.insert_loop.body
+  (h1 : Std.U64) (h2 : Std.U64) (iter : core.ops.range.Range Std.U32)
+  (self : count.DistinctEstimate) (already : Bool) :
+  Result (ControlFlow ((core.ops.range.Range Std.U32) × count.DistinctEstimate
+    × Bool) (count.DistinctEstimate × Bool))
+  := do
+  let (o, iter1) ←
+    core.iter.range.IteratorRange.next core.iter.range.StepU32 iter
+  match o with
+  | none => ok (done (self, already))
+  | some i =>
+    let bit ← count.DistinctEstimate.nth_bit h1 h2 i self.bit_count
+    let b ← count.DistinctEstimate.test_bit self bit
+    if b
+    then ok (cont (iter1, self, already))
+    else
+      let self1 ← count.DistinctEstimate.set_bit self bit
+      ok (cont (iter1, self1, false))
+
+/-- [ferrosa_storage::count::{ferrosa_storage::count::DistinctEstimate}::insert]: loop 0:
+    Source: 'ferrosa-storage/src/count.rs', lines 527:8-533:9
+    Visibility: public -/
+@[rust_loop]
+def count.DistinctEstimate.insert_loop
+  (iter : core.ops.range.Range Std.U32) (self : count.DistinctEstimate)
+  (h1 : Std.U64) (h2 : Std.U64) (already : Bool) :
+  Result (count.DistinctEstimate × Bool)
+  := do
+  loop
+    (fun (iter1, self1, already1) => count.DistinctEstimate.insert_loop.body h1
+      h2 iter1 self1 already1)
+    (iter, self, already)
+
+/-- [ferrosa_storage::count::{ferrosa_storage::count::DistinctEstimate}::insert]:
+    Source: 'ferrosa-storage/src/count.rs', lines 524:4-538:5
+    Visibility: public -/
+def count.DistinctEstimate.insert
+  (self : count.DistinctEstimate) (item : Slice Std.U8) :
+  Result (Bool × count.DistinctEstimate)
+  := do
+  let (h1, h2) ← count.DistinctEstimate.double_hash item
+  let (self1, already) ←
+    count.DistinctEstimate.insert_loop
+      { start := 0#u32, «end» := self.hash_count } self h1 h2 true
+  let self2 ←
+    if already
+    then ok self1
+    else
+      do
+      let i ← lift (core.num.U64.saturating_add self1.seen 1#u64)
+      ok { self1 with seen := i }
+  ok (¬ already, self2)
+
+/-- [ferrosa_storage::count::count_distinct_stream_estimate]: loop body 0:
+    Source: 'ferrosa-storage/src/count.rs', lines 587:4-589:5
+    Visibility: public -/
+@[rust_loop_body]
+def count.count_distinct_stream_estimate_loop.body
+  {T : Type _} {I : Type _} {F : Type _} (coreitertraitsiteratorIteratorInst :
+  core.iter.traits.iterator.Iterator I T)
+  (coreopsfunctionFnMutFTupleSharedTVecU8Inst : core.ops.function.FnMut F T
+  (alloc.vec.Vec Std.U8)) (iter : I) (key : F)
+  (sketch : count.DistinctEstimate) :
+  Result (ControlFlow (I × F × count.DistinctEstimate)
+    count.DistinctEstimate)
+  := do
+  let (o, iter1) ← coreitertraitsiteratorIteratorInst.next iter
+  match o with
+  | none => ok (done sketch)
+  | some item =>
+    let (v, key1) ←
+      coreopsfunctionFnMutFTupleSharedTVecU8Inst.call_mut key item
+    let s := alloc.vec.Vec.deref v
+    let (_, sketch1) ← count.DistinctEstimate.insert sketch s
+    ok (cont (iter1, key1, sketch1))
+
+/-- [ferrosa_storage::count::count_distinct_stream_estimate]: loop 0:
+    Source: 'ferrosa-storage/src/count.rs', lines 587:4-589:5
+    Visibility: public -/
+@[rust_loop]
+def count.count_distinct_stream_estimate_loop
+  {T : Type _} {I : Type _} {F : Type _} (coreitertraitsiteratorIteratorInst :
+  core.iter.traits.iterator.Iterator I T)
+  (coreopsfunctionFnMutFTupleSharedTVecU8Inst : core.ops.function.FnMut F T
+  (alloc.vec.Vec Std.U8)) (iter : I) (key : F)
+  (sketch : count.DistinctEstimate) :
+  Result count.DistinctEstimate
+  := do
+  loop
+    (fun (iter1, key1, sketch1) =>
+      count.count_distinct_stream_estimate_loop.body
+      coreitertraitsiteratorIteratorInst
+      coreopsfunctionFnMutFTupleSharedTVecU8Inst iter1 key1 sketch1)
+    (iter, key, sketch)
+
+/-- [ferrosa_storage::count::count_distinct_stream_estimate]:
+    Source: 'ferrosa-storage/src/count.rs', lines 578:0-591:1
+    Visibility: public -/
+def count.count_distinct_stream_estimate
+  {T : Type _} {I : Type _} {F : Type _} (coreitertraitsiteratorIteratorInst :
+  core.iter.traits.iterator.Iterator I T)
+  (coreopsfunctionFnMutFTupleShared0TVecU8Inst : core.ops.function.FnMut F T
+  (alloc.vec.Vec Std.U8)) (it : I) (key : F) (sketch : count.DistinctEstimate)
+  :
+  Result (Std.U64 × count.DistinctEstimate)
+  := do
+  let sketch1 ←
+    count.count_distinct_stream_estimate_loop
+      coreitertraitsiteratorIteratorInst
+      coreopsfunctionFnMutFTupleShared0TVecU8Inst it key sketch
+  let i ← count.DistinctEstimate.estimate sketch1
+  ok (i, sketch1)
+
+/-- [ferrosa_storage::count::count_distinct_stream_exact]: loop body 0:
+    Source: 'ferrosa-storage/src/count.rs', lines 604:4-608:1
+    Visibility: public -/
+@[rust_loop_body]
+def count.count_distinct_stream_exact_loop.body
+  {T : Type _} {I : Type _} {F : Type _} (coreitertraitsiteratorIteratorInst :
+  core.iter.traits.iterator.Iterator I T)
+  (coreopsfunctionFnMutFTupleSharedTVecU8Inst : core.ops.function.FnMut F T
+  (alloc.vec.Vec Std.U8)) (iter : I) (key : F) (counter : count.DistinctExact)
+  :
+  Result (ControlFlow (I × F × count.DistinctExact) ((core.result.Result
+    Std.U64 core.io.error.Error) × count.DistinctExact))
+  := do
+  let (o, iter1) ← coreitertraitsiteratorIteratorInst.next iter
+  match o with
+  | none =>
+    let i ← count.DistinctExact.count counter
+    ok (done (core.result.Result.Ok i, counter))
+  | some item =>
+    let (v, key1) ←
+      coreopsfunctionFnMutFTupleSharedTVecU8Inst.call_mut key item
+    let s := alloc.vec.Vec.deref v
+    let (r, counter1) ← count.DistinctExact.insert counter s
+    let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+    match cf with
+    | core.ops.control_flow.ControlFlow.Continue _ =>
+      ok (cont (iter1, key1, counter1))
+    | core.ops.control_flow.ControlFlow.Break residual =>
+      let r1 ←
+        core.result.Result.Insts.CoreOpsTry_traitFromResidualResult.from_residual
+          Std.U64 (core.convert.FromSame core.io.error.Error) residual
+      ok (done (r1, counter1))
+
+/-- [ferrosa_storage::count::count_distinct_stream_exact]: loop 0:
+    Source: 'ferrosa-storage/src/count.rs', lines 604:4-608:1
+    Visibility: public -/
+@[rust_loop]
+def count.count_distinct_stream_exact_loop
+  {T : Type _} {I : Type _} {F : Type _} (coreitertraitsiteratorIteratorInst :
+  core.iter.traits.iterator.Iterator I T)
+  (coreopsfunctionFnMutFTupleSharedTVecU8Inst : core.ops.function.FnMut F T
+  (alloc.vec.Vec Std.U8)) (iter : I) (key : F) (counter : count.DistinctExact)
+  :
+  Result ((core.result.Result Std.U64 core.io.error.Error) ×
+    count.DistinctExact)
+  := do
+  loop
+    (fun (iter1, key1, counter1) => count.count_distinct_stream_exact_loop.body
+      coreitertraitsiteratorIteratorInst
+      coreopsfunctionFnMutFTupleSharedTVecU8Inst iter1 key1 counter1)
+    (iter, key, counter)
+
+/-- [ferrosa_storage::count::count_distinct_stream_exact]:
+    Source: 'ferrosa-storage/src/count.rs', lines 595:0-608:1
+    Visibility: public -/
+@[reducible]
+def count.count_distinct_stream_exact
+  {T : Type _} {I : Type _} {F : Type _} (coreitertraitsiteratorIteratorInst :
+  core.iter.traits.iterator.Iterator I T)
+  (coreopsfunctionFnMutFTupleShared0TVecU8Inst : core.ops.function.FnMut F T
+  (alloc.vec.Vec Std.U8)) (it : I) (key : F) (counter : count.DistinctExact) :
+  Result ((core.result.Result Std.U64 core.io.error.Error) ×
+    count.DistinctExact)
+  := do
+  count.count_distinct_stream_exact_loop coreitertraitsiteratorIteratorInst
+    coreopsfunctionFnMutFTupleShared0TVecU8Inst it key counter
+
 end ferrosa_storage
+end
