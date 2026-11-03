@@ -195,8 +195,18 @@ impl DdlPath {
                 // (which requires a peer_host_id and peer_manager) by reusing
                 // the same Schema/StorageEngine operations that DdlCoordinator
                 // would perform.
-                let _pauses = pause_ddl_compactions(&op, schema, engine).await?;
-                apply_direct(&op, schema, engine)
+                let pauses = pause_ddl_compactions(&op, schema, engine).await?;
+                let schema = Arc::clone(schema);
+                let engine = Arc::clone(engine);
+                ferrosa_net::task_pool::TaskPool::current("ddl-direct")
+                    .spawn_blocking(move || {
+                        let _pauses = pauses;
+                        apply_direct(&op, &schema, &engine)
+                    })
+                    .await
+                    .map_err(|error| {
+                        ClusterError::Internal(format!("direct DDL task failed: {error}"))
+                    })?
             }
             Self::Pair(coordinator) => coordinator.coordinate_ddl(op).await,
             Self::Cluster {
@@ -328,7 +338,13 @@ pub(crate) async fn pause_ddl_compactions(
     Ok(pauses)
 }
 
-fn apply_direct(op: &DdlOperation, schema: &Schema, engine: &Arc<StorageEngine>) -> Result<()> {
+/// Apply an authorized direct operation synchronously under the schema lifecycle fence.
+///
+/// Call from a blocking worker. The caller owns any required compaction pauses;
+/// physical cleanup still refuses success if compactions have not drained. This
+/// is shared by `DdlPath::execute` and CQL authorization jobs so their persisted
+/// effects use the same implementation without retaining a lease across an await.
+pub fn apply_direct(op: &DdlOperation, schema: &Schema, engine: &Arc<StorageEngine>) -> Result<()> {
     let _lifecycle = schema.lifecycle_write();
     match op {
         DdlOperation::CreateKeyspace(ks) => {
