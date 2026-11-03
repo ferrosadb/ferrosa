@@ -576,6 +576,20 @@ pub trait WriteSetSource {
 
 /// A resident write-set. Bounded by whatever assembled it; this is the small
 /// autocommit batch, not a staged transaction.
+impl WriteSetSource for &[Mutation] {
+    fn mutation_count(&self) -> usize {
+        self.len()
+    }
+
+    fn for_each_mutation(&self, visit: &mut dyn FnMut(&Mutation) -> Result<()>) -> Result<()> {
+        for mutation in *self {
+            visit(mutation)?;
+        }
+        Ok(())
+    }
+}
+
+/// Owned resident input uses the same borrowed visitation contract.
 impl WriteSetSource for Vec<Mutation> {
     fn mutation_count(&self) -> usize {
         self.len()

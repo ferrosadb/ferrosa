@@ -24,6 +24,8 @@
 //! reserved cores stay free for consensus. This crate is a leaf: it depends only
 //! on tokio, so nothing in the storage/cluster/cql stack leaks in (DSM guard).
 
+#![forbid(unsafe_code)]
+
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

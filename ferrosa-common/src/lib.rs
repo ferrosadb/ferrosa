@@ -10,6 +10,8 @@
 //! that `ferrosa-udf` can depend on them without pulling in `ferrosa-cql`.
 //! Wire-format encoding/decoding for CQL values remains in `ferrosa-cql`.
 
+#![forbid(unsafe_code)]
+
 pub mod accord;
 pub mod cancel;
 pub mod cell;
@@ -28,6 +30,7 @@ pub mod data_type;
 pub mod deployment_mode;
 pub mod error;
 pub mod geometry;
+pub mod hll;
 pub mod key;
 pub mod mem_probe;
 pub mod murmur3;

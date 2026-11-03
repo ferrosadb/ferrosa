@@ -1,0 +1,28 @@
+{
+  "stage": "aeneas",
+  "llbc": "/home/bkearns/src/ferrosa-suite/ferrosa/ferrosa_net.llbc",
+  "lean": "/home/bkearns/.hermes/cache/scratch/leangap-ferrosa-net-g2l0qiq_/FerrosaNet.lean",
+  "translation_errors": 0,
+  "translation_unique_reported": null,
+  "translation_messages": [],
+  "aeneas_exit": 1,
+  "lean_errors": 1,
+  "errors": [
+    {
+      "location": "FerrosaNet.lean:2111:76",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    }
+  ],
+  "sorry_declarations": 0,
+  "compiled": false,
+  "crate": "ferrosa-net",
+  "prefix": "ferrosa_net::lane_actor::*",
+  "generated_at": "2026-10-31T06:36:40+00:00",
+  "memory_max": "10G",
+  "toolchain": {
+    "charon": "/home/bkearns/src/aeneas/charon/bin/charon",
+    "aeneas": "/home/bkearns/src/aeneas/src/_build/default/main.exe",
+    "lean_pkg": "/home/bkearns/.local/aeneas/backends/lean"
+  }
+}

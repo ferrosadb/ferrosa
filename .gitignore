@@ -35,3 +35,11 @@ examples/build/
 # Throwaway TLS certificates for docker-compose.secure.yml
 # (scripts/gen-compose-test-certs.sh, t_3422ae92). Never commit keys.
 /.compose-tls/
+
+# Aeneas/Charon extraction products (regenerate with scripts/lean_rust_extract.sh)
+*.llbc
+FerrosaStorage.lean
+specs/lean4/rust-extract/
+# Lake build products and packages for the extraction library
+specs/lean4-rust/.lake/
+specs/lean4-rust/aeneas-backend

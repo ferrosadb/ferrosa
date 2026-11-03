@@ -1,0 +1,33 @@
+{
+  "stage": "aeneas",
+  "llbc": "/home/bkearns/src/ferrosa-suite/ferrosa/ferrosa_sched.llbc",
+  "lean": "/home/bkearns/.hermes/cache/scratch/leangap-ferrosa-sched-tbmagjg3/FerrosaSched.lean",
+  "translation_errors": 0,
+  "translation_unique_reported": null,
+  "translation_messages": [],
+  "aeneas_exit": 1,
+  "lean_errors": 2,
+  "errors": [
+    {
+      "location": "FerrosaSched.lean:421:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `core.num.nonzero.ZeroablePrimitive`"
+    },
+    {
+      "location": "FerrosaSched.lean:443:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `core.num.nonzero.ZeroablePrimitive`"
+    }
+  ],
+  "sorry_declarations": 130,
+  "compiled": false,
+  "crate": "ferrosa-sched",
+  "prefix": "ferrosa_sched::*",
+  "generated_at": "2026-10-31T18:44:20+00:00",
+  "memory_max": "18G",
+  "toolchain": {
+    "charon": "/home/bkearns/src/aeneas/charon/bin/charon",
+    "aeneas": "/home/bkearns/src/aeneas/src/_build/default/main.exe",
+    "lean_pkg": "/home/bkearns/.local/aeneas/backends/lean"
+  }
+}

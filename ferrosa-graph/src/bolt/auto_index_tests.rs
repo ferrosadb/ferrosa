@@ -131,6 +131,22 @@ impl Fixture {
         }
     }
 
+    /// An engine with the default config over this fixture's schema, storage
+    /// and write path, for seeding data a test needs before it exercises a
+    /// tight `query_timeout`. Seeding through `self.engine` puts the setup
+    /// under that same budget, so a loaded test binary fails the SETUP, not
+    /// the behaviour under test (t_8fe6ad7a).
+    fn seed_engine(&self) -> GraphEngine {
+        GraphEngine::new_with_coordinator(
+            Arc::clone(&self.schema),
+            Arc::clone(&self.storage),
+            Arc::clone(&self.path),
+            Default::default(),
+            std::time::Duration::ZERO,
+            self.coordinator.clone(),
+        )
+    }
+
     fn auth() -> AuthContext {
         AuthContext {
             role: "cassandra".into(),
@@ -711,7 +727,8 @@ async fn bolt_waiting_for_first_access_stays_inside_the_query_timeout() {
         query_timeout: std::time::Duration::from_millis(50),
         ..Default::default()
     });
-    f.engine
+    // Seed outside the 50 ms budget: only the gated query below is under test.
+    f.seed_engine()
         .execute(
             "CREATE (n:Blocked {age: 42}) RETURN 1 AS inserted",
             "bolt_auto",
@@ -731,7 +748,21 @@ async fn bolt_waiting_for_first_access_stays_inside_the_query_timeout() {
     )
     .await
     .expect("the query timeout must include waiting for the setup gate");
-    assert!(result.is_err());
+    // The gate is acquired inside `ensure`'s `tokio::time::timeout`, whose
+    // elapsed arm is this refusal (engine/bolt_indexes.rs). Pin that arm, so
+    // an unrelated error (an unknown label, a failed seed) cannot pass here.
+    let error = result.err().map(|error| error.to_string());
+    assert!(
+        error
+            .as_deref()
+            .is_some_and(|message| message.contains("are not current after 50ms")),
+        "the gated query must fail on the setup deadline: {error:?}"
+    );
+    assert_eq!(
+        f.engine.bolt_index_initializations_for_test(),
+        0,
+        "the query must never get past the held gate"
+    );
 }
 
 #[tokio::test]

@@ -3,6 +3,8 @@
 //! ferrosa-net owns the wire protocol, connection pool, and peer lifecycle.
 //! ferrosa-cluster registers message handlers and reacts to peer events.
 
+#![forbid(unsafe_code)]
+
 pub mod accord_messages;
 pub mod codec;
 pub mod config;

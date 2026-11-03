@@ -19,6 +19,14 @@ use crate::ast::*;
 use crate::error::CqlError;
 use crate::lexer::{Keyword, Lexer, TokenKind};
 
+/// The flag spelling of `COUNT(ESTIMATE_DISTINCT c)`.
+///
+/// Deliberately NOT a lexer keyword: a column may be named `estimate_distinct`,
+/// and reserving the word would break `SELECT estimate_distinct FROM t`. The
+/// parser therefore treats the identifier as a flag only where an aggregate
+/// argument can appear and only when a term follows it.
+const ESTIMATE_DISTINCT_FLAG: &str = "estimate_distinct";
+
 /// Maximum nesting depth for collection/tuple literals and parameterized types.
 /// Security mitigation M2.
 const MAX_NESTING_DEPTH: usize = 32;
@@ -292,6 +300,90 @@ impl<'input> Parser<'input> {
         })
     }
 
+    /// Parse the interior of an aggregate call — just after `(` — plus its
+    /// optional `AS alias`.
+    ///
+    /// `COUNT(DISTINCT c)` is an exact distinct count; `COUNT(ESTIMATE_DISTINCT c)`
+    /// is the bounded-memory **lower bound** (`Ferrosa/Cql/Aggregate.lean`,
+    /// `ferrosa-storage/src/count.rs`). They are two different functions, so each
+    /// gets its own flag and neither is spelled as the other.
+    fn parse_aggregate_call(&mut self, kind: AggregateKind) -> Result<AggregateCall, CqlError> {
+        let name = kind.as_str().to_uppercase();
+        let mut distinct = false;
+        let mut estimate_distinct = false;
+        // `COUNT(estimate_distinct)` — the identifier was the argument itself.
+        let mut argument_from_flag = None;
+
+        if self.lexer.eat(&TokenKind::Keyword(Keyword::Distinct))? {
+            distinct = true;
+        } else if matches!(
+            self.lexer.peek()?.kind,
+            TokenKind::Ident(ident) if ident.eq_ignore_ascii_case(ESTIMATE_DISTINCT_FLAG)
+        ) {
+            // `ESTIMATE_DISTINCT` is not a reserved word — a column may legitimately
+            // be called that — so it is a flag only when a term follows it.
+            self.lexer.next_token()?;
+            if matches!(
+                self.lexer.peek()?.kind,
+                TokenKind::RParen | TokenKind::Comma
+            ) {
+                argument_from_flag = Some(AggregateArgument::Column(
+                    ESTIMATE_DISTINCT_FLAG.to_string(),
+                ));
+            } else {
+                estimate_distinct = true;
+            }
+        }
+
+        let argument = if let Some(argument) = argument_from_flag {
+            argument
+        } else if self.lexer.eat(&TokenKind::Star)? {
+            AggregateArgument::Star
+        } else if matches!(self.lexer.peek()?.kind, TokenKind::RParen) {
+            return Err(CqlError::SyntaxError(format!(
+                "{name}() requires an argument"
+            )));
+        } else {
+            AggregateArgument::from_term(self.parse_term()?)
+        };
+
+        // One argument: `COUNT(c, d)` is not CQL.
+        if self.lexer.eat(&TokenKind::Comma)? {
+            return Err(CqlError::SyntaxError(if distinct || estimate_distinct {
+                format!("{name}(DISTINCT ...) takes exactly one column")
+            } else {
+                format!("{name}() takes exactly one argument")
+            }));
+        }
+        self.lexer.expect(&TokenKind::RParen)?;
+
+        if (distinct || estimate_distinct) && kind != AggregateKind::Count {
+            return Err(CqlError::SyntaxError(format!(
+                "{name} does not accept DISTINCT: only COUNT counts distinct values"
+            )));
+        }
+        if (distinct || estimate_distinct) && argument == AggregateArgument::Star {
+            return Err(CqlError::SyntaxError(
+                "COUNT(DISTINCT ...) requires a column, not *".to_string(),
+            ));
+        }
+
+        // Optional AS alias
+        let alias = if self.lexer.eat(&TokenKind::Keyword(Keyword::As))? {
+            Some(self.parse_ident()?)
+        } else {
+            None
+        };
+
+        Ok(AggregateCall {
+            kind,
+            argument,
+            distinct,
+            estimate_distinct,
+            alias,
+        })
+    }
+
     fn parse_select_columns(&mut self) -> Result<Vec<SelectColumn>, CqlError> {
         if self.lexer.eat(&TokenKind::Star)? {
             return Ok(vec![SelectColumn::Star]);
@@ -308,7 +400,21 @@ impl<'input> Parser<'input> {
                 (None, first)
             };
             if self.lexer.eat(&TokenKind::LParen)? {
-                // Function call: COUNT(*), WRITETIME(col), TTL(col), ks.udf(col).
+                // A builtin aggregate becomes its own AST node: no downstream
+                // layer re-derives "is this an aggregate?" from the name, and
+                // DISTINCT / ESTIMATE_DISTINCT get a place to live that a name
+                // string cannot carry. A keyspace-qualified call is a UDA.
+                if let (None, Some(kind)) = (&keyspace, AggregateKind::from_name(&name)) {
+                    self.enter_nesting()?;
+                    let call = self.parse_aggregate_call(kind)?;
+                    self.exit_nesting();
+                    cols.push(SelectColumn::Aggregate(call));
+                    if !self.lexer.eat(&TokenKind::Comma)? {
+                        break;
+                    }
+                    continue;
+                }
+                // Function call: WRITETIME(col), TTL(col), ks.udf(col).
                 let mut args = vec![];
                 if self.lexer.eat(&TokenKind::Star)? {
                     // COUNT(*) — represent * as a special term
@@ -2617,6 +2723,16 @@ impl<'input> Parser<'input> {
                 self.lexer.expect(&TokenKind::RParen)?;
                 col
             } else if has_lparen {
+                // An aggregate over the rows a predicate selects is not a
+                // predicate: reject it here, by name, instead of reporting it as
+                // an unsupported UDF call.
+                if let Some(kind) = AggregateKind::from_name(&column) {
+                    return Err(CqlError::SyntaxError(format!(
+                        "aggregate function {}() is not allowed in a WHERE clause: aggregates \
+                         are SELECT projections over the rows the predicate selected",
+                        kind.as_str()
+                    )));
+                }
                 return Err(CqlError::SyntaxError(
                     "UDF calls on the left-hand side of WHERE predicates are not supported; place scalar UDF calls on the right-hand side with ALLOW FILTERING"
                         .to_string(),
@@ -2923,6 +3039,18 @@ impl<'input> Parser<'input> {
                     }
                 }
                 if self.lexer.eat(&TokenKind::LParen)? {
+                    // An aggregate is a SELECT projection, never an expression:
+                    // `COUNT(SUM(c))` and `WHERE COUNT(c) > 1` are rejected here,
+                    // as a syntax error, rather than reaching execution as a
+                    // function call that no layer knows how to evaluate.
+                    if let Some(kind) = AggregateKind::from_name(&name) {
+                        return Err(CqlError::SyntaxError(format!(
+                            "aggregate function {}() is not allowed here: aggregates are \
+                             SELECT projections, never nested inside another aggregate and \
+                             never part of a WHERE clause",
+                            kind.as_str()
+                        )));
+                    }
                     // Function call: name(args...)
                     self.enter_nesting()?;
                     let mut args = vec![];
@@ -6312,5 +6440,234 @@ mod tracing_tests {
 
         let stmt = parse("UPDATE ks.t SET b = 2 WHERE a = 1").unwrap();
         assert_eq!(statement_type_name(&stmt), "UPDATE");
+    }
+}
+
+/// Structural-aggregate tests: `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` (and the two
+/// distinct-flavoured counts) must land in the AST as an
+/// [`crate::ast::AggregateCall`], not as a `FunctionCall` whose name a
+/// downstream layer compares against a string. `COUNT(DISTINCT c)` and
+/// `COUNT(ESTIMATE_DISTINCT c)` are the two queries the surface used to reject.
+#[cfg(test)]
+mod aggregate_node_tests {
+    use super::*;
+    use crate::ast::{AggregateArgument, AggregateKind};
+
+    fn select_columns(cql: &str) -> Vec<SelectColumn> {
+        match parse(cql).unwrap_or_else(|e| panic!("{cql:?} must parse, got {e:?}")) {
+            Statement::Select(s) => s.columns,
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    fn single_aggregate(cql: &str) -> AggregateCall {
+        let mut cols = select_columns(cql);
+        assert_eq!(cols.len(), 1, "{cql:?} must project exactly one column");
+        match cols.pop().expect("one column") {
+            SelectColumn::Aggregate(call) => call,
+            other => panic!("{cql:?} must produce an aggregate node, got {other:?}"),
+        }
+    }
+
+    fn syntax_error(cql: &str) -> String {
+        match parse(cql) {
+            Ok(stmt) => panic!("{cql:?} must be rejected, parsed as {stmt:?}"),
+            Err(CqlError::SyntaxError(msg)) => msg,
+            Err(other) => panic!("{cql:?} must be a syntax error, got {other:?}"),
+        }
+    }
+
+    /// Characterisation across the change: `COUNT(*)` used to arrive as
+    /// `FunctionCall { name: "COUNT", args: [StringLiteral("*")] }`. It must
+    /// still be the single count-only projection the router's metadata fast path
+    /// and bounded streaming fold gate on — see the router parity test
+    /// `count_star_still_reaches_the_metadata_count_and_streaming_fold_shapes`.
+    #[test]
+    fn count_star_is_a_count_over_the_star_argument() {
+        assert_eq!(
+            single_aggregate("SELECT COUNT(*) FROM ks.t"),
+            AggregateCall {
+                kind: AggregateKind::Count,
+                argument: AggregateArgument::Star,
+                distinct: false,
+                estimate_distinct: false,
+                alias: None,
+            }
+        );
+    }
+
+    #[test]
+    fn builtin_aggregates_carry_kind_and_column_structurally() {
+        for (cql, kind) in [
+            ("SELECT COUNT(c) FROM ks.t", AggregateKind::Count),
+            ("SELECT SUM(c) FROM ks.t", AggregateKind::Sum),
+            ("SELECT AVG(c) FROM ks.t", AggregateKind::Avg),
+            ("SELECT MIN(c) FROM ks.t", AggregateKind::Min),
+            ("SELECT MAX(c) FROM ks.t", AggregateKind::Max),
+        ] {
+            let call = single_aggregate(cql);
+            assert_eq!(call.kind, kind, "{cql:?}");
+            assert_eq!(
+                call.argument,
+                AggregateArgument::Column("c".to_string()),
+                "{cql:?} must carry its argument column in the node"
+            );
+            assert!(!call.distinct, "{cql:?}");
+            assert!(!call.estimate_distinct, "{cql:?}");
+        }
+    }
+
+    #[test]
+    fn aggregate_kind_is_matched_case_insensitively() {
+        let call = single_aggregate("SELECT count(*) FROM ks.t");
+        assert_eq!(call.kind, AggregateKind::Count);
+        assert_eq!(call.result_name(), "count");
+    }
+
+    #[test]
+    fn count_distinct_carries_the_distinct_flag() {
+        let call = single_aggregate("SELECT COUNT(DISTINCT c) FROM ks.t");
+        assert_eq!(call.kind, AggregateKind::Count);
+        assert!(
+            call.distinct,
+            "COUNT(DISTINCT c) must set the distinct flag"
+        );
+        assert!(!call.estimate_distinct);
+        assert_eq!(
+            call.argument,
+            AggregateArgument::Column("c".to_string()),
+            "the distinct flag must not swallow the column"
+        );
+    }
+
+    #[test]
+    fn count_estimate_distinct_carries_the_estimate_flag() {
+        let call = single_aggregate("SELECT COUNT(ESTIMATE_DISTINCT c) FROM ks.t");
+        assert_eq!(call.kind, AggregateKind::Count);
+        assert!(
+            call.estimate_distinct,
+            "COUNT(ESTIMATE_DISTINCT c) must set the estimate flag: it is the \
+             bounded-memory lower bound, not the exact distinct count"
+        );
+        assert!(
+            !call.distinct,
+            "the estimate must not be recorded as an exact distinct count"
+        );
+        assert_eq!(call.argument, AggregateArgument::Column("c".to_string()));
+    }
+
+    #[test]
+    fn aggregate_alias_is_preserved() {
+        let call = single_aggregate("SELECT COUNT(*) AS n FROM ks.t");
+        assert_eq!(call.alias.as_deref(), Some("n"));
+        assert_eq!(call.result_name(), "n");
+    }
+
+    #[test]
+    fn a_column_named_estimate_distinct_is_still_a_column() {
+        // `ESTIMATE_DISTINCT` is not a reserved word: `COUNT(estimate_distinct)`
+        // folds a column of that name.
+        let call = single_aggregate("SELECT COUNT(estimate_distinct) FROM ks.t");
+        assert!(!call.estimate_distinct);
+        assert_eq!(
+            call.argument,
+            AggregateArgument::Column("estimate_distinct".to_string())
+        );
+    }
+
+    #[test]
+    fn aggregate_nested_in_aggregate_is_a_parse_error() {
+        for cql in [
+            "SELECT SUM(COUNT(c)) FROM ks.t",
+            "SELECT COUNT(MAX(c)) FROM ks.t",
+            "SELECT COUNT(count(*)) FROM ks.t",
+        ] {
+            let msg = syntax_error(cql);
+            assert!(
+                msg.contains("aggregate"),
+                "nested aggregate error must say so, got {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_in_where_is_a_parse_error() {
+        for cql in [
+            "SELECT c FROM ks.t WHERE COUNT(c) > 1",
+            "SELECT c FROM ks.t WHERE sum(c) = 3",
+        ] {
+            let msg = syntax_error(cql);
+            assert!(
+                msg.contains("aggregate"),
+                "WHERE-clause aggregate error must say so, got {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn distinct_on_a_non_count_aggregate_is_a_parse_error() {
+        for cql in [
+            "SELECT SUM(DISTINCT c) FROM ks.t",
+            "SELECT AVG(ESTIMATE_DISTINCT c) FROM ks.t",
+            "SELECT MAX(DISTINCT c) FROM ks.t",
+        ] {
+            let msg = syntax_error(cql);
+            assert!(
+                msg.contains("COUNT"),
+                "only COUNT counts distinct values, got {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn count_distinct_requires_one_column() {
+        assert!(syntax_error("SELECT COUNT(DISTINCT *) FROM ks.t").contains("DISTINCT"));
+        assert!(syntax_error("SELECT COUNT(DISTINCT c, d) FROM ks.t").contains("DISTINCT"));
+        assert!(syntax_error("SELECT COUNT() FROM ks.t").contains("COUNT"));
+        assert!(syntax_error("SELECT COUNT(c, d) FROM ks.t").contains("COUNT"));
+    }
+
+    #[test]
+    fn unknown_function_is_still_a_function_call() {
+        let cols = select_columns("SELECT frobnicate(c) FROM ks.t");
+        match &cols[0] {
+            SelectColumn::FunctionCall { name, .. } => assert_eq!(name, "frobnicate"),
+            other => panic!("an unknown function must stay a FunctionCall, got {other:?}"),
+        }
+        // A UDF/UDA spelled with a keyspace qualifier is not a builtin either.
+        let cols = select_columns("SELECT ks.count(c) FROM ks.t");
+        match &cols[0] {
+            SelectColumn::FunctionCall { keyspace, name, .. } => {
+                assert_eq!(keyspace.as_deref(), Some("ks"));
+                assert_eq!(name, "count");
+            }
+            other => panic!("a qualified count() is a UDA call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn several_aggregates_in_one_projection_stay_ordered() {
+        let cols = select_columns("SELECT COUNT(*), SUM(v), MAX(v) FROM ks.t");
+        let kinds: Vec<AggregateKind> = cols
+            .iter()
+            .map(|c| c.builtin_aggregate().expect("aggregate node").kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![AggregateKind::Count, AggregateKind::Sum, AggregateKind::Max]
+        );
+    }
+
+    #[test]
+    fn a_plain_column_is_not_an_aggregate() {
+        let cols = select_columns("SELECT c, count FROM ks.t");
+        assert_eq!(
+            cols,
+            vec![
+                SelectColumn::Column("c".to_string()),
+                SelectColumn::Column("count".to_string())
+            ],
+            "a column that spells an aggregate name is still a column"
+        );
     }
 }

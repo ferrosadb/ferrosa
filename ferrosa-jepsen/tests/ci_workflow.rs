@@ -56,6 +56,39 @@ fn jepsen_smoke_job_exists_in_ci_yaml() {
     );
 }
 
+/// JE-2: the smoke tier runs the Elle checker tests (`checker::elle`, the orchestrator's
+/// transactional path), which drive the real elle-checker under `lein` and panic without it.
+/// The job must install a pinned, checksum-verified `lein` and prefetch the checker's deps
+/// BEFORE the test step, or every PR goes red on missing setup rather than on a verdict.
+#[test]
+fn the_smoke_tier_installs_a_checksum_verified_lein_before_its_tests() {
+    let path = ci_yaml_path();
+    let yaml =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+    let install_step = "Install Leiningen (pinned, checksum-verified) and prefetch Elle deps";
+    let install = step_body(&yaml, install_step);
+    for needle in [
+        "LEIN_VERSION: \"2.11.2\"",
+        "LEIN_SHA256:",
+        "sha256sum -c",
+        "lein deps",
+    ] {
+        assert!(
+            install.contains(needle),
+            "the lein install step must contain `{needle}`:\n{install}"
+        );
+    }
+    let install_at = yaml.find(&format!("- name: {install_step}")).unwrap();
+    let tests_at = yaml
+        .find("- name: Run Jepsen smoke tier")
+        .expect("the smoke tier test step exists");
+    assert!(
+        install_at < tests_at,
+        "lein must be installed before the smoke tier tests run"
+    );
+}
+
 /// W2.13 negative companion: the legacy `--exclude ferrosa-jepsen` flag
 /// must remain in the *general-purpose* `test` job (so the Docker-free
 /// stages don't try to spin Docker). Asserts both behaviors.
