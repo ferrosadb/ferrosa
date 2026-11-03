@@ -1,0 +1,9 @@
+{
+  "name": "ferrosa-spec-site-a11y",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@axe-core/playwright": "4.10.2",
+    "playwright": "1.55.0"
+  }
+}

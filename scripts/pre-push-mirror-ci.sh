@@ -79,6 +79,7 @@ SKIPS=(
   # Live-infra: needs a 3-node cluster; runs in the "Cluster integration
   # tests" CI job, as in ci.yml.
   --skip replicated_jsonb_index_builds_on_every_node
+  --skip strict_pair_live_s3_ack_replays_exact_mutation
 )
 
 # `cargo nextest run` hangs on this workspace's lib targets on macOS

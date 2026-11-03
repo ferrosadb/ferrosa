@@ -4,7 +4,7 @@
 //! pattern-based ops (`DELETE WHERE`, `DELETE/INSERT … WHERE`, `CLEAR`, `DROP`)
 //! over the `rdf_triples_v2` store (URS-QEC-D04). Pattern ops plan their WHERE
 //! clause through the SELECT executor to bind solutions, then tombstone each
-//! resulting ground triple via the same low-level [`StorageEngine`] path as
+//! resulting ground triple via the same coordinated write path as
 //! `DELETE DATA`. Genuinely unimplemented ops fail loud (URS-QEC-X01).
 //! Correctness: legacy RDF identity tests and COUNT/JSON/protocol regressions.
 //! Last revised: 2026-10-27
@@ -39,8 +39,8 @@ pub struct UpdateResult {
 /// Execute a SPARQL UPDATE statement.
 ///
 /// `write_path` is required for the pattern-based ops, which evaluate their
-/// WHERE clause through the SELECT executor; `storage` backs the actual
-/// tombstone/insert writes.
+/// WHERE clause through the SELECT executor and coordinates every mutation.
+/// `storage` is used only for dataset compatibility validation.
 pub async fn execute_update(
     update_str: &str,
     keyspace: &str,
@@ -71,13 +71,13 @@ pub async fn execute_update(
         match op {
             spargebra::GraphUpdateOperation::InsertData { data } => {
                 for quad in data {
-                    insert_quad(quad, keyspace, storage)?;
+                    insert_quad(quad, keyspace, write_path).await?;
                     total_inserted += 1;
                 }
             }
             spargebra::GraphUpdateOperation::DeleteData { data } => {
                 for quad in data {
-                    delete_ground_quad(quad, keyspace, storage)?;
+                    delete_ground_quad(quad, keyspace, write_path).await?;
                     total_deleted += 1;
                 }
             }
@@ -389,7 +389,7 @@ async fn exec_delete_insert(
     insert: &[QuadPattern],
     pattern: &spargebra::algebra::GraphPattern,
     keyspace: &str,
-    storage: &Arc<StorageEngine>,
+    _storage: &Arc<StorageEngine>,
     write_path: &Arc<WritePath>,
     limits: &ExecutionLimits,
 ) -> Result<(usize, usize), SparqlError> {
@@ -462,7 +462,7 @@ async fn exec_delete_insert(
     let deleted = deletes.len();
     let inserted = inserts.len();
     for triple in &deletes {
-        delete_ground_triple(keyspace, target_graph, triple, storage)?;
+        delete_ground_triple(keyspace, target_graph, triple, write_path).await?;
     }
     for triple in &inserts {
         write_triple(
@@ -474,8 +474,9 @@ async fn exec_delete_insert(
             &triple.obj_type,
             &triple.datatype,
             &triple.language,
-            storage,
-        )?;
+            write_path,
+        )
+        .await?;
     }
 
     Ok((deleted, inserted))
@@ -487,7 +488,7 @@ async fn exec_delete_insert(
 async fn exec_clear(
     target: &GraphTarget,
     keyspace: &str,
-    storage: &Arc<StorageEngine>,
+    _storage: &Arc<StorageEngine>,
     write_path: &Arc<WritePath>,
     limits: &ExecutionLimits,
 ) -> Result<usize, SparqlError> {
@@ -531,8 +532,9 @@ async fn exec_clear(
                                 predicate,
                                 object,
                             },
-                            storage,
-                        )?;
+                            write_path,
+                        )
+                        .await?;
                         deleted += 1;
                     }
                 }
@@ -671,13 +673,13 @@ fn object_metadata(
 }
 
 /// Tombstone a ground triple in `graph` (a `rdf_triples` partition component of
-/// `keyspace`) via the shared low-level `StorageEngine` write path (same path
+/// `keyspace`) via the shared coordinated write path (same path
 /// `DELETE DATA` uses).
-fn delete_ground_triple(
+async fn delete_ground_triple(
     keyspace: &str,
     graph: &str,
     triple: &GroundTriple,
-    storage: &Arc<StorageEngine>,
+    write_path: &Arc<WritePath>,
 ) -> Result<(), SparqlError> {
     tombstone_triple(
         keyspace,
@@ -685,15 +687,16 @@ fn delete_ground_triple(
         &triple.subject,
         &triple.predicate,
         &triple.object,
-        storage,
+        write_path,
     )
+    .await
 }
 
 /// Insert a single RDF quad into storage.
-fn insert_quad(
+async fn insert_quad(
     quad: &Quad,
     keyspace: &str,
-    storage: &Arc<StorageEngine>,
+    write_path: &Arc<WritePath>,
 ) -> Result<(), SparqlError> {
     let graph = graph_name_str(&quad.graph_name);
     let subject = named_node_or_var_str(&quad.subject)?;
@@ -701,23 +704,26 @@ fn insert_quad(
     let (object, obj_type, datatype, language) = term_to_rdf(&quad.object)?;
 
     write_triple(
-        keyspace, &graph, &subject, &predicate, &object, &obj_type, &datatype, &language, storage,
+        keyspace, &graph, &subject, &predicate, &object, &obj_type, &datatype, &language,
+        write_path,
     )
+    .await
 }
 
 /// Delete a single ground quad from storage by writing a tombstone row.
-fn delete_ground_quad(
+async fn delete_ground_quad(
     quad: &GroundQuad,
     keyspace: &str,
-    storage: &Arc<StorageEngine>,
+    write_path: &Arc<WritePath>,
 ) -> Result<(), SparqlError> {
     let triple = ground_quad_triple(quad)?;
     delete_ground_triple(
         keyspace,
         &graph_name_str(&quad.graph_name),
         &triple,
-        storage,
+        write_path,
     )
+    .await
 }
 
 fn ground_quad_triple(quad: &GroundQuad) -> Result<GroundTriple, SparqlError> {
@@ -761,13 +767,13 @@ fn validate_key(
 /// This is the ONE path every SPARQL delete (`DELETE DATA`, `DELETE WHERE`,
 /// `DELETE/INSERT … WHERE`, `CLEAR`, `DROP`) funnels through, so the tombstone
 /// encoding cannot drift across ops (URS-QEC-D07/X02).
-fn tombstone_triple(
+async fn tombstone_triple(
     keyspace: &str,
     graph: &str,
     subject: &str,
     predicate: &str,
     object: &Binding,
-    storage: &Arc<StorageEngine>,
+    write_path: &Arc<WritePath>,
 ) -> Result<(), SparqlError> {
     let table_id = triple_store::triples_table_id(keyspace);
     let key = triple_store::checked_partition_key(graph, subject)?;
@@ -792,12 +798,12 @@ fn tombstone_triple(
         primary_key_liveness: LivenessInfo::NONE,
     };
 
-    storage.write(&table_id, &key, row, timestamp)?;
+    write_row(write_path, &table_id, &key, row, timestamp).await?;
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn write_triple(
+async fn write_triple(
     keyspace: &str,
     graph: &str,
     subject: &str,
@@ -806,7 +812,7 @@ fn write_triple(
     obj_type: &str,
     datatype: &Option<String>,
     language: &Option<String>,
-    storage: &Arc<StorageEngine>,
+    write_path: &Arc<WritePath>,
 ) -> Result<(), SparqlError> {
     let term =
         triple_store::canonical_term(obj_type, object, datatype.as_deref(), language.as_deref())?;
@@ -847,7 +853,39 @@ fn write_triple(
         primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
     };
 
-    storage.write(&table_id, &key, row, timestamp)?;
+    write_row(write_path, &table_id, &key, row, timestamp).await?;
+    Ok(())
+}
+
+/// Use the deployment coordinator's established defaults in cluster mode and
+/// RF2 QUORUM in pair mode, including the singleton archive barrier.
+async fn write_row(
+    path: &WritePath,
+    table: &ferrosa_storage::TableId,
+    key: &ferrosa_common::key::DecoratedKey,
+    row: Row,
+    timestamp: i64,
+) -> Result<(), SparqlError> {
+    match path {
+        WritePath::Cluster(coordinator) => {
+            coordinator
+                .coordinate_write(table, key, row, timestamp)
+                .await?;
+        }
+        _ => {
+            path.write(
+                table,
+                key,
+                row,
+                timestamp,
+                ferrosa_cluster::consistency::ConsistencyLevel::Quorum,
+                &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
+                    replication_factor: 2,
+                },
+            )
+            .await?;
+        }
+    }
     Ok(())
 }
 

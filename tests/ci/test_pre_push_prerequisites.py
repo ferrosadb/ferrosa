@@ -63,6 +63,17 @@ else:
         self.assertEqual(calls[0][1], calls[1][1])
         self.assertTrue(cleaned, calls)
 
+    def test_live_s3_archive_is_excluded_from_credential_free_lanes(self):
+        # The S3 test lives inline in the cluster library, outside the generic
+        # guard's integration-target discovery. It must never use CI credentials
+        # implicitly or fail a credential-free all-features run.
+        skip = "--skip strict_pair_live_s3_ack_replays_exact_mutation"
+        for lane in (".github/workflows/ci.yml",
+                     ".github/workflows/nightly-fuzz.yml",
+                     "scripts/pre-push-mirror-ci.sh"):
+            with self.subTest(lane=lane):
+                self.assertTrue(skip in (ROOT / lane).read_text(), f"{lane} must exclude the opt-in S3 test")
+
     def test_reuses_an_explicit_bundle(self):
         proc, calls, _ = self.run_mirror(supplied=True)
         self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)

@@ -1,0 +1,9 @@
+[package]
+name = "ferrosa-alloc-count"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "ferrosa_alloc_count"
+path = "src/lib.rs"

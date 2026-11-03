@@ -29,7 +29,26 @@ graph. It calls `ferrosa-sim` for the simulator-backed endurance path.
 - **Workloads** (`workload/`) — `register` (single-value register),
   `bank` (conservation-of-money), 16 `lwt-*` LWT patterns, plus the Sprint 2
   membership/forwarding workloads `forward-probe`, `membership-churn`,
-  `late-join-flood`. 21 workloads in the `phase1` registry.
+  `late-join-flood`, and the durability workload `set`. 22 workloads in the
+  `phase1` registry.
+- **`set` workload** (`workload/set.rs`, decisions D7–D9 of
+  `specs/jepsen-evidence`) — inserts unique integers (`nonce << 32 | n`, so a
+  run's values never collide with an earlier run's rows) into
+  `jepsen.set (bucket int, v bigint, PRIMARY KEY (bucket, v))` across
+  `SET_BUCKETS` partitions, at the profile's write level. Each INSERT is
+  acknowledged, indeterminate (timeout or error after send — the default for any
+  error not recognised), or a definite refusal (`Unavailable`, `Overloaded`,
+  invalid/unauthorised, or a driver error raised before sending), recorded in the
+  history. After the workload and nemesis end, `Workload::final_read` waits
+  `FINAL_READ_SETTLE`, then pages every bucket at the profile's read level with a
+  clustering-range query of `FINAL_READ_PAGE` rows, retrying a failing page up to
+  `FINAL_READ_RETRIES` times with logged, doubling backoff. A bucket that still
+  fails is a run failure (`setup_error` "final read failed: bucket N"), never a
+  verdict. The verdict is the durability book's, combined with the history
+  checkers'; the book summary is written to
+  `<topology>-<nemesis>-set.book.json` beside the history. Parameters parse like
+  the consistency profile: unset takes the default (16 buckets, 10 s, 1,000
+  rows, 5 retries), unparseable is refused naming the variable.
 - **Nemeses / fault injection** (`chaos/`) — `NemesisAction` trait
   (`inject`/`heal`). Network (partition halves/ring/one, slow, jitter, packet
   loss — via `iptables`/`tc` over SSH), process (kill minority/majority, pause),
@@ -55,8 +74,43 @@ graph. It calls `ferrosa-sim` for the simulator-backed endurance path.
     I-06–I-10, I-13 over per-node membership snapshots.
   - **Knossos** (`checker/knossos.rs`) — shells out to Clojure/`lein`; only runs
     when a `jepsen_dir` *and* a written history file are both supplied.
-  - **Elle** (`checker/elle.rs`) — types exist; `UnifiedChecker` always sets the
-    Elle result to `None` (not wired to a running checker).
+  - **Elle** (`checker/elle.rs`) — `ElleChecker::check` runs the
+    [`elle-checker`](elle-checker/) project (`lein run <history.edn>`) on an
+    Elle-native EDN history. The verdict is the **exit code** alone: 0 valid,
+    1 invalid or `:unknown`. Any other exit, a missing or unparseable
+    `<history>.anomalies.edn`, or a `lein` that cannot start is a checker
+    error, never a verdict. Anomaly types are the top-level keys of the
+    anomalies file, in Elle's own spelling (`G0-realtime`, `G-single`); stdout
+    is never read (`specs/jepsen-evidence` D3). The project directory comes
+    from `ELLE_CHECKER_DIR` (unset → `ferrosa-jepsen/elle-checker`, relative to
+    the repository root; blank → refused naming the variable). The checker
+    still hard-codes Elle's `list-append` model, so a `rw-register` workload
+    needs a checker change first (JE-7).
+  - **Required checkers.** A workload declares that only the transactional
+    checker can judge its history with `Workload::requires_transactional_checker()`
+    (default `false`; no in-tree workload declares it yet) and exports that
+    history with `Workload::elle_history_edn` (default: refuses). The
+    orchestrator then writes `<combination>.edn` beside the JSONL history and
+    runs Elle on it; Elle's verdict and anomaly types land in
+    `CombinationResult::elle`. If the checker does not run or reaches no
+    verdict, `AllCheckResults::all_passed` refuses the absent result and the
+    orchestrator records a `setup_error`, so the combination — and the run's
+    exit status — fails (D2). A setup failure is always counted as failed in
+    `RunReport`, never as not tested.
+  - **Running the Elle tests.** `checker::elle` and the orchestrator's
+    transactional tests run the real checker and fail loudly without `lein`
+    and a JDK 17+ (`brew install leiningen openjdk@17`, then `lein deps` in
+    `elle-checker/`). The CI Jepsen smoke tier installs a checksum-pinned
+    `lein` 2.11.2 for them.
+  - **Durability book** (`checker/book.rs`) — four multisets kept as
+    value→count maps: `attempted`, `acknowledged`, `indeterminate` (timed out or
+    failed after send) and `recovered` (the final read). It derives
+    `lost = acknowledged − recovered`, `unexpected = recovered − acknowledged`,
+    `fabricated = unexpected − indeterminate` and
+    `recovered_indeterminate = unexpected − fabricated`. Only `lost` and
+    `fabricated` refute, each reported separately and never summed; a run with no
+    acknowledged write is `NotTested("no acknowledged writes")`. Each Lean witness
+    in `specs/lean4/Ferrosa/Testing/Histories.lean` has a test of the same name.
 - **Drivers** (`driver/`) — `rust_driver` connects to a real cluster via the
   `scylla` driver (`phase1`, the only wired driver). Its single-coordinator
   policy first lets the workload session discover topology, selects a stable

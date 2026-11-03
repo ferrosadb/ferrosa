@@ -484,7 +484,7 @@ fn projection_storage_ordinals_for_select_scan(
         let already_needed = needed.iter().any(|column| match column {
             SelectColumn::Column(name) => name.eq_ignore_ascii_case(ann_col),
             SelectColumn::Star => true,
-            SelectColumn::FunctionCall { .. } => false,
+            SelectColumn::FunctionCall { .. } | SelectColumn::Aggregate(_) => false,
         });
         if !already_needed {
             needed.push(SelectColumn::Column(ann_col.clone()));
@@ -520,8 +520,15 @@ fn distinct_full_partition_key_projection(
 
 fn is_count_only_select(columns: &[SelectColumn]) -> bool {
     !columns.is_empty()
-        && columns.iter().all(|c| {
-            matches!(c, SelectColumn::FunctionCall { name, .. } if name.eq_ignore_ascii_case("count"))
+        && columns.iter().all(|c| match c {
+            SelectColumn::FunctionCall { name, .. } => name.eq_ignore_ascii_case("count"),
+            // A distinct-flavoured count counts distinct VALUES, not the rows a
+            // partition holds, so it must never take the metadata pass that
+            // counts partition keys.
+            SelectColumn::Aggregate(call) => {
+                call.kind == AggregateKind::Count && !call.is_distinct_family()
+            }
+            SelectColumn::Star | SelectColumn::Column(_) => false,
         })
 }
 
@@ -648,7 +655,7 @@ fn bounded_partition_clustering_resume(
             .columns
             .get(name)
             .is_some_and(|column| column.kind != ColumnKind::Static),
-        SelectColumn::FunctionCall { .. } => false,
+        SelectColumn::FunctionCall { .. } | SelectColumn::Aggregate(_) => false,
     });
     if !row_preserving_projection
         || s.distinct
@@ -1519,17 +1526,146 @@ fn builtin_scalar_aggregate_stream_shape(s: &SelectStatement) -> bool {
         return false;
     }
     s.columns.iter().all(|c| match c {
+        SelectColumn::Aggregate(call) => {
+            // The distinct-flavoured counts are not a fold over rows: they need
+            // a de-duplicating / estimating state, so they do not qualify.
+            !call.is_distinct_family()
+        }
         SelectColumn::FunctionCall { name, .. } => {
             let n = name.to_lowercase();
             matches!(n.as_str(), "count" | "sum" | "avg" | "min" | "max")
         }
-        _ => false,
+        SelectColumn::Star | SelectColumn::Column(_) => false,
     })
 }
 
+/// The streaming accumulator for one builtin aggregate kind.
+///
+/// `Count` ignores the source column; `SUM`/`AVG`/`MIN`/`MAX` fold the value at
+/// `src_idx` in the row being observed.
+fn streaming_agg_acc_for(
+    kind: AggregateKind,
+    src_idx: usize,
+    col_type: CqlType,
+) -> StreamingAggAcc {
+    match kind {
+        AggregateKind::Count => StreamingAggAcc::Count { count: 0 },
+        AggregateKind::Sum => StreamingAggAcc::SumAvg {
+            is_avg: false,
+            sum: 0.0,
+            n: 0,
+            src_idx,
+            col_type,
+        },
+        AggregateKind::Avg => StreamingAggAcc::SumAvg {
+            is_avg: true,
+            sum: 0.0,
+            n: 0,
+            src_idx,
+            col_type,
+        },
+        AggregateKind::Min => StreamingAggAcc::MinMax {
+            is_max: false,
+            acc: 0.0,
+            seen: false,
+            src_idx,
+            col_type,
+        },
+        AggregateKind::Max => StreamingAggAcc::MinMax {
+            is_max: true,
+            acc: 0.0,
+            seen: false,
+            src_idx,
+            col_type,
+        },
+    }
+}
+
+/// The aggregate a projection carries, with its folded column resolved against
+/// the table's columns.
+///
+/// Reads the AST node when there is one; a directly-built statement (tests, a
+/// UDA spelled `count(...)`) may still present the pre-node `FunctionCall`
+/// shape, which resolves to the same kind. The distinct-flavoured counts are
+/// refused here rather than silently folded as a plain `COUNT` — counting rows
+/// where the query asks for distinct values would be a confidently wrong
+/// answer, the failure this area keeps producing.
+fn aggregate_column_for(
+    sc: &SelectColumn,
+    all_col_names: &[String],
+) -> Result<(AggregateKind, Option<usize>), CqlError> {
+    match sc {
+        SelectColumn::Aggregate(call) => {
+            if call.is_distinct_family() {
+                return Err(CqlError::Invalid(format!(
+                    "{} is not executable yet: COUNT(DISTINCT ...) needs an exact \
+                     de-duplicating fold and COUNT(ESTIMATE_DISTINCT ...) needs the \
+                     bounded-memory lower-bound estimator (ferrosa-storage/src/count.rs)",
+                    if call.estimate_distinct {
+                        "COUNT(ESTIMATE_DISTINCT ...)"
+                    } else {
+                        "COUNT(DISTINCT ...)"
+                    }
+                )));
+            }
+            if call.kind == AggregateKind::Count {
+                return Ok((call.kind, None));
+            }
+            let col_name = match &call.argument {
+                AggregateArgument::Column(name) => name.clone(),
+                AggregateArgument::Term(term) => extract_column_name(term)?,
+                AggregateArgument::Star => {
+                    return Err(CqlError::Invalid(format!(
+                        "{}(*) is not a CQL aggregate",
+                        call.kind.as_str()
+                    )))
+                }
+            };
+            let src_idx = all_col_names
+                .iter()
+                .position(|n| *n == col_name)
+                .ok_or_else(|| {
+                    CqlError::Invalid(format!(
+                        "unknown column in {}(): {col_name}",
+                        call.kind.as_str()
+                    ))
+                })?;
+            Ok((call.kind, Some(src_idx)))
+        }
+        SelectColumn::FunctionCall { name, args, .. } => {
+            let Some(kind) = AggregateKind::from_name(name) else {
+                return Err(CqlError::Invalid(format!(
+                    "streaming aggregate: unsupported function {}",
+                    name.to_lowercase()
+                )));
+            };
+            if kind == AggregateKind::Count {
+                return Ok((kind, None));
+            }
+            // SUM/AVG/MIN/MAX need a source column.
+            let col_name = args
+                .first()
+                .ok_or_else(|| {
+                    CqlError::Invalid(format!("{}() requires a column argument", kind.as_str()))
+                })
+                .and_then(extract_column_name)?;
+            let src_idx = all_col_names
+                .iter()
+                .position(|n| *n == col_name)
+                .ok_or_else(|| {
+                    CqlError::Invalid(format!("unknown column in {}(): {col_name}", kind.as_str()))
+                })?;
+            Ok((kind, Some(src_idx)))
+        }
+        SelectColumn::Star | SelectColumn::Column(_) => Err(CqlError::Invalid(
+            "streaming aggregate: non-aggregate column in aggregate projection".into(),
+        )),
+    }
+}
+
 /// Build the per-column streaming accumulators for a
-/// [`builtin_scalar_aggregate_stream_shape`] query. Returns `None` when a column
-/// references an unknown source column (caller falls back to the error path).
+/// [`builtin_scalar_aggregate_stream_shape`] query. A column that is not an
+/// aggregate, or that references an unknown source column, is an error.
 fn build_agg_accumulators(
     s: &SelectStatement,
     all_col_names: &[String],
@@ -1537,61 +1673,12 @@ fn build_agg_accumulators(
 ) -> Result<Vec<StreamingAggAcc>, CqlError> {
     let mut accs = Vec::with_capacity(s.columns.len());
     for sc in &s.columns {
-        let SelectColumn::FunctionCall { name, args, .. } = sc else {
-            return Err(CqlError::Invalid(
-                "streaming aggregate: non-aggregate column in aggregate projection".into(),
-            ));
-        };
-        let fn_lower = name.to_lowercase();
-        if fn_lower == "count" {
-            accs.push(StreamingAggAcc::Count { count: 0 });
-            continue;
-        }
-        // SUM/AVG/MIN/MAX need a numeric source column.
-        let col_name = args
-            .first()
-            .ok_or_else(|| CqlError::Invalid(format!("{fn_lower}() requires a column argument")))
-            .and_then(extract_column_name)?;
-        let src_idx = all_col_names
-            .iter()
-            .position(|n| *n == col_name)
-            .ok_or_else(|| {
-                CqlError::Invalid(format!("unknown column in {fn_lower}(): {col_name}"))
-            })?;
-        let col_type = all_col_types[src_idx].clone();
-        let acc = match fn_lower.as_str() {
-            "sum" => StreamingAggAcc::SumAvg {
-                is_avg: false,
-                sum: 0.0,
-                n: 0,
-                src_idx,
-                col_type,
-            },
-            "avg" => StreamingAggAcc::SumAvg {
-                is_avg: true,
-                sum: 0.0,
-                n: 0,
-                src_idx,
-                col_type,
-            },
-            "min" => StreamingAggAcc::MinMax {
-                is_max: false,
-                acc: 0.0,
-                seen: false,
-                src_idx,
-                col_type,
-            },
-            "max" => StreamingAggAcc::MinMax {
-                is_max: true,
-                acc: 0.0,
-                seen: false,
-                src_idx,
-                col_type,
-            },
-            other => {
-                return Err(CqlError::Invalid(format!(
-                    "streaming aggregate: unsupported function {other}"
-                )))
+        let (kind, src_idx) = aggregate_column_for(sc, all_col_names)?;
+        let acc = match src_idx {
+            None => streaming_agg_acc_for(kind, 0, CqlType::Bigint),
+            Some(src_idx) => {
+                let col_type = all_col_types[src_idx].clone();
+                streaming_agg_acc_for(kind, src_idx, col_type)
             }
         };
         accs.push(acc);
@@ -1907,13 +1994,10 @@ fn resolve_select_functions(
 /// Whether a SELECT folds its whole result into one row: a built-in
 /// aggregate, or a resolved user-defined aggregate.
 fn select_is_aggregate(s: &SelectStatement, resolved_funcs: &[(usize, ResolvedFunction)]) -> bool {
-    let has_builtin_agg = s.columns.iter().any(|c| {
-        matches!(c, SelectColumn::FunctionCall { name, .. }
-            if name.eq_ignore_ascii_case("count")
-                || name.eq_ignore_ascii_case("avg")
-                || name.eq_ignore_ascii_case("min")
-                || name.eq_ignore_ascii_case("max")
-                || name.eq_ignore_ascii_case("sum"))
+    let has_builtin_agg = s.columns.iter().any(|c| match c {
+        SelectColumn::Aggregate(_) => true,
+        SelectColumn::FunctionCall { name, .. } => AggregateKind::from_name(name).is_some(),
+        SelectColumn::Star | SelectColumn::Column(_) => false,
     });
     has_builtin_agg
         || resolved_funcs
@@ -2004,10 +2088,12 @@ fn result_cursor_shape(
     count_only_select: bool,
     resolved_funcs: &[(usize, ResolvedFunction)],
 ) -> bool {
-    let has_function_projection = s
-        .columns
-        .iter()
-        .any(|c| matches!(c, SelectColumn::FunctionCall { .. }));
+    let has_function_projection = s.columns.iter().any(|c| {
+        matches!(
+            c,
+            SelectColumn::FunctionCall { .. } | SelectColumn::Aggregate(_)
+        )
+    });
     !count_only_select
         && s.ann_of.is_none()
         && (!s.order_by.is_empty() || s.distinct || has_function_projection)
@@ -3157,6 +3243,11 @@ pub async fn route_transactional(
     shim: &mut Option<crate::txn_registry::CqlTxnId>,
     now: std::time::Instant,
 ) -> Option<Result<RouteResult, CqlError>> {
+    if !replica_read_statement(stmt) {
+        if let Some(error) = replica_write_error(state) {
+            return Some(Err(error));
+        }
+    }
     let owner = ctx.auth.role.as_str();
     match stmt {
         Statement::BeginTransaction { timeout_ms } => {
@@ -4061,11 +4152,48 @@ async fn finish_lwt_via_accord(
 // ── Main dispatch ────────────────────────────────────────────────────────
 
 /// Route a parsed statement to the appropriate handler.
+/// Connection admission permits replica reads; mutation authority is checked
+/// before dispatch, including paths that bypass the ordinary write coordinator.
+fn replica_write_error(state: &SharedState) -> Option<CqlError> {
+    use ferrosa_cluster::mode::DeploymentMode;
+    if matches!(
+        state.mode_controller.mode(),
+        DeploymentMode::Pair | DeploymentMode::DegradedPair
+    ) && state.mode_controller.role() != Some(ferrosa_cluster::pair::PairRole::Primary)
+    {
+        Some(CqlError::Overloaded(
+            "writes disallowed on read replica; connect to the primary node".into(),
+        ))
+    } else {
+        None
+    }
+}
+
+fn replica_read_statement(statement: &Statement) -> bool {
+    match statement {
+        Statement::Select(_)
+        | Statement::Use(_)
+        | Statement::Explain(_)
+        | Statement::ListRoles { .. }
+        | Statement::ListPermissions { .. }
+        | Statement::Subscribe(_)
+        | Statement::Unsubscribe { .. }
+        | Statement::Rollback { .. } => true,
+        Statement::InTransaction { inner, .. } => replica_read_statement(inner),
+        _ => false,
+    }
+}
+
 pub async fn route(
     state: &SharedState,
     ctx: &RequestContext<'_>,
     stmt: Statement,
 ) -> Result<RouteResult, CqlError> {
+    if !replica_read_statement(&stmt) {
+        if let Some(error) = replica_write_error(state) {
+            return Err(error);
+        }
+    }
     // Classify the statement opcode for metrics before matching.
     let opcode = match &stmt {
         Statement::Select(_) => CqlOpcode::Select,
@@ -4494,6 +4622,10 @@ async fn route_select(
                         _ => {}
                     }
                 }
+                // Only COUNT is served from a system table (`apply_system_select`
+                // gives it its column); any other aggregate has no value here and
+                // is skipped, exactly as an unrecognised function name was.
+                SelectColumn::Aggregate(_) => {}
                 SelectColumn::Star => unreachable!("handled above"),
             }
         }
@@ -5564,7 +5696,7 @@ async fn route_prepared_select_fast_inner(
         return None;
     }
     if s.columns.iter().any(|col| match col {
-        SelectColumn::FunctionCall { .. } => true,
+        SelectColumn::FunctionCall { .. } | SelectColumn::Aggregate(_) => true,
         SelectColumn::Star | SelectColumn::Column(_) => false,
     }) {
         return None;
@@ -7673,10 +7805,12 @@ async fn route_select_user_table_inner(
                     // Scalar UDFs/toJson are per-row and safe, but excluding all
                     // function calls keeps the streaming gate to plain column/star
                     // projections — exactly the unbounded `SELECT *` OOM shape.
-                    let has_function_projection = s
-                        .columns
-                        .iter()
-                        .any(|c| matches!(c, SelectColumn::FunctionCall { .. }));
+                    let has_function_projection = s.columns.iter().any(|c| {
+                        matches!(
+                            c,
+                            SelectColumn::FunctionCall { .. } | SelectColumn::Aggregate(_)
+                        )
+                    });
                     let distinct_partition_page_shape = s.where_clauses.is_empty()
                         && s.order_by.is_empty()
                         && s.ann_of.is_none()
@@ -8413,13 +8547,10 @@ async fn route_select_user_table_inner(
     let resolved_funcs = select_funcs;
 
     // Check for aggregate functions (builtin COUNT/AVG/MIN/MAX/SUM or UDA).
-    let has_builtin_agg = s.columns.iter().any(|c| {
-        matches!(c, SelectColumn::FunctionCall { name, .. }
-            if name.eq_ignore_ascii_case("count")
-                || name.eq_ignore_ascii_case("avg")
-                || name.eq_ignore_ascii_case("min")
-                || name.eq_ignore_ascii_case("max")
-                || name.eq_ignore_ascii_case("sum"))
+    let has_builtin_agg = s.columns.iter().any(|c| match c {
+        SelectColumn::Aggregate(_) => true,
+        SelectColumn::FunctionCall { name, .. } => AggregateKind::from_name(name).is_some(),
+        SelectColumn::Star | SelectColumn::Column(_) => false,
     });
     let has_uda = resolved_funcs
         .iter()
@@ -8431,6 +8562,44 @@ async fn route_select_user_table_inner(
         let mut agg_row: Vec<Option<CqlValue>> = Vec::with_capacity(s.columns.len());
         for (col_idx, sc) in s.columns.iter().enumerate() {
             match sc {
+                // The aggregate node: same answers the name-matched arms below
+                // produced, read from the node instead of re-parsing the name.
+                // The distinct-flavoured counts are refused, not counted as
+                // rows: their result is a different number.
+                SelectColumn::Aggregate(call) => {
+                    if call.is_distinct_family() {
+                        return Err(CqlError::Invalid(format!(
+                            "{} is not executable yet: it needs the de-duplicating / \
+                             estimating fold (ferrosa-storage/src/count.rs)",
+                            if call.estimate_distinct {
+                                "COUNT(ESTIMATE_DISTINCT ...)"
+                            } else {
+                                "COUNT(DISTINCT ...)"
+                            }
+                        )));
+                    }
+                    if call.kind == AggregateKind::Count {
+                        agg_row.push(Some(CqlValue::Bigint(rows.len() as i64)));
+                        continue;
+                    }
+                    let col_name = match &call.argument {
+                        AggregateArgument::Column(name) => Some(name.clone()),
+                        AggregateArgument::Term(term) => extract_column_name(term).ok(),
+                        AggregateArgument::Star => None,
+                    };
+                    let value = match col_name
+                        .and_then(|name| all_col_names.iter().position(|n| *n == name))
+                    {
+                        Some(src_idx) => compute_builtin_aggregate(
+                            call.kind.as_str(),
+                            &rows,
+                            src_idx,
+                            &all_col_types[src_idx],
+                        ),
+                        None => Some(CqlValue::Null),
+                    };
+                    agg_row.push(value);
+                }
                 SelectColumn::FunctionCall { name, .. } if name.eq_ignore_ascii_case("count") => {
                     agg_row.push(Some(CqlValue::Bigint(rows.len() as i64)));
                 }
@@ -9219,6 +9388,9 @@ pub async fn route_prepared_insert_fast(
     s: &InsertStatement,
     bound_terms: &[Term],
 ) -> Option<Result<RouteResult, CqlError>> {
+    if let Some(error) = replica_write_error(state) {
+        return Some(Err(error));
+    }
     if s.if_not_exists || s.columns.len() != s.values.len() {
         return None;
     }
@@ -13841,6 +14013,22 @@ fn build_column_info(
     for sc in select_columns {
         match sc {
             SelectColumn::Star => unreachable!(),
+            // The aggregate node types the same result column the name-matched
+            // arms below produced, from `kind` instead of a lowercased name.
+            SelectColumn::Aggregate(call) => {
+                let display_name = call.result_name().to_string();
+                let cql_type = match call.kind {
+                    AggregateKind::Count => CqlType::Bigint,
+                    AggregateKind::Avg
+                    | AggregateKind::Min
+                    | AggregateKind::Max
+                    | AggregateKind::Sum => {
+                        resolve_aggregate_argument_type(call, table_meta, ks, schema)?
+                    }
+                };
+                names.push(display_name);
+                types.push(cql_type);
+            }
             SelectColumn::Column(name) => {
                 let col = table_meta
                     .columns
@@ -13958,6 +14146,40 @@ fn build_column_info(
         }
     }
     Ok((names, types))
+}
+
+/// The CQL type of the value an aggregate reports.
+///
+/// `COUNT` (and both distinct-flavoured counts) report `bigint`. `AVG` reports
+/// `double`, except that a `float` column averages to `float`. `SUM`/`MIN`/`MAX`
+/// report the folded column's own type. An argument that is not a column (a
+/// literal, a bind marker) types as `double`, matching the lenient path the
+/// name-matched arms took; an unknown column is an error, not a silent varchar.
+pub(crate) fn resolve_aggregate_argument_type(
+    call: &AggregateCall,
+    table_meta: &TableMetadata,
+    ks: &str,
+    schema: &Schema,
+) -> Result<CqlType, CqlError> {
+    if call.kind == AggregateKind::Count {
+        return Ok(CqlType::Bigint);
+    }
+    let Some(col_name) = call.argument.column_name() else {
+        return Ok(CqlType::Double);
+    };
+    let col_name = col_name.to_lowercase();
+    let col = table_meta.columns.get(&col_name).ok_or_else(|| {
+        CqlError::Invalid(format!(
+            "unknown column in {}(): {col_name}",
+            call.kind.as_str()
+        ))
+    })?;
+    let arg_type = resolve_col_type(&col.column_type, ks, schema)?;
+    Ok(match (call.kind, arg_type) {
+        (AggregateKind::Avg, CqlType::Float) => CqlType::Float,
+        (AggregateKind::Avg, _) => CqlType::Double,
+        (_, arg_type) => arg_type,
+    })
 }
 
 /// Extract partition key values from WHERE clauses, in PK column order.
@@ -15211,6 +15433,15 @@ fn apply_system_select(
     for sc in select_columns_ast {
         match sc {
             SelectColumn::Star => unreachable!(),
+            // System tables are counted, never summed: only COUNT has a value
+            // here, and it is the same "count" / bigint column as before.
+            SelectColumn::Aggregate(call) if call.kind == AggregateKind::Count => {
+                proj_names.push(call.result_name().to_string());
+                proj_types.push(CqlType::Bigint);
+                // COUNT is handled below as aggregate
+                proj_ops.push((usize::MAX, false));
+            }
+            SelectColumn::Aggregate(_) => {}
             SelectColumn::Column(name) => {
                 let idx = all_col_names
                     .iter()
@@ -15275,16 +15506,22 @@ fn apply_system_select(
     }
 
     // Check for COUNT(*) aggregate
-    let has_count = select_columns_ast.iter().any(|c| {
-        matches!(c, SelectColumn::FunctionCall { name, .. } if name.eq_ignore_ascii_case("count"))
+    let has_count = select_columns_ast.iter().any(|c| match c {
+        SelectColumn::Aggregate(call) => call.kind == AggregateKind::Count,
+        SelectColumn::FunctionCall { name, .. } => name.eq_ignore_ascii_case("count"),
+        SelectColumn::Star | SelectColumn::Column(_) => false,
     });
 
     if has_count {
         // Aggregate query -- return a single row
         let mut agg_row: Vec<Option<CqlValue>> = Vec::new();
         for (i, sc) in select_columns_ast.iter().enumerate() {
-            if matches!(sc, SelectColumn::FunctionCall { name, .. } if name.eq_ignore_ascii_case("count"))
-            {
+            let is_count = match sc {
+                SelectColumn::Aggregate(call) => call.kind == AggregateKind::Count,
+                SelectColumn::FunctionCall { name, .. } => name.eq_ignore_ascii_case("count"),
+                SelectColumn::Star | SelectColumn::Column(_) => false,
+            };
+            if is_count {
                 agg_row.push(Some(CqlValue::Bigint(all_rows.len() as i64)));
             } else {
                 let (src_idx, apply_tojson) = proj_ops[i];
@@ -17510,6 +17747,100 @@ mod tests {
             client_address: String::new(),
             protocol_version: 4,
         }
+    }
+
+    #[tokio::test]
+    async fn read_only_pair_rejects_inline_prepared_and_conditional_mutations_before_execution() {
+        let (mut state, _dir) = setup();
+        let auth = dev_auth();
+        let keyspace = None;
+        let ctx = test_ctx(&auth, &keyspace);
+        for query in [
+            "CREATE KEYSPACE ro WITH replication = {'class':'SimpleStrategy','replication_factor':2}",
+            "CREATE TABLE ro.kv (k int PRIMARY KEY, v int)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(query).unwrap()).await.unwrap();
+        }
+        let net = Arc::new(ferrosa_net::config::NetConfig::default());
+        let local = uuid::Uuid::from_u128(2);
+        let (controller, handles) = ferrosa_cluster::ModeController::new(
+            Arc::new(ferrosa_cluster::ClusterConfig::default()),
+            net.clone(),
+            local,
+            state.engine.clone(),
+            state.schema.clone(),
+            Arc::new(ferrosa_net::rpc::HandlerRegistry::new()),
+        );
+        controller.set_peer_manager(Arc::new(
+            ferrosa_net::peer::PeerManager::with_weak_listener(
+                net,
+                local,
+                controller.as_peer_listener(),
+            ),
+        ));
+        ferrosa_net::peer::PeerEventListener::on_peer_connected(
+            &*controller,
+            (uuid::Uuid::from_u128(1), "127.0.0.1:9".parse().unwrap()),
+        );
+        let core = Arc::get_mut(&mut state.core).expect("fixture has one session core owner");
+        core.mode_controller = controller;
+        core.write_path = handles.write_path;
+        core.ddl_path = handles.ddl_path;
+        core.cluster_state = handles.cluster_state;
+        for query in [
+            "INSERT INTO ro.kv (k,v) VALUES (1,2)",
+            "UPDATE ro.kv SET v=3 WHERE k=1",
+            "DELETE FROM ro.kv WHERE k=1",
+            "INSERT INTO ro.kv (k,v) VALUES (1,2) IF NOT EXISTS",
+            "TRUNCATE ro.kv",
+            "DROP TABLE ro.kv",
+            "CREATE TABLE ro.forbidden (k int PRIMARY KEY)",
+        ] {
+            let result = route(&state, &ctx, crate::parser::parse(query).unwrap()).await;
+            assert!(
+                matches!(&result, Err(CqlError::Overloaded(message)) if message.contains("read replica")),
+                "{query}: replica must reject before executing any mutation: {:?}",
+                result.as_ref().err()
+            );
+        }
+        let Statement::Insert(insert) =
+            crate::parser::parse("INSERT INTO ro.kv (k,v) VALUES (?,?)").unwrap()
+        else {
+            panic!("insert fixture")
+        };
+        let fast = route_prepared_insert_fast(
+            &state,
+            &ctx,
+            &insert,
+            &[Term::IntegerLiteral(1), Term::IntegerLiteral(2)],
+        )
+        .await;
+        assert!(
+            matches!(fast, Some(Err(CqlError::Overloaded(_)))),
+            "prepared fast path must reject replica writes"
+        );
+        let block = crate::parser::parse(
+            "BEGIN TRANSACTION; INSERT INTO ro.kv (k,v) VALUES (2,3); COMMIT;",
+        )
+        .unwrap();
+        let mut shim = None;
+        let transaction =
+            route_transactional(&state, &ctx, &block, &mut shim, std::time::Instant::now()).await;
+        assert!(
+            matches!(transaction, Some(Err(CqlError::Overloaded(_)))),
+            "transaction dispatch must reject replica mutations before staging"
+        );
+        let selected = route(
+            &state,
+            &ctx,
+            crate::parser::parse("SELECT * FROM ro.kv WHERE k=1").unwrap(),
+        )
+        .await;
+        assert!(
+            selected.is_ok(),
+            "replica reads must remain usable: {:?}",
+            selected.as_ref().err()
+        );
     }
 
     #[tokio::test]
@@ -23049,11 +23380,10 @@ mod tests {
         }
     }
 
-    /// T-300 gate REMOVED (CQL-T300-01): jsonb DDL is permitted in EVERY
-    /// deployment mode with no capability input. The former "refused outside
-    /// standalone, naming the mode and the D15a ledger" rule is gone.
+    /// JSONB itself has no deployment-mode capability gate. Pair write
+    /// authority still applies when a fixture has no primary grant.
     #[tokio::test]
-    async fn jsonb_ddl_is_permitted_in_every_deployment_mode() {
+    async fn jsonb_ddl_respects_authority_in_every_deployment_mode() {
         use ferrosa_common::deployment_mode::DeploymentMode;
         let (state, _dir) = jsonb_ddl_setup().await;
         let ks_name: Option<String> = Some("ks".into());
@@ -23093,6 +23423,14 @@ mod tests {
             ];
             for cql in cases {
                 let stmt = crate::parser::parse(&cql).unwrap();
+                if matches!(mode, DeploymentMode::Pair | DeploymentMode::DegradedPair) {
+                    let error = route(&state, &ks_ctx, stmt)
+                        .await
+                        .err()
+                        .expect("pair without primary authority must reject DDL");
+                    assert!(matches!(error, CqlError::Overloaded(_)), "{mode}: {error}");
+                    continue;
+                }
                 route(&state, &ks_ctx, stmt)
                     .await
                     .unwrap_or_else(|e| panic!("{mode}: jsonb DDL must be permitted: {cql}: {e}"));
@@ -32814,6 +33152,67 @@ mod tests {
     /// column, an inequality, or a token() call must all fall through to the
     /// real read path: counting only key-matching partitions would ignore the
     /// rest of the WHERE clause and return a confidently wrong number.
+    ///
+    /// Plan-shape characterisation across the aggregate-node change: `COUNT(*)`
+    /// parses as an `Aggregate` node now, but it must still be the one-column
+    /// count-only projection that gates the SSTable-metadata count (one pass over
+    /// the table's metadata, ~75x faster than an index walk at 103k rows) and the
+    /// bounded streaming fold. If either gate stops matching, `COUNT(*)` silently
+    /// falls onto a slower path — the regression this pins.
+    #[test]
+    fn count_star_still_reaches_the_metadata_count_and_streaming_fold_shapes() {
+        let parse_select = |q: &str| {
+            let Statement::Select(sel) = crate::parser::parse(q).unwrap() else {
+                panic!("expected SELECT");
+            };
+            sel
+        };
+
+        let count_star = parse_select("SELECT COUNT(*) FROM ks.t");
+        assert!(
+            is_count_only_select(&count_star.columns),
+            "COUNT(*) must still be the count-only shape: {:?}",
+            count_star.columns
+        );
+        assert!(
+            builtin_scalar_aggregate_stream_shape(&count_star),
+            "COUNT(*) must still qualify for the streaming fold: {:?}",
+            count_star.columns
+        );
+
+        let mixed = parse_select("SELECT COUNT(*), SUM(v), MAX(v) FROM ks.t");
+        assert!(
+            builtin_scalar_aggregate_stream_shape(&mixed),
+            "a mix of scalar aggregates must still fold in one pass: {:?}",
+            mixed.columns
+        );
+        assert!(
+            !is_count_only_select(&mixed.columns),
+            "only an all-COUNT projection may use the metadata count"
+        );
+
+        // The distinct-flavoured counts are NOT the metadata count: they count
+        // distinct values, so counting partition keys would be a wrong answer.
+        for q in [
+            "SELECT COUNT(DISTINCT v) FROM ks.t",
+            "SELECT COUNT(ESTIMATE_DISTINCT v) FROM ks.t",
+        ] {
+            let sel = parse_select(q);
+            assert!(
+                !is_count_only_select(&sel.columns),
+                "{q} must not take the metadata count"
+            );
+            assert!(
+                !builtin_scalar_aggregate_stream_shape(&sel),
+                "{q} must not claim the plain row-fold shape"
+            );
+            assert!(
+                select_is_aggregate(&sel, &[]),
+                "{q} still folds the result to one row"
+            );
+        }
+    }
+
     #[test]
     fn only_partition_key_equalities_qualify_for_a_metadata_count() {
         use std::collections::HashSet;

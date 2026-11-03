@@ -58,10 +58,6 @@ use uuid::Uuid;
 
 use ferrosa_net::peer::PeerManager;
 
-use crate::ddl_path::forward_ddl_to_leader;
-use crate::pair::ddl::DdlOperation;
-use crate::raft::{NodeInfo, NodeState};
-
 // ---------------------------------------------------------------------------
 // Metric counters
 // ---------------------------------------------------------------------------
@@ -150,9 +146,9 @@ impl std::fmt::Display for RejoinError {
 pub async fn attempt_rejoin(
     self_host_id: Uuid,
     self_addr: String,
-    data_center: String,
-    rack: String,
-    cql_broadcast: Option<String>,
+    _data_center: String,
+    _rack: String,
+    _cql_broadcast: Option<String>,
     peers: Vec<(Uuid, SocketAddr)>,
     peer_manager: Arc<PeerManager>,
 ) -> Result<(), RejoinError> {
@@ -171,15 +167,6 @@ pub async fn attempt_rejoin(
         return Err(RejoinError::Exhausted);
     }
 
-    let self_info = NodeInfo {
-        host_id: self_host_id,
-        addr: self_addr.clone(),
-        data_center: data_center.clone(),
-        rack: rack.clone(),
-        state: NodeState::Joining,
-        cql_broadcast: cql_broadcast.clone(),
-    };
-
     let mut backoff_secs = BACKOFF_INITIAL_SECS;
 
     for attempt in 1..=MAX_REJOIN_ATTEMPTS {
@@ -192,7 +179,22 @@ pub async fn attempt_rejoin(
         let mut last_err: Option<String> = None;
 
         for (peer_uuid, _peer_addr) in &peers {
-            let op = DdlOperation::JoinNode(self_info.clone());
+            let resolved = match self_addr.parse::<SocketAddr>() {
+                Ok(addr) => Some(addr),
+                Err(_) => match tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    tokio::net::lookup_host(&self_addr),
+                )
+                .await
+                {
+                    Ok(Ok(mut addresses)) => addresses.next(),
+                    _ => None,
+                },
+            };
+            let Some(addr) = resolved else {
+                last_err = Some("joining internode address did not resolve".into());
+                continue;
+            };
 
             tracing::info!(
                 attempt,
@@ -204,8 +206,17 @@ pub async fn attempt_rejoin(
 
             // Membership op (JoinNode), not a client DDL — no same-node
             // read-your-writes wait (and a rejoining node has no usable raft yet).
-            match forward_ddl_to_leader(None, &peer_manager, *peer_uuid, &op).await {
-                Ok(_committed) => {
+            match super::membership::control::request(
+                &peer_manager,
+                *peer_uuid,
+                crate::membership::MembershipOp::AddVoter {
+                    host_id: self_host_id,
+                    addr,
+                },
+            )
+            .await
+            {
+                Ok(()) => {
                     tracing::info!(
                         attempt,
                         self_id = %self_host_id,

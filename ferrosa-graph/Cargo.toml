@@ -47,6 +47,9 @@ async-trait = "0.1"
 slow-tests = []
 
 [dev-dependencies]
+# The counting `GlobalAlloc` this crate's unit tests install. Dev-only: its `unsafe impl` cannot
+# live here, because this crate forbids `unsafe_code`.
+ferrosa-alloc-count = { path = "../tools/alloc-count" }
 bincode = "1"
 base64 = "0.22"
 bytes = "1"

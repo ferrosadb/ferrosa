@@ -1,0 +1,103 @@
+{
+  "stage": "aeneas",
+  "llbc": "/home/bkearns/src/ferrosa-suite/ferrosa/ferrosa_session.llbc",
+  "lean": "/home/bkearns/.hermes/cache/scratch/leangap-ferrosa-session-j0mx00o5/FerrosaSession.lean",
+  "translation_errors": 0,
+  "translation_unique_reported": null,
+  "translation_messages": [],
+  "aeneas_exit": 1,
+  "lean_errors": 16,
+  "errors": [
+    {
+      "location": "FerrosaSession.lean:1438:31",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSession.lean:1468:31",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSession.lean:1504:31",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSession.lean:1516:22",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `openraft.OptionalSerde`"
+    },
+    {
+      "location": "FerrosaSession.lean:1527:22",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `openraft.OptionalSerde`"
+    },
+    {
+      "location": "FerrosaSession.lean:1607:19",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `openraft.node.NodeId`"
+    },
+    {
+      "location": "FerrosaSession.lean:1619:17",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `openraft.node.Node`"
+    },
+    {
+      "location": "FerrosaSession.lean:1620:19",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `openraft.node.NodeId`"
+    },
+    {
+      "location": "FerrosaSession.lean:1636:17",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `openraft.node.Node`"
+    },
+    {
+      "location": "FerrosaSession.lean:1637:19",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `openraft.node.NodeId`"
+    },
+    {
+      "location": "FerrosaSession.lean:1638:22",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `openraft.OptionalSerde`"
+    },
+    {
+      "location": "FerrosaSession.lean:1720:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `openraft.type_config.RaftTypeConfig`"
+    },
+    {
+      "location": "FerrosaSession.lean:1791:35",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `openraft.type_config.RaftTypeConfig`"
+    },
+    {
+      "location": "FerrosaSession.lean:1808:35",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `openraft.type_config.RaftTypeConfig`"
+    },
+    {
+      "location": "FerrosaSession.lean:1824:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `openraft.type_config.RaftTypeConfig`"
+    },
+    {
+      "location": "FerrosaSession.lean:1826:12",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `openraft.entry.payload.EntryPayload`"
+    }
+  ],
+  "sorry_declarations": 74,
+  "compiled": false,
+  "crate": "ferrosa-session",
+  "prefix": "ferrosa_session::*",
+  "generated_at": "2026-10-31T19:29:59+00:00",
+  "memory_max": "18G",
+  "toolchain": {
+    "charon": "/home/bkearns/src/aeneas/charon/bin/charon",
+    "aeneas": "/home/bkearns/src/aeneas/src/_build/default/main.exe",
+    "lean_pkg": "/home/bkearns/.local/aeneas/backends/lean"
+  }
+}

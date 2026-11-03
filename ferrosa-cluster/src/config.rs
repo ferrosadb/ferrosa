@@ -63,6 +63,10 @@ pub struct ClusterConfig {
     /// Parsed from `FERROSA_EXPECTED_CLUSTER_SIZE`.
     #[serde(default)]
     pub expected_cluster_size: usize,
+    /// Require a shared S3 WAL archive before singleton pair QUORUM ACK.
+    /// ONE remains local; RF2 ALL/TWO always require the follower.
+    #[serde(default)]
+    pub pair_quorum_strict: bool,
     /// CQL broadcast address (host:port) for system.peers.
     /// When set, overrides the internode address for native_address.
     /// Parsed from FERROSA_CQL_BROADCAST env var.
@@ -154,6 +158,7 @@ impl Default for ClusterConfig {
             node_role: NodeRole::Both,
             formation_timeout_secs: None,
             expected_cluster_size: 0,
+            pair_quorum_strict: false,
             cql_broadcast: None,
             raft_heartbeat_ms: 300,
             raft_election_timeout_min_ms: 3000,
@@ -169,6 +174,15 @@ impl ClusterConfig {
     /// Parse configuration from environment variables.
     pub fn from_env() -> Self {
         let mut config = Self::default();
+        match std::env::var("FERROSA_PAIR_QUORUM_STRICT") {
+            Ok(value) => {
+                config.pair_quorum_strict = value
+                    .parse::<bool>()
+                    .expect("FERROSA_PAIR_QUORUM_STRICT must be true or false")
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(error) => panic!("invalid FERROSA_PAIR_QUORUM_STRICT: {error}"),
+        }
 
         if let Ok(name) = std::env::var("FERROSA_CLUSTER_NAME") {
             config.cluster_name = name;

@@ -118,3 +118,10 @@ Near-leaf. **Calls:** `ferrosa-common` (only). **Called by:** `ferrosa`,
 ### PostgreSQL table incarnation isolation (2026-10-26)
 
 The canonical PostgreSQL MVCC Cap'n Proto payload carries `TableMetadata.id` as 16 UUID bytes on each row image and on the partition root (including relation-only metadata without row images). PostgreSQL readers reject missing/invalid UUIDs rather than infer an incarnation from the name. Existing fields retain their ordinals. This additive wire change requires coordinated PostgreSQL participant upgrades: old binaries ignore the new identity fields, and uncheckpointed legacy Accord metadata is not safely replayable without explicit provenance-aware migration.
+
+Pair handoff has its own opaque `PairAuthority` message at tag `0x4C`, gated by
+`CAP_PAIR_AUTHORITY` (`1 << 8`) in `LOCAL_CAPABILITIES`. The cluster layer bounds
+and validates the versioned prepare/challenge/grant payload and persists pair
+identity, generation and owner. Existing `RoleSwap` wire layout is unchanged;
+current cluster handlers refuse its unversioned assignments. A sender that does
+not observe the new capability fails handoff before withdrawing its writer.

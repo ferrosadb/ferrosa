@@ -1,0 +1,27 @@
+# Modules of this package that are extracted Rust rather than prose.
+#
+#   module   crate              sources        charon scope
+#
+# `sources` is what the extraction is a function of: the extraction is in sync when the hash of
+# those files matches the one recorded in `sync.lock`. Keep it as narrow as the scope really is --
+# a wider glob costs false alarms on every unrelated edit, a narrower one lets the generated file
+# go stale without the check noticing.
+#
+# `scope` is the `--start-from` pattern, so the module holds only what its chapter is about.
+# `*` matches one path segment, not a subtree: `m::*` takes the module's own items and leaves every
+# `impl Type` block out, because a method is named `m::Type::method` -- two segments deeper. Give a
+# comma-separated list to include them, e.g. `m::*,m::Type::*`; each pattern is passed separately.
+#
+# The scope below is deliberately the narrow one. The full scope
+#   ferrosa_sstable::compression::*,ferrosa_sstable::compression::Compression::*
+# does bring `Compression::decompress` -- the function the ledger's decompression row is about; the
+# emitted module mentions it 99 times -- but aeneas then hits 7 internal errors
+# (`alloc::io::error::Error::other`, `alloc::boxed::From`, the zstd RefCell wrapper) and the module
+# does not elaborate: 16 Lean errors, all of the shape `core.result.Result Usize
+# ferrosa_common.error.Error` in a position that expects a product type, plus `synthInstanceFailed`
+# on `core.convert.From (Dyn …) Str`. Fix the translator first, then widen this row.
+#
+# Regenerate one with `./extract.sh <module>`; check them all with `./check-sync.sh`.
+
+Storage   ferrosa-storage   src/count.rs       ferrosa_storage::count::*
+Sstable   ferrosa-sstable   src/compression.rs ferrosa_sstable::compression::*

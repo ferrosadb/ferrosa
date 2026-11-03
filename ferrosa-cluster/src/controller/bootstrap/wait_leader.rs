@@ -6,8 +6,10 @@
 //! `formation_timeout_secs`).
 //!
 //! Failure to satisfy the post-condition surfaces as
-//! `BootstrapError::Phase { name: WaitLeader, .. }` — the caller
-//! reverts to `Pair` mode (see existing logic at cluster.rs:~1340).
+//! `BootstrapError::Phase { name: WaitLeader, .. }`. The deadline is a
+//! report, not a verdict: the caller in `cluster.rs` degrades the node
+//! (never to `Pair` for a former member) and keeps waiting for a leader,
+//! completing formation when one appears (t_9c219a2b).
 
 use std::time::Duration;
 

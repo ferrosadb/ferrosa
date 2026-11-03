@@ -1,0 +1,403 @@
+/* Ferrosa branding for the literate specification site.
+
+   Verso's literate stylesheet reads every colour and font from `--verso-*` variables. This file sets
+   them from the Ferrosa design system ("blue steel blueprint", ferrosa-docs `docs/site.css` and
+   `docs/design-system.html`) and changes no layout. Token values are copied from that stylesheet;
+   when the brand palette changes, change them here to match.
+
+   Four tokens differ from the main site, because every text colour here must reach 4.5:1 against
+   every surface it sits on (WCAG 1.4.3), including the inline-code tint: light `accent` and
+   `subtle`, and dark `subtle` and the comment colour. `make a11y` checks the result.
+
+   Dark is the brand default. Light applies when the reader's system asks for it, or when the page
+   sets `data-theme="light"`. Accent cyan is rationed as on the main site: links and the current page
+   only. Blued steel is a line colour, never a text colour. */
+
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap");
+
+:root,
+:root[data-theme="dark"] {
+    --ferrosa-bg: #05070c;
+    --ferrosa-surface: #0e1726;
+    --ferrosa-surface-2: #16243a;
+    --ferrosa-inset: #09111f;
+    --ferrosa-text: #e8f4ff;
+    --ferrosa-muted: #9bb3cf;
+    --ferrosa-subtle: #8197ae;
+    --ferrosa-primary: #348cff;
+    --ferrosa-accent: #7ee7ff;
+    --ferrosa-steel: #516d92;
+    --ferrosa-border: #3d659c;
+    --ferrosa-divider: #17273d;
+    --ferrosa-hairline: #1c3454;
+    --ferrosa-success: #6bc9a0;
+    --ferrosa-warning: #f4a261;
+    --ferrosa-danger: #e25b5b;
+    --ferrosa-on-primary: #04101f;
+    --ferrosa-code-bg: #060b14;
+    --ferrosa-code-text: #dcdcf0;
+    --ferrosa-primary-soft: rgba(52, 140, 255, 0.16);
+    --ferrosa-accent-soft: rgba(126, 231, 255, 0.08);
+    --ferrosa-syn-kw: #c792ea;
+    --ferrosa-syn-fn: #82aaff;
+    --ferrosa-syn-str: #c3e88d;
+    --ferrosa-syn-num: #f78c6c;
+    --ferrosa-syn-com: #8399ae;
+    --ferrosa-logo: url("logo.svg");
+}
+
+:root[data-theme="light"] {
+    --ferrosa-bg: #f4f8fd;
+    --ferrosa-surface: #ffffff;
+    --ferrosa-surface-2: #e7eef7;
+    --ferrosa-inset: #eef4fb;
+    --ferrosa-text: #0c1a2b;
+    --ferrosa-muted: #44586f;
+    --ferrosa-subtle: #56677d;
+    --ferrosa-primary: #2270d8;
+    --ferrosa-accent: #0a6a8a;
+    --ferrosa-steel: #55708f;
+    --ferrosa-border: #6a93bf;
+    --ferrosa-divider: #d7e2ee;
+    --ferrosa-hairline: #e2eaf4;
+    --ferrosa-success: #1d805c;
+    --ferrosa-warning: #a15c14;
+    --ferrosa-danger: #c23b3b;
+    --ferrosa-on-primary: #ffffff;
+    --ferrosa-code-bg: #ffffff;
+    --ferrosa-code-text: #24344a;
+    --ferrosa-primary-soft: rgba(34, 112, 216, 0.10);
+    --ferrosa-accent-soft: rgba(10, 106, 138, 0.10);
+    --ferrosa-syn-kw: #7326a8;
+    --ferrosa-syn-fn: #1b5bb8;
+    --ferrosa-syn-str: #2a6a1c;
+    --ferrosa-syn-num: #9d4a15;
+    --ferrosa-syn-com: #5d6b7a;
+    --ferrosa-logo: url("logo-light.svg");
+}
+
+@media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+        --ferrosa-bg: #f4f8fd;
+        --ferrosa-surface: #ffffff;
+        --ferrosa-surface-2: #e7eef7;
+        --ferrosa-inset: #eef4fb;
+        --ferrosa-text: #0c1a2b;
+        --ferrosa-muted: #44586f;
+        --ferrosa-subtle: #56677d;
+        --ferrosa-primary: #2270d8;
+        --ferrosa-accent: #0a6a8a;
+        --ferrosa-steel: #55708f;
+        --ferrosa-border: #6a93bf;
+        --ferrosa-divider: #d7e2ee;
+        --ferrosa-hairline: #e2eaf4;
+        --ferrosa-success: #1d805c;
+        --ferrosa-warning: #a15c14;
+        --ferrosa-danger: #c23b3b;
+        --ferrosa-on-primary: #ffffff;
+        --ferrosa-code-bg: #ffffff;
+        --ferrosa-code-text: #24344a;
+        --ferrosa-primary-soft: rgba(34, 112, 216, 0.10);
+        --ferrosa-accent-soft: rgba(10, 106, 138, 0.10);
+        --ferrosa-syn-kw: #7326a8;
+        --ferrosa-syn-fn: #1b5bb8;
+        --ferrosa-syn-str: #2a6a1c;
+        --ferrosa-syn-num: #9d4a15;
+        --ferrosa-syn-com: #5d6b7a;
+        --ferrosa-logo: url("logo-light.svg");
+    }
+}
+
+/* Verso's variables, all derived from the tokens above. The selector list repeats Verso's own
+   dark-mode selectors so these win in every theme state, not only the default one. */
+:root,
+:root[data-theme="dark"],
+:root[data-theme="light"] {
+    --verso-text-font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --verso-structure-font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --verso-code-font-family: "JetBrains Mono", "Fira Code", ui-monospace, monospace;
+
+    --verso-text-color: var(--ferrosa-text);
+    --verso-structure-color: var(--ferrosa-text);
+    --verso-background-color: var(--ferrosa-bg);
+    --verso-surface-color: var(--ferrosa-surface);
+    --verso-border-color: var(--ferrosa-divider);
+    --verso-link-color: var(--ferrosa-accent);
+    --verso-link-visited-color: var(--ferrosa-accent);
+    --verso-link-hover-bg: var(--ferrosa-accent-soft);
+    --verso-muted-color: var(--ferrosa-muted);
+    --verso-current-bg: var(--ferrosa-primary);
+    --verso-current-fg: var(--ferrosa-on-primary);
+    --verso-breadcrumb-color: var(--ferrosa-muted);
+    --verso-selected-color: var(--ferrosa-primary-soft);
+
+    --verso-code-box-background-color: var(--ferrosa-code-bg);
+    --verso-code-box-border-color: var(--ferrosa-hairline);
+    --verso-inline-code-bg: var(--ferrosa-surface-2);
+
+    --verso-prose-max-width: 72ch;
+    --verso-blockquote-border-color: var(--ferrosa-steel);
+    --verso-blockquote-color: var(--ferrosa-muted);
+    --verso-docstring-border-color: var(--ferrosa-steel);
+    --verso-imports-summary-color: var(--ferrosa-subtle);
+    --verso-output-color: var(--ferrosa-muted);
+
+    --verso-copy-button-bg: var(--ferrosa-surface-2);
+    --verso-copy-button-border: var(--ferrosa-border);
+    --verso-copy-button-color: var(--ferrosa-muted);
+    --verso-copy-button-hover-bg: var(--ferrosa-surface);
+    --verso-copy-button-copied-color: var(--ferrosa-success);
+
+    --verso-hamburger-bg: var(--ferrosa-surface);
+    --verso-hamburger-border: var(--ferrosa-border);
+    --verso-hamburger-bar-color: var(--ferrosa-text);
+
+    --verso-code-color: var(--ferrosa-code-text);
+    --verso-code-keyword-color: var(--ferrosa-syn-kw);
+    --verso-code-const-color: var(--ferrosa-syn-fn);
+    --verso-code-var-color: var(--ferrosa-code-text);
+    --verso-code-hover-bg-color: var(--ferrosa-surface-2);
+
+    --verso-tooltip-color: var(--ferrosa-text);
+    --verso-tooltip-bg-color: var(--ferrosa-surface);
+    --verso-tooltip-border-color: var(--ferrosa-border);
+    --verso-tooltip-separator-color: var(--ferrosa-divider);
+    --verso-tactic-state-color: var(--ferrosa-text);
+    --verso-tactic-state-bg-color: var(--ferrosa-inset);
+    --verso-tactic-state-border-color: var(--ferrosa-border);
+
+    --verso-info-indicator-color: var(--ferrosa-primary);
+    --verso-message-info-color: var(--ferrosa-text);
+    --verso-code-info-hover-bg-color: var(--ferrosa-primary-soft);
+    --verso-tooltip-info-border-color: var(--ferrosa-border);
+    --verso-warning-indicator-color: var(--ferrosa-warning);
+    --verso-message-warning-color: var(--ferrosa-text);
+    --verso-tooltip-warning-border-color: var(--ferrosa-warning);
+    --verso-error-indicator-color: var(--ferrosa-danger);
+    --verso-message-error-color: var(--ferrosa-danger);
+    --verso-tooltip-error-border-color: var(--ferrosa-danger);
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --verso-text-color: var(--ferrosa-text);
+        --verso-background-color: var(--ferrosa-bg);
+        --verso-surface-color: var(--ferrosa-surface);
+        --verso-border-color: var(--ferrosa-divider);
+        --verso-link-color: var(--ferrosa-accent);
+        --verso-link-visited-color: var(--ferrosa-accent);
+        --verso-code-box-background-color: var(--ferrosa-code-bg);
+        --verso-inline-code-bg: var(--ferrosa-surface-2);
+    }
+
+    .hl.lean.popup {
+        background-color: var(--ferrosa-surface);
+        color: var(--ferrosa-text);
+    }
+}
+
+/* Type. Prose in Inter at a reading size; headings carry weight by value, not by hue. */
+body {
+    font-feature-settings: "cv11", "ss01";
+    -webkit-font-smoothing: antialiased;
+}
+
+h1, h2, h3, h4 {
+    font-family: var(--verso-structure-font-family);
+    letter-spacing: -0.01em;
+    font-weight: 700;
+}
+
+h1 { font-weight: 800; }
+
+/* Hairlines are texture, never meaning: the code box gets a drafting rule on its left edge. */
+.hl.lean.block,
+pre {
+    border-left: 2px solid var(--ferrosa-steel);
+}
+
+/* The wordmark heads the navigation. The SVGs sit beside this file in the built site (`make site`
+   copies `assets/`), and the light variant swaps in with the theme. */
+.sidebar-content::before {
+    content: "";
+    display: block;
+    height: 36px;
+    margin: 20px 16px 12px;
+    background: var(--ferrosa-logo) left center / contain no-repeat;
+}
+
+.sidebar {
+    border-right: 1px solid var(--ferrosa-hairline);
+}
+
+.nav-title {
+    font-family: var(--verso-code-font-family);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-size: 0.75rem;
+    color: var(--ferrosa-subtle);
+}
+
+/* Tables, should a page carry one. Verso's Markdown does not render pipe tables today, so the
+   register and the coverage page use lists; these rules are for HTML tables Verso does emit. */
+table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1rem 0 1.5rem;
+    font-size: 0.9rem;
+}
+
+th {
+    font-family: var(--verso-code-font-family);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 0.72rem;
+    color: var(--ferrosa-subtle);
+    text-align: left;
+    border-bottom: 1px solid var(--ferrosa-border);
+    padding: 0.4rem 0.6rem;
+}
+
+td {
+    border-bottom: 1px solid var(--ferrosa-divider);
+    padding: 0.45rem 0.6rem;
+    vertical-align: top;
+}
+
+/* The register: one theorem per item, a review checkbox in front of each. */
+ul.ferrosa-register {
+    list-style: none;
+    padding-left: 0;
+}
+
+/* Verso emits module-doc list items as `<p>` directly inside the `<ul>`, so style both shapes. */
+ul.ferrosa-register > li,
+ul.ferrosa-register > p {
+    margin: 0;
+    padding: 0.35rem 0 0.35rem 1.75rem;
+    border-bottom: 1px solid var(--ferrosa-divider);
+    position: relative;
+}
+
+ul.ferrosa-register > * > input[type="checkbox"] {
+    position: absolute;
+    left: 0;
+    top: 0.55rem;
+}
+
+ul.ferrosa-register > .ferrosa-reviewed {
+    color: var(--ferrosa-muted);
+}
+
+input[type="checkbox"] {
+    accent-color: var(--ferrosa-primary);
+    width: 1rem;
+    height: 1rem;
+}
+
+.ferrosa-review-count {
+    font-family: var(--verso-code-font-family);
+    font-size: 0.75rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ferrosa-subtle);
+}
+
+.ferrosa-review-total {
+    color: var(--ferrosa-accent);
+}
+
+a { text-decoration-color: var(--ferrosa-steel); text-underline-offset: 0.2em; }
+a:hover { text-decoration-color: var(--ferrosa-accent); }
+
+/* Long lines wrap instead of running out of the box. The corpus's ledgers hold rows whose strings
+   are a sentence or more long, and a box that clips them, or scrolls sideways, cannot be read. */
+.hl.lean.block {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+/* The known-defects list is evaluated from the corpus, so Verso shows it as a command's output. It is
+   prose, so it is set in the text face; elsewhere an output is a type or a value and stays mono. */
+#FerrosaProduct___KnownDefects pre.lean-output.information {
+    font-family: var(--verso-text-font-family);
+    font-size: 1rem;
+    line-height: 1.6;
+    white-space: pre-wrap;
+}
+
+/* A module's opening essay, placed above its code by `postprocess.py`. */
+.ferrosa-module-intro {
+    max-width: var(--verso-prose-max-width);
+    margin: 1.5rem 0 2rem;
+}
+
+.ferrosa-module-intro p {
+    margin: 0 0 1rem;
+    line-height: 1.65;
+}
+
+.ferrosa-module-intro h1,
+h1.ferrosa-page-title {
+    font-size: 1.9rem;
+    line-height: 1.2;
+    margin: 0 0 1rem;
+}
+
+/* Navigation. `postprocess.py` moves each section's link out of its disclosure toggle, so the
+   link and the toggle are two controls side by side, each at least 24px square (WCAG 2.5.8). */
+.module-tree .leaf a,
+.ferrosa-nav-node > a {
+    display: block;
+    min-height: 24px;
+    line-height: 24px;
+}
+
+.ferrosa-nav-node {
+    position: relative;
+    margin-left: 1rem;
+}
+
+.module-tree > .ferrosa-nav-node {
+    margin-left: 0;
+}
+
+.ferrosa-nav-node > a {
+    padding: 0.25rem 0.5rem;
+    border-radius: 0.25rem;
+    color: var(--verso-link-color);
+    text-decoration: none;
+}
+
+.ferrosa-nav-node > a:hover {
+    text-decoration: underline;
+}
+
+.ferrosa-nav-node > a[aria-current="page"] {
+    background-color: var(--verso-current-bg);
+    color: var(--verso-current-fg);
+}
+
+.module-tree .ferrosa-nav-node > details {
+    margin-left: 0;
+}
+
+.module-tree .ferrosa-nav-node > details > summary {
+    position: absolute;
+    top: 0.25rem;
+    left: -24px;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+}
+
+.module-tree .ferrosa-nav-node > details > summary::before {
+    left: 0;
+    width: 24px;
+    line-height: 24px;
+    text-align: center;
+}
+
+.module-tree {
+    padding-left: 24px;
+}

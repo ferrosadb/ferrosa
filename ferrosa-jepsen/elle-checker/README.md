@@ -34,6 +34,13 @@ Isolated from the main `../jepsen` harness so it depends **only** on `jepsen`
    render anomaly graphs — this requires `graphviz` (`dot`) and `gnuplot`;
    without a dir the verdict is reported with no external-tool dependency.
 
+## Driven from Rust
+
+`ferrosa-jepsen`'s `checker::elle::ElleChecker` runs this project the same way
+(`lein run <history.edn>`) and takes the verdict from the exit code only; it
+reads anomaly types from `<history.edn>.anomalies.edn`, never from stdout. Its
+test `elle_verdict_comes_from_the_exit_code` runs both control histories below.
+
 ## Validated
 
 - Known-valid history → `valid? true`.
