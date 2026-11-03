@@ -709,10 +709,9 @@ jobs:
       - name: Push image to GHCR (cross-workflow reuse)
         # Lets the separate, path-filtered driver-smoke workflow and paired
         # repositories pull this image by commit SHA instead of recompiling.
-        # Pull-request workflows run on a synthetic merge SHA, while a paired
-        # repository resolves this branch's head SHA, so publish both tags.
-        # Best-effort: fork PRs lack packages:write, so consumers fall back to
-        # building.
+        # The recorded artifact source is the PR head or event revision.
+        # Fork PRs may lack packages:write; reuse consumers can build their
+        # checked-out source when publication is unavailable.
         continue-on-error: true
         run: |
           set -euo pipefail
