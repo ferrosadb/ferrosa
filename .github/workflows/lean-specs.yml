@@ -203,6 +203,11 @@ jobs:
       REPO: ${{ github.workspace }}
       AENEAS_SRC: ${{ github.workspace }}/aeneas
       CHARON_SRC: ${{ github.workspace }}/aeneas/charon
+      # aeneas' bootstrap creates the switch from OCAML_VERSION. Left unset it does
+      # `opam switch create default -y`, and a GitHub runner's opam has no compiler called
+      # `default`, so the build dies with "No compiler matching `default' found" (exit 5)
+      # before a single crate is measured. Pin the compiler the backend is developed on.
+      OCAML_VERSION: "5.3.0"
       AENEAS: ${{ github.workspace }}/aeneas/src/_build/default/main.exe
       CHARON: ${{ github.workspace }}/aeneas/charon/bin/charon
       LEAN_PKG: ${{ github.workspace }}/aeneas/backends/lean
