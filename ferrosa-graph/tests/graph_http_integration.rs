@@ -5559,6 +5559,185 @@ async fn detach_vertex_preserves_other_scope_shared_adjacency() {
     );
 }
 
+struct ScopedPlainDeleteFixture {
+    schema: Arc<Schema>,
+    storage: Arc<StorageEngine>,
+    _directory: TempDir,
+    tenants: [Uuid; 2],
+    session: Uuid,
+    source: Uuid,
+    targets: [Uuid; 2],
+}
+
+impl ScopedPlainDeleteFixture {
+    async fn new(own_edge: bool) -> Self {
+        let (schema, storage, directory) = setup();
+        create_agent_memory_real_graph_schema(&schema);
+        register_agent_memory_real_tables_with_storage(&storage);
+        let fixture = Self {
+            schema,
+            storage,
+            _directory: directory,
+            tenants: [Uuid::new_v4(), Uuid::new_v4()],
+            session: Uuid::new_v4(),
+            source: Uuid::new_v4(),
+            targets: [Uuid::new_v4(), Uuid::new_v4()],
+        };
+        for index in 0..2 {
+            let tenant = fixture.tenants[index];
+            let session = fixture.session;
+            let source = fixture.source;
+            let target = fixture.targets[index];
+            seed_agent_memory_entity(&fixture.storage, tenant, session, source, "source");
+            seed_agent_memory_entity(&fixture.storage, tenant, session, target, "target");
+            if own_edge || index == 1 {
+                let query = format!("MATCH (a:Entity {{tenant_id: '{tenant}', session_id: '{session}', entity_id: '{source}'}}), (b:Entity {{tenant_id: '{tenant}', session_id: '{session}', entity_id: '{target}'}}) MERGE (a)-[r:CO_OCCURS_WITH {{tenant_id: '{tenant}', session_id: '{session}'}}]->(b) RETURN r");
+                let (status, body) =
+                    temporal_fixture_query(&fixture.schema, &fixture.storage, &query).await;
+                assert_eq!(status, StatusCode::OK, "edge positive: {body:#}");
+            }
+        }
+        fixture
+    }
+
+    fn physical_snapshot(&self) -> [Vec<Uuid>; 3] {
+        use ferrosa_common::{DecoratedKey, PartitionKey};
+        use ferrosa_storage::TableId;
+        let rows = |table: &str, bytes: Vec<u8>| {
+            let mut ids: Vec<_> = self
+                .storage
+                .read(
+                    &TableId::new("agent_memory", table),
+                    &DecoratedKey::new(PartitionKey::new(bytes)),
+                )
+                .unwrap()
+                .map_or_else(Vec::new, |partition| {
+                    partition
+                        .rows
+                        .iter()
+                        .filter(|row| !ferrosa_graph::adjacency::schema::row_is_deleted(row))
+                        .map(|row| Uuid::from_slice(&row.clustering).unwrap())
+                        .collect()
+                });
+            ids.sort();
+            ids
+        };
+        [
+            rows(
+                "entity_store",
+                encode_composite_partition_key(&[
+                    self.tenants[0].as_bytes(),
+                    self.session.as_bytes(),
+                ]),
+            ),
+            rows(
+                "entity_store",
+                encode_composite_partition_key(&[
+                    self.tenants[1].as_bytes(),
+                    self.session.as_bytes(),
+                ]),
+            ),
+            rows("co_occurs_with", self.source.as_bytes().to_vec()),
+        ]
+    }
+
+    fn delete_query(&self, verb: &str) -> String {
+        format!(
+            "MATCH (n:Entity {{tenant_id: '{}', session_id: '{}', entity_id: '{}'}}) {verb} n",
+            self.tenants[0], self.session, self.source
+        )
+    }
+
+    async fn foreign_traversal_count(&self) -> Value {
+        let query = format!("MATCH (a:Entity {{tenant_id: '{}', session_id: '{}', entity_id: '{}'}})-[r:CO_OCCURS_WITH {{tenant_id: '{}', session_id: '{}'}}]->(b:Entity) RETURN count(r)", self.tenants[1], self.session, self.source, self.tenants[1], self.session);
+        let (status, body) = temporal_fixture_query(&self.schema, &self.storage, &query).await;
+        assert_eq!(status, StatusCode::OK, "foreign traversal: {body:#}");
+        body["rows"].clone()
+    }
+}
+
+#[tokio::test]
+async fn plain_delete_scoped_legacy_edge_refuses_without_mutation_then_detaches() {
+    let fixture = ScopedPlainDeleteFixture::new(true).await;
+    let before = fixture.physical_snapshot();
+    assert_eq!(
+        [before[0].len(), before[1].len(), before[2].len()],
+        [2, 2, 2]
+    );
+    assert_eq!(
+        fixture.foreign_traversal_count().await,
+        serde_json::json!([[1]])
+    );
+    let (status, body) = temporal_fixture_query(
+        &fixture.schema,
+        &fixture.storage,
+        &fixture.delete_query("DELETE"),
+    )
+    .await;
+    assert_eq!((status, fixture.physical_snapshot()), (StatusCode::CONFLICT, before.clone()),
+        "plain DELETE must refuse the owned legacy edge and preserve both scopes and every edge: {body:#}");
+    assert!(
+        body.to_string().contains("still has relationships"),
+        "{body:#}"
+    );
+    let (status, body) = temporal_fixture_query(
+        &fixture.schema,
+        &fixture.storage,
+        &fixture.delete_query("DETACH DELETE"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    assert_eq!(
+        fixture.physical_snapshot(),
+        [
+            vec![fixture.targets[0]],
+            before[1].clone(),
+            vec![fixture.targets[1]]
+        ]
+    );
+    assert_eq!(
+        fixture.foreign_traversal_count().await,
+        serde_json::json!([[1]])
+    );
+}
+
+#[tokio::test]
+async fn plain_delete_scoped_foreign_edge_does_not_block_same_uuid_vertex() {
+    let fixture = ScopedPlainDeleteFixture::new(false).await;
+    let before = fixture.physical_snapshot();
+    assert_eq!(
+        [before[0].len(), before[1].len(), before[2].len()],
+        [2, 2, 1]
+    );
+    assert_eq!(
+        fixture.foreign_traversal_count().await,
+        serde_json::json!([[1]])
+    );
+    let (status, body) = temporal_fixture_query(
+        &fixture.schema,
+        &fixture.storage,
+        &fixture.delete_query("DELETE"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "foreign-scope edge must not prohibit this vertex deletion: {body:#}"
+    );
+    assert_eq!(
+        fixture.physical_snapshot(),
+        [
+            vec![fixture.targets[0]],
+            before[1].clone(),
+            before[2].clone()
+        ]
+    );
+    assert_eq!(
+        fixture.foreign_traversal_count().await,
+        serde_json::json!([[1]])
+    );
+}
+
 fn temporal_vertex_fixture() -> (Arc<Schema>, Arc<StorageEngine>, TempDir) {
     fn table(
         name: &str,

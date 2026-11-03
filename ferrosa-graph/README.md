@@ -408,6 +408,12 @@ for multiple clustering columns, a unique UUID component is required. Property
 order and tenant partition columns do not select an endpoint. Hydration uses
 available relationship scope and rejects multiple matching physical rows.
 
+Plain `DELETE` uses the same scoped physical-edge predicate to refuse a vertex
+with an owned live relationship before writing anything. Indexed endpoint
+candidates are checked against their physical rows; a streamed legacy fallback
+stops at the first owned relationship. A foreign tenant's matching UUID does not
+prohibit deletion of this vertex.
+
 `DETACH DELETE` streams declared edge tables and deletes exact incident edge
 and vertex rows in one batch, preserving sibling rows. Shared adjacency entries
 remain live while another physical edge supports them, including edges in other

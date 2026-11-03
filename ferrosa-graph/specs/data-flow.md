@@ -144,7 +144,10 @@ guards.
 
 Logical endpoint bytes are separate from the vertex's complete physical
 partition/clustering key. Deleting a clustered vertex tombstones that exact row
-and the exact physical rows of incident edges. An adjacency tuple can represent
+and the exact physical rows of incident edges. Plain `DELETE` checks the same
+scoped ownership without writing and refuses any owned surviving relationship;
+foreign-scope UUID matches do not count as this vertex's relationships.
+An adjacency tuple can represent
 several physical edge rows, including rows in separate tenant partitions; it
 must stay live while any of them survives. For non-point-checkable legacy edge
 layouts, reconciliation streams support for the current partition's deletion

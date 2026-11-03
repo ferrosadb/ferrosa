@@ -10,7 +10,7 @@
 //! frontiers stop at the configured fan-out bound without a duplicate neighbor
 //! vector.
 //! Last revised: 2026-11-03
-//! Last changed: Keep physical row keys separate from scoped logical endpoints in traversal and DETACH.
+//! Last changed: Preserve scoped logical/physical identity in traversal, DELETE and DETACH.
 
 use crate::executor::io::GraphWrite;
 
@@ -6271,6 +6271,140 @@ async fn protect_shared_index_entries(
     Ok(())
 }
 
+fn graph_edge_tables(
+    schema: &Schema,
+    keyspace: &str,
+) -> Vec<ferrosa_schema::metadata::table::TableMetadata> {
+    schema
+        .snapshot()
+        .tables
+        .values()
+        .filter(|table| {
+            table.keyspace == keyspace
+                && table
+                    .extensions
+                    .get("graph.type")
+                    .is_some_and(|kind| kind == "edge")
+        })
+        .cloned()
+        .collect()
+}
+
+/// Resolve an exact physical vertex row before using its logical endpoint.
+async fn read_vertex_endpoint(
+    write_path: &dyn GraphWrite,
+    meta: &ferrosa_schema::metadata::table::TableMetadata,
+    table: &TableId,
+    key: &DecoratedKey,
+    clustering: &[u8],
+) -> Result<Option<DecoratedKey>> {
+    let Some(partition) = write_path.read(table, key).await? else {
+        return Ok(None);
+    };
+    let Some(row) = partition
+        .rows
+        .iter()
+        .find(|row| row.clustering == clustering && !crate::adjacency::schema::row_is_deleted(row))
+    else {
+        return Ok(None);
+    };
+    graph_vertex_lookup_key(meta, &partition, row, &[]).map(Some)
+}
+
+/// Adjacency is a fast candidate index, never proof that another tenant's row
+/// belongs to this vertex. Point-check only layouts recoverable from endpoints.
+async fn indexed_incident_edge_exists(
+    write_path: &dyn GraphWrite,
+    schema: &Schema,
+    target: &VertexDeleteTarget<'_>,
+) -> Result<bool> {
+    let adjacency_keyspace = adjacency_keyspace_name(&target.table.keyspace);
+    let adjacency = TableId::new(&adjacency_keyspace, "adjacency");
+    let Some(partition) = write_path.read(&adjacency, target.logical_key).await? else {
+        return Ok(false);
+    };
+    for row in &partition.rows {
+        if crate::adjacency::schema::row_is_deleted(row) {
+            continue;
+        }
+        let Some(neighbor) = extract_neighbor_id(&row.clustering, None) else {
+            continue;
+        };
+        let (edge_table, meta) = resolve_edge_from_adjacency_row(Some(schema), row)?;
+        let (Some(source), Some(destination)) = (
+            meta.extensions.get("graph.source"),
+            meta.extensions.get("graph.target"),
+        ) else {
+            continue;
+        };
+        let (src, dst) = match row.clustering.get(2) {
+            Some(&DIRECTION_OUT) => (target.logical_key.key.as_bytes(), neighbor.as_slice()),
+            Some(&DIRECTION_IN) => (neighbor.as_slice(), target.logical_key.key.as_bytes()),
+            _ => continue,
+        };
+        let direct = HashMap::from([
+            (source.clone(), src.to_vec()),
+            (destination.clone(), dst.to_vec()),
+        ]);
+        let Some((key, clustering)) =
+            build_direct_lookup_shape(&meta, &HashMap::new(), &[], &direct)?
+        else {
+            continue;
+        };
+        let table = TableId::new(&edge_table.keyspace, &edge_table.table);
+        let strategy = graph_replication_strategy(Some(schema), &table.keyspace)?;
+        let Some(partition) = write_path
+            .pk_read(&table, &key, ConsistencyLevel::One, &strategy)
+            .await?
+        else {
+            continue;
+        };
+        for row in &partition.rows {
+            if row.clustering == clustering
+                && !crate::adjacency::schema::row_is_deleted(row)
+                && edge_is_incident(write_path, schema, target, &meta, &partition, row).await?
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Read-only refusal check. Missing legacy index entries fall back to a stream
+/// of declared physical edge rows, stopping at the first owned live endpoint.
+async fn scoped_vertex_has_incident_edges(
+    write_path: &dyn GraphWrite,
+    schema: &Schema,
+    target: &VertexDeleteTarget<'_>,
+) -> Result<bool> {
+    let edges = graph_edge_tables(schema, &target.table.keyspace);
+    if edges.is_empty() {
+        return Ok(false);
+    }
+    if indexed_incident_edge_exists(write_path, schema, target).await? {
+        return Ok(true);
+    }
+    for edge in edges {
+        let table = TableId::new(&edge.keyspace, &edge.name);
+        let mut partitions = write_path.range_read_stream_all(&table, 0).await?;
+        while let Some(partition) = partitions.next().await {
+            let partition = partition?;
+            if is_partition_dead(&partition) {
+                continue;
+            }
+            for row in &partition.rows {
+                if !crate::adjacency::schema::row_is_deleted(row)
+                    && edge_is_incident(write_path, schema, target, &edge, &partition, row).await?
+                {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Delete exact physical edge/vertex rows in one atomic batch. Neither legacy
 /// edges nor a clustered vertex may be reconstructed from a logical UUID alone.
 #[allow(clippy::too_many_arguments)]
@@ -6289,15 +6423,17 @@ async fn delete_with_adjacency(
     })?;
     let meta = table_metadata_for(Some(schema), &vertex_table.keyspace, &vertex_table.table)
         .ok_or_else(|| GraphError::Validation("DETACH DELETE vertex metadata is missing".into()))?;
-    let Some(partition) = write_path.read(vertex_table, vertex_key).await? else {
+    let Some(logical_key) = read_vertex_endpoint(
+        write_path,
+        &meta,
+        vertex_table,
+        vertex_key,
+        vertex_clustering,
+    )
+    .await?
+    else {
         return Ok(0);
     };
-    let Some(row) = partition.rows.iter().find(|row| {
-        row.clustering == vertex_clustering && !crate::adjacency::schema::row_is_deleted(row)
-    }) else {
-        return Ok(0);
-    };
-    let logical_key = graph_vertex_lookup_key(&meta, &partition, row, &[])?;
     let target = VertexDeleteTarget {
         table: vertex_table,
         meta: &meta,
@@ -6305,19 +6441,7 @@ async fn delete_with_adjacency(
         clustering: vertex_clustering,
         logical_key: &logical_key,
     };
-    let edges: Vec<_> = schema
-        .snapshot()
-        .tables
-        .values()
-        .filter(|table| {
-            table.keyspace == keyspace
-                && table
-                    .extensions
-                    .get("graph.type")
-                    .is_some_and(|kind| kind == "edge")
-        })
-        .cloned()
-        .collect();
+    let edges = graph_edge_tables(schema, keyspace);
     let mut batch =
         collect_incident_edge_deletes(write_path, schema, &edges, &target, timestamp).await?;
     protect_shared_index_entries(write_path, schema, &edges, &mut batch, timestamp).await?;
@@ -6394,20 +6518,59 @@ async fn check_plain_delete_constraint(
                 .unwrap_or(col_name);
             // Edge tables have no adjacency partition keyed by the edge row;
             // the constraint only governs vertices.
-            let is_edge_table = table_metadata_for(schema, keyspace, table_name)
-                .as_ref()
-                .is_some_and(|meta| {
-                    meta.extensions
-                        .get("graph.type")
-                        .is_some_and(|graph_type| graph_type == "edge")
-                });
+            let table_meta = table_metadata_for(schema, keyspace, table_name);
+            let is_edge_table = table_meta.as_ref().is_some_and(|meta| {
+                meta.extensions
+                    .get("graph.type")
+                    .is_some_and(|kind| kind == "edge")
+            });
             if is_edge_table {
                 continue;
             }
             let key_bytes = hex::decode(&hex_id)
                 .map_err(|e| GraphError::Internal(format!("invalid hex storage key: {e}")))?;
             let key = DecoratedKey::new(PartitionKey::new(key_bytes));
-            if vertex_has_incident_edges(write_path, keyspace, &key).await? {
+            let incident = if let (Some(schema), Some(meta)) = (schema, table_meta.as_ref()) {
+                let table = TableId::new(keyspace, table_name);
+                let clustering = row_values
+                    .get(col_idx)
+                    .and_then(|value| value.as_object())
+                    .and_then(|map| map.get("__ferrosa_clustering"))
+                    .and_then(|value| value.as_str())
+                    .map(hex::decode)
+                    .transpose()
+                    .map_err(|error| {
+                        GraphError::Validation(format!(
+                            "invalid physical vertex clustering: {error}"
+                        ))
+                    })?;
+                let clustering = match clustering {
+                    Some(value) => value,
+                    None if meta.clustering_key.is_empty() => Vec::new(),
+                    None => {
+                        return Err(GraphError::Validation(
+                            "clustered vertex binding is missing its physical row key".into(),
+                        ))
+                    }
+                };
+                if let Some(logical_key) =
+                    read_vertex_endpoint(write_path, meta, &table, &key, &clustering).await?
+                {
+                    let target = VertexDeleteTarget {
+                        table: &table,
+                        meta,
+                        key: &key,
+                        clustering: &clustering,
+                        logical_key: &logical_key,
+                    };
+                    scoped_vertex_has_incident_edges(write_path, schema, &target).await?
+                } else {
+                    false
+                }
+            } else {
+                vertex_has_incident_edges(write_path, keyspace, &key).await?
+            };
+            if incident {
                 return Err(GraphError::ConstraintViolation(format!(
                     "Cannot delete node {hex_id}, because it still has relationships. \
                      To delete this node, you must first delete its relationships, \
