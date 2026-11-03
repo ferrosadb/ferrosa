@@ -2,7 +2,8 @@
   Ferrosa formal specification — the book, as data.
   =================================================
 
-  `specs/lean4/docs/` renders this corpus as a PDF. The prose of that document does not live here:
+  `specs/lean4/site/` renders this corpus as the specification, as HTML and as a PDF printed
+  from that HTML. The prose of that document does not live here:
   it lives in the sources, in the section blocks and the docstrings that the modules already carry
   next to the code they describe. This file holds only what a module cannot say about itself —
   where it sits in the book, and what the part is for.
@@ -17,7 +18,7 @@
 -/
 import Ferrosa.Unimplemented
 
-namespace Ferrosa.Docs.Book
+namespace Ferrosa.Outline
 
 /-- One part of the book: its numeral, its title, the paragraph that opens it, and the modules that
     make it up, in reading order. -/
@@ -164,4 +165,4 @@ theorem placed_module_count : (parts.map (fun p => p.modules.length)).sum = 61 :
 /-- Part numerals are distinct, so `\ref` cannot collide. -/
 theorem part_numerals_distinct : (parts.map (fun p => p.numeral)).Nodup := by decide
 
-end Ferrosa.Docs.Book
+end Ferrosa.Outline

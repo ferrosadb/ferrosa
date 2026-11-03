@@ -1,40 +1,30 @@
-# The book.
+# The corpus, and the data the specification is rendered from.
 #
-# `specs/lean4/docs/` renders this corpus as a PDF. Nothing here writes prose: the chapters are the
-# modules, the sections are the `/-!` blocks, the claim sentences are the ledgers, and the
-# statements come out of Lean itself. Editing the PDF is not possible and editing the generator is
-# usually the wrong fix — write next to the proof instead.
+# Nothing here writes prose: the chapters are the modules, the sections are the `/-!` blocks, the
+# claim sentences are the ledgers, and the statements come out of Lean itself. Editing the rendered
+# document is not possible and editing the generator is usually the wrong fix — write next to the
+# proof instead. `specs/lean4/site/` renders the corpus as the specification; this Makefile only
+# produces the data that renderer reads.
 #
-#   make book        data + PDF, everything
 #   make data        build/specs.json — what the corpus says it proves
-#   make pdf         the PDF, from existing data
-#   make part P=II   one part, for review
-#   make check       the drift checks on their own, no PDF
+#   make check       the drift checks on their own
 #
-# Engine: tectonic if it is on PATH (a single binary, no sudo, no texlive), else latexmk with
-# xelatex. Both consume the same .tex, so CI can use whichever it has.
+# The PDF is printed from the site, not from here: `make -C site pdf`.
 
 LAKE ?= lake
 PYTHON ?= python3
-TECTONIC ?= tectonic
-P ?=
 
 # A Lean `panic!` prints a line and returns a default value, so an exporter that panics still exits
 # 0 with that default in its output. Aborting on panic makes it a failed build instead.
 export LEAN_ABORT_ON_PANIC := 1
 
-.PHONY: book data pdf check clean
-
-book: data pdf
+.PHONY: data check clean
 
 data:
-	$(LAKE) exe docs build/specs.json
+	$(LAKE) exe export build/specs.json
 
 check:
-	$(LAKE) exe docs build/specs.json
-
-pdf:
-	$(PYTHON) docs/render.py $(if $(P),--part $(P),)
+	$(LAKE) exe export build/specs.json
 
 clean:
 	rm -rf build

@@ -21,13 +21,13 @@
 -/
 import Lean
 import Ferrosa
-import Ferrosa.Docs.Book
+import Ferrosa.Outline
 import Ferrosa.Docs.Tex
 import Ferrosa.Docs.Gloss
 
 open Lean
 
-namespace Ferrosa.Docs.Export
+namespace Ferrosa.Export
 
 /-! ## The source walk
 
@@ -228,7 +228,7 @@ def scanFile (env : Environment) (idx : Std.HashMap String (Array Name)) (key sr
               line := i + 1, kind := kw, short, full, doc := pending.getD "", tex, desc
             })
           else
-            IO.eprintln s!"docs: skipping {kw} {full} — no such constant"
+            IO.eprintln s!"export: skipping {kw} {full} — no such constant"
           pending := none
           i := i + 1
   return { key, path, header, evs, namespaces := nss }
@@ -310,10 +310,10 @@ def check (mods : Array ModuleView) : IO UInt32 := do
   for b in bad do
     IO.eprintln b
   if bad.isEmpty then
-    IO.println s!"docs --check: {mods.size} modules clean"
+    IO.println s!"export --check: {mods.size} modules clean"
     pure 0
   else
-    IO.eprintln s!"docs --check: {bad.size} problem(s)"
+    IO.eprintln s!"export --check: {bad.size} problem(s)"
     pure 1
 
 def run (args : List String) : IO UInt32 := do
@@ -330,8 +330,11 @@ def run (args : List String) : IO UInt32 := do
   let mut decls : Array (String × String) := #[]
   for f in files do
     let key := moduleKeyOf f
-    -- the root module is imports only, and `Ferrosa.Docs` is this machinery, not the corpus
-    if key == "Ferrosa" || key.startsWith "Ferrosa.Docs" then continue
+    -- the root module is imports only, and `Ferrosa.Docs` holds the statement formatter, not the
+    -- corpus; `Ferrosa.Outline` (the book's parts) and `Ferrosa.Export` (this file) are the rest of
+    -- that machinery. None of them is a chapter, so none of them gets a page.
+    if key == "Ferrosa" || key.startsWith "Ferrosa.Docs"
+        || key == "Ferrosa.Outline" || key == "Ferrosa.Export" then continue
     let src ← IO.FS.readFile f
     let m ← scanFile env idx key src f
     mods := mods.push m
@@ -363,7 +366,7 @@ def run (args : List String) : IO UInt32 := do
     throw <| IO.userError s!"registered areas {areas.length}, expected 21 (registered_ledger_count)"
 
   let unplaced := areas.filter (fun a =>
-    !Ferrosa.Docs.Book.parts.any (fun p => p.modules.contains a.key))
+    !Ferrosa.Outline.parts.any (fun p => p.modules.contains a.key))
 
   let evJson : Ev → Json
     | .sect level line text => Json.mkObj [("k", Json.str "sect"), ("level", toJson level),
@@ -377,7 +380,7 @@ def run (args : List String) : IO UInt32 := do
     ("namespaces", Json.arr (m.namespaces.map Json.str)),
     ("events", Json.arr (m.evs.map evJson))]
 
-  let partJson := Ferrosa.Docs.Book.parts.toArray.map fun p => Json.mkObj [
+  let partJson := Ferrosa.Outline.parts.toArray.map fun p => Json.mkObj [
     ("numeral", Json.str p.numeral), ("title", Json.str p.title),
     ("intro", Json.str p.intro), ("modules", Json.arr (p.modules.toArray.map Json.str))]
 
@@ -394,20 +397,20 @@ def run (args : List String) : IO UInt32 := do
 
   IO.FS.createDirAll "build"
   IO.FS.writeFile out (root.pretty 80 ++ "\n")
-  IO.println s!"docs: {mods.size} modules, {items} claims, {reds} red, {decls.size} declarations → {out}"
+  IO.println s!"export: {mods.size} modules, {items} claims, {reds} red, {decls.size} declarations → {out}"
   if !unresolved.isEmpty then
-    IO.println s!"docs: {unresolved.size} ledger claims name no declaration:"
+    IO.println s!"export: {unresolved.size} ledger claims name no declaration:"
     for u in unresolved do IO.println s!"  ! {u}"
   if !unplaced.isEmpty then
-    IO.println s!"docs: {unplaced.length} ledgers unplaced in Book.parts:"
+    IO.println s!"export: {unplaced.length} ledgers unplaced in Ferrosa.Outline.parts:"
     for a in unplaced do IO.println s!"  ! {a.key}"
   if !unresolved.isEmpty || !unplaced.isEmpty then return 1
   if checking then return (← check mods)
   return 0
 
-end Ferrosa.Docs.Export
+end Ferrosa.Export
 
 /-- Entry point. It has to live outside the namespace: Lean recognises the entry point by the
     unqualified name `main` in the root module, and a namespaced one is just another definition.
     `Ferrosa/Harness.lean` does the same for the same reason. -/
-def main (args : List String) : IO UInt32 := Ferrosa.Docs.Export.run args
+def main (args : List String) : IO UInt32 := Ferrosa.Export.run args

@@ -1,7 +1,8 @@
 use super::cluster::{
     build_recovered_topology_refresh_plan, build_recovered_topology_token_repair_plan,
-    drain_ddl_queue, keyspace_needs_cluster_replay, peer_topology, seed_join_node_info,
-    should_claim_seed_role, should_initialize_seed_membership, should_run_bootstrap_streaming,
+    drain_ddl_queue, keyspace_needs_cluster_replay, peer_topology, resolve_missing_voters,
+    ring_admission, seed_join_node_info, should_claim_seed_role, should_initialize_seed_membership,
+    should_run_bootstrap_streaming, MissingVoters,
 };
 use super::*;
 use crate::raft::{NodeInfo, NodeState};
@@ -6946,6 +6947,98 @@ fn seed_join_node_info_falls_back_to_local_for_a_silent_peer() {
     );
     assert_eq!(info.data_center, "dc1");
     assert_eq!(info.rack, "rack1");
+}
+
+// ---------------------------------------------------------------------------
+// The leader re-drives missing ring admissions (t_9c219a2b, CL-78).
+//
+// These guard the pieces of the re-drive. The behavioural red is the real-process
+// `data_center_process::a_data_center_that_missed_its_formation_deadline_forms_when_its_peers_arrive`;
+// these were written with the fix, so they are guards, not the red.
+
+#[test]
+fn a_missing_voter_is_resolved_through_the_node_map_to_its_live_connection() {
+    let (a, b) = (Uuid::from_u128(0xa), Uuid::from_u128(0xb));
+    let addr_a: SocketAddr = "127.0.0.1:7001".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:7002".parse().unwrap();
+    let node_map = std::collections::HashMap::from([(1, a), (2, b)]);
+    let resolved = resolve_missing_voters(&[2, 1], &node_map, &[(a, addr_a), (b, addr_b)]);
+    assert_eq!(
+        resolved,
+        MissingVoters {
+            admissible: vec![(b, addr_b), (a, addr_a)],
+            unresolved: vec![],
+        },
+        "each missing voter pairs with ITS host id and address, in the order it was missing"
+    );
+}
+
+#[test]
+fn a_missing_voter_that_cannot_be_described_is_reported_not_dropped() {
+    let (a, gone) = (Uuid::from_u128(0xa), Uuid::from_u128(0xdead));
+    let addr_a: SocketAddr = "127.0.0.1:7001".parse().unwrap();
+    // Node 2 is in the map but not connected; node 3 is not in the map at all.
+    let node_map = std::collections::HashMap::from([(1, a), (2, gone)]);
+    let resolved = resolve_missing_voters(&[1, 2, 3], &node_map, &[(a, addr_a)]);
+    assert_eq!(resolved.admissible, vec![(a, addr_a)]);
+    assert_eq!(
+        resolved.unresolved,
+        vec![2, 3],
+        "a voter the leader cannot describe must stay visible, so the re-drive can say so"
+    );
+}
+
+#[test]
+fn nothing_missing_resolves_to_nothing() {
+    let resolved = resolve_missing_voters(&[], &std::collections::HashMap::new(), &[]);
+    assert_eq!(
+        resolved,
+        MissingVoters {
+            admissible: vec![],
+            unresolved: vec![],
+        }
+    );
+}
+
+#[test]
+fn a_ring_admission_joins_then_assigns_the_members_own_deterministic_tokens() {
+    let host = Uuid::from_u128(0x6666);
+    let node_id = crate::raft::uuid_to_node_id(host);
+    let info = NodeInfo {
+        host_id: host,
+        addr: "127.0.0.1:7006".to_string(),
+        data_center: "eu-west-1".to_string(),
+        rack: "rack-east-a".to_string(),
+        state: NodeState::Normal,
+        cql_broadcast: None,
+    };
+    let (join, assign) = ring_admission(info.clone(), 4);
+    match join.op {
+        crate::raft::RaftOp::JoinNode(joined) => {
+            assert_eq!(joined.host_id, info.host_id);
+            assert_eq!(joined.addr, info.addr);
+            assert_eq!(
+                (joined.data_center.as_str(), joined.rack.as_str()),
+                (info.data_center.as_str(), info.rack.as_str()),
+                "the member is placed in its own DC and rack"
+            );
+        }
+        other => panic!("first command must be JoinNode, got {other:?}"),
+    }
+    match assign.op {
+        crate::raft::RaftOp::AssignTokens {
+            node_id: id,
+            tokens,
+        } => {
+            assert_eq!(id, node_id, "tokens go to the member that joined");
+            assert_eq!(
+                tokens,
+                crate::controller::token::deterministic_tokens_for_node(node_id, 4),
+                "re-proposing must assign the SAME tokens, or it would move ownership"
+            );
+        }
+        other => panic!("second command must be AssignTokens, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------

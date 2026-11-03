@@ -1,7 +1,7 @@
 # Page order and presentation for the literate site. No prose lives here: every sentence on the site
-# comes from the corpus sources, as it does for the PDF.
+# comes from the corpus sources, as it does for the PDF, which is printed from these pages.
 #
-# The order follows the PDF's parts (`Ferrosa/Docs/Book.lean`): the query surface a user meets
+# The order follows the book's parts (`Ferrosa/Outline.lean`): the query surface a user meets
 # first, then consistency and topology, what leaves the cluster, the write path and storage
 # internals, foundations, evidence, and last the accounting of what is not yet proved.
 
@@ -12,8 +12,8 @@ extra_js = ["a11y.js", "review.js"]
 landing_page = "FerrosaProduct"
 order = ["FerrosaProduct", "Ferrosa"]
 
-# The book generator is tooling, not specification.
-exclude = ["Ferrosa.Docs"]
+# Rendering tooling and the book's data, not specification: none of these is a chapter.
+exclude = ["Ferrosa.Docs", "Ferrosa.Outline", "Ferrosa.Export"]
 
 [[targets]]
 library = "FerrosaProduct"

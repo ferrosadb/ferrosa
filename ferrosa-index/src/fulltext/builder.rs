@@ -111,7 +111,7 @@ impl FullTextIndex {
 
 /// Builds a [`FullTextIndex`] by ingesting documents one at a time.
 pub struct FullTextIndexBuilder {
-    analyzer: Box<dyn Analyzer>,
+    analyzer: Analyzer,
     /// term -> list of (partition_key, tf, dl)
     index: HashMap<String, Vec<(Vec<u8>, u32, u32)>>,
     doc_count: u32,
@@ -125,7 +125,7 @@ impl FullTextIndexBuilder {
     }
 
     /// Create a builder with a custom analyzer.
-    pub fn with_analyzer(analyzer: Box<dyn Analyzer>) -> Self {
+    pub fn with_analyzer(analyzer: Analyzer) -> Self {
         Self {
             analyzer,
             index: HashMap::new(),
@@ -146,7 +146,7 @@ impl FullTextIndexBuilder {
     }
 
     /// Create a builder with a custom analyzer and a pre-sized term map.
-    pub fn with_analyzer_and_capacity(analyzer: Box<dyn Analyzer>, terms: usize) -> Self {
+    pub fn with_analyzer_and_capacity(analyzer: Analyzer, terms: usize) -> Self {
         Self {
             analyzer,
             index: HashMap::with_capacity(terms),

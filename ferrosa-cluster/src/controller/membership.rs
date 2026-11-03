@@ -650,18 +650,10 @@ impl ModeController {
                 op: RaftOp::JoinNode(node_info),
                 schema_version,
             };
-            if let Err(e) = raft.client_write(join_cmd).await {
-                clear_pending_join(&pending_joins, host_id);
-                tracing::warn!(peer = %host_id, leader, %e, "JoinNode proposal failed");
-                return;
-            }
-
-            // Propose AssignTokens via Raft.
             let num_tokens = config_clone.num_tokens as usize;
             let tokens: Vec<i64> = (0..num_tokens)
                 .map(|i| generate_deterministic_token(peer_node_id, i))
                 .collect();
-
             let assign_cmd = RaftCommand {
                 op: RaftOp::AssignTokens {
                     node_id: peer_node_id,
@@ -669,13 +661,29 @@ impl ModeController {
                 },
                 schema_version,
             };
-            if let Err(e) = raft.client_write(assign_cmd).await {
-                clear_pending_join(&pending_joins, host_id);
-                tracing::warn!(peer = %host_id, leader, %e, "AssignTokens proposal failed");
-                return;
-            }
-
+            // Leadership can move between the leader check above and this write.
+            // A follower cannot admit anyone (the leader refuses a forwarded
+            // admission), so a refusal leaves it to the leader, which re-proposes
+            // every voter missing from the initial topology (t_9c219a2b).
+            let admitted =
+                crate::raft_forward::propose_ring_member_via_raft(&raft, join_cmd, assign_cmd)
+                    .await;
             clear_pending_join(&pending_joins, host_id);
+            match admitted {
+                Ok(crate::raft_forward::RingAdmission::Committed) => {}
+                Ok(crate::raft_forward::RingAdmission::LeftToLeader) => {
+                    tracing::debug!(
+                        peer = %host_id,
+                        leader,
+                        "not the raft leader; ring admission is left to the leader"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(peer = %host_id, leader, %e, "ring admission (JoinNode + AssignTokens) failed");
+                    return;
+                }
+            }
 
             tracing::info!(
                 peer = %host_id,

@@ -63,6 +63,11 @@ jobs:
         run: python3 -m unittest -q tests/ci/test_ci_cache_workflow.py
       - name: Check CI builds the shipped binary once
         run: python3 -m unittest -q tests/ci/test_ci_build_once.py
+      # The specification's PDF is the Verso site, printed. A second renderer is the defect this
+      # replaced, so this pins that the workflow has none and that the assembler takes its chapter
+      # order from the pages Verso built.
+      - name: Check the specification PDF is printed from the site
+        run: python3 -m unittest -q tests/ci/test_lean_specs_pdf.py
       - name: Check Bolt benchmarks require indexed schemas
         run: python3 -m unittest -q tests/ci/test_bolt_benchmark_schema.py
       - name: Check SPARQL benchmark HTTP contract
@@ -839,6 +844,25 @@ jobs:
         with:
           name: ferrosa-node-image
           path: /tmp/ferrosa-node-image
+      # A bare `docker compose up` pulls with no retry of its own. The compose
+      # file's images all come from downloads.ferrosa.ai, which sits behind
+      # Cloudflare and answers a burst of concurrent CI pulls with a "Too Many
+      # Requests" page that docker reports as `toomanyrequests` -- a plain pull
+      # failure that aborts this job before a single test runs (run 2524,
+      # 2026-11-03, failed that way with every other job green, which makes it
+      # read as a Postgres fault in the PR summary). Pull what the cluster needs
+      # first, through the bounded-retry helper, so a rate-limited window is
+      # waited out. The digests are read back out of the compose file so this
+      # cannot drift from the images the cluster actually starts.
+      - name: Pull the cluster images with a bounded retry
+        run: |
+          set -euo pipefail
+          mapfile -t images < <(
+            grep -oE 'downloads\.ferrosa\.ai/[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' \
+              ferrosa-jepsen/tests/docker/jepsen-cluster.yml | sort -u
+          )
+          printf 'pulling %d pinned images plus %s\n' "${#images[@]}" "$FERROSA_ALPINE_IMAGE"
+          scripts/pull-images.sh "${images[@]}" "$FERROSA_ALPINE_IMAGE"
       - name: Load node image and start the PostgreSQL cluster
         env:
           FERROSA_NIGHTLY_IMAGE: ferrosa-test-node:latest

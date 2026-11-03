@@ -11,8 +11,9 @@ name = "harness"
 root = "Ferrosa.Harness"
 supportInterpreter = true
 
-# The PDF's data. Reads statements from the elaborator and prose from the sources, so the document
-# cannot state a theorem the compiler does not hold. See `docs/render.py`.
+# The site's data. Reads statements from the elaborator and prose from the sources, so the document
+# cannot state a theorem the compiler does not hold. See `site/postprocess.py` and
+# `site/gen_register.py`.
 [[lean_exe]]
-name = "docs"
-root = "Ferrosa.Docs.Export"
+name = "export"
+root = "Ferrosa.Export"

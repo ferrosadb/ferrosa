@@ -22,7 +22,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use ferrosa_index::fulltext::analyzer::{Analyzer, StandardAnalyzer};
+use ferrosa_index::fulltext::analyzer::Analyzer;
 use ferrosa_index::fulltext::builder::FullTextIndexBuilder;
 
 use ferrosa_storage::fulltext_scratch::RowScratch;
@@ -228,7 +228,7 @@ fn per_row_allocation_does_not_grow_with_index_size() {
 /// token for token and in order.
 #[test]
 fn analyze_into_matches_analyze_exactly() {
-    let a = StandardAnalyzer::new();
+    let a = Analyzer::standard();
     let cases = [
         "Hello, World! 123",
         "  leading and trailing  ",
