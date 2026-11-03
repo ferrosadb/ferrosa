@@ -19,6 +19,7 @@ pub mod batchlog;
 pub mod cache;
 pub mod commitlog;
 pub mod compaction;
+pub mod count;
 pub mod data_store;
 pub mod engine;
 pub(crate) mod evicted_read;

@@ -174,3 +174,4 @@ mod tests {
         assert!(state.last_replicated_position.is_none());
     }
 }
+pub(crate) mod authority;

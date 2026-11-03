@@ -402,6 +402,16 @@ impl ModeController {
         // Topology commands built in this task carry the CURRENT schema version
         // (they change no schema); read it from the shared registry here.
         let schema = self.schema.clone();
+        let admission_node_map = self.raft_node_map.load_full();
+        let admission_cancel = self.cancel.clone();
+        let admission_gate = self.membership_admission.clone();
+        let (announced_dc, announced_rack) = peer_topology(
+            host_id,
+            &self.peer_dcs_snapshot(),
+            &self.peer_racks_snapshot(),
+            &self.config.data_center,
+            &self.config.rack,
+        );
 
         self.spawn_tracked(async move {
             let schema_version = schema.snapshot().version;
@@ -511,6 +521,35 @@ impl ModeController {
                 return;
             };
 
+            let is_voter = raft.metrics().borrow().membership_config.membership().voter_ids().any(|id|id==peer_node_id);
+            let needs_admission = existing_member.as_ref().map_or(!is_voter, |info| info.state==NodeState::Joining || (info.state==NodeState::Normal && !is_voter));
+            if needs_admission {
+                let peer_dc=existing_member.as_ref().map(|n|n.data_center.clone()).unwrap_or(announced_dc);
+                if peer_dc != config_clone.data_center {
+                    tracing::warn!(peer=%host_id, dc=%peer_dc, "peer must be admitted by its own DC's membership leader");
+                    clear_pending_join(&pending_joins,host_id);
+                    return;
+                }
+                let result = if leader != uuid_to_node_id(local_host_id) {
+                    let leader_host = ring_holder.load().as_ref().as_ref().and_then(|r|r.get_node(leader).map(|n|n.host_id));
+                    match (peer_manager.as_ref(),leader_host) {
+                        (Some(pm),Some(target))=>control::request(pm,target,crate::membership::MembershipOp::AddVoter { host_id,addr }).await,
+                        _=>Err(ClusterError::Internal("verified admission cannot resolve the current leader".into())),
+                    }
+                } else {
+                    match (peer_manager.as_ref(),admission_node_map.as_ref()) {
+                        (Some(pm),Some(map))=> {
+                            let info=NodeInfo { host_id,addr:desired_addr.clone(),data_center:peer_dc,rack:existing_member.as_ref().map(|n|n.rack.clone()).unwrap_or(announced_rack),state:NodeState::Joining,cql_broadcast:cql_broadcast.clone().or_else(||existing_member.as_ref().and_then(|n|n.cql_broadcast.clone())) };
+                            control::Admission { gate:admission_gate,raft:raft.clone(),node_map:map.clone(),pm:pm.clone(),ring:ring_holder.clone(),schema:schema.clone(),num_tokens:config_clone.num_tokens as usize,cancel:admission_cancel }.run(info,addr).await
+                        }
+                        _=>Err(ClusterError::Internal("verified admission has no network membership map".into())),
+                    }
+                };
+                if let Err(error)=result { tracing::error!(peer=%host_id,%error,"verified membership admission failed; no unverified replica promotion"); }
+                clear_pending_join(&pending_joins,host_id);
+                return;
+            }
+
             if let Some(existing) = existing_member {
                 let refresh_cmd = RaftCommand {
                     op: RaftOp::UpdateNodeInfo(NodeInfo {
@@ -611,18 +650,10 @@ impl ModeController {
                 op: RaftOp::JoinNode(node_info),
                 schema_version,
             };
-            if let Err(e) = raft.client_write(join_cmd).await {
-                clear_pending_join(&pending_joins, host_id);
-                tracing::warn!(peer = %host_id, leader, %e, "JoinNode proposal failed");
-                return;
-            }
-
-            // Propose AssignTokens via Raft.
             let num_tokens = config_clone.num_tokens as usize;
             let tokens: Vec<i64> = (0..num_tokens)
                 .map(|i| generate_deterministic_token(peer_node_id, i))
                 .collect();
-
             let assign_cmd = RaftCommand {
                 op: RaftOp::AssignTokens {
                     node_id: peer_node_id,
@@ -630,13 +661,29 @@ impl ModeController {
                 },
                 schema_version,
             };
-            if let Err(e) = raft.client_write(assign_cmd).await {
-                clear_pending_join(&pending_joins, host_id);
-                tracing::warn!(peer = %host_id, leader, %e, "AssignTokens proposal failed");
-                return;
-            }
-
+            // Leadership can move between the leader check above and this write.
+            // A follower cannot admit anyone (the leader refuses a forwarded
+            // admission), so a refusal leaves it to the leader, which re-proposes
+            // every voter missing from the initial topology (t_9c219a2b).
+            let admitted =
+                crate::raft_forward::propose_ring_member_via_raft(&raft, join_cmd, assign_cmd)
+                    .await;
             clear_pending_join(&pending_joins, host_id);
+            match admitted {
+                Ok(crate::raft_forward::RingAdmission::Committed) => {}
+                Ok(crate::raft_forward::RingAdmission::LeftToLeader) => {
+                    tracing::debug!(
+                        peer = %host_id,
+                        leader,
+                        "not the raft leader; ring admission is left to the leader"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(peer = %host_id, leader, %e, "ring admission (JoinNode + AssignTokens) failed");
+                    return;
+                }
+            }
 
             tracing::info!(
                 peer = %host_id,
@@ -860,3 +907,10 @@ mod streaming_contract_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "membership_verification_tests.rs"]
+mod membership_verification_tests;
+
+#[path = "membership_control.rs"]
+pub(super) mod control;

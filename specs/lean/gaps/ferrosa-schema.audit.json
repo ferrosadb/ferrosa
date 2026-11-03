@@ -1,0 +1,278 @@
+{
+  "stage": "aeneas",
+  "llbc": "/home/bkearns/src/ferrosa-suite/ferrosa/ferrosa_schema.llbc",
+  "lean": "/home/bkearns/.hermes/cache/scratch/leangap-ferrosa-schema-kdrs7w0b/FerrosaSchema.lean",
+  "translation_errors": 0,
+  "translation_unique_reported": null,
+  "translation_messages": [],
+  "aeneas_exit": 1,
+  "lean_errors": 51,
+  "errors": [
+    {
+      "location": "FerrosaSchema.lean:586:4",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_schema.alloc.collections.vec_deque.iter.Iter.Insts.CoreIterTraitsIteratorIteratorSharedAT`"
+    },
+    {
+      "location": "FerrosaSchema.lean:1021:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serializer`"
+    },
+    {
+      "location": "FerrosaSchema.lean:1032:40",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSchema.lean:1057:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serializer`"
+    },
+    {
+      "location": "FerrosaSchema.lean:1068:41",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSchema.lean:1094:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serializer`"
+    },
+    {
+      "location": "FerrosaSchema.lean:1105:39",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSchema.lean:1130:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serializer`"
+    },
+    {
+      "location": "FerrosaSchema.lean:1141:39",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSchema.lean:1166:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serializer`"
+    },
+    {
+      "location": "FerrosaSchema.lean:1178:55",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSchema.lean:1204:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSchema.lean:1204:48",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serializer`"
+    },
+    {
+      "location": "FerrosaSchema.lean:1218:4",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSchema.lean:1218:34",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSchema.lean:1245:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSchema.lean:1245:48",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serializer`"
+    },
+    {
+      "location": "FerrosaSchema.lean:1260:40",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSchema.lean:1261:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSchema.lean:1288:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSchema.lean:1288:48",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serializer`"
+    },
+    {
+      "location": "FerrosaSchema.lean:1302:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSchema.lean:1302:32",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSchema.lean:1328:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serializer`"
+    },
+    {
+      "location": "FerrosaSchema.lean:1341:55",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSchema.lean:1367:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serializer`"
+    },
+    {
+      "location": "FerrosaSchema.lean:1381:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSchema.lean:1429:45",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSchema.lean:1797:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serializer`"
+    },
+    {
+      "location": "FerrosaSchema.lean:1808:45",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSchema.lean:2454:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serializer`"
+    },
+    {
+      "location": "FerrosaSchema.lean:2558:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSchema.lean:2581:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serializer`"
+    },
+    {
+      "location": "FerrosaSchema.lean:2621:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSchema.lean:2644:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serializer`"
+    },
+    {
+      "location": "FerrosaSchema.lean:2669:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSchema.lean:2692:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serializer`"
+    },
+    {
+      "location": "FerrosaSchema.lean:3313:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSchema.lean:3336:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serializer`"
+    },
+    {
+      "location": "FerrosaSchema.lean:3417:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSchema.lean:3557:35",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaSchema.lean:3565:49",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaSchema.lean:3599:36",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaSchema.lean:3607:36",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaSchema.lean:3615:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.ser.Serialize`"
+    },
+    {
+      "location": "FerrosaSchema.lean:3623:30",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaSchema.lean:3631:32",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaSchema.lean:3646:39",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaSchema.lean:3673:39",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaSchema.lean:3701:44",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaSchema.lean:3709:59",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    }
+  ],
+  "sorry_declarations": 91,
+  "compiled": false,
+  "crate": "ferrosa-schema",
+  "prefix": "ferrosa_schema::audit::*",
+  "generated_at": "2026-10-31T18:07:38+00:00",
+  "memory_max": "18G",
+  "toolchain": {
+    "charon": "/home/bkearns/src/aeneas/charon/bin/charon",
+    "aeneas": "/home/bkearns/src/aeneas/src/_build/default/main.exe",
+    "lean_pkg": "/home/bkearns/.local/aeneas/backends/lean"
+  }
+}

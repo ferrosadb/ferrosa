@@ -13,6 +13,8 @@
 //! `ferrosa-session` → `ferrosa-cluster` / `ferrosa-storage` / `ferrosa-schema` /
 //! `ferrosa-net` / `ferrosa-udf` / `ferrosa-common`.
 
+#![forbid(unsafe_code)]
+
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;

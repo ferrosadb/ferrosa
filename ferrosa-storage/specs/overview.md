@@ -545,3 +545,49 @@ semantics retain their existing read/merge rules.
 ## Immutable scalar scan values
 
 CQL values consumed by sorting/test adapters carry shared immutable text/blob payloads. Storage cell payload ownership remains `CellBytes`; cloning it shares immutable backing. Existing external-sort, spill and read formats are unchanged by the runtime-value representation, and shared decoded values do not imply that storage metadata or final response buffers are allocation-free.
+
+
+Strict pair QUORUM uses `retain_commit_log_for_archive` before admission and
+`archive_commit_log_before_ack` after local WAL fsync. The barrier serializes
+with background archive publication, closes/seals WAL segments, streams each in
+8 MiB multipart chunks with incremental SHA256, and awaits the ordinary PITR
+archive manifest before marking the segment archived. Upload/manifest failure
+or cancellation never produces a successful barrier. Existing archive keys and
+WAL recovery format are unchanged; no SSTable synchronization shortcut is used.
+A configured S3 backend supplies the destination without requiring
+`FERROSA_ARCHIVE_ENABLED`; local `file://` storage cannot satisfy this barrier.
+
+Rotation is serialized through final flush and closed-list publication; sealed
+segments reject delayed allocations, and admitted writers drain before the
+final disk snapshot. A failed final sync retains the segment for a later retry.
+Strict retention remains enabled until shutdown, so unarchived WAL can grow
+while the follower is healthy or S3 is unavailable. Default pair mode does no
+new remote work. A cancelled multipart transfer can leave an incomplete remote
+upload for the bucket lifecycle policy to clean up; it has no manifest entry or
+ACK. Before upload, bounded local hashing checks existing manifest entries and
+conditionally creates a SHA256/size reservation for the immutable WAL key.
+Conflicting reuse of an ID fails before overwrite; identical-byte retries are
+safe. Claims contain only control metadata, and never satisfy an ACK or replace
+the ordinary archive/manifest recovery contract. Manifest append uses bounded
+CAS retries across engine instances. Backends without conditional CREATE/update
+fail closed. After losing local WAL state, restore the archive or choose a fresh
+node prefix before accepting new writes; reset IDs cannot overwrite old ACKs.
+
+
+Keyed index lookup re-evaluates each posting against its current row using one
+shared scalar predicate matcher. The matcher uses the current catalog, the same
+BTree/Hash/Composite/Filtered/Phonetic/Geo encoding as index maintenance, declared
+clustering/partition-key component decoding, filter predicates and live cells.
+Old postings cannot return a row whose indexed value changed, expired or was
+tombstoned. Cluster coordinators use the same matcher after canonical row reads.
+Missing/non-scalar declarations and unsupported static-cell/complex-element
+predicates fail loudly instead of guessing. The matcher performs no table scan
+or persisted-index-catalog lookup.
+
+Identity-encoded BTree/Hash/Composite/Filtered predicate comparisons borrow the
+query and cell slices; they do not clone either payload merely to compare it.
+Phonetic and Geo retain their required encoding transformations. The current
+writer rejects empty clustered byte keys; an unsupported empty scalar posting
+on a clustered table is refused before a partition-wide fallback. Ordinary
+nonclustered rows with empty clustering remain supported. No accepted-write or
+internode wire contract was expanded.

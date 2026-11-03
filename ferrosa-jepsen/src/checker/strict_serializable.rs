@@ -371,6 +371,77 @@ mod tests {
         ));
     }
 
+    /// `Accord/Serializable.lean`, `hPhantom_not_serializable`: a read of a
+    /// value no transaction wrote has no serial order at all.
+    #[test]
+    fn rejects_a_read_of_a_value_no_transaction_wrote() {
+        let empty = BTreeMap::new();
+        let history = [txn(1, 1, 2, true, vec![read("x", 9)])];
+        assert!(matches!(
+            check_strict_serializable(&empty, &empty, &history),
+            Err(CheckError::Invalid(_))
+        ));
+    }
+
+    /// `hReadYourWrites_ok`: a read after the transaction's own write sees it.
+    #[test]
+    fn accepts_a_transaction_that_reads_its_own_write() {
+        let empty = BTreeMap::new();
+        let final_state = BTreeMap::from([("x".into(), 1)]);
+        let history = [txn(1, 1, 2, true, vec![write("x", 1), read("x", 1)])];
+        assert!(check_strict_serializable(&empty, &final_state, &history).is_ok());
+    }
+
+    /// `hReadYourWritesBroken_rejected`: the same transaction observed not
+    /// seeing its own write is rejected, because a transaction is atomic and
+    /// its reads are checked against its own writes in program order.
+    #[test]
+    fn rejects_a_transaction_that_misses_its_own_write() {
+        let empty = BTreeMap::new();
+        let final_state = BTreeMap::from([("x".into(), 1)]);
+        let history = [txn(
+            1,
+            1,
+            2,
+            true,
+            vec![
+                write("x", 1),
+                TransactionOperation::Read {
+                    key: "x".into(),
+                    value: None,
+                },
+            ],
+        )];
+        assert!(matches!(
+            check_strict_serializable(&empty, &final_state, &history),
+            Err(CheckError::Invalid(_))
+        ));
+    }
+
+    /// `Testing/Jepsen.lean`, `a_read_only_transaction_can_carry_the_only_cycle`: T2 reads x before
+    /// T1 writes it, T3 reads T1's x and the y T2 has not yet written. T2 → T1 → T3 → T2 is a cycle
+    /// only T3 closes, so a checker that graphs writers alone accepts the history. This one keeps
+    /// read-only transactions, and the history is rejected; without T3 it is accepted.
+    #[test]
+    fn a_read_only_transaction_can_carry_the_only_cycle() {
+        let initial = BTreeMap::from([("x".into(), 0), ("y".into(), 0)]);
+        let final_state = BTreeMap::from([("x".into(), 1), ("y".into(), 1)]);
+        let writers = [
+            txn(1, 1, 10, true, vec![write("x", 1)]),
+            txn(2, 2, 11, true, vec![read("x", 0), write("y", 1)]),
+        ];
+        assert!(
+            check_strict_serializable(&initial, &final_state, &writers).is_ok(),
+            "the writers alone have a serial order: T2 then T1"
+        );
+        let mut with_reader = writers.to_vec();
+        with_reader.push(txn(3, 3, 12, true, vec![read("x", 1), read("y", 0)]));
+        assert!(matches!(
+            check_strict_serializable(&initial, &final_state, &with_reader),
+            Err(CheckError::Invalid(_))
+        ));
+    }
+
     #[test]
     fn ignores_aborted_transactions_and_rejects_search_overflow() {
         let initial = BTreeMap::from([("x".into(), 0)]);

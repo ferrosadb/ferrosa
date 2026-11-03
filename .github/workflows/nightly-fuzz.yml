@@ -127,6 +127,7 @@ jobs:
                  --skip bounded_fetch_reassembles_to_single_pass \
                  --skip read_merge_is_lww_no_data_loss --skip digest_walk_is_deterministic \
                  --skip replicated_jsonb_index_builds_on_every_node \
+                 --skip strict_pair_live_s3_ack_replays_exact_mutation \
                  --skip differential_oracle_dml_agrees \
                  --skip differential_oracle_corpus_agrees \
                  --skip differential_oracle_jsonb \

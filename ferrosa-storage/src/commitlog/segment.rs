@@ -305,6 +305,7 @@ pub struct Segment {
     /// completion. `flush_to_disk()` waits for this to reach zero before
     /// reading the buffer, ensuring no partially-written entries are captured.
     in_flight_writers: AtomicU64,
+    sealed: std::sync::atomic::AtomicBool,
 
     /// Persistent file handle for incremental flush. Opened on first flush,
     /// reused for subsequent appends.
@@ -432,6 +433,7 @@ impl Segment {
             path,
             dirty_tables: DashMap::new(),
             in_flight_writers: AtomicU64::new(0),
+            sealed: std::sync::atomic::AtomicBool::new(false),
             file_handle: Mutex::new(None),
             last_flushed: AtomicU64::new(INITIAL_POSITION),
             last_sync_marker_offset: AtomicU64::new(HEADER_SIZE as u64),
@@ -483,21 +485,34 @@ impl Segment {
     pub fn allocate_and_begin_write(&self, entry_total_size: usize) -> Option<u64> {
         // Increment FIRST so that flush_to_disk() will wait for us even if
         // another thread interleaves between our CAS success and write_entry().
-        self.in_flight_writers.fetch_add(1, Ordering::AcqRel);
+        self.in_flight_writers.fetch_add(1, Ordering::SeqCst);
+        if self.sealed.load(Ordering::SeqCst) {
+            self.in_flight_writers.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
         match self.allocate(entry_total_size) {
             Some(offset) => Some(offset),
             None => {
                 // Allocation failed (segment full) — undo the increment.
-                self.in_flight_writers.fetch_sub(1, Ordering::AcqRel);
+                self.in_flight_writers.fetch_sub(1, Ordering::SeqCst);
                 None
             }
+        }
+    }
+
+    /// Prevent delayed holders of the old active Arc from allocating after
+    /// rotation, then drain every admitted writer before the final snapshot.
+    pub(crate) fn seal_writes(&self) {
+        self.sealed.store(true, Ordering::SeqCst);
+        while self.in_flight_writers.load(Ordering::SeqCst) != 0 {
+            std::thread::yield_now();
         }
     }
 
     /// Decrements the in-flight writer count. Called after `write_entry()`
     /// completes. Paired with the increment in [`allocate()`](Self::allocate).
     pub fn writer_done(&self) {
-        self.in_flight_writers.fetch_sub(1, Ordering::AcqRel);
+        self.in_flight_writers.fetch_sub(1, Ordering::SeqCst);
     }
 
     /// Spins until all in-flight writers have completed their entries.

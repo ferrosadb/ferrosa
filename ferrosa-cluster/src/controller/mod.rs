@@ -223,9 +223,9 @@ pub struct ModeController {
     pub(super) pair_context: Mutex<Option<PairContext>>,
     /// Set by force_promote — overrides UUID election on next pair transition.
     pub(super) force_promoted: AtomicBool,
-    /// Lamport counter incremented on each force_promote. On reconnect after
-    /// a partition, the node with the higher promote_epoch wins primary role.
-    /// Prevents split-brain when both nodes force_promote independently.
+    /// Process-local operator-promotion telemetry. This is not a handshake
+    /// authority or a split-brain fence; durable pair generations and explicit
+    /// operator fencing govern ownership.
     pub(super) promote_epoch: std::sync::atomic::AtomicU64,
     /// Handle to this controller for components it OWNS and that must call back
     /// into it — the DDL path's cross-DC relay. A weak handle because the
@@ -310,6 +310,9 @@ pub struct ModeController {
     /// for testability (unit tests can inspect pending joins without
     /// requiring a full Raft cluster).
     pub(super) pending_joins: Arc<Mutex<Vec<Uuid>>>,
+    /// Serializes guarded data-owner admission across distinct joining hosts.
+    pub(super) membership_admission: Arc<tokio::sync::Mutex<()>>,
+    pub(super) membership_bootstrap: Arc<std::sync::atomic::AtomicBool>,
     /// Serializes mode transitions. Held across the check-and-transition
     /// window to prevent concurrent `on_peer_connected` calls from both
     /// triggering `transition_to_pair` when two peers arrive simultaneously.
@@ -421,13 +424,13 @@ pub(super) fn declared_topology_is_ready(
     match expected_cluster_size {
         0 => match mode {
             DeploymentMode::Standalone => true,
-            DeploymentMode::Pair => role == Some(PairRole::Primary),
+            DeploymentMode::Pair => role.is_some(),
             DeploymentMode::Forming => false,
             DeploymentMode::Cluster => true,
             DeploymentMode::DegradedPair | DeploymentMode::DegradedCluster => true,
         },
         1 => mode == DeploymentMode::Standalone,
-        2 => mode == DeploymentMode::Pair && role == Some(PairRole::Primary),
+        2 => matches!(mode, DeploymentMode::Pair | DeploymentMode::DegradedPair) && role.is_some(),
         expected => {
             mode == DeploymentMode::Cluster && has_raft_leader && committed_voters >= expected
         }
@@ -450,6 +453,19 @@ impl ModeController {
             schema: schema.clone(),
             engine: storage.clone(),
         }));
+
+        match crate::pair::authority::PairAuthority::read(storage.data_dir(), local_host_id) {
+            Ok(Some(_record)) => {
+                write_path.store(Arc::new(WritePath::Unavailable));
+                ddl_path.store(Arc::new(DdlPath::Unavailable));
+            }
+            Err(error) => {
+                tracing::error!(%error, "pair authority recovery failed; writes fenced");
+                write_path.store(Arc::new(WritePath::Unavailable));
+                ddl_path.store(Arc::new(DdlPath::Unavailable));
+            }
+            _ => {}
+        }
 
         // Build a HintConfig from ClusterConfig, then initialise the store.
         // If the hint store fails to initialise (e.g. bad directory permissions)
@@ -566,6 +582,8 @@ impl ModeController {
             approved_nodes: Mutex::new(BTreeSet::new()),
             ring: Arc::new(ArcSwap::from_pointee(None)),
             pending_joins: Arc::new(Mutex::new(Vec::new())),
+            membership_admission: Arc::new(tokio::sync::Mutex::new(())),
+            membership_bootstrap: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             transition_guard: Mutex::new(()),
             seed_initialisation_claimed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             formation_epoch: std::sync::atomic::AtomicU64::new(0),
@@ -740,6 +758,8 @@ impl ModeController {
             approved_nodes: Mutex::new(BTreeSet::new()),
             ring: Arc::new(ArcSwap::from_pointee(None)),
             pending_joins: Arc::new(Mutex::new(Vec::new())),
+            membership_admission: Arc::new(tokio::sync::Mutex::new(())),
+            membership_bootstrap: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             transition_guard: Mutex::new(()),
             seed_initialisation_claimed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             formation_epoch: std::sync::atomic::AtomicU64::new(0),
@@ -819,6 +839,8 @@ impl ModeController {
             approved_nodes: Mutex::new(BTreeSet::new()),
             ring: Arc::new(ArcSwap::from_pointee(None)),
             pending_joins: Arc::new(Mutex::new(Vec::new())),
+            membership_admission: Arc::new(tokio::sync::Mutex::new(())),
+            membership_bootstrap: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             transition_guard: Mutex::new(()),
             seed_initialisation_claimed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             formation_epoch: std::sync::atomic::AtomicU64::new(0),
@@ -934,8 +956,8 @@ impl ModeController {
 
     /// Whether this node should accept CQL client connections.
     ///
-    /// In pair mode only the primary accepts clients; the secondary exists
-    /// solely for replication.  Standalone and cluster nodes always accept.
+    /// Pair replicas accept read traffic. Mutation and DDL dispatch enforce
+    /// primary authority rather than rejecting a connection before its opcode.
     pub fn is_cql_ready(&self) -> bool {
         if !self.consensus_health.is_healthy() {
             return false;
@@ -969,6 +991,9 @@ impl ModeController {
     /// Consensus health is intentionally excluded: a failed node must still
     /// answer OPTIONS/STARTUP and return typed errors for data opcodes.
     pub fn accepts_cql_connections(&self) -> bool {
+        if matches!(&**self.write_path.load(), WritePath::Unavailable) {
+            return false;
+        }
         let expected = self.config.expected_cluster_size;
         // Membership/leadership is observable before the asynchronous bootstrap
         // publishes Raft-backed DDL. Declared clusters must not admit clients

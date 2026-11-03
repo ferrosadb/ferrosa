@@ -1,0 +1,25 @@
+{
+  "stage": "aeneas-crash",
+  "error": "Fatal error: exception Not_found",
+  "trace": [
+    "Fatal error: exception Not_found",
+    "Raised at Stdlib__Map.Make.find in file \"map.ml\", line 141, characters 10-25",
+    "Called from Aeneas__Extract.extract_field_projector in file \"extract/Extract.ml\", line 1143, characters 20-58",
+    "Called from Stdlib__List.iter in file \"list.ml\", line 112, characters 12-15",
+    "Called from Aeneas__Extract.extract_function_call in file \"extract/Extract.ml\", lines 1087-1091, characters 6-12",
+    "Called from Aeneas__Extract.extract_fun_decl_gen in file \"extract/Extract.ml\", lines 2292-2293, characters 8-52",
+    "Called from Aeneas__Translate.export_functions_group_scc.(fun) in file \"Translate.ml\", line 892, characters 14-71",
+    "Called from Stdlib__List.iter in file \"list.ml\", line 112, characters 12-15"
+  ],
+  "llbc": "/home/bkearns/src/ferrosa-suite/ferrosa/ferrosa_index_builder.llbc",
+  "log": "free_blocks: 0\nheap_chunks: 0\n\nPost-processed translated transparent functions:  [####################] 71/71 \u2826\nPost-processed translated transparent functions:  [####################] 71/71 \u2714\ufe0f\n\u001b[?25hminor_collections:      298538\nmajor_collections:      379\ncompactions:            0\nforced_major_collections: 4\n\nminor_words:    86378146278\npromoted_words:  3068265417\nmajor_words:     3103142049\n\ntop_heap_words: 150790075\nheap_words:      10694070\nlive_words:       2489567\nfree_words:       8182907\nlargest_free:           0\nfragments:          21596\n\nlive_blocks: 390637\nfree_blocks: 0\nheap_chunks: 0\nFatal error: exception Not_found\nRaised at Stdlib__Map.Make.find in file \"map.ml\", line 141, characters 10-25\nCalled from Aeneas__Extract.extract_field_projector in file \"extract/Extract.ml\", line 1143, characters 20-58\nCalled from Stdlib__List.iter in file \"list.ml\", line 112, characters 12-15\nCalled from Aeneas__Extract.extract_function_call in file \"extract/Extract.ml\", lines 1087-1091, characters 6-12\nCalled from Aeneas__Extract.extract_fun_decl_gen in file \"extract/Extract.ml\", lines 2292-2293, characters 8-52\nCalled from Aeneas__Translate.export_functions_group_scc.(fun) in file \"Translate.ml\", line 892, characters 14-71\nCalled from Stdlib__List.iter in file \"list.ml\", line 112, characters 12-15\nCalled from Aeneas__Translate.export_functions_group_scc in file \"Translate.ml\", line 906, characters 4-42\nCalled from Stdlib__List.iter in file \"list.ml\", line 112, characters 12-15\nCalled from Aeneas__Translate.export_functions_group in file \"Translate.ml\", line 990, characters 4-45\nCalled from Aeneas__Translate.extract_definitions.(fun) in file \"Translate.ml\", line 1406, characters 10-29\nCalled from Stdlib__List.iter in file \"list.ml\", line 112, characters 12-15\nCalled from Aeneas__Translate.extract_file in file \"Translate.ml\", line 1574, characters 2-36\nCalled from Aeneas__Translate.extract_translated_crate in file \"Translate.ml\", line 2295, characters 5-42\nCalled from Dune__exe__Main in file \"Main.ml\", lines 797-798, characters 8-37",
+  "crate": "ferrosa-index-builder",
+  "prefix": "ferrosa_index_builder::*",
+  "generated_at": "2026-10-31T19:31:28+00:00",
+  "memory_max": "18G",
+  "toolchain": {
+    "charon": "/home/bkearns/src/aeneas/charon/bin/charon",
+    "aeneas": "/home/bkearns/src/aeneas/src/_build/default/main.exe",
+    "lean_pkg": "/home/bkearns/.local/aeneas/backends/lean"
+  }
+}

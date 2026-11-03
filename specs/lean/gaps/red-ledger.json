@@ -1,0 +1,22 @@
+{
+  "stage": "aeneas",
+  "llbc": "/home/bkearns/src/ferrosa-suite/ferrosa/red_ledger.llbc",
+  "lean": "/home/bkearns/.hermes/cache/scratch/leangap-red-ledger-t1los193/RedLedger.lean",
+  "translation_errors": 0,
+  "translation_unique_reported": null,
+  "translation_messages": [],
+  "aeneas_exit": 0,
+  "lean_errors": 0,
+  "errors": [],
+  "sorry_declarations": 0,
+  "compiled": true,
+  "crate": "red-ledger",
+  "prefix": "red_ledger::*",
+  "generated_at": "2026-10-31T21:11:11+00:00",
+  "memory_max": "18G",
+  "toolchain": {
+    "charon": "/home/bkearns/src/aeneas/charon/bin/charon",
+    "aeneas": "/home/bkearns/src/aeneas/src/_build/default/main.exe",
+    "lean_pkg": "/home/bkearns/.local/aeneas/backends/lean"
+  }
+}

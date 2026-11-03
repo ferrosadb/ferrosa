@@ -6082,6 +6082,41 @@ mod bolt_rmw_regressions {
         }
     }
 
+    /// Materialize the label and row before starting either transaction, through
+    /// an engine with the default budget over the same schema, storage and write
+    /// path. The Bolt read runs first-access setup (index DDL and build) into the
+    /// shared storage, so the engine under test finds its indexes current and
+    /// spends none of its own budget building them. Explicit id makes MATCH a
+    /// synchronous local primary-key read, not a range stream with unrelated
+    /// asynchronous I/O in its first poll.
+    async fn seed_outside_the_budget(
+        schema: &Arc<Schema>,
+        storage: &Arc<StorageEngine>,
+        path: &Arc<arc_swap::ArcSwap<ferrosa_cluster::write_path::WritePath>>,
+    ) {
+        use futures::StreamExt;
+        let seed = GraphEngine::new(
+            schema.clone(),
+            storage.clone(),
+            path.clone(),
+            GraphEngineConfig::default(),
+            std::time::Duration::ZERO,
+        );
+        seed.execute(
+            "CREATE (n:BoltRmw {id: 'counter', value: 0})",
+            "neo4j",
+            &superuser_auth(),
+        )
+        .await
+        .unwrap();
+        let (_, rows, _) = seed
+            .execute_bolt_stream_with_params(READ, "neo4j", &superuser_auth(), &HashMap::new())
+            .await
+            .unwrap();
+        let rows: Vec<_> = rows.map(|row| row.unwrap()).collect().await;
+        assert_eq!(rows, vec![vec![serde_json::json!(0)]]);
+    }
+
     struct Fixture {
         engine: Arc<GraphEngine>,
         addr: std::net::SocketAddr,
@@ -6113,6 +6148,7 @@ mod bolt_rmw_regressions {
             let path = Arc::new(arc_swap::ArcSwap::from_pointee(
                 ferrosa_cluster::write_path::WritePath::direct(storage.clone()),
             ));
+            seed_outside_the_budget(&schema, &storage, &path).await;
             let engine = Arc::new(GraphEngine::new(
                 schema.clone(),
                 storage,
@@ -6137,25 +6173,13 @@ mod bolt_rmw_regressions {
                 },
                 shutdown_rx,
             ));
-            let fixture = Self {
+            Self {
                 engine,
                 addr,
                 shutdown,
                 server: Some(server),
                 _dir: dir,
-            };
-            let mut seed = fixture.client().await;
-            // Materialize the label and row before starting either transaction.
-            // Explicit id makes MATCH a synchronous local primary-key read, not
-            // a range stream with unrelated asynchronous I/O in its first poll.
-            seed.query("CREATE (n:BoltRmw {id: 'counter', value: 0})", "neo4j")
-                .await;
-            assert_eq!(
-                seed.query(READ, "neo4j").await,
-                vec![vec![PackValue::Int(0)]]
-            );
-            seed.send(&BoltMessage::Goodbye).await;
-            fixture
+            }
         }
 
         async fn client(&self) -> BoltTestClient {
@@ -6555,6 +6579,31 @@ mod bolt_rmw_regressions {
                 increment(&mut fresh, SECOND).await.unwrap(),
                 vec![vec![PackValue::Int(1)]]
             );
+            fixture.stop().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    /// The fixture's seed must not spend the query timeout of the engine under
+    /// test. It used to seed over Bolt through that engine, so its first-access
+    /// schema and index setup ran under the test's 100 ms budget, and under a
+    /// loaded test binary the seed itself came back `LockClientStopped` (the
+    /// Bolt code for `GraphError::Timeout`) before the gate was exercised
+    /// (t_8fe6ad7a). A zero budget times out any statement that takes
+    /// measurable time, so the fixture builds only if no setup runs under it.
+    #[tokio::test]
+    async fn fixture_setup_does_not_spend_the_query_timeout_under_test() {
+        tokio::time::timeout(HANG_GUARD, async {
+            let fixture = Fixture::with_query_timeout(std::time::Duration::ZERO).await;
+            // Positive control: the engine under test really has a zero budget.
+            assert!(matches!(
+                fixture
+                    .engine
+                    .execute(READ, "neo4j", &superuser_auth())
+                    .await,
+                Err(ferrosa_graph::error::GraphError::Timeout)
+            ));
             fixture.stop().await;
         })
         .await

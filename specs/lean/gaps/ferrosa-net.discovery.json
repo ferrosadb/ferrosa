@@ -1,0 +1,48 @@
+{
+  "stage": "aeneas",
+  "llbc": "/home/bkearns/src/ferrosa-suite/ferrosa/ferrosa_net.llbc",
+  "lean": "/home/bkearns/.hermes/cache/scratch/leangap-ferrosa-net-pm6mkzd_/FerrosaNet.lean",
+  "translation_errors": 0,
+  "translation_unique_reported": null,
+  "translation_messages": [],
+  "aeneas_exit": 1,
+  "lean_errors": 5,
+  "errors": [
+    {
+      "location": "FerrosaNet.lean:677:10",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `core.str.Str.split`"
+    },
+    {
+      "location": "FerrosaNet.lean:681:6",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `Char.Insts.CoreStrPatternPattern`"
+    },
+    {
+      "location": "FerrosaNet.lean:688:6",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `Char.Insts.CoreStrPatternPattern`"
+    },
+    {
+      "location": "FerrosaNet.lean:697:6",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `Char.Insts.CoreStrPatternPattern`"
+    },
+    {
+      "location": "FerrosaNet.lean:707:4",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `Char.Insts.CoreStrPatternPattern`"
+    }
+  ],
+  "sorry_declarations": 1,
+  "compiled": false,
+  "crate": "ferrosa-net",
+  "prefix": "ferrosa_net::discovery::*",
+  "generated_at": "2026-10-31T06:41:47+00:00",
+  "memory_max": "8G",
+  "toolchain": {
+    "charon": "/home/bkearns/src/aeneas/charon/bin/charon",
+    "aeneas": "/home/bkearns/src/aeneas/src/_build/default/main.exe",
+    "lean_pkg": "/home/bkearns/.local/aeneas/backends/lean"
+  }
+}

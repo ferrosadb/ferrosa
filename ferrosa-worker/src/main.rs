@@ -7,6 +7,8 @@
 //! No cluster membership, no Raft, no persistent state.
 //! Pure function: input -> compute -> output.
 
+#![forbid(unsafe_code)]
+
 use serde::{Deserialize, Serialize};
 
 /// Task descriptor -- describes what work the worker should perform.

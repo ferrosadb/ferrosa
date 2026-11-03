@@ -1,0 +1,14 @@
+{
+  "stage": "oom",
+  "memory_max": "18G",
+  "llbc": "/home/bkearns/src/ferrosa-suite/ferrosa/ferrosa_schema.llbc",
+  "error": "aeneas killed at the 18G memory ceiling",
+  "crate": "ferrosa-schema",
+  "prefix": "ferrosa_schema::*",
+  "generated_at": "2026-10-31T17:51:40+00:00",
+  "toolchain": {
+    "charon": "/home/bkearns/src/aeneas/charon/bin/charon",
+    "aeneas": "/home/bkearns/src/aeneas/src/_build/default/main.exe",
+    "lean_pkg": "/home/bkearns/.local/aeneas/backends/lean"
+  }
+}

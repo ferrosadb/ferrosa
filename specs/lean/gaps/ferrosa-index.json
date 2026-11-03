@@ -1,0 +1,25 @@
+{
+  "stage": "aeneas-crash",
+  "error": "Fatal error: exception Aeneas.Errors.CFailure(_)",
+  "trace": [
+    "Fatal error: exception Aeneas.Errors.CFailure(_)",
+    "Raised at Aeneas__Errors.craise_opt_span in file \"Errors.ml\", line 127, characters 4-46",
+    "Called from Aeneas__PrePasses.update_array_default.matches_default_array in file \"PrePasses.ml\", lines 166-167, characters 6-71",
+    "Called from Aeneas__PrePasses.update_array_default.(fun) in file \"PrePasses.ml\", line 194, characters 12-38",
+    "Called from Stdlib__Map.Make.iter in file \"map.ml\", line 305, characters 20-25",
+    "Called from Stdlib__Map.Make.iter in file \"map.ml\", line 305, characters 10-18",
+    "Called from Stdlib__Map.Make.iter in file \"map.ml\", line 305, characters 10-18",
+    "Called from Stdlib__Map.Make.iter in file \"map.ml\", line 305, characters 10-18"
+  ],
+  "llbc": "/home/bkearns/src/ferrosa-suite/ferrosa/ferrosa_index.llbc",
+  "log": "[\u001b[92mInfo\u001b[39m ] Imported: /home/bkearns/src/ferrosa-suite/ferrosa/ferrosa_index.llbc\n[\u001b[91mError\u001b[39m] Internal error: please file an issue\nSource: '/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rand-0.10.1/src/seq/slice.rs', lines 450:0-450:29\nminor_collections:      694\nmajor_collections:      58\ncompactions:            0\nforced_major_collections: 1\n\nminor_words:    170503803\npromoted_words:  69909876\nmajor_words:     71427000\n\ntop_heap_words: 68750945\nheap_words:      7326866\nlive_words:      1824958\nfree_words:      5489859\nlargest_free:          0\nfragments:         12049\n\nlive_blocks: 415709\nfree_blocks: 0\nheap_chunks: 0\nFatal error: exception Aeneas.Errors.CFailure(_)\nRaised at Aeneas__Errors.craise_opt_span in file \"Errors.ml\", line 127, characters 4-46\nCalled from Aeneas__PrePasses.update_array_default.matches_default_array in file \"PrePasses.ml\", lines 166-167, characters 6-71\nCalled from Aeneas__PrePasses.update_array_default.(fun) in file \"PrePasses.ml\", line 194, characters 12-38\nCalled from Stdlib__Map.Make.iter in file \"map.ml\", line 305, characters 20-25\nCalled from Stdlib__Map.Make.iter in file \"map.ml\", line 305, characters 10-18\nCalled from Stdlib__Map.Make.iter in file \"map.ml\", line 305, characters 10-18\nCalled from Stdlib__Map.Make.iter in file \"map.ml\", line 305, characters 10-18\nCalled from Stdlib__Map.Make.iter in file \"map.ml\", line 305, characters 10-18\nCalled from Aeneas__PrePasses.update_array_default in file \"PrePasses.ml\", lines 192-208, characters 2-21\nCalled from Aeneas__PrePasses.apply_passes in file \"PrePasses.ml\", line 2366, characters 14-40\nCalled from Dune__exe__Main in file \"Main.ml\", line 788, characters 14-45",
+  "crate": "ferrosa-index",
+  "prefix": "ferrosa_index::*",
+  "generated_at": "2026-10-31T17:43:03+00:00",
+  "memory_max": "18G",
+  "toolchain": {
+    "charon": "/home/bkearns/src/aeneas/charon/bin/charon",
+    "aeneas": "/home/bkearns/src/aeneas/src/_build/default/main.exe",
+    "lean_pkg": "/home/bkearns/.local/aeneas/backends/lean"
+  }
+}

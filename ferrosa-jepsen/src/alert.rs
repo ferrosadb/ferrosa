@@ -18,6 +18,10 @@ pub struct AlertPayload {
 pub enum AlertStatus {
     Pass,
     Fail,
+    /// Nothing failed, and nothing was confirmed: the run's consistency profile could not support a
+    /// claim either way. Distinct from both, because collapsing it into either one misreports the
+    /// configuration's guarantees.
+    Inconclusive,
 }
 
 /// Send an alert to a webhook URL.
@@ -65,10 +69,15 @@ pub fn alert_from_report(report: &crate::report::RunReport, tier: &str) -> Alert
     AlertPayload {
         run_id: report.run_id.clone(),
         tier: tier.into(),
-        status: if report.all_passed() {
+        status: if !report.all_passed() {
+            AlertStatus::Fail
+        } else if report.fully_confirmed() {
             AlertStatus::Pass
         } else {
-            AlertStatus::Fail
+            // Nothing failed and nothing was confirmed: the profile could not support a claim.
+            // Reporting Pass would announce a guarantee the configuration never made; reporting Fail
+            // would announce a defect that was never observed.
+            AlertStatus::Inconclusive
         },
         total: report.total,
         passed: report.passed,
@@ -123,8 +132,11 @@ mod tests {
             invariant_passed: false,
             invariant_error: Some("invariant violated".into()),
             setup_error: None,
+            elle: None,
             duration_secs: 1.0,
             op_count: 10,
+            profile: Default::default(),
+            assurance: crate::checker::profile::Assurance::Refuted,
         }];
         let report = RunReport::from_results("test-fail", results);
         let alert = alert_from_report(&report, "full");
@@ -159,8 +171,11 @@ mod tests {
             setup_error: Some(
                 "executing query `CREATE KEYSPACE ...`: Failed to await schema agreement".into(),
             ),
+            elle: None,
             duration_secs: 0.0,
             op_count: 0,
+            profile: Default::default(),
+            assurance: crate::checker::profile::Assurance::Refuted,
         }];
         let report = RunReport::from_results("test-setup-fail", results);
         let alert = alert_from_report(&report, "multi-dc");

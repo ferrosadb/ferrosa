@@ -68,8 +68,11 @@ mod tests {
                 Some("invariant violated".into())
             },
             setup_error: None,
+            elle: None,
             duration_secs: 1.0,
             op_count: 10,
+            profile: Default::default(),
+            assurance: Default::default(),
         }
     }
 
@@ -110,8 +113,11 @@ mod tests {
             invariant_passed: false,
             invariant_error: None,
             setup_error: None,
+            elle: None,
             duration_secs: 1.0,
             op_count: 5,
+            profile: Default::default(),
+            assurance: Default::default(),
         };
         let html = format_anomaly_html(&result);
         assert!(html.contains("NOT linearizable"));

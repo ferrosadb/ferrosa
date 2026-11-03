@@ -225,7 +225,7 @@ impl Default for SparqlConfig {
 /// SPARQL query engine backed by ferrosa's StorageEngine.
 pub struct SparqlEngine {
     storage: Arc<StorageEngine>,
-    write_path: Arc<WritePath>,
+    write_path: Arc<arc_swap::ArcSwap<WritePath>>,
     config: SparqlConfig,
     limits: ExecutionLimits,
 }
@@ -239,6 +239,19 @@ impl SparqlEngine {
     pub fn new(
         storage: Arc<StorageEngine>,
         write_path: Arc<WritePath>,
+        config: SparqlConfig,
+    ) -> Self {
+        Self::new_with_write_path_source(
+            storage,
+            Arc::new(arc_swap::ArcSwap::from(write_path)),
+            config,
+        )
+    }
+
+    /// Follow the node's live write authority across deployment and pair-role changes.
+    pub fn new_with_write_path_source(
+        storage: Arc<StorageEngine>,
+        write_path: Arc<arc_swap::ArcSwap<WritePath>>,
         config: SparqlConfig,
     ) -> Self {
         let limits = ExecutionLimits {
@@ -372,15 +385,21 @@ impl SparqlEngine {
                 "invalid keyspace name: {ks}"
             )));
         }
+        let write_path = self.write_path.load_full();
+        if matches!(
+            &*write_path,
+            WritePath::Unavailable | WritePath::DegradedPair(_)
+        ) {
+            return Err(ferrosa_cluster::error::ClusterError::NotPrimary.into());
+        }
+        if let WritePath::Pair(coordinator) = &*write_path {
+            if coordinator.role() != ferrosa_cluster::pair::PairRole::Primary {
+                return Err(ferrosa_cluster::error::ClusterError::NotPrimary.into());
+            }
+        }
         self.ensure_table_registered(ks)?;
-        crate::update::execute_update(
-            update_str,
-            ks,
-            &self.storage,
-            &self.write_path,
-            &self.limits,
-        )
-        .await
+        crate::update::execute_update(update_str, ks, &self.storage, &write_path, &self.limits)
+            .await
     }
 
     /// Execute a SPARQL query and return results.
@@ -446,8 +465,9 @@ impl SparqlEngine {
         let scope = planner::TripleScope::isolated(graph, &self.config.default_graph);
         let plan = planner::plan_query(&query, &scope)?;
 
-        // 3. Execute plan against storage.
-        let results = crate::executor::execute(&plan, &self.write_path, &self.limits).await?;
+        // 3. Execute against one live path snapshot for the entire query.
+        let write_path = self.write_path.load_full();
+        let results = crate::executor::execute(&plan, &write_path, &self.limits).await?;
 
         // BUG-S6 fix: ASK queries return boolean result format.
         if plan.is_ask {
@@ -461,8 +481,7 @@ impl SparqlEngine {
         // URS-QEC-S01: CONSTRUCT / DESCRIBE return a graph result.
         if let Some(graph_mode) = &plan.graph_mode {
             return Ok(SparqlResult::Graph(
-                build_graph_result(graph_mode, &results, &plan, &self.write_path, &self.limits)
-                    .await?,
+                build_graph_result(graph_mode, &results, &plan, &write_path, &self.limits).await?,
             ));
         }
 

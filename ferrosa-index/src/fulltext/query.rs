@@ -86,7 +86,7 @@ pub fn parse_fts_query(query: &str) -> Result<FtsQuery, String> {
 /// Returns `None` when the whole query reduces to no searchable terms (e.g.
 /// every term is a stop word). Callers treat `None` as "matches nothing"
 /// **without** erroring the query.
-pub fn analyze_query(query: &FtsQuery, analyzer: &dyn Analyzer) -> Option<FtsQuery> {
+pub fn analyze_query(query: &FtsQuery, analyzer: &Analyzer) -> Option<FtsQuery> {
     match query {
         FtsQuery::Term(t) => from_tokens(analyzer.analyze(t)),
         FtsQuery::MultiTerm(terms) => {
@@ -416,11 +416,11 @@ mod tests {
 
     // ── analyze_query (query-side analyzer parity) ────────────────────────────
 
-    use crate::fulltext::analyzer::{KeywordAnalyzer, StandardAnalyzer};
+    use crate::fulltext::analyzer::Analyzer;
 
     #[test]
     fn analyze_drops_stopword_from_multiterm_conjunction() {
-        let a = StandardAnalyzer::new();
+        let a = Analyzer::standard();
         let q = parse_fts_query("reports were emitted").unwrap();
         let norm = analyze_query(&q, &a).expect("has searchable terms");
         assert_eq!(
@@ -431,21 +431,21 @@ mod tests {
 
     #[test]
     fn analyze_all_stopwords_yields_none() {
-        let a = StandardAnalyzer::new();
+        let a = Analyzer::standard();
         let q = parse_fts_query("was there").unwrap();
         assert_eq!(analyze_query(&q, &a), None);
     }
 
     #[test]
     fn analyze_single_stopword_term_yields_none() {
-        let a = StandardAnalyzer::new();
+        let a = Analyzer::standard();
         let q = parse_fts_query("were").unwrap();
         assert_eq!(analyze_query(&q, &a), None);
     }
 
     #[test]
     fn analyze_and_operand_stopword_collapses_to_sibling() {
-        let a = StandardAnalyzer::new();
+        let a = Analyzer::standard();
         let q = parse_fts_query("reports AND were").unwrap();
         assert_eq!(
             analyze_query(&q, &a),
@@ -461,7 +461,7 @@ mod tests {
 
     #[test]
     fn analyze_or_operand_stopword_collapses_to_sibling() {
-        let a = StandardAnalyzer::new();
+        let a = Analyzer::standard();
         let q = parse_fts_query("reports OR were").unwrap();
         assert_eq!(
             analyze_query(&q, &a),
@@ -471,7 +471,7 @@ mod tests {
 
     #[test]
     fn analyze_term_with_punctuation_splits_into_conjunction() {
-        let a = StandardAnalyzer::new();
+        let a = Analyzer::standard();
         // A single token carrying punctuation is analyzed as the index stored it.
         let q = parse_fts_query("foo-bar").unwrap();
         assert_eq!(
@@ -482,14 +482,14 @@ mod tests {
 
     #[test]
     fn analyze_prefix_is_left_untouched() {
-        let a = StandardAnalyzer::new();
+        let a = Analyzer::standard();
         let q = parse_fts_query("rep*").unwrap();
         assert_eq!(analyze_query(&q, &a), Some(FtsQuery::Prefix("rep".into())));
     }
 
     #[test]
     fn analyze_phrase_drops_stopword_preserving_order() {
-        let a = StandardAnalyzer::new();
+        let a = Analyzer::standard();
         let q = parse_fts_query("\"reports were emitted\"").unwrap();
         assert_eq!(
             analyze_query(&q, &a),
@@ -499,7 +499,7 @@ mod tests {
 
     #[test]
     fn analyze_not_stopword_keeps_operand_verbatim() {
-        let a = StandardAnalyzer::new();
+        let a = Analyzer::standard();
         // `NOT was` must remain a Not so the evaluator excludes nothing — it
         // must not collapse to None (which would match nothing).
         let q = parse_fts_query("NOT was").unwrap();
@@ -513,7 +513,7 @@ mod tests {
     fn analyze_keyword_analyzer_has_no_stopwords() {
         // Parity must follow the INDEX's analyzer: a keyword analyzer keeps the
         // whole string, so a "stop word" is a real, matchable token.
-        let a = KeywordAnalyzer;
+        let a = Analyzer::Keyword;
         let q = parse_fts_query("were").unwrap();
         assert_eq!(analyze_query(&q, &a), Some(FtsQuery::Term("were".into())));
     }

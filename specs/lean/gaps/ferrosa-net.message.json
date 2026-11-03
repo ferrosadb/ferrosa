@@ -1,0 +1,108 @@
+{
+  "stage": "aeneas",
+  "llbc": "/home/bkearns/src/ferrosa-suite/ferrosa/ferrosa_net.llbc",
+  "lean": "/home/bkearns/.hermes/cache/scratch/leangap-ferrosa-net-a5yx_xya/FerrosaNet.lean",
+  "translation_errors": 0,
+  "translation_unique_reported": null,
+  "translation_messages": [],
+  "aeneas_exit": 0,
+  "lean_errors": 17,
+  "errors": [
+    {
+      "location": "FerrosaNet.lean:580:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes_mut.BytesMut.Insts.BytesBufBuf_mutBufMut`"
+    },
+    {
+      "location": "FerrosaNet.lean:628:6",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:639:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:643:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:653:20",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `bytes`: The environment does not contain `ferrosa_net.bytes.bytes.Bytes.bytes`, so it is not possible to project the field `bytes` from an expression"
+    },
+    {
+      "location": "FerrosaNet.lean:680:6",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:692:12",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `buf`: The environment does not contain `Aeneas.Std.Array.buf`, so it is not possible to project the field `buf` from an expression"
+    },
+    {
+      "location": "FerrosaNet.lean:745:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes_mut.BytesMut.Insts.BytesBufBuf_mutBufMut`"
+    },
+    {
+      "location": "FerrosaNet.lean:765:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes_mut.BytesMut.Insts.BytesBufBuf_mutBufMut`"
+    },
+    {
+      "location": "FerrosaNet.lean:770:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes_mut.BytesMut.Insts.BytesBufBuf_mutBufMut`"
+    },
+    {
+      "location": "FerrosaNet.lean:792:6",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:798:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:822:6",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:833:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:837:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:857:6",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:861:6",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    }
+  ],
+  "sorry_declarations": 0,
+  "compiled": false,
+  "crate": "ferrosa-net",
+  "prefix": "ferrosa_net::message::*",
+  "generated_at": "2026-10-31T06:36:47+00:00",
+  "memory_max": "10G",
+  "toolchain": {
+    "charon": "/home/bkearns/src/aeneas/charon/bin/charon",
+    "aeneas": "/home/bkearns/src/aeneas/src/_build/default/main.exe",
+    "lean_pkg": "/home/bkearns/.local/aeneas/backends/lean"
+  }
+}

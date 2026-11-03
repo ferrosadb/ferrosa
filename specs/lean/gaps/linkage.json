@@ -1,0 +1,266 @@
+{
+  "ledger_items": 317,
+  "broken": [
+    {
+      "area": "Recovery",
+      "what": "replay is idempotent",
+      "ledger": "Ferrosa.Storage.Recovery",
+      "item": "replay is idempotent",
+      "site": "commitlog/mutation.rs: a zero mutation_id is always re-applied, so a non-idempotent mutation duplicates",
+      "anchors": [
+        "ferrosa-storage/src/commitlog/mutation.rs"
+      ],
+      "confidence": "explicit",
+      "symbol_named_in_site": [],
+      "symbols_from_same_file": [],
+      "class": "crate-charon"
+    },
+    {
+      "area": "Tombstone",
+      "what": "a local deletion time is representable for every TTL",
+      "ledger": "Ferrosa.Storage.Tombstone",
+      "item": "a local deletion time is representable for every valid TTL",
+      "site": "ferrosa-common/src/cell.rs:52 and ferrosa-sstable/src/types.rs:90 hold it as i32 seconds (`i32::MAX` = not deleted); ferrosa-sstable/src/data.rs:1108-1111 decodes it with `wrapping_add`, so a past-2038 value wraps negative, and ferrosa-row-bridge/src/row.rs:53-55 then reports it expired with a signed `now_secs >= ldt`",
+      "anchors": [
+        "ferrosa-common/src/cell.rs",
+        "ferrosa-row-bridge/src/row.rs",
+        "ferrosa-sstable/src/data.rs",
+        "ferrosa-sstable/src/types.rs"
+      ],
+      "confidence": "explicit",
+      "symbol_named_in_site": [],
+      "symbols_from_same_file": [
+        "core.cell.RefCell",
+        "core.error.Erased"
+      ],
+      "class": "crate-measured-file-not-extracted"
+    },
+    {
+      "area": "SQL",
+      "what": "three-valued logic is preserved",
+      "ledger": "Ferrosa.Sql.Semantics",
+      "item": "three-valued logic is preserved",
+      "site": "unverified: no site on main. ferrosa-sql evaluates `NOT` over the three-valued `Option` (plan.rs:192-197) and `sql_cmp` returns `None` for NULL, so UNKNOWN survives negation; plan.rs:1369-1373 and 1894-1898 assert the NULL row is excluded. The hazard is real in the model (Ferrosa/Sql/Semantics.lean:39 `notEqNaive`) but no Rust path performs the compare-and-negate translation",
+      "anchors": [],
+      "confidence": "none",
+      "symbol_named_in_site": [],
+      "symbols_from_same_file": [],
+      "class": "no-code-anchor"
+    },
+    {
+      "area": "SQL",
+      "what": "aggregates follow the empty-set rules",
+      "ledger": "Ferrosa.Sql.Semantics",
+      "item": "aggregates follow SQL's empty-set rules",
+      "site": "unverified: no site on main. ferrosa-sql/src/exec.rs:379-381 returns `Value::Null` when `numeric_count == 0` (`// PostgreSQL: SUM over no non-null rows is NULL`), exec.rs:1211-1228 and plan.rs:1820-1824 assert it, and CQL's path agrees (ferrosa-cql/src/router.rs:1497-1508). The model's zero-returning accumulator (Ferrosa/Sql/Semantics.lean) has no shipping counterpart",
+      "anchors": [],
+      "confidence": "none",
+      "symbol_named_in_site": [],
+      "symbols_from_same_file": [],
+      "class": "no-code-anchor"
+    },
+    {
+      "area": "SQL",
+      "what": "the commit decision is durable before the acknowledgement",
+      "ledger": "Ferrosa.Sql.Txn",
+      "item": "the commit decision is durable before the acknowledgement",
+      "site": "ferrosa-postgres/src/query.rs:2014-2021 commits through `engine.write_atomic_batch(source)`, i.e. ferrosa-storage/src/engine.rs:10347-10348 with `record = None`, so ferrosa-storage/src/engine.rs:10429-10435 appends each mutation as its own log entry; the single CRC-protected decision record (ferrosa-storage/src/commitlog/transaction_record.rs, reachable only via ferrosa-storage/src/engine.rs:10505-10514) is never written, yet ferrosa-storage/src/engine.rs:10448 syncs and ferrosa-postgres/src/server.rs:1495-1498 acks `COMMIT`",
+      "anchors": [
+        "ferrosa-postgres/src/query.rs",
+        "ferrosa-postgres/src/server.rs",
+        "ferrosa-storage/src/commitlog/transaction_record.rs",
+        "ferrosa-storage/src/engine.rs"
+      ],
+      "confidence": "explicit",
+      "symbol_named_in_site": [],
+      "symbols_from_same_file": [],
+      "class": "crate-measured-file-not-extracted"
+    },
+    {
+      "area": "SPARQL",
+      "what": "`p+` returns each pair once",
+      "ledger": "Ferrosa.Sparql.Semantics",
+      "item": "`p+` returns each pair once",
+      "site": "unverified: no site on main. ferrosa-sparql/src/property_path.rs:158-169 seeds `visited` with the start and pushes a node only when `visited.insert` succeeds, so each `(start, node)` pair is emitted once and the cycle test at 345-362 asserts it. The model's `expandNoVisited` (Ferrosa/Sparql/Semantics.lean:80-82) has no Rust counterpart; a different hole does exist there \u2014 a self-loop `(a,a)` emits nothing",
+      "anchors": [],
+      "confidence": "none",
+      "symbol_named_in_site": [],
+      "symbols_from_same_file": [],
+      "class": "no-code-anchor"
+    },
+    {
+      "area": "SPARQL",
+      "what": "RDF-star terms are distinct from IRIs in the store",
+      "ledger": "Ferrosa.Sparql.Semantics",
+      "item": "RDF-star terms are distinct from IRIs in the store",
+      "site": "unverified: no site on main. ferrosa-sparql/src/triple_store.rs:264-271 keys a term by a tagged identity header (`[2, kind, 0x10, datatype, 0x11, lang]`, kind 0=uri/1=bnode/2=literal) and triple_store.rs:335-343 hard-errors on an unknown tag, so no packing can collide an IRI with another kind; quoted triples are rejected outright (results.rs:158-163, update.rs:740-744). The collision exists only in the model's `s * 1000000 + p * 1000 + o` encoding (Ferrosa/Sparql/Semantics.lean:117-119)",
+      "anchors": [],
+      "confidence": "none",
+      "symbol_named_in_site": [],
+      "symbols_from_same_file": [],
+      "class": "no-code-anchor"
+    },
+    {
+      "area": "Index",
+      "what": "index and table cannot diverge",
+      "ledger": "Ferrosa.Sql.Index",
+      "item": "index and table cannot diverge",
+      "site": "ferrosa-storage/src/store.rs:3907-3920 inserts the index postings and ferrosa-storage/src/store.rs:4065-4068 then puts the row in the memtable: two side effects, in that order, with the code comment admitting `before the memtable put`; ferrosa-storage/src/engine.rs:10123-10127 logs the row for durability and ferrosa-storage/src/engine.rs:10163-10186 performs the write, so the commit log holds no index record and a crash between them cannot be repaired from it",
+      "anchors": [
+        "ferrosa-storage/src/engine.rs",
+        "ferrosa-storage/src/store.rs"
+      ],
+      "confidence": "explicit",
+      "symbol_named_in_site": [],
+      "symbols_from_same_file": [],
+      "class": "crate-charon"
+    },
+    {
+      "area": "Consistency",
+      "what": "the coordinator enforces the per-datacenter requirement",
+      "ledger": "Ferrosa.Sql.Consistency",
+      "item": "the coordinator enforces the per-datacenter requirement for every write, not a total",
+      "site": "write.rs:753 compares a total ack count, so five acks in the primary and none in the secondary passes QUORUM",
+      "anchors": [
+        "ferrosa-cluster/src/coordinator/write.rs"
+      ],
+      "confidence": "explicit",
+      "symbol_named_in_site": [],
+      "symbols_from_same_file": [],
+      "class": "crate-modules-partial"
+    },
+    {
+      "area": "Streaming",
+      "what": "a page bound in rows is a bound in memory",
+      "ledger": "Ferrosa.Storage.Streaming",
+      "item": "the scan's page bound is a bound in bytes",
+      "site": "DEFAULT_SCAN_PAGE_SIZE is 5000 rows: 5 MB of narrow rows and 5 GB of 1 MiB rows on the same coordinator",
+      "anchors": [
+        "ferrosa-cql/src/paging.rs"
+      ],
+      "confidence": "ident",
+      "symbol_named_in_site": [],
+      "symbols_from_same_file": [],
+      "class": "crate-measured-file-not-extracted"
+    },
+    {
+      "area": "Streaming",
+      "what": "the scan never materialises a page of rows before encoding",
+      "ledger": "Ferrosa.Storage.Streaming",
+      "item": "the row buffer is never built as Vec<Vec<Option<CqlValue>>> on the scan path",
+      "site": "encode_rows_with_writer visits one row at a time, but all_rows accumulates a whole page before it is called",
+      "anchors": [
+        "ferrosa-cql/src/result.rs"
+      ],
+      "confidence": "ident",
+      "symbol_named_in_site": [],
+      "symbols_from_same_file": [],
+      "class": "crate-measured-file-not-extracted"
+    },
+    {
+      "area": "Streaming",
+      "what": "the reader streams partitions to the caller",
+      "ledger": "Ferrosa.Storage.Streaming",
+      "item": "the reader hands partitions to the caller instead of a vector of them",
+      "site": "read_partitions_limited returns Vec<Partition>, so the page is already materialised when the caller sees it",
+      "anchors": [
+        "ferrosa-sstable/src/reader.rs",
+        "ferrosa-sstable/src/types.rs",
+        "ferrosa-storage/src/memtable/skiplist.rs"
+      ],
+      "confidence": "ident",
+      "symbol_named_in_site": [],
+      "symbols_from_same_file": [],
+      "class": "crate-aeneas-crash"
+    },
+    {
+      "area": "Streaming",
+      "what": "a decoded chunk is written into a caller-supplied buffer",
+      "ledger": "Ferrosa.Storage.Streaming",
+      "item": "a decoded chunk is written into a caller-supplied buffer rather than returned as a new Vec",
+      "site": "compression.rs decompress ignores its uncompressed-length argument and returns a fresh Vec per chunk: one allocation and one copy for every byte read",
+      "anchors": [
+        "ferrosa-cluster/src/accord/compression.rs",
+        "ferrosa-sstable/src/compression.rs"
+      ],
+      "confidence": "explicit",
+      "symbol_named_in_site": [],
+      "symbols_from_same_file": [
+        "compression.CompressionInfo",
+        "compression.LZ4_TABLES",
+        "compression.ZSTD_CCTX.const.closure.as_fn",
+        "compression.take_array",
+        "compression.take_array.closure",
+        "compression.take_array.closure.Insts.CoreOpsFunctionFnOnceTupleTryFromSliceErrorError",
+        "compression.take_array.closure.Insts.CoreOpsFunctionFnOnceTupleTryFromSliceErrorError.call_once",
+        "compression.take_bytes",
+        "compression.take_bytes.closure",
+        "compression.take_bytes.closure.Insts.CoreOpsFunctionFnOnceTupleError",
+        "compression.take_bytes.closure.Insts.CoreOpsFunctionFnOnceTupleError.call_once",
+        "compression.take_bytes.closure_1",
+        "compression.take_bytes.closure_1.Insts.CoreOpsFunctionFnOnceTupleError",
+        "compression.take_bytes.closure_1.Insts.CoreOpsFunctionFnOnceTupleError.call_once",
+        "compression.zstd_error",
+        "zstd_safe.get_error_name"
+      ],
+      "class": "extracted"
+    },
+    {
+      "area": "Streaming",
+      "what": "a slow client cannot grow the coordinator's memory",
+      "ledger": "Ferrosa.Storage.Streaming",
+      "item": "a slow client cannot grow the coordinator's memory",
+      "site": "ferrosa-cql/src/result.rs:133-164 encodes the whole page into one `BytesMut` (`let mut buf = BytesMut::new()` at :143, returned whole) and ferrosa-cql/src/connection.rs:757-779 only then freezes and sends it, so occupancy is the whole response and a slow client parks all of it in the coordinator; ferrosa-cql/src/router.rs:2967-2991 feeds it from a fully built `Vec<Vec<Option<CqlValue>>>`",
+      "anchors": [
+        "ferrosa-cql/src/connection.rs",
+        "ferrosa-cql/src/result.rs",
+        "ferrosa-cql/src/router.rs"
+      ],
+      "confidence": "explicit",
+      "symbol_named_in_site": [],
+      "symbols_from_same_file": [],
+      "class": "crate-measured-file-not-extracted"
+    },
+    {
+      "area": "Streaming",
+      "what": "acks are coalesced so a high-latency pipe is not ack-starved",
+      "ledger": "Ferrosa.Storage.Streaming",
+      "item": "acks are coalesced so a high-latency pipe is not ack-starved",
+      "site": "unverified: stale as written. The premise that NODELAY exists only on unmerged c38add89 is false \u2014 `git merge-base --is-ancestor c38add89 HEAD` exits 0, and ferrosa-cql/src/server.rs:303-311 sets `stream.set_nodelay(true)` on every accepted CQL socket (same at ferrosa-postgres/src/server.rs:2237-2245, ferrosa-graph/src/bolt/server.rs:136-142, ferrosa-net/src/rpc/server.rs:267-273). Whether replies are still several small writes, and what that costs per statement, has not been re-measured. Do not re-site this row before measuring",
+      "anchors": [],
+      "confidence": "none",
+      "symbol_named_in_site": [],
+      "symbols_from_same_file": [],
+      "class": "no-code-anchor"
+    }
+  ],
+  "classes": {
+    "crate-charon": 2,
+    "crate-measured-file-not-extracted": 5,
+    "no-code-anchor": 5,
+    "crate-modules-partial": 1,
+    "crate-aeneas-crash": 1,
+    "extracted": 1
+  },
+  "extracted_files": [
+    "ferrosa-sstable/src/compression.rs"
+  ],
+  "overlap": [
+    "ferrosa-sstable/src/compression.rs"
+  ],
+  "symbols": 69,
+  "sync": [
+    {
+      "module": "Sstable",
+      "crate": "ferrosa-sstable",
+      "sources": "src/compression.rs",
+      "status": "ok"
+    },
+    {
+      "module": "Storage",
+      "crate": "ferrosa-storage",
+      "sources": "src/count.rs",
+      "status": "stale:regenerating under the current toolchain emits a call to core.iter.Iterator.count, which the Aeneas Std library does not model, so the module does not elaborate"
+    }
+  ]
+}
