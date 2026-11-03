@@ -227,6 +227,9 @@ import sys
 name = Path(sys.argv[0]).name
 with Path(os.environ["IDENTITY_CALLS"]).open("a") as output:
     output.write(json.dumps({"tool": name, "cwd": str(Path.cwd())}) + "\n")
+if name == "lean" and os.environ.get("IDENTITY_LEAN_FAIL") == "1":
+    sys.stderr.write("Lean (version 4.35.0)\n")
+    sys.exit(3)
 if name == "lake" and os.environ.get("IDENTITY_LAKE_FAIL") == "1":
     sys.exit(3)
 manifest = Path.cwd() / "lean-toolchain"
@@ -249,6 +252,8 @@ print("Lean (version " + manifest.read_text().strip() + ")")
                 "ELAN_HOME": str(root / "empty-elan-home"),
                 "IDENTITY_CALLS": str(self.calls),
                 "IDENTITY_LAKE_FAIL": "0",
+                "IDENTITY_LEAN_FAIL": "0",
+                "AENEAS_SRC": str(self.repo / "unbuilt-aeneas"),
             }),
         ]
         for patch in patches:
@@ -263,6 +268,38 @@ print("Lean (version " + manifest.read_text().strip() + ")")
 
     def observed(self):
         return [json.loads(line) for line in self.calls.read_text().splitlines()]
+
+    def ratchet_identity(self):
+        # Load the real CLI module while allowing its sibling helper import.
+        with mock.patch.object(sys, "path", [str(SCRIPT.parent), *sys.path]):
+            spec = importlib.util.spec_from_file_location("ratchet_project_context", SCRIPT.with_name("lean_gap_ratchet.py"))
+            ratchet = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(ratchet)
+        with mock.patch.dict(os.environ, {"LEAN_PKG": str(self.backend)}):
+            return ratchet.pin_lean()
+
+    def test_ratchet_backend_resolves_without_a_global_default(self):
+        self.assertFalse((self.repo / "lean-toolchain").exists())
+        self.assertEqual(self.ratchet_identity()["version"], "4.35.0")
+        self.assertEqual(self.observed(), [{"tool": "lean", "cwd": str(self.backend)}])
+
+    def test_ratchet_repository_toolchain_does_not_override_backend(self):
+        (self.repo / "lean-toolchain").write_text("4.36.0\n")
+        self.assertEqual(self.ratchet_identity()["version"], "4.35.0")
+        self.assertEqual(self.observed(), [{"tool": "lean", "cwd": str(self.backend)}])
+
+    def test_ratchet_nonzero_exit_is_not_an_identity(self):
+        os.environ["IDENTITY_LEAN_FAIL"] = "1"
+        with self.assertRaises(SystemExit):
+            self.ratchet_identity()
+        self.assertEqual(self.observed(), [{"tool": "lean", "cwd": str(self.backend)}])
+
+    def test_ratchet_missing_backend_identity_never_uses_repository(self):
+        (self.backend / "lean-toolchain").unlink()
+        (self.repo / "lean-toolchain").write_text("4.36.0\n")
+        with self.assertRaises(SystemExit):
+            self.ratchet_identity()
+        self.assertEqual(self.observed(), [{"tool": "lean", "cwd": str(self.backend)}])
 
     def test_backend_project_resolves_without_a_global_default(self):
         self.assertFalse((self.repo / "lean-toolchain").exists())

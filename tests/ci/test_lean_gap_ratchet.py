@@ -223,7 +223,14 @@ class RatchetTest(unittest.TestCase):
             subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c",
                             "user.name=t", "commit", "-q", "--allow-empty", "-m", "x"],
                            check=True)
-            done = self.fx.run("check", env={"AENEAS_SRC": str(repo), "CHARON_SRC": str(repo)})
+            backend = repo / "backends/lean"
+            backend.mkdir(parents=True)
+            (backend / "lean-toolchain").write_text("leanprover/lean4:v4.35.0\n")
+            lean = repo / "lean"
+            lean.write_text("#!/bin/sh\necho 'Lean (version 4.35.0)'\n")
+            lean.chmod(0o755)
+            done = self.fx.run("check", env={"AENEAS_SRC": str(repo), "CHARON_SRC": str(repo),
+                                             "LEAN_PKG": str(backend), "LEAN": str(lean)})
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
         self.assertIn("FAIL toolchain drift: the aeneas that was built is", done.stdout)
 
@@ -236,6 +243,9 @@ class RatchetTest(unittest.TestCase):
             fake_lean = Path(tmp) / "lean"
             fake_lean.write_text(f"#!/bin/sh\necho '{lean_line}'\n")
             fake_lean.chmod(0o755)
+            backend = repo / "backends/lean"
+            backend.mkdir(parents=True)
+            (backend / "lean-toolchain").write_text("leanprover/lean4:v4.35.0\n")
             subprocess.run(["git", "init", "-q", str(repo)], check=True)
             (repo / "f").write_text("1")
             for cmd in (["add", "f"], ["commit", "-q", "-m", "one"]):

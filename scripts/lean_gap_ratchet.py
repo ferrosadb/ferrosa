@@ -43,6 +43,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from lean_gap_inventory import tool_identity
+
 REPO = Path(os.environ.get("REPO") or Path(__file__).resolve().parent.parent)
 GAPS = REPO / "specs/lean/gaps"
 BASELINE = GAPS / "baseline.json"
@@ -262,24 +264,20 @@ def pin_charon(aeneas_repo: Path | None = None) -> dict:
 
 def pin_lean() -> dict:
     """The Lean the Aeneas backend elaborates against, from the backend's own toolchain file."""
-    toolchain = None
-    for candidate in (Path(os.environ.get("LEAN_PKG") or Path.home() / ".local/aeneas/backends/lean"),
-                      Path(os.environ.get("AENEAS_SRC") or Path.home() / "src/aeneas") / "backends/lean"):
-        f = candidate / "lean-toolchain"
-        if f.is_file():
-            toolchain = f.read_text().strip()
-            break
-    version = None
-    binary = os.environ.get("LEAN") or "lean"
-    try:
-        r = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=120)
-        text = (r.stdout or r.stderr).strip()
-        m = re.search(r"version (\d+\.\d+\.\d+)", text)
-        version = m.group(1) if m else (text.splitlines()[0] if text else None)
-        commit = re.search(r"commit ([0-9a-f]{7,40})", text)
-        version_commit = commit.group(1) if commit else None
-    except (OSError, subprocess.TimeoutExpired):
-        text, version, version_commit = None, None, None
+    candidates = (Path(os.environ.get("LEAN_PKG") or Path.home() / ".local/aeneas/backends/lean"),
+                  Path(os.environ.get("AENEAS_SRC") or Path.home() / "src/aeneas") / "backends/lean")
+    backend = next((path for path in candidates if (path / "lean-toolchain").is_file()),
+                   candidates[0])
+    manifest = backend / "lean-toolchain"
+    toolchain = manifest.read_text().strip() if manifest.is_file() else None
+    # The same project selects Lean for elaboration, inventory and ratchet checks.
+    # Never accept a failed elan invocation's stderr as a compiler identity.
+    text = tool_identity([os.environ.get("LEAN") or "lean", "--version"],
+                         "lean", budget=120, cwd=backend)
+    match = re.search(r"version (\d+\.\d+\.\d+)", text)
+    version = match.group(1) if match else text
+    commit = re.search(r"commit ([0-9a-f]{7,40})", text)
+    version_commit = commit.group(1) if commit else None
     return {"toolchain": toolchain, "version": version, "commit": version_commit}
 
 
