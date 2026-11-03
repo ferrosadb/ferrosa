@@ -122,7 +122,6 @@ async fn run_direct_schema_change<T: Send + 'static>(
 
 /// Only an applied table change may publish an event, for the owner resolved under
 /// the lifecycle writer. Conditional no-ops have no completion effects.
-
 enum DirectTableChange {
     Applied(TableId),
     Unchanged,
@@ -161,7 +160,6 @@ async fn run_direct_table_change(
 /// Default cooperative-yield cadence for long partition scans. Larger
 /// tasks; smaller values do the opposite. Tune via
 /// `FERROSA_CQL_SCAN_YIELD_EVERY_PARTITIONS`.
-
 pub const DEFAULT_COOPERATIVE_SCAN_YIELD_EVERY_PARTITIONS: usize = 32;
 
 fn cooperative_scan_yield_every_partitions() -> usize {
@@ -12112,7 +12110,6 @@ async fn route_create_table(
 /// none (`schema.json` absent -> S3 -> start fresh) (t_0acc233d, D-47).
 ///
 /// Fails loudly: the caller must not acknowledge a table it cannot recover.
-
 fn persist_registry_snapshot_before_ack(
     state: &SessionCore,
     table_name: &str,
@@ -12554,7 +12551,6 @@ async fn route_drop_table(
 
 /// Parse a Filtered (partial) index's `filter_op` option string into a
 /// [`ferrosa_index::FilterOp`]. Fails loud on any unrecognized operator.
-
 fn parse_filter_op(op: &str) -> Result<ferrosa_index::FilterOp, CqlError> {
     use ferrosa_index::FilterOp;
     match op.trim() {
@@ -12691,7 +12687,6 @@ fn build_filter_clause(
 ///
 /// Every missing/invalid option fails loud — a partial index with a broken
 /// predicate would silently index the wrong rows, an unsound result.
-
 fn build_filter_predicate_from_options(
     state: &SessionCore,
     ks: &str,
@@ -12737,7 +12732,6 @@ fn build_filter_predicate_from_options(
 /// the same symbols [`parse_filter_op`] accepts (`=`,`!=`,`<`,`>`,`<=`,`>=`).
 /// String literals may be single-quoted (`'eng'`); the quotes are stripped.
 /// Any unparseable clause fails loud rather than being silently dropped.
-
 fn parse_filter_conjunction(expr: &str) -> Result<Vec<(String, String, String)>, CqlError> {
     // Split on the word `AND` (case-insensitive), surrounded by whitespace.
     let mut clauses = Vec::new();
@@ -13851,7 +13845,6 @@ async fn route_drop_role(
 /// salted_hash is NEVER projected — the login path reads it directly
 /// from the schema snapshot. (See SELECT * redaction for how reads
 /// against `system_auth.roles` should expose a masked column instead.)
-
 async fn route_list_roles(
     state: &SharedState,
     ctx: &RequestContext<'_>,
