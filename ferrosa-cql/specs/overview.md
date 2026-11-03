@@ -70,6 +70,11 @@ semaphore (default 128) returns `Overloaded` rather than unbounded queueing.
 
 ## Data flow
 
+**Optional metadata discovery.** After registered virtual-table lookup, a
+missing `system_schema` table returns `Invalid` (`0x2200`). Drivers may probe
+optional vendor metadata without requiring grants on nonexistent tables.
+Supported metadata routing and user-table authorization are unchanged.
+
 **Write (INSERT/UPDATE/DELETE).** Frame bytes → `CqlCodec::decode` → opcode
 dispatch in `connection` → `parser` → `Statement` → `router::route()`. The router
 checks permissions (M8), converts `Term`s to `CqlValue`s via `bridge`, builds the
