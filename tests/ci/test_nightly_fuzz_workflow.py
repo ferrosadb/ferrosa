@@ -56,18 +56,28 @@ class NightlyFuzzWorkflowTest(unittest.TestCase):
             "nightly fuzz must keep ferrosa-loadgen proptest coverage active",
         )
 
-    def test_pair_failover_requires_operator_promotion_before_node2_reads(self):
+    def test_pair_failover_keeps_replica_reads_and_requires_promotion_for_writes(self):
         smoke = DOCKER_SMOKE.read_text(encoding="utf-8")
         phase_two = smoke.split("# Phase 2: Kill primary, verify degraded behavior", 1)[1]
         phase_two, phase_three = phase_two.split("# Phase 3: Operator promotion", 1)
 
         self.assertIn(
-            'if cql2 "SELECT v FROM smoke_test.kv WHERE k = \'key1\';"',
+            'wait_for_cql_value 9043 "SELECT v FROM smoke_test.kv WHERE k = \'key1\';"',
             phase_two,
-            "an unpromoted secondary must reject CQL reads after primary loss",
+            "an unpromoted secondary must still serve its replicated data",
         )
         self.assertIn(
-            "Unpromoted node2 served a CQL read after node1 death",
+            '"from_node1" "unpromoted node2 read key1"',
+            phase_two,
+            "the replica read must return the replicated value, not merely succeed",
+        )
+        self.assertIn(
+            'if cql2 "INSERT INTO smoke_test.kv (k, v) VALUES (\'should_fail\', \'nope\')"',
+            phase_two,
+            "writes must remain fenced until operator promotion",
+        )
+        self.assertIn(
+            "Unpromoted node2 served a CQL write after node1 death",
             phase_two,
         )
 
@@ -78,7 +88,7 @@ class NightlyFuzzWorkflowTest(unittest.TestCase):
             self.assertGreater(
                 phase_three.index(f"SELECT v FROM smoke_test.kv WHERE k = '{key}';"),
                 phase_three.index(promote),
-                "the smoke test must verify replicated reads only after operator promotion",
+                "the promoted-node phase must also verify both replicated values",
             )
 
 
