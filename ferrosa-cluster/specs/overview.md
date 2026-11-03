@@ -336,3 +336,13 @@ The synchronous `ddl_path::apply_direct` implementation is shared with CQL
 authorization jobs to keep grant/revoke persistence canonical. Callers must check
 authorization, run it on a blocking worker and own required compaction pauses;
 physical cleanup refuses success if compactions remain active.
+
+### Pair local I/O
+
+Pair-mode local writes and commit-log syncs run on TaskPool blocking workers.
+The admitted caller and local I/O job share the existing handoff read lease: the
+worker retains admission until I/O finishes when the caller is cancelled, and a
+live caller retains its share through peer ACK and the strict archive barrier.
+Inbound handlers retain their existing primary apply/replicate-back and secondary
+apply-only behavior; they acquire no nested handoff read lease. Cancellation
+produces no successful ACK and can leave an unacknowledged local write.

@@ -1835,3 +1835,9 @@ updates retain the maximum existing value. A physical failure returns an error
 and retains the group's recovery intents; it does not acknowledge an unfinished
 drop. The caller serializes schema recreation with the shared lifecycle writer.
 Single-table unregister APIs retain their existing behavior and recovery format.
+
+### Commit-log contention test support
+
+The `test-support` feature exposes a callback that holds the active commit-log
+segment's existing file mutex. Sibling-crate progress tests use it to exercise
+real flush/fsync contention with deterministic release and ordinary storage I/O.

@@ -1594,6 +1594,12 @@ impl CommitLog {
         Segment::entry_total_size(mutation)
     }
 
+    /// Hold the active segment's real flush mutex for a deterministic test.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_flush_held_for_test(&self, hold: impl FnOnce()) {
+        self.active.load().with_flush_held_for_test(hold);
+    }
+
     /// Force-syncs the active segment to disk.
     ///
     /// Waits for all in-flight writers to complete, then flushes the
