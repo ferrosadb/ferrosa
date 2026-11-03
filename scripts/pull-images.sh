@@ -14,26 +14,48 @@
 # the retry only covers the case where our own origin hiccups.
 #
 # Retries are bounded and the failure is reported as a pull failure naming the
-# image, so a broken run never looks like a storage or cluster fault. Four
-# attempts with linear backoff (5s, 10s, 15s).
+# image, so a broken run never looks like a storage or cluster fault.
+#
+# A rate limit is not a blip: downloads.ferrosa.ai sits behind Cloudflare and
+# answers a burst of concurrent CI pulls with a "Too Many Requests" page, which
+# docker surfaces as `toomanyrequests`. That is a window to wait out, so those
+# failures back off much further than a connection reset does. Both schedules
+# are bounded (about 4 minutes worst case) and the last attempt is reported.
 set -euo pipefail
 
 [ $# -ge 1 ] || { echo "usage: $0 IMAGE [IMAGE...]" >&2; exit 2; }
 
+MAX_ATTEMPTS=5
+
+# Seconds to wait after a failed attempt. Rate limits get a window-sized wait;
+# everything else gets the short linear schedule it always had.
+backoff_seconds() {
+    local attempt="$1" output_file="$2"
+    if grep -qiE 'toomanyrequests|too many requests|rate limit|429' "$output_file"; then
+        echo $((attempt * 20))
+    else
+        echo $((attempt * 5))
+    fi
+}
+
 failed=0
 for image in "$@"; do
-    for attempt in 1 2 3 4; do
-        if docker pull "$image"; then
+    attempt=1
+    while :; do
+        if docker pull "$image" 2>&1 | tee /tmp/pull-images.$$.log; then
             break
         fi
-        if [ "$attempt" -eq 4 ]; then
-            echo "::error::could not pull $image after 4 attempts" >&2
+        if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
+            echo "::error::could not pull $image after $MAX_ATTEMPTS attempts" >&2
             failed=1
             break
         fi
-        echo "pull failed for $image (attempt $attempt/4); retrying in $((attempt * 5))s" >&2
-        sleep $((attempt * 5))
+        wait_for=$(backoff_seconds "$attempt" /tmp/pull-images.$$.log)
+        echo "pull failed for $image (attempt $attempt/$MAX_ATTEMPTS); retrying in ${wait_for}s" >&2
+        sleep "$wait_for"
+        attempt=$((attempt + 1))
     done
 done
+rm -f /tmp/pull-images.$$.log
 
 exit "$failed"
