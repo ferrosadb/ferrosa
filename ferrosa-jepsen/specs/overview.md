@@ -35,9 +35,9 @@ SSH (`russh`) for fault injection, and to the simulator via `ferrosa-sim`.
 |--------|----------------|
 | `orchestrator` (`src/orchestrator.rs`) | Run loop: provision/accept external contacts → iterate selected combinations → record → check → `RunReport`. Rejects a multi-DC run without live contact points and runs a named nemesis concurrently with its workload. |
 | `config` (`src/config.rs`) | `Tier`, `Topology` (T1–T4), `Concurrency`, `RunConfig` and their tier-driven resolution. |
-| `workload` (`src/workload/`) | `Workload` trait + registry: `register`, `bank`, 16 `lwt-*`, `forward-probe`, `membership-churn`, `late-join-flood`. |
+| `workload` (`src/workload/`) | `Workload` trait + registry: `register`, `bank`, 16 `lwt-*`, `forward-probe`, `membership-churn`, `late-join-flood`, `set` (durability: book + paged final read). `Workload::final_read` is the optional durability hook; `CqlSession::execute_at` runs a statement at an explicit consistency level and refuses by default rather than falling back. |
 | `chaos` (`src/chaos/`) | `NemesisAction` trait + registry: network, process, clock, disk, WAN/cross-DC, composed nemeses. WAN actions execute via SSH, Fly SSH, or `container_runtime() exec` (`iptables`/`tc`/signals). |
-| `checker` (`src/checker/`) | Linearizability (native WGL backtracking), membership invariants, Knossos (subprocess), Elle (stub). |
+| `checker` (`src/checker/`) | Linearizability (native WGL backtracking), membership invariants, Knossos (subprocess), Elle (elle-checker subprocess, verdict by exit code), the consistency profile (`profile`), and the durability book (`book`: attempted / acknowledged / indeterminate / recovered multisets, `lost` and `fabricated` derived and never summed, verdict from book + profile; mirrors `specs/lean4/Ferrosa/Testing/Histories.lean`). |
 | `driver` (`src/driver/`) | `rust_driver` (real `scylla` connection; after its workload session discovers topology, the same session is pinned by one of its own host IDs); `ContainerDriver` (per-language Docker images, not in default tiers). |
 | `docker_provision` (`src/docker_provision.rs`) | **Wired** backend: managed Docker Compose for up to three nodes and non-owning external contact points for T3/Fly. `container_runtime()` selects a usable Docker/Podman daemon, not merely an installed CLI. |
 | `firecracker` / `cluster` | microVM provisioning primitives — present but **not wired** into the run path. |
@@ -68,9 +68,17 @@ flowchart TD
     NEM --> HIST
     HIST --> LIN["check_linearizability (native WGL)"]
     HIST --> INV["workload.check_invariant"]
+    HIST --> FR["workload.final_read (set: settle, paged read, book verdict)"]
     LIN --> REP["RunReport (results.json + report.html)"]
     INV --> REP
+    FR --> REP
 ```
+
+The final read runs after `tokio::join!` of the workload and the nemesis cycle
+returns, so every fault has been healed. A final read that cannot complete is an
+`Err` from `run_single_combination`, which the run loop records as a
+`setup_error`; it never becomes a verdict, because a missing read would count
+every acknowledged write as lost.
 
 The orchestrator accepts `FERROSA_TEST_CLUSTER_NODES` before considering
 managed provisioning. This makes a six-node T3 compose stack or Fly topology a
@@ -94,16 +102,20 @@ flowchart LR
     H["History (Vec&lt;Operation&gt;)"] --> LIN["Linearizability: per-key WGL backtracking, RegisterModel, 100k-node bound"]
     H --> MEM["Membership invariants I-06..I-10, I-13 over node snapshots"]
     H --> KN["Knossos: lein subprocess (only if jepsen_dir + history file)"]
-    H --> EL["Elle: stub — result always None"]
+    H --> EDN["Workload.elle_history_edn (only when requires_transactional_checker)"]
+    EDN --> EL["Elle: lein run elle-checker; exit 0 valid, 1 invalid, else checker error"]
     LIN --> AGG["AllCheckResults.all_passed()"]
     MEM --> AGG
     KN --> AGG
     EL --> AGG
 ```
 
-Only the native linearizability checker and the membership-invariant checks run
-in default `cargo test`/CI. Knossos requires a Clojure/`lein` project and a
-written history; Elle is type-only (`elle_result = None`).
+The native linearizability checker, the membership-invariant checks, and the
+Elle checker's own tests (against elle-checker's committed control histories)
+run in CI; the Elle tests need `lein` and a JDK. Knossos requires a
+Clojure/`lein` project and a written history. On a suite run Elle runs only
+for a workload that requires it, and none does yet; for such a workload a
+missing Elle verdict fails the run as a setup failure rather than passing.
 
 ## PostgreSQL strict-serializability history
 

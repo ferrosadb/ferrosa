@@ -1,0 +1,28 @@
+{
+  "stage": "aeneas",
+  "llbc": "/home/bkearns/src/ferrosa-suite/ferrosa/ferrosa_loadgen.llbc",
+  "lean": "/home/bkearns/.hermes/cache/scratch/leangap-ferrosa-loadgen-yd_7ep2q/FerrosaLoadgen.lean",
+  "translation_errors": 0,
+  "translation_unique_reported": null,
+  "translation_messages": [],
+  "aeneas_exit": 1,
+  "lean_errors": 1,
+  "errors": [
+    {
+      "location": "FerrosaLoadgen.lean:7553:30",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `GroundTruth`: The environment does not contain `ferrosa_loadgen.ground_truth.GroundTruth.GroundTruth`, so it is not possible to project the field `GroundTruth` from an expression"
+    }
+  ],
+  "sorry_declarations": 396,
+  "compiled": false,
+  "crate": "ferrosa-loadgen",
+  "prefix": "ferrosa_loadgen::*",
+  "generated_at": "2026-10-31T19:55:30+00:00",
+  "memory_max": "18G",
+  "toolchain": {
+    "charon": "/home/bkearns/src/aeneas/charon/bin/charon",
+    "aeneas": "/home/bkearns/src/aeneas/src/_build/default/main.exe",
+    "lean_pkg": "/home/bkearns/.local/aeneas/backends/lean"
+  }
+}

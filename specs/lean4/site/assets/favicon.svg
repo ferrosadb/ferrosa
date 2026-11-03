@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#15243b"/>
+      <stop offset="100%" stop-color="#05070c"/>
+    </linearGradient>
+    <linearGradient id="steel" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#d7fbff"/>
+      <stop offset="50%" stop-color="#7ee7ff"/>
+      <stop offset="100%" stop-color="#348cff"/>
+    </linearGradient>
+  </defs>
+  <rect width="32" height="32" rx="7" fill="url(#bg)"/>
+  <rect x="5" y="5" width="22" height="22" rx="5" fill="none" stroke="url(#steel)" stroke-width="1.5" opacity="0.8"/>
+  <ellipse cx="16" cy="16" rx="11" ry="11" fill="none" stroke="#7ee7ff" stroke-width="0.8" opacity="0.3" stroke-dasharray="3 2"/>
+  <text x="16" y="20" text-anchor="middle" font-family="Georgia, serif" font-size="12" font-weight="700" fill="url(#steel)">Fe</text>
+</svg>

@@ -110,6 +110,8 @@ pub enum MembershipOp {
     /// promoted to a typed variant.  Existing pre-W1.13 senders that
     /// bincode a `RaftCommand` directly are now decoded here.
     Raw(Box<RaftCommand>),
+    /// Ask the named joining node to verify its own data; only its Raft leader may send this.
+    BootstrapData { host_id: Uuid },
 }
 
 // ---------------------------------------------------------------------------
@@ -677,6 +679,24 @@ impl<N: MembershipNetwork> MembershipChanger<N> {
         };
         self.submit_join_node(info).await?;
 
+        Ok(())
+    }
+
+    /// Admit a data replica as a log-replicating learner that remains Joining.
+    /// Publishing Joining before catch-up preserves a resumable data-bootstrap
+    /// obligation even if the process stops between membership steps. This must
+    /// never be confused with an operator's long-lived analytics learner.
+    pub async fn add_bootstrapping_learner(
+        &self,
+        mut info: NodeInfo,
+        addr: SocketAddr,
+    ) -> Result<(), MembershipError> {
+        info.state = NodeState::Joining;
+        let host_id = info.host_id;
+        self.submit_join_node(info).await?;
+        tracing::info!(%host_id,"bootstrapping learner metadata committed; awaiting log catch-up");
+        self.join_as_learner(host_id, addr).await?;
+        tracing::info!(%host_id,"bootstrapping learner log caught up");
         Ok(())
     }
 

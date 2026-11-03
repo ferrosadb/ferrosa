@@ -132,6 +132,12 @@ struct NodeSpec<'a> {
 
 /// Launch one `ferrosa` process with an explicit data center and rack.
 fn spawn_node(spec: NodeSpec<'_>) -> Node {
+    spawn_node_with_env(spec, &[])
+}
+
+/// [`spawn_node`], plus extra environment for this one process (a shorter
+/// formation deadline, say). Applied last, so it overrides the defaults above.
+fn spawn_node_with_env(spec: NodeSpec<'_>, extra_env: &[(&str, &str)]) -> Node {
     let NodeSpec {
         dir,
         ports,
@@ -182,6 +188,9 @@ fn spawn_node(spec: NodeSpec<'_>) -> Node {
         .stderr(Stdio::from(stderr));
     if let Some(seed) = seed {
         cmd.env("FERROSA_SEED", seed);
+    }
+    for (key, value) in extra_env {
+        cmd.env(key, value);
     }
 
     Node {
@@ -677,5 +686,143 @@ async fn a_ddl_created_in_one_dc_reaches_the_other() {
             east_nodes[0].log_tail(45)
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Poll `node`'s log until it contains `needle`, or panic with the tail.
+fn wait_for_log(node: &Node, needle: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if std::fs::read_to_string(node.log_path()).is_ok_and(|log| log.contains(needle)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    panic!(
+        "node {} never logged {needle:?} within {timeout:?}\n=== log tail ===\n{}",
+        node.host_id,
+        node.log_tail(60)
+    );
+}
+
+/// A data center whose formation deadline passes before its peers arrive must
+/// still form when they do. The deadline is a report, not a verdict.
+///
+/// The east DC's highest-id node starts alone beside a formed west DC, with a
+/// 2 s formation deadline. It enters cluster mode knowing none of its own DC's
+/// voters, so it correctly does not initialise a group (CL-76), and the
+/// deadline passes. Only then do the other two east nodes start. That node is
+/// the one that must initialise the east group, because it has the highest id;
+/// the other two never claim the seed role while it is connected.
+///
+/// RED as written (t_9c219a2b): the election wait ended at the deadline, so the
+/// late initialise that lives inside it never ran again. The east DC never got a
+/// group, and every east node waited on `/readyz` for good. It fails on the
+/// formation behaviour, not on the fixture: the deadline line is asserted to
+/// have fired before the peers start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_data_center_that_missed_its_formation_deadline_forms_when_its_peers_arrive() {
+    const VOTERS_PER_DC: usize = 3;
+    let cluster_name = format!("dc-late-{}", std::process::id());
+    let mut alloc = PortAllocator::new();
+    let ports: Vec<Ports> = (0..VOTERS_PER_DC * 2)
+        .map(|_| alloc_ports(&mut alloc))
+        .collect();
+    let seed_hub = format!("127.0.0.1:{}", ports[0].internode);
+    let host_id = |n: u8| {
+        let d = 0x11u8 * n;
+        format!(
+            "{d:02x}{d:02x}{d:02x}{d:02x}-{d:02x}{d:02x}-{d:02x}{d:02x}-\
+             {d:02x}{d:02x}-{d:02x}{d:02x}{d:02x}{d:02x}{d:02x}{d:02x}"
+        )
+    };
+    let spec = |index: usize, ports: Ports| {
+        let (dc, rack) = if index < VOTERS_PER_DC {
+            (DC_WEST, "rack-west-a")
+        } else {
+            (DC_EAST, "rack-east-a")
+        };
+        NodeSpec {
+            dir: tempfile::tempdir().unwrap(),
+            ports,
+            host_id: host_id(index as u8 + 1),
+            cluster_name: &cluster_name,
+            seed: if index == 0 { None } else { Some(&seed_hub) },
+            dc,
+            rack,
+            expected_cluster_size: VOTERS_PER_DC,
+        }
+    };
+
+    let mut west = Vec::new();
+    for (index, ports) in ports.iter().copied().enumerate().take(VOTERS_PER_DC) {
+        west.push(spawn_node(spec(index, ports)));
+    }
+    for node in &west {
+        wait_ready(node, Duration::from_secs(120));
+    }
+
+    // The east node with the highest id, alone, with a short deadline.
+    let late_seed_index = VOTERS_PER_DC * 2 - 1;
+    let east_seed = spawn_node_with_env(
+        spec(late_seed_index, ports[late_seed_index]),
+        &[("FERROSA_FORMATION_TIMEOUT_SECS", "2")],
+    );
+    wait_for_log(
+        &east_seed,
+        "raft leader election timed out",
+        Duration::from_secs(90),
+    );
+
+    // Its DC's other voters arrive after the deadline.
+    let mut east = vec![east_seed];
+    for (index, port) in ports
+        .iter()
+        .copied()
+        .enumerate()
+        .take(late_seed_index)
+        .skip(VOTERS_PER_DC)
+    {
+        east.push(spawn_node(spec(index, port)));
+    }
+    for node in &east {
+        wait_ready(node, Duration::from_secs(120));
+    }
+
+    // Ready must mean the east group commits DDL: through the node that missed
+    // its deadline, and visible on the voters that joined after it.
+    let keyspace = format!("late_form_{}", std::process::id());
+    let mut client = connect_or_dump(&east[0]).await;
+    client
+        .query(&format!(
+            "CREATE KEYSPACE {keyspace} WITH replication = \
+             {{'class': 'SimpleStrategy', 'replication_factor': 1}}"
+        ))
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "the node that missed its deadline must commit DDL once its DC formed: {e}\n\
+                 === log ===\n{}",
+                east[0].log_tail(40)
+            )
+        });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let mut missing = Vec::new();
+        for node in &east {
+            if !has_keyspace(node, &keyspace).await {
+                missing.push(node.host_id.clone());
+            }
+        }
+        if missing.is_empty() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the keyspace never reached every east voter (missing on {missing:?})\n\
+             === late seed log ===\n{}",
+            east[0].log_tail(45)
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }

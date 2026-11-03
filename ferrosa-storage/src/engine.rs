@@ -1637,6 +1637,9 @@ pub struct StorageEngine {
     batchlog: Option<crate::batchlog::BatchlogManager>,
     /// Background archiver task handle, if archiving is enabled.
     archiver_handle: Option<tokio::task::JoinHandle<()>>,
+    archive_store_override: Option<(Arc<dyn object_store::ObjectStore>, String)>,
+    /// A node prefix has one manifest publisher, shared by background and ACK barriers.
+    archive_publication: Arc<tokio::sync::Mutex<()>>,
     /// Compaction S3 operation metrics (uploads, deletes, bytes reclaimed).
     pub compaction_metrics: Arc<crate::metrics::CompactionMetrics>,
     /// NVMe pin/unpin operation metrics (pinned tables, bytes, evictions).
@@ -3695,6 +3698,8 @@ impl StorageEngine {
                 crate::batchlog::BatchlogConfig::default(),
             )),
             archiver_handle: None,
+            archive_store_override: None,
+            archive_publication: Arc::new(tokio::sync::Mutex::new(())),
             compaction_metrics: Arc::new(crate::metrics::CompactionMetrics::new()),
             pin_metrics: Arc::new(crate::metrics::PinMetrics::new()),
             object_store,
@@ -3847,6 +3852,10 @@ impl StorageEngine {
             durable_local,
         );
 
+        let archive_store_override = archive_store
+            .as_ref()
+            .map(|store| (store.clone(), archive_prefix.clone()));
+        let archive_publication = Arc::new(tokio::sync::Mutex::new(()));
         // Set up archiver if enabled.
         let archiver_handle = match (&config.commit_log.archive, archive_store, runtime) {
             (Some(archive_cfg), Some(store), Some(rt)) if archive_cfg.enabled => {
@@ -3859,14 +3868,18 @@ impl StorageEngine {
                     config.commit_log.log_dir.clone(),
                 );
 
+                let publication = archive_publication.clone();
+                let archived_segments = commit_log.archive_tracking();
                 // Spawn background archiver task.
                 // Each segment runs inside a panic boundary: before, one
                 // panic ended this task, and every later rotation's notify
                 // failed (now counted by `archive_notify_dropped_total`).
                 let handle = rt.spawn(async move {
                     while let Some(segment_id) = rx.recv().await {
+                        let _publication = publication.lock().await;
+                        if archived_segments.lock().contains(&segment_id) { continue; }
                         let archived = futures::FutureExt::catch_unwind(
-                            std::panic::AssertUnwindSafe(archiver.archive_segment(segment_id)),
+                            std::panic::AssertUnwindSafe(archiver.archive_segment_streaming(segment_id)),
                         )
                         .await;
                         let archived = match archived {
@@ -3904,6 +3917,8 @@ impl StorageEngine {
                                     .await
                                 {
                                     tracing::error!(%e, segment_id, "commitlog-archiver: manifest update failed");
+                                } else {
+                                    archived_segments.lock().insert(segment_id);
                                 }
                             }
                             Err(e) => {
@@ -3968,6 +3983,8 @@ impl StorageEngine {
                 crate::batchlog::BatchlogConfig::default(),
             )),
             archiver_handle,
+            archive_store_override,
+            archive_publication,
             compaction_metrics: Arc::new(crate::metrics::CompactionMetrics::new()),
             pin_metrics: Arc::new(crate::metrics::PinMetrics::new()),
             object_store,
@@ -4276,6 +4293,8 @@ impl StorageEngine {
                 crate::batchlog::BatchlogConfig::default(),
             )),
             archiver_handle: None,
+            archive_store_override: None,
+            archive_publication: Arc::new(tokio::sync::Mutex::new(())),
             compaction_metrics: Arc::new(crate::metrics::CompactionMetrics::new()),
             pin_metrics: Arc::new(crate::metrics::PinMetrics::new()),
             object_store,
@@ -11110,6 +11129,21 @@ impl StorageEngine {
         }
     }
 
+    /// Evaluate a canonical row against the named local index declaration,
+    /// using the same catalog, key encoding and predicate rules as postings.
+    pub fn index_row_matches(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        query: &ferrosa_index::IndexKey,
+        key: &DecoratedKey,
+        row: &Row,
+    ) -> ferrosa_common::Result<bool> {
+        self.require_table(table_id)?
+            .store
+            .index_row_matches(index_name, query, key, row)
+    }
+
     /// Query by secondary index restricted to ONE partition (t_430c4188).
     ///
     /// Delegates to [`TableStore::read_by_index_in_partition`], which keeps
@@ -11202,7 +11236,7 @@ impl StorageEngine {
         // normalize internally; this keeps the fast path in parity. A query
         // that analyzes away entirely matches nothing.
         let analyzer = default_analyzer();
-        let parsed = match analyze_query(&parsed, analyzer.as_ref()) {
+        let parsed = match analyze_query(&parsed, &analyzer) {
             Some(q) => q,
             None => return Ok(vec![]),
         };
@@ -11469,7 +11503,7 @@ impl StorageEngine {
         // Analyzer parity for the single-`Term` streaming fast path (see
         // `fulltext_search`). A query that analyzes away matches nothing.
         let analyzer = default_analyzer();
-        let parsed = match analyze_query(&parsed, analyzer.as_ref()) {
+        let parsed = match analyze_query(&parsed, &analyzer) {
             Some(q) => q,
             None => return Ok(()),
         };
@@ -12102,6 +12136,51 @@ impl StorageEngine {
     /// the commit log (e.g., for catch-up replay after failover).
     pub fn force_commit_log_sync(&self) -> ferrosa_common::Result<()> {
         self.commit_log.force_sync()
+    }
+
+    /// Pin WAL before strict pair writes can race with memtable flush/GC.
+    pub fn retain_commit_log_for_archive(&self) {
+        self.commit_log.retain_for_archive();
+    }
+
+    /// Publish every closed WAL segment through the ordinary PITR archive and
+    /// manifest before a strict singleton QUORUM ACK. A busy upload is awaited.
+    /// Failures and cancellation leave WAL retained, and never imply durability.
+    pub async fn archive_commit_log_before_ack(&self) -> ferrosa_common::Result<()> {
+        let (store, prefix) = if let Some((store, prefix)) = &self.archive_store_override {
+            (store.clone(), prefix.clone())
+        } else {
+            let (config, store) = self.object_store_and_config()?;
+            if config.is_local() {
+                return Err(ferrosa_common::Error::InvalidData(
+                    "strict pair QUORUM requires shared S3, not file://".into(),
+                ));
+            }
+            (store.clone(), config.prefix.clone())
+        };
+        let _publication = self.archive_publication.lock().await;
+        let segments = self.commit_log.close_for_archive()?;
+        let archiver = crate::commitlog::archiver::CommitLogArchiver::new(
+            store,
+            prefix,
+            self.config.commit_log.log_dir.clone(),
+        );
+        for segment_id in segments {
+            let result = archiver.archive_segment_streaming(segment_id).await?;
+            crate::commitlog::manifest::ArchiveManifest::append_and_save(
+                archiver.store(),
+                archiver.prefix(),
+                crate::commitlog::manifest::ArchiveSegmentEntry {
+                    id: result.segment_id,
+                    sha256: result.sha256,
+                    size: result.size,
+                    archived_at: result.archived_at,
+                },
+            )
+            .await?;
+            self.commit_log.mark_archived(segment_id);
+        }
+        Ok(())
     }
 
     /// Health of the commit-log sync thread, for the node supervisor.
@@ -17128,6 +17207,8 @@ impl StorageEngine {
                 crate::batchlog::BatchlogConfig::default(),
             )),
             archiver_handle: None,
+            archive_store_override: None,
+            archive_publication: Arc::new(tokio::sync::Mutex::new(())),
             compaction_metrics: Arc::new(crate::metrics::CompactionMetrics::new()),
             pin_metrics: Arc::new(crate::metrics::PinMetrics::new()),
             object_store: Some(Arc::clone(&store)),
@@ -27373,29 +27454,46 @@ mod tests {
     }
 
     /// Drive `vec_idx`'s repair to completion: run it here, or wait for the
-    /// background run registration started. Bounded; fails loud if it never
-    /// finishes.
+    /// background run registration starts (`reload_indexes_from_system_schema`
+    /// → `add_vector_index_with_method` → `spawn_vector_repair_if_needed`),
+    /// whose `run/{index}` claim makes
+    /// [`StorageEngine::repair_vector_index`] return `Ok(None)` while it holds
+    /// the index.
+    ///
+    /// Bounded by progress, not by attempts: one generation's build is the
+    /// unit of work (minutes at production scale), so the wait ends when
+    /// `pending` drains and fails loud only when it stops shrinking. A count of
+    /// attempts cannot see that — 1,000 iterations of a 10 ms sleep is ten
+    /// seconds, less than one generation takes, so a background run doing
+    /// exactly the right thing was reported as one that "never finished".
     fn finish_vector_repair(engine: &StorageEngine) {
-        for _ in 0..1_000 {
-            if engine
-                .vector_generations_pending(&table_id(), "vec_idx")
-                .unwrap()
-                .is_empty()
-            {
-                return;
-            }
-            if engine
+        const NO_PROGRESS: std::time::Duration = std::time::Duration::from_secs(900);
+        let mut pending = engine
+            .vector_generations_pending(&table_id(), "vec_idx")
+            .unwrap();
+        let mut last_progress = std::time::Instant::now();
+        while !pending.is_empty() {
+            assert!(
+                last_progress.elapsed() < NO_PROGRESS,
+                "vector repair made no progress for {NO_PROGRESS:?}; pending: {pending:?}"
+            );
+            // `None` means another run holds the index: wait for it rather
+            // than counting that as "nothing happened".
+            let ran_here = engine
                 .repair_vector_index(&table_id(), "vec_idx")
                 .unwrap()
-                .is_none()
-            {
+                .is_some();
+            let now = engine
+                .vector_generations_pending(&table_id(), "vec_idx")
+                .unwrap();
+            if now.len() < pending.len() {
+                last_progress = std::time::Instant::now();
+            }
+            pending = now;
+            if !ran_here {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
-        panic!(
-            "vector repair never finished; pending: {:?}",
-            engine.vector_generations_pending(&table_id(), "vec_idx")
-        );
     }
 
     /// Flush `rows` as one SSTable each batch, then compact them into one.

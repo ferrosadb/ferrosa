@@ -53,7 +53,7 @@ here — it lives in `ferrosa-cql` / `ferrosa-row-bridge`.
   `is_backpressure()` for overload classification.
 - **Accord primitives** — `Timestamp`, `TxnId`, `BallotNumber` /
   `AcceptedBallot` / `PromisedBallot` (type-safe role separation),
-  `HybridLogicalClock` (lock-free, drift-rejecting `merge`), `BallotGenerator`,
+  `HybridLogicalClock` (coherent time/sequence locking, drift-rejecting `merge`), `BallotGenerator`,
   `TxnPhase` / `TxnState`.
 - **Schema** — `TableSchema`, `ColumnDefinition`, `PinConfig` (NVMe pinning from
   table extensions), plus fail-loud helpers `fixed_width_for_marshal_type`,
@@ -287,3 +287,13 @@ allocations fell from 2,400 (6.25/row) to 1,632 (4.25/row).
 ## Immutable scalar scan values
 
 Runtime `CqlValue::Text`/`Ascii` use immutable `SharedText`, and `Blob` uses `CellBytes`. Clones share payload ownership. `SharedText::from_cell` validates UTF-8 once while retaining the original `CellBytes` owner through `bytes::Bytes`/`bytestring::ByteString`; it does not copy the payload when another storage owner is alive. Adopting text allocates an ownership handle, so this is not allocation-free. String constructors transfer their buffer with `.into()`. Retained backing capacity is tracked separately from byte-based equality, ordering, hashing and string serialization. Blob serialization retains the existing strict byte-array representation.
+
+The HLC updates its `(time, sequence)` pair under one short synchronous mutex in
+`now` and `merge`, so concurrent callers cannot reuse a transaction ID through
+a torn pair of atomic operations. Timestamp fields and their serialized encoding
+are unchanged. Sequence exhaustion fails loudly rather than reusing an ID.
+`witness` merges then mints through those same synchronized operations. No I/O or
+await occurs while holding the lock except reading the system clock. Callers
+sharing one node clock may contend; an end-to-end latency budget has not been
+measured. Concurrent uniqueness and the existing drift/monotonicity tests cover
+the clock contract.

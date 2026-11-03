@@ -1,0 +1,458 @@
+{
+  "stage": "aeneas",
+  "llbc": "/home/bkearns/src/ferrosa-suite/ferrosa/ferrosa_net.llbc",
+  "lean": "/home/bkearns/.hermes/cache/scratch/leangap-ferrosa-net-b9k4sihq/FerrosaNet.lean",
+  "translation_errors": 0,
+  "translation_unique_reported": null,
+  "translation_messages": [],
+  "aeneas_exit": 1,
+  "lean_errors": 87,
+  "errors": [
+    {
+      "location": "FerrosaNet.lean:2686:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes_mut.BytesMut.Insts.BytesBufBuf_mutBufMut`"
+    },
+    {
+      "location": "FerrosaNet.lean:2734:6",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:2745:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:2749:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:2759:20",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `bytes`: The environment does not contain `ferrosa_net.bytes.bytes.Bytes.bytes`, so it is not possible to project the field `bytes` from an expression"
+    },
+    {
+      "location": "FerrosaNet.lean:2786:6",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:2798:12",
+      "kind": "lean.invalidField",
+      "message": "Invalid field `buf`: The environment does not contain `Aeneas.Std.Array.buf`, so it is not possible to project the field `buf` from an expression"
+    },
+    {
+      "location": "FerrosaNet.lean:2851:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes_mut.BytesMut.Insts.BytesBufBuf_mutBufMut`"
+    },
+    {
+      "location": "FerrosaNet.lean:2871:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes_mut.BytesMut.Insts.BytesBufBuf_mutBufMut`"
+    },
+    {
+      "location": "FerrosaNet.lean:2876:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes_mut.BytesMut.Insts.BytesBufBuf_mutBufMut`"
+    },
+    {
+      "location": "FerrosaNet.lean:2898:6",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:2904:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:2928:6",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:2939:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:2943:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:2963:6",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:2967:6",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3410:12",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3421:14",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3424:14",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3435:16",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3439:16",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3525:10",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3536:12",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3539:12",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3542:12",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3604:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3615:10",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3618:10",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3623:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3634:10",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3637:10",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3640:10",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3649:10",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3660:12",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3703:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3709:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3715:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3721:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3727:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3733:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3739:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3745:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3751:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3757:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3763:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3769:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3775:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3781:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3787:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3793:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3799:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3805:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3811:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3817:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3823:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3829:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3835:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3842:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3849:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3855:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3862:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3868:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3874:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3881:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3888:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3895:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3902:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3909:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3915:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3921:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3927:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3933:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3939:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3945:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3951:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3957:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3968:10",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3971:10",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:3976:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:4002:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:4008:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:4014:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:4020:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:4026:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:4032:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    },
+    {
+      "location": "FerrosaNet.lean:4038:8",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_net.bytes.bytes.Bytes.Insts.BytesBufBuf_implBuf`"
+    }
+  ],
+  "sorry_declarations": 0,
+  "compiled": false,
+  "crate": "ferrosa-net",
+  "prefix": "ferrosa_net::protocol::*",
+  "generated_at": "2026-10-31T07:07:11+00:00",
+  "memory_max": "8G",
+  "toolchain": {
+    "charon": "/home/bkearns/src/aeneas/charon/bin/charon",
+    "aeneas": "/home/bkearns/src/aeneas/src/_build/default/main.exe",
+    "lean_pkg": "/home/bkearns/.local/aeneas/backends/lean"
+  }
+}

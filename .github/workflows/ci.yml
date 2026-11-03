@@ -37,6 +37,10 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --check
+      # `unsafe` is the one part of the codebase no model or proof covers, so the set has to be
+      # enumerated and reviewed by hand. This fails when the enumeration and the source disagree.
+      - name: Check the unsafe ledger matches the source
+        run: python3 -m unittest -q tests.ci.test_unsafe_ledger
       - name: Check Cluster Data Loss workflow contract
         run: python3 -m unittest tests.ci.test_cluster_data_loss_workflow
       - name: Check Install Smoke workflow contract
@@ -73,6 +77,14 @@ jobs:
         run: python3 -m unittest -q tests/ci/test_dev_profile_optimizes_test_engines.py
       - name: Check the no-new-waivers guard
         run: python3 -m unittest -q tests/ci/test_check_no_new_waivers.py
+      - name: Check the Lean linkage report reads Broken rows by field name
+        run: python3 -m unittest -q tests/ci/test_lean_linkage_rows.py
+      - name: Check the red ledger is data, not ignored tests
+        run: python3 -m unittest -q tests/ci/test_red_ledger_generator.py
+      - name: Check the theorem register tells counterexamples from reds
+        run: python3 -m unittest -q tests/ci/test_gen_register.py
+      - name: Check the extraction sync check runs without an aeneas checkout
+        run: python3 -m unittest -q tests/ci/test_lean4_rust_check_sync.py
       - name: Check local CI mirror prerequisites
         run: python3 -m unittest tests.ci.test_pre_push_prerequisites
       - name: Check local and CI dependency gate parity
@@ -119,6 +131,31 @@ jobs:
         run: python3 scripts/guard-no-python-data-writes.py
       - name: Guard tests
         run: python3 -m unittest -q tests/ci/test_guard_no_python_data_writes.py
+
+  # Charon and Aeneas' Lean backend are what exhaust this host: charon reached
+  # 21.5 GB and 24.4 GB resident on ferrosa-common, and on 2026-10-30 three
+  # concurrent `aeneas main.exe -backend lean` runs took a 30 GB machine to a
+  # global OOM that killed an unrelated CI rustc. Two ceilings now stand in the
+  # way. lean_gap_report.py holds a machine-wide flock across extract+elaborate,
+  # so only one crate is extracted at a time; and it runs every child inside a
+  # user cgroup scope with MemoryMax (60% of RAM by default), so one extraction
+  # cannot do it alone either -- the scan that took the box down was started by a
+  # systemd user unit with no limits of its own, which is why the ceiling lives in
+  # the script and not in a launcher.
+  # Cheap to check: no cargo, no toolchain, just processes, cgroups and a lock
+  # file. The cgroup cases skip where there is no user manager, as in this runner.
+  lean-gap-extraction-limits:
+    name: Lean gap extraction is serialized and capped
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Extraction lock, memory ceiling and exclusion tests
+        run: >-
+          python3 -m unittest -q
+          tests/ci/test_lean_gap_single_extraction.py
+          tests/ci/test_lean_gap_memory_cap.py
+          tests/ci/test_lean_gap_exclusions.py
+          tests/ci/test_lean_gap_inventory_state.py
 
   # Every `--all-features --workspace` lane must exclude the tests behind
   # `live-infra-tests`: they are absent from the default target and panic by
@@ -352,7 +389,7 @@ jobs:
           # is how this step once ran 9,740 tests and failed six of them.
           cargo nextest run --all-features --workspace --lib --tests \
             --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
-            -E 'not binary(accord_apply_decode_residency) and not binary(commit_guarantee_replica_process) and not binary(drop_table_replica_process) and not binary(jsonb_first_class_cluster_process) and not binary(pg_public_keyspace_rf_process) and not binary(pg_select_cluster_read_process) and not binary(pg_txn_value_process)' \
+            -E 'not binary(accord_apply_decode_residency) and not binary(commit_guarantee_replica_process) and not binary(data_center_process) and not binary(data_dir_lock_process) and not binary(drop_table_replica_process) and not binary(jsonb_first_class_cluster_process) and not binary(pg_public_keyspace_rf_process) and not binary(pg_select_cluster_read_process) and not binary(pg_txn_value_process)' \
             -- --skip ::slow:: --skip accord::perf --skip conflict_index_residency_projection_absolute \
                --skip apply_writeset_peak_stays_within_the_input_size \
                --skip apply_writeset_borrowed_does_not_hold_the_decoded_batch_resident \
@@ -374,13 +411,17 @@ jobs:
                --skip differential_oracle \
                --skip fly_multi_node_streaming_scan \
                --skip replicated_jsonb_index_builds_on_every_node \
+               --skip strict_pair_live_s3_ack_replays_exact_mutation \
                --skip real_typed_edges_paged_scan_delivers_every_distinct_row \
                --skip count_range_metadata_merger_dedups_real_typed_edges_sstables \
                --skip promote_dir_fsync_lazyfs_crash_loses_neither_copy \
 
       - name: Run the real-process cluster harnesses (isolated)
-        # Each of these spawns THREE real `ferrosa` node processes and asserts on
-        # leader election, snapshot barriers and restart repair. Measured 5/5 green
+        # Every `ferrosa/tests/*_process.rs` binary: each spawns real `ferrosa`
+        # node processes (up to three) and asserts on leader election, snapshot
+        # barriers, restart repair, data-center stamping or the data-dir lock.
+        # tests/ci/test_ci_build_once.py derives the set from the tree, so a new
+        # harness cannot silently land in the parallel run above. Measured 5/5 green
         # locally in 13-23 s each, but inside the ~9,650-test run above a node can be
         # starved for its entire 90 s readiness budget and never bind its listener --
         # indistinguishable from a hang from the outside, so no harness-side budget
@@ -395,11 +436,11 @@ jobs:
         # cassandra_reads_compacted, compaction_end_to_end_pipeline, lazyfs
         # promote, the typed-edge count merger) fail in ~0.1s without their
         # infrastructure. `binary()` matches a binary name exactly, so the
-        # filterset selects these six binaries and nothing else.
+        # filterset selects these binaries and nothing else.
         run: |
           cargo nextest run --all-features --workspace --lib --tests \
             --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
-            -E 'package(ferrosa) and (binary(commit_guarantee_replica_process) or binary(drop_table_replica_process) or binary(jsonb_first_class_cluster_process) or binary(pg_public_keyspace_rf_process) or binary(pg_select_cluster_read_process) or binary(pg_txn_value_process))'
+            -E 'package(ferrosa) and (binary(commit_guarantee_replica_process) or binary(data_center_process) or binary(data_dir_lock_process) or binary(drop_table_replica_process) or binary(jsonb_first_class_cluster_process) or binary(pg_public_keyspace_rf_process) or binary(pg_select_cluster_read_process) or binary(pg_txn_value_process))'
 
   # ── Stage 2a': Differential oracle vs real PostgreSQL ──────────────
   # The `test` job above skips `differential_oracle` because it has no
@@ -697,6 +738,40 @@ jobs:
           scripts/pull-images.sh \
             "downloads.ferrosa.ai/rustfs@sha256:58c589bedfab28d001fc6176735872ac84323dddc6c5313cc95260600ed1ae8d" \
             "downloads.ferrosa.ai/aws-cli@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed"
+      # The Elle checker tests (`checker::elle`, the orchestrator's transactional
+      # path) run the real elle-checker project under lein, and panic with setup
+      # instructions when lein is missing — they are never skipped. So this job
+      # provides a JDK, a pinned lein, and the checker's deps before the tests.
+      - uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Cache lein/Elle deps
+        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.2
+        with:
+          path: |
+            ~/.m2
+            ~/.lein/self-installs
+          key: lein-2.11.2-m2-${{ hashFiles('ferrosa-jepsen/elle-checker/project.clj') }}
+      - name: Install Leiningen (pinned, checksum-verified) and prefetch Elle deps
+        working-directory: ferrosa-jepsen/elle-checker
+        env:
+          LEIN_VERSION: "2.11.2"
+          # sha256 of bin/lein at the 2.11.2 tag. The script in turn verifies the
+          # standalone jar it self-installs against its own embedded LEIN_CHECKSUM,
+          # so this one digest pins both.
+          LEIN_SHA256: f83e3de252cb09d301f18f1912acffa807b54c1c9a96772ae63847a946032bd4
+        run: |
+          set -euo pipefail
+          if ! command -v lein >/dev/null; then
+            curl -fsSL -o "$RUNNER_TEMP/lein" \
+              "https://raw.githubusercontent.com/technomancy/leiningen/${LEIN_VERSION}/bin/lein"
+            echo "${LEIN_SHA256}  $RUNNER_TEMP/lein" | sha256sum -c -
+            sudo install -m 0755 "$RUNNER_TEMP/lein" /usr/local/bin/lein
+          fi
+          lein version
+          # Fetch jepsen/Elle and Clojure, which the fake-checker tests reuse.
+          lein deps
       - name: Run Jepsen smoke tier
         env:
           FERROSA_TEST_CONTAINERS: "1"
@@ -757,6 +832,25 @@ jobs:
         with:
           name: ferrosa-node-image
           path: /tmp/ferrosa-node-image
+      # A bare `docker compose up` pulls with no retry of its own. The compose
+      # file's images all come from downloads.ferrosa.ai, which sits behind
+      # Cloudflare and answers a burst of concurrent CI pulls with a "Too Many
+      # Requests" page that docker reports as `toomanyrequests` -- a plain pull
+      # failure that aborts this job before a single test runs (run 2524,
+      # 2026-11-03, failed that way with every other job green, which makes it
+      # read as a Postgres fault in the PR summary). Pull what the cluster needs
+      # first, through the bounded-retry helper, so a rate-limited window is
+      # waited out. The digests are read back out of the compose file so this
+      # cannot drift from the images the cluster actually starts.
+      - name: Pull the cluster images with a bounded retry
+        run: |
+          set -euo pipefail
+          mapfile -t images < <(
+            grep -oE 'downloads\.ferrosa\.ai/[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' \
+              ferrosa-jepsen/tests/docker/jepsen-cluster.yml | sort -u
+          )
+          printf 'pulling %d pinned images plus %s\n' "${#images[@]}" "$FERROSA_ALPINE_IMAGE"
+          scripts/pull-images.sh "${images[@]}" "$FERROSA_ALPINE_IMAGE"
       - name: Load node image and start the PostgreSQL cluster
         env:
           FERROSA_NIGHTLY_IMAGE: ferrosa-test-node:latest

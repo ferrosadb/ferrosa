@@ -268,6 +268,7 @@ pub enum Message {
     SstableStreamEnd(Bytes),
 
     // Pair mode
+    PairAuthority(Bytes),
     PairWriteForward(Bytes),
     PairWriteAck(Bytes),
     PairCatchUp {
@@ -440,6 +441,7 @@ impl Message {
             Self::PairCatchUp { .. } => MsgType::PairCatchUp,
             Self::PairCatchUpResponse(_) => MsgType::PairCatchUpResponse,
             Self::RoleSwap { .. } => MsgType::RoleSwap,
+            Self::PairAuthority(..) => MsgType::PairAuthority,
             Self::PairSchemaSync(_) => MsgType::PairSchemaSync,
             Self::PairDdlForward(_) => MsgType::PairDdlForward,
             Self::PairDdlAck(_) => MsgType::PairDdlAck,
@@ -627,6 +629,7 @@ impl Message {
             | Self::SstableStreamStart(b)
             | Self::SstableStreamChunk(b)
             | Self::SstableStreamEnd(b)
+            | Self::PairAuthority(b)
             | Self::PairWriteForward(b)
             | Self::PairWriteAck(b)
             | Self::PairCatchUpResponse(b)
@@ -799,6 +802,7 @@ impl Message {
                     last_offset: body.get_u32(),
                 }
             }
+            MsgType::PairAuthority => Self::PairAuthority(body.split_to(body.remaining())),
             MsgType::RoleSwap => {
                 let new_primary = get_uuid(body)?;
                 let new_secondary = get_uuid(body)?;
@@ -1325,6 +1329,23 @@ mod tests {
             }
             other => panic!("expected Handshake, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn pair_authority_opaque_payload_roundtrip() {
+        let original = Message::PairAuthority(Bytes::from_static(br#"{"operation":"Prepare"}"#));
+        let mut buffer = BytesMut::new();
+        original.encode(&mut buffer).unwrap();
+        assert_eq!(original.msg_type() as u8, 0x4C);
+        assert_eq!(MsgType::try_from(0x4C).unwrap(), MsgType::PairAuthority);
+        assert_eq!(
+            Message::decode(MsgType::PairAuthority, &mut buffer.freeze()).unwrap(),
+            original
+        );
+        assert_ne!(
+            crate::handshake::LOCAL_CAPABILITIES & crate::handshake::CAP_PAIR_AUTHORITY,
+            0
+        );
     }
 
     #[test]

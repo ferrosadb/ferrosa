@@ -11,6 +11,7 @@ members = [
     "ferrosa-graph",
     "ferrosa-index",
     "ferrosa-jsonb",
+    "red-ledger",
     "ferrosa-net",
     "ferrosa-postgres",
     "ferrosa-row-bridge",
@@ -29,6 +30,7 @@ members = [
     "ferrosa-index-builder",
     "ferrosa-sim",
     "xtask",
+    "tools/alloc-count",
 ]
 # Dev-only oracle with its own [workspace] and Cargo.lock: parquet-variant 60
 # needs chrono >= 0.4.40, which breaks arrow-arith 53 (ferrosa-flight) at
@@ -127,7 +129,7 @@ opt-level = 3
 opt-level = 3
 
 [workspace.package]
-version = "0.30.8"
+version = "0.31.2"
 edition = "2021"
 license = "Apache-2.0"
 # No workspace crate is published to crates.io. Saying so lets cargo-deny

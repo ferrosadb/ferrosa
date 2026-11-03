@@ -12,7 +12,6 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::Bytes;
 use object_store::path::Path as ObjectPath;
@@ -45,12 +44,6 @@ pub struct CommitLogArchiver {
     log_dir: PathBuf,
 }
 
-/// Maximum retry attempts for S3 upload.
-const MAX_RETRIES: u32 = 5;
-
-/// Base delay for exponential backoff: 1s, 2s, 4s, 8s, 16s.
-const BASE_DELAY: Duration = Duration::from_secs(1);
-
 impl CommitLogArchiver {
     /// Creates a new archiver.
     pub fn new(store: Arc<dyn ObjectStore>, prefix: String, log_dir: PathBuf) -> Self {
@@ -71,92 +64,176 @@ impl CommitLogArchiver {
         &self.prefix
     }
 
-    /// Archives a single closed segment to S3.
-    ///
-    /// Reads the segment file from disk, computes its SHA-256, uploads
-    /// to `{prefix}/commitlog-archive/{hex}/{segment_id}.log` (where `hex`
-    /// is a 2-char prefix from `hex_prefix_for`), and returns
-    /// the archive metadata.
-    ///
-    /// Retries transient S3 errors with exponential backoff (5 attempts:
-    /// 1s, 2s, 4s, 8s, 16s).
+    /// Archive a closed segment using bounded streaming and immutable-key
+    /// reservation. Errors are returned for the caller to retry; no data is
+    /// published through an unfenced compatibility path.
     pub async fn archive_segment(
         &self,
         segment_id: u64,
     ) -> ferrosa_common::Result<ArchivedSegment> {
-        // Read segment file from disk.
+        self.archive_segment_streaming(segment_id).await
+    }
+
+    /// Upload immutable WAL with bounded 8 MiB buffering and incremental SHA256.
+    /// The existing PITR key and manifest format remain the recovery contract.
+    /// Errors fail the caller; no successful return before multipart completion.
+    pub async fn archive_segment_streaming(
+        &self,
+        segment_id: u64,
+    ) -> ferrosa_common::Result<ArchivedSegment> {
+        use tokio::io::AsyncReadExt;
         let path = self.log_dir.join(format!("commitlog-{segment_id}.log"));
-        let data = tokio::fs::read(&path).await.map_err(|e| {
+        let mut file = tokio::fs::File::open(&path).await.map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!(
-                "failed to read segment {segment_id} at {}: {e}",
+                "open archive WAL {}: {e}",
                 path.display()
             ))
         })?;
-
-        // Compute SHA-256.
-        let sha256 = hex_sha256(&data);
-        let size = data.len() as u64;
-
-        // Upload to S3 with retry.
-        // Distribute across 256 hex-prefixed buckets (same pattern as SSTable uploads).
         let hex = crate::upload::manager::hex_prefix_for(&segment_id.to_string());
-        let s3_path = ObjectPath::from(format!(
+        let object = ObjectPath::from(format!(
             "{}/commitlog-archive/{hex}/{segment_id}.log",
             self.prefix
         ));
-        let bytes = Bytes::from(data);
-
-        self.put_with_retry(&s3_path, bytes, MAX_RETRIES).await?;
-
-        let archived_at = now_iso8601();
-
-        Ok(ArchivedSegment {
-            segment_id,
-            sha256,
-            size,
-            archived_at,
-        })
-    }
-
-    /// Puts data to S3 with exponential backoff retry.
-    async fn put_with_retry(
-        &self,
-        path: &ObjectPath,
-        data: Bytes,
-        max_retries: u32,
-    ) -> ferrosa_common::Result<()> {
-        let mut delay = BASE_DELAY;
-
-        for attempt in 0..=max_retries {
-            match self.store.put(path, data.clone().into()).await {
-                Ok(_) => return Ok(()),
-                Err(e) if attempt < max_retries => {
-                    tracing::warn!(
-                        attempt = attempt + 1,
-                        max_retries = max_retries + 1,
-                        %path,
-                        %e,
-                        "commitlog-archiver: upload attempt failed"
-                    );
-                    tokio::time::sleep(delay).await;
-                    delay *= 2;
+        self.claim_segment(segment_id, &mut file).await?;
+        let mut upload = self.store.put_multipart(&object).await.map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!("start archive {object}: {e}"))
+        })?;
+        let transfer = async {
+            let mut hash = Sha256::new();
+            let mut size = 0u64;
+            loop {
+                let mut chunk = vec![0u8; 8 * 1024 * 1024];
+                let mut filled = 0;
+                while filled < chunk.len() {
+                    let n = file.read(&mut chunk[filled..]).await.map_err(|e| {
+                        ferrosa_common::Error::InvalidFormat(format!("read archive WAL: {e}"))
+                    })?;
+                    if n == 0 {
+                        break;
+                    }
+                    filled += n;
                 }
-                Err(e) => {
-                    return Err(ferrosa_common::Error::InvalidFormat(format!(
-                        "failed to upload {path} after {} attempts: {e}",
-                        max_retries + 1
-                    )));
+                if filled == 0 {
+                    break;
                 }
+                chunk.truncate(filled);
+                hash.update(&chunk);
+                size += filled as u64;
+                upload
+                    .put_part(Bytes::from(chunk).into())
+                    .await
+                    .map_err(|e| {
+                        ferrosa_common::Error::InvalidFormat(format!(
+                            "upload archive {object}: {e}"
+                        ))
+                    })?;
+            }
+            upload.complete().await.map_err(|e| {
+                ferrosa_common::Error::InvalidFormat(format!("complete archive {object}: {e}"))
+            })?;
+            let sha256 = hex_digest(&hash.finalize());
+            Ok(ArchivedSegment {
+                segment_id,
+                sha256,
+                size,
+                archived_at: now_iso8601(),
+            })
+        }
+        .await;
+        if transfer.is_err() {
+            if let Err(error) = upload.abort().await {
+                tracing::warn!(%error, %object, "failed to abort archive multipart upload");
             }
         }
+        transfer
+    }
 
-        unreachable!()
+    /// Reserve an immutable archive data key before uploading. The tiny claim
+    /// is control metadata, not a recovery object or a durability acknowledgment.
+    /// Conditional CREATE fences concurrent engines sharing a node prefix.
+    async fn claim_segment(
+        &self,
+        segment_id: u64,
+        file: &mut tokio::fs::File,
+    ) -> ferrosa_common::Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let mut hash = Sha256::new();
+        let mut size = 0u64;
+        let mut chunk = vec![0u8; 64 * 1024];
+        loop {
+            let n = file.read(&mut chunk).await.map_err(|error| {
+                ferrosa_common::Error::InvalidFormat(format!("hash archive WAL: {error}"))
+            })?;
+            if n == 0 {
+                break;
+            }
+            hash.update(&chunk[..n]);
+            size += n as u64;
+        }
+        file.rewind().await.map_err(|error| {
+            ferrosa_common::Error::InvalidFormat(format!("rewind archive WAL: {error}"))
+        })?;
+        let sha256 = hex_digest(&hash.finalize());
+        let manifest = super::manifest::ArchiveManifest::load(self.store(), self.prefix()).await?;
+        if manifest
+            .segments
+            .iter()
+            .any(|entry| entry.id == segment_id && (entry.sha256 != sha256 || entry.size != size))
+        {
+            return Err(ferrosa_common::Error::InvalidData(format!(
+                "archive WAL id {segment_id} collides with acknowledged data; recover or use a fresh node prefix")));
+        }
+        let hex = crate::upload::manager::hex_prefix_for(&segment_id.to_string());
+        let claim = ObjectPath::from(format!(
+            "{}/commitlog-archive/{hex}/{segment_id}.claim",
+            self.prefix
+        ));
+        let signature = format!("v1:{size}:{sha256}");
+        match self
+            .store
+            .put_opts(
+                &claim,
+                Bytes::from(signature.clone()).into(),
+                object_store::PutMode::Create.into(),
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(
+                object_store::Error::AlreadyExists { .. }
+                | object_store::Error::Precondition { .. },
+            ) => {
+                let existing = self
+                    .store
+                    .get(&claim)
+                    .await
+                    .map_err(|error| {
+                        ferrosa_common::Error::InvalidFormat(format!(
+                            "read WAL archive claim: {error}"
+                        ))
+                    })?
+                    .bytes()
+                    .await
+                    .map_err(|error| {
+                        ferrosa_common::Error::InvalidFormat(format!(
+                            "read WAL archive claim body: {error}"
+                        ))
+                    })?;
+                if existing.as_ref() == signature.as_bytes() {
+                    Ok(())
+                } else {
+                    Err(ferrosa_common::Error::InvalidData(format!(
+                        "archive WAL id {segment_id} is reserved for different bytes; refusing overwrite")))
+                }
+            }
+            Err(error) => Err(ferrosa_common::Error::InvalidFormat(format!(
+                "conditional archive WAL reservation failed: {error}"
+            ))),
+        }
     }
 }
 
-/// Compute SHA-256 hex digest of a byte slice.
-fn hex_sha256(data: &[u8]) -> String {
-    let digest = Sha256::digest(data);
+fn hex_digest(digest: &[u8]) -> String {
     // Format as lowercase hex without pulling in the `hex` crate at runtime.
     digest.iter().fold(String::with_capacity(64), |mut s, b| {
         use std::fmt::Write;
@@ -244,7 +321,7 @@ mod tests {
                 dir.path().to_path_buf(),
             );
 
-            let result = archiver.archive_segment(42).await.unwrap();
+            let result = archiver.archive_segment_streaming(42).await.unwrap();
 
             // Verify segment was uploaded to correct S3 path (hex-prefixed).
             let hex = crate::upload::manager::hex_prefix_for("42");
@@ -281,7 +358,7 @@ mod tests {
                 dir.path().to_path_buf(),
             );
 
-            let result = archiver.archive_segment(1).await;
+            let result = archiver.archive_segment_streaming(1).await;
             assert!(result.is_ok());
         });
     }
@@ -300,7 +377,7 @@ mod tests {
                 dir.path().to_path_buf(),
             );
 
-            let result = archiver.archive_segment(99).await;
+            let result = archiver.archive_segment_streaming(99).await;
             assert!(result.is_err(), "missing segment file should return error");
         });
     }
@@ -320,7 +397,7 @@ mod tests {
                 dir.path().to_path_buf(),
             );
 
-            let result = archiver.archive_segment(7).await.unwrap();
+            let result = archiver.archive_segment_streaming(7).await.unwrap();
 
             use sha2::{Digest, Sha256};
             let expected = hex::encode(Sha256::digest(data));

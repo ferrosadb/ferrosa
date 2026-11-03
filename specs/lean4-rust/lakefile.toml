@@ -1,0 +1,17 @@
+name = "ferrosa_rust"
+version = "0.1.0"
+defaultTargets = ["FerrosaRust"]
+
+# The Aeneas Lean backend, which the extracted code imports. It is a local path rather than a git
+# requirement because the extraction and the library must be the same release: an Aeneas bump that
+# moves `Std.U64` underneath the generated file is a rebuild of everything here.
+#
+# The path is relative and gitignored, created by `bootstrap.sh` from $AENEAS_BACKEND. A tracked
+# config that pins one host's home directory builds on exactly one machine: this file used to name
+# `/home/<user>/.local/aeneas/backends/lean` and failed everywhere else as a missing package.
+[[require]]
+name = "aeneas"
+path = "aeneas-backend"
+
+[[lean_lib]]
+name = "FerrosaRust"

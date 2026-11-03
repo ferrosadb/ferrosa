@@ -11,6 +11,8 @@
 //! - **Pull mode**: Watches the engine's manifest endpoint for unindexed
 //!   SSTables and builds them independently.
 
+#![forbid(unsafe_code)]
+
 pub mod pull;
 pub mod server;
 pub mod worker;

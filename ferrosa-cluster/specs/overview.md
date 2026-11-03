@@ -81,6 +81,21 @@ projected scans use `range_read_projected_stream_all_from` /
 `range_read_projected` wrapper has been removed so projected scans cannot drift
 back to local-only materialization.
 
+NetworkTopologyStrategy scans and COUNT retain the configured per-DC RF map.
+NTS point/index reads, writes and streaming ranges share CL role eligibility
+and canonicalize targets by physical host UUID before quorum accounting.
+Conflicting DC labels within a selected replica scope invalidate that scope;
+filtering never reduces the configured RF denominator.
+A pinned ring snapshot supplies distinct eligible replica identities for each
+token ownership scope; every scope must meet the shared consistency predicate
+before a scan is exposed. QUORUM needs the origin replica majority plus replica
+majorities in a strict majority of configured DCs; LOCAL_QUORUM uses only the
+origin DC, and EACH_QUORUM requires each configured DC. Unavailable DCs never
+shrink these denominators. Accepted sources still use the bounded fragment merge,
+and interruption of any selected source fails the scan rather than returning a
+successful partial result. Legacy scalar-RF calls retain SimpleStrategy behavior, preserve the configured RF
+denominator, and refuse EACH_QUORUM or ambiguous multi-DC local scopes.
+
 **Keyed index read (t_430c4188).** `coordinate_index_read_in_partition`
 serves `WHERE <full partition key> AND <indexed_col> = ?`: it resolves the
 partition's replicas from the ring under the keyspace strategy and sends each an
@@ -253,3 +268,57 @@ Storage schemas now persist the authoritative UUID in the reserved `ferrosa.tabl
 ## Single-row COUNT pushdown
 
 The single-row liveness-count route follows the same consistency/replication selection as range reads. When the selected read needs no remote replica it invokes the exact local metadata counter; otherwise it counts the existing consistency-merged partition stream and applies row visibility. Remote errors propagate; they never become a local-only or zero count. Remote reconciliation can still decode payloads: the metadata-only optimization applies to the local route.
+
+
+Pair authority is durable in `pair-authority.json` from initial pairing onward,
+with peer identities, owner and monotonic generation. Every known pair member
+restarts with client writes and DDL fenced; UUID ordering is only initial
+bootstrap selection. A restarted member needs a fresh versioned handoff or
+explicit operator promotion. This deliberately sacrifices automatic recovery
+when offline promotion cannot be ruled out; recorded ownership alone cannot
+prove a peer has not been promoted while this node was down.
+
+Switchover requires capability `CAP_PAIR_AUTHORITY` and uses the distinct
+`PairAuthority` RPC (`0x4C`): prepare a fresh receiver challenge, withdraw and
+persist sender ownership, then grant the next generation. The receiver persists
+before opening its writer and consumes the challenge once. Wrong peers,
+malformed messages, replayed grants and legacy `RoleSwap` cannot promote.
+Timeout/cancellation after withdrawal leaves the sender fenced. The same
+handoff gate drains admitted writes and DDL and is retained across re-pairing.
+Reconnect takes this gate before choosing or installing a role; a busy transfer
+or admitted write defers reconnect without consuming operator promotion state.
+Mixed-version handoff fails with an upgrade error. Replica promotion remains an
+explicit operator decision requiring the previous primary to be unable to write;
+partition detection never automatically promotes it. Automatic reconciliation of
+two restarted peers is not implemented.
+
+
+Pair singleton QUORUM defaults to a local WAL fsync before ACK. Set
+`FERROSA_PAIR_QUORUM_STRICT=true` to require the surviving writable primary to
+upload closed WAL and publish the PITR archive manifest before ACK when the
+follower does not durably ACK. Invalid explicit values fail startup. The flag
+also applies to LOCAL_QUORUM and pair batches; ONE remains local. RF2 ALL/TWO
+still require a durable follower ACK. Authority and handoff fencing apply in
+both modes. A configured shared S3 backend is required for the singleton strict
+barrier; `file://` cannot satisfy it. No separate background-archive opt-in is
+needed. Healthy follower ACKs avoid a forced S3 upload.
+
+Strict mode conservatively retains unarchived WAL for the engine lifetime;
+failed/cancelled publication cannot unpin it. Long healthy-follower periods or
+archive outages can grow retained WAL and eventually trigger disk admission
+limits. Strict latency includes S3 upload and manifest publication. Pair
+`WritePath::write_batch` preserves its existing per-mutation application shape
+while propagating caller consistency; `coordinate_batch_with` applies an atomic
+local batch and requires each replicated mutation to ACK when two copies are
+required. This does not provide a cross-node atomic visibility transaction.
+
+
+Keyed scalar index reads now treat replica postings as candidates. Each candidate tracks its own distinct positive responders under the configured
+consistency/DC certificate. Healthy certified rows use their merged payloads;
+ambiguous positives obtain a canonical exact-row certificate. Both paths check
+the declared predicate. Empty posting responses can
+therefore invalidate stale positives after a quorum-acknowledged value change.
+Fallback verification reads exactly one clustering row at a time. Healthy
+positive certificates add no row-refetch RPCs; ambiguous candidates add canonical
+read/repair work proportional to candidate count.
+The existing point-read planner and wire shapes are unchanged.

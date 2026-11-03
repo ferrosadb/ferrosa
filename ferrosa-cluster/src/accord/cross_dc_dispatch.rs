@@ -296,9 +296,13 @@ pub fn delivery_for_cl(cl: ConsistencyLevel, remote_dcs: usize) -> CrossDcDelive
         return CrossDcDelivery::Async;
     }
     match cl {
-        ConsistencyLevel::EachQuorum | ConsistencyLevel::All | ConsistencyLevel::Serial => {
-            CrossDcDelivery::AllDcs
-        }
+        // DC_QUORUM needs a quorum of datacenters; waiting for all of them is stronger than the
+        // requirement and never weaker, so it is the safe arm until a quorum-of-DCs delivery
+        // variant exists.
+        ConsistencyLevel::EachQuorum
+        | ConsistencyLevel::All
+        | ConsistencyLevel::Serial
+        | ConsistencyLevel::DcQuorum => CrossDcDelivery::AllDcs,
         ConsistencyLevel::One
         | ConsistencyLevel::Two
         | ConsistencyLevel::Three

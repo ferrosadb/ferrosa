@@ -20,6 +20,11 @@ pub enum ConsistencyLevel {
     /// Data-center-local serial consistency for lightweight transactions.
     /// Wire code: 0x0009.
     LocalSerial,
+    /// Quorum in the origin datacenter **and** a quorum of datacenters, each reaching its own
+    /// quorum. Ferrosa-specific: Cassandra has no equivalent, so this uses an out-of-band wire code
+    /// and a stock driver rejects it with a protocol error rather than misreading it. New
+    /// applications can opt in by string (`"DC_QUORUM"`) or by code. Wire code: 0x0100.
+    DcQuorum,
 }
 
 impl ConsistencyLevel {
@@ -27,17 +32,29 @@ impl ConsistencyLevel {
     ///
     /// # Panics
     ///
-    /// Panics if called with `EachQuorum` -- use `block_for_dc` instead.
+    /// Panics if called with `EachQuorum`, which a single total cannot express -- use
+    /// `block_for_dc`. For `DcQuorum` this returns the node-quorum condition only; the datacenter
+    /// shape lives in `coordinator::dc_quorum`.
     pub fn block_for(&self, rf: usize) -> usize {
         match self {
             Self::One | Self::LocalOne => 1,
             Self::Two => 2.min(rf),
             Self::Three => 3.min(rf),
-            Self::Quorum | Self::LocalQuorum | Self::Serial => rf / 2 + 1,
+            // DC_QUORUM's node-quorum condition, and its safe value on a single datacenter. A
+            // request path that needs the full requirement (the origin datacenter's quorum plus a
+            // quorum of datacenters) must go through `coordinator::dc_quorum`, but no path may
+            // panic on a level a client is allowed to send.
+            Self::Quorum | Self::LocalQuorum | Self::Serial | Self::DcQuorum => rf / 2 + 1,
             Self::LocalSerial => rf / 2 + 1,
             Self::All => rf,
             Self::EachQuorum => {
-                panic!("use block_for_dc() for EACH_QUORUM");
+                // EACH_QUORUM's exact requirement is the sum of the per-datacenter quorums, which
+                // only `block_for_dc` can express. There is no datacenter vector here, so the only
+                // total answer is the single-datacenter node quorum — the same value the single-DC
+                // read and write paths need. A path that must satisfy the whole EACH_QUORUM
+                // requirement goes through `coordinator::dc_quorum`, never through this function;
+                // but no path may panic on a level a client is allowed to send.
+                rf / 2 + 1
             }
         }
     }
@@ -45,7 +62,9 @@ impl ConsistencyLevel {
     /// Number of replicas per data center that must acknowledge.
     pub fn block_for_dc(&self, dc_rf: usize) -> usize {
         match self {
-            Self::EachQuorum | Self::LocalQuorum | Self::LocalSerial => dc_rf / 2 + 1,
+            Self::EachQuorum | Self::LocalQuorum | Self::LocalSerial | Self::DcQuorum => {
+                dc_rf / 2 + 1
+            }
             _ => self.block_for(dc_rf),
         }
     }
@@ -65,6 +84,9 @@ impl ConsistencyLevel {
             0x0008 => Some(Self::Serial),
             0x0009 => Some(Self::LocalSerial),
             0x000A => Some(Self::LocalOne),
+            // Out of Cassandra's assigned range (0x0000-0x000A) on purpose: a stock driver must
+            // fail loudly on DC_QUORUM rather than silently interpret it as another level.
+            0x0100 => Some(Self::DcQuorum),
             _ => None,
         }
     }
@@ -83,6 +105,7 @@ impl ConsistencyLevel {
             "EACH_QUORUM" => Some(Self::EachQuorum),
             "SERIAL" => Some(Self::Serial),
             "LOCAL_SERIAL" => Some(Self::LocalSerial),
+            "DC_QUORUM" => Some(Self::DcQuorum),
             _ => None,
         }
     }
@@ -100,6 +123,7 @@ impl ConsistencyLevel {
             Self::Serial => 0x0008,
             Self::LocalSerial => 0x0009,
             Self::LocalOne => 0x000A,
+            Self::DcQuorum => 0x0100,
         }
     }
 
@@ -116,6 +140,7 @@ impl ConsistencyLevel {
             Self::EachQuorum => "EACH_QUORUM",
             Self::Serial => "SERIAL",
             Self::LocalSerial => "LOCAL_SERIAL",
+            Self::DcQuorum => "DC_QUORUM",
         }
     }
 }
@@ -162,6 +187,55 @@ mod tests {
         assert_eq!(ConsistencyLevel::LocalQuorum.block_for_dc(3), 2);
     }
 
+    /// Every level the wire decoder can produce, derived from the decoder itself.
+    ///
+    /// A client can send any of these codes, so a hand-written list here would let a new variant
+    /// slip past the totality checks below.
+    fn wire_decodable_levels() -> impl Iterator<Item = ConsistencyLevel> {
+        (0u16..=u16::MAX).filter_map(ConsistencyLevel::from_wire)
+    }
+
+    /// `block_for` is called on the request path with a level that came off the wire, so it must
+    /// answer for every decodable level instead of panicking on one of them.
+    #[test]
+    fn block_for_answers_every_wire_decodable_level() {
+        let mut seen = Vec::new();
+        for cl in wire_decodable_levels() {
+            let answered = std::panic::catch_unwind(|| cl.block_for(3));
+            assert!(
+                answered.is_ok(),
+                "block_for({cl}) panicked for a level the wire decoder produces"
+            );
+            let bf = answered.unwrap();
+            assert!(
+                (1..=3).contains(&bf),
+                "blockFor({cl}, 3) = {bf} is outside 1..=rf"
+            );
+            assert_eq!(ConsistencyLevel::from_wire(cl.to_wire()), Some(cl));
+            seen.push(cl);
+        }
+        assert_eq!(seen.len(), 11, "wire decoder variant set changed: {seen:?}");
+    }
+
+    /// EACH_QUORUM's exact requirement is the sum of per-datacenter quorums, which only
+    /// `block_for_dc` can express. Without a datacenter vector the only total answer is the
+    /// single-datacenter node quorum -- the same value the single-DC write/read paths need.
+    #[test]
+    fn block_for_each_quorum_is_the_single_dc_node_quorum() {
+        for rf in 1..=9usize {
+            assert_eq!(
+                ConsistencyLevel::EachQuorum.block_for(rf),
+                rf / 2 + 1,
+                "EACH_QUORUM without a DC vector must fall back to the node quorum"
+            );
+            assert_eq!(
+                ConsistencyLevel::EachQuorum.block_for_dc(rf),
+                rf / 2 + 1,
+                "the per-DC requirement stays the per-DC quorum"
+            );
+        }
+    }
+
     #[test]
     fn from_str_roundtrip() {
         for cl in &[
@@ -202,17 +276,7 @@ mod tests {
     proptest! {
         #[test]
         fn block_for_never_exceeds_rf(rf in 1usize..=100) {
-            for cl in &[
-                ConsistencyLevel::One,
-                ConsistencyLevel::Two,
-                ConsistencyLevel::Three,
-                ConsistencyLevel::Quorum,
-                ConsistencyLevel::All,
-                ConsistencyLevel::LocalOne,
-                ConsistencyLevel::LocalQuorum,
-                ConsistencyLevel::Serial,
-                ConsistencyLevel::LocalSerial,
-            ] {
+            for cl in wire_decodable_levels() {
                 let bf = cl.block_for(rf);
                 prop_assert!(bf <= rf, "blockFor({:?}, {}) = {} exceeds RF", cl, rf, bf);
             }
@@ -226,15 +290,7 @@ mod tests {
 
         #[test]
         fn block_for_at_least_one(rf in 1usize..=100) {
-            for cl in &[
-                ConsistencyLevel::One,
-                ConsistencyLevel::Two,
-                ConsistencyLevel::Three,
-                ConsistencyLevel::Quorum,
-                ConsistencyLevel::All,
-                ConsistencyLevel::Serial,
-                ConsistencyLevel::LocalSerial,
-            ] {
+            for cl in wire_decodable_levels() {
                 let bf = cl.block_for(rf);
                 prop_assert!(bf >= 1, "blockFor({:?}, {}) = 0", cl, rf);
             }

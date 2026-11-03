@@ -7,6 +7,8 @@
 //! first-JOIN milestone — built TDD against an in-memory provider. The
 //! storage-backed provider and the SQL parser/planner land on top.
 
+#![forbid(unsafe_code)]
+
 pub mod ast;
 pub mod catalog;
 pub mod exec;

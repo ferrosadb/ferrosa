@@ -1872,6 +1872,7 @@ impl ModeController {
         // without touching the controller (which this spawned task cannot borrow).
         let connected_peers_for_init = self.connected_peers.clone();
         let peer_dcs_for_init = self.peer_dcs.clone();
+        let peer_racks_for_init = self.peer_racks.clone();
         let seed_claim_for_init = self.seed_initialisation_claimed.clone();
         let ddl_path = self.ddl_path.clone();
         let mode_swap = self.mode.clone();
@@ -1885,7 +1886,7 @@ impl ModeController {
         // member set is fine here because it's only used for bookkeeping
         // (counts + iteration), NOT for token-ring construction (which is
         // now Raft-driven via the seed-authored JoinNode + AssignTokens).
-        let all_node_ids_for_bootstrap: Vec<u64> = std::iter::once(local_node_id)
+        let mut all_node_ids_for_bootstrap: Vec<u64> = std::iter::once(local_node_id)
             .chain(peers.iter().map(|(uuid, _)| uuid_to_node_id(*uuid)))
             .collect();
         let cluster_name = self.config.cluster_name.clone();
@@ -1939,6 +1940,10 @@ impl ModeController {
                 cluster_forward_lazy_raft,
             ),
         );
+        let cluster_forward_handler = Arc::new(super::membership::control::Handler::new(
+            self.self_weak.get().cloned().unwrap_or_default(),
+            cluster_forward_handler,
+        ));
         self.registry
             .register(MsgType::ClusterMembershipForward, cluster_forward_handler);
 
@@ -2702,11 +2707,12 @@ impl ModeController {
             // Non-seed nodes will receive their membership via AppendEntries
             // from the leader. This prevents CF-T17 (membership race from
             // independent initialize() calls with potentially different member lists).
-            let initialized_seed_membership = should_initialize_seed_membership(
+            let mut initialized_seed_membership = should_initialize_seed_membership(
                 was_seed,
                 has_recovered_membership,
                 has_recovered_topology_state,
             );
+            let mut initialized_peers = peers.clone();
             if initialized_seed_membership {
                 if let Err(e) = raft_arc.initialize(members).await {
                     // Some failures are expected (already initialized after a
@@ -2743,6 +2749,167 @@ impl ModeController {
             let election_start = tokio::time::Instant::now();
             let election_deadline = election_start
                 + std::time::Duration::from_secs(formation_deadline_secs);
+
+            // The formation deadline is a REPORT, not a verdict (t_9c219a2b).
+            // When it passes with no leader, this runs once: count it, say so at
+            // ERROR, degrade, and arm the rejoin. The wait below then KEEPS
+            // waiting for a leader, so a DC whose voters arrive late still forms.
+            // Ending the wait here used to strand the node: the late initialise
+            // and the leader arm below (ring admission, Cluster DDL path) never
+            // ran again, so a DC that missed its deadline never formed.
+            let degrade_after_formation_deadline = || {
+                // Previously logged at warn and silently reverted to Pair mode —
+                // operators had no metric to alert on. Now: count the timeout
+                // (silent-failure detector) and surface at error level.
+                LEADER_ELECTION_TIMEOUTS.fetch_add(1, AtomicOrdering::Relaxed);
+                tracing::error!(
+                    peers = peers.len(),
+                    deadline_secs = formation_deadline_secs,
+                    "raft leader election timed out — cluster formation did not complete; \
+                     still waiting for a leader"
+                );
+                // NO automatic downgrade to Pair.
+                //
+                // This used to store `DeploymentMode::Pair` directly, via the
+                // raw `mode_swap` handle -- bypassing `try_transition_mode`
+                // and with it the state machine, which forbids
+                // `Cluster -> Pair` (see `DeploymentMode::can_transition_to`
+                // and the note on `next_mode`). The bypass shipped because
+                // the guard in `tests.rs` looked for the literal
+                // `mode.store(` while this line says `mode_swap.store(`: the
+                // rule was correct, consulted, and evaded by an alias.
+                //
+                // Moving a node out of a Raft cluster is a change of the
+                // system's guarantees: a pair replicates point-to-point and
+                // accepts writes a quorum would have refused, while the rest
+                // of the cluster keeps committing through Raft. So it is an
+                // operator action, exactly like promoting a secondary to
+                // primary -- not something a timeout decides.
+                //
+                // Degrading keeps those guarantees intact, so it is still
+                // automatic: the node stops serving as a healthy cluster
+                // member until it has a quorum, which is the failure this
+                // timeout actually represents.
+                //
+                // The durable marker decides which way down. A node that has
+                // EVER been a committed cluster member must never become a
+                // pair again -- that is the rule `DeploymentMode` already
+                // documents, and the marker is how it survives the fact that
+                // mode itself lives only in memory. node2 (2026-10-01) proved
+                // the gap: it started `degraded-cluster` from the marker,
+                // timed out, and this line demoted it to `Pair` anyway.
+                //
+                // So: a former member degrades and needs an operator to go
+                // further. A node that never was a member is still forming
+                // for the first time with too few peers (its seeds are
+                // unreachable, say), and there it is legitimate to fall back
+                // to Pair -- no multi-node cluster ever existed, which is the
+                // same reason `Forming -> Pair` is legal in the state
+                // machine. `Forming -> DegradedPair` is the shape for that
+                // case: it keeps the peer context for recovery, exactly as
+                // `Pair -> DegradedPair` does, and leaves no way to reach
+                // `Pair` for a node that was ever a member.
+                let raft_dir = configured_raft_dir(&config_for_promotion);
+                let was_member = raft_dir
+                    .as_deref()
+                    .map(DeploymentMode::was_cluster_member)
+                    .unwrap_or(false);
+                let fallback = if was_member {
+                    DeploymentMode::DegradedCluster
+                } else {
+                    DeploymentMode::DegradedPair
+                };
+                super::try_transition_mode_swap(&mode_swap, fallback);
+                tracing::warn!(
+                    was_cluster_member = was_member,
+                    target = %fallback,
+                    "cluster formation timed out. A node that has ever been a \
+                     cluster member never becomes a pair again; a downgrade is \
+                     an operator action (see ferrosa-ctl), not a timeout."
+                );
+                // Restore DDL path from Blocked to Direct (single-node fallback).
+                // Without this, DDL stays blocked indefinitely after failed formation.
+                ddl_path.store(Arc::new(DdlPath::Direct {
+                    schema: schema_for_replay.clone(),
+                    engine: storage_for_bootstrap.clone(),
+                }));
+                tracing::info!("DDL path restored to Direct after formation timeout");
+
+                // A node coming back inside the cluster shape must be able to
+                // RECEIVE the cluster's schema, not only offer its own. The
+                // ReplaySchema phase pushes this node's schema outward, so a
+                // node that missed DDL while it was down re-offers the tables
+                // it already has (each a no-op) and never learns the ones it
+                // lacks -- the divergence never repairs.
+                //
+                // Pair mode registers this handler on its way through pair;
+                // a returning member never forms a pair, so it would
+                // otherwise have nowhere to receive a schema snapshot.
+                registry.register(
+                    MsgType::PairSchemaSync,
+                    Arc::new(PairSchemaSyncHandler::for_cluster(
+                        schema_for_replay.clone(),
+                        storage_for_bootstrap.clone(),
+                        // A returning member only ever RECEIVES the
+                        // cluster's schema here, so it is a receiver.
+                        Arc::new(ArcSwap::from_pointee(crate::pair::PairRole::Secondary)),
+                    )),
+                );
+
+                // P0-21 FIX: Spawn a background rejoin task that contacts
+                // the existing cluster's leader and asks it to add this node
+                // as a voter via JoinNode.  This closes the gap where the
+                // node is stuck in election-storm limbo with no path to
+                // converge (P0-17/P0-19 suppress elections, P0-20 pusher
+                // stays silent because this node isn't in the voter set).
+                {
+                    use crate::controller::cluster_rejoin::attempt_rejoin;
+                    let rejoin_self_id = local_host_id_for_refresh;
+                    let rejoin_self_addr = local_addr_for_refresh.clone();
+                    let rejoin_dc = config_for_promotion.data_center.clone();
+                    let rejoin_rack = config_for_promotion.rack.clone();
+                    let rejoin_cql_broadcast = local_cql_broadcast_for_refresh.clone();
+                    let rejoin_peers = peers.clone();
+                    let rejoin_pm = peer_manager_for_bootstrap.clone();
+                    ferrosa_net::task_pool::TaskPool::current("cluster-rejoin").spawn(async move {
+                        tracing::info!(
+                            self_id = %rejoin_self_id,
+                            peer_count = rejoin_peers.len(),
+                            "cluster_rejoin: formation timed out — attempting to add self \
+                             to existing cluster voter set (P0-21)"
+                        );
+                        match attempt_rejoin(
+                            rejoin_self_id,
+                            rejoin_self_addr,
+                            rejoin_dc,
+                            rejoin_rack,
+                            rejoin_cql_broadcast,
+                            rejoin_peers,
+                            rejoin_pm,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                tracing::info!(
+                                    self_id = %rejoin_self_id,
+                                    "cluster_rejoin: JoinNode accepted by leader — \
+                                     awaiting snapshot + replication convergence"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    self_id = %rejoin_self_id,
+                                    error = %e,
+                                    "cluster_rejoin: EXHAUSTED — node is NOT a voter. \
+                                     Operator intervention required. \
+                                     (CLUSTER_REJOIN_FAILURES_TOTAL incremented, P0-21)"
+                                );
+                            }
+                        }
+                    });
+                }
+            };
+            let mut formation_overdue = false;
             let mut leader = None;
             let mut attempt: u32 = 0;
             loop {
@@ -2793,14 +2960,20 @@ impl ModeController {
                             "CL-76: this DC's membership completed while waiting for a \
                              leader — initialising the group now"
                         );
-                        if let Err(e) = raft_arc.initialize(members_now).await {
-                            tracing::warn!(
-                                %e,
-                                "CL-76: late raft.initialize failed — releasing the claim \
-                                 so a later iteration can retry"
-                            );
-                            seed_claim_for_init
-                                .store(false, std::sync::atomic::Ordering::Release);
+                        match raft_arc.initialize(members_now).await {
+                            Ok(()) => {
+                                // The exact successfully initialized scope owns topology
+                                // publication too; the earlier transition may know fewer peers.
+                                initialized_seed_membership = true;
+                                initialized_peers = local_peers;
+                                all_node_ids_for_bootstrap = std::iter::once(local_node_id)
+                                    .chain(initialized_peers.iter().map(|(id, _)| uuid_to_node_id(*id)))
+                                    .collect();
+                            }
+                            Err(e) => {
+                                tracing::warn!(%e, "late raft.initialize failed; releasing the claim so a later iteration can retry");
+                                seed_claim_for_init.store(false, std::sync::atomic::Ordering::Release);
+                            }
                         }
                     }
                 }
@@ -2808,7 +2981,12 @@ impl ModeController {
                     leader = Some(lid);
                     break;
                 }
-                if tokio::time::Instant::now() >= election_deadline {
+                if !formation_overdue && tokio::time::Instant::now() >= election_deadline {
+                    formation_overdue = true;
+                    degrade_after_formation_deadline();
+                }
+                // Bounded by shutdown, not by the deadline.
+                if election_guard_cancel.is_cancelled() {
                     break;
                 }
                 let backoff =
@@ -2819,6 +2997,20 @@ impl ModeController {
 
             match leader {
                 Some(lid) => {
+                    if formation_overdue {
+                        // The recovery edge of the deadline report above. A peer
+                        // event may already have restored `Cluster`; this is then
+                        // a no-op.
+                        let restored =
+                            super::try_transition_mode_swap(&mode_swap, DeploymentMode::Cluster);
+                        tracing::warn!(
+                            leader = lid,
+                            waited_secs = election_start.elapsed().as_secs(),
+                            deadline_secs = formation_deadline_secs,
+                            restored,
+                            "raft leader elected after the formation deadline; completing formation"
+                        );
+                    }
                     tracing::info!(
                         leader = lid,
                         "raft leader elected, swapping DDL path to Cluster"
@@ -2957,57 +3149,49 @@ impl ModeController {
                         // load tests then see roughly N-1 owners instead of
                         // N, and the "diabolical" single-owner pattern
                         // persists from the follower side.
-                        let local_node_info = crate::raft::NodeInfo {
-                            host_id: local_host_id_for_refresh,
-                            addr: local_addr_for_refresh.clone(),
-                            data_center: config_for_promotion.data_center.clone(),
-                            rack: config_for_promotion.rack.clone(),
-                            state: crate::raft::NodeState::Normal,
-                            cql_broadcast: local_cql_broadcast_for_refresh.clone(),
-                        };
-                        let self_join_cmd = crate::raft::RaftCommand {
-                            op: crate::raft::RaftOp::JoinNode(local_node_info),
-                            schema_version: Uuid::new_v4(),
-                        };
-                        if let Err(e) = raft_arc.client_write(self_join_cmd).await {
-                            tracing::warn!(
-                                local = local_node_id,
-                                leader = lid,
-                                %e,
-                                "seed: JoinNode for self failed after leader election"
-                            );
-                        }
-                        let self_tokens = crate::controller::token::deterministic_tokens_for_node(
-                            local_node_id,
+                        let (self_join_cmd, self_assign_cmd) = ring_admission(
+                            crate::raft::NodeInfo {
+                                host_id: local_host_id_for_refresh,
+                                addr: local_addr_for_refresh.clone(),
+                                data_center: config_for_promotion.data_center.clone(),
+                                rack: config_for_promotion.rack.clone(),
+                                state: crate::raft::NodeState::Normal,
+                                cql_broadcast: local_cql_broadcast_for_refresh.clone(),
+                            },
                             seed_num_tokens,
                         );
-                        let self_assign_cmd = crate::raft::RaftCommand {
-                            op: crate::raft::RaftOp::AssignTokens {
-                                node_id: local_node_id,
-                                tokens: self_tokens,
-                            },
-                            schema_version: Uuid::new_v4(),
-                        };
-                        if let Err(e) = raft_arc.client_write(self_assign_cmd).await {
+                        // The seed initialized Raft but need not win the election.
+                        // When it did not, these proposals come back
+                        // `LeftToLeader`, and the leader re-proposes every voter
+                        // missing from its ring in the topology wait below
+                        // (t_9c219a2b).
+                        if let Err(e) = crate::raft_forward::propose_ring_member_via_raft(
+                            &raft_arc,
+                            self_join_cmd,
+                            self_assign_cmd,
+                        )
+                        .await
+                        {
                             tracing::warn!(
                                 local = local_node_id,
                                 leader = lid,
                                 %e,
-                                "seed: AssignTokens for self failed after leader election"
+                                "seed: ring admission for self failed after leader election"
                             );
                         }
 
-                        for (peer_uuid, addr) in &peers {
+                        let initialized_dcs = peer_dcs_for_init.load_full();
+                        let initialized_racks = peer_racks_for_init.load_full();
+                        for (peer_uuid, addr) in &initialized_peers {
                             let peer_node_id = uuid_to_node_id(*peer_uuid);
-                            let peer_internode_broadcast =
-                                peer_internode_broadcasts.get(peer_uuid).cloned().flatten();
+                            let peer_internode_broadcast = peer_manager_for_bootstrap.get_peer_internode_broadcast_sync(*peer_uuid);
                             let node_info = seed_join_node_info(
                                 *peer_uuid,
                                 *addr,
                                 peer_internode_broadcast.as_deref(),
-                                peer_cql_broadcasts.get(peer_uuid).cloned().flatten(),
-                                &peer_dc_map,
-                                &peer_racks,
+                                peer_manager_for_bootstrap.get_peer_cql_broadcast_sync(*peer_uuid),
+                                &initialized_dcs,
+                                &initialized_racks,
                                 (
                                     &config_for_promotion.data_center,
                                     &config_for_promotion.rack,
@@ -3017,14 +3201,6 @@ impl ModeController {
                                 op: crate::raft::RaftOp::JoinNode(node_info),
                                 schema_version: Uuid::new_v4(),
                             };
-                            if let Err(e) = raft_arc.client_write(join_cmd).await {
-                                tracing::warn!(
-                                    peer = %peer_uuid,
-                                    leader = lid,
-                                    %e,
-                                    "seed: JoinNode for peer failed after leader election"
-                                );
-                            }
                             let peer_tokens = crate::controller::token::deterministic_tokens_for_node(
                                 peer_node_id,
                                 seed_num_tokens,
@@ -3036,20 +3212,156 @@ impl ModeController {
                                 },
                                 schema_version: Uuid::new_v4(),
                             };
-                            if let Err(e) = raft_arc.client_write(assign_cmd).await {
+                            if let Err(e) = crate::raft_forward::propose_ring_member_via_raft(
+                                &raft_arc,
+                                join_cmd,
+                                assign_cmd,
+                            )
+                            .await
+                            {
                                 tracing::warn!(
                                     peer = %peer_uuid,
                                     leader = lid,
                                     %e,
-                                    "seed: AssignTokens for peer failed after leader election"
+                                    "seed: ring admission for peer failed after leader election"
                                 );
                             }
                         }
                         tracing::info!(
-                            peer_count = peers.len(),
+                            peer_count = initialized_peers.len(),
                             leader = lid,
                             "seed: submitted JoinNode + AssignTokens via Raft for every peer"
                         );
+                    }
+                    if !has_recovered_topology_state {
+                        // Wait for every initial voter to own tokens before
+                        // publishing the Cluster DDL path. Like the election wait,
+                        // the deadline is reported, not obeyed (t_9c219a2b): it
+                        // used to end in a bare `return`, which left the node
+                        // `Forming` for good.
+                        //
+                        // Admission is the LEADER's job. A forwarded `JoinNode` or
+                        // `AssignTokens` is refused by the leader's membership
+                        // control by design ("legacy ownership/promotion requires
+                        // verified membership admission"), so a follower cannot
+                        // admit itself. And every node seeds ITS OWN entry into its
+                        // local state machine at transition (`seed_topology`), which
+                        // is never replicated, so only the leader can see what its
+                        // followers lack. So the leader proposes its own admission
+                        // now, and while the topology is incomplete re-proposes
+                        // every voter missing from its ring. Followers wait.
+                        if lid == local_node_id {
+                            let (join_cmd, assign_cmd) = ring_admission(
+                                crate::raft::NodeInfo {
+                                    host_id: local_host_id_for_refresh,
+                                    addr: local_addr_for_refresh.clone(),
+                                    data_center: config_for_promotion.data_center.clone(),
+                                    rack: config_for_promotion.rack.clone(),
+                                    state: crate::raft::NodeState::Normal,
+                                    cql_broadcast: local_cql_broadcast_for_refresh.clone(),
+                                },
+                                config_for_promotion.num_tokens as usize,
+                            );
+                            if let Err(e) = crate::raft_forward::propose_ring_member_via_raft(
+                                &raft_arc,
+                                join_cmd,
+                                assign_cmd,
+                            )
+                            .await
+                            {
+                                tracing::warn!(%e, "leader: ring admission for self failed");
+                            }
+                        }
+                        let voters: Vec<_> = raft_arc.metrics().borrow().membership_config.membership().voter_ids().collect();
+                        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(formation_deadline_secs);
+                        let mut overdue = false;
+                        let mut next_readmission =
+                            tokio::time::Instant::now() + INITIAL_TOPOLOGY_READMISSION_INTERVAL;
+                        let mut last_readmission_error: Option<String> = None;
+                        loop {
+                            let missing: Vec<u64> = {
+                                let ring_guard = ring_for_bootstrap.load();
+                                let ring = ring_guard.as_ref().as_ref();
+                                voters
+                                    .iter()
+                                    .copied()
+                                    .filter(|id| {
+                                        !ring.is_some_and(|ring| {
+                                            ring.get_node(*id).is_some_and(|info| info.state.is_voter())
+                                                && !ring.tokens_for_node(*id).is_empty()
+                                        })
+                                    })
+                                    .collect()
+                            };
+                            if missing.is_empty() {
+                                if overdue {
+                                    tracing::warn!(
+                                        voters = voters.len(),
+                                        waited_secs = formation_deadline_secs,
+                                        "initial voter topology published token ownership after its deadline"
+                                    );
+                                }
+                                break;
+                            }
+                            if election_guard_cancel.is_cancelled() {
+                                tracing::info!("shutdown before the initial voter topology published");
+                                return;
+                            }
+                            let now = tokio::time::Instant::now();
+                            if !overdue && now >= deadline {
+                                overdue = true;
+                                tracing::error!(
+                                    voters = voters.len(),
+                                    missing = ?missing,
+                                    deadline_secs = formation_deadline_secs,
+                                    "initial voter topology did not publish token ownership; refusing \
+                                     client admission and still waiting"
+                                );
+                            }
+                            if now >= next_readmission
+                                && raft_arc.current_leader().await == Some(local_node_id)
+                            {
+                                next_readmission = now + INITIAL_TOPOLOGY_READMISSION_INTERVAL;
+                                let resolved = {
+                                    let map = node_map_for_bootstrap
+                                        .read()
+                                        .unwrap_or_else(|e| e.into_inner());
+                                    resolve_missing_voters(
+                                        &missing,
+                                        &map,
+                                        &connected_peers_for_init.load_full(),
+                                    )
+                                };
+                                let outcome = redrive_ring_admissions(
+                                    &raft_arc,
+                                    resolved,
+                                    &peer_manager_for_bootstrap,
+                                    (&peer_dcs_for_init.load_full(), &peer_racks_for_init.load_full()),
+                                    (&config_for_promotion.data_center, &config_for_promotion.rack),
+                                    config_for_promotion.num_tokens as usize,
+                                )
+                                .await;
+                                // Report the edges: a new failure, and the first
+                                // success after one. Not every attempt.
+                                match outcome {
+                                    Ok(()) => {
+                                        if last_readmission_error.take().is_some() {
+                                            tracing::info!("leader: re-proposed the missing ring admissions");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        if last_readmission_error.as_deref() != Some(e.as_str()) {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "leader: re-proposing a missing ring admission failed; retrying"
+                                            );
+                                            last_readmission_error = Some(e);
+                                        }
+                                    }
+                                }
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                        }
                     }
                     // Register the cluster DDL forward handler so that when a
                     // non-leader forwards a PairDdlForward to the leader, the
@@ -3060,6 +3372,7 @@ impl ModeController {
                         peer_manager_for_ddl.clone(),
                         node_map_for_ddl.clone(),
                     ));
+                    let cluster_ddl_handler=Arc::new(super::membership::control::DdlHandler(cluster_ddl_handler));
                     registry.register(MsgType::PairDdlForward, cluster_ddl_handler);
 
                     ddl_path.store(Arc::new(DdlPath::Cluster {
@@ -3609,160 +3922,10 @@ impl ModeController {
                     }
                 }
                 None => {
-                    // Election timeout. Previously logged at warn and silently
-                    // reverted to Pair mode — operators had no metric to alert
-                    // on. Now: count the timeout (silent-failure detector) and
-                    // surface at error level. The fallback to Pair is still
-                    // the right behavior so the node keeps serving local data,
-                    // but operators must be notified that the cluster did not
-                    // form.
-                    LEADER_ELECTION_TIMEOUTS.fetch_add(1, AtomicOrdering::Relaxed);
-                    tracing::error!(
-                        peers = peers.len(),
-                        deadline_secs = formation_deadline_secs,
-                        "raft leader election timed out — cluster formation did not complete"
+                    // The wait above ends without a leader only at shutdown.
+                    tracing::info!(
+                        "shutdown before a raft leader was elected; cluster formation abandoned"
                     );
-                    // NO automatic downgrade to Pair.
-                    //
-                    // This used to store `DeploymentMode::Pair` directly, via the
-                    // raw `mode_swap` handle -- bypassing `try_transition_mode`
-                    // and with it the state machine, which forbids
-                    // `Cluster -> Pair` (see `DeploymentMode::can_transition_to`
-                    // and the note on `next_mode`). The bypass shipped because
-                    // the guard in `tests.rs` looked for the literal
-                    // `mode.store(` while this line says `mode_swap.store(`: the
-                    // rule was correct, consulted, and evaded by an alias.
-                    //
-                    // Moving a node out of a Raft cluster is a change of the
-                    // system's guarantees: a pair replicates point-to-point and
-                    // accepts writes a quorum would have refused, while the rest
-                    // of the cluster keeps committing through Raft. So it is an
-                    // operator action, exactly like promoting a secondary to
-                    // primary -- not something a timeout decides.
-                    //
-                    // Degrading keeps those guarantees intact, so it is still
-                    // automatic: the node stops serving as a healthy cluster
-                    // member until it has a quorum, which is the failure this
-                    // timeout actually represents.
-                    //
-                    // The durable marker decides which way down. A node that has
-                    // EVER been a committed cluster member must never become a
-                    // pair again -- that is the rule `DeploymentMode` already
-                    // documents, and the marker is how it survives the fact that
-                    // mode itself lives only in memory. node2 (2026-10-01) proved
-                    // the gap: it started `degraded-cluster` from the marker,
-                    // timed out, and this line demoted it to `Pair` anyway.
-                    //
-                    // So: a former member degrades and needs an operator to go
-                    // further. A node that never was a member is still forming
-                    // for the first time with too few peers (its seeds are
-                    // unreachable, say), and there it is legitimate to fall back
-                    // to Pair -- no multi-node cluster ever existed, which is the
-                    // same reason `Forming -> Pair` is legal in the state
-                    // machine. `Forming -> DegradedPair` is the shape for that
-                    // case: it keeps the peer context for recovery, exactly as
-                    // `Pair -> DegradedPair` does, and leaves no way to reach
-                    // `Pair` for a node that was ever a member.
-                    let raft_dir = configured_raft_dir(&config_for_promotion);
-                    let was_member = raft_dir
-                        .as_deref()
-                        .map(DeploymentMode::was_cluster_member)
-                        .unwrap_or(false);
-                    let fallback = if was_member {
-                        DeploymentMode::DegradedCluster
-                    } else {
-                        DeploymentMode::DegradedPair
-                    };
-                    super::try_transition_mode_swap(&mode_swap, fallback);
-                    tracing::warn!(
-                        was_cluster_member = was_member,
-                        target = %fallback,
-                        "cluster formation timed out. A node that has ever been a \
-                         cluster member never becomes a pair again; a downgrade is \
-                         an operator action (see ferrosa-ctl), not a timeout."
-                    );
-                    // Restore DDL path from Blocked to Direct (single-node fallback).
-                    // Without this, DDL stays blocked indefinitely after failed formation.
-                    ddl_path.store(Arc::new(DdlPath::Direct {
-                        schema: schema_for_replay.clone(),
-                        engine: storage_for_bootstrap.clone(),
-                    }));
-                    tracing::info!("DDL path restored to Direct after formation timeout");
-
-                    // A node coming back inside the cluster shape must be able to
-                    // RECEIVE the cluster's schema, not only offer its own. The
-                    // ReplaySchema phase pushes this node's schema outward, so a
-                    // node that missed DDL while it was down re-offers the tables
-                    // it already has (each a no-op) and never learns the ones it
-                    // lacks -- the divergence never repairs.
-                    //
-                    // Pair mode registers this handler on its way through pair;
-                    // a returning member never forms a pair, so it would
-                    // otherwise have nowhere to receive a schema snapshot.
-                    registry.register(
-                        MsgType::PairSchemaSync,
-                        Arc::new(PairSchemaSyncHandler::for_cluster(
-                            schema_for_replay.clone(),
-                            storage_for_bootstrap.clone(),
-                            // A returning member only ever RECEIVES the
-                            // cluster's schema here, so it is a receiver.
-                            Arc::new(ArcSwap::from_pointee(crate::pair::PairRole::Secondary)),
-                        )),
-                    );
-
-
-                    // P0-21 FIX: Spawn a background rejoin task that contacts
-                    // the existing cluster's leader and asks it to add this node
-                    // as a voter via JoinNode.  This closes the gap where the
-                    // node is stuck in election-storm limbo with no path to
-                    // converge (P0-17/P0-19 suppress elections, P0-20 pusher
-                    // stays silent because this node isn't in the voter set).
-                    {
-                        use crate::controller::cluster_rejoin::attempt_rejoin;
-                        let rejoin_self_id = local_host_id_for_refresh;
-                        let rejoin_self_addr = local_addr_for_refresh.clone();
-                        let rejoin_dc = config_for_promotion.data_center.clone();
-                        let rejoin_rack = config_for_promotion.rack.clone();
-                        let rejoin_cql_broadcast = local_cql_broadcast_for_refresh.clone();
-                        let rejoin_peers = peers.clone();
-                        let rejoin_pm = peer_manager_for_bootstrap.clone();
-                        ferrosa_net::task_pool::TaskPool::current("cluster-rejoin").spawn(async move {
-                            tracing::info!(
-                                self_id = %rejoin_self_id,
-                                peer_count = rejoin_peers.len(),
-                                "cluster_rejoin: formation timed out — attempting to add self \
-                                 to existing cluster voter set (P0-21)"
-                            );
-                            match attempt_rejoin(
-                                rejoin_self_id,
-                                rejoin_self_addr,
-                                rejoin_dc,
-                                rejoin_rack,
-                                rejoin_cql_broadcast,
-                                rejoin_peers,
-                                rejoin_pm,
-                            )
-                            .await
-                            {
-                                Ok(()) => {
-                                    tracing::info!(
-                                        self_id = %rejoin_self_id,
-                                        "cluster_rejoin: JoinNode accepted by leader — \
-                                         awaiting snapshot + replication convergence"
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        self_id = %rejoin_self_id,
-                                        error = %e,
-                                        "cluster_rejoin: EXHAUSTED — node is NOT a voter. \
-                                         Operator intervention required. \
-                                         (CLUSTER_REJOIN_FAILURES_TOTAL incremented, P0-21)"
-                                    );
-                                }
-                            }
-                        });
-                    }
                 }
             }
 
@@ -3778,6 +3941,130 @@ impl ModeController {
                 raft_groups_swap.store(Arc::new(next));
             }
         });
+    }
+}
+
+/// How often the leader re-proposes the admissions still missing from the
+/// initial voter topology (t_9c219a2b). Long enough that the normal path, where
+/// every voter is admitted within milliseconds of the election, never
+/// re-proposes at all.
+const INITIAL_TOPOLOGY_READMISSION_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(2);
+
+/// A member's ring admission: `JoinNode` for `node_info`, then `AssignTokens`
+/// with that member's deterministic tokens.
+///
+/// Re-proposing it is safe. `JoinNode` upserts the member and `AssignTokens`
+/// inserts the same deterministic tokens again, so the formation wait can repeat
+/// it until the admission lands instead of giving up after one attempt.
+pub(super) fn ring_admission(
+    node_info: NodeInfo,
+    num_tokens: usize,
+) -> (crate::raft::RaftCommand, crate::raft::RaftCommand) {
+    let node_id = uuid_to_node_id(node_info.host_id);
+    let tokens = crate::controller::token::deterministic_tokens_for_node(node_id, num_tokens);
+    debug_assert_eq!(tokens.len(), num_tokens, "one token per vnode");
+    (
+        crate::raft::RaftCommand {
+            op: crate::raft::RaftOp::JoinNode(node_info),
+            schema_version: Uuid::new_v4(),
+        },
+        crate::raft::RaftCommand {
+            op: crate::raft::RaftOp::AssignTokens { node_id, tokens },
+            schema_version: Uuid::new_v4(),
+        },
+    )
+}
+
+/// The voters the leader can re-admit, and the ones it cannot describe.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct MissingVoters {
+    /// Missing voters that are connected now, with the host id from the Raft
+    /// node map and the address they connected from.
+    pub(super) admissible: Vec<(Uuid, SocketAddr)>,
+    /// Missing voters with no node-map entry or no live connection. Their
+    /// `NodeInfo` cannot be authored yet; they are retried on a later pass.
+    pub(super) unresolved: Vec<u64>,
+}
+
+/// Pair each voter missing from the ring with what the leader needs to
+/// re-propose its admission: its host id (Raft node map) and its address (the
+/// live connection). Order follows `missing`, so retries are deterministic.
+pub(super) fn resolve_missing_voters(
+    missing: &[u64],
+    node_map: &std::collections::HashMap<u64, Uuid>,
+    connected: &[(Uuid, SocketAddr)],
+) -> MissingVoters {
+    let mut resolved = MissingVoters {
+        admissible: Vec::with_capacity(missing.len()),
+        unresolved: Vec::new(),
+    };
+    for &node_id in missing {
+        let connection = node_map
+            .get(&node_id)
+            .and_then(|host| connected.iter().find(|(peer, _)| peer == host));
+        match connection {
+            Some(&(host, addr)) => resolved.admissible.push((host, addr)),
+            None => resolved.unresolved.push(node_id),
+        }
+    }
+    debug_assert_eq!(
+        resolved.admissible.len() + resolved.unresolved.len(),
+        missing.len(),
+        "every missing voter is either admissible or unresolved"
+    );
+    resolved
+}
+
+/// On the leader, re-propose the ring admission of every admissible missing
+/// voter, authored exactly as the seed authors a peer's (`seed_join_node_info`
+/// plus deterministic tokens). Proposes every one before reporting, so one
+/// failure does not starve the rest; the error names the first failure and
+/// every voter that could not be described.
+async fn redrive_ring_admissions(
+    raft: &FerrosRaft,
+    missing: MissingVoters,
+    peer_manager: &PeerManager,
+    peer_topology: (
+        &std::collections::HashMap<Uuid, String>,
+        &std::collections::HashMap<Uuid, String>,
+    ),
+    local_topology: (&str, &str),
+    num_tokens: usize,
+) -> std::result::Result<(), String> {
+    let mut first_error: Option<String> = None;
+    for (host, addr) in missing.admissible {
+        let broadcast = peer_manager.get_peer_internode_broadcast_sync(host);
+        let info = seed_join_node_info(
+            host,
+            addr,
+            broadcast.as_deref(),
+            peer_manager.get_peer_cql_broadcast_sync(host),
+            peer_topology.0,
+            peer_topology.1,
+            local_topology,
+        );
+        let (join_cmd, assign_cmd) = ring_admission(info, num_tokens);
+        let outcome =
+            crate::raft_forward::propose_ring_member_via_raft(raft, join_cmd, assign_cmd).await;
+        match outcome {
+            Ok(crate::raft_forward::RingAdmission::Committed) => {}
+            // Leadership moved mid-pass; the new leader re-drives.
+            Ok(crate::raft_forward::RingAdmission::LeftToLeader) => {
+                first_error.get_or_insert_with(|| format!("{host}: no longer the raft leader"));
+            }
+            Err(e) => {
+                first_error.get_or_insert_with(|| format!("{host}: {e}"));
+            }
+        }
+    }
+    match (first_error, missing.unresolved.is_empty()) {
+        (None, true) => Ok(()),
+        (error, _) => Err(format!(
+            "{}; not connected or not in the node map: {:?}",
+            error.as_deref().unwrap_or("no proposal failed"),
+            missing.unresolved
+        )),
     }
 }
 
