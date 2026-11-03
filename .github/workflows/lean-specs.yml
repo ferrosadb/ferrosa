@@ -71,7 +71,7 @@ jobs:
       - name: The committed extractions still match their sources
         run: specs/lean4-rust/check-sync.sh
 
-  # The PDF is not decoration: `lake exe docs` reads every ledger claim back out of the corpus and
+  # The PDF is not decoration: `lake exe export` reads every ledger claim back out of the corpus and
   # fails if one names no theorem, if a registered ledger has no chapter, or if the red count differs
   # from `ledgerTotal` — the number the corpus pins with `decide`. So this job is a check that happens
   # to produce a document, and the artifact is only uploaded once those checks pass.

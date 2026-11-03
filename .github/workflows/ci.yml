@@ -63,6 +63,11 @@ jobs:
         run: python3 -m unittest -q tests/ci/test_ci_cache_workflow.py
       - name: Check CI builds the shipped binary once
         run: python3 -m unittest -q tests/ci/test_ci_build_once.py
+      # The specification's PDF is the Verso site, printed. A second renderer is the defect this
+      # replaced, so this pins that the workflow has none and that the assembler takes its chapter
+      # order from the pages Verso built.
+      - name: Check the specification PDF is printed from the site
+        run: python3 -m unittest -q tests/ci/test_lean_specs_pdf.py
       - name: Check Bolt benchmarks require indexed schemas
         run: python3 -m unittest -q tests/ci/test_bolt_benchmark_schema.py
       - name: Check SPARQL benchmark HTTP contract
