@@ -20,7 +20,7 @@
 #
 #   PAIR MODE (2 nodes):
 #   Phase 1  — Bidirectional reads and writes + DDL replication
-#   Phase 2  — Primary failure (unpromoted secondary rejects reads and writes)
+#   Phase 2  — Primary failure (unpromoted secondary serves reads, rejects writes)
 #   Phase 3  — Operator promotion (reads and writes resume)
 #   Phase 4  — Rejoin and catch-up (schema + data)
 #   Phase 5  — Switchover (swap roles)
@@ -285,9 +285,9 @@ wait_for_cql_value() {
     fail "$description did not become visible in ${timeout}s (expected: $expected)"
 }
 
-# Helper: wait for a pair member to converge to its expected role. A secondary
-# is intentionally healthy while rejecting client CQL, so CQL readiness is the
-# wrong signal for pair-role transitions.
+# Helper: wait for a pair member to converge to its expected role. Both pair
+# members accept read-only CQL, so CQL readiness does not distinguish primary
+# from secondary — ask for the role explicitly.
 wait_for_cluster_role() {
     local port=$1 name=$2 expected_role=$3 timeout=${4:-60}
     local deadline=$((SECONDS + timeout))
@@ -425,9 +425,8 @@ wait_for_cluster_role 9090 "node1" "primary" "$PAIR_CQL_TIMEOUT"
 
 wait_cql 9042 "node1" "$PAIR_CQL_TIMEOUT"
 
-# node2 is the secondary. The CQL server rejects all connections on secondaries
-# (only the primary serves CQL), so wait for the explicit role rather than
-# treating a rejected CQL connection as unready.
+# node2 is the secondary. Both pair members accept read-only CQL, so wait for
+# the explicit role rather than using CQL readiness as the role signal.
 info "Waiting for node2 to become the pair secondary..."
 wait_for_cluster_role 9091 "node2" "secondary" "$PAIR_CQL_TIMEOUT"
 
@@ -466,10 +465,11 @@ wait_for_cql_value 9042 "SELECT v FROM smoke_test.kv WHERE k = 'key1';" \
     "from_node1" "node1 key1"
 pass "Read from node1: key1=from_node1"
 
-# Read from node2 — in pair mode, node2 is the secondary and rejects CQL
-# connections. Reads should succeed after node1 dies (Phase 2) when node2
-# auto-transitions to degraded/standalone mode. Skip this check here.
-info "Skipping CQL read from node2 (secondary rejects CQL until promoted)"
+# Read from node2 — a pair secondary serves read-only CQL from its local replica
+# (`replica_read_statement` admits SELECT; `replica_write_error` fences
+# mutations). The replicated read is asserted in Phase 2 after node1 dies, so it
+# also proves the row is on node2's own storage. Skip the duplicate here.
+info "Deferring the node2 read to Phase 2 (asserted after node1 dies)"
 
 # Write to node2 (secondary, should be forwarded to primary)
 # CQL forwarding from secondaries is not supported — writes go to node1.
@@ -495,14 +495,16 @@ info "Killing node1..."
 docker compose stop node1
 sleep 3
 
-# An unpromoted secondary must not serve client reads or writes: allowing either
-# would permit split brain after the primary is lost. An operator promotes it in
-# Phase 3 once that decision is safe.
-info "Verifying unpromoted node2 rejects CQL reads..."
-if cql2 "SELECT v FROM smoke_test.kv WHERE k = 'key1';" 2>&1; then
-    fail "Unpromoted node2 served a CQL read after node1 death"
-fi
-pass "Unpromoted node2 rejects CQL reads after node1 death"
+# An unpromoted secondary serves read-only CQL: the front end admits replica
+# reads (`replica_read_statement`) and fences mutations before dispatch
+# (`replica_write_error` -> "writes disallowed on read replica"). After the
+# primary is lost, node2 must therefore still answer a read from its own replica,
+# and must still refuse writes: accepting a write before an operator promotes it
+# would permit split brain. Phase 3 covers the promoted node.
+info "Verifying unpromoted node2 serves the replicated read..."
+wait_for_cql_value 9043 "SELECT v FROM smoke_test.kv WHERE k = 'key1';" \
+    "from_node1" "unpromoted node2 read key1"
+pass "Unpromoted node2 serves replicated reads after node1 death"
 
 info "Verifying unpromoted node2 rejects CQL writes..."
 if cql2 "INSERT INTO smoke_test.kv (k, v) VALUES ('should_fail', 'nope')" 2>&1; then
@@ -528,7 +530,8 @@ pass "Node2 promoted to standalone primary"
 
 wait_cql 9043 "node2" "$PAIR_CQL_TIMEOUT"
 
-# Promotion makes the replicated data safe to serve from node2.
+# Promotion makes node2 the write authority; the replicated reads above were
+# already served by the unpromoted secondary.
 info "Verifying replicated reads on promoted node2..."
 wait_for_cql_value 9043 "SELECT v FROM smoke_test.kv WHERE k = 'key1';" \
     "from_node1" "promoted node2 key1"
@@ -561,8 +564,9 @@ info "Restarting node1..."
 docker compose start node1
 wait_for_cluster_role 9090 "node1" "secondary" "$PAIR_CQL_TIMEOUT"
 
-# Verify schema was replicated via catch-up. Node1 is a healthy secondary and
-# intentionally rejects CQL, so compare the schema version each node holds:
+# Verify schema was replicated via catch-up. Node1 is a healthy secondary that
+# serves read-only CQL but is not the DDL authority, so compare the schema
+# version each node holds:
 # PairSchemaSync acknowledges only after the secondary's keyspaces and tables
 # match the primary's, and then adopts the primary's version. node1 restarted
 # from a schema.json written before the ALTER, so this is the check that
