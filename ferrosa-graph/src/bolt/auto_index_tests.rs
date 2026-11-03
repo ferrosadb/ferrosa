@@ -737,26 +737,37 @@ async fn bolt_waiting_for_first_access_stays_inside_the_query_timeout() {
         .await
         .unwrap();
     let _blocked = f.engine.hold_bolt_index_setup_for_test().await;
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        f.engine.execute_bolt_stream_with_params(
-            "MATCH (n:Blocked) RETURN n.age",
-            "bolt_auto",
-            &Fixture::auth(),
-            &HashMap::new(),
-        ),
-    )
-    .await
-    .expect("the query timeout must include waiting for the setup gate");
-    // The gate is acquired inside `ensure`'s `tokio::time::timeout`, whose
-    // elapsed arm is this refusal (engine/bolt_indexes.rs). Pin that arm, so
-    // an unrelated error (an unknown label, a failed seed) cannot pass here.
-    let error = result.err().map(|error| error.to_string());
+    // Start virtual time after storage setup. The outer query deadline and
+    // inner index-setup deadline can expire in the same timer tick; either
+    // refusal is correct, but neither may release a successful query.
+    tokio::time::pause();
+    let auth = Fixture::auth();
+    let params = HashMap::new();
+    let query = f.engine.execute_bolt_stream_with_params(
+        "MATCH (n:Blocked) RETURN n.age",
+        "bolt_auto",
+        &auth,
+        &params,
+    );
+    tokio::pin!(query);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(50);
+    assert!(futures::poll!(&mut query).is_pending());
+    tokio::time::advance(std::time::Duration::from_millis(49)).await;
+    assert!(futures::poll!(&mut query).is_pending());
+    // Let the timer driver deliver this exact deadline. Merely advancing the
+    // clock does not guarantee that the timer wheel has notified its waiters.
+    tokio::time::sleep_until(deadline).await;
+    let result = futures::poll!(&mut query);
+    let outcome = match &result {
+        std::task::Poll::Pending => "pending".to_string(),
+        std::task::Poll::Ready(Ok(_)) => "success".to_string(),
+        std::task::Poll::Ready(Err(error)) => error.to_string(),
+    };
     assert!(
-        error
-            .as_deref()
-            .is_some_and(|message| message.contains("are not current after 50ms")),
-        "the gated query must fail on the setup deadline: {error:?}"
+        matches!(result, std::task::Poll::Ready(Err(GraphError::Timeout)))
+            || matches!(&result, std::task::Poll::Ready(Err(GraphError::Validation(message)))
+                if message == "Bolt scalar indexes for keyspace 'bolt_auto' are not current after 50ms; retry after backfill completes"),
+        "the gated query must fail on its query or index-setup deadline: {outcome}"
     );
     assert_eq!(
         f.engine.bolt_index_initializations_for_test(),
