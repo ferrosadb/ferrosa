@@ -1,0 +1,29 @@
+# The scope of step 1, and the crates a CI runner cannot measure.
+#
+# Step 1 is "every crate in the workspace produces Lean": charon runs, aeneas runs, and a
+# non-empty `.lean` file lands. `scripts/lean_gap_translate.py check` asserts exactly that, for
+# every library crate `cargo metadata` reports -- the whole workspace, not the 19 crates the
+# class ratchet gates. That difference is the point of the milestone: elaboration is expensive
+# enough that only some crates can be held to a ceiling, and translation is cheap enough that
+# few of them should be invisible.
+#
+# A crate that is not measured is a hole in a coverage claim, so it must be written down here
+# with a reason. An entry below is *known unmeasured*: the gate prints it with its reason and
+# does not count it as translated. A crate that is neither measured nor listed fails the gate.
+# A line naming a crate the workspace does not have also fails it -- a stale excuse would let
+# the next crate to take that name through unmeasured.
+#
+# The reasons are the measured cost of the translation itself, which is what this mode pays:
+# charon and aeneas, before any elaboration. The figures are from
+# `specs/lean/gaps/state.json` on a 30 GB host, and a hosted runner has a quarter of that.
+#
+# Closing one of these means measuring it on a machine that can hold it and deleting the line in
+# the same commit that records the measurement.
+#
+# <crate> <reason>
+ferrosa-common   21.5 GB resident in one whole-crate charon run; a hosted runner cannot hold it
+ferrosa-cql      606 s of translation for one crate; a sweep of the workspace cannot spend that on one of it
+ferrosa-jepsen   1301 s of translation for one crate; same reason
+ferrosa-net      1957 s, and it dies inside aeneas above 25 GiB, so a smaller machine cannot measure it either
+ferrosa-schema   the whole-crate run passed 18 GB in aeneas without finishing
+ferrosa-view     the whole-crate run passed 14 GB in aeneas without finishing

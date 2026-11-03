@@ -1,0 +1,63 @@
+{
+  "toolchain": {
+    "charon": "7b462d9159db2ed3015162352183906a30bfafc6",
+    "aeneas": "930d0435bdf5d223b9797745e88a0205676859f5",
+    "lean": "Lean (version 4.35.0, x86_64-unknown-linux-gnu, commit eb6cafb7290e8bd5f2937522d8d804f58f02bafc, Release)"
+  },
+  "budgets": {
+    "whole_seconds": 0,
+    "module_seconds": 0,
+    "sample": false
+  },
+  "crates": {
+    "ferrosa-alloc-count": {
+      "fingerprint": "5a8d854d30deeb60",
+      "measured_at": "2026-11-03T17:58:46+00:00",
+      "measurement": {
+        "stage": "aeneas-ok",
+        "translation_errors": 0,
+        "lean_errors": null,
+        "sorry": null,
+        "seconds": 3,
+        "elaboration": "skipped",
+        "translated": true,
+        "lean_bytes": 21520,
+        "lean": "/home/bkearns/.cache/ferrosa-lean-extract/translate/ferrosa-alloc-count.lean",
+        "scope": "crate"
+      }
+    },
+    "ferrosa-index": {
+      "fingerprint": "ff23f58d8d478a44",
+      "measured_at": "2026-11-03T18:02:56+00:00",
+      "measurement": {
+        "stage": "aeneas-ok",
+        "translation_errors": 0,
+        "lean_errors": null,
+        "sorry": null,
+        "seconds": 243,
+        "elaboration": "skipped",
+        "translated": true,
+        "lean_bytes": 3031303,
+        "lean": "/home/bkearns/.cache/ferrosa-lean-extract/translate/ferrosa-index.lean",
+        "scope": "crate"
+      }
+    },
+    "ferrosa-graph": {
+      "fingerprint": "bad248d6ad328bc5",
+      "measured_at": "2026-11-03T18:10:43+00:00",
+      "measurement": {
+        "stage": "aeneas-crash",
+        "translation_errors": null,
+        "lean_errors": null,
+        "sorry": null,
+        "seconds": 151,
+        "elaboration": "skipped",
+        "translated": false,
+        "lean_bytes": null,
+        "lean": null,
+        "scope": "crate"
+      }
+    }
+  },
+  "updated_at": "2026-11-03T18:10:43+00:00"
+}

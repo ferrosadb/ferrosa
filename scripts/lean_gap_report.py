@@ -8,7 +8,15 @@ This turns that into one record per crate, written to specs/lean/gaps/<crate>.js
 markdown summary that a scheduler can diff to see gaps appearing or closing.
 
 Usage:  scripts/lean_gap_report.py ferrosa-sstable [--prefix ferrosa_sstable::]
+        scripts/lean_gap_report.py ferrosa-sstable --translate-only
         (run from the repo root; all paths overridable by environment variables)
+
+`--translate-only` measures the first milestone only: charon and aeneas run, and the record
+says whether aeneas produced a non-empty `.lean` file. It does *not* elaborate, and it says so
+with `elaboration: "skipped"`. The two milestones are separate questions -- "every crate
+produces Lean" is a coverage claim that costs seconds per small crate, while "that Lean
+elaborates" needs the Aeneas library and minutes per crate -- and a record that merged them
+would let a translation crash read as "zero Lean errors".
 
 Environment:
   CHARON      charon binary            (default ~/src/aeneas/charon/bin/charon)
@@ -21,6 +29,10 @@ Environment:
   LEAN_GAP_MEM_MAX                     memory ceiling for one extraction (default: 60% of RAM);
                                        0/none/off runs each child unbounded
   LEAN_GAP_MEM_SWAP_MAX                swap ceiling beside it (default 1G)
+  LEAN_GAP_KEEP_LEAN                   where `--translate-only` copies the `.lean` it produced
+                                       (default ~/.cache/ferrosa-lean-extract/translate);
+                                       empty keeps the file in the scratch tree and records
+                                       only its size and digest
 
 Two separate ceilings, because they stop two different ways of taking the host down:
 
@@ -42,6 +54,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -360,6 +373,68 @@ def extract(crate: str, prefix: str, work: Path) -> dict:
     }
 
 
+def keep_lean_dir() -> Path | None:
+    """Where a translate-only run parks the `.lean` it produced, or None to keep none.
+
+    The extraction itself lives in a `mkdtemp` that is removed on the way out, so the path in a
+    check-mode record has stopped existing by the time anyone reads it. A translate-only run
+    copies the file to a stable path first, which lets the gate check the artifact the record
+    claims -- the point of milestone 1 is the file, not a count beside it.
+    """
+    raw = os.environ.get("LEAN_GAP_KEEP_LEAN",
+                         str(Path.home() / ".cache/ferrosa-lean-extract/translate"))
+    return Path(raw) if raw.strip() else None
+
+
+def translation_record(rec: dict, crate: str, keep: Path | None = None) -> dict:
+    """The record a translate-only run produces: did aeneas write Lean, or not?
+
+    Elaboration is the second milestone, so it is not attempted here, and the record says so
+    with `elaboration: "skipped"`. It deliberately carries no `lean_errors`, no `compiled` and
+    no `sorry_declarations`: a zero in any of those would be a claim this run never made, and
+    every reader of the record shape -- `lean_gap_ratchet.py` included -- treats a zero as a
+    measurement. `translated` is the only verdict, and it is true only when a non-empty file
+    exists.
+
+    A crash stays `aeneas-crash` with its exception line, because a crate that dies inside the
+    translator and a crate whose Lean merely fails to elaborate are different failures and the
+    whole point of this mode is to stop reporting them as one.
+    """
+    rec = dict(rec)
+    rec["elaboration"] = "skipped"
+    for key in ("lean_errors", "errors", "compiled", "sorry_declarations"):
+        rec.pop(key, None)
+
+    stage = rec.get("stage")
+    if stage == "aeneas":
+        src = Path(rec["lean"]) if rec.get("lean") else None
+        size = src.stat().st_size if src is not None and src.is_file() else 0
+        if src is None or size <= 0:
+            # aeneas exited without a crash and wrote nothing usable. That is not a crash and
+            # not a translation either, so it gets its own stage rather than borrowing one.
+            rec.update({"stage": "no-lean", "translated": False,
+                        "error": "aeneas produced no non-empty .lean file"})
+            return rec
+        data = src.read_bytes()
+        rec.update({"stage": "aeneas-ok", "translated": True,
+                    "lean_bytes": size, "lean_sha256": hashlib.sha256(data).hexdigest()})
+        if keep is not None:
+            keep.mkdir(parents=True, exist_ok=True)
+            dest = keep / f"{crate}.lean"
+            dest.write_bytes(data)
+            rec["lean"] = str(dest)
+        return rec
+
+    if stage == "aeneas-crash":
+        rec["translated"] = False
+        return rec
+
+    # `charon`, `oom`, `locate`: nothing reached aeneas, so there is no file to talk about.
+    rec["translated"] = False
+    rec.setdefault("error", f"no Lean produced (stage {stage})")
+    return rec
+
+
 def elaborate(lean_file: Path) -> dict:
     """Compile the generated module against the Aeneas Lean library."""
     res = run(["lake", "env", "lean", str(lean_file.resolve())], cwd=Path(LEAN_PKG),
@@ -389,6 +464,9 @@ def main() -> int:
     ap.add_argument("--out", default=None,
                     help="record path (default specs/lean/gaps/<crate>.json); a per-module run "
                          "passes its own path so sibling modules do not overwrite each other")
+    ap.add_argument("--translate-only", action="store_true",
+                    help="run charon and aeneas and stop: record whether a non-empty .lean was "
+                         "produced, and record `elaboration: skipped` instead of elaborating")
     args = ap.parse_args()
 
     crate = args.crate
@@ -400,7 +478,9 @@ def main() -> int:
         # scale with crate size, not with how many sessions decided to measure one at once.
         with single_extraction():
             rec = extract(crate, prefix, work)
-            if rec.get("lean"):
+            if args.translate_only:
+                rec = translation_record(rec, crate, keep_lean_dir())
+            elif rec.get("lean"):
                 rec.update(elaborate(Path(rec["lean"])))
             elif "error" not in rec:
                 rec["error"] = "no Lean file to elaborate"
@@ -411,9 +491,26 @@ def main() -> int:
                 "memory_max": mem_cap(),
                 "toolchain": {"charon": CHARON, "aeneas": AENEAS, "lean_pkg": LEAN_PKG}})
     GAPS.mkdir(parents=True, exist_ok=True)
-    out = Path(args.out) if args.out else GAPS / f"{crate}.json"
+    # A translate-only record never lands in the elaboration directory by default: those records
+    # are what `lean_gap_ratchet.py` diffs, and a translate-only row there -- no `lean_errors`,
+    # `elaboration: skipped` -- would either read as a coverage regression or, worse, replace the
+    # error list a growth report names.
+    default_dir = (GAPS / "translate") if args.translate_only else GAPS
+    out = Path(args.out) if args.out else default_dir / f"{crate}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(rec, indent=2) + "\n")
+
+    if args.translate_only:
+        # `translated` is the verdict and `lean_errors` is absent, so this line cannot be
+        # mistaken for the elaboration summary below it.
+        ok = rec.get("translated") is True
+        print(f"{crate}: stage={rec.get('stage')} translated={'yes' if ok else 'no'} "
+              f"elaboration=skipped"
+              + (f" lean={rec.get('lean_bytes')}B" if ok else "")
+              + f" -> {'TRANSLATED' if ok else 'NO LEAN'}  ({out})")
+        if rec.get("error"):
+            print("  " + str(rec["error"])[:400])
+        return 0 if ok else 1
 
     ok = rec.get("compiled", False)
     print(f"{crate}: translation_errors={rec.get('translation_errors', '?')} "

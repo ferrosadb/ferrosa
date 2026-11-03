@@ -22,15 +22,24 @@ Usage:
   lean_gap_inventory.py --dry-run       # print the plan, measure nothing
   lean_gap_inventory.py --dag-only      # regenerate dag.json/dag.md only
   lean_gap_inventory.py --rekey         # keep cached rows when a toolchain field became resolvable
+  lean_gap_inventory.py --translate-only  # milestone 1: does the crate produce Lean at all?
+
+`--translate-only` runs charon and aeneas and stops: it records whether a non-empty `.lean` was
+written and marks the record `elaboration: "skipped"`, so a crate that crashes and a crate whose
+Lean is merely wrong stay distinguishable. Its records live under
+`specs/lean/gaps/translate/` -- a separate state file, so an elaboration sweep and a
+translate-only sweep never grade each other's rows -- and the gate over them is
+`scripts/lean_gap_translate.py`.
 
 Artifacts (all committed):
   specs/lean/gaps/state.json      per-crate fingerprint + last measurement
   specs/lean/gaps/dag.json        crate DAG in topological order
   specs/lean/gaps/dag.md          mermaid graph + checklist
+  specs/lean/gaps/translate/      the same three, for `--translate-only`
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, NamedTuple
 
 import argparse
 import hashlib
@@ -49,6 +58,41 @@ GAPS = REPO / "specs/lean/gaps"
 STATE = GAPS / "state.json"
 DAG_JSON = GAPS / "dag.json"
 DAG_MD = GAPS / "dag.md"
+
+
+class Layout(NamedTuple):
+    """Where one measurement mode keeps its artifacts.
+
+    The two milestones answer different questions and their records must not overwrite each
+    other: `lean_gap_ratchet.py` reads `specs/lean/gaps/state.json` and a crate's error list, and a
+    translate-only row there -- no `lean_errors`, `elaboration: skipped` -- would be a stage that
+    says `aeneas` with no count behind it. That is the shape the ratchet refuses to compare, so a
+    translate-only sweep under `specs/lean/gaps/translate/` keeps the class ceiling intact instead
+    of tripping it with records that never intended to elaborate anything.
+    """
+
+    records: Path
+    state: Path
+    dag_json: Path
+    dag_md: Path
+    translate: bool
+
+
+TRANSLATE_DIR = GAPS / "translate"
+CHECK_LAYOUT = Layout(GAPS, STATE, DAG_JSON, DAG_MD, translate=False)
+TRANSLATE_LAYOUT = Layout(TRANSLATE_DIR, TRANSLATE_DIR / "state.json",
+                          TRANSLATE_DIR / "dag.json", TRANSLATE_DIR / "dag.md", translate=True)
+# The mode this process is measuring in. One inventory run has one mode, and every function that
+# writes an artifact reads it from here rather than taking a parameter it would only ever pass on.
+LAYOUT = CHECK_LAYOUT
+
+
+def use_layout(translate: bool) -> Layout:
+    global LAYOUT
+    LAYOUT = TRANSLATE_LAYOUT if translate else CHECK_LAYOUT
+    return LAYOUT
+
+
 CHARON = os.environ.get("CHARON", str(Path.home() / "src/aeneas/charon/bin/charon"))
 AENEAS = os.environ.get("AENEAS", str(Path.home() / "src/aeneas/src/_build/default/main.exe"))
 LEAN_PKG = os.environ.get("LEAN_PKG", str(Path.home() / ".local/aeneas/backends/lean"))
@@ -277,18 +321,26 @@ def sample_module(crate_dir: Path) -> str | None:
 
 # A stage that means the crate was actually read end to end. `aeneas-crash` counts: it is a
 # deterministic property of this crate under this toolchain, and re-running it produces the same
-# exception until the translator is fixed -- a bad answer, but an answer.
+# exception until the translator is fixed -- a bad answer, but an answer. `aeneas-ok` is the
+# translate-only success stage: aeneas wrote a file and stopped there.
 CONCLUDED_STAGES = ("aeneas", "compiled", "aeneas-crash")
+TRANSLATED_STAGES = ("aeneas-ok", "aeneas-crash")
 
 
-def settles(row: dict, fingerprint: str) -> bool:
+def settles(row: dict, fingerprint: str, translate: bool = False) -> bool:
     """Whether a cached row answers the coverage question for this crate.
 
     Only a row that measured *the crate* and finished the job does. A module sample is a different
     unit, and `timeout`/`oom`/`locked`/`unknown` record the absence of a measurement; treating any
     of those as done is how a sweep reports coverage it never had.
+
+    `translate` selects the stage vocabulary: a translate-only run concludes at `aeneas-ok` or
+    `aeneas-crash`, where the elaboration run concludes at `aeneas`/`compiled`/`aeneas-crash`. The
+    two are kept apart on purpose -- a translate-only row must never settle an elaboration sweep,
+    which is why `aeneas-ok` is not in CONCLUDED_STAGES.
     """
     meas = row.get("measurement") or {}
+    concluded = TRANSLATED_STAGES if translate else CONCLUDED_STAGES
     if row.get("fingerprint") != fingerprint:
         return False
     if meas.get("stage") == "modules":
@@ -296,7 +348,7 @@ def settles(row: dict, fingerprint: str) -> bool:
         # module concluding, and `modules-partial` is not that.
         mods = meas.get("modules") or {}
         return bool(mods) and all(m.get("stage") in CONCLUDED_STAGES for m in mods.values())
-    return meas.get("scope") == "crate" and meas.get("stage") in CONCLUDED_STAGES
+    return meas.get("scope") == "crate" and meas.get("stage") in concluded
 
 
 def run_report(crate: str, prefix: str | None, budget: int, work_log: Path,
@@ -304,6 +356,14 @@ def run_report(crate: str, prefix: str | None, budget: int, work_log: Path,
     cmd = [sys.executable, str(REPO / "scripts/lean_gap_report.py"), crate]
     if prefix:
         cmd += ["--prefix", prefix]
+    if LAYOUT.translate:
+        # Translation only: charon and aeneas, then stop. The record says `elaboration: skipped`
+        # and carries no `lean_errors`, so nothing downstream can read it as a clean elaboration.
+        cmd += ["--translate-only"]
+        # Always name the record: the child's default is the *elaboration* directory, and a
+        # translate-only run that fell through to it would overwrite the very records the class
+        # ratchet compares against.
+        out = out or LAYOUT.records / f"{crate}.json"
     if out is not None:
         # A per-module run needs its own record or every module overwrites the crate's file and
         # only the last one's error list survives.
@@ -330,7 +390,7 @@ def run_report(crate: str, prefix: str | None, budget: int, work_log: Path,
     secs = round(time.time() - started)
     data = {}
     try:
-        data = json.loads((out or GAPS / f"{crate}.json").read_text())
+        data = json.loads((out or LAYOUT.records / f"{crate}.json").read_text())
     except Exception:
         pass
     # A queued or timed-out run produced nothing; carrying the previous run's counts beside a
@@ -343,6 +403,16 @@ def run_report(crate: str, prefix: str | None, budget: int, work_log: Path,
         "sorry": data.get("sorry_declarations") if measured else None,
         "seconds": secs,
     }
+    if LAYOUT.translate:
+        # This row is what `lean_gap_translate.py` asserts on, so it carries the verdict and the
+        # file it is about -- not a count. `elaboration: skipped` travels with it: a reader that
+        # only sees the state file must not have to infer that nothing was elaborated.
+        row.update({
+            "elaboration": "skipped",
+            "translated": data.get("translated") if measured else None,
+            "lean_bytes": data.get("lean_bytes") if measured else None,
+            "lean": data.get("lean") if measured else None,
+        })
     work_log.write_text(json.dumps(row))
     return row
 
@@ -417,6 +487,13 @@ def measure(crate: str, crates: dict[str, dict], sample: bool = False,
     """
     ident = crate.replace("-", "_")
     whole = run_report(crate, None, WHOLE_BUDGET, Path(tempfile.gettempdir()) / f"whole-{crate}.json")
+    if LAYOUT.translate:
+        # Step 1 asks one question per crate: does it produce Lean whole? A crate that needs more
+        # memory than the host has does not, and covering it module by module would answer a
+        # different question (some of this crate translates) while the gate asserts "this crate
+        # translates". So the row stands as it fell, and `oom` is a finding the gate reports.
+        whole["scope"] = "crate"
+        return whole
     if whole["stage"] == "locked":
         # Nothing was extracted, so a module sample would be queued too -- and reporting one
         # would claim a measurement this run never made.
@@ -453,39 +530,77 @@ def render(crates: dict[str, dict], order: list[str], state: dict) -> None:
     lines.append("```")
 
     done = 0
+    translated_count = 0
     for name in order:
         rec = state["crates"].get(name, {})
         m = rec.get("measurement") or {}
         stage = m.get("stage", "unmeasured")
-        ok = stage in ("compiled", "aeneas") and (m.get("lean_errors") == 0)
+        if LAYOUT.translate:
+            ok = m.get("translated") is True and stage == "aeneas-ok"
+            translated_count += 1 if ok else 0
+        else:
+            ok = stage in ("compiled", "aeneas") and (m.get("lean_errors") == 0)
         done += 1 if rec.get("fingerprint") else 0
         mark = "x" if ok else " "
         scope = m.get("scope", "-")
-        rows.append(
-            f"| {name} | {mark} | {scope} | {stage} | {m.get('translation_errors', '-')} "
-            f"| {m.get('lean_errors', '-')} | {m.get('sorry', '-')} | {m.get('seconds', '-')} "
-            f"| {rec.get('measured_at', '-')} |")
+        if LAYOUT.translate:
+            # No `lean` column: this table has not elaborated anything, and a column of dashes
+            # beside a stage reads as "measured zero errors" to anyone skimming it.
+            rows.append(
+                f"| {name} | {mark} | {scope} | {stage} | "
+                f"{'yes' if m.get('translated') else 'no'} | {m.get('lean_bytes', '-')} "
+                f"| {m.get('seconds', '-')} | {rec.get('measured_at', '-')} |")
+        else:
+            rows.append(
+                f"| {name} | {mark} | {scope} | {stage} | {m.get('translation_errors', '-')} "
+                f"| {m.get('lean_errors', '-')} | {m.get('sorry', '-')} | {m.get('seconds', '-')} "
+                f"| {rec.get('measured_at', '-')} |")
         lines.append("")  # placeholder, mermaid already emitted
 
-    checklist = [f"- [{'x' if (state['crates'].get(n, {}).get('measurement') or {}).get('stage') in ('compiled','aeneas') and ((state['crates'].get(n, {}).get('measurement') or {}).get('lean_errors') == 0) else ' '}] "
-                 f"{n} — {(state['crates'].get(n, {}).get('measurement') or {}).get('stage', 'unmeasured')}"
+    def ok_mark(n: str) -> str:
+        m = state["crates"].get(n, {}).get("measurement") or {}
+        if LAYOUT.translate:
+            return "x" if m.get("translated") is True and m.get("stage") == "aeneas-ok" else " "
+        return "x" if (m.get("stage") in ("compiled", "aeneas")
+                       and m.get("lean_errors") == 0) else " "
+
+    checklist = [f"- [{ok_mark(n)}] {n} — "
+                 f"{(state['crates'].get(n, {}).get('measurement') or {}).get('stage', 'unmeasured')}"
                  for n in order]
 
-    md = [f"# Lean extraction inventory — {done}/{len(order)} crates measured", "",
+    if LAYOUT.translate:
+        head = (f"# Lean translation inventory — {translated_count}/{len(order)} crates produce Lean")
+        intro = [
+            "Generated by `scripts/lean_gap_inventory.py --translate-only`. This measures the first",
+            "milestone only: charon and aeneas run, and the row says whether aeneas wrote a",
+            "non-empty `.lean`. **Elaboration was not attempted** — every record carries",
+            "`elaboration: \"skipped\"` and none carries a `lean_errors` count, because a zero there",
+            "would be a claim this run never made. `scripts/lean_gap_translate.py check` is the gate",
+            "over these records; whether the Lean elaborates is `scripts/lean_gap_ratchet.py`.",
+        ]
+        table = "| crate | ok | scope | stage | translated | bytes | s | measured |"
+        rule = "|---|---|---|---|---|---|---|---|"
+    else:
+        head = f"# Lean extraction inventory — {done}/{len(order)} crates measured"
+        intro = [
+            "Generated by `scripts/lean_gap_inventory.py`. A crate is re-measured when its fingerprint",
+            "changes -- its own sources, its transitive workspace dependencies' sources, or the",
+            "toolchain -- and whenever its last row did not measure the crate end to end. `scope` says",
+            "which unit the numbers describe, so a module row is never read as a crate row.",
+        ]
+        table = "| crate | ok | scope | stage | transl | lean | sorry | s | measured |"
+        rule = "|---|---|---|---|---|---|---|---|---|"
+
+    md = [head, "",
           f"Toolchain: {tc.get('charon','?')} · aeneas {tc.get('aeneas','?')} · {tc.get('lean','?')}",
           f"Budgets: whole crate {state.get('budgets', {}).get('whole_seconds') or 'unbounded'}s, "
           f"module {state.get('budgets', {}).get('module_seconds')}s, "
           f"sample fallback {'on' if state.get('budgets', {}).get('sample') else 'off'}",
-          f"Updated: {state.get('updated_at','-')}", "",
-          "Generated by `scripts/lean_gap_inventory.py`. A crate is re-measured when its fingerprint",
-          "changes -- its own sources, its transitive workspace dependencies' sources, or the",
-          "toolchain -- and whenever its last row did not measure the crate end to end. `scope` says",
-          "which unit the numbers describe, so a module row is never read as a crate row.", "",
-          "## Checklist", ""] + checklist + ["", "## Results", "",
-          "| crate | ok | scope | stage | transl | lean | sorry | s | measured |",
-          "|---|---|---|---|---|---|---|---|---|"] + rows + ["", "## Dependency order", ""] + lines
-    DAG_MD.write_text("\n".join(md) + "\n")
-    DAG_JSON.write_text(json.dumps(
+          f"Updated: {state.get('updated_at','-')}", "", *intro, "",
+          "## Checklist", ""] + checklist + ["", "## Results", "", table, rule] + rows + \
+         ["", "## Dependency order", ""] + lines
+    LAYOUT.dag_md.write_text("\n".join(md) + "\n")
+    LAYOUT.dag_json.write_text(json.dumps(
         {"order": order, "edges": {n: [d for d in crates[n]["deps"] if d in crates] for n in order},
          "toolchain": tc}, indent=2) + "\n")
 
@@ -505,9 +620,15 @@ def main() -> int:
     ap.add_argument("--sample", action="store_true",
                     help="fall back to one representative module when the whole crate runs out of "
                          "time or memory; off by default, because a sample is not coverage")
+    ap.add_argument("--translate-only", action="store_true",
+                    help="measure milestone 1 only: run charon and aeneas, record whether a "
+                         "non-empty .lean was produced, and never elaborate. Records go to "
+                         "specs/lean/gaps/translate/ so the elaboration records and the class "
+                         "ratchet are untouched")
     args = ap.parse_args()
 
-    GAPS.mkdir(parents=True, exist_ok=True)
+    layout = use_layout(args.translate_only)
+    layout.records.mkdir(parents=True, exist_ok=True)
     crates = lib_crates(metadata())
     order = dag(crates)
     tc = toolchain()
@@ -516,9 +637,9 @@ def main() -> int:
                               "sample": args.sample},
                   "crates": {}}
     recorded_tc: dict = {}
-    if STATE.is_file():
+    if layout.state.is_file():
         try:
-            old = json.loads(STATE.read_text())
+            old = json.loads(layout.state.read_text())
             # Every row carries the toolchain in its own fingerprint, so a changed identity makes
             # exactly the affected rows stale. Nothing here drops the cache wholesale: that read a
             # busy host as a new toolchain and re-extracted the suite for a version string.
@@ -540,7 +661,7 @@ def main() -> int:
         meas = prev.get("measurement") or {}
         if name in args.force:
             todo.append((name, fp))
-        elif settles(prev, fp):
+        elif settles(prev, fp, translate=layout.translate):
             print(f"skip {name} ({meas.get('stage')}, {prev.get('measured_at', '-')})")
         elif (args.rekey
               and should_adopt(prev, crate_fingerprint(name, crates, recorded_tc), fp,
@@ -559,7 +680,7 @@ def main() -> int:
             # Persist the adoption before the first extraction: recognising ten cached rows and
             # then losing them to an interrupted run would mean extracting them again on resume.
             state["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-            STATE.write_text(json.dumps(state, indent=2) + "\n")
+            LAYOUT.state.write_text(json.dumps(state, indent=2) + "\n")
 
     print(f"plan: {len(todo)} to measure, {len(want) - len(todo)} unchanged, {len(order)} crates total")
     if dry:
@@ -586,7 +707,7 @@ def main() -> int:
             is enough here because `measured_at` is the completion time of the run that wrote it.
             """
             try:
-                on_disk = (json.loads(STATE.read_text()).get("crates") or {}).get(_name) or {}
+                on_disk = (json.loads(LAYOUT.state.read_text()).get("crates") or {}).get(_name) or {}
                 at = on_disk.get("measured_at")
                 return bool(at) and datetime.fromisoformat(at) > _started
             except (OSError, ValueError):
@@ -603,7 +724,7 @@ def main() -> int:
             SAME crate safe, since two runs measuring it is a genuine conflict, not a merge.
             """
             try:
-                on_disk = json.loads(STATE.read_text())
+                on_disk = json.loads(LAYOUT.state.read_text())
                 if not isinstance(on_disk, dict):
                     raise ValueError("not an object")
             except (OSError, ValueError):
@@ -614,7 +735,7 @@ def main() -> int:
                 on_disk["crates"] = crates_on_disk
             crates_on_disk[_name] = state["crates"][_name]
             on_disk["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-            STATE.write_text(json.dumps(on_disk, indent=2) + "\n")
+            LAYOUT.state.write_text(json.dumps(on_disk, indent=2) + "\n")
             state["crates"] = on_disk["crates"]
             state["updated_at"] = on_disk["updated_at"]
 
@@ -647,16 +768,21 @@ def main() -> int:
             "measured_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "measurement": row,
         }
-        print(f"    -> {row.get('scope')} {row['stage']} transl={row.get('translation_errors')} "
-              f"lean={row.get('lean_errors')} sorry={row.get('sorry')} {row.get('seconds')}s", flush=True)
+        if LAYOUT.translate:
+            print(f"    -> {row.get('scope')} {row['stage']} translated={row.get('translated')} "
+                  f"bytes={row.get('lean_bytes')} {row.get('seconds')}s", flush=True)
+        else:
+            print(f"    -> {row.get('scope')} {row['stage']} transl={row.get('translation_errors')} "
+                  f"lean={row.get('lean_errors')} sorry={row.get('sorry')} {row.get('seconds')}s",
+                  flush=True)
         state["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         persist(name)
         render(crates, order, state)
 
     state["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    STATE.write_text(json.dumps(state, indent=2) + "\n")
+    LAYOUT.state.write_text(json.dumps(state, indent=2) + "\n")
     render(crates, order, state)
-    print(f"wrote {STATE}, {DAG_JSON}, {DAG_MD}")
+    print(f"wrote {LAYOUT.state}, {LAYOUT.dag_json}, {LAYOUT.dag_md}")
     return 0
 
 

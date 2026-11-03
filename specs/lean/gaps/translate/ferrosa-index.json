@@ -1,0 +1,22 @@
+{
+  "stage": "aeneas-ok",
+  "llbc": "/home/bkearns/src/ferrosa-suite/ferrosa/ferrosa_index.llbc",
+  "lean": "/home/bkearns/.cache/ferrosa-lean-extract/translate/ferrosa-index.lean",
+  "translation_errors": 0,
+  "translation_unique_reported": null,
+  "translation_messages": [],
+  "aeneas_exit": 1,
+  "elaboration": "skipped",
+  "translated": true,
+  "lean_bytes": 3031303,
+  "lean_sha256": "e840ab8ae87fbf22ac33bbd5e5b6a8da4bf2129f18d45b7eb6b5cec81b0fa01b",
+  "crate": "ferrosa-index",
+  "prefix": "ferrosa_index::*",
+  "generated_at": "2026-11-03T17:58:52+00:00",
+  "memory_max": "8G",
+  "toolchain": {
+    "charon": "/home/bkearns/src/aeneas/charon/bin/charon",
+    "aeneas": "/home/bkearns/src/aeneas/src/_build/default/main.exe",
+    "lean_pkg": "/home/bkearns/.local/aeneas/backends/lean"
+  }
+}

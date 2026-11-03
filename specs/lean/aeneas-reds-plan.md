@@ -35,6 +35,32 @@ The ceiling covers 451 of the 763 reds, over 19 crates. Five crates are measured
 gated, because one measurement of them does not fit a hosted runner;
 `specs/lean/gaps/ratchet-scope.txt` names each one and why.
 
+## The two milestones, and the step-1 gate
+
+"Red" has been one word for two different failures, and only the expensive one was gated:
+
+1. **The crate translates.** charon runs, aeneas runs, a non-empty `.lean` file lands. This is a
+   coverage question and it is cheap -- seconds to a few minutes per crate, no Aeneas library, no
+   elaborator.
+2. **That Lean elaborates.** `lake env lean` accepts it with no `unknownIdentifier`,
+   `synthInstanceFailed` or `invalidField`. This is what the numbered steps below close, and it is
+   expensive enough that 19 of 27 crates are held to a ceiling and the rest are written off.
+
+`scripts/lean_gap_inventory.py --translate-only` measures milestone 1 and stops: it records
+`stage: aeneas-ok` (or `aeneas-crash` with the exception line) and `elaboration: "skipped"`, and
+carries no `lean_errors` at all, because a zero there would be a claim the run never made. Its
+records live in `specs/lean/gaps/translate/`, so an elaboration sweep and a translate-only sweep
+never grade each other's rows.
+
+`scripts/lean_gap_translate.py check` is the gate over those records, and it is deliberately not a
+ratchet: it asserts that **every library crate in the workspace** produced Lean, naming each crate
+that did not and why. There is no count to shrink and no baseline to update. A crate that cannot be
+measured on a runner is listed in `specs/lean/gaps/translate/translate-scope.txt` with its reason
+and reported as *known unmeasured* -- absent is a failure, written-off-with-a-reason is not. The
+two failures stay separate on purpose: milestone 1 red means "this crate has no Lean to elaborate",
+milestone 2 red means "the Lean it has is wrong".
+
+
 ## What the reds actually are
 
 Grouped by mechanism, not by Lean error kind:
