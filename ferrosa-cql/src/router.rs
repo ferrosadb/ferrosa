@@ -104,11 +104,11 @@ fn publish_schema_change(
 
 /// Run direct schema and physical mutations under the shared lifecycle fence.
 /// The blocking job owns the fence and completion effects if its requester exits.
-async fn run_direct_schema_change(
+async fn run_direct_schema_change<T: Send + 'static>(
     state: &SharedState,
     auth: &AuthContext,
-    change: impl FnOnce(&SessionCore, &AuthContext) -> Result<(), CqlError> + Send + 'static,
-) -> Result<(), CqlError> {
+    change: impl FnOnce(&SessionCore, &AuthContext) -> Result<T, CqlError> + Send + 'static,
+) -> Result<T, CqlError> {
     let core = Arc::clone(&state.core);
     let auth = auth.clone();
     ferrosa_net::task_pool::TaskPool::current("cql-ddl")
@@ -120,30 +120,40 @@ async fn run_direct_schema_change(
         .map_err(|error| CqlError::ServerError(format!("schema change task failed: {error}")))?
 }
 
+/// Only an applied table change may publish an event, for the owner resolved under
+/// the lifecycle writer. Conditional no-ops have no completion effects.
+
+enum DirectTableChange {
+    Applied(TableId),
+    Unchanged,
+}
+
 /// Keep table metadata, physical effects and completion events in one owned job.
 async fn run_direct_table_change(
     state: &SharedState,
     auth: &AuthContext,
-    keyspace: String,
-    table: String,
     change_type: SchemaChangeType,
-    change: impl FnOnce(&SessionCore, &AuthContext) -> Result<(), CqlError> + Send + 'static,
-) -> Result<(), CqlError> {
+    change: impl FnOnce(&SessionCore, &AuthContext) -> Result<DirectTableChange, CqlError>
+        + Send
+        + 'static,
+) -> Result<DirectTableChange, CqlError> {
     let event_sender = state.event_sender.clone();
     let last_schema_event = state.last_schema_event.clone();
     run_direct_schema_change(state, auth, move |core, auth| {
-        change(core, auth)?;
-        publish_schema_change(
-            &event_sender,
-            &last_schema_event,
-            CqlEvent::SchemaChange {
-                change_type,
-                target: SchemaTarget::Table,
-                keyspace,
-                name: Some(table),
-            },
-        );
-        Ok(())
+        let outcome = change(core, auth)?;
+        if let DirectTableChange::Applied(table) = &outcome {
+            publish_schema_change(
+                &event_sender,
+                &last_schema_event,
+                CqlEvent::SchemaChange {
+                    change_type,
+                    target: SchemaTarget::Table,
+                    keyspace: table.keyspace.clone(),
+                    name: Some(table.table.clone()),
+                },
+            );
+        }
+        Ok(outcome)
     })
     .await
 }
@@ -151,6 +161,7 @@ async fn run_direct_table_change(
 /// Default cooperative-yield cadence for long partition scans. Larger
 /// tasks; smaller values do the opposite. Tune via
 /// `FERROSA_CQL_SCAN_YIELD_EVERY_PARTITIONS`.
+
 pub const DEFAULT_COOPERATIVE_SCAN_YIELD_EVERY_PARTITIONS: usize = 32;
 
 fn cooperative_scan_yield_every_partitions() -> usize {
@@ -11585,6 +11596,11 @@ async fn route_create_keyspace(
             let event_sender = state.event_sender.clone();
             let last_schema_event = state.last_schema_event.clone();
             run_direct_schema_change(state, ctx.auth, move |core, auth| {
+                core.schema
+                    .check_permission(auth, Permission::Create, &Resource::AllKeyspaces)?;
+                if s.if_not_exists && core.schema.snapshot().keyspaces.contains_key(&ks_meta.name) {
+                    return Ok(());
+                }
                 core.schema.create_keyspace(ks_meta.clone(), auth)?;
                 publish_schema_change(
                     &event_sender,
@@ -11759,6 +11775,11 @@ async fn route_drop_keyspace(
                 // cancelling the waiting client must not resume compactions
                 // halfway through physical cleanup or lose the notification.
                 let _pauses = pauses;
+                core.schema
+                    .check_permission(auth, Permission::Drop, &Resource::AllKeyspaces)?;
+                if s.if_exists && !core.schema.snapshot().keyspaces.contains_key(&keyspace) {
+                    return Ok(());
+                }
                 // Include tables admitted while the asynchronous pre-pause was
                 // draining. The lifecycle fence prevents further schema changes;
                 // group unregister also validates/owns pauses for this current set.
@@ -11930,6 +11951,20 @@ async fn route_create_table(
             let event_sender = state.event_sender.clone();
             let last_schema_event = state.last_schema_event.clone();
             run_direct_schema_change(state, ctx.auth, move |core, auth| {
+                core.schema.check_permission(
+                    auth,
+                    Permission::Create,
+                    &Resource::Keyspace(table_meta.keyspace.clone()),
+                )?;
+                if s.if_not_exists
+                    && core
+                        .schema
+                        .snapshot()
+                        .tables
+                        .contains_key(&(table_meta.keyspace.clone(), table_meta.name.clone()))
+                {
+                    return Ok(());
+                }
                 // Register with schema
                 core.schema.create_table(table_meta.clone(), auth)?;
 
@@ -12077,6 +12112,7 @@ async fn route_create_table(
 /// none (`schema.json` absent -> S3 -> start fresh) (t_0acc233d, D-47).
 ///
 /// Fails loudly: the caller must not acknowledge a table it cannot recover.
+
 fn persist_registry_snapshot_before_ack(
     state: &SessionCore,
     table_name: &str,
@@ -12315,7 +12351,7 @@ async fn route_alter_table(
         DdlPath::Direct { .. } => {
             let keyspace = ks.to_string();
             let table = s.table.clone();
-            run_direct_table_change(state, ctx.auth, keyspace.clone(), table.clone(), SchemaChangeType::Updated, move |core, auth| {
+            run_direct_table_change(state, ctx.auth, SchemaChangeType::Updated, move |core, auth| {
                 let ks = keyspace.as_str();
             core.schema.alter_table(ks, &table, updates, auth)?;
             // Propagate the post-ALTER column set to the storage engine,
@@ -12354,7 +12390,7 @@ async fn route_alter_table(
                     })?;
             }
             persist_registry_snapshot_before_ack(core, &table)?;
-                Ok(())
+                Ok(DirectTableChange::Applied(TableId::new(ks, &table)))
             }).await?;
             return Ok(result::encode_schema_change(
                 "UPDATED",
@@ -12445,16 +12481,28 @@ async fn route_drop_table(
             run_direct_table_change(
                 state,
                 ctx.auth,
-                keyspace.clone(),
-                table.clone(),
                 SchemaChangeType::Dropped,
                 move |core, auth| {
                     let ks = keyspace.as_str();
                     let _pause = pause;
+                    core.schema.check_permission(
+                        auth,
+                        Permission::Drop,
+                        &Resource::Table(keyspace.clone(), table.clone()),
+                    )?;
+                    if s.if_exists
+                        && !core
+                            .schema
+                            .snapshot()
+                            .tables
+                            .contains_key(&(keyspace.clone(), table.clone()))
+                    {
+                        return Ok(DirectTableChange::Unchanged);
+                    }
                     core.schema.drop_table(ks, &table, auth)?;
                     core.engine.unregister_table(&tid)?;
                     persist_registry_snapshot_before_ack(core, &table)?;
-                    Ok(())
+                    Ok(DirectTableChange::Applied(tid))
                 },
             )
             .await?;
@@ -12506,6 +12554,7 @@ async fn route_drop_table(
 
 /// Parse a Filtered (partial) index's `filter_op` option string into a
 /// [`ferrosa_index::FilterOp`]. Fails loud on any unrecognized operator.
+
 fn parse_filter_op(op: &str) -> Result<ferrosa_index::FilterOp, CqlError> {
     use ferrosa_index::FilterOp;
     match op.trim() {
@@ -12590,7 +12639,7 @@ fn filter_value_to_term(value: &str, cql_type: &CqlType) -> Result<Term, CqlErro
 /// encoding the value to storage bytes. Every failure is loud — a partial index
 /// with a broken clause would silently index the wrong rows.
 fn build_filter_clause(
-    state: &SharedState,
+    state: &SessionCore,
     ks: &str,
     table: &str,
     column: &str,
@@ -12642,8 +12691,9 @@ fn build_filter_clause(
 ///
 /// Every missing/invalid option fails loud — a partial index with a broken
 /// predicate would silently index the wrong rows, an unsound result.
+
 fn build_filter_predicate_from_options(
-    state: &SharedState,
+    state: &SessionCore,
     ks: &str,
     table: &str,
     options: &HashMap<String, String>,
@@ -12687,6 +12737,7 @@ fn build_filter_predicate_from_options(
 /// the same symbols [`parse_filter_op`] accepts (`=`,`!=`,`<`,`>`,`<=`,`>=`).
 /// String literals may be single-quoted (`'eng'`); the quotes are stripped.
 /// Any unparseable clause fails loud rather than being silently dropped.
+
 fn parse_filter_conjunction(expr: &str) -> Result<Vec<(String, String, String)>, CqlError> {
     // Split on the word `AND` (case-insensitive), surrounded by whitespace.
     let mut clauses = Vec::new();
@@ -13034,14 +13085,12 @@ async fn route_create_index(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            let index_meta = index_meta.clone();
+            let mut index_meta = index_meta.clone();
             let keyspace = ks.to_string();
             let table = s.table.clone();
             run_direct_table_change(
                 state,
                 ctx.auth,
-                keyspace.clone(),
-                table.clone(),
                 SchemaChangeType::Created,
                 move |core, auth| {
                     let ks = keyspace.as_str();
@@ -13051,10 +13100,71 @@ async fn route_create_index(
                         Permission::Alter,
                         &Resource::Table(ks.to_string(), table.clone()),
                     )?;
+                    let snap = core.schema.snapshot();
+                    let existing = snap
+                        .indexes
+                        .keys()
+                        .any(|(index_ks, _, name)| index_ks == ks && name == &index_meta.name);
+                    if existing {
+                        if s.if_not_exists {
+                            return Ok(DirectTableChange::Unchanged);
+                        }
+                        return Err(CqlError::Invalid(format!(
+                            "index '{}.{}' already exists",
+                            ks, index_meta.name
+                        )));
+                    }
+                    let parent = snap
+                        .tables
+                        .get(&(keyspace.clone(), table.clone()))
+                        .ok_or_else(|| {
+                            CqlError::from(ferrosa_schema::SchemaError::TableNotFound(
+                                keyspace.clone(),
+                                table.clone(),
+                            ))
+                        })?;
+                    if index_meta.target_columns.is_empty() {
+                        return Err(CqlError::Invalid(
+                            "index requires at least one target column".to_string(),
+                        ));
+                    }
+                    for column in &index_meta.target_columns {
+                        let metadata = parent.columns.get(column).ok_or_else(|| {
+                            CqlError::Invalid(format!(
+                                "index target column '{column}' not found in {ks}.{table}"
+                            ))
+                        })?;
+                        if index_meta.index_type == IndexType::Vector
+                            && ferrosa_common::schema::vector_dimension(&metadata.column_type)
+                                .is_none()
+                        {
+                            return Err(CqlError::Invalid(format!(
+                                "vector index target column '{column}' has non-vector type '{}'",
+                                metadata.column_type
+                            )));
+                        }
+                    }
+                    if index_meta.index_type == IndexType::Filtered {
+                        let predicate = build_filter_predicate_from_options(
+                            core,
+                            ks,
+                            &table,
+                            &index_meta.options,
+                        )?;
+                        let encoded = predicate.to_option_string().map_err(|error| {
+                            CqlError::ServerError(format!(
+                                "failed to serialize filter predicate: {error}"
+                            ))
+                        })?;
+                        index_meta
+                            .options
+                            .insert(FILTER_PREDICATE_OPTION_KEY.to_string(), encoded);
+                        index_meta.filter_predicate = Some(predicate);
+                    }
                     persist_index_row_direct(&core.engine, &index_meta);
                     core.schema.create_index(index_meta.clone(), auth)?;
                     wire_created_index(core, &index_meta, vector_method)?;
-                    Ok(())
+                    Ok(DirectTableChange::Applied(TableId::new(ks, &table)))
                 },
             )
             .await?;
@@ -13098,6 +13208,7 @@ async fn route_create_index(
         &[ks, &s.table],
     ))
 }
+
 fn wire_created_index(
     state: &SessionCore,
     metadata: &IndexMetadata,
@@ -13319,6 +13430,28 @@ fn wire_created_index(
     Ok(())
 }
 
+/// Resolve a keyspace-wide index name without choosing an arbitrary owner.
+/// Historical registries may contain the same name on more than one table.
+fn resolve_index_owner(
+    schema: &Schema,
+    keyspace: &str,
+    index_name: &str,
+) -> Result<Option<String>, CqlError> {
+    let snapshot = schema.snapshot();
+    let mut owners = snapshot
+        .indexes
+        .keys()
+        .filter(|(ks, _, name)| ks == keyspace && name == index_name)
+        .map(|(_, table, _)| table);
+    let owner = owners.next().cloned();
+    if owners.next().is_some() {
+        return Err(CqlError::Invalid(format!(
+            "index '{keyspace}.{index_name}' is ambiguous"
+        )));
+    }
+    Ok(owner)
+}
+
 async fn route_drop_index(
     state: &SharedState,
     ctx: &RequestContext<'_>,
@@ -13326,13 +13459,7 @@ async fn route_drop_index(
 ) -> Result<BytesMut, CqlError> {
     let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
 
-    // Look up which table owns this index by scanning the schema snapshot
-    let snap = state.schema.snapshot();
-    let table_name = snap
-        .indexes
-        .keys()
-        .find(|(k, _t, n)| k == ks && n == &s.name)
-        .map(|(_, t, _)| t.clone());
+    let table_name = resolve_index_owner(&state.schema, ks, &s.name)?;
 
     let table_name = match table_name {
         Some(t) => t,
@@ -13365,14 +13492,28 @@ async fn route_drop_index(
             let index_name = s.name.clone();
             let keyspace = ks.to_string();
             let table = table_name.clone();
-            run_direct_table_change(
+            let outcome = run_direct_table_change(
                 state,
                 ctx.auth,
-                keyspace.clone(),
-                table.clone(),
                 SchemaChangeType::Dropped,
                 move |core, auth| {
                     let ks = keyspace.as_str();
+                    let current_table = resolve_index_owner(&core.schema, ks, &index_name)?;
+                    // Even a conditional no-op retains the existing permission policy.
+                    let owner = current_table.as_ref().unwrap_or(&table);
+                    core.schema.check_permission(
+                        auth,
+                        Permission::Alter,
+                        &Resource::Table(keyspace.clone(), owner.clone()),
+                    )?;
+                    let Some(table) = current_table else {
+                        if s.if_exists {
+                            return Ok(DirectTableChange::Unchanged);
+                        }
+                        return Err(CqlError::Invalid(format!(
+                            "index '{index_name}' not found in keyspace '{ks}'"
+                        )));
+                    };
                     core.schema.drop_index(ks, &table, &index_name, auth)?;
                     core.engine
                         .drop_index(&TableId::new(ks, &table), &index_name)
@@ -13380,14 +13521,18 @@ async fn route_drop_index(
                             CqlError::ServerError(format!("drop index storage cleanup: {e}"))
                         })?;
                     tombstone_index_row_direct(&core.engine, ks, &table, &index_name);
-                    Ok(())
+                    Ok(DirectTableChange::Applied(TableId::new(ks, &table)))
                 },
             )
             .await?;
+            let response_table = match outcome {
+                DirectTableChange::Applied(table) => table.table,
+                DirectTableChange::Unchanged => table_name.clone(),
+            };
             return Ok(result::encode_schema_change(
                 "DROPPED",
                 "TABLE",
-                &[ks, &table_name],
+                &[ks, &response_table],
             ));
         }
         DdlPath::Pair(coordinator) => {
@@ -13503,6 +13648,11 @@ async fn route_create_role(
             let hashed_password = s.hashed_password.clone();
             let password = s.password.clone();
             run_direct_schema_change(state, ctx.auth, move |core, auth| {
+                core.schema
+                    .check_permission(auth, Permission::Create, &Resource::AllRoles)?;
+                if s.if_not_exists && core.schema.snapshot().roles.contains_key(&name) {
+                    return Ok(());
+                }
                 if let Some(hash) = hashed_password {
                     core.schema.create_role_hashed(base_role, &hash, auth)?;
                 } else {
@@ -13661,6 +13811,11 @@ async fn route_drop_role(
         DdlPath::Direct { .. } => {
             let name = s.name.clone();
             run_direct_schema_change(state, ctx.auth, move |core, auth| {
+                core.schema
+                    .check_permission(auth, Permission::Drop, &Resource::AllRoles)?;
+                if s.if_exists && !core.schema.snapshot().roles.contains_key(&name) {
+                    return Ok(());
+                }
                 core.schema.drop_role(&name, auth)?;
                 ferrosa_cluster::system_table_writer::SystemTableWriter::new(core.engine.clone())
                     .apply(
@@ -13696,6 +13851,7 @@ async fn route_drop_role(
 /// salted_hash is NEVER projected — the login path reads it directly
 /// from the schema snapshot. (See SELECT * redaction for how reads
 /// against `system_auth.roles` should expose a masked column instead.)
+
 async fn route_list_roles(
     state: &SharedState,
     ctx: &RequestContext<'_>,
@@ -17101,44 +17257,6 @@ async fn route_drop_function(
     ))
 }
 
-fn validate_aggregate_dependencies(
-    schema: &Schema,
-    aggregate: &UserAggregateMetadata,
-) -> Result<(), CqlError> {
-    let mut state_args = vec![aggregate.state_type.clone()];
-    state_args.extend(aggregate.arg_types.iter().cloned());
-    if schema
-        .get_function(&aggregate.keyspace, &aggregate.state_func, &state_args)
-        .is_none()
-    {
-        return Err(CqlError::Invalid(format!(
-            "state function {}.{} not found with expected signature",
-            aggregate.keyspace, aggregate.state_func,
-        )));
-    }
-    if let Some(name) = &aggregate.final_func {
-        let final_function = schema
-            .get_function(
-                &aggregate.keyspace,
-                name,
-                std::slice::from_ref(&aggregate.state_type),
-            )
-            .ok_or_else(|| {
-                CqlError::Invalid(format!(
-                    "final function {}.{name} not found with expected signature",
-                    aggregate.keyspace,
-                ))
-            })?;
-        if final_function.return_type != aggregate.return_type {
-            return Err(CqlError::Invalid(format!(
-                "final function {}.{name} return type changed while waiting for schema writer",
-                aggregate.keyspace,
-            )));
-        }
-    }
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn route_create_aggregate(
     state: &SharedState,
@@ -17177,102 +17295,96 @@ async fn route_create_aggregate(
         .map(bridge::cql_type_display_name)
         .collect();
 
-    // Resolve state type
-    let resolved_state_type = bridge::resolve_type_name(&state_type, &ks, &state.schema)?;
-    let common_state_type = cql_type_to_common(&resolved_state_type);
+    let definition_keyspace = ks.clone();
+    let definition_name = name.clone();
+    let definition_args = arg_types.clone();
+    let resolve_metadata = move |schema: &Schema| -> Result<UserAggregateMetadata, CqlError> {
+        // Resolve state type
+        let resolved_state_type =
+            bridge::resolve_type_name(&state_type, &definition_keyspace, schema)?;
+        let common_state_type = cql_type_to_common(&resolved_state_type);
 
-    // Validate state function exists. The state function takes (state_type, arg_types...) as params.
-    let mut sfunc_arg_types = vec![common_state_type.clone()];
-    sfunc_arg_types.extend(arg_types.iter().cloned());
-    if state
-        .schema
-        .get_function(&ks, &state_func, &sfunc_arg_types)
-        .is_none()
-    {
-        return Err(CqlError::Invalid(format!(
-            "state function {ks}.{state_func} not found with expected signature"
-        )));
-    }
-
-    // Determine return type: final_func return type if present, otherwise state_type.
-    let return_type = if let Some(ref ff_name) = final_func {
-        // Final function takes a single arg of the state type
-        let ff_args = vec![common_state_type.clone()];
-        match state.schema.get_function(&ks, ff_name, &ff_args) {
-            Some(ff_meta) => ff_meta.return_type.clone(),
-            None => {
-                return Err(CqlError::Invalid(format!(
-                    "final function {ks}.{ff_name} not found with expected signature"
-                )));
-            }
-        }
-    } else {
-        common_state_type.clone()
-    };
-
-    // Resolve init_cond if present
-    let resolved_init_cond = if let Some(ref term) = init_cond {
-        let cql_state_type = &resolved_state_type;
-        Some(bridge::term_to_cql_value(term, cql_state_type)?)
-    } else {
-        None
-    };
-
-    // Convert the CqlValue (wire type) to common CqlValue
-    let common_init_cond = resolved_init_cond.map(|v| cql_value_to_common(&v));
-
-    // Check for existing aggregate
-    let existing = state.schema.get_aggregate(&ks, &name, &arg_types);
-    if existing.is_some() {
-        if or_replace {
-            // Will be replaced by the new creation
-        } else if if_not_exists {
-            return Ok(result::encode_schema_change_with_args(
-                "CREATED",
-                "AGGREGATE",
-                &[&ks, &name],
-                &agg_arg_type_names,
-            ));
-        } else {
+        // Validate state function exists. The state function takes (state_type, definition_args...) as params.
+        let mut sfunc_arg_types = vec![common_state_type.clone()];
+        sfunc_arg_types.extend(definition_args.iter().cloned());
+        if schema
+            .get_function(&definition_keyspace, &state_func, &sfunc_arg_types)
+            .is_none()
+        {
             return Err(CqlError::Invalid(format!(
-                "aggregate {ks}.{name} already exists"
+                "state function {definition_keyspace}.{state_func} not found with expected signature"
             )));
         }
-    }
 
-    let agg_meta = UserAggregateMetadata {
-        keyspace: ks.clone(),
-        name: name.clone(),
-        arg_types,
-        state_func,
-        state_type: common_state_type,
-        final_func,
-        init_cond: common_init_cond,
-        return_type,
-        wasm_body: None,
+        // Determine return type: final_func return type if present, otherwise state_type.
+        let return_type = if let Some(ref ff_name) = final_func {
+            // Final function takes a single arg of the state type
+            let ff_args = vec![common_state_type.clone()];
+            match schema.get_function(&definition_keyspace, ff_name, &ff_args) {
+                Some(ff_meta) => ff_meta.return_type.clone(),
+                None => {
+                    return Err(CqlError::Invalid(format!(
+                        "final function {definition_keyspace}.{ff_name} not found with expected signature"
+                    )));
+                }
+            }
+        } else {
+            common_state_type.clone()
+        };
+
+        // Resolve init_cond if present
+        let resolved_init_cond = if let Some(ref term) = init_cond {
+            let cql_state_type = &resolved_state_type;
+            Some(bridge::term_to_cql_value(term, cql_state_type)?)
+        } else {
+            None
+        };
+
+        // Convert the CqlValue (wire type) to common CqlValue
+        let common_init_cond = resolved_init_cond.map(|v| cql_value_to_common(&v));
+
+        let metadata = UserAggregateMetadata {
+            keyspace: definition_keyspace.clone(),
+            name: definition_name.clone(),
+            arg_types: definition_args,
+            state_func,
+            state_type: common_state_type,
+            final_func,
+            init_cond: common_init_cond,
+            return_type,
+            wasm_body: None,
+        };
+
+        Ok(metadata)
     };
 
     let ddl_guard = state.ddl_path.load();
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
+            let keyspace = ks.clone();
+            let aggregate_name = name.clone();
             run_direct_schema_change(state, ctx.auth, move |core, auth| {
                 core.schema.check_permission(
                     auth,
                     Permission::Alter,
-                    &Resource::Keyspace(agg_meta.keyspace.clone()),
+                    &Resource::Keyspace(keyspace.clone()),
                 )?;
-                if if_not_exists
-                    && core
-                        .schema
-                        .get_aggregate(&agg_meta.keyspace, &agg_meta.name, &agg_meta.arg_types)
-                        .is_some()
-                {
+                let existing = core
+                    .schema
+                    .get_aggregate(&keyspace, &aggregate_name, &arg_types)
+                    .is_some();
+                if existing && if_not_exists {
                     return Ok(());
                 }
-                validate_aggregate_dependencies(&core.schema, &agg_meta)?;
+                if existing && !or_replace {
+                    return Err(CqlError::Invalid(format!(
+                        "aggregate {keyspace}.{aggregate_name} already exists"
+                    )));
+                }
+                let aggregate = resolve_metadata(&core.schema)?;
                 ferrosa_cluster::ddl_path::apply_direct(
-                    &DdlOperation::CreateAggregate(agg_meta),
+                    &DdlOperation::CreateAggregate(aggregate),
                     &core.schema,
                     &core.engine,
                 )
@@ -17280,13 +17392,39 @@ async fn route_create_aggregate(
             })
             .await?;
         }
-        DdlPath::Pair(coordinator) => {
-            let op = DdlOperation::CreateAggregate(agg_meta);
-            coordinator.coordinate_ddl(op).await?;
-        }
-        DdlPath::Cluster { .. } => {
-            let op = DdlOperation::CreateAggregate(agg_meta);
-            ddl.execute(op).await.map_err(CqlError::from)?;
+        DdlPath::Pair(_) | DdlPath::Cluster { .. } => {
+            let agg_meta = resolve_metadata(&state.schema)?;
+            // Check for existing aggregate
+            let existing = state.schema.get_aggregate(&ks, &name, &arg_types);
+            if existing.is_some() {
+                if or_replace {
+                    // Will be replaced by the new creation
+                } else if if_not_exists {
+                    return Ok(result::encode_schema_change_with_args(
+                        "CREATED",
+                        "AGGREGATE",
+                        &[&ks, &name],
+                        &agg_arg_type_names,
+                    ));
+                } else {
+                    return Err(CqlError::Invalid(format!(
+                        "aggregate {ks}.{name} already exists"
+                    )));
+                }
+            }
+
+            match ddl {
+                DdlPath::Pair(coordinator) => {
+                    coordinator
+                        .coordinate_ddl(DdlOperation::CreateAggregate(agg_meta))
+                        .await?
+                }
+                DdlPath::Cluster { .. } => ddl
+                    .execute(DdlOperation::CreateAggregate(agg_meta))
+                    .await
+                    .map_err(CqlError::from)?,
+                _ => unreachable!("matched in outer match"),
+            }
         }
         DdlPath::Unavailable | DdlPath::Forming { .. } => {
             return Err(CqlError::ServerError(
@@ -17843,6 +17981,7 @@ fn term_has_udf_call(term: &Term) -> bool {
 
 #[cfg(test)]
 mod tests {
+    mod conditional_schema_tests;
     use super::*;
     use crate::virtual_tables::active_queries::ActiveQueriesTable;
     use crate::virtual_tables::connections::ConnectionsTable;
