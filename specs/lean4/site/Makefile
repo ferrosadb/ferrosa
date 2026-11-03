@@ -39,6 +39,22 @@ register:
 	$(MAKE) -C .. data
 	$(PYTHON) -I gen_register.py $(SPECS_JSON) FerrosaProduct
 
+# The PDF is the site, printed. `print.py` assembles the built pages in the book's order into one
+# document and Chromium prints that, so the paper cannot drift from the web: there is one rendering
+# of the corpus and both outputs come from it.
+#
+#   make pdf                 build/specs.pdf
+#   make pdf CHROME=chromium another browser
+PDF := .lake/build/specs.pdf
+CHROME ?= $(shell command -v google-chrome || command -v chromium || command -v chromium-browser)
+
+pdf: site
+	@test -n "$(CHROME)" || { echo "make pdf: no Chrome/Chromium on PATH; pass CHROME=..." >&2; exit 2; }
+	$(PYTHON) -I print.py $(OUT) .lake/build/specs-print.html
+	$(CHROME) --headless --disable-gpu --no-sandbox --no-pdf-header-footer \
+	  --print-to-pdf=$(abspath $(PDF)) file://$(abspath .lake/build/specs-print.html)
+	@echo "pdf: $(PDF)"
+
 # Fails when the committed register is not what the current corpus generates.
 check: register
 	git diff --exit-code -- FerrosaProduct/Register.lean FerrosaProduct/Register/

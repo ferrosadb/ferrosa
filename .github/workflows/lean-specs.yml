@@ -98,11 +98,11 @@ jobs:
 
       - name: Extract the book's data and run the drift checks
         working-directory: specs/lean4
-        run: lake exe docs build/specs.json
+        run: lake exe export build/specs.json
 
       - name: Check the source docs say what the book prints
         working-directory: specs/lean4
-        run: lake exe docs --check
+        run: lake exe export --check
 
       # The tie to the implementation. Every red claim above has a test of the same name in
       # red-ledger/tests/reds.rs; this step fails when the two sides have drifted, which is the
@@ -110,41 +110,29 @@ jobs:
       - name: Check the Rust red ledger matches this one
         run: python3 scripts/red_ledger.py --check
 
-      - name: Install tectonic
-        id: tectonic
-        run: |
-          curl -sSfL -o tectonic.tar.gz \
-            "https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic%400.15.0/tectonic-0.15.0-x86_64-unknown-linux-musl.tar.gz"
-          tar xzf tectonic.tar.gz
-          mkdir -p "$HOME/.local/bin"
-          mv tectonic "$HOME/.local/bin/"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      # Tectonic fetches its package bundle over the network on a cold runner. When that host is
-      # unreachable the job would fail on an outage that has nothing to do with the corpus, so the
-      # fallback is TeX Live from apt and the same .tex through latexmk. The document is
-      # engine-neutral by construction: unicode appears only inside `Statement` blocks, and the one
-      # system font it needs is installed above.
-      - name: Render the PDF
-        working-directory: specs/lean4
-        run: |
-          if python3 docs/render.py; then exit 0; fi
-          echo "::warning::tectonic path failed, falling back to TeX Live"
-          sudo apt-get install -y -qq texlive-xetex texlive-latex-extra latexmk
-          python3 docs/render.py
+      # The PDF is the site, printed: `print.py` assembles the pages Verso built, in the book's
+      # order, and Chromium prints that document. There is no second renderer to fall out of step,
+      # so the paper cannot state something the web pages do not. google-chrome is on the runner
+      # image; `make pdf` fails with a clear message if it is not.
+      - name: Print the site to PDF
+        working-directory: specs/lean4/site
+        run: make pdf
 
       - name: The PDF must exist and have pages
-        working-directory: specs/lean4
+        working-directory: specs/lean4/site
         run: |
-          test -s build/ferrosa-specs.pdf
-          ls -l build/ferrosa-specs.pdf
+          test -s .lake/build/specs.pdf
+          pages=$(pdfinfo .lake/build/specs.pdf | awk '/^Pages:/ {print $2}')
+          echo "pages: $pages"
+          test "$pages" -gt 100
+          ls -l .lake/build/specs.pdf
 
       # The pin every other workflow in this repo uses; the previous SHA does not resolve, which
       # failed the job before its first step ran.
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ferrosa-formal-specification
-          path: specs/lean4/build/ferrosa-specs.pdf
+          path: specs/lean4/site/.lake/build/specs.pdf
           if-no-files-found: error
           retention-days: 30
 
