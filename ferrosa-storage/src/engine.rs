@@ -12194,6 +12194,12 @@ impl StorageEngine {
         self.commit_log.restart_sync()
     }
 
+    /// Hold the commit log's real flush mutex for cross-crate progress tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_commit_log_flush_held_for_test(&self, hold: impl FnOnce()) {
+        self.commit_log.with_flush_held_for_test(hold);
+    }
+
     /// Make the commit-log sync thread panic at its next sync attempt.
     #[cfg(any(test, feature = "test-support"))]
     pub fn inject_commit_log_sync_panic(&self) {

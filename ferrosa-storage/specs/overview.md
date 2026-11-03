@@ -591,3 +591,7 @@ writer rejects empty clustered byte keys; an unsupported empty scalar posting
 on a clustered table is refused before a partition-wide fallback. Ordinary
 nonclustered rows with empty clustering remain supported. No accepted-write or
 internode wire contract was expanded.
+
+The `test-support` feature exposes a callback that holds the active commit-log
+segment's existing file mutex. Sibling-crate progress tests use it to exercise
+real flush/fsync contention with deterministic release and ordinary storage I/O.

@@ -42,7 +42,11 @@ impl RpcHandler for PairWriteForwardHandler {
         let result = match **self.role.load() {
             PairRole::Primary => {
                 // Forwarded write from secondary: apply + replicate back
-                if let Err(e) = self.coordinator.apply_locally(&mutation) {
+                if let Err(e) = self
+                    .coordinator
+                    .apply_locally_async(mutation.clone(), None)
+                    .await
+                {
                     tracing::error!("failed to apply forwarded write: {e}");
                     return None;
                 }
@@ -50,7 +54,7 @@ impl RpcHandler for PairWriteForwardHandler {
             }
             PairRole::Secondary => {
                 // Replicated write from primary: apply locally only
-                self.coordinator.apply_locally(&mutation)
+                self.coordinator.apply_locally_async(mutation, None).await
             }
         };
 
