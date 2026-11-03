@@ -56,6 +56,12 @@ class WorkflowPrintsTheSite(unittest.TestCase):
         self.assertIn("make pdf", self.workflow)
         self.assertIn("working-directory: specs/lean4/site", self.workflow)
 
+    def test_the_page_count_check_installs_its_tool(self):
+        # `pdfinfo` is poppler-utils and is not on the runner image. Asking for it without
+        # installing it fails the job at the assertion, which reads as a broken PDF.
+        if "pdfinfo" in self.workflow:
+            self.assertIn("poppler-utils", self.workflow)
+
     def test_the_artifact_is_the_printed_site(self):
         self.assertIn("specs/lean4/site/.lake/build/specs.pdf", self.workflow)
 

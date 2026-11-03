@@ -88,9 +88,13 @@ jobs:
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
 
       # DejaVu Sans Mono is the one font the document needs from the system: Lean's statements are
-      # full of ⟨⟩ ∀ ∃ ∧ ⊆, and it is the smallest face that covers them.
-      - name: Install fonts
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq fonts-dejavu-core
+      # full of ⟨⟩ ∀ ∃ ∧ ⊆, and it is the smallest face that covers them. poppler-utils is for the
+      # page-count check below: `pdfinfo` is not on the runner image, so asking for it without this
+      # fails the job at the assertion rather than at the print.
+      - name: Install fonts and pdfinfo
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-dejavu-core poppler-utils
 
       - name: Build the corpus
         working-directory: specs/lean4
@@ -121,10 +125,13 @@ jobs:
       - name: The PDF must exist and have pages
         working-directory: specs/lean4/site
         run: |
+          # Name the missing tool: without this, a bare `test "" -gt 100` reads as a broken
+          # document when the check itself is what is broken.
+          command -v pdfinfo >/dev/null || { echo "pdfinfo is missing; poppler-utils did not install"; exit 1; }
           test -s .lake/build/specs.pdf
           pages=$(pdfinfo .lake/build/specs.pdf | awk '/^Pages:/ {print $2}')
           echo "pages: $pages"
-          test "$pages" -gt 100
+          test "${pages:-0}" -gt 100
           ls -l .lake/build/specs.pdf
 
       # The pin every other workflow in this repo uses; the previous SHA does not resolve, which
