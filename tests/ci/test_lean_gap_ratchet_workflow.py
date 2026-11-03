@@ -95,6 +95,14 @@ class RatchetWorkflowTest(unittest.TestCase):
             self.assertEqual(args[:3], ["toolchain", "install", "nightly-2026-09-17"])
             self.assertIn("--component", args)
             self.assertIn("rustfmt", args)
+            # A different build failure must be reported, not retried after setup.
+            calls = root / "failed-bootstrap-calls"
+            bootstrap.write_text('#!/bin/sh\nprintf x >> "$FAILED_BOOTSTRAP_CALLS"\nexit 23\n')
+            failure = subprocess.run(["bash", "-euo", "pipefail", "-c", step["run"]],
+                                     cwd=root, env={**env, "FAILED_BOOTSTRAP_CALLS": str(calls)},
+                                     capture_output=True, text=True)
+            self.assertEqual(failure.returncode, 23, failure.stdout + failure.stderr)
+            self.assertEqual(calls.read_text(), "x", "failed bootstrap must execute exactly once")
 
     def test_update_only_runs_on_a_dispatch_that_asked_for_it(self):
         for step in self.job["steps"]:
