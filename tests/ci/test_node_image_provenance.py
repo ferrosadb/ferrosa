@@ -51,10 +51,31 @@ class NodeImageProvenance(unittest.TestCase):
         (node / 'source-revision.txt').write_text(self.head + '\n')
         tools = self.root / 'tools'; tools.mkdir()
         docker = tools / 'docker'
-        docker.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$DOCKER_LOG"\nif [ "$1" = build ]; then\n while [ "$#" -gt 0 ]; do\n  if [ "$1" = --iidfile ]; then shift; printf "sha256:fixture\\n" > "$1"; fi\n  shift\n done\nfi\n')
+        docker.write_text('''#!/bin/bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "$DOCKER_LOG"
+case "$1" in
+  login)
+    # Match --password-stdin: exiting before reading can SIGPIPE the producer.
+    cat > "$DOCKER_STDIN"
+    ;;
+  build)
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = --iidfile ]; then
+        shift
+        printf 'sha256:fixture\\n' > "$1"
+      fi
+      shift
+    done
+    ;;
+  save|tag|push) ;;
+  *) exit 64 ;;
+esac
+''')
         docker.chmod(0o755)
         self.env.update(PATH=str(tools) + os.pathsep + self.env['PATH'],
-                        DOCKER_LOG=str(self.root / 'docker.log'), SOURCE_REVISION=self.head,
+                         DOCKER_LOG=str(self.root / 'docker.log'),
+                         DOCKER_STDIN=str(self.root / 'docker-stdin'), SOURCE_REVISION=self.head,
                         GITHUB_OUTPUT=str(self.root / 'output'))
 
     def git(self, *args):
@@ -86,6 +107,8 @@ class NodeImageProvenance(unittest.TestCase):
         pushes = [line for line in log.splitlines() if line.startswith('push ')]
         self.assertEqual(pushes, ['push ghcr.io/fixture/ferrosa-test-node:' + self.head])
         self.assertIn('org.opencontainers.image.revision=' + self.head, log)
+        self.assertIn('tag sha256:fixture ghcr.io/fixture/ferrosa-test-node:' + self.head, log)
+        self.assertEqual((self.root / 'docker-stdin').read_text(), 'fixture-not-a-token\n')
 
     def test_mismatched_artifact_refuses_before_any_docker_operation(self):
         self.git('checkout', '-q', self.head)
