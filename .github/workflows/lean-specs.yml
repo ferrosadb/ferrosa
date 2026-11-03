@@ -256,7 +256,22 @@ jobs:
 
       - name: Build the pinned toolchain
         run: |
-          ./aeneas/bootstrap.sh
+          # charon's default make target runs `cargo fmt`, and its pinned toolchain
+          # (charon/rust-toolchain) asks for rustc-dev, llvm-tools, rust-src and miri but not
+          # rustfmt, so a clean runner dies with "'cargo-fmt' is not installed for the
+          # toolchain" before aeneas is built. bootstrap clones charon before it builds it,
+          # so on failure the channel is already on disk: add the missing component and retry
+          # once rather than hard-coding a nightly that charon's pin may bump.
+          if ! ./aeneas/bootstrap.sh; then
+            channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' aeneas/charon/rust-toolchain 2>/dev/null | head -1)
+            echo "bootstrap failed; adding rustfmt to ${channel:-the default toolchain} and retrying"
+            if [ -n "${channel:-}" ]; then
+              rustup component add rustfmt --toolchain "$channel"
+            else
+              rustup component add rustfmt
+            fi
+            ./aeneas/bootstrap.sh
+          fi
           test -x "$AENEAS"
           test -x "$CHARON"
 
