@@ -591,3 +591,13 @@ writer rejects empty clustered byte keys; an unsupported empty scalar posting
 on a clustered table is refused before a partition-wide fallback. Ordinary
 nonclustered rows with empty clustering remain supported. No accepted-write or
 internode wire contract was expanded.
+
+### Group drop recovery transactions
+
+`StorageEngine::unregister_tables` records the group's drop timestamps in one
+bounded ledger transaction, marks its pending sweeps in a second transaction,
+and clears those sweeps only after every physical removal succeeds. Timestamp
+updates retain the maximum existing value. A physical failure returns an error
+and retains the group's recovery intents; it does not acknowledge an unfinished
+drop. The caller serializes schema recreation with the shared lifecycle writer.
+Single-table unregister APIs retain their existing behavior and recovery format.

@@ -1825,3 +1825,13 @@ internode wire contract was expanded.
 Resumable range-scan supervisors await scheduler admission directly through
 `execute_scan`/`resume_scan`; carrier work remains on the bounded blocking pool.
 Producer panics are delivered as stream errors.
+
+### Group drop recovery transactions
+
+`StorageEngine::unregister_tables` records the group's drop timestamps in one
+bounded ledger transaction, marks its pending sweeps in a second transaction,
+and clears those sweeps only after every physical removal succeeds. Timestamp
+updates retain the maximum existing value. A physical failure returns an error
+and retains the group's recovery intents; it does not acknowledge an unfinished
+drop. The caller serializes schema recreation with the shared lifecycle writer.
+Single-table unregister APIs retain their existing behavior and recovery format.

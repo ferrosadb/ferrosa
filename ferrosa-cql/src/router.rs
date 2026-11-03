@@ -88,12 +88,36 @@ fn emit_schema_change(
         keyspace: keyspace.to_string(),
         name: name.map(|n| n.to_string()),
     };
+    publish_schema_change(&state.event_sender, &state.last_schema_event, event);
+}
+
+fn publish_schema_change(
+    event_sender: &tokio::sync::broadcast::Sender<CqlEvent>,
+    last_schema_event: &tokio::sync::watch::Sender<Option<(CqlEvent, std::time::Instant)>>,
+    event: CqlEvent,
+) {
     // best-effort broadcast; lagging receivers are dropped
-    let _ = state.event_sender.send(event.clone());
+    let _ = event_sender.send(event.clone());
     // Also retain in watch channel for late subscribers (control connection reconnect)
-    let _ = state
-        .last_schema_event
-        .send(Some((event, std::time::Instant::now())));
+    let _ = last_schema_event.send(Some((event, std::time::Instant::now())));
+}
+
+/// Run direct schema and physical mutations under the shared lifecycle fence.
+/// The blocking job owns the fence and completion effects if its requester exits.
+async fn run_direct_schema_change(
+    state: &SharedState,
+    auth: &AuthContext,
+    change: impl FnOnce(&SessionCore, &AuthContext) -> Result<(), CqlError> + Send + 'static,
+) -> Result<(), CqlError> {
+    let core = Arc::clone(&state.core);
+    let auth = auth.clone();
+    ferrosa_net::task_pool::TaskPool::current("cql-ddl")
+        .spawn_blocking(move || {
+            let _lifecycle = core.schema.lifecycle_write();
+            change(&core, &auth)
+        })
+        .await
+        .map_err(|error| CqlError::ServerError(format!("schema change task failed: {error}")))?
 }
 
 /// Default cooperative-yield cadence for long partition scans. Larger
@@ -11530,8 +11554,28 @@ async fn route_create_keyspace(
     let ddl = &**ddl_guard;
     let actually_created = match ddl {
         DdlPath::Direct { .. } => {
-            state.schema.create_keyspace(ks_meta, ctx.auth)?;
-            true
+            let event_sender = state.event_sender.clone();
+            let last_schema_event = state.last_schema_event.clone();
+            run_direct_schema_change(state, ctx.auth, move |core, auth| {
+                core.schema.create_keyspace(ks_meta.clone(), auth)?;
+                publish_schema_change(
+                    &event_sender,
+                    &last_schema_event,
+                    CqlEvent::SchemaChange {
+                        change_type: SchemaChangeType::Created,
+                        target: SchemaTarget::Keyspace,
+                        keyspace: ks_meta.name,
+                        name: None,
+                    },
+                );
+                Ok(())
+            })
+            .await?;
+            return Ok(result::encode_schema_change(
+                "CREATED",
+                "KEYSPACE",
+                &[&s.name],
+            ));
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::CreateKeyspace(ks_meta);
@@ -11601,7 +11645,12 @@ async fn route_alter_keyspace(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            state.schema.alter_keyspace(&s.name, updates, ctx.auth)?;
+            let name = s.name.clone();
+            run_direct_schema_change(state, ctx.auth, move |core, auth| {
+                core.schema.alter_keyspace(&name, updates, auth)?;
+                Ok(())
+            })
+            .await?;
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::AlterKeyspace {
@@ -11674,10 +11723,45 @@ async fn route_drop_keyspace(
                         .await?,
                 );
             }
-            state.schema.drop_keyspace(&s.name, ctx.auth)?;
-            for tid in &table_ids {
-                state.engine.unregister_table(tid)?;
-            }
+            let keyspace = s.name.clone();
+            let event_sender = state.event_sender.clone();
+            let last_schema_event = state.last_schema_event.clone();
+            run_direct_schema_change(state, ctx.auth, move |core, auth| {
+                // The admitted job owns the pauses and its completion event:
+                // cancelling the waiting client must not resume compactions
+                // halfway through physical cleanup or lose the notification.
+                let _pauses = pauses;
+                // Include tables admitted while the asynchronous pre-pause was
+                // draining. The lifecycle fence prevents further schema changes;
+                // group unregister also validates/owns pauses for this current set.
+                let table_ids: Vec<_> = core
+                    .schema
+                    .snapshot()
+                    .tables
+                    .keys()
+                    .filter(|(ks, _)| ks == &keyspace)
+                    .map(|(ks, table)| TableId::new(ks, table))
+                    .collect();
+                core.schema.drop_keyspace(&keyspace, auth)?;
+                core.engine.unregister_tables(&table_ids)?;
+                publish_schema_change(
+                    &event_sender,
+                    &last_schema_event,
+                    CqlEvent::SchemaChange {
+                        change_type: SchemaChangeType::Dropped,
+                        target: SchemaTarget::Keyspace,
+                        keyspace,
+                        name: None,
+                    },
+                );
+                Ok(())
+            })
+            .await?;
+            return Ok(result::encode_schema_change(
+                "DROPPED",
+                "KEYSPACE",
+                &[&s.name],
+            ));
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::DropKeyspace(s.name.clone());
@@ -11815,44 +11899,61 @@ async fn route_create_table(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            // Register with schema
-            state.schema.create_table(table_meta.clone(), ctx.auth)?;
+            let event_sender = state.event_sender.clone();
+            let last_schema_event = state.last_schema_event.clone();
+            run_direct_schema_change(state, ctx.auth, move |core, auth| {
+                // Register with schema
+                core.schema.create_table(table_meta.clone(), auth)?;
 
-            // Register with storage engine
-            let storage_schema = table_meta.to_storage_schema();
-            let tid = TableId::new(&table_meta.keyspace, &table_meta.name);
-            state.engine.register_table(storage_schema.clone())?;
+                // Register with storage engine
+                let storage_schema = table_meta.to_storage_schema();
+                let tid = TableId::new(&table_meta.keyspace, &table_meta.name);
+                core.engine.register_table(storage_schema.clone())?;
 
-            // Durability barrier: the table must be on disk BEFORE the client is
-            // told it was created. register_table_inner only puts the schema in
-            // memory, so without this the acknowledgement is a promise the node
-            // cannot keep: a kill between the ack and the next maintenance tick
-            // leaves no recoverable record of the table (t_0acc233d).
-            //
-            // `update_table_schema` is the existing barrier for this: it holds the
-            // table lock across a flush of the old schema, swaps in the new one,
-            // and persists the storage-side record. For a newly created table the
-            // memtable is empty, so the flush is a no-op in cost.
-            //
-            // Propagate the error rather than logging it: returning CREATED after
-            // a failed persist would be the same false promise in a different
-            // place.
-            state
-                .engine
-                .update_table_schema(&tid, storage_schema)
-                .map_err(|e| {
-                    CqlError::ServerError(format!(
-                        "CREATE TABLE durability barrier failed for {tid}: {e}"
-                    ))
-                })?;
+                // Durability barrier: the table must be on disk BEFORE the client is
+                // told it was created. register_table_inner only puts the schema in
+                // memory, so without this the acknowledgement is a promise the node
+                // cannot keep: a kill between the ack and the next maintenance tick
+                // leaves no recoverable record of the table (t_0acc233d).
+                //
+                // `update_table_schema` is the existing barrier for this: it holds the
+                // table lock across a flush of the old schema, swaps in the new one,
+                // and persists the storage-side record. For a newly created table the
+                // memtable is empty, so the flush is a no-op in cost.
+                //
+                // Propagate the error rather than logging it: returning CREATED after
+                // a failed persist would be the same false promise in a different
+                // place.
+                core.engine
+                    .update_table_schema(&tid, storage_schema)
+                    .map_err(|e| {
+                        CqlError::ServerError(format!(
+                            "CREATE TABLE durability barrier failed for {tid}: {e}"
+                        ))
+                    })?;
 
-            // The registry snapshot is persisted after the match, so that it also
-            // covers the cascade tables this arm creates below (they mutate the
-            // registry) and so the same guarantee holds for the Pair and Cluster
-            // paths. See the barrier after the match.
+                // Auto-create cascade tables if consolidation.cascade is enabled.
+                create_cascade_tables_if_needed(core, &table_meta)?;
 
-            // Auto-create cascade tables if consolidation.cascade is enabled.
-            create_cascade_tables_if_needed(state, &table_meta)?;
+                persist_registry_snapshot_before_ack(core, &table_meta.name)?;
+                publish_schema_change(
+                    &event_sender,
+                    &last_schema_event,
+                    CqlEvent::SchemaChange {
+                        change_type: SchemaChangeType::Created,
+                        target: SchemaTarget::Table,
+                        keyspace: table_meta.keyspace,
+                        name: Some(table_meta.name),
+                    },
+                );
+                Ok(())
+            })
+            .await?;
+            return Ok(result::encode_schema_change(
+                "CREATED",
+                "TABLE",
+                &[ks, &s.name],
+            ));
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::CreateTable(Box::new(table_meta.clone()));
@@ -11949,10 +12050,10 @@ async fn route_create_table(
 ///
 /// Fails loudly: the caller must not acknowledge a table it cannot recover.
 fn persist_registry_snapshot_before_ack(
-    state: &SharedState,
+    state: &SessionCore,
     table_name: &str,
 ) -> Result<(), CqlError> {
-    let snapshot = state.core.schema.snapshot();
+    let snapshot = state.schema.snapshot();
     ferrosa_storage::schema_snapshot::SchemaSnapshotStore::new(state.engine.data_dir())
         .persist(&snapshot)
         .map_err(|e| {
@@ -11966,7 +12067,7 @@ fn persist_registry_snapshot_before_ack(
 /// If the table has `consolidation.cascade = true` in its extensions,
 /// auto-create the downstream cascade tables (e.g., sensor_5m, sensor_15m, sensor_1h).
 fn create_cascade_tables_if_needed(
-    state: &SharedState,
+    state: &SessionCore,
     source: &TableMetadata,
 ) -> Result<(), CqlError> {
     use ferrosa_storage::timeseries::config::{generate_cascade_chain, ConsolidationConfig};
@@ -33725,6 +33826,557 @@ mod tests {
     }
 
     // ── ALTER KEYSPACE routing ───────────────────────────────────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drop_keyspace_preserves_async_progress_while_journal_is_locked() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (state, dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        for cql in [
+            "CREATE KEYSPACE drop_progress WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE drop_progress.items (id int PRIMARY KEY, value text)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+        let table_dir = dir.path().join("sstables/drop_progress.items");
+        std::fs::create_dir_all(&table_dir).unwrap();
+        std::fs::write(table_dir.join("owned-marker"), b"cleanup must complete").unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.path().join(".dropped-tables.json.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        let escaped = Arc::new(AtomicBool::new(false));
+        let watchdog_escaped = escaped.clone();
+        let (release, signal) = std::sync::mpsc::channel();
+        let watchdog = std::thread::spawn(move || {
+            // Safety escape for the broken implementation, not a latency target.
+            let forced = signal
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_err();
+            watchdog_escaped.store(forced, Ordering::SeqCst);
+            lock.unlock().unwrap();
+        });
+        let mut events = state.event_sender.subscribe();
+        let dropping = route(
+            &state,
+            &ctx,
+            crate::parser::parse("DROP KEYSPACE drop_progress").unwrap(),
+        );
+        tokio::pin!(dropping);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut dropping => {
+                    assert!(
+                        !escaped.load(Ordering::SeqCst),
+                        "DROP blocked the async runtime until the filesystem-lock watchdog escaped"
+                    );
+                    result.expect("DROP failed before reaching its locked journal");
+                    panic!("DROP completed while its durable journal was locked");
+                }
+                _ = tokio::task::yield_now() => {}
+            }
+            if !state
+                .schema
+                .snapshot()
+                .keyspaces
+                .contains_key("drop_progress")
+            {
+                // The schema mutation proves we passed any earlier compaction
+                // awaits; the biased poll above still found DROP pending.
+                assert!(!escaped.load(Ordering::SeqCst));
+                assert!(matches!(
+                    events.try_recv(),
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                ));
+                break;
+            }
+        }
+        release.send(()).unwrap();
+        dropping.await.unwrap();
+        watchdog.join().unwrap();
+        assert!(!escaped.load(Ordering::SeqCst));
+        assert!(!table_dir.exists());
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            CqlEvent::SchemaChange {
+                change_type: SchemaChangeType::Dropped,
+                target: SchemaTarget::Keyspace,
+                keyspace,
+                ..
+            } if keyspace == "drop_progress"
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_drop_keeps_physical_cleanup_and_completion_notifications() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (state, dir) = setup();
+        let state = Arc::new(state);
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        for cql in [
+            "CREATE KEYSPACE drop_cancel WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE drop_cancel.items (id int PRIMARY KEY)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+        let table_dir = dir.path().join("sstables/drop_cancel.items");
+        std::fs::create_dir_all(&table_dir).unwrap();
+        std::fs::write(table_dir.join("owned-marker"), b"do not acknowledge early").unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.path().join(".dropped-tables.json.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        let escaped = Arc::new(AtomicBool::new(false));
+        let watchdog_escaped = escaped.clone();
+        let (release, signal) = std::sync::mpsc::channel();
+        let watchdog = std::thread::spawn(move || {
+            let forced = signal
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_err();
+            watchdog_escaped.store(forced, Ordering::SeqCst);
+            lock.unlock().unwrap();
+        });
+        let mut events = state.event_sender.subscribe();
+        let mut last_event = state.last_schema_event.subscribe();
+        last_event.borrow_and_update();
+        let task_state = state.clone();
+        let dropping = tokio::spawn(async move {
+            let ctx = RequestContext {
+                auth: &dev_auth(),
+                current_keyspace: &None,
+                consistency: ConsistencyLevel::One,
+                serial_consistency: None,
+                paging: crate::paging::PagingParams::default(),
+                client_address: String::new(),
+                protocol_version: 4,
+            };
+            route(
+                &task_state,
+                &ctx,
+                crate::parser::parse("DROP KEYSPACE drop_cancel").unwrap(),
+            )
+            .await
+        });
+        while state
+            .schema
+            .snapshot()
+            .keyspaces
+            .contains_key("drop_cancel")
+        {
+            assert!(!escaped.load(Ordering::SeqCst));
+            tokio::task::yield_now().await;
+        }
+        assert!(!dropping.is_finished());
+        dropping.abort();
+        match dropping.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("the request completed before cancellation"),
+        }
+        assert!(table_dir.exists(), "physical cleanup must still be blocked");
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        release.send(()).unwrap();
+        // Deadlock escape only: cancellation must not erase the job's event.
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await
+            .expect("cancelled requester lost the cleanup completion event")
+            .unwrap();
+        assert!(matches!(
+            event,
+            CqlEvent::SchemaChange {
+                change_type: SchemaChangeType::Dropped,
+                target: SchemaTarget::Keyspace,
+                keyspace,
+                ..
+            } if keyspace == "drop_cancel"
+        ));
+        last_event.changed().await.unwrap();
+        assert!(last_event.borrow().is_some());
+        watchdog.join().unwrap();
+        assert!(!escaped.load(Ordering::SeqCst));
+        assert!(!table_dir.exists());
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recreate_waits_for_previous_drop_physical_cleanup() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (state, dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        for cql in [
+            "CREATE KEYSPACE drop_recreate WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE drop_recreate.items (id int PRIMARY KEY)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.path().join(".dropped-tables.json.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        let escaped = Arc::new(AtomicBool::new(false));
+        let watchdog_escaped = escaped.clone();
+        let (release, signal) = std::sync::mpsc::channel();
+        let watchdog = std::thread::spawn(move || {
+            let forced = signal
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_err();
+            watchdog_escaped.store(forced, Ordering::SeqCst);
+            lock.unlock().unwrap();
+        });
+        let dropping = route(
+            &state,
+            &ctx,
+            crate::parser::parse("DROP KEYSPACE drop_recreate").unwrap(),
+        );
+        tokio::pin!(dropping);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut dropping => panic!("DROP completed before the owned journal lock was released"),
+                _ = tokio::task::yield_now() => {}
+            }
+            if !state
+                .schema
+                .snapshot()
+                .keyspaces
+                .contains_key("drop_recreate")
+            {
+                break;
+            }
+            assert!(!escaped.load(Ordering::SeqCst));
+        }
+        let creating = async {
+            for cql in [
+                "CREATE KEYSPACE drop_recreate WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+                "CREATE TABLE drop_recreate.items (id int PRIMARY KEY)",
+                "INSERT INTO drop_recreate.items (id) VALUES (99)",
+            ] {
+                route(&state, &ctx, crate::parser::parse(cql).unwrap()).await?;
+            }
+            Ok::<(), CqlError>(())
+        };
+        tokio::pin!(creating);
+        let mut early_result = None;
+        tokio::select! {
+            biased;
+            result = &mut creating => early_result = Some(result),
+            _ = std::future::ready(()) => {}
+        }
+        let published_before_cleanup = state
+            .schema
+            .snapshot()
+            .keyspaces
+            .contains_key("drop_recreate");
+        let escaped_before_release = escaped.load(Ordering::SeqCst);
+        let _ = release.send(());
+        dropping.await.unwrap();
+        let created = match early_result {
+            Some(result) => result,
+            None => creating.await,
+        };
+        watchdog.join().unwrap();
+        assert!(
+            !escaped_before_release,
+            "a concurrent CREATE blocked the request runtime on the DROP journal"
+        );
+        assert!(
+            !published_before_cleanup,
+            "CREATE published a new keyspace incarnation before the old physical cleanup completed"
+        );
+        created.unwrap();
+        let selected = route(
+            &state,
+            &ctx,
+            crate::parser::parse("SELECT id FROM drop_recreate.items WHERE id = 99").unwrap(),
+        )
+        .await
+        .unwrap();
+        let RouteResult::Result(body) = selected else {
+            panic!("SELECT must return rows");
+        };
+        assert_eq!(extract_row_count(&body), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drop_keyspace_records_all_intents_before_physical_cleanup() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (state, dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        for cql in [
+            "CREATE KEYSPACE drop_recreate WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE drop_recreate.items0 (id int PRIMARY KEY)",
+            "CREATE TABLE drop_recreate.items1 (id int PRIMARY KEY)",
+            "CREATE TABLE drop_recreate.items2 (id int PRIMARY KEY)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap()).await.unwrap();
+        }
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.path().join(".pending-table-sweeps.json.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        let escaped = Arc::new(AtomicBool::new(false));
+        let watchdog_escaped = escaped.clone();
+        let (release, signal) = std::sync::mpsc::channel();
+        let watchdog = std::thread::spawn(move || {
+            let forced = signal
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_err();
+            watchdog_escaped.store(forced, Ordering::SeqCst);
+            lock.unlock().unwrap();
+        });
+        let dropping = route(
+            &state,
+            &ctx,
+            crate::parser::parse("DROP KEYSPACE drop_recreate").unwrap(),
+        );
+        tokio::pin!(dropping);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut dropping => panic!("DROP completed before the owned journal lock was released"),
+                _ = tokio::task::yield_now() => {}
+            }
+            if !ferrosa_storage::table_drops::load(dir.path())
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            assert!(!escaped.load(Ordering::SeqCst));
+        }
+        let ledger = ferrosa_storage::table_drops::load(dir.path()).unwrap();
+        let intent_count = (0..3)
+            .filter(|i| ledger.contains_key(&format!("drop_recreate.items{i}")))
+            .count();
+        let remaining_directories = (0..3)
+            .filter(|i| {
+                dir.path()
+                    .join("sstables")
+                    .join(format!("drop_recreate.items{i}"))
+                    .exists()
+            })
+            .count();
+        let _ = release.send(());
+        dropping.await.unwrap();
+        watchdog.join().unwrap();
+        assert!(!escaped.load(Ordering::SeqCst), "journal watchdog escaped");
+        assert_eq!(
+            remaining_directories, 3,
+            "physical cleanup started before group pending intent was durable"
+        );
+        assert_eq!(
+            intent_count, 3,
+            "DROP KEYSPACE must durably record every table before physical cleanup starts"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_keyspace_physical_failure_retains_group_recovery_intents() {
+        let (state, dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        for cql in [
+            "CREATE KEYSPACE drop_recreate WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE drop_recreate.items0 (id int PRIMARY KEY)",
+            "CREATE TABLE drop_recreate.items1 (id int PRIMARY KEY)",
+            "CREATE TABLE drop_recreate.items2 (id int PRIMARY KEY)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap()).await.unwrap();
+        }
+        let physical = dir.path().join("sstables/drop_recreate.items1");
+        std::fs::remove_dir_all(&physical).unwrap();
+        std::fs::write(&physical, b"owned physical refusal fixture").unwrap();
+        let mut events = state.event_sender.subscribe();
+        let dropped = route(
+            &state,
+            &ctx,
+            crate::parser::parse("DROP KEYSPACE drop_recreate").unwrap(),
+        )
+        .await;
+        assert!(
+            dropped.is_err(),
+            "physical failure must refuse acknowledgement"
+        );
+        let pending = ferrosa_storage::table_drops::load_pending_sweeps(dir.path()).unwrap();
+        for index in 0..3 {
+            assert!(
+                pending.contains(&format!("drop_recreate.items{index}")),
+                "physical refusal lost a group recovery intent"
+            );
+        }
+        assert!(physical.is_file());
+        assert!(
+            events.try_recv().is_err(),
+            "failed physical drop published completion"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn alter_keyspace_waits_without_blocking_drop_runtime() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (state, dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        for cql in [
+            "CREATE KEYSPACE drop_recreate WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE drop_recreate.items (id int PRIMARY KEY)",
+            "CREATE KEYSPACE alter_survivor WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.path().join(".dropped-tables.json.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        let escaped = Arc::new(AtomicBool::new(false));
+        let watchdog_escaped = escaped.clone();
+        let (release, signal) = std::sync::mpsc::channel();
+        let watchdog = std::thread::spawn(move || {
+            let forced = signal
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_err();
+            watchdog_escaped.store(forced, Ordering::SeqCst);
+            lock.unlock().unwrap();
+        });
+        let dropping = route(
+            &state,
+            &ctx,
+            crate::parser::parse("DROP KEYSPACE drop_recreate").unwrap(),
+        );
+        tokio::pin!(dropping);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut dropping => panic!("DROP completed before the owned journal lock was released"),
+                _ = tokio::task::yield_now() => {}
+            }
+            if !state
+                .schema
+                .snapshot()
+                .keyspaces
+                .contains_key("drop_recreate")
+            {
+                break;
+            }
+            assert!(!escaped.load(Ordering::SeqCst));
+        }
+        let creating = async {
+            route(
+                &state,
+                &ctx,
+                crate::parser::parse("ALTER KEYSPACE alter_survivor WITH durable_writes = false")
+                    .unwrap(),
+            )
+            .await?;
+            Ok::<(), CqlError>(())
+        };
+        tokio::pin!(creating);
+        let mut early_result = None;
+        tokio::select! {
+            biased;
+            result = &mut creating => early_result = Some(result),
+            _ = std::future::ready(()) => {}
+        }
+        let escaped_before_release = escaped.load(Ordering::SeqCst);
+        let _ = release.send(());
+        dropping.await.unwrap();
+        let created = match early_result {
+            Some(result) => result,
+            None => creating.await,
+        };
+        watchdog.join().unwrap();
+        assert!(
+            !escaped_before_release,
+            "ALTER KEYSPACE blocked the async runtime waiting for the DROP lifecycle writer"
+        );
+        created.unwrap();
+        assert!(!state.schema.snapshot().keyspaces["alter_survivor"].durable_writes);
+    }
 
     #[tokio::test]
     async fn alter_keyspace_changes_durable_writes() {
