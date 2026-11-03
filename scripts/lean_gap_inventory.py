@@ -7,6 +7,10 @@ code), so a change in a dependency invalidates the dependents. Measuring in DAG 
 each row on a fingerprint of (crate sources + transitive workspace dependency sources + toolchain)
 means a re-run only touches what actually changed.
 
+Correctness: identity uses the same project/toolchain context as elaboration.
+Last revised: 2026-11-03
+Last changed: Probe Lean in the built backend project without assuming a global elan default.
+
 Per crate it measures the *whole* crate. A module sample is opt-in (`--sample`), because a sample is
 not coverage: `ferrosa-jsonb`'s `reader` module elaborated with no Lean errors while the whole crate
 dies inside aeneas in the region pass, so a green sample can hide a red crate. There is no time
@@ -115,7 +119,8 @@ def dag(crates: dict[str, dict]) -> list[str]:
     return order
 
 
-def tool_identity(cmd: list[str], what: str, budget: int = 300) -> str:
+def tool_identity(cmd: list[str], what: str, budget: int = 300,
+                  *, cwd: str | Path | None = None) -> str:
     """One line naming `what`, or a loud failure.
 
     A toolchain that cannot be named is a measurement that cannot be reproduced. It used to be
@@ -123,7 +128,8 @@ def tool_identity(cmd: list[str], what: str, budget: int = 300) -> str:
     dropped the whole cache -- so a host that was merely busy read as a new toolchain.
     """
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=budget, cwd=REPO)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=budget,
+                           cwd=REPO if cwd is None else cwd)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise SystemExit(f"lean_gap_inventory: cannot identify {what}: {exc} "
                          f"({cmd[0]}); point the environment at the toolchain and re-run")
@@ -138,8 +144,9 @@ def toolchain() -> dict:
     """Identity of the toolchain a measurement is valid under.
 
     `lean` is asked through `lake env lean` first, because that is what elaborates a measurement,
-    then through the elan shim, which needs no package directory and still answers while the host
-    is busy extracting. A timeout in the first form says the host was loaded, not that Lean moved.
+    then through the elan shim. Both probes run in the built backend project:
+    its lean-toolchain selects the compiler even when elan has no global default.
+    A timeout in the first form says the host was loaded, not that Lean moved.
 
     charon and aeneas are identified by the *sources* their binaries were built from, read from
     the checkouts named by CHARON_SRC and AENEAS_SRC. A version string cannot do this job for
@@ -163,7 +170,7 @@ def toolchain() -> dict:
     lean = None
     for cmd in (["lake", "env", "lean", "--version"], ["lean", "--version"]):
         try:
-            lean = tool_identity(cmd, "lean")
+            lean = tool_identity(cmd, "lean", cwd=LEAN_PKG)
             break
         except SystemExit:
             continue

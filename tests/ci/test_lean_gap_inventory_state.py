@@ -5,9 +5,17 @@ reason is not a slowdown -- it is the OOM this suite has already taken the host 
 protect it: an `unknown` toolchain field is a resolution failure rather than a different compiler,
 and a row keeps its measurement across an identity change only when that crate's own sources
 provably did not move.
+
+Correctness: project-selected Lean identity and cached measurements stay reproducible.
+Last revised: 2026-11-03
+Last changed: Exercise Lean project selection without a global default through subprocesses.
 """
 
 import importlib.util
+import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -194,6 +202,95 @@ class ModuleSweepProgress(unittest.TestCase):
         prior = {"alpha": {"stage": "oom"}}
         inv.measure_modules("ferrosa-demo", self.crates, {"stage": "oom"}, prior=prior)
         self.assertEqual(self.calls, ["ferrosa_demo::alpha::*", "ferrosa_demo::beta::*"])
+
+
+class ProjectToolchainIdentity(unittest.TestCase):
+    """Portable elan-like entrypoints select the project manifest, never a global default."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="lean-identity-")
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.repo = root / "repo"
+        self.backend = root / "backend"
+        tools = root / "bin"
+        for directory in [self.repo, self.backend, tools]:
+            directory.mkdir()
+        self.calls = root / "calls.jsonl"
+        (self.backend / "lean-toolchain").write_text("4.35.0\n")
+        shim = "#!" + sys.executable + "\n" + r"""
+import json
+import os
+from pathlib import Path
+import sys
+
+name = Path(sys.argv[0]).name
+with Path(os.environ["IDENTITY_CALLS"]).open("a") as output:
+    output.write(json.dumps({"tool": name, "cwd": str(Path.cwd())}) + "\n")
+if name == "lake" and os.environ.get("IDENTITY_LAKE_FAIL") == "1":
+    sys.exit(3)
+manifest = Path.cwd() / "lean-toolchain"
+if not manifest.is_file():
+    sys.stderr.write("no default toolchain configured\n")
+    sys.exit(1)
+print("Lean (version " + manifest.read_text().strip() + ")")
+"""
+        for name in ["lake", "lean"]:
+            path = tools / name
+            path.write_text(shim)
+            path.chmod(0o755)
+        self.inv = load_inventory()
+        patches = [
+            mock.patch.object(self.inv, "REPO", self.repo),
+            mock.patch.object(self.inv, "LEAN_PKG", str(self.backend)),
+            mock.patch.object(self.inv, "git_identity", side_effect=lambda _, what: what + "-source"),
+            mock.patch.dict(os.environ, {
+                "PATH": str(tools) + os.pathsep + os.environ.get("PATH", ""),
+                "ELAN_HOME": str(root / "empty-elan-home"),
+                "IDENTITY_CALLS": str(self.calls),
+                "IDENTITY_LAKE_FAIL": "0",
+            }),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        # Establish that the same fixture executable identifies the backend
+        # before testing whether production selects its context correctly.
+        control = subprocess.run([str(tools / "lake"), "env", "lean", "--version"],
+                                 cwd=self.backend, capture_output=True, text=True, check=True)
+        self.assertEqual(control.stdout.strip(), "Lean (version 4.35.0)")
+        self.calls.unlink()
+
+    def observed(self):
+        return [json.loads(line) for line in self.calls.read_text().splitlines()]
+
+    def test_backend_project_resolves_without_a_global_default(self):
+        self.assertFalse((self.repo / "lean-toolchain").exists())
+        self.assertEqual(self.inv.toolchain()["lean"], "Lean (version 4.35.0)")
+        self.assertEqual(self.observed(), [{"tool": "lake", "cwd": str(self.backend)}])
+
+    def test_repository_toolchain_does_not_override_the_built_backend(self):
+        (self.repo / "lean-toolchain").write_text("4.36.0\n")
+        self.assertEqual(self.inv.toolchain()["lean"], "Lean (version 4.35.0)")
+        self.assertEqual(self.observed(), [{"tool": "lake", "cwd": str(self.backend)}])
+
+    def test_direct_lean_fallback_keeps_the_backend_context(self):
+        os.environ["IDENTITY_LAKE_FAIL"] = "1"
+        self.assertEqual(self.inv.toolchain()["lean"], "Lean (version 4.35.0)")
+        self.assertEqual(self.observed(), [
+            {"tool": "lake", "cwd": str(self.backend)},
+            {"tool": "lean", "cwd": str(self.backend)},
+        ])
+
+    def test_unidentifiable_backend_fails_once_per_supported_entrypoint(self):
+        (self.backend / "lean-toolchain").unlink()
+        (self.repo / "lean-toolchain").write_text("4.36.0\n")
+        with self.assertRaises(SystemExit):
+            self.inv.toolchain()
+        self.assertEqual(self.observed(), [
+            {"tool": "lake", "cwd": str(self.backend)},
+            {"tool": "lean", "cwd": str(self.backend)},
+        ])
 
 
 class FailLoudRules(unittest.TestCase):

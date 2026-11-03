@@ -84,6 +84,9 @@ jobs:
         run: python3 -m unittest -q tests/ci/test_check_no_new_waivers.py
       - name: Check the Lean linkage report reads Broken rows by field name
         run: python3 -m unittest -q tests/ci/test_lean_linkage_rows.py
+
+      - name: Check Lean inventory uses the backend project toolchain
+        run: python3 -m unittest -q tests.ci.test_lean_gap_inventory_state
       - name: Check the red ledger is data, not ignored tests
         run: python3 -m unittest -q tests/ci/test_red_ledger_generator.py
       - name: Check the theorem register tells counterexamples from reds
