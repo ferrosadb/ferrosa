@@ -142,6 +142,16 @@ source of truth. Caveat (FMEA): it is disarmed by the default config and repairs
 at hardcoded RF=1, so the fallback is currently weaker than the invariant it
 guards.
 
+Logical endpoint bytes are separate from the vertex's complete physical
+partition/clustering key. Deleting a clustered vertex tombstones that exact row
+and the exact physical rows of incident edges. An adjacency tuple can represent
+several physical edge rows, including rows in separate tenant partitions; it
+must stay live while any of them survives. For non-point-checkable legacy edge
+layouts, reconciliation streams support for the current partition's deletion
+candidates across physical partitions before removing the index entries. It
+does not retain a table-sized support set, and read failure cannot authorize a
+candidate deletion.
+
 
 ## Same-engine write ownership
 

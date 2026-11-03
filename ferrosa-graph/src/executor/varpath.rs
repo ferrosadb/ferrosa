@@ -4,6 +4,8 @@
 //! from an anchor through repeated hops within the specified min/max range.
 //! Uses a visited set for cycle detection (FMEA F2) and a total vertex
 //! budget for DoS protection (threat T13, FMEA F3).
+//! Last revised: 2026-11-03
+//! Last changed: Reject ambiguous logical anchor identity instead of using a physical partition key.
 
 use crate::executor::io::GraphWrite;
 
@@ -157,10 +159,12 @@ pub async fn execute_var_length(
                     }
                 }
                 if passes {
-                    seed_keys.push(
-                        graph_vertex_lookup_key(meta, partition, row, &anchor.props)
-                            .unwrap_or_else(|| partition.key.clone()),
-                    );
+                    seed_keys.push(graph_vertex_lookup_key(
+                        meta,
+                        partition,
+                        row,
+                        &anchor.props,
+                    )?);
                 }
             }
         } else {

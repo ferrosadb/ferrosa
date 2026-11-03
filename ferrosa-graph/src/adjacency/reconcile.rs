@@ -3,6 +3,8 @@
 //! Safety net for dropped observer mutations (backpressure) and crash recovery
 //! gaps. Runs as a tokio task, yielding between partition scans to avoid
 //! competing with query workloads.
+//! Last revised: 2026-11-03
+//! Last changed: Verify shared legacy index support across physical partitions before deletion.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,7 +20,7 @@ use ferrosa_schema::Schema;
 use ferrosa_sstable::types::DeletionTime;
 use ferrosa_storage::{Mutation, TableId};
 
-use crate::adjacency::observer::derive_adjacency_mutations;
+use crate::adjacency::observer::{derive_adjacency_mutations, derive_adjacency_row_mutations};
 use crate::adjacency::schema::{adjacency_keyspace_name, row_is_deleted, DIRECTION_OUT};
 use crate::executor::expand::extract_neighbor_id;
 
@@ -321,7 +323,25 @@ pub async fn reconcile_once_with(
             };
             edge_partitions_scanned += 1;
 
-            let expected = expected_entries(schema, edge_tid, &partition, &mut metrics);
+            let mut expected = expected_entries(schema, edge_tid, &partition, &mut metrics);
+            if !edge_keyed_by_source_and_target(edge_meta) {
+                if let Err(error) = complete_shared_entry_support(
+                    schema,
+                    write_path,
+                    edge_tid,
+                    &edge_strategy,
+                    &mut expected,
+                )
+                .await
+                {
+                    // An incomplete scan cannot prove any candidate orphaned.
+                    // Keep positively observed live support and defer deletions.
+                    expected.retain(|_, entry| entry.live_at.is_some());
+                    metrics.errors += 1;
+                    tracing::warn!(table = %edge_table_fqn, %error,
+                        "adjacency reconcile: shared-entry support scan failed; keeping unresolved entries");
+                }
+            }
             for (_, entry) in expected {
                 let freed = in_flight
                     .start(reconcile_entry(
@@ -582,6 +602,66 @@ fn edge_written_at(row: &ferrosa_sstable::types::Row) -> Option<i64> {
 /// `partition` — so a composite-key edge table is keyed by its `graph.source`
 /// and `graph.target` columns, not by its raw key bytes — keyed by
 /// (vertex key, clustering).
+/// One existing partition's candidate map is the memory bound. For legacy
+/// layouts, the same index tuple can have live support in another physical
+/// partition. Stream once for this candidate group before choosing deletions;
+/// stop as soon as every candidate has positive live support. The fallback is
+/// O(table rows * partitions containing unresolved deleted candidates), without
+/// a table-sized set. Point-checkable endpoint layouts never take this path.
+async fn complete_shared_entry_support(
+    schema: &Schema,
+    write_path: &WritePath,
+    edge_tid: &TableId,
+    strategy: &ferrosa_cluster::ring::strategy::ReplicationStrategy,
+    expected: &mut BTreeMap<(Vec<u8>, Vec<u8>), ExpectedEntry>,
+) -> std::result::Result<(), String> {
+    let mut remaining = expected
+        .values()
+        .filter(|entry| entry.live_at.is_none() && entry.deleted_at.is_some())
+        .count();
+    if remaining == 0 {
+        return Ok(());
+    }
+    let mut partitions = write_path
+        .range_read_stream_all_with(edge_tid, 0, SCAN_CONSISTENCY, strategy)
+        .await
+        .map_err(|error| error.to_string())?;
+    while let Some(partition) = partitions.next().await {
+        let partition = partition.map_err(|error| error.to_string())?;
+        for row in &partition.rows {
+            if row_is_deleted(row) {
+                continue;
+            }
+            let Some(written_at) = edge_written_at(row) else {
+                continue;
+            };
+            for derived in
+                derive_adjacency_row_mutations(schema, edge_tid, &partition.key, row, written_at)
+            {
+                for row in derived.rows {
+                    let Some(entry) =
+                        expected.get_mut(&(derived.key.key.as_bytes().to_vec(), row.clustering))
+                    else {
+                        continue;
+                    };
+                    if entry.live_at.is_none() && entry.deleted_at.is_some() {
+                        remaining -= 1;
+                    }
+                    entry.live_at = entry.live_at.max(Some(written_at));
+                    if entry.edge_table_cell.is_none() {
+                        entry.edge_table_cell =
+                            row.cells.first().and_then(|(_, cell)| cell.value.clone());
+                    }
+                }
+            }
+        }
+        if remaining == 0 {
+            break;
+        }
+    }
+    Ok(())
+}
+
 fn expected_entries(
     schema: &Schema,
     edge_tid: &TableId,

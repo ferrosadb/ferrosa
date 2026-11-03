@@ -2,6 +2,8 @@
 //!
 //! Watches all tables with `extensions["graph.type"] == "edge"`. On each mutation,
 //! extracts source and target key bytes and generates OUT and IN adjacency entries.
+//! Last revised: 2026-11-03
+//! Last changed: Share borrowed-row derivation with scoped deletion and reconciliation.
 
 use std::sync::Arc;
 
@@ -75,6 +77,45 @@ pub(crate) fn derive_adjacency_into(
     mutation: &Mutation,
     out: &mut Vec<Mutation>,
 ) {
+    derive_adjacency_rows_into(
+        schema,
+        table,
+        &mutation.key,
+        &mutation.rows,
+        mutation.timestamp,
+        out,
+    );
+}
+
+/// Derive index entries from one borrowed physical row without copying its
+/// unrelated cell payloads into a temporary edge mutation.
+pub(crate) fn derive_adjacency_row_mutations(
+    schema: &Schema,
+    table: &TableId,
+    key: &ferrosa_common::DecoratedKey,
+    row: &ferrosa_sstable::types::Row,
+    timestamp: i64,
+) -> Vec<Mutation> {
+    let mut out = Vec::new();
+    derive_adjacency_rows_into(
+        schema,
+        table,
+        key,
+        std::slice::from_ref(row),
+        timestamp,
+        &mut out,
+    );
+    out
+}
+
+fn derive_adjacency_rows_into(
+    schema: &Schema,
+    table: &TableId,
+    partition_key: &ferrosa_common::DecoratedKey,
+    rows: &[ferrosa_sstable::types::Row],
+    timestamp: i64,
+    out: &mut Vec<Mutation>,
+) {
     let snap = schema.schema_ref().load();
     let key = (table.keyspace.clone(), table.table.clone());
     let meta = match snap.tables.get(&key) {
@@ -109,12 +150,16 @@ pub(crate) fn derive_adjacency_into(
     let edge_table = format!("{}.{}", table.keyspace, table.table);
 
     // Two entries per live edge row, so reserve exactly once instead of growing.
-    out.reserve(mutation.rows.len() * 2);
-    for row in &mutation.rows {
-        let Some(source_id) = extract_graph_column_bytes(meta, mutation, row, source_col) else {
+    out.reserve(rows.len() * 2);
+    for row in rows {
+        let Some(source_id) =
+            extract_graph_column_bytes(meta, partition_key.key.as_bytes(), row, source_col)
+        else {
             continue;
         };
-        let Some(target_id) = extract_graph_column_bytes(meta, mutation, row, target_col) else {
+        let Some(target_id) =
+            extract_graph_column_bytes(meta, partition_key.key.as_bytes(), row, target_col)
+        else {
             continue;
         };
 
@@ -129,7 +174,7 @@ pub(crate) fn derive_adjacency_into(
                 &edge_label,
                 neighbor,
                 &edge_table,
-                mutation.timestamp,
+                timestamp,
             );
             // A deleted edge must delete its entries. Deriving live entries
             // from the edge's tombstone would keep the edge traversable.
@@ -196,7 +241,7 @@ pub(crate) fn make_adjacency_mutation(
 
 fn extract_graph_column_bytes(
     meta: &ferrosa_schema::metadata::table::TableMetadata,
-    mutation: &Mutation,
+    partition_key: &[u8],
     row: &ferrosa_sstable::types::Row,
     column_name: &str,
 ) -> Option<ferrosa_common::CellBytes> {
@@ -207,8 +252,7 @@ fn extract_graph_column_bytes(
                 .partition_key
                 .iter()
                 .position(|name| name == column_name)?;
-            let components =
-                decode_partition_components(mutation.key.key.as_bytes(), meta.partition_key.len())?;
+            let components = decode_partition_components(partition_key, meta.partition_key.len())?;
             components.get(idx).cloned().map(Into::into)
         }
         ferrosa_schema::metadata::column::ColumnKind::Clustering => {
