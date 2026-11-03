@@ -4,6 +4,10 @@ What has to stay true: the pin in the workflow equals the pin in the baseline (a
 builds one build and compares it against another's numbers is the drift the gate exists to
 catch), the measurement stays off the every-push path, and the gate runs `check` -- not
 `update`, which is the one command that can raise a ceiling.
+
+Correctness: execute checkout/bootstrap contracts against disposable tools and Git sources.
+Last revised: 2026-11-03
+Last changed: Reproduce opam's local fetch from the workflow's pinned Charon checkout.
 """
 from __future__ import annotations
 
@@ -68,6 +72,74 @@ class RatchetWorkflowTest(unittest.TestCase):
         self.assertIn("./aeneas/bootstrap.sh", runs)
         self.assertIn("lake build", runs)
         self.assertIn("python3 scripts/lean_gap_inventory.py --only", runs)
+
+    def test_charon_checkout_serves_the_local_git_fetch_used_by_opam(self):
+        step = next(s for s in self.job["steps"] if s.get("name") == "Fetch the pinned aeneas")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # Fixture repositories must not inherit operator Git hooks, signing,
+            # credentials, or overrides of upload-pack's lazy-fetch policy.
+            env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+            env.update({"GIT_CONFIG_GLOBAL": os.devnull,
+                        "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"})
+
+            def git(repository, *arguments):
+                return subprocess.run(["git", "-C", str(repository), *arguments],
+                                      env=env, capture_output=True, text=True, check=True)
+
+            def origin(name, files):
+                repository = root / (name + "-origin")
+                subprocess.run(["git", "init", "-q", "-b", "main", str(repository)],
+                               env=env, capture_output=True, text=True, check=True)
+                for key, value in [("user.name", "CI Fixture"),
+                                   ("user.email", "fixture@example.invalid"),
+                                   ("commit.gpgsign", "false"),
+                                   ("uploadpack.allowFilter", "true")]:
+                    git(repository, "config", key, value)
+                # Checkout needs only the second commit's files. A downstream
+                # unfiltered fetch also needs this retired historical blob.
+                historical = repository / "historical-only.txt"
+                historical.write_text("historical source not present at the pin\n")
+                git(repository, "add", ".")
+                git(repository, "commit", "-qm", "historical source")
+                historical_blob = git(repository, "rev-parse", "HEAD:historical-only.txt").stdout.strip()
+                historical.unlink()
+                for path, content in files.items():
+                    output = repository / path
+                    output.parent.mkdir(parents=True, exist_ok=True)
+                    output.write_text(content)
+                git(repository, "add", "-A")
+                git(repository, "commit", "-qm", "pinned source")
+                return repository, git(repository, "rev-parse", "HEAD").stdout.strip(), historical_blob
+
+            charon, charon_pin, historical_blob = origin("charon", {
+                "name_matcher_parser.opam": 'opam-version: "2.0"\nversion: "0.1"\n',
+            })
+            aeneas, aeneas_pin, _ = origin("aeneas", {"charon-pin": charon_pin + "\n"})
+            workspace = root / "workspace"
+            workspace.mkdir()
+            fetched = subprocess.run(["bash", "-euo", "pipefail", "-c", step["run"]],
+                                     cwd=workspace, capture_output=True, text=True,
+                                     env={**env, "AENEAS_REPO": aeneas.as_uri(),
+                                          "AENEAS_COMMIT": aeneas_pin,
+                                          "CHARON_REPO": charon.as_uri(),
+                                          "CHARON_COMMIT": charon_pin})
+            self.assertEqual(fetched.returncode, 0, fetched.stdout + fetched.stderr)
+            checkout = workspace / "aeneas/charon"
+            self.assertEqual(git(checkout, "rev-parse", "HEAD").stdout.strip(), charon_pin)
+            self.assertEqual(git(workspace / "aeneas", "rev-parse", "HEAD").stdout.strip(), aeneas_pin)
+            # bootstrap.sh installs the sibling .opam file from the Git checkout.
+            # Opam then runs this ordinary fetch against git+file://...#HEAD.
+            source = root / "opam-switch/sources/name_matcher_parser"
+            source.mkdir(parents=True)
+            git(source, "init", "-q")
+            git(source, "remote", "add", "origin", checkout.as_uri())
+            transfer = subprocess.run(["git", "-C", str(source), "fetch", "-q"],
+                                      env=env, capture_output=True, text=True)
+            self.assertEqual(transfer.returncode, 0,
+                             "opam's local Git source must be self-contained: " + transfer.stderr)
+            self.assertEqual(git(source, "rev-parse", "FETCH_HEAD").stdout.strip(), charon_pin)
+            git(source, "cat-file", "-e", historical_blob)
 
     def test_bootstrap_installs_the_pinned_charon_formatter_first(self):
         step = next(s for s in self.job["steps"] if s.get("name") == "Build the pinned toolchain")

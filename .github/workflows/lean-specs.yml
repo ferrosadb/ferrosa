@@ -243,7 +243,9 @@ jobs:
           test "$(git -C aeneas rev-parse HEAD)" = "$AENEAS_COMMIT"
           echo "aeneas at $(git -C aeneas rev-parse HEAD)"
           grep -v '^#' aeneas/charon-pin | tail -1
-          git clone --filter=blob:none --no-checkout "$CHARON_REPO" aeneas/charon
+          # Opam fetches sibling packages from this repository via git+file://.
+          # upload-pack disables lazy fetch, so the source must contain its history.
+          git clone --no-checkout "$CHARON_REPO" aeneas/charon
           git -C aeneas/charon checkout "$CHARON_COMMIT"
           test "$(git -C aeneas/charon rev-parse HEAD)" = "$CHARON_COMMIT"
           git -C aeneas/charon submodule update --init --recursive
