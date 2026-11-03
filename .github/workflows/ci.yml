@@ -156,6 +156,13 @@ jobs:
           tests/ci/test_lean_gap_memory_cap.py
           tests/ci/test_lean_gap_exclusions.py
           tests/ci/test_lean_gap_inventory_state.py
+      # The ratchet's rules (growth fails, shrinking passes, a mismatched toolchain is
+      # refused) and the workflow that runs it. Pure Python: no charon, no Lean, seconds.
+      - name: Ratchet and ratchet-workflow tests
+        run: >-
+          python3 -m unittest -q
+          tests.ci.test_lean_gap_ratchet
+          tests.ci.test_lean_gap_ratchet_workflow
 
   # Every `--all-features --workspace` lane must exclude the tests behind
   # `live-infra-tests`: they are absent from the default target and panic by

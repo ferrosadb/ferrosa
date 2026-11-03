@@ -1,0 +1,18 @@
+# Crates the weekly ratchet does not gate, and why.
+#
+# `lean_gap_inventory.py` still measures these -- they are in specs/lean/gaps/ like every
+# other crate -- but their counts are not part of the CI ceiling, because one measurement
+# of them does not fit in a hosted runner's memory or its patience. That is a hole in the
+# control, so it is written down here rather than left implicit: `lean_gap_ratchet.py
+# update` refuses to gate a crate listed here, and `check` fails if one is gated anyway.
+#
+# Closing one of these means running the inventory on a machine that can hold it and
+# deleting the line in the same commit that re-records the baseline.
+#
+# <crate> <reason>
+ferrosa-common  21.5 GB resident in a whole-crate charon run; more than a hosted runner has
+ferrosa-cql     606 s for one whole-crate run; the largest crates starve the rest of the job
+ferrosa-jepsen  1301 s for one whole-crate run; same reason
+ferrosa-net     1957 s, and it dies inside aeneas above 25 GiB, so a smaller machine cannot measure it either
+ferrosa-schema  the whole-crate run passed 18 GB in aeneas without finishing; its module fallback costs minutes per module
+ferrosa-view    the whole-crate run passed 14 GB in aeneas without finishing; its counts are module-level, not comparable to a crate row
