@@ -69,7 +69,7 @@ class RatchetWorkflowTest(unittest.TestCase):
         self.assertIn("python3 scripts/lean_gap_ratchet.py check", runs)
         # The measurement has to use the pin in env, not $HOME/src/aeneas on the runner.
         self.assertIn('git -C aeneas checkout "$AENEAS_COMMIT"', runs)
-        self.assertIn("./aeneas/bootstrap.sh", runs)
+        self.assertIn("python3 scripts/lean_gap_bootstrap.py aeneas", runs)
         self.assertIn("lake build", runs)
         self.assertIn("python3 scripts/lean_gap_inventory.py --only", runs)
 
@@ -145,6 +145,10 @@ class RatchetWorkflowTest(unittest.TestCase):
         step = next(s for s in self.job["steps"] if s.get("name") == "Build the pinned toolchain")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            (scripts / "lean_gap_bootstrap.py").write_bytes(
+                (ROOT / "scripts/lean_gap_bootstrap.py").read_bytes())
             charon = root / "aeneas/charon/charon"
             charon.mkdir(parents=True)
             (charon / "rust-toolchain").write_text('[toolchain]\nchannel = "nightly-2026-09-17"\n')
@@ -175,6 +179,27 @@ class RatchetWorkflowTest(unittest.TestCase):
                                      capture_output=True, text=True)
             self.assertEqual(failure.returncode, 23, failure.stdout + failure.stderr)
             self.assertEqual(calls.read_text(), "x", "failed bootstrap must execute exactly once")
+
+    def test_cache_upload_failure_does_not_replace_the_semantic_gate(self):
+        save = next(s for s in self.job["steps"] if s.get("name") == "Save the verified toolchain")
+        self.assertIs(save.get("continue-on-error"), True)
+        self.assertNotIn("always()", save["if"])
+        check = next(s for s in self.job["steps"] if "lean_gap_ratchet.py check" in s.get("run", ""))
+        self.assertFalse(check.get("continue-on-error", False))
+
+    def test_completed_toolchain_is_saved_before_measurement(self):
+        steps = self.job["steps"]
+        restore = next(s for s in steps if s.get("id") == "toolchain-cache")
+        save = next(s for s in steps if s.get("name") == "Save the verified toolchain")
+        self.assertIn("actions/cache/restore@", restore["uses"])
+        self.assertIn("actions/cache/save@", save["uses"])
+        self.assertEqual(save["with"]["path"], restore["with"]["path"])
+        self.assertEqual(save["with"]["key"], "${{ steps.toolchain-cache.outputs.cache-primary-key }}")
+        self.assertEqual(save["if"], "${{ success() && steps.toolchain-cache.outputs.cache-hit != 'true' }}")
+        order = {s.get("name"): i for i, s in enumerate(steps)}
+        self.assertLess(order["Build the pinned toolchain"], order["Save the verified toolchain"])
+        self.assertLess(order["Build the Aeneas Lean backend"], order["Save the verified toolchain"])
+        self.assertLess(order["Save the verified toolchain"], order["Re-measure the gated crates"])
 
     def test_update_only_runs_on_a_dispatch_that_asked_for_it(self):
         for step in self.job["steps"]:

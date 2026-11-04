@@ -223,7 +223,7 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq libgmp-dev m4 python3-yaml
 
       - name: Ratchet and bootstrap contracts
-        run: /usr/bin/python3 -m unittest -q tests.ci.test_lean_gap_ratchet tests.ci.test_lean_gap_ratchet_workflow
+        run: /usr/bin/python3 -m unittest -q tests.ci.test_lean_gap_ratchet tests.ci.test_lean_gap_ratchet_workflow tests.ci.test_lean_gap_bootstrap
 
       - name: Install elan
         run: |
@@ -251,7 +251,8 @@ jobs:
           git -C aeneas/charon submodule update --init --recursive
 
       - name: Cache the OCaml switch and the charon build
-        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.2
+        id: toolchain-cache
+        uses: actions/cache/restore@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.2
         with:
           path: |
             ~/.local/opam
@@ -265,7 +266,7 @@ jobs:
           # for the manifest's own channel, without changing either source pin.
           toolchain=$(python3 -c 'import tomllib; from pathlib import Path; print(tomllib.loads(Path("aeneas/charon/charon/rust-toolchain").read_text())["toolchain"]["channel"])')
           rustup toolchain install "$toolchain" --profile minimal --component rustfmt
-          ./aeneas/bootstrap.sh
+          python3 scripts/lean_gap_bootstrap.py aeneas
           test -x "$AENEAS"
           test -x "$CHARON"
 
@@ -276,6 +277,18 @@ jobs:
         run: |
           cat lean-toolchain
           lake build
+
+      # Save only after both builds succeed, even if a later measurement fails.
+      - name: Save the verified toolchain
+        # The original post-job cache upload was best effort, not a gate.
+        continue-on-error: true
+        if: ${{ success() && steps.toolchain-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.2
+        with:
+          path: |
+            ~/.local/opam
+            aeneas/charon/charon/target
+          key: ${{ steps.toolchain-cache.outputs.cache-primary-key }}
 
       - name: What the baseline holds
         run: python3 scripts/lean_gap_ratchet.py show
