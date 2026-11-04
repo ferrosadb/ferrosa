@@ -640,7 +640,11 @@ jobs:
           EXPECTED_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
-          revision="$(git rev-parse HEAD)"
+          workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
+          case "$workspace" in /*) ;; *) echo "::error::workspace must be absolute"; exit 1 ;; esac
+          workspace="$(cd -- "$workspace" && pwd -P)"
+          [ "$workspace" = "$(pwd -P)" ] || { echo "::error::glibc checkout workspace mismatch"; exit 1; }
+          revision="$(git -c "safe.directory=$workspace" rev-parse HEAD)"
           [ "$revision" = "$EXPECTED_REVISION" ] || { echo "::error::glibc checkout revision mismatch"; exit 1; }
           printf '%s\n' "$revision" > target/x86_64-unknown-linux-gnu/release/source-revision.txt
           printf 'revision=%s\n' "$revision" >> "$GITHUB_OUTPUT"

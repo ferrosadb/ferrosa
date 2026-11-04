@@ -76,7 +76,7 @@ esac
         self.env.update(PATH=str(tools) + os.pathsep + self.env['PATH'],
                          DOCKER_LOG=str(self.root / 'docker.log'),
                          DOCKER_STDIN=str(self.root / 'docker-stdin'), SOURCE_REVISION=self.head,
-                        GITHUB_OUTPUT=str(self.root / 'output'))
+                        GITHUB_OUTPUT=str(self.root / 'output'), GITHUB_WORKSPACE=str(self.root))
 
     def git(self, *args):
         return subprocess.check_output(['git', *args], cwd=self.root, env=self.env, text=True).strip()
@@ -136,6 +136,63 @@ esac
         self.git('checkout', '-q', self.merge)
         result = self.run_step('glibc', 'Record the glibc artifact source')
         self.assertNotEqual(result.returncode, 0)
+
+    def prepare_recording(self):
+        self.git('checkout', '-q', self.head)
+        artifact = self.root / 'target/x86_64-unknown-linux-gnu/release'
+        artifact.mkdir(parents=True)
+        self.env['EXPECTED_REVISION'] = self.head
+        return artifact
+
+    def assume_different_owner(self):
+        global_config = self.root / 'isolated-global.gitconfig'
+        global_config.write_text('[fixture]\n    sentinel = preserved\n')
+        unrelated = self.root / 'unrelated-checkout'
+        subprocess.run(['git', 'init', '-q', str(unrelated)], env=self.env, check=True)
+        self.env.update(GIT_CONFIG_GLOBAL=str(global_config), GIT_TEST_ASSUME_DIFFERENT_OWNER='1')
+        # A real Git control proves this installation actually enforces ownership.
+        refused = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=self.root, env=self.env,
+                                 capture_output=True, text=True)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn('dubious ownership', refused.stderr)
+        return global_config, unrelated
+
+    def test_differing_owner_records_only_workspace_without_persistent_trust(self):
+        artifact = self.prepare_recording()
+        global_config, unrelated = self.assume_different_owner()
+        original_config = global_config.read_bytes()
+        result = self.run_step('glibc', 'Record the glibc artifact source')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((artifact / 'source-revision.txt').read_text(), self.head + '\n')
+        self.assertEqual((self.root / 'output').read_text(), 'revision=' + self.head + '\n')
+        self.assertEqual(global_config.read_bytes(), original_config)
+        for checkout in [self.root, unrelated]:
+            refused = subprocess.run(['git', 'rev-parse', '--show-toplevel'], cwd=checkout,
+                                     env=self.env, capture_output=True, text=True)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn('dubious ownership', refused.stderr)
+
+    def test_differing_owner_still_rejects_wrong_expected_revision(self):
+        artifact = self.prepare_recording()
+        self.assume_different_owner()
+        self.env['EXPECTED_REVISION'] = self.merge
+        result = self.run_step('glibc', 'Record the glibc artifact source')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('glibc checkout revision mismatch', result.stdout)
+        self.assertFalse((artifact / 'source-revision.txt').exists())
+        self.assertFalse((self.root / 'output').exists())
+
+    def test_recording_refuses_a_workspace_other_than_the_current_checkout(self):
+        artifact = self.prepare_recording()
+        other = self.root / 'other-workspace'
+        other.mkdir()
+        for workspace in [str(other), '.']:
+            with self.subTest(workspace=workspace):
+                self.env['GITHUB_WORKSPACE'] = workspace
+                result = self.run_step('glibc', 'Record the glibc artifact source')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((artifact / 'source-revision.txt').exists())
+                self.assertFalse((self.root / 'output').exists())
 
     def test_checkout_output_sidecar_and_format_guard_are_wired(self):
         workflow = WORKFLOW.read_text(); all_jobs = jobs(workflow)
