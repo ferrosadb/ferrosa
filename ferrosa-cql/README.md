@@ -478,3 +478,34 @@ its token after an upgrade; unlimited scan tokens retain their existing format.
 ## Immutable scalar scan values
 
 Plain scalar projection consumes decoded page rows. Identity projection retains the page and row buffers; reordered projection moves cells, and repeated immutable payloads share backing. LIMIT and paging move selected rows rather than cloning a page. Function/UDF/toJson evaluation retains the established evaluation path. Scalar text/blob decoding shares immutable storage backing; wire framing still appends bytes into bounded response buffers. This does not promise end-to-end zero-copy network writes. Page sizes, cursors, row ordering and total-query LIMIT semantics remain unchanged.
+
+### Direct keyspace cleanup and lifecycle ordering
+
+Direct `DROP KEYSPACE` runs schema removal and physical cleanup on the blocking
+DDL task pool. Its job owns the compaction pauses, shared schema lifecycle writer
+and completion notification, including when the requesting client disconnects.
+The response is sent only after durable recovery intents and physical cleanup
+succeed. Direct keyspace/table CREATE and ALTER, table DROP, and index CREATE
+and DROP wait for the same lifecycle writer on the blocking pool. Their jobs own
+storage updates, existing durability barriers and completion events, so client
+cancellation cannot interrupt those effects. A same-name CREATE cannot publish a
+new incarnation while old directories are still being removed. Paired and cluster
+DDL paths retain their existing coordination behavior. Role/permission updates and local type alteration also execute their authorization and persistence inside owned blocking jobs. Shared Direct execution for type/function operations uses the same blocking boundary; no synchronous lifecycle lease is retained across an await.
+
+
+Direct role-membership changes, function removal, and aggregate creation/removal
+perform their permission checks after their blocking job acquires the lifecycle
+writer. Aggregate creation also rechecks its state/final function dependencies
+there. Direct function replacement validates and publishes its component before
+removing old metadata, then performs DROP and CREATE in that same owned job and
+lease. Dropping the requesting future cannot submit only the DROP half of an
+admitted replacement. Pair and Cluster coordination keep their existing paths.
+
+Direct conditional CREATE/DROP rechecks existence and the existing authorization
+policy under the lifecycle writer before changing metadata, physical state or
+persistent rows. Conditional no-ops do not change schema version, audit or native
+events. Table-event jobs report whether they applied a change and the table they
+actually changed; index removal resolves and authorizes its current owner there.
+Index creation validates the current parent/target columns and rebuilds filtered
+predicates from current types and storage ordinals before persistence. Existing
+aggregate IF NOT EXISTS returns before irrelevant proposed dependency validation.

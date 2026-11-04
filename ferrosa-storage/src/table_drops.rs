@@ -140,6 +140,46 @@ pub fn load(data_dir: &Path) -> Result<DropLedger> {
     })
 }
 
+/// Record a group of drop intents in one bounded durable ledger transaction.
+pub(crate) fn record_drops(
+    data_dir: &Path,
+    tables: &[crate::TableId],
+    at_millis: u64,
+) -> Result<()> {
+    let _serial = WRITE_SERIAL.lock();
+    let mut ledger = load(data_dir)?;
+    for table in tables {
+        let entry = ledger
+            .entry(ledger_key(table.keyspace(), table.table()))
+            .or_insert(0);
+        *entry = (*entry).max(at_millis);
+    }
+    crate::schema_snapshot::persist_bounded_json(data_dir, DROPPED_TABLES_FILE, &ledger)
+}
+
+/// Change a group's recovery intents atomically, retaining the existing file format.
+pub(crate) fn set_pending_sweeps(
+    data_dir: &Path,
+    tables: &[crate::TableId],
+    pending: bool,
+) -> Result<()> {
+    let _serial = WRITE_SERIAL.lock();
+    let mut sweeps = load_pending_sweeps(data_dir)?;
+    let mut changed = false;
+    for table in tables {
+        let key = ledger_key(table.keyspace(), table.table());
+        changed |= if pending {
+            sweeps.insert(key)
+        } else {
+            sweeps.remove(&key)
+        };
+    }
+    if changed {
+        crate::schema_snapshot::persist_bounded_json(data_dir, PENDING_SWEEPS_FILE, &sweeps)?;
+    }
+    Ok(())
+}
+
 /// Durably records that `keyspace.table` was dropped at `at_millis`.
 pub fn record_drop(data_dir: &Path, keyspace: &str, table: &str, at_millis: u64) -> Result<()> {
     let _serial = WRITE_SERIAL.lock();
@@ -194,5 +234,28 @@ mod tests {
             set_aside_file_created_millis(Path::new("/d/odd.unreplayed")),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod group_tests {
+    #[test]
+    fn bulk_drop_preserves_existing_maximum_and_unrelated_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let tables = [
+            crate::TableId::new("ks", "a"),
+            crate::TableId::new("ks", "b"),
+        ];
+        super::record_drop(dir.path(), "ks", "a", 900).unwrap();
+        super::mark_pending_sweep(dir.path(), "other", "retained").unwrap();
+        super::record_drops(dir.path(), &tables, 100).unwrap();
+        super::set_pending_sweeps(dir.path(), &tables, true).unwrap();
+        let ledger = super::load(dir.path()).unwrap();
+        assert_eq!(ledger["ks.a"], 900);
+        assert_eq!(ledger["ks.b"], 100);
+        super::set_pending_sweeps(dir.path(), &tables, false).unwrap();
+        let pending = super::load_pending_sweeps(dir.path()).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains("other.retained"));
     }
 }

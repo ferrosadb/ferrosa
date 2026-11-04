@@ -88,12 +88,73 @@ fn emit_schema_change(
         keyspace: keyspace.to_string(),
         name: name.map(|n| n.to_string()),
     };
+    publish_schema_change(&state.event_sender, &state.last_schema_event, event);
+}
+
+fn publish_schema_change(
+    event_sender: &tokio::sync::broadcast::Sender<CqlEvent>,
+    last_schema_event: &tokio::sync::watch::Sender<Option<(CqlEvent, std::time::Instant)>>,
+    event: CqlEvent,
+) {
     // best-effort broadcast; lagging receivers are dropped
-    let _ = state.event_sender.send(event.clone());
+    let _ = event_sender.send(event.clone());
     // Also retain in watch channel for late subscribers (control connection reconnect)
-    let _ = state
-        .last_schema_event
-        .send(Some((event, std::time::Instant::now())));
+    let _ = last_schema_event.send(Some((event, std::time::Instant::now())));
+}
+
+/// Run direct schema and physical mutations under the shared lifecycle fence.
+/// The blocking job owns the fence and completion effects if its requester exits.
+async fn run_direct_schema_change<T: Send + 'static>(
+    state: &SharedState,
+    auth: &AuthContext,
+    change: impl FnOnce(&SessionCore, &AuthContext) -> Result<T, CqlError> + Send + 'static,
+) -> Result<T, CqlError> {
+    let core = Arc::clone(&state.core);
+    let auth = auth.clone();
+    ferrosa_net::task_pool::TaskPool::current("cql-ddl")
+        .spawn_blocking(move || {
+            let _lifecycle = core.schema.lifecycle_write();
+            change(&core, &auth)
+        })
+        .await
+        .map_err(|error| CqlError::ServerError(format!("schema change task failed: {error}")))?
+}
+
+/// Only an applied table change may publish an event, for the owner resolved under
+/// the lifecycle writer. Conditional no-ops have no completion effects.
+enum DirectTableChange {
+    Applied(TableId),
+    Unchanged,
+}
+
+/// Keep table metadata, physical effects and completion events in one owned job.
+async fn run_direct_table_change(
+    state: &SharedState,
+    auth: &AuthContext,
+    change_type: SchemaChangeType,
+    change: impl FnOnce(&SessionCore, &AuthContext) -> Result<DirectTableChange, CqlError>
+        + Send
+        + 'static,
+) -> Result<DirectTableChange, CqlError> {
+    let event_sender = state.event_sender.clone();
+    let last_schema_event = state.last_schema_event.clone();
+    run_direct_schema_change(state, auth, move |core, auth| {
+        let outcome = change(core, auth)?;
+        if let DirectTableChange::Applied(table) = &outcome {
+            publish_schema_change(
+                &event_sender,
+                &last_schema_event,
+                CqlEvent::SchemaChange {
+                    change_type,
+                    target: SchemaTarget::Table,
+                    keyspace: table.keyspace.clone(),
+                    name: Some(table.table.clone()),
+                },
+            );
+        }
+        Ok(outcome)
+    })
+    .await
 }
 
 /// Default cooperative-yield cadence for long partition scans. Larger
@@ -11530,8 +11591,33 @@ async fn route_create_keyspace(
     let ddl = &**ddl_guard;
     let actually_created = match ddl {
         DdlPath::Direct { .. } => {
-            state.schema.create_keyspace(ks_meta, ctx.auth)?;
-            true
+            let event_sender = state.event_sender.clone();
+            let last_schema_event = state.last_schema_event.clone();
+            run_direct_schema_change(state, ctx.auth, move |core, auth| {
+                core.schema
+                    .check_permission(auth, Permission::Create, &Resource::AllKeyspaces)?;
+                if s.if_not_exists && core.schema.snapshot().keyspaces.contains_key(&ks_meta.name) {
+                    return Ok(());
+                }
+                core.schema.create_keyspace(ks_meta.clone(), auth)?;
+                publish_schema_change(
+                    &event_sender,
+                    &last_schema_event,
+                    CqlEvent::SchemaChange {
+                        change_type: SchemaChangeType::Created,
+                        target: SchemaTarget::Keyspace,
+                        keyspace: ks_meta.name,
+                        name: None,
+                    },
+                );
+                Ok(())
+            })
+            .await?;
+            return Ok(result::encode_schema_change(
+                "CREATED",
+                "KEYSPACE",
+                &[&s.name],
+            ));
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::CreateKeyspace(ks_meta);
@@ -11601,7 +11687,12 @@ async fn route_alter_keyspace(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            state.schema.alter_keyspace(&s.name, updates, ctx.auth)?;
+            let name = s.name.clone();
+            run_direct_schema_change(state, ctx.auth, move |core, auth| {
+                core.schema.alter_keyspace(&name, updates, auth)?;
+                Ok(())
+            })
+            .await?;
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::AlterKeyspace {
@@ -11674,10 +11765,50 @@ async fn route_drop_keyspace(
                         .await?,
                 );
             }
-            state.schema.drop_keyspace(&s.name, ctx.auth)?;
-            for tid in &table_ids {
-                state.engine.unregister_table(tid)?;
-            }
+            let keyspace = s.name.clone();
+            let event_sender = state.event_sender.clone();
+            let last_schema_event = state.last_schema_event.clone();
+            run_direct_schema_change(state, ctx.auth, move |core, auth| {
+                // The admitted job owns the pauses and its completion event:
+                // cancelling the waiting client must not resume compactions
+                // halfway through physical cleanup or lose the notification.
+                let _pauses = pauses;
+                core.schema
+                    .check_permission(auth, Permission::Drop, &Resource::AllKeyspaces)?;
+                if s.if_exists && !core.schema.snapshot().keyspaces.contains_key(&keyspace) {
+                    return Ok(());
+                }
+                // Include tables admitted while the asynchronous pre-pause was
+                // draining. The lifecycle fence prevents further schema changes;
+                // group unregister also validates/owns pauses for this current set.
+                let table_ids: Vec<_> = core
+                    .schema
+                    .snapshot()
+                    .tables
+                    .keys()
+                    .filter(|(ks, _)| ks == &keyspace)
+                    .map(|(ks, table)| TableId::new(ks, table))
+                    .collect();
+                core.schema.drop_keyspace(&keyspace, auth)?;
+                core.engine.unregister_tables(&table_ids)?;
+                publish_schema_change(
+                    &event_sender,
+                    &last_schema_event,
+                    CqlEvent::SchemaChange {
+                        change_type: SchemaChangeType::Dropped,
+                        target: SchemaTarget::Keyspace,
+                        keyspace,
+                        name: None,
+                    },
+                );
+                Ok(())
+            })
+            .await?;
+            return Ok(result::encode_schema_change(
+                "DROPPED",
+                "KEYSPACE",
+                &[&s.name],
+            ));
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::DropKeyspace(s.name.clone());
@@ -11815,44 +11946,75 @@ async fn route_create_table(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            // Register with schema
-            state.schema.create_table(table_meta.clone(), ctx.auth)?;
+            let event_sender = state.event_sender.clone();
+            let last_schema_event = state.last_schema_event.clone();
+            run_direct_schema_change(state, ctx.auth, move |core, auth| {
+                core.schema.check_permission(
+                    auth,
+                    Permission::Create,
+                    &Resource::Keyspace(table_meta.keyspace.clone()),
+                )?;
+                if s.if_not_exists
+                    && core
+                        .schema
+                        .snapshot()
+                        .tables
+                        .contains_key(&(table_meta.keyspace.clone(), table_meta.name.clone()))
+                {
+                    return Ok(());
+                }
+                // Register with schema
+                core.schema.create_table(table_meta.clone(), auth)?;
 
-            // Register with storage engine
-            let storage_schema = table_meta.to_storage_schema();
-            let tid = TableId::new(&table_meta.keyspace, &table_meta.name);
-            state.engine.register_table(storage_schema.clone())?;
+                // Register with storage engine
+                let storage_schema = table_meta.to_storage_schema();
+                let tid = TableId::new(&table_meta.keyspace, &table_meta.name);
+                core.engine.register_table(storage_schema.clone())?;
 
-            // Durability barrier: the table must be on disk BEFORE the client is
-            // told it was created. register_table_inner only puts the schema in
-            // memory, so without this the acknowledgement is a promise the node
-            // cannot keep: a kill between the ack and the next maintenance tick
-            // leaves no recoverable record of the table (t_0acc233d).
-            //
-            // `update_table_schema` is the existing barrier for this: it holds the
-            // table lock across a flush of the old schema, swaps in the new one,
-            // and persists the storage-side record. For a newly created table the
-            // memtable is empty, so the flush is a no-op in cost.
-            //
-            // Propagate the error rather than logging it: returning CREATED after
-            // a failed persist would be the same false promise in a different
-            // place.
-            state
-                .engine
-                .update_table_schema(&tid, storage_schema)
-                .map_err(|e| {
-                    CqlError::ServerError(format!(
-                        "CREATE TABLE durability barrier failed for {tid}: {e}"
-                    ))
-                })?;
+                // Durability barrier: the table must be on disk BEFORE the client is
+                // told it was created. register_table_inner only puts the schema in
+                // memory, so without this the acknowledgement is a promise the node
+                // cannot keep: a kill between the ack and the next maintenance tick
+                // leaves no recoverable record of the table (t_0acc233d).
+                //
+                // `update_table_schema` is the existing barrier for this: it holds the
+                // table lock across a flush of the old schema, swaps in the new one,
+                // and persists the storage-side record. For a newly created table the
+                // memtable is empty, so the flush is a no-op in cost.
+                //
+                // Propagate the error rather than logging it: returning CREATED after
+                // a failed persist would be the same false promise in a different
+                // place.
+                core.engine
+                    .update_table_schema(&tid, storage_schema)
+                    .map_err(|e| {
+                        CqlError::ServerError(format!(
+                            "CREATE TABLE durability barrier failed for {tid}: {e}"
+                        ))
+                    })?;
 
-            // The registry snapshot is persisted after the match, so that it also
-            // covers the cascade tables this arm creates below (they mutate the
-            // registry) and so the same guarantee holds for the Pair and Cluster
-            // paths. See the barrier after the match.
+                // Auto-create cascade tables if consolidation.cascade is enabled.
+                create_cascade_tables_if_needed(core, &table_meta)?;
 
-            // Auto-create cascade tables if consolidation.cascade is enabled.
-            create_cascade_tables_if_needed(state, &table_meta)?;
+                persist_registry_snapshot_before_ack(core, &table_meta.name)?;
+                publish_schema_change(
+                    &event_sender,
+                    &last_schema_event,
+                    CqlEvent::SchemaChange {
+                        change_type: SchemaChangeType::Created,
+                        target: SchemaTarget::Table,
+                        keyspace: table_meta.keyspace,
+                        name: Some(table_meta.name),
+                    },
+                );
+                Ok(())
+            })
+            .await?;
+            return Ok(result::encode_schema_change(
+                "CREATED",
+                "TABLE",
+                &[ks, &s.name],
+            ));
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::CreateTable(Box::new(table_meta.clone()));
@@ -11949,10 +12111,10 @@ async fn route_create_table(
 ///
 /// Fails loudly: the caller must not acknowledge a table it cannot recover.
 fn persist_registry_snapshot_before_ack(
-    state: &SharedState,
+    state: &SessionCore,
     table_name: &str,
 ) -> Result<(), CqlError> {
-    let snapshot = state.core.schema.snapshot();
+    let snapshot = state.schema.snapshot();
     ferrosa_storage::schema_snapshot::SchemaSnapshotStore::new(state.engine.data_dir())
         .persist(&snapshot)
         .map_err(|e| {
@@ -11966,7 +12128,7 @@ fn persist_registry_snapshot_before_ack(
 /// If the table has `consolidation.cascade = true` in its extensions,
 /// auto-create the downstream cascade tables (e.g., sensor_5m, sensor_15m, sensor_1h).
 fn create_cascade_tables_if_needed(
-    state: &SharedState,
+    state: &SessionCore,
     source: &TableMetadata,
 ) -> Result<(), CqlError> {
     use ferrosa_storage::timeseries::config::{generate_cascade_chain, ConsolidationConfig};
@@ -12184,7 +12346,11 @@ async fn route_alter_table(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            state.schema.alter_table(ks, &s.table, updates, ctx.auth)?;
+            let keyspace = ks.to_string();
+            let table = s.table.clone();
+            run_direct_table_change(state, ctx.auth, SchemaChangeType::Updated, move |core, auth| {
+                let ks = keyspace.as_str();
+            core.schema.alter_table(ks, &table, updates, auth)?;
             // Propagate the post-ALTER column set to the storage engine,
             // mirroring what CreateTable's Direct arm does. Without this,
             // standalone/Direct nodes leave their TableSchema stuck at the
@@ -12197,29 +12363,37 @@ async fn route_alter_table(
             // already calls engine.update_table_schema via the RaftOp
             // AlterTable apply (state_machine.rs:995) — the Direct
             // path was simply missing the equivalent local update.
-            let snap = state.schema.snapshot();
-            if let Some(tbl) = snap.tables.get(&(ks.to_string(), s.table.clone())) {
-                let tid = ferrosa_storage::TableId::new(ks, &s.table);
+            let snap = core.schema.snapshot();
+            if let Some(tbl) = snap.tables.get(&(ks.to_string(), table.clone())) {
+                let tid = ferrosa_storage::TableId::new(ks, &table);
                 // Fail the statement rather than acknowledge an ALTER the
                 // engine did not take: the registry now has the new columns
                 // and the engine the old ones, so writes would be misplaced.
-                state
+                core
                     .engine
                     .update_table_schema(&tid, tbl.to_storage_schema())
                     .map_err(|e| {
                         tracing::error!(
                             %e,
                             keyspace = %ks,
-                            table = %s.table,
+                            table = %table,
                             "Direct ALTER: engine.update_table_schema failed; ALTER NOT acknowledged"
                         );
                         CqlError::ServerError(format!(
                             "ALTER TABLE {ks}.{}: storage engine did not apply the new column \
                              set: {e}",
-                            s.table
+                            table
                         ))
                     })?;
             }
+            persist_registry_snapshot_before_ack(core, &table)?;
+                Ok(DirectTableChange::Applied(TableId::new(ks, &table)))
+            }).await?;
+            return Ok(result::encode_schema_change(
+                "UPDATED",
+                "TABLE",
+                &[ks, &s.table],
+            ));
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::AlterTable {
@@ -12294,13 +12468,46 @@ async fn route_drop_table(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            let tid = ferrosa_storage::TableId::new(ks, &s.table);
-            let _pause = state
+            let tid = TableId::new(ks, &s.table);
+            let pause = state
                 .engine
                 .pause_table_compactions(&tid, ferrosa_common::CancelReason::TableDropped)
                 .await?;
-            state.schema.drop_table(ks, &s.table, ctx.auth)?;
-            state.engine.unregister_table(&tid)?;
+            let keyspace = ks.to_string();
+            let table = s.table.clone();
+            run_direct_table_change(
+                state,
+                ctx.auth,
+                SchemaChangeType::Dropped,
+                move |core, auth| {
+                    let ks = keyspace.as_str();
+                    let _pause = pause;
+                    core.schema.check_permission(
+                        auth,
+                        Permission::Drop,
+                        &Resource::Table(keyspace.clone(), table.clone()),
+                    )?;
+                    if s.if_exists
+                        && !core
+                            .schema
+                            .snapshot()
+                            .tables
+                            .contains_key(&(keyspace.clone(), table.clone()))
+                    {
+                        return Ok(DirectTableChange::Unchanged);
+                    }
+                    core.schema.drop_table(ks, &table, auth)?;
+                    core.engine.unregister_table(&tid)?;
+                    persist_registry_snapshot_before_ack(core, &table)?;
+                    Ok(DirectTableChange::Applied(tid))
+                },
+            )
+            .await?;
+            return Ok(result::encode_schema_change(
+                "DROPPED",
+                "TABLE",
+                &[ks, &s.table],
+            ));
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::DropTable {
@@ -12428,7 +12635,7 @@ fn filter_value_to_term(value: &str, cql_type: &CqlType) -> Result<Term, CqlErro
 /// encoding the value to storage bytes. Every failure is loud — a partial index
 /// with a broken clause would silently index the wrong rows.
 fn build_filter_clause(
-    state: &SharedState,
+    state: &SessionCore,
     ks: &str,
     table: &str,
     column: &str,
@@ -12481,7 +12688,7 @@ fn build_filter_clause(
 /// Every missing/invalid option fails loud — a partial index with a broken
 /// predicate would silently index the wrong rows, an unsound result.
 fn build_filter_predicate_from_options(
-    state: &SharedState,
+    state: &SessionCore,
     ks: &str,
     table: &str,
     options: &HashMap<String, String>,
@@ -12872,18 +13079,101 @@ async fn route_create_index(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            // Dogfood: persist the system_schema.indexes row so the storage-backed
-            // SELECT path returns it. The cluster/pair DDL paths persist this via
-            // SystemTableWriter on the leader; standalone Direct mode writes it here.
-            persist_index_row_direct(&state.engine, &index_meta);
-            state.schema.create_index(index_meta, ctx.auth)?;
+            let mut index_meta = index_meta.clone();
+            let keyspace = ks.to_string();
+            let table = s.table.clone();
+            run_direct_table_change(
+                state,
+                ctx.auth,
+                SchemaChangeType::Created,
+                move |core, auth| {
+                    let ks = keyspace.as_str();
+                    // Revalidate after the asynchronous wait, before any metadata effect.
+                    core.schema.check_permission(
+                        auth,
+                        Permission::Alter,
+                        &Resource::Table(ks.to_string(), table.clone()),
+                    )?;
+                    let snap = core.schema.snapshot();
+                    let existing = snap
+                        .indexes
+                        .keys()
+                        .any(|(index_ks, _, name)| index_ks == ks && name == &index_meta.name);
+                    if existing {
+                        if s.if_not_exists {
+                            return Ok(DirectTableChange::Unchanged);
+                        }
+                        return Err(CqlError::Invalid(format!(
+                            "index '{}.{}' already exists",
+                            ks, index_meta.name
+                        )));
+                    }
+                    let parent = snap
+                        .tables
+                        .get(&(keyspace.clone(), table.clone()))
+                        .ok_or_else(|| {
+                            CqlError::from(ferrosa_schema::SchemaError::TableNotFound(
+                                keyspace.clone(),
+                                table.clone(),
+                            ))
+                        })?;
+                    if index_meta.target_columns.is_empty() {
+                        return Err(CqlError::Invalid(
+                            "index requires at least one target column".to_string(),
+                        ));
+                    }
+                    for column in &index_meta.target_columns {
+                        let metadata = parent.columns.get(column).ok_or_else(|| {
+                            CqlError::Invalid(format!(
+                                "index target column '{column}' not found in {ks}.{table}"
+                            ))
+                        })?;
+                        if index_meta.index_type == IndexType::Vector
+                            && ferrosa_common::schema::vector_dimension(&metadata.column_type)
+                                .is_none()
+                        {
+                            return Err(CqlError::Invalid(format!(
+                                "vector index target column '{column}' has non-vector type '{}'",
+                                metadata.column_type
+                            )));
+                        }
+                    }
+                    if index_meta.index_type == IndexType::Filtered {
+                        let predicate = build_filter_predicate_from_options(
+                            core,
+                            ks,
+                            &table,
+                            &index_meta.options,
+                        )?;
+                        let encoded = predicate.to_option_string().map_err(|error| {
+                            CqlError::ServerError(format!(
+                                "failed to serialize filter predicate: {error}"
+                            ))
+                        })?;
+                        index_meta
+                            .options
+                            .insert(FILTER_PREDICATE_OPTION_KEY.to_string(), encoded);
+                        index_meta.filter_predicate = Some(predicate);
+                    }
+                    persist_index_row_direct(&core.engine, &index_meta);
+                    core.schema.create_index(index_meta.clone(), auth)?;
+                    wire_created_index(core, &index_meta, vector_method)?;
+                    Ok(DirectTableChange::Applied(TableId::new(ks, &table)))
+                },
+            )
+            .await?;
+            return Ok(result::encode_schema_change(
+                "CREATED",
+                "TABLE",
+                &[ks, &s.table],
+            ));
         }
         DdlPath::Pair(coordinator) => {
-            let op = DdlOperation::CreateIndex(index_meta);
+            let op = DdlOperation::CreateIndex(index_meta.clone());
             coordinator.coordinate_ddl(op).await?;
         }
         DdlPath::Cluster { .. } => {
-            let op = DdlOperation::CreateIndex(index_meta);
+            let op = DdlOperation::CreateIndex(index_meta.clone());
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
         DdlPath::Unavailable | DdlPath::Forming { .. } => {
@@ -12893,17 +13183,48 @@ async fn route_create_index(
         }
     }
 
+    wire_created_index(state, &index_meta, vector_method)?;
+
+    // CQL native protocol schema-change events do not define an INDEX target.
+    // Report the owning table so clients refresh the table metadata, including
+    // its newly created index.
+    emit_schema_change(
+        state,
+        SchemaChangeType::Created,
+        SchemaTarget::Table,
+        ks,
+        Some(&s.table),
+    );
+
+    Ok(result::encode_schema_change(
+        "CREATED",
+        "TABLE",
+        &[ks, &s.table],
+    ))
+}
+
+fn wire_created_index(
+    state: &SessionCore,
+    metadata: &IndexMetadata,
+    vector_method: Option<ferrosa_storage::VectorIndexMethod>,
+) -> Result<(), CqlError> {
+    let ks = metadata.keyspace.as_str();
+    let table = metadata.table.clone();
+    let index_name = metadata.name.clone();
+    let index_type = metadata.index_type;
+    let filter_predicate = metadata.filter_predicate.clone();
+    let columns = &metadata.target_columns;
     // Notify the storage engine about the new index so future memtable writes
     // are indexed. We look up the column position from the post-DDL schema
     // snapshot. Only the first target column is wired (composite index support
     // is deferred). If the table is not yet registered with the engine (e.g.,
     // schema-only mode), a warning is logged but the operation does not fail.
-    if let Some(target_col) = s.columns.first() {
+    if let Some(target_col) = columns.first() {
         let snap = state.schema.snapshot();
-        let table_id = TableId::new(ks, &s.table);
+        let table_id = TableId::new(ks, &table);
         let col_info = snap
             .tables
-            .get(&(ks.to_string(), s.table.clone()))
+            .get(&(ks.to_string(), table.clone()))
             .and_then(|tbl| {
                 // The memtable/SSTable cell position is the *storage* column
                 // index (statics then regulars, each sorted by Cassandra's
@@ -12961,7 +13282,7 @@ async fn route_create_index(
                 tracing::warn!(
                     %e,
                     index_name,
-                    table = %format!("{ks}.{}", s.table),
+                    table = %format!("{ks}.{}", table),
                     "router: CREATE INDEX failed to wire index to storage engine"
                 );
             }
@@ -12973,14 +13294,14 @@ async fn route_create_index(
             // index was persisted in schema but NEVER wired to storage — the
             // planner then offered a permanently-empty index whose reads
             // degraded to silent full scans.
-            let clustering_component = snap
-                .tables
-                .get(&(ks.to_string(), s.table.clone()))
-                .and_then(|tbl| {
-                    tbl.clustering_key
-                        .iter()
-                        .position(|(name, _)| name == target_col)
-                });
+            let clustering_component =
+                snap.tables
+                    .get(&(ks.to_string(), table.clone()))
+                    .and_then(|tbl| {
+                        tbl.clustering_key
+                            .iter()
+                            .position(|(name, _)| name == target_col)
+                    });
             match clustering_component {
                 Some(component)
                     if matches!(
@@ -13000,7 +13321,7 @@ async fn route_create_index(
                         tracing::warn!(
                             %e,
                             index_name,
-                            table = %format!("{ks}.{}", s.table),
+                            table = %format!("{ks}.{}", table),
                             "router: CREATE INDEX failed to wire clustering-column \
                              index to storage engine"
                         );
@@ -13011,7 +13332,7 @@ async fn route_create_index(
                         index_name,
                         target_col,
                         ?index_type,
-                        table = %format!("{ks}.{}", s.table),
+                        table = %format!("{ks}.{}", table),
                         "router: CREATE INDEX on a clustering column supports scalar \
                          index kinds only — index registered in schema but NOT wired \
                          to storage (reads on it will scan)"
@@ -13028,7 +13349,7 @@ async fn route_create_index(
                     // its zero rows as a complete answer.
                     let partition_component = snap
                         .tables
-                        .get(&(ks.to_string(), s.table.clone()))
+                        .get(&(ks.to_string(), table.clone()))
                         .and_then(|tbl| {
                             tbl.partition_key.iter().position(|name| name == target_col)
                         });
@@ -13054,7 +13375,7 @@ async fn route_create_index(
                                     tracing::error!(
                                         ?outcome,
                                         index_name,
-                                        table = %format!("{ks}.{}", s.table),
+                                        table = %format!("{ks}.{}", table),
                                         "router: CREATE INDEX backfill did NOT complete; the \
                                          partition-key index is stale and refuses reads until \
                                          `ferrosa-ctl index rebuild` finishes it"
@@ -13065,7 +13386,7 @@ async fn route_create_index(
                                     tracing::warn!(
                                         %e,
                                         index_name,
-                                        table = %format!("{ks}.{}", s.table),
+                                        table = %format!("{ks}.{}", table),
                                         "router: CREATE INDEX failed to wire \
                                          partition-key index to storage engine"
                                     );
@@ -13077,7 +13398,7 @@ async fn route_create_index(
                                 index_name,
                                 target_col,
                                 ?index_type,
-                                table = %format!("{ks}.{}", s.table),
+                                table = %format!("{ks}.{}", table),
                                 "router: CREATE INDEX on a partition-key column \
                                  supports scalar index kinds only — index registered \
                                  in schema but NOT wired to storage (reads on it \
@@ -13088,7 +13409,7 @@ async fn route_create_index(
                             tracing::warn!(
                                 index_name,
                                 target_col,
-                                table = %format!("{ks}.{}", s.table),
+                                table = %format!("{ks}.{}", table),
                                 "router: CREATE INDEX target is an unknown column — \
                                  index registered in schema but NOT wired to storage \
                                  (reads on it will scan)"
@@ -13100,22 +13421,29 @@ async fn route_create_index(
         }
     }
 
-    // CQL native protocol schema-change events do not define an INDEX target.
-    // Report the owning table so clients refresh the table metadata, including
-    // its newly created index.
-    emit_schema_change(
-        state,
-        SchemaChangeType::Created,
-        SchemaTarget::Table,
-        ks,
-        Some(&s.table),
-    );
+    Ok(())
+}
 
-    Ok(result::encode_schema_change(
-        "CREATED",
-        "TABLE",
-        &[ks, &s.table],
-    ))
+/// Resolve a keyspace-wide index name without choosing an arbitrary owner.
+/// Historical registries may contain the same name on more than one table.
+fn resolve_index_owner(
+    schema: &Schema,
+    keyspace: &str,
+    index_name: &str,
+) -> Result<Option<String>, CqlError> {
+    let snapshot = schema.snapshot();
+    let mut owners = snapshot
+        .indexes
+        .keys()
+        .filter(|(ks, _, name)| ks == keyspace && name == index_name)
+        .map(|(_, table, _)| table);
+    let owner = owners.next().cloned();
+    if owners.next().is_some() {
+        return Err(CqlError::Invalid(format!(
+            "index '{keyspace}.{index_name}' is ambiguous"
+        )));
+    }
+    Ok(owner)
 }
 
 async fn route_drop_index(
@@ -13125,13 +13453,7 @@ async fn route_drop_index(
 ) -> Result<BytesMut, CqlError> {
     let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
 
-    // Look up which table owns this index by scanning the schema snapshot
-    let snap = state.schema.snapshot();
-    let table_name = snap
-        .indexes
-        .keys()
-        .find(|(k, _t, n)| k == ks && n == &s.name)
-        .map(|(_, t, _)| t.clone());
+    let table_name = resolve_index_owner(&state.schema, ks, &s.name)?;
 
     let table_name = match table_name {
         Some(t) => t,
@@ -13161,16 +13483,51 @@ async fn route_drop_index(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            state
-                .schema
-                .drop_index(ks, &table_name, &s.name, ctx.auth)?;
-            state
-                .engine
-                .drop_index(&TableId::new(ks, &table_name), &s.name)
-                .map_err(|e| CqlError::ServerError(format!("drop index storage cleanup: {e}")))?;
-            // Tombstone the dogfooded system_schema.indexes row (cluster/pair
-            // paths do this via SystemTableWriter; Direct mode does it here).
-            tombstone_index_row_direct(&state.engine, ks, &table_name, &s.name);
+            let index_name = s.name.clone();
+            let keyspace = ks.to_string();
+            let table = table_name.clone();
+            let outcome = run_direct_table_change(
+                state,
+                ctx.auth,
+                SchemaChangeType::Dropped,
+                move |core, auth| {
+                    let ks = keyspace.as_str();
+                    let current_table = resolve_index_owner(&core.schema, ks, &index_name)?;
+                    // Even a conditional no-op retains the existing permission policy.
+                    let owner = current_table.as_ref().unwrap_or(&table);
+                    core.schema.check_permission(
+                        auth,
+                        Permission::Alter,
+                        &Resource::Table(keyspace.clone(), owner.clone()),
+                    )?;
+                    let Some(table) = current_table else {
+                        if s.if_exists {
+                            return Ok(DirectTableChange::Unchanged);
+                        }
+                        return Err(CqlError::Invalid(format!(
+                            "index '{index_name}' not found in keyspace '{ks}'"
+                        )));
+                    };
+                    core.schema.drop_index(ks, &table, &index_name, auth)?;
+                    core.engine
+                        .drop_index(&TableId::new(ks, &table), &index_name)
+                        .map_err(|e| {
+                            CqlError::ServerError(format!("drop index storage cleanup: {e}"))
+                        })?;
+                    tombstone_index_row_direct(&core.engine, ks, &table, &index_name);
+                    Ok(DirectTableChange::Applied(TableId::new(ks, &table)))
+                },
+            )
+            .await?;
+            let response_table = match outcome {
+                DirectTableChange::Applied(table) => table.table,
+                DirectTableChange::Unchanged => table_name.clone(),
+            };
+            return Ok(result::encode_schema_change(
+                "DROPPED",
+                "TABLE",
+                &[ks, &response_table],
+            ));
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::DropIndex {
@@ -13214,7 +13571,7 @@ async fn route_drop_index(
 
 // ── DDL: Role ────────────────────────────────────────────────────────────
 
-fn persist_role_row_direct(state: &SharedState, name: &str) -> Result<(), CqlError> {
+fn persist_role_row_direct(state: &SessionCore, name: &str) -> Result<(), CqlError> {
     let role = state
         .schema
         .snapshot()
@@ -13281,17 +13638,24 @@ async fn route_create_role(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            // Direct path: `Schema::create_role` hashes the cleartext under the
-            // write-lock; `create_role_hashed` validates and stores a supplied
-            // HASHED PASSWORD verbatim. Both emit the audit event.
-            if let Some(ref h) = s.hashed_password {
-                state.schema.create_role_hashed(base_role, h, ctx.auth)?;
-            } else {
-                state
-                    .schema
-                    .create_role(base_role, s.password.as_deref(), ctx.auth)?;
-            }
-            persist_role_row_direct(state, &s.name)?;
+            let name = s.name.clone();
+            let hashed_password = s.hashed_password.clone();
+            let password = s.password.clone();
+            run_direct_schema_change(state, ctx.auth, move |core, auth| {
+                core.schema
+                    .check_permission(auth, Permission::Create, &Resource::AllRoles)?;
+                if s.if_not_exists && core.schema.snapshot().roles.contains_key(&name) {
+                    return Ok(());
+                }
+                if let Some(hash) = hashed_password {
+                    core.schema.create_role_hashed(base_role, &hash, auth)?;
+                } else {
+                    core.schema
+                        .create_role(base_role, password.as_deref(), auth)?;
+                }
+                persist_role_row_direct(core, &name)
+            })
+            .await?;
         }
         DdlPath::Pair(_) | DdlPath::Cluster { .. } => {
             // Pair/Cluster paths: serialise `DdlOperation::CreateRole(role)`
@@ -13355,8 +13719,7 @@ async fn route_alter_role(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            // Direct path: `Schema::alter_role` hashes plaintext under the lock,
-            // or validates+stores a HASHED PASSWORD verbatim; emits the audit event.
+            let name = s.name.clone();
             let updates = RoleUpdates {
                 is_superuser: s.superuser,
                 can_login: s.login,
@@ -13364,8 +13727,11 @@ async fn route_alter_role(
                 hashed_password: s.hashed_password.clone(),
                 member_of: None,
             };
-            state.schema.alter_role(&s.name, updates, ctx.auth)?;
-            persist_role_row_direct(state, &s.name)?;
+            run_direct_schema_change(state, ctx.auth, move |core, auth| {
+                core.schema.alter_role(&name, updates, auth)?;
+                persist_role_row_direct(core, &name)
+            })
+            .await?;
         }
         DdlPath::Pair(_) | DdlPath::Cluster { .. } => {
             // Pair/Cluster paths: `alter_role_internal` (registry.rs:481)
@@ -13437,16 +13803,23 @@ async fn route_drop_role(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            state.schema.drop_role(&s.name, ctx.auth)?;
-            ferrosa_cluster::system_table_writer::SystemTableWriter::new(state.engine.clone())
-                .apply(
-                    ferrosa_schema::system::persistence::SystemTableMutation::RoleDropped(
-                        s.name.clone(),
-                    ),
-                )
-                .map_err(|e| {
-                    CqlError::ServerError(format!("persist dropped role {}: {e}", s.name))
-                })?;
+            let name = s.name.clone();
+            run_direct_schema_change(state, ctx.auth, move |core, auth| {
+                core.schema
+                    .check_permission(auth, Permission::Drop, &Resource::AllRoles)?;
+                if s.if_exists && !core.schema.snapshot().roles.contains_key(&name) {
+                    return Ok(());
+                }
+                core.schema.drop_role(&name, auth)?;
+                ferrosa_cluster::system_table_writer::SystemTableWriter::new(core.engine.clone())
+                    .apply(
+                        ferrosa_schema::system::persistence::SystemTableMutation::RoleDropped(
+                            name.clone(),
+                        ),
+                    )
+                    .map_err(|e| CqlError::ServerError(format!("persist dropped role {name}: {e}")))
+            })
+            .await?;
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::DropRole(s.name.clone());
@@ -13669,21 +14042,21 @@ async fn route_grant(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            // In-memory apply (also emits the audit event). Then run the same
-            // persisted DDL path the Pair/Cluster arms use so the grant is
-            // written to system_auth.role_permissions and survives a restart —
-            // standalone mode otherwise only updated memory, silently losing
-            // grants on restart (t_fb280b30). grant_internal is idempotent.
-            state
-                .schema
-                .grant(&s.role, &resource, perms.clone(), ctx.auth)?;
-            ddl.execute(DdlOperation::Grant(GrantEntry {
-                role: s.role.clone(),
-                resource,
-                permissions: perms,
-            }))
-            .await
-            .map_err(CqlError::from)?;
+            let role = s.role.clone();
+            run_direct_schema_change(state, ctx.auth, move |core, auth| {
+                core.schema.grant(&role, &resource, perms.clone(), auth)?;
+                ferrosa_cluster::ddl_path::apply_direct(
+                    &DdlOperation::Grant(GrantEntry {
+                        role,
+                        resource,
+                        permissions: perms,
+                    }),
+                    &core.schema,
+                    &core.engine,
+                )
+                .map_err(CqlError::from)
+            })
+            .await?;
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::Grant(GrantEntry {
@@ -13730,21 +14103,24 @@ async fn route_revoke(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            // In-memory apply (+ audit), then persist each revoke to
-            // system_auth.role_permissions so it survives a restart — else the
-            // revoked permission silently reappears after restart (t_fb280b30).
-            state
-                .schema
-                .revoke(&s.role, &resource, perms.clone(), ctx.auth)?;
-            for perm in perms {
-                ddl.execute(DdlOperation::Revoke {
-                    role: s.role.clone(),
-                    resource: resource.clone(),
-                    permission: perm,
-                })
-                .await
-                .map_err(CqlError::from)?;
-            }
+            let role = s.role.clone();
+            run_direct_schema_change(state, ctx.auth, move |core, auth| {
+                core.schema.revoke(&role, &resource, perms.clone(), auth)?;
+                for permission in perms {
+                    ferrosa_cluster::ddl_path::apply_direct(
+                        &DdlOperation::Revoke {
+                            role: role.clone(),
+                            resource: resource.clone(),
+                            permission,
+                        },
+                        &core.schema,
+                        &core.engine,
+                    )
+                    .map_err(CqlError::from)?;
+                }
+                Ok(())
+            })
+            .await?;
         }
         DdlPath::Pair(coordinator) => {
             // DdlOperation::Revoke carries one permission at a time; emit one
@@ -13826,11 +14202,13 @@ async fn route_grant_role(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            // Route through the persisted DDL path (apply_direct) so the
-            // membership change is written to system_auth.role_members and
-            // survives a restart — Direct mode previously only updated memory,
-            // silently losing role grants on restart (t_fb280b30).
-            ddl.execute(op).await.map_err(CqlError::from)?;
+            run_direct_schema_change(state, ctx.auth, move |core, auth| {
+                core.schema
+                    .check_permission(auth, Permission::Authorize, &Resource::Role(role))?;
+                ferrosa_cluster::ddl_path::apply_direct(&op, &core.schema, &core.engine)
+                    .map_err(CqlError::from)
+            })
+            .await?;
         }
         DdlPath::Pair(coordinator) => {
             coordinator.coordinate_ddl(op).await?;
@@ -16117,6 +16495,26 @@ fn cql_type_name_to_string(type_name: &CqlTypeName) -> String {
 
 // ── DDL: User-Defined Types ──────────────────────────────────────────────
 
+fn resolve_user_type(
+    schema: &Schema,
+    keyspace: &str,
+    name: &str,
+    fields: &[(String, CqlTypeName)],
+) -> Result<UserTypeMetadata, CqlError> {
+    let fields = fields
+        .iter()
+        .map(|(name, field_type)| {
+            bridge::resolve_type_name(field_type, keyspace, schema)
+                .map(|resolved| (name.clone(), resolved))
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(UserTypeMetadata {
+        keyspace: keyspace.to_string(),
+        name: name.to_string(),
+        fields,
+    })
+}
+
 async fn route_create_type(
     state: &SharedState,
     ctx: &RequestContext<'_>,
@@ -16145,34 +16543,38 @@ async fn route_create_type(
         ));
     }
 
-    // Resolve field types using bridge::resolve_type_name
-    let resolved_fields: Vec<(String, CqlType)> = fields
-        .iter()
-        .map(|(fname, ftype)| {
-            let resolved = bridge::resolve_type_name(ftype, &ks, &state.schema)?;
-            Ok((fname.clone(), resolved))
-        })
-        .collect::<Result<_, CqlError>>()?;
-
-    let udt = UserTypeMetadata {
-        keyspace: ks.clone(),
-        name: name.clone(),
-        fields: resolved_fields,
-    };
-
     let ddl_guard = state.ddl_path.load();
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            ddl.execute(DdlOperation::CreateType(udt))
-                .await
-                .map_err(CqlError::from)?;
+            let job_keyspace = ks.clone();
+            let job_name = name.clone();
+            run_direct_schema_change(state, ctx.auth, move |core, auth| {
+                core.schema.check_permission(
+                    auth,
+                    Permission::Create,
+                    &Resource::Keyspace(job_keyspace.clone()),
+                )?;
+                if if_not_exists && core.schema.get_type(&job_keyspace, &job_name).is_some() {
+                    return Ok(());
+                }
+                let udt = resolve_user_type(&core.schema, &job_keyspace, &job_name, &fields)?;
+                ferrosa_cluster::ddl_path::apply_direct(
+                    &DdlOperation::CreateType(udt),
+                    &core.schema,
+                    &core.engine,
+                )
+                .map_err(CqlError::from)
+            })
+            .await?;
         }
         DdlPath::Pair(coordinator) => {
+            let udt = resolve_user_type(&state.schema, &ks, &name, &fields)?;
             let op = DdlOperation::CreateType(udt);
             coordinator.coordinate_ddl(op).await?;
         }
         DdlPath::Cluster { .. } => {
+            let udt = resolve_user_type(&state.schema, &ks, &name, &fields)?;
             let op = DdlOperation::CreateType(udt);
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
@@ -16206,47 +16608,55 @@ async fn route_alter_type(
         .schema
         .check_permission(ctx.auth, Permission::Alter, &Resource::Keyspace(ks.clone()))?;
 
-    for alt in alterations {
-        match alt {
-            TypeAlteration::AddField {
-                name: fname,
-                field_type,
-            } => {
-                let resolved = bridge::resolve_type_name(&field_type, &ks, &state.schema)?;
-                state
-                    .schema
-                    .alter_type_add_field(&ks, &name, &fname, resolved)
-                    .map_err(|e| CqlError::Invalid(format!("alter type: {e}")))?;
-            }
-            TypeAlteration::RenameField { from, to } => {
-                state
-                    .schema
-                    .alter_type_rename_field(&ks, &name, &from, &to)
-                    .map_err(|e| CqlError::Invalid(format!("alter type: {e}")))?;
-            }
-            TypeAlteration::AlterField { .. } => {
-                // ALTER TYPE ... ALTER field TYPE is deprecated in Cassandra; defer
+    let job_keyspace = ks.clone();
+    let job_name = name.clone();
+    run_direct_schema_change(state, ctx.auth, move |core, auth| {
+        let ks = job_keyspace;
+        let name = job_name;
+        core.schema
+            .check_permission(auth, Permission::Alter, &Resource::Keyspace(ks.clone()))?;
+        for alt in alterations {
+            match alt {
+                TypeAlteration::AddField {
+                    name: fname,
+                    field_type,
+                } => {
+                    let resolved = bridge::resolve_type_name(&field_type, &ks, &core.schema)?;
+                    core.schema
+                        .alter_type_add_field(&ks, &name, &fname, resolved)
+                        .map_err(|e| CqlError::Invalid(format!("alter type: {e}")))?;
+                }
+                TypeAlteration::RenameField { from, to } => {
+                    core.schema
+                        .alter_type_rename_field(&ks, &name, &from, &to)
+                        .map_err(|e| CqlError::Invalid(format!("alter type: {e}")))?;
+                }
+                TypeAlteration::AlterField { .. } => {
+                    // ALTER TYPE ... ALTER field TYPE is deprecated in Cassandra; defer
+                }
             }
         }
-    }
 
-    // Re-persist the altered UDT to the dogfooded `system_schema.types` table so
-    // the storage-served read path reflects the change after restart. ALTER TYPE
-    // mutates the Registry in place (not via the DDL `SystemTableWriter`), so we
-    // upsert the row here — same PK (keyspace) + clustering (type_name) as the
-    // CREATE path, overwriting the previous field list.
-    if let Some(updated) = state.schema.get_type(&ks, &name) {
-        let row = ferrosa_schema::system::persistence::type_to_row(&updated);
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros() as i64)
-            .unwrap_or(0);
-        let tid = TableId::new("system_schema", "types");
-        state
-            .engine
-            .write(&tid, &row.key, row.row, ts)
-            .map_err(|e| CqlError::ServerError(format!("persist altered type: {e}")))?;
-    }
+        // Re-persist the altered UDT to the dogfooded `system_schema.types` table so
+        // the storage-served read path reflects the change after restart. ALTER TYPE
+        // mutates the Registry in place (not via the DDL `SystemTableWriter`), so we
+        // upsert the row here — same PK (keyspace) + clustering (type_name) as the
+        // CREATE path, overwriting the previous field list.
+        if let Some(updated) = core.schema.get_type(&ks, &name) {
+            let row = ferrosa_schema::system::persistence::type_to_row(&updated);
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as i64)
+                .unwrap_or(0);
+            let tid = TableId::new("system_schema", "types");
+            core.engine
+                .write(&tid, &row.key, row.row, ts)
+                .map_err(|e| CqlError::ServerError(format!("persist altered type: {e}")))?;
+        }
+
+        Ok(())
+    })
+    .await?;
 
     Ok(result::encode_schema_change(
         "UPDATED",
@@ -16284,12 +16694,28 @@ async fn route_drop_type(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            ddl.execute(DdlOperation::DropType {
-                keyspace: ks.clone(),
-                name: name.clone(),
+            let job_keyspace = ks.clone();
+            let job_name = name.clone();
+            run_direct_schema_change(state, ctx.auth, move |core, auth| {
+                core.schema.check_permission(
+                    auth,
+                    Permission::Drop,
+                    &Resource::Keyspace(job_keyspace.clone()),
+                )?;
+                if if_exists && core.schema.get_type(&job_keyspace, &job_name).is_none() {
+                    return Ok(());
+                }
+                ferrosa_cluster::ddl_path::apply_direct(
+                    &DdlOperation::DropType {
+                        keyspace: job_keyspace,
+                        name: job_name,
+                    },
+                    &core.schema,
+                    &core.engine,
+                )
+                .map_err(CqlError::from)
             })
-            .await
-            .map_err(CqlError::from)?;
+            .await?;
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::DropType {
@@ -16441,6 +16867,25 @@ async fn load_function_body(body: &FunctionBodySource) -> Result<(Vec<u8>, Strin
     }
 }
 
+fn compile_function_component(
+    state: &SessionCore,
+    keyspace: &str,
+    name: &str,
+    arg_types: &[ferrosa_common::CqlType],
+    wasm_bytes: &[u8],
+) -> Result<(), CqlError> {
+    if ferrosa_udf::UdfExecutor::wasm_declares_streaming_aggregate_abi(wasm_bytes) {
+        state
+            .udf_executor
+            .compile_streaming_aggregate(keyspace, name, arg_types, wasm_bytes)
+    } else {
+        state
+            .udf_executor
+            .compile(keyspace, name, arg_types, wasm_bytes)
+    }
+    .map_err(CqlError::from)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn route_create_function(
     state: &SharedState,
@@ -16534,17 +16979,6 @@ async fn route_create_function(
     } else {
         load_function_body(&body).await?
     };
-    if ferrosa_udf::UdfExecutor::wasm_declares_streaming_aggregate_abi(&wasm_bytes) {
-        state
-            .udf_executor
-            .compile_streaming_aggregate(&ks, &name, &arg_types, &wasm_bytes)
-            .map_err(CqlError::from)?;
-    } else {
-        state
-            .udf_executor
-            .compile(&ks, &name, &arg_types, &wasm_bytes)
-            .map_err(CqlError::from)?;
-    }
     let drop_arg_types = arg_types.clone();
 
     let func_meta = UserFunctionMetadata {
@@ -16560,20 +16994,65 @@ async fn route_create_function(
 
     let ddl_guard = state.ddl_path.load();
     let ddl = &**ddl_guard;
+    if !matches!(ddl, DdlPath::Direct { .. }) {
+        compile_function_component(state, &ks, &name, &func_meta.arg_types, &wasm_bytes)?;
+    }
     match ddl {
         DdlPath::Direct { .. } => {
-            if replacing_existing {
-                ddl.execute(DdlOperation::DropFunction {
-                    keyspace: ks.clone(),
-                    name: name.clone(),
-                    arg_types: drop_arg_types.clone(),
-                })
-                .await
-                .map_err(CqlError::from)?;
-            }
-            ddl.execute(DdlOperation::CreateFunction(func_meta))
-                .await
-                .map_err(CqlError::from)?;
+            run_direct_schema_change(state, ctx.auth, move |core, auth| {
+                if !auth.is_superuser {
+                    return Err(CqlError::Invalid(
+                        "CREATE FUNCTION requires a superuser role".into(),
+                    ));
+                }
+                core.schema.check_permission(
+                    auth,
+                    Permission::Alter,
+                    &Resource::Keyspace(func_meta.keyspace.clone()),
+                )?;
+                let exists = core
+                    .schema
+                    .get_function(&func_meta.keyspace, &func_meta.name, &func_meta.arg_types)
+                    .is_some();
+                if exists && if_not_exists {
+                    return Ok(());
+                }
+                if exists && !or_replace {
+                    return Err(CqlError::Invalid(format!(
+                        "function {}.{} already exists",
+                        func_meta.keyspace, func_meta.name
+                    )));
+                }
+                // Validate and publish the component before removing the old
+                // metadata. Both persisted operations remain in this same job
+                // if the awaiting request is dropped.
+                compile_function_component(
+                    core,
+                    &func_meta.keyspace,
+                    &func_meta.name,
+                    &func_meta.arg_types,
+                    &wasm_bytes,
+                )?;
+                if exists {
+                    ferrosa_cluster::ddl_path::apply_direct(
+                        &DdlOperation::DropFunction {
+                            keyspace: func_meta.keyspace.clone(),
+                            name: func_meta.name.clone(),
+                            arg_types: func_meta.arg_types.clone(),
+                        },
+                        &core.schema,
+                        &core.engine,
+                    )
+                    .map_err(CqlError::from)?;
+                }
+                ferrosa_cluster::ddl_path::apply_direct(
+                    &DdlOperation::CreateFunction(func_meta),
+                    &core.schema,
+                    &core.engine,
+                )
+                .map_err(CqlError::from)
+            })
+            .await?;
         }
         DdlPath::Pair(coordinator) => {
             if replacing_existing {
@@ -16700,22 +17179,45 @@ async fn route_drop_function(
         ));
     }
 
-    // Invalidate cached compilation
-    state
-        .udf_executor
-        .invalidate(&ks, &name, &resolved_arg_types);
-
     let ddl_guard = state.ddl_path.load();
     let ddl = &**ddl_guard;
+    if !matches!(ddl, DdlPath::Direct { .. }) {
+        state
+            .udf_executor
+            .invalidate(&ks, &name, &resolved_arg_types);
+    }
     match ddl {
         DdlPath::Direct { .. } => {
-            ddl.execute(DdlOperation::DropFunction {
-                keyspace: ks.clone(),
-                name: name.clone(),
-                arg_types: resolved_arg_types,
+            let keyspace = ks.clone();
+            let function_name = name.clone();
+            run_direct_schema_change(state, ctx.auth, move |core, auth| {
+                core.schema.check_permission(
+                    auth,
+                    Permission::Alter,
+                    &Resource::Keyspace(keyspace.clone()),
+                )?;
+                if if_exists
+                    && core
+                        .schema
+                        .get_function(&keyspace, &function_name, &resolved_arg_types)
+                        .is_none()
+                {
+                    return Ok(());
+                }
+                core.udf_executor
+                    .invalidate(&keyspace, &function_name, &resolved_arg_types);
+                ferrosa_cluster::ddl_path::apply_direct(
+                    &DdlOperation::DropFunction {
+                        keyspace,
+                        name: function_name,
+                        arg_types: resolved_arg_types,
+                    },
+                    &core.schema,
+                    &core.engine,
+                )
+                .map_err(CqlError::from)
             })
-            .await
-            .map_err(CqlError::from)?;
+            .await?;
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::DropFunction {
@@ -16786,96 +17288,136 @@ async fn route_create_aggregate(
         .map(bridge::cql_type_display_name)
         .collect();
 
-    // Resolve state type
-    let resolved_state_type = bridge::resolve_type_name(&state_type, &ks, &state.schema)?;
-    let common_state_type = cql_type_to_common(&resolved_state_type);
+    let definition_keyspace = ks.clone();
+    let definition_name = name.clone();
+    let definition_args = arg_types.clone();
+    let resolve_metadata = move |schema: &Schema| -> Result<UserAggregateMetadata, CqlError> {
+        // Resolve state type
+        let resolved_state_type =
+            bridge::resolve_type_name(&state_type, &definition_keyspace, schema)?;
+        let common_state_type = cql_type_to_common(&resolved_state_type);
 
-    // Validate state function exists. The state function takes (state_type, arg_types...) as params.
-    let mut sfunc_arg_types = vec![common_state_type.clone()];
-    sfunc_arg_types.extend(arg_types.iter().cloned());
-    if state
-        .schema
-        .get_function(&ks, &state_func, &sfunc_arg_types)
-        .is_none()
-    {
-        return Err(CqlError::Invalid(format!(
-            "state function {ks}.{state_func} not found with expected signature"
-        )));
-    }
-
-    // Determine return type: final_func return type if present, otherwise state_type.
-    let return_type = if let Some(ref ff_name) = final_func {
-        // Final function takes a single arg of the state type
-        let ff_args = vec![common_state_type.clone()];
-        match state.schema.get_function(&ks, ff_name, &ff_args) {
-            Some(ff_meta) => ff_meta.return_type.clone(),
-            None => {
-                return Err(CqlError::Invalid(format!(
-                    "final function {ks}.{ff_name} not found with expected signature"
-                )));
-            }
-        }
-    } else {
-        common_state_type.clone()
-    };
-
-    // Resolve init_cond if present
-    let resolved_init_cond = if let Some(ref term) = init_cond {
-        let cql_state_type = &resolved_state_type;
-        Some(bridge::term_to_cql_value(term, cql_state_type)?)
-    } else {
-        None
-    };
-
-    // Convert the CqlValue (wire type) to common CqlValue
-    let common_init_cond = resolved_init_cond.map(|v| cql_value_to_common(&v));
-
-    // Check for existing aggregate
-    let existing = state.schema.get_aggregate(&ks, &name, &arg_types);
-    if existing.is_some() {
-        if or_replace {
-            // Will be replaced by the new creation
-        } else if if_not_exists {
-            return Ok(result::encode_schema_change_with_args(
-                "CREATED",
-                "AGGREGATE",
-                &[&ks, &name],
-                &agg_arg_type_names,
-            ));
-        } else {
+        // Validate state function exists. The state function takes (state_type, definition_args...) as params.
+        let mut sfunc_arg_types = vec![common_state_type.clone()];
+        sfunc_arg_types.extend(definition_args.iter().cloned());
+        if schema
+            .get_function(&definition_keyspace, &state_func, &sfunc_arg_types)
+            .is_none()
+        {
             return Err(CqlError::Invalid(format!(
-                "aggregate {ks}.{name} already exists"
+                "state function {definition_keyspace}.{state_func} not found with expected signature"
             )));
         }
-    }
 
-    let agg_meta = UserAggregateMetadata {
-        keyspace: ks.clone(),
-        name: name.clone(),
-        arg_types,
-        state_func,
-        state_type: common_state_type,
-        final_func,
-        init_cond: common_init_cond,
-        return_type,
-        wasm_body: None,
+        // Determine return type: final_func return type if present, otherwise state_type.
+        let return_type = if let Some(ref ff_name) = final_func {
+            // Final function takes a single arg of the state type
+            let ff_args = vec![common_state_type.clone()];
+            match schema.get_function(&definition_keyspace, ff_name, &ff_args) {
+                Some(ff_meta) => ff_meta.return_type.clone(),
+                None => {
+                    return Err(CqlError::Invalid(format!(
+                        "final function {definition_keyspace}.{ff_name} not found with expected signature"
+                    )));
+                }
+            }
+        } else {
+            common_state_type.clone()
+        };
+
+        // Resolve init_cond if present
+        let resolved_init_cond = if let Some(ref term) = init_cond {
+            let cql_state_type = &resolved_state_type;
+            Some(bridge::term_to_cql_value(term, cql_state_type)?)
+        } else {
+            None
+        };
+
+        // Convert the CqlValue (wire type) to common CqlValue
+        let common_init_cond = resolved_init_cond.map(|v| cql_value_to_common(&v));
+
+        let metadata = UserAggregateMetadata {
+            keyspace: definition_keyspace.clone(),
+            name: definition_name.clone(),
+            arg_types: definition_args,
+            state_func,
+            state_type: common_state_type,
+            final_func,
+            init_cond: common_init_cond,
+            return_type,
+            wasm_body: None,
+        };
+
+        Ok(metadata)
     };
 
     let ddl_guard = state.ddl_path.load();
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            ddl.execute(DdlOperation::CreateAggregate(agg_meta))
-                .await
-                .map_err(CqlError::from)?;
+            let keyspace = ks.clone();
+            let aggregate_name = name.clone();
+            run_direct_schema_change(state, ctx.auth, move |core, auth| {
+                core.schema.check_permission(
+                    auth,
+                    Permission::Alter,
+                    &Resource::Keyspace(keyspace.clone()),
+                )?;
+                let existing = core
+                    .schema
+                    .get_aggregate(&keyspace, &aggregate_name, &arg_types)
+                    .is_some();
+                if existing && if_not_exists {
+                    return Ok(());
+                }
+                if existing && !or_replace {
+                    return Err(CqlError::Invalid(format!(
+                        "aggregate {keyspace}.{aggregate_name} already exists"
+                    )));
+                }
+                let aggregate = resolve_metadata(&core.schema)?;
+                ferrosa_cluster::ddl_path::apply_direct(
+                    &DdlOperation::CreateAggregate(aggregate),
+                    &core.schema,
+                    &core.engine,
+                )
+                .map_err(CqlError::from)
+            })
+            .await?;
         }
-        DdlPath::Pair(coordinator) => {
-            let op = DdlOperation::CreateAggregate(agg_meta);
-            coordinator.coordinate_ddl(op).await?;
-        }
-        DdlPath::Cluster { .. } => {
-            let op = DdlOperation::CreateAggregate(agg_meta);
-            ddl.execute(op).await.map_err(CqlError::from)?;
+        DdlPath::Pair(_) | DdlPath::Cluster { .. } => {
+            let agg_meta = resolve_metadata(&state.schema)?;
+            // Check for existing aggregate
+            let existing = state.schema.get_aggregate(&ks, &name, &arg_types);
+            if existing.is_some() {
+                if or_replace {
+                    // Will be replaced by the new creation
+                } else if if_not_exists {
+                    return Ok(result::encode_schema_change_with_args(
+                        "CREATED",
+                        "AGGREGATE",
+                        &[&ks, &name],
+                        &agg_arg_type_names,
+                    ));
+                } else {
+                    return Err(CqlError::Invalid(format!(
+                        "aggregate {ks}.{name} already exists"
+                    )));
+                }
+            }
+
+            match ddl {
+                DdlPath::Pair(coordinator) => {
+                    coordinator
+                        .coordinate_ddl(DdlOperation::CreateAggregate(agg_meta))
+                        .await?
+                }
+                DdlPath::Cluster { .. } => ddl
+                    .execute(DdlOperation::CreateAggregate(agg_meta))
+                    .await
+                    .map_err(CqlError::from)?,
+                _ => unreachable!("matched in outer match"),
+            }
         }
         DdlPath::Unavailable | DdlPath::Forming { .. } => {
             return Err(CqlError::ServerError(
@@ -16981,13 +17523,34 @@ async fn route_drop_aggregate(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            ddl.execute(DdlOperation::DropAggregate {
-                keyspace: ks.clone(),
-                name: name.clone(),
-                arg_types: resolved_arg_types,
+            let keyspace = ks.clone();
+            let aggregate_name = name.clone();
+            run_direct_schema_change(state, ctx.auth, move |core, auth| {
+                core.schema.check_permission(
+                    auth,
+                    Permission::Alter,
+                    &Resource::Keyspace(keyspace.clone()),
+                )?;
+                if if_exists
+                    && core
+                        .schema
+                        .get_aggregate(&keyspace, &aggregate_name, &resolved_arg_types)
+                        .is_none()
+                {
+                    return Ok(());
+                }
+                ferrosa_cluster::ddl_path::apply_direct(
+                    &DdlOperation::DropAggregate {
+                        keyspace,
+                        name: aggregate_name,
+                        arg_types: resolved_arg_types,
+                    },
+                    &core.schema,
+                    &core.engine,
+                )
+                .map_err(CqlError::from)
             })
-            .await
-            .map_err(CqlError::from)?;
+            .await?;
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::DropAggregate {
@@ -17411,6 +17974,7 @@ fn term_has_udf_call(term: &Term) -> bool {
 
 #[cfg(test)]
 mod tests {
+    mod conditional_schema_tests;
     use super::*;
     use crate::virtual_tables::active_queries::ActiveQueriesTable;
     use crate::virtual_tables::connections::ConnectionsTable;
@@ -33725,6 +34289,1117 @@ mod tests {
     }
 
     // ── ALTER KEYSPACE routing ───────────────────────────────────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drop_keyspace_preserves_async_progress_while_journal_is_locked() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (state, dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        for cql in [
+            "CREATE KEYSPACE drop_progress WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE drop_progress.items (id int PRIMARY KEY, value text)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+        let table_dir = dir.path().join("sstables/drop_progress.items");
+        std::fs::create_dir_all(&table_dir).unwrap();
+        std::fs::write(table_dir.join("owned-marker"), b"cleanup must complete").unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.path().join(".dropped-tables.json.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        let escaped = Arc::new(AtomicBool::new(false));
+        let watchdog_escaped = escaped.clone();
+        let (release, signal) = std::sync::mpsc::channel();
+        let watchdog = std::thread::spawn(move || {
+            // Safety escape for the broken implementation, not a latency target.
+            let forced = signal
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_err();
+            watchdog_escaped.store(forced, Ordering::SeqCst);
+            lock.unlock().unwrap();
+        });
+        let mut events = state.event_sender.subscribe();
+        let dropping = route(
+            &state,
+            &ctx,
+            crate::parser::parse("DROP KEYSPACE drop_progress").unwrap(),
+        );
+        tokio::pin!(dropping);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut dropping => {
+                    assert!(
+                        !escaped.load(Ordering::SeqCst),
+                        "DROP blocked the async runtime until the filesystem-lock watchdog escaped"
+                    );
+                    result.expect("DROP failed before reaching its locked journal");
+                    panic!("DROP completed while its durable journal was locked");
+                }
+                _ = tokio::task::yield_now() => {}
+            }
+            if !state
+                .schema
+                .snapshot()
+                .keyspaces
+                .contains_key("drop_progress")
+            {
+                // The schema mutation proves we passed any earlier compaction
+                // awaits; the biased poll above still found DROP pending.
+                assert!(!escaped.load(Ordering::SeqCst));
+                assert!(matches!(
+                    events.try_recv(),
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                ));
+                break;
+            }
+        }
+        release.send(()).unwrap();
+        dropping.await.unwrap();
+        watchdog.join().unwrap();
+        assert!(!escaped.load(Ordering::SeqCst));
+        assert!(!table_dir.exists());
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            CqlEvent::SchemaChange {
+                change_type: SchemaChangeType::Dropped,
+                target: SchemaTarget::Keyspace,
+                keyspace,
+                ..
+            } if keyspace == "drop_progress"
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_drop_keeps_physical_cleanup_and_completion_notifications() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (state, dir) = setup();
+        let state = Arc::new(state);
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        for cql in [
+            "CREATE KEYSPACE drop_cancel WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE drop_cancel.items (id int PRIMARY KEY)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+        let table_dir = dir.path().join("sstables/drop_cancel.items");
+        std::fs::create_dir_all(&table_dir).unwrap();
+        std::fs::write(table_dir.join("owned-marker"), b"do not acknowledge early").unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.path().join(".dropped-tables.json.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        let escaped = Arc::new(AtomicBool::new(false));
+        let watchdog_escaped = escaped.clone();
+        let (release, signal) = std::sync::mpsc::channel();
+        let watchdog = std::thread::spawn(move || {
+            let forced = signal
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_err();
+            watchdog_escaped.store(forced, Ordering::SeqCst);
+            lock.unlock().unwrap();
+        });
+        let mut events = state.event_sender.subscribe();
+        let mut last_event = state.last_schema_event.subscribe();
+        last_event.borrow_and_update();
+        let task_state = state.clone();
+        let dropping = tokio::spawn(async move {
+            let ctx = RequestContext {
+                auth: &dev_auth(),
+                current_keyspace: &None,
+                consistency: ConsistencyLevel::One,
+                serial_consistency: None,
+                paging: crate::paging::PagingParams::default(),
+                client_address: String::new(),
+                protocol_version: 4,
+            };
+            route(
+                &task_state,
+                &ctx,
+                crate::parser::parse("DROP KEYSPACE drop_cancel").unwrap(),
+            )
+            .await
+        });
+        while state
+            .schema
+            .snapshot()
+            .keyspaces
+            .contains_key("drop_cancel")
+        {
+            assert!(!escaped.load(Ordering::SeqCst));
+            tokio::task::yield_now().await;
+        }
+        assert!(!dropping.is_finished());
+        dropping.abort();
+        match dropping.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("the request completed before cancellation"),
+        }
+        assert!(table_dir.exists(), "physical cleanup must still be blocked");
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        release.send(()).unwrap();
+        // Deadlock escape only: cancellation must not erase the job's event.
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await
+            .expect("cancelled requester lost the cleanup completion event")
+            .unwrap();
+        assert!(matches!(
+            event,
+            CqlEvent::SchemaChange {
+                change_type: SchemaChangeType::Dropped,
+                target: SchemaTarget::Keyspace,
+                keyspace,
+                ..
+            } if keyspace == "drop_cancel"
+        ));
+        last_event.changed().await.unwrap();
+        assert!(last_event.borrow().is_some());
+        watchdog.join().unwrap();
+        assert!(!escaped.load(Ordering::SeqCst));
+        assert!(!table_dir.exists());
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recreate_waits_for_previous_drop_physical_cleanup() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (state, dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        for cql in [
+            "CREATE KEYSPACE drop_recreate WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE drop_recreate.items (id int PRIMARY KEY)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.path().join(".dropped-tables.json.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        let escaped = Arc::new(AtomicBool::new(false));
+        let watchdog_escaped = escaped.clone();
+        let (release, signal) = std::sync::mpsc::channel();
+        let watchdog = std::thread::spawn(move || {
+            let forced = signal
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_err();
+            watchdog_escaped.store(forced, Ordering::SeqCst);
+            lock.unlock().unwrap();
+        });
+        let dropping = route(
+            &state,
+            &ctx,
+            crate::parser::parse("DROP KEYSPACE drop_recreate").unwrap(),
+        );
+        tokio::pin!(dropping);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut dropping => panic!("DROP completed before the owned journal lock was released"),
+                _ = tokio::task::yield_now() => {}
+            }
+            if !state
+                .schema
+                .snapshot()
+                .keyspaces
+                .contains_key("drop_recreate")
+            {
+                break;
+            }
+            assert!(!escaped.load(Ordering::SeqCst));
+        }
+        let creating = async {
+            for cql in [
+                "CREATE KEYSPACE drop_recreate WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+                "CREATE TABLE drop_recreate.items (id int PRIMARY KEY)",
+                "INSERT INTO drop_recreate.items (id) VALUES (99)",
+            ] {
+                route(&state, &ctx, crate::parser::parse(cql).unwrap()).await?;
+            }
+            Ok::<(), CqlError>(())
+        };
+        tokio::pin!(creating);
+        let mut early_result = None;
+        tokio::select! {
+            biased;
+            result = &mut creating => early_result = Some(result),
+            _ = std::future::ready(()) => {}
+        }
+        let published_before_cleanup = state
+            .schema
+            .snapshot()
+            .keyspaces
+            .contains_key("drop_recreate");
+        let escaped_before_release = escaped.load(Ordering::SeqCst);
+        let _ = release.send(());
+        dropping.await.unwrap();
+        let created = match early_result {
+            Some(result) => result,
+            None => creating.await,
+        };
+        watchdog.join().unwrap();
+        assert!(
+            !escaped_before_release,
+            "a concurrent CREATE blocked the request runtime on the DROP journal"
+        );
+        assert!(
+            !published_before_cleanup,
+            "CREATE published a new keyspace incarnation before the old physical cleanup completed"
+        );
+        created.unwrap();
+        let selected = route(
+            &state,
+            &ctx,
+            crate::parser::parse("SELECT id FROM drop_recreate.items WHERE id = 99").unwrap(),
+        )
+        .await
+        .unwrap();
+        let RouteResult::Result(body) = selected else {
+            panic!("SELECT must return rows");
+        };
+        assert_eq!(extract_row_count(&body), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drop_keyspace_records_all_intents_before_physical_cleanup() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (state, dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        for cql in [
+            "CREATE KEYSPACE drop_recreate WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE drop_recreate.items0 (id int PRIMARY KEY)",
+            "CREATE TABLE drop_recreate.items1 (id int PRIMARY KEY)",
+            "CREATE TABLE drop_recreate.items2 (id int PRIMARY KEY)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap()).await.unwrap();
+        }
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.path().join(".pending-table-sweeps.json.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        let escaped = Arc::new(AtomicBool::new(false));
+        let watchdog_escaped = escaped.clone();
+        let (release, signal) = std::sync::mpsc::channel();
+        let watchdog = std::thread::spawn(move || {
+            let forced = signal
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_err();
+            watchdog_escaped.store(forced, Ordering::SeqCst);
+            lock.unlock().unwrap();
+        });
+        let dropping = route(
+            &state,
+            &ctx,
+            crate::parser::parse("DROP KEYSPACE drop_recreate").unwrap(),
+        );
+        tokio::pin!(dropping);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut dropping => panic!("DROP completed before the owned journal lock was released"),
+                _ = tokio::task::yield_now() => {}
+            }
+            if !ferrosa_storage::table_drops::load(dir.path())
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            assert!(!escaped.load(Ordering::SeqCst));
+        }
+        let ledger = ferrosa_storage::table_drops::load(dir.path()).unwrap();
+        let intent_count = (0..3)
+            .filter(|i| ledger.contains_key(&format!("drop_recreate.items{i}")))
+            .count();
+        let remaining_directories = (0..3)
+            .filter(|i| {
+                dir.path()
+                    .join("sstables")
+                    .join(format!("drop_recreate.items{i}"))
+                    .exists()
+            })
+            .count();
+        let _ = release.send(());
+        dropping.await.unwrap();
+        watchdog.join().unwrap();
+        assert!(!escaped.load(Ordering::SeqCst), "journal watchdog escaped");
+        assert_eq!(
+            remaining_directories, 3,
+            "physical cleanup started before group pending intent was durable"
+        );
+        assert_eq!(
+            intent_count, 3,
+            "DROP KEYSPACE must durably record every table before physical cleanup starts"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_keyspace_physical_failure_retains_group_recovery_intents() {
+        let (state, dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        for cql in [
+            "CREATE KEYSPACE drop_recreate WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE drop_recreate.items0 (id int PRIMARY KEY)",
+            "CREATE TABLE drop_recreate.items1 (id int PRIMARY KEY)",
+            "CREATE TABLE drop_recreate.items2 (id int PRIMARY KEY)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap()).await.unwrap();
+        }
+        let physical = dir.path().join("sstables/drop_recreate.items1");
+        std::fs::remove_dir_all(&physical).unwrap();
+        std::fs::write(&physical, b"owned physical refusal fixture").unwrap();
+        let mut events = state.event_sender.subscribe();
+        let dropped = route(
+            &state,
+            &ctx,
+            crate::parser::parse("DROP KEYSPACE drop_recreate").unwrap(),
+        )
+        .await;
+        assert!(
+            dropped.is_err(),
+            "physical failure must refuse acknowledgement"
+        );
+        let pending = ferrosa_storage::table_drops::load_pending_sweeps(dir.path()).unwrap();
+        for index in 0..3 {
+            assert!(
+                pending.contains(&format!("drop_recreate.items{index}")),
+                "physical refusal lost a group recovery intent"
+            );
+        }
+        assert!(physical.is_file());
+        assert!(
+            events.try_recv().is_err(),
+            "failed physical drop published completion"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn type_mutations_recheck_permission_after_waiting_for_schema_writer() {
+        for (statement, permission, should_exist) in [
+            (
+                "CREATE TYPE permission_wait.new_type (id int)",
+                Permission::Create,
+                false,
+            ),
+            ("DROP TYPE permission_wait.old_type", Permission::Drop, true),
+        ] {
+            let (state, _dir) = setup();
+            let admin = dev_auth();
+            let mut ctx = RequestContext {
+                auth: &admin,
+                current_keyspace: &None,
+                consistency: ConsistencyLevel::One,
+                serial_consistency: None,
+                paging: crate::paging::PagingParams::default(),
+                client_address: String::new(),
+                protocol_version: 4,
+            };
+            for cql in [
+                "CREATE KEYSPACE permission_wait WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+                "CREATE ROLE type_waiter WITH LOGIN = false",
+                "CREATE TYPE permission_wait.old_type (id int)",
+            ] {
+                route(&state, &ctx, crate::parser::parse(cql).unwrap()).await.unwrap();
+            }
+            let resource = Resource::Keyspace("permission_wait".into());
+            state
+                .schema
+                .grant_internal(GrantEntry {
+                    role: "type_waiter".into(),
+                    resource: resource.clone(),
+                    permissions: [permission].into_iter().collect(),
+                })
+                .unwrap();
+            let caller = AuthContext {
+                role: "type_waiter".into(),
+                is_superuser: false,
+                must_change_password: false,
+            };
+            ctx.auth = &caller;
+            state
+                .schema
+                .check_permission(&caller, permission, &resource)
+                .unwrap();
+
+            let schema = state.schema.clone();
+            let (ready, held) = tokio::sync::oneshot::channel();
+            let (release, waiting) = std::sync::mpsc::channel();
+            let writer = std::thread::spawn(move || {
+                let _writer = schema.lifecycle_write();
+                ready.send(()).unwrap();
+                waiting
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                schema
+                    .revoke_internal("type_waiter", &resource, &permission)
+                    .unwrap();
+            });
+            held.await.unwrap();
+            let mutation = route(&state, &ctx, crate::parser::parse(statement).unwrap());
+            tokio::pin!(mutation);
+            // Poll through the initial permission check and enqueue the owned
+            // mutation while another schema writer still owns the fence.
+            assert!(futures::poll!(&mut mutation).is_pending());
+            release.send(()).unwrap();
+            let result = mutation.await;
+            writer.join().unwrap();
+            assert!(
+                matches!(result, Err(CqlError::Unauthorized(_))),
+                "a revoked grant must prevent {statement}: {:?}",
+                result.as_ref().err()
+            );
+            let name = if should_exist { "old_type" } else { "new_type" };
+            assert_eq!(
+                state.schema.get_type("permission_wait", name).is_some(),
+                should_exist
+            );
+        }
+    }
+
+    async fn assert_remaining_direct_permission_rechecked(statement: &str) {
+        let (state, _dir) = setup();
+        state.engine.register_system_tables().unwrap();
+        let admin = dev_auth();
+        let mut ctx = RequestContext {
+            auth: &admin,
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        for cql in [
+            "CREATE KEYSPACE remaining_wait WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE ROLE remaining_actor WITH LOGIN = false",
+            "CREATE ROLE remaining_source WITH LOGIN = false",
+            "CREATE ROLE remaining_member WITH LOGIN = false",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+        let component = hex_encode(&minimal_wasm_component());
+        let function = format!(
+            "CREATE FUNCTION remaining_wait.state_fn(state int, value int) CALLED ON NULL INPUT RETURNS int LANGUAGE wasm AS '{component}'"
+        );
+        route(&state, &ctx, crate::parser::parse(&function).unwrap())
+            .await
+            .unwrap();
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE AGGREGATE remaining_wait.old_agg(int) SFUNC state_fn STYPE int INITCOND 0",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        if statement.starts_with("REVOKE") {
+            route(
+                &state,
+                &ctx,
+                crate::parser::parse("GRANT remaining_source TO remaining_member").unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        let membership = statement.starts_with("GRANT") || statement.starts_with("REVOKE");
+        let (permission, resource) = if membership {
+            (
+                Permission::Authorize,
+                Resource::Role("remaining_source".into()),
+            )
+        } else {
+            (
+                Permission::Alter,
+                Resource::Keyspace("remaining_wait".into()),
+            )
+        };
+        state
+            .schema
+            .grant_internal(GrantEntry {
+                role: "remaining_actor".into(),
+                resource: resource.clone(),
+                permissions: [permission].into_iter().collect(),
+            })
+            .unwrap();
+        let caller = AuthContext {
+            role: "remaining_actor".into(),
+            is_superuser: false,
+            must_change_password: false,
+        };
+        ctx.auth = &caller;
+        state
+            .schema
+            .check_permission(&caller, permission, &resource)
+            .unwrap();
+        let schema = state.schema.clone();
+        let (ready, held) = tokio::sync::oneshot::channel();
+        let (release, waiting) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let _writer = schema.lifecycle_write();
+            ready.send(()).unwrap();
+            waiting
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            schema
+                .revoke_internal("remaining_actor", &resource, &permission)
+                .unwrap();
+        });
+        held.await.unwrap();
+        let mutation = route(&state, &ctx, crate::parser::parse(statement).unwrap());
+        tokio::pin!(mutation);
+        assert!(futures::poll!(&mut mutation).is_pending());
+        release.send(()).unwrap();
+        let result = mutation.await;
+        writer.join().unwrap();
+        assert!(
+            matches!(result, Err(CqlError::Unauthorized(_))),
+            "revoked authority must prevent {statement}: {:?}",
+            result.as_ref().err()
+        );
+        let snapshot = state.schema.snapshot();
+        if membership {
+            assert_eq!(
+                snapshot.roles["remaining_member"]
+                    .member_of
+                    .contains("remaining_source"),
+                statement.starts_with("REVOKE")
+            );
+        } else if statement.starts_with("DROP FUNCTION") {
+            assert!(state
+                .schema
+                .get_function("remaining_wait", "state_fn", &[CqlType::Int, CqlType::Int])
+                .is_some());
+            assert!(
+                state
+                    .udf_executor
+                    .get_kind("remaining_wait", "state_fn", &[CqlType::Int, CqlType::Int])
+                    .is_ok(),
+                "denied DROP must preserve the compiled function too"
+            );
+        } else {
+            assert!(state
+                .schema
+                .get_aggregate("remaining_wait", "old_agg", &[CqlType::Int])
+                .is_some());
+            assert!(state
+                .schema
+                .get_aggregate("remaining_wait", "new_agg", &[CqlType::Int])
+                .is_none());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remaining_direct_grant_role_rechecks_authority_after_writer() {
+        assert_remaining_direct_permission_rechecked("GRANT remaining_source TO remaining_member")
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remaining_direct_revoke_role_rechecks_authority_after_writer() {
+        assert_remaining_direct_permission_rechecked(
+            "REVOKE remaining_source FROM remaining_member",
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remaining_direct_drop_function_rechecks_authority_after_writer() {
+        assert_remaining_direct_permission_rechecked(
+            "DROP FUNCTION remaining_wait.state_fn(int, int)",
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remaining_direct_create_aggregate_rechecks_authority_after_writer() {
+        assert_remaining_direct_permission_rechecked(
+            "CREATE AGGREGATE remaining_wait.new_agg(int) SFUNC state_fn STYPE int INITCOND 0",
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remaining_direct_drop_aggregate_rechecks_authority_after_writer() {
+        assert_remaining_direct_permission_rechecked("DROP AGGREGATE remaining_wait.old_agg(int)")
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remaining_direct_create_aggregate_rechecks_dependencies_after_writer() {
+        let (state, _dir) = setup();
+        state.engine.register_system_tables().unwrap();
+        let admin = dev_auth();
+        let ctx = RequestContext {
+            auth: &admin,
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        route(&state, &ctx, crate::parser::parse(
+            "CREATE KEYSPACE remaining_dependency WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}"
+        ).unwrap()).await.unwrap();
+        let component = hex_encode(&minimal_wasm_component());
+        let function = format!(
+            "CREATE FUNCTION remaining_dependency.state_fn(state int, value int) CALLED ON NULL INPUT RETURNS int LANGUAGE wasm AS '{component}'"
+        );
+        route(&state, &ctx, crate::parser::parse(&function).unwrap())
+            .await
+            .unwrap();
+        let schema = state.schema.clone();
+        let (ready, held) = tokio::sync::oneshot::channel();
+        let (release, waiting) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let _writer = schema.lifecycle_write();
+            ready.send(()).unwrap();
+            waiting
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            schema
+                .drop_function_internal(
+                    "remaining_dependency",
+                    "state_fn",
+                    &[CqlType::Int, CqlType::Int],
+                )
+                .unwrap();
+        });
+        held.await.unwrap();
+        let mutation = route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE AGGREGATE remaining_dependency.a(int) SFUNC state_fn STYPE int INITCOND 0",
+            )
+            .unwrap(),
+        );
+        tokio::pin!(mutation);
+        assert!(futures::poll!(&mut mutation).is_pending());
+        release.send(()).unwrap();
+        let result = mutation.await;
+        writer.join().unwrap();
+        assert!(
+            matches!(result, Err(CqlError::Invalid(_))),
+            "a removed state function must refuse the queued aggregate: {:?}",
+            result.as_ref().err()
+        );
+        assert!(state
+            .schema
+            .get_aggregate("remaining_dependency", "a", &[CqlType::Int])
+            .is_none());
+    }
+
+    #[test]
+    fn remaining_direct_replacement_survives_cancelled_request() {
+        // One blocking worker makes the final queued barrier acknowledge completion
+        // of the previously admitted DDL job, without a sleep or scheduling race.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (state, _dir) = setup();
+            state.engine.register_system_tables().unwrap();
+            let admin = dev_auth();
+            let ctx = RequestContext {
+                auth: &admin,
+                current_keyspace: &None,
+                consistency: ConsistencyLevel::One,
+                serial_consistency: None,
+                paging: crate::paging::PagingParams::default(),
+                client_address: String::new(),
+                protocol_version: 4,
+            };
+            route(&state, &ctx, crate::parser::parse(
+                "CREATE KEYSPACE remaining_cancel WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}"
+            ).unwrap()).await.unwrap();
+            let original = hex_encode(&minimal_wasm_component());
+            let create = format!("CREATE FUNCTION remaining_cancel.f(val int) CALLED ON NULL INPUT RETURNS int LANGUAGE wasm AS '{original}'");
+            route(&state, &ctx, crate::parser::parse(&create).unwrap()).await.unwrap();
+            let replacement = hex_encode(&minimal_streaming_aggregate_component());
+            let replace = format!("CREATE OR REPLACE FUNCTION remaining_cancel.f(val int) CALLED ON NULL INPUT RETURNS int LANGUAGE wasm AS '{replacement}'");
+            let schema = state.schema.clone();
+            let (ready, held) = tokio::sync::oneshot::channel();
+            let (release, waiting) = std::sync::mpsc::channel();
+            let writer = std::thread::spawn(move || {
+                let _writer = schema.lifecycle_write();
+                ready.send(()).unwrap();
+                waiting.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            });
+            held.await.unwrap();
+            let mut mutation = Box::pin(route(&state, &ctx, crate::parser::parse(&replace).unwrap()));
+            assert!(futures::poll!(&mut mutation).is_pending());
+            drop(mutation);
+            release.send(()).unwrap();
+            writer.join().unwrap();
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            let function = state.schema.get_function("remaining_cancel", "f", &[CqlType::Int]);
+            assert!(function.is_some(), "cancelled replacement deleted the old function without replacing it");
+            assert_eq!(function.unwrap().body, replacement);
+            assert_eq!(state.udf_executor.get_kind("remaining_cancel", "f", &[CqlType::Int]).unwrap(),
+                ferrosa_udf::FunctionKind::Aggregate);
+        });
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remaining_direct_replacement_validates_before_deleting_old_function() {
+        let (state, _dir) = setup();
+        state.engine.register_system_tables().unwrap();
+        let admin = dev_auth();
+        let ctx = RequestContext {
+            auth: &admin,
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        route(&state, &ctx, crate::parser::parse(
+            "CREATE KEYSPACE remaining_invalid WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}"
+        ).unwrap()).await.unwrap();
+        let original = hex_encode(&minimal_wasm_component());
+        let create = format!(
+            "CREATE FUNCTION remaining_invalid.f(val int) CALLED ON NULL INPUT RETURNS int LANGUAGE wasm AS '{original}'"
+        );
+        route(&state, &ctx, crate::parser::parse(&create).unwrap())
+            .await
+            .unwrap();
+        let replace = "CREATE OR REPLACE FUNCTION remaining_invalid.f(val int) CALLED ON NULL INPUT RETURNS int LANGUAGE wasm AS 'not valid hex'";
+        assert!(route(&state, &ctx, crate::parser::parse(replace).unwrap())
+            .await
+            .is_err());
+        assert_eq!(
+            state
+                .schema
+                .get_function("remaining_invalid", "f", &[CqlType::Int])
+                .unwrap()
+                .body,
+            original
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn schema_mutations_wait_without_blocking_drop_runtime() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        for statement in [
+            "CREATE TYPE alter_survivor.new_type (id int)",
+            "ALTER TYPE alter_survivor.old_type ADD value text",
+            "DROP TYPE alter_survivor.old_type",
+            "CREATE ROLE schema_waiter_new WITH LOGIN = false",
+            "ALTER ROLE schema_waiter WITH SUPERUSER = true",
+            "DROP ROLE schema_waiter",
+            "GRANT SELECT ON KEYSPACE alter_survivor TO schema_waiter",
+            "REVOKE SELECT ON KEYSPACE alter_survivor FROM schema_waiter",
+            "ALTER TABLE alter_survivor.items ADD value text",
+            "DROP TABLE alter_survivor.items",
+            "CREATE INDEX new_index ON alter_survivor.items (existing)",
+            "DROP INDEX alter_survivor.old_index",
+        ] {
+            let (state, dir) = setup();
+            let ctx = RequestContext {
+                auth: &dev_auth(),
+                current_keyspace: &None,
+                consistency: ConsistencyLevel::One,
+                serial_consistency: None,
+                paging: crate::paging::PagingParams::default(),
+                client_address: String::new(),
+                protocol_version: 4,
+            };
+            for cql in [
+            "CREATE KEYSPACE drop_recreate WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE drop_recreate.items (id int PRIMARY KEY)",
+            "CREATE KEYSPACE alter_survivor WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE alter_survivor.items (id int PRIMARY KEY, existing text)",
+            "CREATE INDEX old_index ON alter_survivor.items (existing)",
+                "CREATE ROLE schema_waiter WITH LOGIN = false",
+                "CREATE TYPE alter_survivor.old_type (id int)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(dir.path().join(".dropped-tables.json.lock"))
+                .unwrap();
+            lock.lock().unwrap();
+            let escaped = Arc::new(AtomicBool::new(false));
+            let watchdog_escaped = escaped.clone();
+            let (release, signal) = std::sync::mpsc::channel();
+            let watchdog = std::thread::spawn(move || {
+                let forced = signal
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .is_err();
+                watchdog_escaped.store(forced, Ordering::SeqCst);
+                lock.unlock().unwrap();
+            });
+            let dropping = route(
+                &state,
+                &ctx,
+                crate::parser::parse("DROP KEYSPACE drop_recreate").unwrap(),
+            );
+            tokio::pin!(dropping);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut dropping => panic!("DROP completed before the owned journal lock was released"),
+                    _ = tokio::task::yield_now() => {}
+                }
+                if !state
+                    .schema
+                    .snapshot()
+                    .keyspaces
+                    .contains_key("drop_recreate")
+                {
+                    break;
+                }
+                assert!(!escaped.load(Ordering::SeqCst));
+            }
+            let creating = async {
+                route(&state, &ctx, crate::parser::parse(statement).unwrap()).await?;
+                Ok::<(), CqlError>(())
+            };
+            tokio::pin!(creating);
+            let mut early_result = None;
+            tokio::select! {
+                biased;
+                result = &mut creating => early_result = Some(result),
+                _ = std::future::ready(()) => {}
+            }
+            let escaped_before_release = escaped.load(Ordering::SeqCst);
+            let _ = release.send(());
+            dropping.await.unwrap();
+            let created = match early_result {
+                Some(result) => result,
+                None => creating.await,
+            };
+            watchdog.join().unwrap();
+            assert!(
+                !escaped_before_release,
+                "{statement} blocked the async runtime waiting for the DROP lifecycle writer"
+            );
+            created.unwrap();
+            let snapshot = state.schema.snapshot();
+            let key = ("alter_survivor".to_string(), "items".to_string());
+            if statement.starts_with("ALTER TABLE") {
+                assert!(snapshot.tables[&key].columns.contains_key("value"));
+            } else if statement.starts_with("DROP TABLE") {
+                assert!(!snapshot.tables.contains_key(&key));
+            } else if statement.starts_with("CREATE ROLE") {
+                assert!(snapshot.roles.contains_key("schema_waiter_new"));
+            } else if statement.starts_with("ALTER ROLE") {
+                assert!(snapshot.roles["schema_waiter"].is_superuser);
+            } else if statement.starts_with("DROP ROLE") {
+                assert!(!snapshot.roles.contains_key("schema_waiter"));
+            } else if statement.starts_with("CREATE TYPE") {
+                assert!(state
+                    .schema
+                    .get_type("alter_survivor", "new_type")
+                    .is_some());
+            } else if statement.starts_with("ALTER TYPE") {
+                assert!(state
+                    .schema
+                    .get_type("alter_survivor", "old_type")
+                    .is_some());
+            } else if statement.starts_with("DROP TYPE") {
+                assert!(state
+                    .schema
+                    .get_type("alter_survivor", "old_type")
+                    .is_none());
+            } else if statement.starts_with("GRANT") || statement.starts_with("REVOKE") {
+                // Success is checked above; detailed authorization/durability cases remain in the library suite.
+            } else {
+                let name = if statement.starts_with("CREATE") {
+                    "new_index"
+                } else {
+                    "old_index"
+                };
+                let present = snapshot
+                    .indexes
+                    .contains_key(&(key.0, key.1, name.to_string()));
+                assert_eq!(present, statement.starts_with("CREATE"));
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn alter_keyspace_waits_without_blocking_drop_runtime() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (state, dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        for cql in [
+            "CREATE KEYSPACE drop_recreate WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE drop_recreate.items (id int PRIMARY KEY)",
+            "CREATE KEYSPACE alter_survivor WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.path().join(".dropped-tables.json.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        let escaped = Arc::new(AtomicBool::new(false));
+        let watchdog_escaped = escaped.clone();
+        let (release, signal) = std::sync::mpsc::channel();
+        let watchdog = std::thread::spawn(move || {
+            let forced = signal
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_err();
+            watchdog_escaped.store(forced, Ordering::SeqCst);
+            lock.unlock().unwrap();
+        });
+        let dropping = route(
+            &state,
+            &ctx,
+            crate::parser::parse("DROP KEYSPACE drop_recreate").unwrap(),
+        );
+        tokio::pin!(dropping);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut dropping => panic!("DROP completed before the owned journal lock was released"),
+                _ = tokio::task::yield_now() => {}
+            }
+            if !state
+                .schema
+                .snapshot()
+                .keyspaces
+                .contains_key("drop_recreate")
+            {
+                break;
+            }
+            assert!(!escaped.load(Ordering::SeqCst));
+        }
+        let creating = async {
+            route(
+                &state,
+                &ctx,
+                crate::parser::parse("ALTER KEYSPACE alter_survivor WITH durable_writes = false")
+                    .unwrap(),
+            )
+            .await?;
+            Ok::<(), CqlError>(())
+        };
+        tokio::pin!(creating);
+        let mut early_result = None;
+        tokio::select! {
+            biased;
+            result = &mut creating => early_result = Some(result),
+            _ = std::future::ready(()) => {}
+        }
+        let escaped_before_release = escaped.load(Ordering::SeqCst);
+        let _ = release.send(());
+        dropping.await.unwrap();
+        let created = match early_result {
+            Some(result) => result,
+            None => creating.await,
+        };
+        watchdog.join().unwrap();
+        assert!(
+            !escaped_before_release,
+            "ALTER KEYSPACE blocked the async runtime waiting for the DROP lifecycle writer"
+        );
+        created.unwrap();
+        assert!(!state.schema.snapshot().keyspaces["alter_survivor"].durable_writes);
+    }
 
     #[tokio::test]
     async fn alter_keyspace_changes_durable_writes() {

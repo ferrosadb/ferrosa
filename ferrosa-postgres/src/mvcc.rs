@@ -1444,7 +1444,7 @@ pub(crate) enum MvccCommitError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     // Count only allocations made by the current test thread. Other tests and
     // background runtimes must not affect this allocation regression.
@@ -2480,8 +2480,9 @@ mod tests {
 
     #[test]
     fn expiring_an_old_snapshot_releases_history_and_rejects_commit() {
-        let config = MvccConfig::from_overrides(None, Some("5"), None).unwrap();
-        let manager = MvccManager::with_config(config);
+        // Exercise expiry at explicit age boundaries, without making setup
+        // commits race an artificial five-millisecond wall-clock lifetime.
+        let manager = MvccManager::default();
         let setup = manager.snapshot();
         manager
             .commit(
@@ -2506,7 +2507,22 @@ mod tests {
         drop(writer);
         assert_eq!(manager.retained_version_count(), 2);
 
-        let expired = manager.expire_snapshots_before(Instant::now() + Duration::from_millis(6));
+        let deadline = manager.deadline_for_test(&old_snapshot);
+        assert_eq!(
+            manager.expire_snapshots_before(deadline - Duration::from_nanos(1)),
+            0,
+            "a snapshot remains active immediately before its age limit"
+        );
+        assert_eq!(manager.active_snapshot_count(), 1);
+        assert_eq!(manager.retained_version_count(), 2);
+        assert_eq!(
+            manager
+                .table_overlay(&old_snapshot, "public.items")
+                .unwrap()
+                .get(&vec![Value::Int(1)]),
+            Some(&Some(row("v1")))
+        );
+        let expired = manager.expire_snapshots_before(deadline);
         assert_eq!(expired, 1);
         assert_eq!(manager.active_snapshot_count(), 0);
         assert_eq!(manager.retained_version_count(), 1);
@@ -2517,6 +2533,15 @@ mod tests {
             ),
             "an expired snapshot must refuse its commit"
         );
+        let fresh = manager.snapshot();
+        assert_eq!(
+            manager
+                .table_overlay(&fresh, "public.items")
+                .unwrap()
+                .get(&vec![Value::Int(1)]),
+            Some(&Some(row("v2")))
+        );
+        assert!(manager.validate_commit(&fresh, &HashSet::new()).is_ok());
     }
 
     #[test]

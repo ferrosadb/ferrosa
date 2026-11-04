@@ -394,6 +394,40 @@ async fn deferred_build_has_a_bounded_readiness_deadline() {
         .index_is_current(&table, "pgbench_accounts_pkey"));
 }
 
+/// Establish actual applied index state while the external builder stays held.
+/// A first Pending can now be the owned schema-apply job, before declaration or
+/// tracker registration. Drive the caller until both are observable; never infer
+/// index state from the scheduler's first yield or release backfill to get here.
+async fn await_pending_index<F>(
+    operation: &mut F,
+    engine: &StorageEngine,
+    table: &TableId,
+    name: &str,
+) where
+    F: std::future::Future<Output = Result<(), String>> + Unpin,
+{
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut *operation => {
+                    panic!("held backfill must remain pending before observation: {result:?}");
+                }
+                _ = tokio::task::yield_now() => {}
+            }
+            let registered_pending = engine
+                .index_tracker()
+                .get_state(table.keyspace(), table.table(), name)
+                .is_some_and(|state| !state.pending_sstables.is_empty());
+            if engine.declares_index(table, name) && registered_pending {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("index declaration and pending tracker must become observable");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelling_readiness_keeps_pending_postings_unreadable() {
     let fixture = fixture().await;
@@ -421,10 +455,13 @@ async fn cancelling_readiness_keeps_pending_postings_unreadable() {
         "pgbench_accounts_pkey",
         &columns,
     );
-    assert!(
-        matches!(futures::poll!(&mut operation), Poll::Pending),
-        "backfill must be awaited"
-    );
+    await_pending_index(
+        &mut operation,
+        &fixture.engine,
+        &table,
+        "pgbench_accounts_pkey",
+    )
+    .await;
     drop(operation); // Cancels the caller's wait; durable build work is not rolled back.
     assert!(fixture
         .engine
@@ -446,11 +483,11 @@ async fn cancelling_readiness_keeps_pending_postings_unreadable() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn missing_tracker_is_an_error_not_ready() {
     let fixture = fixture().await;
-    populate(&fixture).await;
+    let table = populate(&fixture).await;
     let ddl = ClusterDdl::new(Arc::clone(&fixture.path));
     let columns = vec!["aid".into()];
     let mut operation = ddl.create_index("public", "pgbench_accounts", "idx", &columns);
-    assert!(matches!(futures::poll!(&mut operation), Poll::Pending));
+    await_pending_index(&mut operation, &fixture.engine, &table, "idx").await;
     assert!(fixture
         .engine
         .index_tracker()
@@ -465,11 +502,11 @@ async fn missing_tracker_is_an_error_not_ready() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retired_table_generation_cannot_complete_an_old_wait() {
     let fixture = fixture().await;
-    populate(&fixture).await;
+    let table = populate(&fixture).await;
     let ddl = ClusterDdl::new(Arc::clone(&fixture.path));
     let columns = vec!["aid".into()];
     let mut operation = ddl.create_index("public", "pgbench_accounts", "idx", &columns);
-    assert!(matches!(futures::poll!(&mut operation), Poll::Pending));
+    await_pending_index(&mut operation, &fixture.engine, &table, "idx").await;
     fixture
         .client
         .batch_execute("DROP TABLE pgbench_accounts")
@@ -498,7 +535,7 @@ async fn retired_sstable_does_not_hide_pending_replacement() {
     let ddl = ClusterDdl::new(Arc::clone(&fixture.path));
     let columns = vec!["aid".into()];
     let mut operation = ddl.create_index("public", "pgbench_accounts", "idx", &columns);
-    assert!(matches!(futures::poll!(&mut operation), Poll::Pending));
+    await_pending_index(&mut operation, &fixture.engine, &table, "idx").await;
     let tracker = fixture.engine.index_tracker();
     let old = tracker
         .get_state("public", "pgbench_accounts", "idx")
@@ -521,11 +558,11 @@ async fn retired_sstable_does_not_hide_pending_replacement() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deployment_transition_cannot_acknowledge_local_readiness() {
     let fixture = fixture().await;
-    populate(&fixture).await;
+    let table = populate(&fixture).await;
     let ddl = ClusterDdl::new(Arc::clone(&fixture.path));
     let columns = vec!["aid".into()];
     let mut operation = ddl.create_index("public", "pgbench_accounts", "idx", &columns);
-    assert!(matches!(futures::poll!(&mut operation), Poll::Pending));
+    await_pending_index(&mut operation, &fixture.engine, &table, "idx").await;
     fixture.path.store(Arc::new(DdlPath::Unavailable));
     let error = tokio::time::timeout(Duration::from_secs(2), operation)
         .await

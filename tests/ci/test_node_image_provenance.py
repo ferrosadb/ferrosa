@@ -1,0 +1,208 @@
+"""The prebuilt node image names the source of its actual glibc artifact.
+
+Execute the workflow shell with real divergent head/merge Git commits and an
+isolated Docker boundary. No compiler, registry credentials or daemon needed.
+"""
+
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+
+from tests.ci.test_ci_cache_workflow import jobs, steps
+
+ROOT = Path(__file__).resolve().parents[2]
+WORKFLOW = ROOT / '.github/workflows/ci.yml'
+
+
+def script(job, name):
+    step = next(s for s in steps(jobs(WORKFLOW.read_text())[job]) if s.startswith('name: ' + name + '\n'))
+    body = step.split('        run: |\n', 1)[1]
+    return '\n'.join(line[10:] for line in body.splitlines() if line.startswith('          ')) + '\n'
+
+
+class NodeImageProvenance(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+        self.env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull,
+                        GIT_AUTHOR_NAME='Fixture', GIT_AUTHOR_EMAIL='fixture@example.invalid',
+                        GIT_COMMITTER_NAME='Fixture', GIT_COMMITTER_EMAIL='fixture@example.invalid')
+        self.git('init', '-q')
+        (self.root / 'source').write_text('base')
+        self.git('add', 'source'); self.git('commit', '-qm', 'base')
+        base = self.git('rev-parse', 'HEAD')
+        self.git('checkout', '-qb', 'feature')
+        (self.root / 'feature').write_text('head')
+        self.git('add', 'feature'); self.git('commit', '-qm', 'head')
+        self.head = self.git('rev-parse', 'HEAD')
+        self.git('checkout', '-qb', 'merge', base)
+        (self.root / 'other').write_text('main')
+        self.git('add', 'other'); self.git('commit', '-qm', 'main')
+        self.git('merge', '-qm', 'synthetic merge', 'feature')
+        self.merge = self.git('rev-parse', 'HEAD')
+        self.assertNotEqual(self.head, self.merge)
+        node = self.root / 'node-bin'; node.mkdir()
+        for name in ['ferrosa', 'ferrosa-ctl']:
+            (node / name).write_text('fixture artifact')
+        (node / 'source-revision.txt').write_text(self.head + '\n')
+        tools = self.root / 'tools'; tools.mkdir()
+        docker = tools / 'docker'
+        docker.write_text('''#!/bin/bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "$DOCKER_LOG"
+case "$1" in
+  login)
+    # Match --password-stdin: exiting before reading can SIGPIPE the producer.
+    cat > "$DOCKER_STDIN"
+    ;;
+  build)
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = --iidfile ]; then
+        shift
+        printf 'sha256:fixture\\n' > "$1"
+      fi
+      shift
+    done
+    ;;
+  save|tag|push) ;;
+  *) exit 64 ;;
+esac
+''')
+        docker.chmod(0o755)
+        self.env.update(PATH=str(tools) + os.pathsep + self.env['PATH'],
+                         DOCKER_LOG=str(self.root / 'docker.log'),
+                         DOCKER_STDIN=str(self.root / 'docker-stdin'), SOURCE_REVISION=self.head,
+                        GITHUB_OUTPUT=str(self.root / 'output'), GITHUB_WORKSPACE=str(self.root))
+
+    def git(self, *args):
+        return subprocess.check_output(['git', *args], cwd=self.root, env=self.env, text=True).strip()
+
+    def run_step(self, job, name):
+        body = script(job, name)
+        replacements = {'github.sha': self.merge, 'github.event.pull_request.head.sha': self.head,
+                        'needs.glibc.outputs.revision': self.head,
+                        'github.repository_owner': 'fixture', 'github.actor': 'fixture',
+                        'secrets.GITHUB_TOKEN': 'fixture-not-a-token'}
+        for key, value in replacements.items():
+            body = body.replace('${{ ' + key + ' }}', value)
+        return subprocess.run(['bash', '-eu', '-o', 'pipefail', '-c', body], cwd=self.root,
+                              env=self.env, capture_output=True, text=True)
+
+    def test_mismatched_checkout_refuses_before_any_docker_operation(self):
+        result = self.run_step('build-node-image', 'Package into a thin runtime image')
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((self.root / 'docker.log').exists(), 'mismatch reached Docker')
+
+    def test_matching_head_artifact_publishes_only_actual_source_revision(self):
+        self.git('checkout', '-q', self.head)
+        result = self.run_step('build-node-image', 'Package into a thin runtime image')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = self.run_step('build-node-image', 'Push image to GHCR (cross-workflow reuse)')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        log = (self.root / 'docker.log').read_text()
+        pushes = [line for line in log.splitlines() if line.startswith('push ')]
+        self.assertEqual(pushes, ['push ghcr.io/fixture/ferrosa-test-node:' + self.head])
+        self.assertIn('org.opencontainers.image.revision=' + self.head, log)
+        self.assertIn('tag sha256:fixture ghcr.io/fixture/ferrosa-test-node:' + self.head, log)
+        self.assertEqual((self.root / 'docker-stdin').read_text(), 'fixture-not-a-token\n')
+
+    def test_mismatched_artifact_refuses_before_any_docker_operation(self):
+        self.git('checkout', '-q', self.head)
+        (self.root / 'node-bin/source-revision.txt').write_text(self.merge + '\n')
+        result = self.run_step('build-node-image', 'Package into a thin runtime image')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.root / 'docker.log').exists())
+
+    def test_publication_rechecks_artifact_before_login_or_tag(self):
+        self.git('checkout', '-q', self.head)
+        (self.root / 'node-bin/source-revision.txt').write_text(self.merge + '\n')
+        result = self.run_step('build-node-image', 'Push image to GHCR (cross-workflow reuse)')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.root / 'docker.log').exists())
+
+    def test_recorded_artifact_revision_is_actual_checked_out_head(self):
+        self.git('checkout', '-q', self.head)
+        artifact = self.root / 'target/x86_64-unknown-linux-gnu/release'
+        artifact.mkdir(parents=True)
+        self.env['EXPECTED_REVISION'] = self.head
+        result = self.run_step('glibc', 'Record the glibc artifact source')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((artifact / 'source-revision.txt').read_text(), self.head + '\n')
+        self.assertEqual((self.root / 'output').read_text(), 'revision=' + self.head + '\n')
+        self.git('checkout', '-q', self.merge)
+        result = self.run_step('glibc', 'Record the glibc artifact source')
+        self.assertNotEqual(result.returncode, 0)
+
+    def prepare_recording(self):
+        self.git('checkout', '-q', self.head)
+        artifact = self.root / 'target/x86_64-unknown-linux-gnu/release'
+        artifact.mkdir(parents=True)
+        self.env['EXPECTED_REVISION'] = self.head
+        return artifact
+
+    def assume_different_owner(self):
+        global_config = self.root / 'isolated-global.gitconfig'
+        global_config.write_text('[fixture]\n    sentinel = preserved\n')
+        unrelated = self.root / 'unrelated-checkout'
+        subprocess.run(['git', 'init', '-q', str(unrelated)], env=self.env, check=True)
+        self.env.update(GIT_CONFIG_GLOBAL=str(global_config), GIT_TEST_ASSUME_DIFFERENT_OWNER='1')
+        # A real Git control proves this installation actually enforces ownership.
+        refused = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=self.root, env=self.env,
+                                 capture_output=True, text=True)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn('dubious ownership', refused.stderr)
+        return global_config, unrelated
+
+    def test_differing_owner_records_only_workspace_without_persistent_trust(self):
+        artifact = self.prepare_recording()
+        global_config, unrelated = self.assume_different_owner()
+        original_config = global_config.read_bytes()
+        result = self.run_step('glibc', 'Record the glibc artifact source')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((artifact / 'source-revision.txt').read_text(), self.head + '\n')
+        self.assertEqual((self.root / 'output').read_text(), 'revision=' + self.head + '\n')
+        self.assertEqual(global_config.read_bytes(), original_config)
+        for checkout in [self.root, unrelated]:
+            refused = subprocess.run(['git', 'rev-parse', '--show-toplevel'], cwd=checkout,
+                                     env=self.env, capture_output=True, text=True)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn('dubious ownership', refused.stderr)
+
+    def test_differing_owner_still_rejects_wrong_expected_revision(self):
+        artifact = self.prepare_recording()
+        self.assume_different_owner()
+        self.env['EXPECTED_REVISION'] = self.merge
+        result = self.run_step('glibc', 'Record the glibc artifact source')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('glibc checkout revision mismatch', result.stdout)
+        self.assertFalse((artifact / 'source-revision.txt').exists())
+        self.assertFalse((self.root / 'output').exists())
+
+    def test_recording_refuses_a_workspace_other_than_the_current_checkout(self):
+        artifact = self.prepare_recording()
+        other = self.root / 'other-workspace'
+        other.mkdir()
+        for workspace in [str(other), '.']:
+            with self.subTest(workspace=workspace):
+                self.env['GITHUB_WORKSPACE'] = workspace
+                result = self.run_step('glibc', 'Record the glibc artifact source')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((artifact / 'source-revision.txt').exists())
+                self.assertFalse((self.root / 'output').exists())
+
+    def test_checkout_output_sidecar_and_format_guard_are_wired(self):
+        workflow = WORKFLOW.read_text(); all_jobs = jobs(workflow)
+        self.assertIn('ref: ${{ github.event.pull_request.head.sha || github.sha }}', all_jobs['glibc'])
+        self.assertIn('revision: ${{ steps.revision.outputs.revision }}', all_jobs['glibc'])
+        self.assertIn('source-revision.txt', all_jobs['glibc'])
+        self.assertIn('ref: ${{ needs.glibc.outputs.revision }}', all_jobs['build-node-image'])
+        self.assertIn('needs: glibc', all_jobs['build-node-image'])
+        self.assertIn('tests.ci.test_node_image_provenance', all_jobs['fmt'])
+
+
+if __name__ == '__main__':
+    unittest.main()
