@@ -753,9 +753,11 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   a random UUID on first boot, so any deployment that needs a predictable
   primary must pin the ids — every `docker-compose*.yml` in this repo does, and
   `ferrosa`'s `pair_primary_is_deterministic` test enforces it. An unpromoted
-  secondary refuses client CQL entirely (`is_cql_ready()` is false) while still
-  reporting healthy on `/readyz`, so an unpinned stack can hand you a node that
-  looks up but serves nothing.
+  secondary accepts read-only client CQL — replica reads are admitted and
+  mutations are fenced with "writes disallowed on read replica"
+  (`ferrosa-cql/src/router.rs`, `replica_write_error`) — so an unpinned stack can
+  hand you a node that serves replicated reads and refuses every write until an
+  operator promotes it.
 - `rebalance.rs` — token-skew rebalancing with data streaming.
 - `raft/handlers.rs` `RowWire`/`CellValueWire` — the bincode row format of
   coordinator reads, anti-entropy repair, range-read streaming, digests and
