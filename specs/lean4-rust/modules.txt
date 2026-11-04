@@ -25,3 +25,11 @@
 
 Storage   ferrosa-storage   src/count.rs       ferrosa_storage::count::*
 Sstable   ferrosa-sstable   src/compression.rs ferrosa_sstable::compression::*
+
+# `ferrosa-view` is not here yet, and the reason is worth writing down because the obvious guess is
+# wrong: the memory ceiling is no longer what stops it. With its five derived `Deserialize` impls
+# made opaque through `scope.toml`, the crate translates in 28 s at 2.3 GiB peak (it could not
+# finish one function before), but the module does not elaborate -- aeneas cannot translate the
+# signature of `ViewMetadata::primary_key` or `validate::base_pk_names` (`impl Iterator<Item = &str>`
+# triggers `[Error] Unimplemented: found an occurrence of a lifetime constraint`). Add a row when the
+# translator can express the type; see SYNC.md, "What the scope buys, measured".
