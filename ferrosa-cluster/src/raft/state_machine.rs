@@ -5586,6 +5586,122 @@ mod tests {
         );
     }
 
+    /// The production gate exactly as `ferrosa/src/main.rs`
+    /// `enforce_production_requirements` feeds it: does it refuse a default
+    /// superuser password on this schema?
+    fn gate_refuses_default_superuser(schema: &ferrosa_schema::Schema) -> bool {
+        use ferrosa_schema::startup::{
+            validate_production_requirements, DeploymentMode, ProductionCheckConfig,
+            ProductionViolation,
+        };
+        validate_production_requirements(&ProductionCheckConfig {
+            mode: DeploymentMode::Production,
+            password_policy: ferrosa_schema::PasswordPolicy::permissive(),
+            has_superuser_password: !ferrosa_schema::auth::bootstrap::admin_password_is_default(
+                schema,
+            ),
+            secrets_provider_type: "env".to_string(),
+            s3_allow_http: false,
+            auth_enabled: true,
+            listeners: Vec::new(),
+            internode_require_tls: true,
+        })
+        .iter()
+        .any(|v| matches!(v, ProductionViolation::DefaultSuperuserPassword))
+    }
+
+    /// A node's startup role sequence on the fixed binary (main.rs): replay
+    /// system_auth.roles, seed, repair. Returns the node's registry.
+    fn start_fixed_node(
+        engine: &Arc<StorageEngine>,
+        config: &ferrosa_schema::auth::bootstrap::SeedConfig,
+    ) -> Arc<ferrosa_schema::Schema> {
+        let schema = fast_role_schema();
+        let loader = crate::system_table_loader::SystemTableLoader::new(Arc::clone(engine));
+        loader.replay_roles_into_schema(&schema).unwrap();
+        ferrosa_schema::auth::bootstrap::seed_default_roles_with_config(&schema, config).unwrap();
+        loader
+            .repair_default_credential_rows(&schema, config)
+            .unwrap();
+        schema
+    }
+
+    /// Rolling upgrade of an existing v2026.10.28.1513 node (t_d0e5e6e5).
+    ///
+    /// Its system_auth.roles holds the default-hash rows the pre-fix apply
+    /// wrote for ferrosa-memory's CREATE ROLE IF NOT EXISTS. Restarted on the
+    /// fixed binary with FERROSA_SEED_ADMIN_PASSWORD set, it must come up on
+    /// the seeded hash and pass the production gate. While the rest of the
+    /// cluster still runs the old binary, an old coordinator keeps
+    /// replicating that CreateRole: the upgraded node's apply must persist
+    /// nothing, so the next restart passes too. Without a configured seed the
+    /// gate must still refuse.
+    #[tokio::test]
+    async fn rolling_upgrade_repairs_default_rows_and_gate_passes_in_mixed_cluster() {
+        use ferrosa_schema::auth::bootstrap::{
+            SeedConfig, SEED_ADMIN_PASSWORD, SEED_ADMIN_USER, SEED_APP_PASSWORD,
+            SEED_APP_READER_USER,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let old_create_ops = || {
+            vec![
+                RaftOp::CreateRole(replicated_role(SEED_ADMIN_USER, SEED_ADMIN_PASSWORD, true)),
+                RaftOp::CreateRole(replicated_role(
+                    SEED_APP_READER_USER,
+                    SEED_APP_PASSWORD,
+                    false,
+                )),
+            ]
+        };
+        // Disk state left by the old binary: its apply persisted the incoming roles.
+        let writer = crate::system_table_writer::SystemTableWriter::new(Arc::clone(&engine));
+        for op in old_create_ops() {
+            let RaftOp::CreateRole(role) = op else {
+                unreachable!()
+            };
+            writer
+                .apply(SystemTableMutation::RoleCreated(role))
+                .unwrap();
+        }
+
+        // Without a configured seed there is nothing to repair to: the gate refuses.
+        let unseeded =
+            SeedConfig::from_parts(ferrosa_schema::startup::DeploymentMode::Production, None);
+        assert!(
+            gate_refuses_default_superuser(&start_fixed_node(&engine, &unseeded)),
+            "the gate must still fire when no seed is configured and the row is default"
+        );
+
+        // Upgraded node start with the seed configured: repaired, gate passes.
+        let schema = start_fixed_node(&engine, &managed_seed_config());
+        assert!(!gate_refuses_default_superuser(&schema));
+        assert!(schema
+            .authenticate(SEED_ADMIN_USER, MANAGED_ADMIN_PASSWORD)
+            .is_ok());
+        assert!(schema
+            .authenticate(SEED_APP_READER_USER, SEED_APP_PASSWORD)
+            .is_err());
+
+        // Mixed-version window: old coordinators still replicate the CreateRole.
+        let mut sm =
+            FerrosStateMachine::with_side_effects(Arc::clone(&schema), Arc::clone(&engine));
+        let entries: Vec<_> = old_create_ops()
+            .into_iter()
+            .enumerate()
+            .map(|(i, op)| make_entry(1, i as u64 + 1, op))
+            .collect();
+        sm.apply(entries).await.unwrap();
+        let admin_row = persisted_role(&engine, SEED_ADMIN_USER).unwrap();
+        assert!(verifies(&admin_row, MANAGED_ADMIN_PASSWORD));
+        assert!(!verifies(&admin_row, SEED_ADMIN_PASSWORD));
+
+        // Next restart of the upgraded node: still passes, nothing re-broken.
+        let schema = start_fixed_node(&engine, &managed_seed_config());
+        assert!(!gate_refuses_default_superuser(&schema));
+    }
+
     /// A genuinely new role is still persisted, and the row is the stored role.
     #[tokio::test]
     async fn create_role_new_role_persists_the_stored_row() {
