@@ -211,6 +211,11 @@ jobs:
       # be recorded as `oom`. The time budgets are the other half: unbounded by default,
       # because a cap turns "slow" into "unmeasured", but in CI a cap is the difference
       # between a job that reports and a job that hangs until its timeout.
+      #
+      # Both memory values are *requests*: they can only be applied inside a user cgroup scope,
+      # and a hosted runner has no delegated cgroup tree. There the child runs unbounded and the
+      # runner's own RAM is what kills it, which is recorded as `killed` rather than `oom` so the
+      # record does not name a ceiling that was never in force.
       LEAN_GAP_MEM_SWAP_MAX: 1G
       WHOLE_BUDGET: 1800
       MODULE_BUDGET: 900

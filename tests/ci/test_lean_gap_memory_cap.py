@@ -72,6 +72,33 @@ class KillAttributionTest(unittest.TestCase):
         self.assertFalse(rep.killed_by_cap(137, None), "unbounded SIGKILL is somebody else's kill")
         self.assertFalse(rep.killed_by_cap(1, "18G"))
 
+    def test_a_configured_ceiling_that_was_never_applied_is_not_in_force(self):
+        """`LEAN_GAP_MEM_MAX` is a request. With no user cgroup it is only a number.
+
+        A GitHub runner has no delegated cgroup tree, so `bounded()` runs children unbounded.
+        Reading the configured 9G afterwards called the kernel's kill at the runner's own
+        memory limit "aeneas killed at the 9G memory ceiling", which is a record that names a
+        constraint that did not exist.
+        """
+        with mock.patch.object(rep, "scope_available", return_value=False):
+            self.assertIsNone(rep.ceiling_in_force())
+        with mock.patch.object(rep, "scope_available", return_value=True):
+            self.assertEqual(rep.ceiling_in_force(), rep.mem_cap())
+
+    def test_a_kill_names_whether_a_ceiling_was_in_force(self):
+        stage, why = rep.death_stage("aeneas", 137, "18G", "18G")
+        self.assertEqual(stage, "oom")
+        self.assertIn("18G memory ceiling", why)
+
+        stage, why = rep.death_stage("aeneas", -9, None, "9G")
+        self.assertEqual(stage, "killed")
+        self.assertIn("no cgroup ceiling was in force", why)
+        self.assertIn("9G", why, "the configured ceiling is still worth naming")
+
+        self.assertEqual(rep.death_stage("aeneas", 1, None, "9G"), (None, None))
+        self.assertEqual(rep.death_stage("aeneas", 137, None, None), (None, None),
+                         "with no ceiling configured there is nothing to attribute")
+
 
 class MissingScopeTest(unittest.TestCase):
     def test_an_absent_user_scope_is_announced_once_and_the_run_continues(self):
