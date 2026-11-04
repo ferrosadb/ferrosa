@@ -648,15 +648,27 @@ impl Schema {
     /// Create a role without auth checks. Idempotent — succeeds silently if role exists.
     /// Used for pair mode DDL replication.
     pub fn create_role_internal(&self, role: RoleMetadata) -> crate::Result<()> {
+        self.insert_role_if_absent(role).map(|_| ())
+    }
+
+    /// Insert a role without auth checks unless one with that name exists.
+    ///
+    /// Returns `true` only when the role was inserted. An existing role is
+    /// left untouched, so a caller that persists the role row must persist
+    /// only on `true`, and must persist the STORED role: persisting the
+    /// caller's incoming copy of a role that already existed would make disk
+    /// disagree with memory, and restart replay would resurrect the incoming
+    /// credential (t_d0e5e6e5).
+    pub fn insert_role_if_absent(&self, role: RoleMetadata) -> crate::Result<bool> {
         let _lifecycle = self.lifecycle_write();
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         if snap.roles.contains_key(&role.name) {
-            return Ok(());
+            return Ok(false);
         }
         snap.roles.insert(role.name.clone(), role);
         self.inner.store(Arc::new(snap));
-        Ok(())
+        Ok(true)
     }
 
     /// Restore one authoritative role row from system_auth.roles.

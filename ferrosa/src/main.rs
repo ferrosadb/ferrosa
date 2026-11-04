@@ -2702,7 +2702,19 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
         // restored. A fresh registry always contains the built-in cassandra
         // role; seeding before recovery recreated the other defaults on every
         // start and let a stale bootstrap hash win after an unclean shutdown.
-        ferrosa_schema::auth::bootstrap::seed_default_roles(&schema)?;
+        let seed_config = ferrosa_schema::auth::bootstrap::SeedConfig::from_env();
+        ferrosa_schema::auth::bootstrap::seed_default_roles_with_config(&schema, &seed_config)?;
+        // Repair seed-role rows a pre-fix CREATE ROLE IF NOT EXISTS persisted
+        // with a client's well-known password (t_d0e5e6e5). Runs before
+        // `enforce_production_requirements`, which still refuses a default
+        // superuser password this cannot repair. Each repair logs itself.
+        let repair = loader.repair_default_credential_rows(&schema, &seed_config)?;
+        if repair != Default::default() {
+            tracing::warn!(
+                ?repair,
+                "repaired default-password seed-role rows at startup"
+            );
+        }
         let schema_for_warn = Arc::clone(&schema);
         runtimes.background.spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(5 * 60)).await;

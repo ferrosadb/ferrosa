@@ -11,15 +11,47 @@
 use std::{collections::HashMap, sync::Arc};
 
 use ferrosa_common::Error as FerrosaError;
+use ferrosa_schema::auth::bootstrap::{
+    SeedConfig, SEED_ADMIN_PASSWORD, SEED_ADMIN_USER, SEED_APP_PASSWORD, SEED_APP_READER_USER,
+    SEED_GRAPH_ENGINE_USER,
+};
 use ferrosa_schema::system::persistence::{
-    PERMISSIONS_COL_PERMISSIONS, ROLES_COL_CAN_LOGIN, ROLES_COL_IS_SUPERUSER,
+    SystemTableMutation, PERMISSIONS_COL_PERMISSIONS, ROLES_COL_CAN_LOGIN, ROLES_COL_IS_SUPERUSER,
     ROLES_COL_SALTED_HASH, ROLES_COL_SCRAM,
 };
 use ferrosa_schema::{
-    GrantEntry, Permission, Resource, RoleMetadata, Schema, UserFunctionMetadata, UserTypeMetadata,
+    DeploymentMode, GrantEntry, PasswordHasher, Permission, Resource, RoleMetadata, Schema,
+    UserFunctionMetadata, UserTypeMetadata,
 };
 use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::TableId;
+
+/// What [`SystemTableLoader::repair_default_credential_rows`] changed.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CredentialRepairReport {
+    /// `ferrosa_admin`'s default-password row was replaced with the
+    /// configured `FERROSA_SEED_ADMIN_PASSWORD`.
+    pub admin_reseeded: bool,
+    /// Service roles whose default-password row had LOGIN disabled.
+    pub logins_disabled: Vec<String>,
+}
+
+/// Whether `role`'s stored hash verifies against `password`.
+///
+/// An unverifiable hash is not a default-password match: it is logged at
+/// ERROR and left for the normal authentication path to reject.
+fn role_verifies(role: &RoleMetadata, password: &str) -> bool {
+    let Some(hash) = role.salted_hash.as_deref() else {
+        return false;
+    };
+    match PasswordHasher::verify_password_any(password, hash) {
+        Ok(matches) => matches,
+        Err(e) => {
+            tracing::error!(%e, role = %role.name, "stored role hash could not be verified");
+            false
+        }
+    }
+}
 
 /// Loads system table data from the storage engine at cold start.
 ///
@@ -156,6 +188,132 @@ impl SystemTableLoader {
             })?;
         }
         Ok(count)
+    }
+
+    /// Repair seed-role rows that a pre-fix cluster persisted with a client's
+    /// well-known password (t_d0e5e6e5). Run after role replay AND seeding.
+    ///
+    /// Before the fix, `CREATE ROLE IF NOT EXISTS ferrosa_admin WITH PASSWORD =
+    /// '<default>'` reaching Raft apply wrote the default hash to
+    /// system_auth.roles on every node while memory kept the seeded one. The
+    /// replayed row then wins at restart. Two repairs, both persisted (row
+    /// first, then memory) and both logged:
+    ///
+    /// - `ferrosa_admin`: when the operator configured
+    ///   `FERROSA_SEED_ADMIN_PASSWORD` and the stored admin verifies against
+    ///   the built-in default but not against that configured password, the
+    ///   configured password is hashed and re-persisted. This only ever
+    ///   replaces the well-known credential with the operator's own one. With
+    ///   no configured password nothing is changed: the original was random
+    ///   and is unrecoverable, so the production gate must still refuse the
+    ///   default, and an ERROR names the remedy.
+    /// - `graph_engine` / `ferrosa_user` (production mode only): a login role
+    ///   whose stored hash verifies against the well-known service password
+    ///   has LOGIN disabled. Production never seeds that password, so the row
+    ///   came from a client literal; the random seeded password it overwrote is
+    ///   unrecoverable, and a well-known credential must not authenticate. An
+    ///   operator restores it with `ALTER ROLE <name> WITH PASSWORD = '...' AND
+    ///   LOGIN = true`.
+    pub fn repair_default_credential_rows(
+        &self,
+        schema: &Schema,
+        config: &SeedConfig,
+    ) -> ferrosa_common::Result<CredentialRepairReport> {
+        let mut report = CredentialRepairReport {
+            admin_reseeded: self.repair_default_admin_row(schema, config)?,
+            logins_disabled: Vec::new(),
+        };
+        if config.mode == DeploymentMode::Production {
+            for name in [SEED_GRAPH_ENGINE_USER, SEED_APP_READER_USER] {
+                if self.disable_default_service_login(schema, name)? {
+                    report.logins_disabled.push(name.to_string());
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    fn repair_default_admin_row(
+        &self,
+        schema: &Schema,
+        config: &SeedConfig,
+    ) -> ferrosa_common::Result<bool> {
+        let Some(admin) = schema.snapshot().roles.get(SEED_ADMIN_USER).cloned() else {
+            return Ok(false);
+        };
+        if !role_verifies(&admin, SEED_ADMIN_PASSWORD) {
+            return Ok(false);
+        }
+        let configured = config
+            .admin_password
+            .as_deref()
+            .filter(|pw| *pw != SEED_ADMIN_PASSWORD);
+        let Some(configured) = configured else {
+            if config.mode == DeploymentMode::Production {
+                tracing::error!(
+                    role = SEED_ADMIN_USER,
+                    "ferrosa_admin's stored credential is the well-known default and \
+                     FERROSA_SEED_ADMIN_PASSWORD is not set, so it cannot be repaired; production \
+                     startup will refuse it. Set FERROSA_SEED_ADMIN_PASSWORD to the intended admin \
+                     password and restart to re-persist it (t_d0e5e6e5)"
+                );
+            }
+            return Ok(false);
+        };
+        let mut repaired = admin;
+        repaired.salted_hash = Some(schema.password_hasher().hash_password(configured).map_err(
+            |e| FerrosaError::InvalidData(format!("hash configured admin password: {e}")),
+        )?);
+        repaired.scram = Some(ferrosa_schema::auth::scram::derive_with_random_salt(
+            configured,
+        ));
+        self.persist_and_restore(schema, repaired)?;
+        tracing::warn!(
+            role = SEED_ADMIN_USER,
+            "repaired ferrosa_admin: the persisted system_auth.roles row held the well-known \
+             default password while FERROSA_SEED_ADMIN_PASSWORD is configured; re-persisted the \
+             configured password (t_d0e5e6e5)"
+        );
+        Ok(true)
+    }
+
+    fn disable_default_service_login(
+        &self,
+        schema: &Schema,
+        name: &str,
+    ) -> ferrosa_common::Result<bool> {
+        let Some(role) = schema.snapshot().roles.get(name).cloned() else {
+            return Ok(false);
+        };
+        if !role.can_login || !role_verifies(&role, SEED_APP_PASSWORD) {
+            return Ok(false);
+        }
+        let mut locked = role;
+        locked.can_login = false;
+        self.persist_and_restore(schema, locked)?;
+        tracing::error!(
+            role = name,
+            "disabled LOGIN for a production service role whose persisted credential is the \
+             well-known default password (t_d0e5e6e5). Restore it with ALTER ROLE <role> WITH \
+             PASSWORD = '<new password>' AND LOGIN = true"
+        );
+        Ok(true)
+    }
+
+    /// Persist the row first so a failed write leaves memory unchanged and
+    /// fails startup loudly instead of reporting a repair that a restart undoes.
+    fn persist_and_restore(
+        &self,
+        schema: &Schema,
+        role: RoleMetadata,
+    ) -> ferrosa_common::Result<()> {
+        let name = role.name.clone();
+        crate::system_table_writer::SystemTableWriter::new(Arc::clone(&self.engine))
+            .apply(SystemTableMutation::RoleCreated(role.clone()))
+            .map_err(|e| FerrosaError::InvalidData(format!("persist repaired role {name}: {e}")))?;
+        schema
+            .restore_role_internal(role)
+            .map_err(|e| FerrosaError::InvalidData(format!("restore repaired role {name}: {e}")))
     }
 
     /// Load persisted grants from `system_auth.role_permissions`.
@@ -748,6 +906,217 @@ mod tests {
             Some(&persisted_scram),
             "Postgres verifier must survive role replay"
         );
+    }
+
+    // -- t_d0e5e6e5: repair of default-password seed-role rows --------------
+
+    const MANAGED_ADMIN_PASSWORD: &str = "managed-admin-secret-d0e5"; // pragma: allowlist secret
+
+    fn fast_schema() -> Schema {
+        Schema::new(SchemaConfig {
+            hasher: PasswordHasher::Bcrypt { cost: 4 },
+            password_policy: PasswordPolicy::permissive(),
+            auth_method: AuthMethod::Password,
+            rate_limit: RateLimitConfig::default(),
+            audit_sink: Box::new(LogAuditSink),
+            secrets: Box::new(EnvSecretsProvider),
+            mode: ferrosa_schema::DeploymentMode::Development,
+        })
+        .unwrap()
+    }
+
+    fn write_role_row(engine: &Arc<StorageEngine>, name: &str, password: &str, superuser: bool) {
+        SystemTableWriter::new(Arc::clone(engine))
+            .apply(SystemTableMutation::RoleCreated(RoleMetadata {
+                name: name.to_string(),
+                is_superuser: superuser,
+                can_login: true,
+                salted_hash: Some(
+                    PasswordHasher::Bcrypt { cost: 4 }
+                        .hash_password(password)
+                        .unwrap(),
+                ),
+                member_of: Default::default(),
+                scram: None,
+            }))
+            .unwrap();
+    }
+
+    fn persisted(engine: &Arc<StorageEngine>, name: &str) -> RoleMetadata {
+        SystemTableLoader::new(Arc::clone(engine))
+            .load_roles()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.name == name)
+            .unwrap_or_else(|| panic!("{name} must be persisted"))
+    }
+
+    /// The node's startup sequence: replay system_auth.roles, seed, repair.
+    fn restart(
+        engine: &Arc<StorageEngine>,
+        config: &SeedConfig,
+    ) -> (Schema, CredentialRepairReport) {
+        let schema = fast_schema();
+        let loader = SystemTableLoader::new(Arc::clone(engine));
+        loader.replay_roles_into_schema(&schema).unwrap();
+        ferrosa_schema::auth::bootstrap::seed_default_roles_with_config(&schema, config).unwrap();
+        let report = loader
+            .repair_default_credential_rows(&schema, config)
+            .unwrap();
+        (schema, report)
+    }
+
+    /// Records every event's level and message so a test can assert that a
+    /// repair is observable in the log.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl CapturedLog {
+        fn contains(&self, level: tracing::Level, needle: &str) -> bool {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(l, m)| *l == level && m.contains(needle))
+        }
+    }
+
+    impl tracing::Subscriber for CapturedLog {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            self.0
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), message.0));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// An existing cluster restarted onto the fix: system_auth.roles holds the
+    /// default admin and ferrosa_user rows a pre-fix CREATE ROLE IF NOT EXISTS
+    /// wrote. Startup must re-persist the configured admin password (so the
+    /// production gate passes on a real credential, not a bypass), lock the
+    /// well-known service login, log both, and be idempotent.
+    #[test]
+    fn repair_reseeds_default_admin_row_and_locks_default_service_login() {
+        use ferrosa_schema::auth::bootstrap::admin_password_is_default;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        write_role_row(&engine, SEED_ADMIN_USER, SEED_ADMIN_PASSWORD, true);
+        write_role_row(&engine, SEED_APP_READER_USER, SEED_APP_PASSWORD, false);
+        write_role_row(&engine, SEED_GRAPH_ENGINE_USER, "random-service-pw", false);
+
+        let config = SeedConfig::from_parts(
+            DeploymentMode::Production,
+            Some(MANAGED_ADMIN_PASSWORD.to_string()),
+        );
+        let log = CapturedLog::default();
+        let (schema, report) =
+            tracing::subscriber::with_default(log.clone(), || restart(&engine, &config));
+
+        assert_eq!(
+            report,
+            CredentialRepairReport {
+                admin_reseeded: true,
+                logins_disabled: vec![SEED_APP_READER_USER.to_string()],
+            }
+        );
+        assert!(log.contains(tracing::Level::WARN, "repaired ferrosa_admin"));
+        assert!(log.contains(tracing::Level::ERROR, "disabled LOGIN"));
+
+        assert!(!admin_password_is_default(&schema));
+        assert!(schema
+            .authenticate(SEED_ADMIN_USER, MANAGED_ADMIN_PASSWORD)
+            .is_ok());
+        assert!(schema
+            .authenticate(SEED_APP_READER_USER, SEED_APP_PASSWORD)
+            .is_err());
+        assert!(schema
+            .authenticate(SEED_GRAPH_ENGINE_USER, "random-service-pw")
+            .is_ok());
+
+        let admin_row = persisted(&engine, SEED_ADMIN_USER);
+        assert!(role_verifies(&admin_row, MANAGED_ADMIN_PASSWORD));
+        assert!(!role_verifies(&admin_row, SEED_ADMIN_PASSWORD));
+        assert!(!persisted(&engine, SEED_APP_READER_USER).can_login);
+        assert!(persisted(&engine, SEED_GRAPH_ENGINE_USER).can_login);
+
+        // The repair is durable: the next restart replays repaired rows and
+        // has nothing left to do.
+        let (schema, report) = restart(&engine, &config);
+        assert_eq!(report, CredentialRepairReport::default());
+        assert!(!admin_password_is_default(&schema));
+    }
+
+    /// With no configured admin password there is nothing correct to restore:
+    /// the repair changes nothing and logs the remedy, and the default stays
+    /// visible so the production gate still refuses it.
+    #[test]
+    fn repair_without_configured_admin_password_leaves_gate_to_refuse() {
+        use ferrosa_schema::auth::bootstrap::admin_password_is_default;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        write_role_row(&engine, SEED_ADMIN_USER, SEED_ADMIN_PASSWORD, true);
+
+        let config = SeedConfig::from_parts(DeploymentMode::Production, None);
+        let log = CapturedLog::default();
+        let (schema, report) =
+            tracing::subscriber::with_default(log.clone(), || restart(&engine, &config));
+
+        assert!(!report.admin_reseeded);
+        assert!(
+            admin_password_is_default(&schema),
+            "the repair must never hide the default from the production gate"
+        );
+        assert!(role_verifies(
+            &persisted(&engine, SEED_ADMIN_USER),
+            SEED_ADMIN_PASSWORD
+        ));
+        assert!(log.contains(
+            tracing::Level::ERROR,
+            "FERROSA_SEED_ADMIN_PASSWORD is not set"
+        ));
+    }
+
+    /// Development mode uses the well-known service password by design.
+    #[test]
+    fn repair_leaves_development_service_logins_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        write_role_row(&engine, SEED_APP_READER_USER, SEED_APP_PASSWORD, false);
+
+        let config = SeedConfig::from_parts(DeploymentMode::Development, None);
+        let (schema, report) = restart(&engine, &config);
+
+        assert!(report.logins_disabled.is_empty());
+        assert!(schema
+            .authenticate(SEED_APP_READER_USER, SEED_APP_PASSWORD)
+            .is_ok());
     }
 
     #[test]

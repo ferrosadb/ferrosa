@@ -13625,6 +13625,20 @@ async fn route_create_role(
         ));
     }
 
+    // Existence is decided before anything is hashed or enters a DDL log
+    // (mirrors CREATE KEYSPACE IF NOT EXISTS). Replicating a CreateRole for a
+    // role that already exists — e.g. a seeded ferrosa_admin — used to persist
+    // the client's literal password on every node while memory kept the seeded
+    // one, and restart replayed it (t_d0e5e6e5). The Direct path re-checks
+    // under its schema lock, and the Raft apply refuses to persist a duplicate,
+    // so a concurrent CREATE racing this check stays safe.
+    if state.schema.snapshot().roles.contains_key(&s.name) {
+        if s.if_not_exists {
+            return Ok(result::encode_void());
+        }
+        return Err(ferrosa_schema::SchemaError::RoleExists(s.name.clone()).into());
+    }
+
     let base_role = RoleMetadata {
         name: s.name.clone(),
         is_superuser: s.superuser.unwrap_or(false),
@@ -31979,6 +31993,123 @@ mod tests {
         assert!(
             snap.roles.contains_key("test_role"),
             "role should be in schema"
+        );
+    }
+
+    /// Put a role in the registry the way the startup seed does: in memory only.
+    fn seed_role_in_memory(state: &SharedState, name: &str, password: &str) {
+        let role = RoleMetadata {
+            name: name.into(),
+            is_superuser: false,
+            can_login: true,
+            salted_hash: Some(
+                state
+                    .schema
+                    .password_hasher()
+                    .hash_password(password)
+                    .unwrap(),
+            ),
+            member_of: HashSet::new(),
+            scram: None,
+        };
+        state.schema.create_role_internal(role).unwrap();
+    }
+
+    async fn route_role_ddl(state: &SharedState, cql: &str) -> Result<RouteResult, CqlError> {
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        route(state, &ctx, crate::parser::parse(cql).unwrap()).await
+    }
+
+    /// t_d0e5e6e5: on the replicated (Pair/Cluster) DDL paths `IF NOT EXISTS`
+    /// was never read, so a client's `CREATE ROLE IF NOT EXISTS` for a seeded
+    /// role hashed its literal and replicated a CreateRole. The existence check
+    /// must happen before anything is replicated. `Unavailable` stands in for
+    /// any non-Direct path: if the router tried to replicate, it errors.
+    #[tokio::test]
+    async fn create_role_existing_role_never_replicates() {
+        let (state, _dir) = setup();
+        seed_role_in_memory(&state, "seeded_role", "managed-pw");
+        state.ddl_path.store(Arc::new(DdlPath::Unavailable));
+
+        let result = route_role_ddl(
+            &state,
+            "CREATE ROLE IF NOT EXISTS seeded_role WITH PASSWORD = 'well-known' AND LOGIN = true", // pragma: allowlist secret
+        )
+        .await;
+        match result {
+            Ok(RouteResult::Result(b)) => assert_eq!(&b[0..4], &0x0001i32.to_be_bytes()),
+            Ok(_) => panic!("IF NOT EXISTS on an existing role must return a void result"),
+            Err(e) => panic!("IF NOT EXISTS on an existing role must be a void no-op: {e:?}"),
+        }
+        assert!(state
+            .schema
+            .authenticate("seeded_role", "managed-pw")
+            .is_ok());
+        assert!(state
+            .schema
+            .authenticate("seeded_role", "well-known")
+            .is_err());
+
+        assert_role_exists_error(
+            route_role_ddl(
+                &state,
+                "CREATE ROLE seeded_role WITH PASSWORD = 'well-known' AND LOGIN = true", // pragma: allowlist secret
+            )
+            .await,
+        );
+    }
+
+    fn assert_role_exists_error(result: Result<RouteResult, CqlError>) {
+        match result {
+            Ok(_) => panic!("CREATE ROLE without IF NOT EXISTS on an existing role must fail"),
+            Err(e) => assert!(
+                format!("{e:?}").contains("role already exists"),
+                "expected RoleExists, got {e:?}"
+            ),
+        }
+    }
+
+    /// Standalone (Direct) path: same contract, and no system_auth row is
+    /// written for the no-op.
+    #[tokio::test]
+    async fn create_role_existing_role_direct_is_noop_without_persist() {
+        let (state, _dir) = setup();
+        seed_role_in_memory(&state, "seeded_direct", "managed-pw");
+
+        let result = route_role_ddl(
+            &state,
+            "CREATE ROLE IF NOT EXISTS seeded_direct WITH PASSWORD = 'well-known' AND LOGIN = true", // pragma: allowlist secret
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "IF NOT EXISTS must succeed: {:?}",
+            result.err()
+        );
+        assert!(state
+            .schema
+            .authenticate("seeded_direct", "managed-pw")
+            .is_ok());
+        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            b"seeded_direct".to_vec(),
+        ));
+        assert!(
+            state
+                .engine
+                .read(&ferrosa_storage::TableId::new("system_auth", "roles"), &key)
+                .unwrap()
+                .is_none(),
+            "the no-op must not write a system_auth.roles row"
+        );
+
+        assert_role_exists_error(
+            route_role_ddl(
+                &state,
+                "CREATE ROLE seeded_direct WITH PASSWORD = 'well-known' AND LOGIN = true", // pragma: allowlist secret
+            )
+            .await,
         );
     }
 

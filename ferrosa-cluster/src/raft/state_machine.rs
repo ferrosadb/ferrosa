@@ -811,6 +811,38 @@ impl FerrosStateMachine {
         Ok(())
     }
 
+    /// Queue the system_auth.roles row for `name` from the role the node
+    /// STORES: the schema registry when one is attached (it is what
+    /// authenticates, and what restart replays), else the replicated copy.
+    ///
+    /// The replicated `state.roles` copy is not authoritative for roles the
+    /// registry seeded locally, and a cluster that applied the pre-fix
+    /// CreateRole holds a client's default-password copy there (t_d0e5e6e5);
+    /// persisting it would put that password back on disk.
+    fn queue_stored_role_write(
+        &self,
+        name: &str,
+        pending: &mut Vec<PendingSystemWrite>,
+        context: &'static str,
+    ) {
+        let stored = match &self.schema {
+            Some(schema) => schema.snapshot().roles.get(name).cloned(),
+            None => self.state.roles.get(name).cloned(),
+        };
+        match stored {
+            Some(role) => pending.push(PendingSystemWrite {
+                mutation: SystemTableMutation::RoleCreated(role),
+                level: SystemWriteLogLevel::Error,
+                context,
+            }),
+            None => tracing::warn!(
+                role = name,
+                "Raft apply: role update for a role this node does not store; no system_auth \
+                 row written"
+            ),
+        }
+    }
+
     fn table_has_local_artifacts(
         &self,
         engine: &StorageEngine,
@@ -1673,21 +1705,40 @@ impl FerrosStateMachine {
 
             // ---- DDL: Roles & Grants -----------------------------------
             RaftOp::CreateRole(role) => {
-                self.state
-                    .roles
-                    .entry(role.name.clone())
-                    .or_insert_with(|| role.clone());
-                if self.system_writer.is_some() {
-                    pending_system_writes.push(PendingSystemWrite {
-                        mutation: SystemTableMutation::RoleCreated(role.clone()),
-                        level: SystemWriteLogLevel::Error,
-                        context: "Raft apply: system table write failed",
-                    });
+                let name = role.name.clone();
+                let inserted_in_state = !self.state.roles.contains_key(&name);
+                if inserted_in_state {
+                    self.state.roles.insert(name.clone(), role.clone());
                 }
-                if let Some(schema) = &self.schema {
-                    if let Err(e) = schema.create_role_internal(role) {
-                        tracing::error!(%e, "Raft apply: schema.create_role_internal failed");
-                    }
+                // The registry is the authority for whether the role is new:
+                // seeded roles (ferrosa_admin, graph_engine, ferrosa_user) live
+                // only there, never in the replicated `state.roles`.
+                let inserted = match &self.schema {
+                    Some(schema) => match schema.insert_role_if_absent(role) {
+                        Ok(inserted) => inserted,
+                        Err(e) => {
+                            tracing::error!(%e, role = %name, "Raft apply: schema.insert_role_if_absent failed");
+                            false
+                        }
+                    },
+                    None => inserted_in_state,
+                };
+                if !inserted {
+                    // Persisting the incoming role here wrote the client's
+                    // password over a seeded one on disk only; restart then
+                    // replayed it (t_d0e5e6e5). The stored role is unchanged,
+                    // so its row (if any) is already correct.
+                    tracing::warn!(
+                        role = %name,
+                        "Raft apply: CreateRole for a role that already exists; kept the stored \
+                         role and persisted nothing"
+                    );
+                } else if self.system_writer.is_some() {
+                    self.queue_stored_role_write(
+                        &name,
+                        &mut pending_system_writes,
+                        "Raft apply: system table write failed",
+                    );
                 }
             }
             RaftOp::AlterRole { name, updates } => {
@@ -1705,19 +1756,18 @@ impl FerrosStateMachine {
                         role.member_of = member_of.clone();
                     }
                 }
-                if self.system_writer.is_some() {
-                    if let Some(role) = self.state.roles.get(&name) {
-                        pending_system_writes.push(PendingSystemWrite {
-                            mutation: SystemTableMutation::RoleCreated(role.clone()),
-                            level: SystemWriteLogLevel::Error,
-                            context: "Raft apply: system table write failed",
-                        });
-                    }
-                }
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.alter_role_internal(&name, updates) {
                         tracing::error!(%e, "Raft apply: schema.alter_role_internal failed");
                     }
+                }
+                // After the registry update, so the row is the altered stored role.
+                if self.system_writer.is_some() {
+                    self.queue_stored_role_write(
+                        &name,
+                        &mut pending_system_writes,
+                        "Raft apply: system table write failed",
+                    );
                 }
             }
             RaftOp::DropRole(name) => {
@@ -1809,19 +1859,17 @@ impl FerrosStateMachine {
                     if let Some(role) = self.state.roles.get_mut(&member) {
                         role.member_of.insert(granted_role.clone());
                     }
-                    if self.system_writer.is_some() {
-                        if let Some(role) = self.state.roles.get(&member) {
-                            pending_system_writes.push(PendingSystemWrite {
-                                mutation: SystemTableMutation::RoleCreated(role.clone()),
-                                level: SystemWriteLogLevel::Error,
-                                context: "Raft apply: system table write failed for GrantRole",
-                            });
-                        }
-                    }
                     if let Some(schema) = &self.schema {
                         if let Err(e) = schema.grant_role_internal(&member, &granted_role) {
                             tracing::error!(%e, "Raft apply: schema.grant_role_internal failed");
                         }
+                    }
+                    if self.system_writer.is_some() {
+                        self.queue_stored_role_write(
+                            &member,
+                            &mut pending_system_writes,
+                            "Raft apply: system table write failed for GrantRole",
+                        );
                     }
                 }
             }
@@ -1832,19 +1880,17 @@ impl FerrosStateMachine {
                 if let Some(role) = self.state.roles.get_mut(&member) {
                     role.member_of.remove(&granted_role);
                 }
-                if self.system_writer.is_some() {
-                    if let Some(role) = self.state.roles.get(&member) {
-                        pending_system_writes.push(PendingSystemWrite {
-                            mutation: SystemTableMutation::RoleCreated(role.clone()),
-                            level: SystemWriteLogLevel::Error,
-                            context: "Raft apply: system table write failed for RevokeRole",
-                        });
-                    }
-                }
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.revoke_role_internal(&member, &granted_role) {
                         tracing::error!(%e, "Raft apply: schema.revoke_role_internal failed");
                     }
+                }
+                if self.system_writer.is_some() {
+                    self.queue_stored_role_write(
+                        &member,
+                        &mut pending_system_writes,
+                        "Raft apply: system table write failed for RevokeRole",
+                    );
                 }
             }
 
@@ -5395,6 +5441,256 @@ mod tests {
         sm.apply(entries).await.unwrap();
 
         // After drop, the write should not error (tombstone was written).
+    }
+
+    // -- t_d0e5e6e5: CREATE ROLE for an already-seeded role ------------------
+
+    const MANAGED_ADMIN_PASSWORD: &str = "managed-admin-secret-d0e5"; // pragma: allowlist secret
+
+    /// A schema with cheap bcrypt so the role tests stay fast.
+    fn fast_role_schema() -> Arc<ferrosa_schema::Schema> {
+        use ferrosa_schema::{
+            AuthMethod, LogAuditSink, PasswordHasher, PasswordPolicy, RateLimitConfig, SchemaConfig,
+        };
+        Arc::new(
+            ferrosa_schema::Schema::new(SchemaConfig {
+                hasher: PasswordHasher::Bcrypt { cost: 4 },
+                password_policy: PasswordPolicy::permissive(),
+                auth_method: AuthMethod::Password,
+                rate_limit: RateLimitConfig::default(),
+                audit_sink: Box::new(LogAuditSink),
+                secrets: Box::new(ferrosa_schema::EnvSecretsProvider),
+                mode: ferrosa_schema::startup::DeploymentMode::Development,
+            })
+            .unwrap(),
+        )
+    }
+
+    /// The production seed a managed deployment runs at every start
+    /// (`FERROSA_MODE=production` + `FERROSA_SEED_ADMIN_PASSWORD`).
+    fn managed_seed_config() -> ferrosa_schema::auth::bootstrap::SeedConfig {
+        ferrosa_schema::auth::bootstrap::SeedConfig::from_parts(
+            ferrosa_schema::startup::DeploymentMode::Production,
+            Some(MANAGED_ADMIN_PASSWORD.to_string()),
+        )
+    }
+
+    /// The role a coordinator replicates for
+    /// `CREATE ROLE IF NOT EXISTS <name> WITH PASSWORD = '<password>'`.
+    fn replicated_role(name: &str, password: &str, is_superuser: bool) -> RoleMetadata {
+        RoleMetadata {
+            name: name.to_string(),
+            is_superuser,
+            can_login: true,
+            salted_hash: Some(
+                ferrosa_schema::PasswordHasher::Bcrypt { cost: 4 }
+                    .hash_password(password)
+                    .unwrap(),
+            ),
+            member_of: HashSet::new(),
+            scram: None,
+        }
+    }
+
+    fn persisted_role(engine: &Arc<StorageEngine>, name: &str) -> Option<RoleMetadata> {
+        crate::system_table_loader::SystemTableLoader::new(Arc::clone(engine))
+            .load_roles()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.name == name)
+    }
+
+    fn verifies(role: &RoleMetadata, password: &str) -> bool {
+        role.salted_hash.as_deref().is_some_and(|hash| {
+            ferrosa_schema::PasswordHasher::verify_password_any(password, hash).unwrap()
+        })
+    }
+
+    /// Finding 6 (t_d0e5e6e5). A seeded role lives only in memory. A client
+    /// `CREATE ROLE IF NOT EXISTS ferrosa_admin WITH PASSWORD = '<default>'`
+    /// that reaches Raft apply must not write the INCOMING default hash to
+    /// system_auth.roles while memory keeps the managed one: on restart the
+    /// replayed row wins and production startup exits FATAL on the default
+    /// superuser password. ferrosa_user must not come back with its
+    /// well-known password either.
+    #[tokio::test]
+    async fn finding6_if_not_exists_create_role_overwrites_persisted_seed_hash() {
+        use ferrosa_schema::auth::bootstrap::{
+            admin_password_is_default, seed_default_roles_with_config, SEED_ADMIN_PASSWORD,
+            SEED_ADMIN_USER, SEED_APP_PASSWORD, SEED_APP_READER_USER,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+
+        let schema = fast_role_schema();
+        seed_default_roles_with_config(&schema, &managed_seed_config()).unwrap();
+        let mut sm =
+            FerrosStateMachine::with_side_effects(Arc::clone(&schema), Arc::clone(&engine));
+
+        sm.apply(vec![
+            make_entry(
+                1,
+                1,
+                RaftOp::CreateRole(replicated_role(SEED_ADMIN_USER, SEED_ADMIN_PASSWORD, true)),
+            ),
+            make_entry(
+                1,
+                2,
+                RaftOp::CreateRole(replicated_role(
+                    SEED_APP_READER_USER,
+                    SEED_APP_PASSWORD,
+                    false,
+                )),
+            ),
+        ])
+        .await
+        .unwrap();
+
+        assert!(
+            schema
+                .authenticate(SEED_ADMIN_USER, MANAGED_ADMIN_PASSWORD)
+                .is_ok(),
+            "memory keeps the seeded admin credential"
+        );
+        for (name, default) in [
+            (SEED_ADMIN_USER, SEED_ADMIN_PASSWORD),
+            (SEED_APP_READER_USER, SEED_APP_PASSWORD),
+        ] {
+            if let Some(row) = persisted_role(&engine, name) {
+                assert!(
+                    !verifies(&row, default),
+                    "{name}: system_auth.roles must not hold the incoming default hash"
+                );
+            }
+        }
+
+        // Restart: a fresh registry replays system_auth.roles, then seeds.
+        let restarted = fast_role_schema();
+        crate::system_table_loader::SystemTableLoader::new(Arc::clone(&engine))
+            .replay_roles_into_schema(&restarted)
+            .unwrap();
+        seed_default_roles_with_config(&restarted, &managed_seed_config()).unwrap();
+        assert!(
+            !admin_password_is_default(&restarted),
+            "replayed admin must not verify against the default password"
+        );
+        assert!(restarted
+            .authenticate(SEED_ADMIN_USER, MANAGED_ADMIN_PASSWORD)
+            .is_ok());
+        assert!(
+            restarted
+                .authenticate(SEED_APP_READER_USER, SEED_APP_PASSWORD)
+                .is_err(),
+            "a restarted node must not accept ferrosa_user's well-known password"
+        );
+    }
+
+    /// A genuinely new role is still persisted, and the row is the stored role.
+    #[tokio::test]
+    async fn create_role_new_role_persists_the_stored_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = fast_role_schema();
+        let mut sm =
+            FerrosStateMachine::with_side_effects(Arc::clone(&schema), Arc::clone(&engine));
+
+        sm.apply(vec![make_entry(
+            1,
+            1,
+            RaftOp::CreateRole(replicated_role("fresh_role", "fresh-pw", false)),
+        )])
+        .await
+        .unwrap();
+
+        let row = persisted_role(&engine, "fresh_role").expect("new role must be persisted");
+        assert!(verifies(&row, "fresh-pw"));
+        assert!(schema.authenticate("fresh_role", "fresh-pw").is_ok());
+    }
+
+    /// ALTER/GRANT on a role must persist the role the registry STORES. A
+    /// seeded role is absent from the replicated `state.roles`, and a cluster
+    /// that applied the pre-fix CreateRole holds a stale default-hash copy
+    /// there: persisting that copy re-writes the default password to disk.
+    #[tokio::test]
+    async fn role_updates_persist_the_stored_role_not_replicated_copy() {
+        use ferrosa_schema::auth::bootstrap::{
+            seed_default_roles_with_config, SEED_ADMIN_PASSWORD, SEED_ADMIN_USER,
+            SEED_APP_READER_USER,
+        };
+        use ferrosa_schema::RoleUpdates;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = fast_role_schema();
+        seed_default_roles_with_config(&schema, &managed_seed_config()).unwrap();
+        let mut sm =
+            FerrosStateMachine::with_side_effects(Arc::clone(&schema), Arc::clone(&engine));
+
+        // Legacy replicated state: a default-hash copy of the admin role.
+        sm.state.roles.insert(
+            SEED_ADMIN_USER.to_string(),
+            replicated_role(SEED_ADMIN_USER, SEED_ADMIN_PASSWORD, true),
+        );
+
+        sm.apply(vec![make_entry(
+            1,
+            1,
+            RaftOp::AlterRole {
+                name: SEED_ADMIN_USER.to_string(),
+                updates: RoleUpdates {
+                    can_login: Some(true),
+                    ..RoleUpdates::default()
+                },
+            },
+        )])
+        .await
+        .unwrap();
+        let row = persisted_role(&engine, SEED_ADMIN_USER).expect("ALTER must persist the role");
+        assert!(
+            verifies(&row, MANAGED_ADMIN_PASSWORD) && !verifies(&row, SEED_ADMIN_PASSWORD),
+            "ALTER must persist the stored (managed) hash, not the replicated default copy"
+        );
+
+        // A seeded role that is NOT in state.roles: ALTER ... PASSWORD must
+        // still reach disk, or the rotation is lost on restart.
+        let rotated = ferrosa_schema::PasswordHasher::Bcrypt { cost: 4 }
+            .hash_password("rotated-user-pw")
+            .unwrap();
+        sm.apply(vec![make_entry(
+            1,
+            2,
+            RaftOp::AlterRole {
+                name: SEED_APP_READER_USER.to_string(),
+                updates: RoleUpdates {
+                    password: Some(rotated),
+                    ..RoleUpdates::default()
+                },
+            },
+        )])
+        .await
+        .unwrap();
+        let row = persisted_role(&engine, SEED_APP_READER_USER)
+            .expect("ALTER ROLE PASSWORD on a seeded role must persist");
+        assert!(verifies(&row, "rotated-user-pw"));
+
+        // GRANT ROLE re-persists the member row: it too must be the stored role.
+        sm.apply(vec![make_entry(
+            1,
+            3,
+            RaftOp::GrantRole {
+                member: SEED_ADMIN_USER.to_string(),
+                granted_role: SEED_APP_READER_USER.to_string(),
+            },
+        )])
+        .await
+        .unwrap();
+        let row = persisted_role(&engine, SEED_ADMIN_USER).unwrap();
+        assert!(
+            !verifies(&row, SEED_ADMIN_PASSWORD),
+            "GRANT ROLE must not re-persist the replicated default hash"
+        );
     }
 
     // -- IndexNodeStatus / index_state_map tests ----------------------------
