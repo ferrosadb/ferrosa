@@ -59,6 +59,8 @@ jobs:
       # refuse to release below the latest stable tag.
       - name: Check release version comes from main
         run: python3 -m unittest -q tests/ci/test_release_version_from_main.py
+      - name: Check hardened runner DNS prerequisites
+        run: python3 -m unittest -q tests.ci.test_security_dns_prerequisite
       - name: Check CI cache workflow contract
         run: python3 -m unittest -q tests/ci/test_ci_cache_workflow.py
       - name: Check node image artifact provenance
