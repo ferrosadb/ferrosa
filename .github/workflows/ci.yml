@@ -61,6 +61,8 @@ jobs:
         run: python3 -m unittest -q tests/ci/test_release_version_from_main.py
       - name: Check CI cache workflow contract
         run: python3 -m unittest -q tests/ci/test_ci_cache_workflow.py
+      - name: Check node image artifact provenance
+        run: python3 -m unittest -q tests.ci.test_node_image_provenance
       - name: Check CI builds the shipped binary once
         run: python3 -m unittest -q tests/ci/test_ci_build_once.py
       # The specification's PDF is the Verso site, printed. A second renderer is the defect this
@@ -608,6 +610,8 @@ jobs:
     env:
       # The oldest glibc every glibc artifact must run on (Ubuntu 22.04).
       GLIBC_FLOOR: "2.35"
+    outputs:
+      revision: ${{ steps.revision.outputs.revision }}
     steps:
       - name: Install glibc build dependencies
         # Same packages as release.yml's build-linux-gnu, before checkout: the
@@ -618,6 +622,9 @@ jobs:
             git curl ca-certificates build-essential pkg-config perl file \
             capnproto libunwind-dev
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Cross-repo consumers resolve the branch head, not the PR merge tree.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -639,6 +646,20 @@ jobs:
             echo "::error::binary needs glibc ${required}, newer than ${GLIBC_FLOOR} (Ubuntu 22.04)"
             exit 1
           fi
+      - name: Record the glibc artifact source
+        id: revision
+        env:
+          EXPECTED_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
+          case "$workspace" in /*) ;; *) echo "::error::workspace must be absolute"; exit 1 ;; esac
+          workspace="$(cd -- "$workspace" && pwd -P)"
+          [ "$workspace" = "$(pwd -P)" ] || { echo "::error::glibc checkout workspace mismatch"; exit 1; }
+          revision="$(git -c "safe.directory=$workspace" rev-parse HEAD)"
+          [ "$revision" = "$EXPECTED_REVISION" ] || { echo "::error::glibc checkout revision mismatch"; exit 1; }
+          printf '%s\n' "$revision" > target/x86_64-unknown-linux-gnu/release/source-revision.txt
+          printf 'revision=%s\n' "$revision" >> "$GITHUB_OUTPUT"
       - name: Upload glibc binaries
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -646,6 +667,7 @@ jobs:
           path: |
             target/x86_64-unknown-linux-gnu/release/ferrosa
             target/x86_64-unknown-linux-gnu/release/ferrosa-ctl
+            target/x86_64-unknown-linux-gnu/release/source-revision.txt
           retention-days: 14
 
   build-node-image:
@@ -657,7 +679,12 @@ jobs:
     permissions:
       contents: read
       packages: write
+    env:
+      SOURCE_REVISION: ${{ needs.glibc.outputs.revision }}
     steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.glibc.outputs.revision }}
       - name: Download the glibc binaries
         uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
         with:
@@ -665,6 +692,10 @@ jobs:
           path: node-bin
       - name: Package into a thin runtime image
         run: |
+          set -euo pipefail
+          [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::invalid source revision"; exit 1; }
+          [ "$(git rev-parse HEAD)" = "$SOURCE_REVISION" ] || { echo "::error::image checkout revision mismatch"; exit 1; }
+          [ "$(cat node-bin/source-revision.txt)" = "$SOURCE_REVISION" ] || { echo "::error::artifact source revision mismatch"; exit 1; }
           mkdir -p node-bin
           # upload-artifact does not keep file modes.
           chmod +x node-bin/ferrosa node-bin/ferrosa-ctl
@@ -685,7 +716,7 @@ jobs:
           # fails the job and DROPS the PR from the merge queue. A bounded retry
           # rides out the transient registry blip (see forge t_75ec87fd).
           for attempt in 1 2 3 4; do
-            docker build -t ferrosa-test-node:latest node-bin && break
+            docker build --iidfile node-bin/image-id --label "org.opencontainers.image.revision=$SOURCE_REVISION" -t ferrosa-test-node:latest node-bin && break
             [ "$attempt" = 4 ] && { echo "docker build failed after 4 attempts"; exit 1; }
             echo "docker build attempt $attempt failed (likely Docker Hub base-image pull); retrying in $((attempt * 10))s…"
             sleep $((attempt * 10))
@@ -694,21 +725,20 @@ jobs:
       - name: Push image to GHCR (cross-workflow reuse)
         # Lets the separate, path-filtered driver-smoke workflow and paired
         # repositories pull this image by commit SHA instead of recompiling.
-        # Pull-request workflows run on a synthetic merge SHA, while a paired
-        # repository resolves this branch's head SHA, so publish both tags.
-        # Best-effort: fork PRs lack packages:write, so consumers fall back to
-        # building.
+        # The recorded artifact source is the PR head or event revision.
+        # Fork PRs may lack packages:write; reuse consumers can build their
+        # checked-out source when publication is unavailable.
         continue-on-error: true
         run: |
+          set -euo pipefail
+          [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::invalid source revision"; exit 1; }
+          [ "$(git rev-parse HEAD)" = "$SOURCE_REVISION" ] || { echo "::error::image checkout revision mismatch"; exit 1; }
+          [ "$(cat node-bin/source-revision.txt)" = "$SOURCE_REVISION" ] || { echo "::error::artifact source revision mismatch"; exit 1; }
           IMAGE="ghcr.io/${{ github.repository_owner }}/ferrosa-test-node"
-          MERGE_SHA="${{ github.sha }}"
-          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          for SHA in "$MERGE_SHA" "$HEAD_SHA"; do
-            [ -n "$SHA" ] || continue
-            docker tag ferrosa-test-node:latest "$IMAGE:$SHA"
-            docker push "$IMAGE:$SHA"
-          done
+          # Use the exact image built above, not another job's mutable local tag.
+          docker tag "$(cat node-bin/image-id)" "$IMAGE:$SOURCE_REVISION"
+          docker push "$IMAGE:$SOURCE_REVISION"
       - name: Upload node image
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

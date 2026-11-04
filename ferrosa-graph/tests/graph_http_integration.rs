@@ -3,6 +3,9 @@
 //! Exercises the full graph workflow through the HTTP API:
 //! schema creation via ferrosa-schema, then Cypher queries via
 //! the graph HTTP endpoint.
+//! Correctness: physical graph rows and scoped endpoint reads agree after writes and cascades.
+//! Last revised: 2026-11-03
+//! Last changed: Cover legacy cascade row keys and temporal vertex endpoint identities.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -5329,6 +5332,665 @@ fn live_row_count(storage: &StorageEngine, keyspace: &str, table: &str, key_byte
             .count(),
         None => 0,
     }
+}
+
+/// Legacy endpoint columns need not be either vertex's storage partition key.
+/// Cascade outgoing, incoming and self-loop rows, preserve an unrelated row in
+/// the incoming edge partition, and preserve sibling vertices in this session.
+#[tokio::test]
+async fn detach_delete_clustered_vertex_cascades_physical_legacy_edges() {
+    use ferrosa_common::{DecoratedKey, PartitionKey};
+    use ferrosa_storage::TableId;
+
+    async fn query(schema: &Arc<Schema>, storage: &Arc<StorageEngine>, text: &str) -> Value {
+        let app = build_app(Arc::clone(schema), Arc::clone(storage));
+        let response = tokio::time::timeout(
+            HANG_GUARD,
+            app.oneshot(json_request(
+                "POST",
+                "/graph/query",
+                Some(serde_json::json!({"query": text, "keyspace": "agent_memory"})),
+            )),
+        )
+        .await
+        .expect("owned graph request must complete")
+        .unwrap();
+        let status = response.status();
+        let body = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{text}: {body:#}");
+        body
+    }
+
+    let (schema, storage, _directory) = setup();
+    create_agent_memory_real_graph_schema(&schema);
+    register_agent_memory_real_tables_with_storage(&storage);
+    let tenant = Uuid::new_v4();
+    let session = Uuid::new_v4();
+    let doomed = Uuid::new_v4();
+    let neighbour = Uuid::new_v4();
+    let bystander = Uuid::new_v4();
+    for (id, name) in [
+        (doomed, "doomed"),
+        (neighbour, "neighbour"),
+        (bystander, "bystander"),
+    ] {
+        seed_agent_memory_entity(&storage, tenant, session, id, name);
+    }
+    let scope = format!("tenant_id: '{tenant}', session_id: '{session}'");
+    for (source, target) in [
+        (doomed, neighbour),
+        (neighbour, doomed),
+        (doomed, doomed),
+        (neighbour, bystander),
+    ] {
+        query(
+            &schema,
+            &storage,
+            &format!(
+                "MERGE (a:Entity {{{scope}, entity_id: '{source}'}}) \
+                 MERGE (b:Entity {{{scope}, entity_id: '{target}'}}) \
+                 MERGE (a)-[r:CO_OCCURS_WITH {{{scope}, entity_a: '{source}', entity_b: '{target}'}}]->(b) \
+                 SET r.strength = 0.5 RETURN r"
+            ),
+        )
+        .await;
+    }
+
+    // Inspect the actual legacy table, independently of endpoint hydration.
+    let targets = |source: Uuid| {
+        let key = DecoratedKey::new(PartitionKey::new(source.as_bytes().to_vec()));
+        let mut ids: Vec<Uuid> = storage
+            .read(&TableId::new("agent_memory", "co_occurs_with"), &key)
+            .unwrap()
+            .map(|partition| {
+                partition
+                    .rows
+                    .iter()
+                    .filter(|row| row.deletion.is_live())
+                    .map(|row| Uuid::from_slice(&row.clustering).expect("canonical UUID edge key"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        ids.sort();
+        ids
+    };
+    let mut outgoing_before = vec![doomed, neighbour];
+    outgoing_before.sort();
+    let mut incoming_before = vec![doomed, bystander];
+    incoming_before.sort();
+    assert_eq!(targets(doomed), outgoing_before);
+    assert_eq!(targets(neighbour), incoming_before);
+
+    query(
+        &schema,
+        &storage,
+        &format!("MATCH (n:Entity {{{scope}, entity_id: '{doomed}'}}) DETACH DELETE n"),
+    )
+    .await;
+    let remaining = query(
+        &schema,
+        &storage,
+        &format!("MATCH (n:Entity {{{scope}}}) RETURN n.entity_id"),
+    )
+    .await;
+    let mut survivors: Vec<String> = remaining["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row[0].as_str().unwrap().to_owned())
+        .collect();
+    survivors.sort();
+    let mut expected = vec![neighbour.to_string(), bystander.to_string()];
+    expected.sort();
+    assert_eq!(
+        (targets(doomed), targets(neighbour), survivors),
+        (Vec::<Uuid>::new(), vec![bystander], expected),
+        "physical incident edges must be tombstoned without deleting unrelated rows or sibling vertices"
+    );
+}
+
+/// Real temporal vertex and legacy UUID endpoint table metadata.
+/// Equal endpoint UUIDs in separate tenant scopes share index tuples, but
+/// deleting one physical vertex must preserve the other scope's live edge/index.
+#[tokio::test]
+async fn detach_vertex_preserves_other_scope_shared_adjacency() {
+    use ferrosa_common::{DecoratedKey, PartitionKey};
+    use ferrosa_graph::adjacency::adjacency_keyspace_name;
+    use ferrosa_storage::TableId;
+
+    let (schema, storage, _directory) = setup();
+    create_agent_memory_real_graph_schema(&schema);
+    register_agent_memory_real_tables_with_storage(&storage);
+    let tenants = [Uuid::new_v4(), Uuid::new_v4()];
+    let session = Uuid::new_v4();
+    let src = Uuid::new_v4();
+    let dst = Uuid::new_v4();
+    for tenant in tenants {
+        seed_agent_memory_entity(&storage, tenant, session, src, "source");
+        seed_agent_memory_entity(&storage, tenant, session, dst, "target");
+        let query = format!(
+            "MATCH (a:Entity {{tenant_id: '{tenant}', session_id: '{session}', entity_id: '{src}'}}), \
+             (b:Entity {{tenant_id: '{tenant}', session_id: '{session}', entity_id: '{dst}'}}) \
+             MERGE (a)-[r:TYPED_EDGE {{tenant_id: '{tenant}', session_id: '{session}', edge_type: 'related_to'}}]->(b) RETURN r"
+        );
+        let (status, body) = temporal_fixture_query(&schema, &storage, &query).await;
+        assert_eq!(status, StatusCode::OK, "{body:#}");
+    }
+    let physical = |tenant: Uuid| {
+        live_row_count(
+            &storage,
+            "agent_memory",
+            "typed_edges",
+            &encode_composite_partition_key(&[tenant.as_bytes(), session.as_bytes()]),
+        )
+    };
+    assert_eq!((physical(tenants[0]), physical(tenants[1])), (1, 1));
+    let adj_ks = adjacency_keyspace_name("agent_memory");
+    // A retained row deletion can coexist with newer live cells/liveness.
+    // Count the real storage liveness contract, including restored index rows.
+    let live_index_rows = |id: Uuid| {
+        storage
+            .read(
+                &TableId::new(&adj_ks, "adjacency"),
+                &DecoratedKey::new(PartitionKey::new(id.as_bytes().to_vec())),
+            )
+            .unwrap()
+            .map_or(0, |partition| {
+                partition
+                    .rows
+                    .iter()
+                    .filter(|row| !ferrosa_graph::adjacency::schema::row_is_deleted(row))
+                    .count()
+            })
+    };
+    assert_eq!(live_index_rows(src), 1);
+    let query = format!("MATCH (a:Entity {{tenant_id: '{}', session_id: '{session}', entity_id: '{src}'}})-[r:TYPED_EDGE {{tenant_id: '{}', session_id: '{session}', edge_type: 'related_to'}}]->(b:Entity) RETURN count(r)", tenants[1], tenants[1]);
+    let (status, body) = temporal_fixture_query(&schema, &storage, &query).await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    assert_eq!(
+        body["rows"],
+        serde_json::json!([[1]]),
+        "before-delete positive traversal must work"
+    );
+    let query = format!("MATCH (n:Entity {{tenant_id: '{}', session_id: '{session}', entity_id: '{src}'}}) DETACH DELETE n", tenants[0]);
+    let (status, body) = temporal_fixture_query(&schema, &storage, &query).await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    let query = format!("MATCH (a:Entity {{tenant_id: '{}', session_id: '{session}', entity_id: '{src}'}})-[r:TYPED_EDGE {{tenant_id: '{}', session_id: '{session}', edge_type: 'related_to'}}]->(b:Entity) RETURN count(r)", tenants[1], tenants[1]);
+    let (status, body) = temporal_fixture_query(&schema, &storage, &query).await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    let index_debug = storage
+        .read(
+            &TableId::new(&adj_ks, "adjacency"),
+            &DecoratedKey::new(PartitionKey::new(src.as_bytes().to_vec())),
+        )
+        .unwrap();
+    assert_eq!(
+        body["rows"],
+        serde_json::json!([[1]]),
+        "post-delete index live={} raw={index_debug:#?}",
+        live_index_rows(src)
+    );
+    assert_eq!(
+        (
+            physical(tenants[0]),
+            physical(tenants[1]),
+            live_index_rows(src),
+            live_index_rows(dst)
+        ),
+        (0, 1, 1, 1),
+        "other scope's exact physical edge and shared OUT/IN entries must survive"
+    );
+    // The remaining scoped vertex has not been deleted through a shared PK.
+    let key = encode_composite_partition_key(&[tenants[1].as_bytes(), session.as_bytes()]);
+    let partition = storage
+        .read(
+            &TableId::new("agent_memory", "entity_store"),
+            &DecoratedKey::new(PartitionKey::new(key)),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        partition
+            .rows
+            .iter()
+            .filter(|row| row.deletion.is_live())
+            .count(),
+        2
+    );
+}
+
+struct ScopedPlainDeleteFixture {
+    schema: Arc<Schema>,
+    storage: Arc<StorageEngine>,
+    _directory: TempDir,
+    tenants: [Uuid; 2],
+    session: Uuid,
+    source: Uuid,
+    targets: [Uuid; 2],
+}
+
+impl ScopedPlainDeleteFixture {
+    async fn new(own_edge: bool) -> Self {
+        let (schema, storage, directory) = setup();
+        create_agent_memory_real_graph_schema(&schema);
+        register_agent_memory_real_tables_with_storage(&storage);
+        let fixture = Self {
+            schema,
+            storage,
+            _directory: directory,
+            tenants: [Uuid::new_v4(), Uuid::new_v4()],
+            session: Uuid::new_v4(),
+            source: Uuid::new_v4(),
+            targets: [Uuid::new_v4(), Uuid::new_v4()],
+        };
+        for index in 0..2 {
+            let tenant = fixture.tenants[index];
+            let session = fixture.session;
+            let source = fixture.source;
+            let target = fixture.targets[index];
+            seed_agent_memory_entity(&fixture.storage, tenant, session, source, "source");
+            seed_agent_memory_entity(&fixture.storage, tenant, session, target, "target");
+            if own_edge || index == 1 {
+                let query = format!("MATCH (a:Entity {{tenant_id: '{tenant}', session_id: '{session}', entity_id: '{source}'}}), (b:Entity {{tenant_id: '{tenant}', session_id: '{session}', entity_id: '{target}'}}) MERGE (a)-[r:CO_OCCURS_WITH {{tenant_id: '{tenant}', session_id: '{session}'}}]->(b) RETURN r");
+                let (status, body) =
+                    temporal_fixture_query(&fixture.schema, &fixture.storage, &query).await;
+                assert_eq!(status, StatusCode::OK, "edge positive: {body:#}");
+            }
+        }
+        fixture
+    }
+
+    fn physical_snapshot(&self) -> [Vec<Uuid>; 3] {
+        use ferrosa_common::{DecoratedKey, PartitionKey};
+        use ferrosa_storage::TableId;
+        let rows = |table: &str, bytes: Vec<u8>| {
+            let mut ids: Vec<_> = self
+                .storage
+                .read(
+                    &TableId::new("agent_memory", table),
+                    &DecoratedKey::new(PartitionKey::new(bytes)),
+                )
+                .unwrap()
+                .map_or_else(Vec::new, |partition| {
+                    partition
+                        .rows
+                        .iter()
+                        .filter(|row| !ferrosa_graph::adjacency::schema::row_is_deleted(row))
+                        .map(|row| Uuid::from_slice(&row.clustering).unwrap())
+                        .collect()
+                });
+            ids.sort();
+            ids
+        };
+        [
+            rows(
+                "entity_store",
+                encode_composite_partition_key(&[
+                    self.tenants[0].as_bytes(),
+                    self.session.as_bytes(),
+                ]),
+            ),
+            rows(
+                "entity_store",
+                encode_composite_partition_key(&[
+                    self.tenants[1].as_bytes(),
+                    self.session.as_bytes(),
+                ]),
+            ),
+            rows("co_occurs_with", self.source.as_bytes().to_vec()),
+        ]
+    }
+
+    fn delete_query(&self, verb: &str) -> String {
+        format!(
+            "MATCH (n:Entity {{tenant_id: '{}', session_id: '{}', entity_id: '{}'}}) {verb} n",
+            self.tenants[0], self.session, self.source
+        )
+    }
+
+    async fn foreign_traversal_count(&self) -> Value {
+        let query = format!("MATCH (a:Entity {{tenant_id: '{}', session_id: '{}', entity_id: '{}'}})-[r:CO_OCCURS_WITH {{tenant_id: '{}', session_id: '{}'}}]->(b:Entity) RETURN count(r)", self.tenants[1], self.session, self.source, self.tenants[1], self.session);
+        let (status, body) = temporal_fixture_query(&self.schema, &self.storage, &query).await;
+        assert_eq!(status, StatusCode::OK, "foreign traversal: {body:#}");
+        body["rows"].clone()
+    }
+}
+
+#[tokio::test]
+async fn plain_delete_scoped_legacy_edge_refuses_without_mutation_then_detaches() {
+    let fixture = ScopedPlainDeleteFixture::new(true).await;
+    let before = fixture.physical_snapshot();
+    assert_eq!(
+        [before[0].len(), before[1].len(), before[2].len()],
+        [2, 2, 2]
+    );
+    assert_eq!(
+        fixture.foreign_traversal_count().await,
+        serde_json::json!([[1]])
+    );
+    let (status, body) = temporal_fixture_query(
+        &fixture.schema,
+        &fixture.storage,
+        &fixture.delete_query("DELETE"),
+    )
+    .await;
+    assert_eq!((status, fixture.physical_snapshot()), (StatusCode::CONFLICT, before.clone()),
+        "plain DELETE must refuse the owned legacy edge and preserve both scopes and every edge: {body:#}");
+    assert!(
+        body.to_string().contains("still has relationships"),
+        "{body:#}"
+    );
+    let (status, body) = temporal_fixture_query(
+        &fixture.schema,
+        &fixture.storage,
+        &fixture.delete_query("DETACH DELETE"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    assert_eq!(
+        fixture.physical_snapshot(),
+        [
+            vec![fixture.targets[0]],
+            before[1].clone(),
+            vec![fixture.targets[1]]
+        ]
+    );
+    assert_eq!(
+        fixture.foreign_traversal_count().await,
+        serde_json::json!([[1]])
+    );
+}
+
+#[tokio::test]
+async fn plain_delete_scoped_foreign_edge_does_not_block_same_uuid_vertex() {
+    let fixture = ScopedPlainDeleteFixture::new(false).await;
+    let before = fixture.physical_snapshot();
+    assert_eq!(
+        [before[0].len(), before[1].len(), before[2].len()],
+        [2, 2, 1]
+    );
+    assert_eq!(
+        fixture.foreign_traversal_count().await,
+        serde_json::json!([[1]])
+    );
+    let (status, body) = temporal_fixture_query(
+        &fixture.schema,
+        &fixture.storage,
+        &fixture.delete_query("DELETE"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "foreign-scope edge must not prohibit this vertex deletion: {body:#}"
+    );
+    assert_eq!(
+        fixture.physical_snapshot(),
+        [
+            vec![fixture.targets[0]],
+            before[1].clone(),
+            before[2].clone()
+        ]
+    );
+    assert_eq!(
+        fixture.foreign_traversal_count().await,
+        serde_json::json!([[1]])
+    );
+}
+
+fn temporal_vertex_fixture() -> (Arc<Schema>, Arc<StorageEngine>, TempDir) {
+    fn table(
+        name: &str,
+        columns: &[(&str, &str)],
+        partition: &[&str],
+        clustering: &[&str],
+        extensions: &[(&str, &str)],
+    ) -> TableMetadata {
+        let columns = columns
+            .iter()
+            .map(|(name, kind)| {
+                let pk = partition.iter().position(|value| value == name);
+                let ck = clustering.iter().position(|value| value == name);
+                (
+                    (*name).to_owned(),
+                    ColumnMetadata {
+                        name: (*name).to_owned(),
+                        kind: if pk.is_some() {
+                            ColumnKind::PartitionKey
+                        } else if ck.is_some() {
+                            ColumnKind::Clustering
+                        } else {
+                            ColumnKind::Regular
+                        },
+                        position: pk.or(ck).map(|value| value as i32).unwrap_or(-1),
+                        column_type: (*kind).to_owned(),
+                        clustering_order: if ck.is_some() {
+                            ClusteringOrder::Asc
+                        } else {
+                            ClusteringOrder::None
+                        },
+                        mask: None,
+                    },
+                )
+            })
+            .collect();
+        TableMetadata {
+            keyspace: "agent_memory".to_owned(),
+            name: name.to_owned(),
+            id: Uuid::new_v4(),
+            columns,
+            partition_key: partition.iter().map(|value| (*value).to_owned()).collect(),
+            clustering_key: clustering
+                .iter()
+                .map(|value| ((*value).to_owned(), ClusteringOrder::Asc))
+                .collect(),
+            params: TableParams::default(),
+            flags: HashSet::new(),
+            extensions: extensions
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect(),
+            is_system: false,
+        }
+    }
+    let (schema, storage, directory) = setup();
+    create_agent_memory_real_graph_schema(&schema);
+    for metadata in [
+        table(
+            "temporal_events",
+            &[
+                ("tenant_id", "uuid"),
+                ("entity_id", "uuid"),
+                ("event_time", "timestamp"),
+                ("event_id", "uuid"),
+            ],
+            &["tenant_id", "entity_id"],
+            &["event_time", "event_id"],
+            &[("graph.type", "vertex"), ("graph.label", "Fact")],
+        ),
+        table(
+            "supersedes",
+            &[
+                ("new_event_id", "uuid"),
+                ("old_event_id", "uuid"),
+                ("tenant_id", "uuid"),
+                ("entity_id", "uuid"),
+                ("created_at", "timestamp"),
+            ],
+            &["new_event_id"],
+            &["old_event_id"],
+            &[
+                ("graph.type", "edge"),
+                ("graph.label", "SUPERSEDES"),
+                ("graph.source", "new_event_id"),
+                ("graph.target", "old_event_id"),
+                ("graph.source_label", "Fact"),
+                ("graph.target_label", "Fact"),
+            ],
+        ),
+    ] {
+        storage
+            .register_table(metadata.to_storage_schema())
+            .unwrap();
+        schema.create_table(metadata, &superuser_auth()).unwrap();
+    }
+    (schema, storage, directory)
+}
+
+async fn temporal_fixture_query(
+    schema: &Arc<Schema>,
+    storage: &Arc<StorageEngine>,
+    query: &str,
+) -> (StatusCode, Value) {
+    let app = build_app(Arc::clone(schema), Arc::clone(storage));
+    let response = tokio::time::timeout(
+        HANG_GUARD,
+        app.oneshot(json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({"query": query, "keyspace": "agent_memory"})),
+        )),
+    )
+    .await
+    .expect("temporal graph request must complete")
+    .unwrap();
+    (response.status(), response_json(response).await)
+}
+
+/// UUID endpoints identify events, while both physical vertex keys are composite.
+#[tokio::test]
+async fn matched_temporal_vertex_edge_roundtrips_and_detaches() {
+    use ferrosa_common::{DecoratedKey, PartitionKey};
+    use ferrosa_storage::TableId;
+
+    let (schema, storage, _directory) = temporal_vertex_fixture();
+    let tenant = Uuid::new_v4();
+    let other_tenant = Uuid::new_v4();
+    let entity = Uuid::new_v4();
+    let new_event = Uuid::new_v4();
+    let old_event = Uuid::new_v4();
+    for (scope, event, time) in [
+        (tenant, new_event, "2026-11-03T00:00:00+00:00"),
+        (tenant, old_event, "2026-11-02T00:00:00+00:00"),
+        (other_tenant, old_event, "2026-11-01T00:00:00+00:00"),
+    ] {
+        let (status, body) = temporal_fixture_query(&schema, &storage, &format!(
+            "MERGE (n:Fact {{tenant_id: '{scope}', entity_id: '{entity}', event_time: '{time}', event_id: '{event}'}}) RETURN n")).await;
+        assert_eq!(status, StatusCode::OK, "vertex: {body:#}");
+    }
+    let scope = format!("tenant_id: '{tenant}', entity_id: '{entity}'");
+    let edge = format!("{scope}, new_event_id: '{new_event}', old_event_id: '{old_event}'");
+    let new_fact = format!("(n:Fact {{{scope}, event_id: '{new_event}'}})");
+    let old_fact = format!("(o:Fact {{{scope}, event_id: '{old_event}'}})");
+    for vertex in [&new_fact, &old_fact] {
+        let (status, body) = temporal_fixture_query(
+            &schema,
+            &storage,
+            &format!("MATCH {vertex} RETURN count(*)"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "endpoint: {body:#}");
+        assert_eq!(body["rows"][0][0], 1, "endpoint must already exist");
+    }
+    let (status, body) = temporal_fixture_query(
+        &schema,
+        &storage,
+        &format!(
+            "MATCH {new_fact}, {old_fact} MERGE (n)-[r:SUPERSEDES {{{edge}}}]->(o) \
+         SET r.created_at = '2026-11-03T00:00:00+00:00' RETURN r"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "edge: {body:#}");
+    let facts_key = encode_composite_partition_key(&[tenant.as_bytes(), entity.as_bytes()]);
+    let other_key = encode_composite_partition_key(&[other_tenant.as_bytes(), entity.as_bytes()]);
+    assert_eq!(
+        live_row_count(&storage, "agent_memory", "temporal_events", &facts_key),
+        2,
+        "MATCH-selected MERGE must not create extra physical vertices"
+    );
+    assert_eq!(
+        live_row_count(&storage, "agent_memory", "temporal_events", &other_key),
+        1
+    );
+    let partition = storage
+        .read(
+            &TableId::new("agent_memory", "supersedes"),
+            &DecoratedKey::new(PartitionKey::new(new_event.as_bytes().to_vec())),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(partition.rows.len(), 1);
+    assert_eq!(
+        partition.rows[0].clustering,
+        old_event.as_bytes(),
+        "canonical UUID edge key"
+    );
+
+    let (status, unbound) = temporal_fixture_query(&schema, &storage, &format!(
+        "MATCH (n:Fact)-[r:SUPERSEDES {{{edge}}}]->(o:Fact) RETURN n.event_id, o.event_id, n.tenant_id, o.tenant_id")).await;
+    assert_eq!(status, StatusCode::OK, "edge-bound: {unbound:#}");
+    let (status, bound) = temporal_fixture_query(
+        &schema,
+        &storage,
+        &format!("MATCH {new_fact}-[r:SUPERSEDES]->(o:Fact) RETURN count(r)"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "source-bound: {bound:#}");
+    assert_eq!((unbound["rows"].clone(), bound["rows"][0][0].clone()),
+        (serde_json::json!([[new_event.to_string(), old_event.to_string(), tenant.to_string(), tenant.to_string()]]), serde_json::json!(1)),
+        "physical UUID edge must hydrate only its scoped temporal endpoints, even with a duplicate event UUID in another tenant");
+
+    let (status, body) = temporal_fixture_query(
+        &schema,
+        &storage,
+        &format!("MATCH {new_fact} DETACH DELETE n"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "delete: {body:#}");
+    assert_eq!(
+        (
+            live_row_count(&storage, "agent_memory", "supersedes", new_event.as_bytes()),
+            live_row_count(&storage, "agent_memory", "temporal_events", &facts_key),
+            live_row_count(&storage, "agent_memory", "temporal_events", &other_key)
+        ),
+        (0, 1, 1)
+    );
+}
+
+/// An edge lacking required scope must never hydrate the first colliding UUID.
+#[tokio::test]
+async fn temporal_vertex_endpoint_without_scope_does_not_choose_a_tenant() {
+    let (schema, storage, _directory) = temporal_vertex_fixture();
+    let tenant = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    let entity = Uuid::new_v4();
+    let new_event = Uuid::new_v4();
+    let old_event = Uuid::new_v4();
+    for (scope, event) in [(tenant, new_event), (tenant, old_event), (other, old_event)] {
+        let (status, body) = temporal_fixture_query(&schema, &storage, &format!(
+            "MERGE (n:Fact {{tenant_id: '{scope}', entity_id: '{entity}', event_time: '2026-11-03T00:00:00+00:00', event_id: '{event}'}}) RETURN n")).await;
+        assert_eq!(status, StatusCode::OK, "vertex: {body:#}");
+    }
+    let scope = format!("tenant_id: '{tenant}', entity_id: '{entity}'");
+    let ids = format!("new_event_id: '{new_event}', old_event_id: '{old_event}'");
+    let (status, body) = temporal_fixture_query(&schema, &storage, &format!(
+        "MATCH (n:Fact {{{scope}, event_id: '{new_event}'}}), (o:Fact {{{scope}, event_id: '{old_event}'}}) \
+         MERGE (n)-[r:SUPERSEDES {{{ids}}}]->(o) RETURN r")).await;
+    assert_eq!(status, StatusCode::OK, "edge: {body:#}");
+    let (status, body) = temporal_fixture_query(
+        &schema,
+        &storage,
+        &format!(
+            "MATCH (n:Fact)-[r:SUPERSEDES {{{ids}}}]->(o:Fact) RETURN n.event_id, o.tenant_id"
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "unscoped UUID collision must be refused: {body:#}"
+    );
 }
 
 /// Inline MERGE must bind an explicit UUID destination before deriving its edge.

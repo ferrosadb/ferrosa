@@ -9,8 +9,8 @@
 //! Correctness: keyed anchors read only their adjacency partition, and hop
 //! frontiers stop at the configured fan-out bound without a duplicate neighbor
 //! vector.
-//! Last revised: 2026-10-26
-//! Last changed: Route eligible property equality through 2i and count vertex metadata.
+//! Last revised: 2026-11-03
+//! Last changed: Preserve scoped logical/physical identity in traversal, DELETE and DETACH.
 
 use crate::executor::io::GraphWrite;
 
@@ -29,7 +29,7 @@ use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 use ferrosa_storage::{Mutation, TableId};
 use futures::StreamExt as _;
 
-use crate::adjacency::observer::derive_adjacency_mutations;
+use crate::adjacency::observer::{derive_adjacency_mutations, derive_adjacency_row_mutations};
 use crate::adjacency::schema::{adjacency_keyspace_name, DIRECTION_IN, DIRECTION_OUT};
 use crate::error::{GraphError, Result};
 use crate::executor::aggregate::{create_accumulator, Accumulator};
@@ -1787,8 +1787,7 @@ async fn expand_to_states(plan: ExpandPlan<'_>, ctx: ExpandCtx<'_>) -> Result<Ex
 
                     let mut bindings = HashMap::new();
                     bindings.insert(anchor_var.to_string(), row_json);
-                    let current_key = graph_vertex_lookup_key(meta, partition, row, &anchor.props)
-                        .unwrap_or_else(|| partition.key.clone());
+                    let current_key = graph_vertex_lookup_key(meta, partition, row, &anchor.props)?;
 
                     let mut passes = true;
                     for filter in &anchor.filters {
@@ -3081,6 +3080,15 @@ pub(super) fn row_to_json(
         serde_json::Value::String(hex::encode(partition.key.key.as_bytes())),
     );
 
+    map.insert(
+        "__ferrosa_key".to_string(),
+        serde_json::Value::String(hex::encode(partition.key.key.as_bytes())),
+    );
+    map.insert(
+        "__ferrosa_clustering".to_string(),
+        serde_json::Value::String(hex::encode(&row.clustering)),
+    );
+
     if let Some(components) =
         decode_partition_components(partition.key.key.as_bytes(), meta.partition_key.len())
     {
@@ -3250,30 +3258,49 @@ fn prop_map_passes(
     Ok(true)
 }
 
+/// The logical endpoint is distinct from the complete physical row key.
+/// A single key component is unambiguous. For a multi-component clustering
+/// key, only a unique UUID component supplies an unambiguous endpoint identity;
+/// property order and tenant/partition names must never select it.
+fn vertex_identity_column(meta: &ferrosa_schema::metadata::table::TableMetadata) -> Result<&str> {
+    if meta.clustering_key.is_empty() && meta.partition_key.len() == 1 {
+        return Ok(&meta.partition_key[0]);
+    }
+    if meta.clustering_key.len() == 1 {
+        return Ok(&meta.clustering_key[0].0);
+    }
+    let mut ids = meta.clustering_key.iter().filter(|(name, _)| {
+        meta.columns.get(name).is_some_and(|column| {
+            let ty = column.column_type.to_ascii_lowercase();
+            ty == "uuid" || ty == "timeuuid" || ty.ends_with("uuidtype")
+        })
+    });
+    if let Some((name, _)) = ids.next() {
+        if ids.next().is_none() {
+            return Ok(name);
+        }
+    }
+    Err(GraphError::Validation(format!(
+        "vertex table {}.{} has no unambiguous logical endpoint key",
+        meta.keyspace, meta.name
+    )))
+}
+
 pub(super) fn graph_vertex_lookup_key(
     meta: &ferrosa_schema::metadata::table::TableMetadata,
     partition: &ferrosa_sstable::types::Partition,
     row: &Row,
-    props: &[(String, Expr)],
-) -> Option<DecoratedKey> {
-    if meta.partition_key.len() == 1 && meta.clustering_key.is_empty() {
-        return Some(partition.key.clone());
-    }
-
-    if meta.clustering_key.len() == 1 {
-        let bytes = decode_clustering_components(&row.clustering, 1)?
-            .into_iter()
-            .next()?;
-        return Some(DecoratedKey::new(PartitionKey::new(bytes)));
-    }
-
-    let preferred_prop = props
-        .iter()
-        .find(|(name, _)| name == "id" || name.ends_with("_id"))
-        .or_else(|| props.first())?;
-    let column_type = meta.columns.get(&preferred_prop.0)?.column_type.as_str();
-    let bytes = encode_expr_for_column_type(&preferred_prop.1, column_type).ok()?;
-    Some(DecoratedKey::new(PartitionKey::new(bytes)))
+    _props: &[(String, Expr)],
+) -> Result<DecoratedKey> {
+    let column = vertex_identity_column(meta)?;
+    let bytes = extract_column_bytes_from_row(meta, partition.key.key.as_bytes(), row, column)
+        .ok_or_else(|| {
+            GraphError::Validation(format!(
+                "vertex table {}.{} has an invalid endpoint key in column {column}",
+                meta.keyspace, meta.name
+            ))
+        })?;
+    Ok(DecoratedKey::new(PartitionKey::new(bytes.to_vec())))
 }
 
 pub(super) fn extract_column_bytes_from_row(
@@ -3395,6 +3422,8 @@ async fn find_vertex_match(
     var_name: &str,
     schema: Option<&Schema>,
 ) -> Result<Option<MatchedTableRow>> {
+    // A complete physical row key is already unique, so preserve the direct
+    // lookup path. Incomplete composite keys fall through to scoped streaming.
     if let Some((key, clustering)) =
         build_neighbor_vertex_lookup_shape(meta, bindings, target_props, neighbor_id)?
     {
@@ -3406,24 +3435,53 @@ async fn find_vertex_match(
             if let Some(row) = partition.rows.iter().find(|row| {
                 row.clustering == clustering && !crate::adjacency::schema::row_is_deleted(row)
             }) {
-                let row_json = row_to_json(meta, &partition, row);
-                if prop_map_passes(var_name, target_props, &row_json)?
-                    && graph_vertex_lookup_key(meta, &partition, row, target_props)
-                        .is_some_and(|vertex_key| vertex_key.key.as_bytes() == neighbor_id)
+                let json = row_to_json(meta, &partition, row);
+                if prop_map_passes(var_name, target_props, &json)?
+                    && graph_vertex_lookup_key(meta, &partition, row, target_props)?
+                        .key
+                        .as_bytes()
+                        == neighbor_id
                 {
                     return Ok(Some(MatchedTableRow {
                         key: partition.key.clone(),
                         clustering: row.clustering.clone(),
-                        json: row_json,
+                        json,
                     }));
                 }
             }
         }
+        return Ok(None);
     }
-
-    // STREAMED with an early return (t_bc5f0e6f): same shape as
-    // `find_edge_match` — one neighbour vertex is wanted, not the whole table.
-    let mut partitions = write_path.range_read_stream_all(table_id, 0).await?;
+    // Resolve the available endpoint scope from the edge row, not an arbitrary
+    // first UUID match. A fully specified partition needs only one keyed read.
+    // Otherwise stream partitions and retain at most one matching physical row;
+    // an ambiguous endpoint must fail before any mutation can be published.
+    let mut scope = HashMap::new();
+    for name in &meta.partition_key {
+        if let Some(column) = meta.columns.get(name) {
+            if let Some(bytes) =
+                resolve_lookup_component(column, bindings, target_props, &HashMap::new())?
+            {
+                scope.insert(name.clone(), bytes);
+            }
+        }
+    }
+    let mut partitions: PartitionResultStream = if scope.len() == meta.partition_key.len() {
+        let components = meta
+            .partition_key
+            .iter()
+            .map(|name| scope[name].clone())
+            .collect::<Vec<_>>();
+        let key = DecoratedKey::new(PartitionKey::new(encode_partition_components(&components)));
+        let strategy = graph_replication_strategy(schema, &table_id.keyspace)?;
+        let hit = write_path
+            .pk_read(table_id, &key, ConsistencyLevel::One, &strategy)
+            .await?;
+        Box::pin(futures::stream::iter(hit.into_iter().map(Ok)))
+    } else {
+        write_path.range_read_stream_all(table_id, 0).await?
+    };
+    let mut matched = None;
     while let Some(partition) = partitions.next().await {
         let partition = partition?;
         if is_partition_dead(&partition) {
@@ -3433,25 +3491,33 @@ async fn find_vertex_match(
             if crate::adjacency::schema::row_is_deleted(row) {
                 continue;
             }
+            if !scope.iter().all(|(name, bytes)| {
+                extract_column_bytes_from_row(meta, partition.key.key.as_bytes(), row, name)
+                    .is_some_and(|value| value.as_ref() == bytes.as_slice())
+            }) {
+                continue;
+            }
             let row_json = row_to_json(meta, &partition, row);
             if !prop_map_passes(var_name, target_props, &row_json)? {
                 continue;
             }
-            let Some(vertex_key) = graph_vertex_lookup_key(meta, &partition, row, target_props)
-            else {
-                continue;
-            };
+            let vertex_key = graph_vertex_lookup_key(meta, &partition, row, target_props)?;
             if vertex_key.key.as_bytes() == neighbor_id {
-                return Ok(Some(MatchedTableRow {
+                if matched.is_some() {
+                    return Err(GraphError::Validation(format!(
+                        "ambiguous endpoint in {}.{}: relationship scope does not identify one physical vertex row",
+                        meta.keyspace, meta.name
+                    )));
+                }
+                matched = Some(MatchedTableRow {
                     key: partition.key.clone(),
                     clustering: row.clustering.clone(),
                     json: row_json,
-                }));
+                });
             }
         }
     }
-
-    Ok(None)
+    Ok(matched)
 }
 
 fn build_neighbor_vertex_lookup_shape(
@@ -3460,16 +3526,9 @@ fn build_neighbor_vertex_lookup_shape(
     target_props: &[(String, Expr)],
     neighbor_id: &[u8],
 ) -> Result<Option<(DecoratedKey, Vec<u8>)>> {
-    let mut direct_components = HashMap::new();
-    if let Some((column_name, _)) = meta
-        .clustering_key
-        .iter()
-        .find(|(name, _)| name == "id" || name.ends_with("_id") || name.ends_with("_uuid"))
-    {
-        direct_components.insert(column_name.clone(), neighbor_id.to_vec());
-    }
-
-    build_direct_lookup_shape(meta, bindings, target_props, &direct_components)
+    let identity = vertex_identity_column(meta)?;
+    let direct = HashMap::from([(identity.to_owned(), neighbor_id.to_vec())]);
+    build_direct_lookup_shape(meta, bindings, target_props, &direct)
 }
 
 fn build_direct_lookup_shape(
@@ -3524,19 +3583,23 @@ fn resolve_lookup_component(
         return encode_expr_for_column_type(expr, &column.column_type).map(Some);
     }
 
+    let mut resolved = None;
     for value in bindings.values() {
-        let serde_json::Value::Object(map) = value else {
-            continue;
-        };
-        let Some(field) = map.get(&column.name) else {
+        let Some(field) = value.as_object().and_then(|map| map.get(&column.name)) else {
             continue;
         };
         if let Some(expr) = json_value_to_expr(field) {
-            return encode_expr_for_column_type(&expr, &column.column_type).map(Some);
+            let bytes = encode_expr_for_column_type(&expr, &column.column_type)?;
+            if resolved.as_ref().is_some_and(|prior| prior != &bytes) {
+                return Err(GraphError::Validation(format!(
+                    "conflicting endpoint scope for column {}",
+                    column.name
+                )));
+            }
+            resolved = Some(bytes);
         }
     }
-
-    Ok(None)
+    Ok(resolved)
 }
 
 async fn find_table_row_by_props(
@@ -6005,46 +6068,6 @@ async fn execute_remove(
     })
 }
 
-/// Execute a DELETE plan: run the expand to find matching vertices, then write
-/// tombstones for each one.
-#[allow(clippy::too_many_arguments)]
-/// Build the standard composite adjacency clustering key
-/// `[u16 1][1B direction][u16 label_len][label][u16 nid_len][neighbor_id]`,
-/// matching `make_adjacency_mutation`'s wire format. Defined once so the
-/// DETACH-DELETE cascade tombstones the exact key the observer wrote.
-fn adjacency_clustering_bytes(direction: u8, edge_label: &str, neighbor_id: &[u8]) -> Vec<u8> {
-    let mut clustering = Vec::new();
-    clustering.extend_from_slice(&1u16.to_be_bytes());
-    clustering.push(direction);
-    clustering.extend_from_slice(&(edge_label.len() as u16).to_be_bytes());
-    clustering.extend_from_slice(edge_label.as_bytes());
-    clustering.extend_from_slice(&(neighbor_id.len() as u16).to_be_bytes());
-    clustering.extend_from_slice(neighbor_id);
-    clustering
-}
-
-/// Read the edge-label string out of an adjacency clustering key
-/// (component 1 of the standard composite layout).
-fn adjacency_edge_label(clustering: &[u8]) -> Option<String> {
-    if clustering.len() < 5 {
-        return None;
-    }
-    let dir_len = u16::from_be_bytes([clustering[0], clustering[1]]) as usize;
-    let label_len_pos = 2 + dir_len;
-    if label_len_pos + 2 > clustering.len() {
-        return None;
-    }
-    let label_len =
-        u16::from_be_bytes([clustering[label_len_pos], clustering[label_len_pos + 1]]) as usize;
-    let label_start = label_len_pos + 2;
-    if label_start + label_len > clustering.len() {
-        return None;
-    }
-    std::str::from_utf8(&clustering[label_start..label_start + label_len])
-        .ok()
-        .map(str::to_string)
-}
-
 /// Build a pure-tombstone [`Mutation`] for one row in `keyspace.table`.
 /// `clustering = None` deletes the whole partition; `Some` deletes one row.
 /// Mirrors `StorageEngine`'s `BatchOp::Tombstone` lowering so the
@@ -6072,126 +6095,373 @@ fn tombstone_mutation(
     )
 }
 
-/// DETACH DELETE cascade for one vertex (URS-QEC-D01/D03/D07).
-///
-/// Enumerates ALL incident edges via the adjacency index (forward OUT +
-/// backward IN), then collects tombstones for each edge row, its OWN
-/// adjacency entry, the neighbor's mirror adjacency entry, and finally the
-/// vertex row, into ONE batch applied atomically through the shared
-/// `StorageEngine` multi-write primitive (`WritePath::write_batch` →
-/// `write_atomic_batch`/`coordinate_logged_batch`). No new batch path is
-/// invented; adjacency cleanup happens inside the delete, so a subsequent
-/// scan finds zero references without reconciliation (URS-QEC-D03).
-///
-/// Returns the number of incident edges tombstoned.
+type AdjacencyEntryKey = (Vec<u8>, Vec<u8>);
+type PhysicalEdgeRowKey = (String, Vec<u8>, Vec<u8>);
+
+struct VertexDeleteTarget<'a> {
+    table: &'a TableId,
+    meta: &'a ferrosa_schema::metadata::table::TableMetadata,
+    key: &'a DecoratedKey,
+    clustering: &'a [u8],
+    logical_key: &'a DecoratedKey,
+}
+
+#[derive(Default)]
+struct IncidentEdgeDeletes {
+    mutations: Vec<Mutation>,
+    index_updates: HashMap<AdjacencyEntryKey, Mutation>,
+    removed_rows: HashSet<PhysicalEdgeRowKey>,
+}
+
+/// Match the declared endpoint and its relationship scope back to one exact
+/// physical vertex. An equal UUID in another tenant is not this vertex.
+async fn edge_is_incident(
+    write_path: &dyn GraphWrite,
+    schema: &Schema,
+    target: &VertexDeleteTarget<'_>,
+    edge: &ferrosa_schema::metadata::table::TableMetadata,
+    partition: &ferrosa_sstable::types::Partition,
+    row: &Row,
+) -> Result<bool> {
+    for (endpoint, endpoint_label) in [
+        ("graph.source", "graph.source_label"),
+        ("graph.target", "graph.target_label"),
+    ] {
+        if edge.extensions.get(endpoint_label) != target.meta.extensions.get("graph.label") {
+            continue;
+        }
+        let Some(column) = edge.extensions.get(endpoint) else {
+            continue;
+        };
+        let Some(id) =
+            extract_column_bytes_from_row(edge, partition.key.key.as_bytes(), row, column)
+        else {
+            continue;
+        };
+        if id.as_ref() != target.logical_key.key.as_bytes() {
+            continue;
+        }
+        let bindings = HashMap::from([("_edge".to_string(), row_to_json(edge, partition, row))]);
+        if let Some(found) = find_vertex_match(
+            write_path,
+            target.table,
+            target.meta,
+            &bindings,
+            id.as_ref(),
+            &[],
+            "_vertex",
+            Some(schema),
+        )
+        .await?
+        {
+            if found.key == *target.key && found.clustering == target.clustering {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Stream declared legacy tables, retaining only incident row/index mutations.
+async fn collect_incident_edge_deletes(
+    write_path: &dyn GraphWrite,
+    schema: &Schema,
+    edges: &[ferrosa_schema::metadata::table::TableMetadata],
+    target: &VertexDeleteTarget<'_>,
+    timestamp: i64,
+) -> Result<IncidentEdgeDeletes> {
+    let mut batch = IncidentEdgeDeletes::default();
+    for edge in edges {
+        let table = TableId::new(&edge.keyspace, &edge.name);
+        let mut partitions = write_path.range_read_stream_all(&table, 0).await?;
+        while let Some(partition) = partitions.next().await {
+            let partition = partition?;
+            if is_partition_dead(&partition) {
+                continue;
+            }
+            for row in &partition.rows {
+                if crate::adjacency::schema::row_is_deleted(row)
+                    || !edge_is_incident(write_path, schema, target, edge, &partition, row).await?
+                {
+                    continue;
+                }
+                for entry in
+                    derive_adjacency_row_mutations(schema, &table, &partition.key, row, timestamp)
+                {
+                    let key = (
+                        entry.key.key.as_bytes().to_vec(),
+                        entry.rows[0].clustering.clone(),
+                    );
+                    let deleted = tombstone_mutation(
+                        &entry.keyspace,
+                        &entry.table,
+                        &entry.key,
+                        Some(entry.rows[0].clustering.clone()),
+                        timestamp,
+                    );
+                    batch.index_updates.insert(key, deleted);
+                }
+                batch.removed_rows.insert((
+                    edge.name.clone(),
+                    partition.key.key.as_bytes().to_vec(),
+                    row.clustering.clone(),
+                ));
+                batch.mutations.push(tombstone_mutation(
+                    &edge.keyspace,
+                    &edge.name,
+                    &partition.key,
+                    Some(row.clustering.clone()),
+                    timestamp,
+                ));
+            }
+        }
+    }
+    Ok(batch)
+}
+
+/// Index tuples omit tenant scope. Replace candidate tombstones with live
+/// entries supported by surviving physical rows, outranking observer-derived
+/// tombstones at timestamp+1. Memory stays proportional to the deletion batch.
+async fn protect_shared_index_entries(
+    write_path: &dyn GraphWrite,
+    schema: &Schema,
+    edges: &[ferrosa_schema::metadata::table::TableMetadata],
+    batch: &mut IncidentEdgeDeletes,
+    timestamp: i64,
+) -> Result<()> {
+    if batch.index_updates.is_empty() {
+        return Ok(());
+    }
+    for edge in edges {
+        let table = TableId::new(&edge.keyspace, &edge.name);
+        let mut partitions = write_path.range_read_stream_all(&table, 0).await?;
+        while let Some(partition) = partitions.next().await {
+            let partition = partition?;
+            if is_partition_dead(&partition) {
+                continue;
+            }
+            for row in &partition.rows {
+                if crate::adjacency::schema::row_is_deleted(row)
+                    || batch.removed_rows.contains(&(
+                        edge.name.clone(),
+                        partition.key.key.as_bytes().to_vec(),
+                        row.clustering.clone(),
+                    ))
+                {
+                    continue;
+                }
+                for entry in derive_adjacency_row_mutations(
+                    schema,
+                    &table,
+                    &partition.key,
+                    row,
+                    timestamp.saturating_add(1),
+                ) {
+                    let key = (
+                        entry.key.key.as_bytes().to_vec(),
+                        entry.rows[0].clustering.clone(),
+                    );
+                    if let Some(update) = batch.index_updates.get_mut(&key) {
+                        *update = entry;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn graph_edge_tables(
+    schema: &Schema,
+    keyspace: &str,
+) -> Vec<ferrosa_schema::metadata::table::TableMetadata> {
+    schema
+        .snapshot()
+        .tables
+        .values()
+        .filter(|table| {
+            table.keyspace == keyspace
+                && table
+                    .extensions
+                    .get("graph.type")
+                    .is_some_and(|kind| kind == "edge")
+        })
+        .cloned()
+        .collect()
+}
+
+/// Resolve an exact physical vertex row before using its logical endpoint.
+async fn read_vertex_endpoint(
+    write_path: &dyn GraphWrite,
+    meta: &ferrosa_schema::metadata::table::TableMetadata,
+    table: &TableId,
+    key: &DecoratedKey,
+    clustering: &[u8],
+) -> Result<Option<DecoratedKey>> {
+    let Some(partition) = write_path.read(table, key).await? else {
+        return Ok(None);
+    };
+    let Some(row) = partition
+        .rows
+        .iter()
+        .find(|row| row.clustering == clustering && !crate::adjacency::schema::row_is_deleted(row))
+    else {
+        return Ok(None);
+    };
+    graph_vertex_lookup_key(meta, &partition, row, &[]).map(Some)
+}
+
+/// Adjacency is a fast candidate index, never proof that another tenant's row
+/// belongs to this vertex. Point-check only layouts recoverable from endpoints.
+async fn indexed_incident_edge_exists(
+    write_path: &dyn GraphWrite,
+    schema: &Schema,
+    target: &VertexDeleteTarget<'_>,
+) -> Result<bool> {
+    let adjacency_keyspace = adjacency_keyspace_name(&target.table.keyspace);
+    let adjacency = TableId::new(&adjacency_keyspace, "adjacency");
+    let Some(partition) = write_path.read(&adjacency, target.logical_key).await? else {
+        return Ok(false);
+    };
+    for row in &partition.rows {
+        if crate::adjacency::schema::row_is_deleted(row) {
+            continue;
+        }
+        let Some(neighbor) = extract_neighbor_id(&row.clustering, None) else {
+            continue;
+        };
+        let (edge_table, meta) = resolve_edge_from_adjacency_row(Some(schema), row)?;
+        let (Some(source), Some(destination)) = (
+            meta.extensions.get("graph.source"),
+            meta.extensions.get("graph.target"),
+        ) else {
+            continue;
+        };
+        let (src, dst) = match row.clustering.get(2) {
+            Some(&DIRECTION_OUT) => (target.logical_key.key.as_bytes(), neighbor.as_slice()),
+            Some(&DIRECTION_IN) => (neighbor.as_slice(), target.logical_key.key.as_bytes()),
+            _ => continue,
+        };
+        let direct = HashMap::from([
+            (source.clone(), src.to_vec()),
+            (destination.clone(), dst.to_vec()),
+        ]);
+        let Some((key, clustering)) =
+            build_direct_lookup_shape(&meta, &HashMap::new(), &[], &direct)?
+        else {
+            continue;
+        };
+        let table = TableId::new(&edge_table.keyspace, &edge_table.table);
+        let strategy = graph_replication_strategy(Some(schema), &table.keyspace)?;
+        let Some(partition) = write_path
+            .pk_read(&table, &key, ConsistencyLevel::One, &strategy)
+            .await?
+        else {
+            continue;
+        };
+        for row in &partition.rows {
+            if row.clustering == clustering
+                && !crate::adjacency::schema::row_is_deleted(row)
+                && edge_is_incident(write_path, schema, target, &meta, &partition, row).await?
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Read-only refusal check. Missing legacy index entries fall back to a stream
+/// of declared physical edge rows, stopping at the first owned live endpoint.
+async fn scoped_vertex_has_incident_edges(
+    write_path: &dyn GraphWrite,
+    schema: &Schema,
+    target: &VertexDeleteTarget<'_>,
+) -> Result<bool> {
+    let edges = graph_edge_tables(schema, &target.table.keyspace);
+    if edges.is_empty() {
+        return Ok(false);
+    }
+    if indexed_incident_edge_exists(write_path, schema, target).await? {
+        return Ok(true);
+    }
+    for edge in edges {
+        let table = TableId::new(&edge.keyspace, &edge.name);
+        let mut partitions = write_path.range_read_stream_all(&table, 0).await?;
+        while let Some(partition) = partitions.next().await {
+            let partition = partition?;
+            if is_partition_dead(&partition) {
+                continue;
+            }
+            for row in &partition.rows {
+                if !crate::adjacency::schema::row_is_deleted(row)
+                    && edge_is_incident(write_path, schema, target, &edge, &partition, row).await?
+                {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Delete exact physical edge/vertex rows in one atomic batch. Neither legacy
+/// edges nor a clustered vertex may be reconstructed from a logical UUID alone.
+#[allow(clippy::too_many_arguments)]
 async fn delete_with_adjacency(
     write_path: &dyn GraphWrite,
     keyspace: &str,
     vertex_key: &DecoratedKey,
+    vertex_clustering: &[u8],
     vertex_table: &TableId,
     timestamp: i64,
     strategy: &ReplicationStrategy,
+    schema: Option<&Schema>,
 ) -> Result<usize> {
-    let vid = vertex_key.key.as_bytes().to_vec();
-    let adj_ks = adjacency_keyspace_name(keyspace);
-    let adj_table = TableId::new(&adj_ks, "adjacency");
-
-    let mut mutations: Vec<Mutation> = Vec::new();
-    let mut edges_deleted = 0usize;
-
-    // Enumerate incident edges from the vertex's adjacency partition.
-    if let Some(partition) = write_path.read(&adj_table, vertex_key).await? {
-        for row in &partition.rows {
-            if !row.deletion.is_live() {
-                continue;
-            }
-            // Standard composite: direction byte sits at offset 2.
-            if row.clustering.len() < 3 {
-                continue;
-            }
-            let direction = row.clustering[2];
-            let Some(neighbor_id) = extract_neighbor_id(&row.clustering, None) else {
-                continue;
-            };
-            let Some(edge_label) = adjacency_edge_label(&row.clustering) else {
-                continue;
-            };
-            // The edge table FQN is stored in the row's first cell value.
-            let Some(edge_fqn) = row
-                .cells
-                .first()
-                .and_then(|(_, cell)| cell.value.as_ref())
-                .and_then(|bytes| std::str::from_utf8(bytes).ok())
-            else {
-                continue;
-            };
-            let Some((edge_ks, edge_tbl)) = edge_fqn.split_once('.') else {
-                continue;
-            };
-
-            // Reconstruct the edge's storage key: partition = source vertex,
-            // clustering = target vertex.
-            let (src_id, dst_id) = if direction == DIRECTION_OUT {
-                (vid.clone(), neighbor_id.clone())
-            } else {
-                (neighbor_id.clone(), vid.clone())
-            };
-            let edge_src_key = DecoratedKey::new(PartitionKey::new(src_id));
-
-            // (a) Tombstone the edge row itself.
-            mutations.push(tombstone_mutation(
-                edge_ks,
-                edge_tbl,
-                &edge_src_key,
-                Some(dst_id),
-                timestamp,
-            ));
-
-            // (b) Tombstone this vertex's adjacency entry (exact clustering).
-            mutations.push(tombstone_mutation(
-                &adj_ks,
-                "adjacency",
-                vertex_key,
-                Some(row.clustering.clone()),
-                timestamp,
-            ));
-
-            // (c) Tombstone the neighbor's mirror adjacency entry: flipped
-            //     direction, neighbor = this vertex.
-            let mirror_direction = if direction == DIRECTION_OUT {
-                DIRECTION_IN
-            } else {
-                DIRECTION_OUT
-            };
-            let neighbor_key = DecoratedKey::new(PartitionKey::new(neighbor_id));
-            let mirror_clustering = adjacency_clustering_bytes(mirror_direction, &edge_label, &vid);
-            mutations.push(tombstone_mutation(
-                &adj_ks,
-                "adjacency",
-                &neighbor_key,
-                Some(mirror_clustering),
-                timestamp,
-            ));
-
-            edges_deleted += 1;
-        }
-    }
-
-    // Finally, tombstone the vertex row (whole-partition delete).
-    mutations.push(tombstone_mutation(
+    let schema = schema.ok_or_else(|| {
+        GraphError::Validation("DETACH DELETE requires vertex and edge schema metadata".into())
+    })?;
+    let meta = table_metadata_for(Some(schema), &vertex_table.keyspace, &vertex_table.table)
+        .ok_or_else(|| GraphError::Validation("DETACH DELETE vertex metadata is missing".into()))?;
+    let Some(logical_key) = read_vertex_endpoint(
+        write_path,
+        &meta,
+        vertex_table,
+        vertex_key,
+        vertex_clustering,
+    )
+    .await?
+    else {
+        return Ok(0);
+    };
+    let target = VertexDeleteTarget {
+        table: vertex_table,
+        meta: &meta,
+        key: vertex_key,
+        clustering: vertex_clustering,
+        logical_key: &logical_key,
+    };
+    let edges = graph_edge_tables(schema, keyspace);
+    let mut batch =
+        collect_incident_edge_deletes(write_path, schema, &edges, &target, timestamp).await?;
+    protect_shared_index_entries(write_path, schema, &edges, &mut batch, timestamp).await?;
+    let edges_deleted = batch.removed_rows.len();
+    batch.mutations.extend(batch.index_updates.into_values());
+    batch.mutations.push(tombstone_mutation(
         &vertex_table.keyspace,
         &vertex_table.table,
         vertex_key,
-        None,
+        Some(vertex_clustering.to_vec()),
         timestamp,
     ));
-
-    let rf = strategy.replication_factor();
     write_path
-        .write_batch(mutations, graph_write_consistency(), rf)
+        .write_batch(
+            batch.mutations,
+            graph_write_consistency(),
+            strategy.replication_factor(),
+        )
         .await
         .map_err(GraphError::Storage)?;
-
     Ok(edges_deleted)
 }
 
@@ -6248,20 +6518,59 @@ async fn check_plain_delete_constraint(
                 .unwrap_or(col_name);
             // Edge tables have no adjacency partition keyed by the edge row;
             // the constraint only governs vertices.
-            let is_edge_table = table_metadata_for(schema, keyspace, table_name)
-                .as_ref()
-                .is_some_and(|meta| {
-                    meta.extensions
-                        .get("graph.type")
-                        .is_some_and(|graph_type| graph_type == "edge")
-                });
+            let table_meta = table_metadata_for(schema, keyspace, table_name);
+            let is_edge_table = table_meta.as_ref().is_some_and(|meta| {
+                meta.extensions
+                    .get("graph.type")
+                    .is_some_and(|kind| kind == "edge")
+            });
             if is_edge_table {
                 continue;
             }
             let key_bytes = hex::decode(&hex_id)
                 .map_err(|e| GraphError::Internal(format!("invalid hex storage key: {e}")))?;
             let key = DecoratedKey::new(PartitionKey::new(key_bytes));
-            if vertex_has_incident_edges(write_path, keyspace, &key).await? {
+            let incident = if let (Some(schema), Some(meta)) = (schema, table_meta.as_ref()) {
+                let table = TableId::new(keyspace, table_name);
+                let clustering = row_values
+                    .get(col_idx)
+                    .and_then(|value| value.as_object())
+                    .and_then(|map| map.get("__ferrosa_clustering"))
+                    .and_then(|value| value.as_str())
+                    .map(hex::decode)
+                    .transpose()
+                    .map_err(|error| {
+                        GraphError::Validation(format!(
+                            "invalid physical vertex clustering: {error}"
+                        ))
+                    })?;
+                let clustering = match clustering {
+                    Some(value) => value,
+                    None if meta.clustering_key.is_empty() => Vec::new(),
+                    None => {
+                        return Err(GraphError::Validation(
+                            "clustered vertex binding is missing its physical row key".into(),
+                        ))
+                    }
+                };
+                if let Some(logical_key) =
+                    read_vertex_endpoint(write_path, meta, &table, &key, &clustering).await?
+                {
+                    let target = VertexDeleteTarget {
+                        table: &table,
+                        meta,
+                        key: &key,
+                        clustering: &clustering,
+                        logical_key: &logical_key,
+                    };
+                    scoped_vertex_has_incident_edges(write_path, schema, &target).await?
+                } else {
+                    false
+                }
+            } else {
+                vertex_has_incident_edges(write_path, keyspace, &key).await?
+            };
+            if incident {
                 return Err(GraphError::ConstraintViolation(format!(
                     "Cannot delete node {hex_id}, because it still has relationships. \
                      To delete this node, you must first delete its relationships, \
@@ -6369,7 +6678,7 @@ async fn execute_delete(
                 let key_bytes = hex::decode(key_hex)
                     .map_err(|e| GraphError::Internal(format!("invalid hex storage key: {e}")))?;
                 let key = DecoratedKey::new(PartitionKey::new(key_bytes));
-                let clustering = if is_edge_table {
+                let clustering = {
                     row_values
                         .get(col_idx)
                         .and_then(|value| value.as_object())
@@ -6381,8 +6690,6 @@ async fn execute_delete(
                             GraphError::Internal(format!("invalid hex storage clustering: {e}"))
                         })?
                         .unwrap_or_default()
-                } else {
-                    Vec::new()
                 };
 
                 if detach && !is_edge_table {
@@ -6391,7 +6698,14 @@ async fn execute_delete(
                     // adjacency entries together with the vertex, atomically
                     // (URS-QEC-D01/D03/D07).
                     let edges_deleted = delete_with_adjacency(
-                        write_path, keyspace, &key, &table_id, timestamp, &strategy,
+                        write_path,
+                        keyspace,
+                        &key,
+                        &clustering,
+                        &table_id,
+                        timestamp,
+                        &strategy,
+                        schema,
                     )
                     .await?;
                     stats.edges_deleted += edges_deleted;

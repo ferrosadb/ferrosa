@@ -5909,19 +5909,47 @@ impl StorageEngine {
         self.unregister_table_quiesced(table_id)
     }
 
-    fn unregister_table_quiesced(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
-        // Recorded BEFORE anything is removed, and a failure refuses the drop:
-        // without the record, set-aside frames of this table would later be
-        // applied to a re-created table of the same name. Only a registered
-        // table is a drop; a replayed DROP of an absent table records nothing.
-        if self.tables.load().contains_key(table_id) {
-            crate::table_drops::record_drop(
+    /// Unregister a quiesced group with one durable transaction per recovery phase.
+    /// The caller must serialize same-name schema recreation through its lifecycle fence.
+    /// Physical failures refuse success and retain every group recovery intent.
+    pub fn unregister_tables(&self, table_ids: &[TableId]) -> ferrosa_common::Result<()> {
+        let registered: Vec<_> = table_ids
+            .iter()
+            .filter(|id| self.tables.load().contains_key(*id))
+            .cloned()
+            .collect();
+        if table_ids.is_empty() {
+            return Ok(());
+        }
+        if !registered.is_empty() {
+            crate::table_drops::record_drops(
                 &self.config.data_dir,
-                table_id.keyspace(),
-                table_id.table(),
+                &registered,
                 crate::table_drops::now_millis()?,
             )?;
         }
+        crate::table_drops::set_pending_sweeps(&self.config.data_dir, table_ids, true)?;
+        let mut pauses = Vec::with_capacity(table_ids.len());
+        for table_id in table_ids {
+            let pause = self
+                .compaction_executor
+                .pause_table(table_id, ferrosa_common::CancelReason::TableDropped);
+            if !pause.is_drained() {
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "table {table_id} has active compaction; pause the group before unregistering"
+                )));
+            }
+            pauses.push(pause);
+        }
+        for table_id in table_ids {
+            self.retire_table_state(table_id)?;
+            self.delete_table_directory(table_id)?;
+        }
+        crate::table_drops::set_pending_sweeps(&self.config.data_dir, table_ids, false)?;
+        Ok(())
+    }
+
+    fn retire_table_state(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
         self.clear_compaction_retry_state(table_id);
         if let Some(state) = remove_table(&self.tables, table_id)? {
             if state.in_write_soft_zone.swap(false, Ordering::Relaxed) {
@@ -5968,6 +5996,42 @@ impl StorageEngine {
             );
         }
 
+        Ok(())
+    }
+
+    fn delete_table_directory(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
+        let table_dir = self
+            .config
+            .data_dir
+            .join("sstables")
+            .join(table_id.to_string());
+        if !table_dir.exists() {
+            return Ok(());
+        }
+        std::fs::remove_dir_all(&table_dir).map_err(|e| {
+            tracing::error!(table = %table_id, path = %table_dir.display(), %e,
+                "DROP TABLE: could not delete SSTable directory; refusing success; same-name CREATE will sweep it");
+            ferrosa_common::Error::Io(e)
+        })?;
+        tracing::info!(table = %table_id, "deleted local SSTable directory on DROP TABLE");
+        Ok(())
+    }
+
+    fn unregister_table_quiesced(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
+        // Recorded BEFORE anything is removed, and a failure refuses the drop:
+        // without the record, set-aside frames of this table would later be
+        // applied to a re-created table of the same name. Only a registered
+        // table is a drop; a replayed DROP of an absent table records nothing.
+        if self.tables.load().contains_key(table_id) {
+            crate::table_drops::record_drop(
+                &self.config.data_dir,
+                table_id.keyspace(),
+                table_id.table(),
+                crate::table_drops::now_millis()?,
+            )?;
+        }
+        self.retire_table_state(table_id)?;
+
         // Delete local SSTable directory so DROP+CREATE starts empty.
         //
         // A failed removal must not report success: the dropped rows would stay
@@ -5988,29 +6052,12 @@ impl StorageEngine {
                 table_id.keyspace(),
                 table_id.table(),
             )?;
-            match std::fs::remove_dir_all(&table_dir) {
-                Ok(()) => {
-                    crate::table_drops::clear_pending_sweep(
-                        &self.config.data_dir,
-                        table_id.keyspace(),
-                        table_id.table(),
-                    )?;
-                    tracing::info!(
-                        table = %table_id,
-                        "deleted local SSTable directory on DROP TABLE"
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(
-                        table = %table_id,
-                        path = %table_dir.display(),
-                        %e,
-                        "DROP TABLE: could not delete the SSTable directory — refusing to \
-                         report success; a same-name CREATE will sweep it"
-                    );
-                    return Err(ferrosa_common::Error::Io(e));
-                }
-            }
+            self.delete_table_directory(table_id)?;
+            crate::table_drops::clear_pending_sweep(
+                &self.config.data_dir,
+                table_id.keyspace(),
+                table_id.table(),
+            )?;
         }
 
         Ok(())

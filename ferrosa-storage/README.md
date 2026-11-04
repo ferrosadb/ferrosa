@@ -1826,6 +1826,18 @@ Resumable range-scan supervisors await scheduler admission directly through
 `execute_scan`/`resume_scan`; carrier work remains on the bounded blocking pool.
 Producer panics are delivered as stream errors.
 
+### Group drop recovery transactions
+
+`StorageEngine::unregister_tables` records the group's drop timestamps in one
+bounded ledger transaction, marks its pending sweeps in a second transaction,
+and clears those sweeps only after every physical removal succeeds. Timestamp
+updates retain the maximum existing value. A physical failure returns an error
+and retains the group's recovery intents; it does not acknowledge an unfinished
+drop. The caller serializes schema recreation with the shared lifecycle writer.
+Single-table unregister APIs retain their existing behavior and recovery format.
+
+### Commit-log contention test support
+
 The `test-support` feature exposes a callback that holds the active commit-log
 segment's existing file mutex. Sibling-crate progress tests use it to exercise
 real flush/fsync contention with deterministic release and ordinary storage I/O.

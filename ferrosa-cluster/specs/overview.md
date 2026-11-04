@@ -323,6 +323,22 @@ positive certificates add no row-refetch RPCs; ambiguous candidates add canonica
 read/repair work proportional to candidate count.
 The existing point-read planner and wire shapes are unchanged.
 
+
+### Direct DDL execution
+
+`DdlPath::execute` drains required compactions asynchronously, then transfers the
+operation and its pauses to a blocking job. The job applies schema and physical
+storage changes under the existing lifecycle writer and retains the pauses until
+completion, including after client cancellation. Paired and Raft execution retain
+their existing coordination.
+
+The synchronous `ddl_path::apply_direct` implementation is shared with CQL
+authorization jobs to keep grant/revoke persistence canonical. Callers must check
+authorization, run it on a blocking worker and own required compaction pauses;
+physical cleanup refuses success if compactions remain active.
+
+### Pair local I/O
+
 Pair-mode local writes and commit-log syncs run on TaskPool blocking workers.
 The admitted caller and local I/O job share the existing handoff read lease: the
 worker retains admission until I/O finishes when the caller is cancelled, and a

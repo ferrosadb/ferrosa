@@ -400,6 +400,30 @@ Should an edge ever lack them (e.g. legacy data, or the referenced vertex table
 was dropped), a label-agnostic expansion **fails loud** with a `400` naming the
 edge and the missing key rather than returning a null endpoint.
 
+### Logical endpoints and physical rows
+
+Traversal keeps a vertex's logical endpoint separate from its complete storage
+partition and clustering key. A single clustering column supplies the endpoint;
+for multiple clustering columns, a unique UUID component is required. Property
+order and tenant partition columns do not select an endpoint. Hydration uses
+available relationship scope and rejects multiple matching physical rows.
+
+Plain `DELETE` uses the same scoped physical-edge predicate to refuse a vertex
+with an owned live relationship before writing anything. Indexed endpoint
+candidates are checked against their physical rows; a streamed legacy fallback
+stops at the first owned relationship. A foreign tenant's matching UUID does not
+prohibit deletion of this vertex.
+
+`DETACH DELETE` streams declared edge tables and deletes exact incident edge
+and vertex rows in one batch, preserving sibling rows. Shared adjacency entries
+remain live while another physical edge supports them, including edges in other
+tenant partitions. Reconciliation checks that support before deleting entries
+from legacy layouts whose physical keys cannot be recovered from adjacency.
+Its support scan retains only the existing partition's candidate entries; a
+failed scan defers unresolved deletions. This fallback can scan a legacy table
+once per partition containing unresolved deleted candidates. Endpoint-keyed
+tables retain their direct lookup path.
+
 ## Performance notes
 
 Measured 2026-10-15 on a single-node local development cluster (release build):
