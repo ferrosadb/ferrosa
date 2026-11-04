@@ -2240,7 +2240,7 @@ struct RowBodyPlan<'a> {
 
 /// Encode one row's body — liveness, row-level deletion, missing-column
 /// subset, and cells — into `sink`. Called twice per row against the same
-/// `plan`: once with a [`SizeCounter`], once with the real `DataBuffer`.
+/// `plan`: once with a [`SizeCounter`], once with the real [`DataSink`].
 ///
 /// `complex_order` is the writer's reusable index scratch. For each complex
 /// (collection) column run it is cleared, filled with the run's element
@@ -2837,7 +2837,7 @@ fn write_complex_deletion<S: RowSink>(
 
 /// Write an unsigned varint to any [`RowSink`] — the row-body destination,
 /// generic so the same call site works for a [`SizeCounter`] or a real
-/// [`DataBuffer`].
+/// [`DataSink`].
 fn push_unsigned_vint_to<S: RowSink>(buf: &mut S, value: u64) -> Result<()> {
     let mut vbuf = [0u8; 9];
     let n = varint::write_unsigned_vint(&mut vbuf, value);
