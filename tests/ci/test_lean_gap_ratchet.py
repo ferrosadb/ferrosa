@@ -286,6 +286,36 @@ class RatchetTest(unittest.TestCase):
         self.assertEqual(done.returncode, 1)
         self.assertIn("FAIL coverage: ferrosa-view", done.stdout)
 
+    def test_the_error_line_names_the_check_that_failed(self):
+        """A coverage regression is not growth, and must not be reported as zero growth.
+
+        The CI job printed `0 class(es) grew` for a run whose only failure was lost coverage,
+        which points the reader at the ratchet's ceiling instead of at the missing measurement.
+        """
+        self.baseline_of({"ferrosa-cdc": record()})
+        self.fx.write({"ferrosa-cdc": {"stage": "modules-partial", "scope": "modules (1/3)",
+                                       "translation_errors": None, "lean_errors": None}})
+        done = self.fx.run("check", "--no-verify-build")
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("FAIL coverage: ferrosa-cdc", done.stdout)
+        error = next(line for line in done.stdout.splitlines() if line.startswith("::error"))
+        self.assertNotIn("class", error,
+                         "nothing grew; saying so sends the reader to the wrong gate")
+        self.assertIn("1 crate stopped concluding", error)
+
+    def test_both_kinds_of_failure_are_named_in_one_error_line(self):
+        self.baseline_of({"ferrosa-cdc": record(lean_errors=2),
+                          "ferrosa-sched": record("ferrosa-sched")})
+        self.fx.write({"ferrosa-cdc": record(lean_errors=3),
+                       "ferrosa-sched": {"stage": "modules-partial", "scope": "modules (1/2)",
+                                         "translation_errors": None, "lean_errors": None}})
+        done = self.fx.run("check", "--no-verify-build")
+        self.assertEqual(done.returncode, 1)
+        error = next(line for line in done.stdout.splitlines() if line.startswith("::error"))
+        self.assertIn("1 class grew", error)
+        self.assertIn("1 crate stopped concluding", error)
+        self.assertIn("a red may be closed but never added", error)
+
     # ------------------------------------------------------------ scope
 
     def test_a_crate_declared_out_of_scope_is_not_gated(self):

@@ -9,9 +9,10 @@ current records against a committed baseline and fails when any error class grew
 Three rules, and the reasons they are rules rather than heuristics:
 
 * Growth fails closed. A class present now but absent from the baseline counts as growth
-  from zero, and a crate that used to conclude but now stops at `oom`, `aeneas-crash` or
-  `timeout` is a coverage regression -- also growth, because the reds it used to report
-  are now unreported rather than fixed.
+  from zero, and a crate that used to conclude but now stops at `oom`, `killed`,
+  `aeneas-crash` or `timeout` is a coverage regression -- also growth, because the reds it
+  used to report are now unreported rather than fixed. The failure line says which of the two
+  checks failed, so a lost measurement is never reported as a class that grew.
 * Shrinking never fails. Closing reds is the entire point; requiring a baseline rewrite
   in the same commit would make closing one red block an unrelated PR.
 * Numbers from two toolchains are not comparable, so a build whose identity differs from
@@ -625,6 +626,37 @@ def describe_toolchain(tc: dict) -> str:
 # ---------------------------------------------------------------- commands
 
 
+def describe_failures(growth: list[str]) -> str:
+    """The `::error` summary: name the checks that actually failed.
+
+    The job used to print `0 class(es) grew` whenever anything failed, including a run whose only
+    failure was lost coverage -- a sentence about a ceiling nobody had hit, which sends the
+    reader to the wrong gate.
+    """
+    def count(prefix: str) -> int:
+        return sum(1 for line in growth if line.startswith(prefix))
+
+    def plural(n: int, one: str, many: str) -> str:
+        return f"{n} {one if n == 1 else many}"
+
+    grew = count("FAIL growth:")
+    lost = count("FAIL coverage:")
+    unmeasured = count("FAIL unmeasured:")
+    parts = []
+    if grew:
+        parts.append(f"{plural(grew, 'class', 'classes')} grew")
+    if lost:
+        parts.append(f"{plural(lost, 'crate', 'crates')} stopped concluding")
+    if unmeasured:
+        parts.append(f"{plural(unmeasured, 'crate', 'crates')} produced no record")
+    summary = "; ".join(parts) if parts else "the baseline could not be compared"
+    if grew:
+        summary += "; a red may be closed but never added"
+    elif lost or unmeasured:
+        summary += "; coverage must not regress -- the reds it reported are unreported, not fixed"
+    return summary
+
+
 def cmd_check(args) -> int:
     baseline = load(Path(args.baseline))
     state_path = Path(args.state)
@@ -667,9 +699,7 @@ def cmd_check(args) -> int:
     if growth:
         for line in growth:
             print(line)
-        classes = sum(1 for line in growth if line.startswith("FAIL growth:"))
-        print(f"::error title=Lean gap ratchet::{classes} class(es) grew; a red may be "
-              f"closed but never added")
+        print(f"::error title=Lean gap ratchet::{describe_failures(growth)}")
         print("lean-gap-ratchet: FAIL -- the baseline is a ceiling, not a report")
         return 1
 
