@@ -172,6 +172,7 @@ jobs:
           tests.ci.test_lean_gap_ratchet
           tests.ci.test_lean_gap_ratchet_workflow
           tests.ci.test_lean_gap_bootstrap
+          tests.ci.test_lean_gap_diagnostics
 
   # Every `--all-features --workspace` lane must exclude the tests behind
   # `live-infra-tests`: they are absent from the default target and panic by

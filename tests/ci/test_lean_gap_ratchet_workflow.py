@@ -180,6 +180,67 @@ class RatchetWorkflowTest(unittest.TestCase):
             self.assertEqual(failure.returncode, 23, failure.stdout + failure.stderr)
             self.assertEqual(calls.read_text(), "x", "failed bootstrap must execute exactly once")
 
+    def schema_package_fixture(self, fail_install=False):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        tools = root / "tools"
+        tools.mkdir()
+        scripts = {
+            "sudo": '#!/bin/sh\nexec "$@"\n',
+            "apt-get": (
+                '#!/bin/sh\nset -eu\n'
+                'if [ "$1" = install ]; then\n'
+                ' printf "%s\\n" "$@" > "$PACKAGE_RECEIPT"\n'
+                ' case " $* " in *" capnproto "*)\n'
+                '  test "${FAIL_SCHEMA_INSTALL:-0}" != 1 || exit 17\n'
+                '  touch "$SCHEMA_INSTALLED";; esac\nfi\n'),
+            "capnp": (
+                '#!/bin/sh\nset -eu\ntest -f "$SCHEMA_INSTALLED"\n'
+                'test "$1" = --version\nprintf checked > "$SCHEMA_PROBED"\n'
+                'printf "CapnProto fixture version\\n"\n'),
+        }
+        for name, text in scripts.items():
+            path = tools / name
+            path.write_text(text)
+            path.chmod(0o755)
+        step = next(s for s in self.job["steps"] if s.get("name") == "System packages the toolchain links against")
+        env = {**os.environ, "PATH": str(tools)+os.pathsep+os.environ["PATH"],
+               "PACKAGE_RECEIPT": str(root/"packages"), "SCHEMA_INSTALLED": str(root/"installed"),
+               "SCHEMA_PROBED": str(root/"probed"), "FAIL_SCHEMA_INSTALL": str(int(fail_install))}
+        result = subprocess.run(["bash", "-euo", "pipefail", "-c", step["run"]],
+                                cwd=root, env=env, text=True, capture_output=True)
+        return root, result
+
+    def test_schema_compiler_is_installed_and_verified_before_extraction(self):
+        root, result = self.schema_package_fixture()
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        self.assertTrue((root/"installed").exists(), "capnproto must be provisioned")
+        self.assertEqual((root/"probed").read_text(), "checked")
+        packages = (root/"packages").read_text().splitlines()
+        for existing in ("libgmp-dev", "m4", "python3-yaml"):
+            self.assertIn(existing, packages)
+
+    def test_schema_install_failure_stops_before_extraction(self):
+        root, result = self.schema_package_fixture(fail_install=True)
+        self.assertEqual(result.returncode, 17, result.stdout+result.stderr)
+        self.assertFalse((root/"probed").exists())
+
+    def test_failed_extraction_diagnostics_are_bounded_and_retained(self):
+        steps = self.job["steps"]
+        collect = next(s for s in steps if s.get("name") == "Collect bounded extraction diagnostics")
+        upload = next(s for s in steps if s.get("name") == "Upload extraction diagnostics")
+        self.assertEqual(collect["if"], "${{ failure() }}")
+        self.assertEqual(upload["if"], "${{ failure() }}")
+        self.assertIn("scripts/lean_gap_diagnostics.py", collect["run"])
+        self.assertIn("--since-file .ci-artifacts/lean-gap-started-at", collect["run"])
+        self.assertEqual(upload["with"]["path"], ".ci-artifacts/lean-gap-diagnostics.json")
+        self.assertEqual(upload["with"]["retention-days"], 7)
+        self.assertEqual(upload["with"]["if-no-files-found"], "error")
+        measure = next(s for s in steps if s.get("name") == "Re-measure the gated crates")
+        self.assertLess(measure["run"].index("lean-gap-started-at"),
+                        measure["run"].index("scripts/lean_gap_inventory.py"))
+
     def test_cache_upload_failure_does_not_replace_the_semantic_gate(self):
         save = next(s for s in self.job["steps"] if s.get("name") == "Save the verified toolchain")
         self.assertIs(save.get("continue-on-error"), True)
