@@ -627,9 +627,9 @@ def grantEffects : List String := ["GrantUpdated", "PermissionRevoked"]
 
 /-! ## The ledger
 
-Five obligations on partial application, three of them red. Two are about what a partially applied
-entry leaves behind generically; the three on the grant surface are about the family that produced
-the shape this taxonomy was built for.
+Five obligations across the two lists below, three of them red: two are about what a partially
+applied entry leaves behind generically, two are on the grant projection, and one is the entry-level
+"no durable effect without publication".
 
 `Ferrosa/Raft/Obligations.lean` appends this list to the area ledger, so the count and the
 classification are checked there rather than asserted here.
