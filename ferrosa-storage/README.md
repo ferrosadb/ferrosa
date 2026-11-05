@@ -1861,3 +1861,13 @@ Read, compaction and repair cell comparison delegates to the same common orderin
 WAL readers reject future header versions before interpreting entries. The writer still emits the existing version; a future mutation generation requires a compatible reader rollout across WAL and Pair transport.
 
 Deferred compaction uses canonical cell reconciliation for both current heads and duplicate-row batches, including equal-timestamp tombstones and TTL ties. Payload comparison retains the existing reusable buffers; metadata-determined losers do not fetch values.
+
+### Checked store writer retirement
+
+`TableStore::retire_checked(writer_deadline)` closes new row writes, propagates
+rotation-barrier errors, then seals and drains admitted writers in the current
+memtable. Late truncates are refused. A drain failure remains closed and returns
+an error; a later retry can confirm completion after the existing writers leave.
+Rows already held in the memtable remain readable. This does not flush those rows,
+drain readers or compaction, or authorize replacing physical files. Recovery callers
+must establish those separate boundaries before issuing an installed-content receipt.
