@@ -98,6 +98,19 @@ pub enum ApplyError {
         table: String,
         reason: String,
     },
+    /// This node's engine holds no registration for a table the committed log
+    /// says exists, so a per-table effect (`update_table_schema`) had nothing to
+    /// act on.
+    ///
+    /// Refusal, not storage failure: with no registration no write can reach a
+    /// memtable, so no flush can be built from a wrong header. The table is
+    /// unusable on this node, loudly, and a re-issued CREATE registers it with
+    /// the metadata the log has accumulated since.
+    EngineTableNotRegistered {
+        keyspace: String,
+        table: String,
+        reason: String,
+    },
     /// A local effect whose failure leaves the bytes this node will *persist*
     /// wrong, or whose durable effect is not established. Latching.
     ///
@@ -144,7 +157,9 @@ impl ApplyError {
     /// here instead of silently inheriting the latch (or silently escaping it).
     fn fences_replica(&self) -> bool {
         match self {
-            Self::EngineRegisterTable { .. } | Self::EngineDropCleanupRefused { .. } => false,
+            Self::EngineRegisterTable { .. }
+            | Self::EngineDropCleanupRefused { .. }
+            | Self::EngineTableNotRegistered { .. } => false,
             Self::EngineUnregisterTable { .. } | Self::Other(_) => true,
         }
     }
@@ -173,6 +188,15 @@ impl std::fmt::Display for ApplyError {
             } => write!(
                 f,
                 "engine.unregister_table({keyspace}.{table}) failed: {reason}"
+            ),
+            Self::EngineTableNotRegistered {
+                keyspace,
+                table,
+                reason,
+            } => write!(
+                f,
+                "engine.update_table_schema({keyspace}.{table}) failed: this node's engine \
+                 has no registration for a table the committed log says exists: {reason}"
             ),
             Self::Other(msg) => f.write_str(msg),
         }
@@ -1878,7 +1902,27 @@ impl FerrosStateMachine {
                 // (bug-sstable-writer-produces-zero-byte-rows-db.md).
                 if let (Some(engine), Some(new_schema)) = (&self.engine, new_storage_schema) {
                     let tid = TableId::new(&keyspace, &table);
-                    if let Err(e) = engine.update_table_schema(&tid, new_schema) {
+                    if engine.table_schema(&tid).is_none() {
+                        // Refusal, not a storage failure: this node's engine has
+                        // no registration for a table the committed log says
+                        // exists (typically a CREATE whose registration was
+                        // refused above). There is no schema to rotate and no
+                        // memtable a flush could build from a wrong header, so
+                        // refusing the ALTER keeps the node serving — latching
+                        // here would resurrect the refused-CREATE fence one
+                        // statement later.
+                        tracing::error!(
+                            keyspace = %keyspace,
+                            table = %table,
+                            "Raft apply: update_table_schema refused — the engine has no \
+                             registration for this table"
+                        );
+                        apply_errors.push(ApplyError::EngineTableNotRegistered {
+                            keyspace: keyspace.clone(),
+                            table: table.clone(),
+                            reason: "engine has no registration for the table".to_string(),
+                        });
+                    } else if let Err(e) = engine.update_table_schema(&tid, new_schema) {
                         tracing::error!(%e, "Raft apply: update_table_schema failed — future flushes may be corrupt");
                         apply_errors.push(ApplyError::Other(format!(
                             "update_table_schema failed — future flushes may be corrupt: {e}"
@@ -6606,6 +6650,122 @@ mod tests {
         assert!(engine
             .table_schema(&TableId::new("regress_ks", "victim_tbl"))
             .is_none());
+    }
+
+    /// An ALTER of a table this node's engine does not hold is a refusal, not a
+    /// storage failure.
+    ///
+    /// Nothing can be rotated and no memtable can be flushed from a stale
+    /// header when there is no registration to begin with, so latching here
+    /// would only re-fence a node that is already correctly refusing writes to
+    /// that table — exactly what a refused CREATE leaves behind. The ALTER must
+    /// reach the caller, the node must keep applying, and re-registering the
+    /// table (what a re-issued CREATE does) must make the next ALTER work.
+    #[tokio::test]
+    async fn refused_alter_without_engine_registration_surfaces_and_keeps_applying() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = test_schema_instance();
+        let mut sm = FerrosStateMachine::with_side_effects(Arc::new(schema), Arc::clone(&engine));
+
+        sm.apply(vec![
+            make_entry(
+                1,
+                1,
+                RaftOp::CreateKeyspace(simple_keyspace("unregistered_ks")),
+            ),
+            make_entry(
+                1,
+                2,
+                RaftOp::CreateTable(Box::new(simple_table("unregistered_ks", "victim"))),
+            ),
+        ])
+        .await
+        .unwrap();
+
+        // The engine loses the registration while committed metadata keeps the
+        // table — the state a refused CREATE leaves behind.
+        let tid = TableId::new("unregistered_ks", "victim");
+        engine.unregister_table(&tid).unwrap();
+        assert!(engine.table_schema(&tid).is_none());
+
+        let add_column = |name: &str| ferrosa_schema::metadata::table::TableUpdates {
+            params: None,
+            drop_columns: vec![],
+            extensions: None,
+            add_columns: vec![ColumnMetadata {
+                name: name.into(),
+                kind: ColumnKind::Regular,
+                position: 1,
+                column_type: "text".into(),
+                clustering_order: ClusteringOrder::None,
+                mask: None,
+            }],
+        };
+
+        let responses = sm
+            .apply(vec![make_entry(
+                1,
+                3,
+                RaftOp::AlterTable {
+                    keyspace: "unregistered_ks".into(),
+                    table: "victim".into(),
+                    updates: Box::new(add_column("added")),
+                },
+            )])
+            .await
+            .expect("a refused ALTER must surface to the caller, not fail the apply");
+        let refusal = match responses.first() {
+            Some(RaftResponse::Error(reason)) => reason.clone(),
+            other => panic!("a refused ALTER must be an error response, got {other:?}"),
+        };
+        assert!(refusal.contains("no registration"), "{refusal}");
+        assert!(
+            sm.apply_failure.is_none(),
+            "a refused ALTER must not close the apply fence: {refusal}"
+        );
+        assert_eq!(sm.last_applied.unwrap().index, 3);
+
+        // The node still applies after the refusal.
+        let next = sm
+            .apply(vec![make_entry(
+                1,
+                4,
+                RaftOp::CreateTable(Box::new(simple_table("unregistered_ks", "later"))),
+            )])
+            .await
+            .expect("the node must still apply after a refused ALTER");
+        assert!(matches!(next[0], RaftResponse::Ok), "{next:?}");
+
+        // The repair is a DDL: re-registering the table with the metadata the
+        // log has accumulated makes the same ALTER apply.
+        let current = sm
+            .state
+            .tables
+            .get(&("unregistered_ks".into(), "victim".into()))
+            .expect("committed metadata keeps the table")
+            .to_storage_schema();
+        engine.register_table(current).unwrap();
+        let repaired = sm
+            .apply(vec![make_entry(
+                1,
+                5,
+                RaftOp::AlterTable {
+                    keyspace: "unregistered_ks".into(),
+                    table: "victim".into(),
+                    updates: Box::new(add_column("added_after_repair")),
+                },
+            )])
+            .await
+            .expect("an ALTER after re-registration must apply");
+        assert!(matches!(repaired[0], RaftResponse::Ok), "{repaired:?}");
+        assert!(engine
+            .table_schema(&tid)
+            .expect("registered")
+            .regular_columns
+            .iter()
+            .any(|c| c.name == "added_after_repair"));
     }
 
     /// Repro for forge t_86f9259d: a keyspace created through the Raft
