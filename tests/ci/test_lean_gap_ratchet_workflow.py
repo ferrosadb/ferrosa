@@ -194,11 +194,15 @@ class RatchetWorkflowTest(unittest.TestCase):
                 ' printf "%s\\n" "$@" > "$PACKAGE_RECEIPT"\n'
                 ' case " $* " in *" capnproto "*)\n'
                 '  test "${FAIL_SCHEMA_INSTALL:-0}" != 1 || exit 17\n'
-                '  touch "$SCHEMA_INSTALLED";; esac\nfi\n'),
+                '  touch "$SCHEMA_INSTALLED";; esac\n'
+                ' case " $* " in *" opam "*) touch "$OPAM_INSTALLED";; esac\nfi\n'),
             "capnp": (
                 '#!/bin/sh\nset -eu\ntest -f "$SCHEMA_INSTALLED"\n'
                 'test "$1" = --version\nprintf checked > "$SCHEMA_PROBED"\n'
                 'printf "CapnProto fixture version\\n"\n'),
+            "opam": (
+                '#!/bin/sh\nset -eu\ntest -f "$OPAM_INSTALLED"\n'
+                'test "$1" = --version\nprintf "Opam fixture version\\n"\n'),
         }
         for name, text in scripts.items():
             path = tools / name
@@ -207,7 +211,8 @@ class RatchetWorkflowTest(unittest.TestCase):
         step = next(s for s in self.job["steps"] if s.get("name") == "System packages the toolchain links against")
         env = {**os.environ, "PATH": str(tools)+os.pathsep+os.environ["PATH"],
                "PACKAGE_RECEIPT": str(root/"packages"), "SCHEMA_INSTALLED": str(root/"installed"),
-               "SCHEMA_PROBED": str(root/"probed"), "FAIL_SCHEMA_INSTALL": str(int(fail_install))}
+                "SCHEMA_PROBED": str(root/"probed"), "FAIL_SCHEMA_INSTALL": str(int(fail_install)),
+                "OPAM_INSTALLED": str(root/"opam-installed")}
         result = subprocess.run(["bash", "-euo", "pipefail", "-c", step["run"]],
                                 cwd=root, env=env, text=True, capture_output=True)
         return root, result
@@ -218,7 +223,7 @@ class RatchetWorkflowTest(unittest.TestCase):
         self.assertTrue((root/"installed").exists(), "capnproto must be provisioned")
         self.assertEqual((root/"probed").read_text(), "checked")
         packages = (root/"packages").read_text().splitlines()
-        for existing in ("libgmp-dev", "m4", "python3-yaml"):
+        for existing in ("libgmp-dev", "m4", "python3-yaml", "opam"):
             self.assertIn(existing, packages)
 
     def test_schema_install_failure_stops_before_extraction(self):
