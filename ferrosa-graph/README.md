@@ -387,6 +387,14 @@ file, so every start heals until an operator removes it. To force a heal on one 
 stop it and delete that file; a build that needs every node to heal again
 raises `heal_record::HEAL_VERSION`.
 
+The record is written by its own task after the heal completes; traversals
+do not wait for it, only for the heal. Waiting for it put two fsyncs (behind
+a process-wide lock) in front of every first-use traversal, which on a loaded
+host took longer than the 1 s heal wait budget and refused queries with HTTP
+503 while the index was already whole (t_9930eb20). Record writes are now
+serialized per data dir rather than per process. A node that stops between
+the heal and its record heals again on its next start.
+
 **Verify on one node** before rolling the others:
 
 ```bash
