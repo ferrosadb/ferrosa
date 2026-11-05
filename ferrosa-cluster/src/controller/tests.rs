@@ -126,6 +126,38 @@ async fn fresh_and_rebuilt_raft_storage_share_controller_recovery_admission() {
     }
 }
 
+#[tokio::test]
+async fn recovery_quarantine_closes_common_readiness_without_closing_protocol_handshake() {
+    let dir = tempfile::tempdir().unwrap();
+    let (controller, _handles) = ModeController::new(
+        Arc::new(ClusterConfig::default()),
+        Arc::new(NetConfig::default()),
+        Uuid::new_v4(),
+        test_storage(dir.path()),
+        test_schema(),
+        Arc::new(HandlerRegistry::new()),
+    );
+    assert!(controller.consensus_is_healthy());
+    assert!(controller.is_cql_ready());
+    assert!(controller.accepts_cql_connections());
+    controller
+        .recovery_admission()
+        .quarantine("owned-raft-group", "verified repair is still pending");
+    assert!(
+        !controller.consensus_is_healthy(),
+        "shared quarantine must close data/readiness admission"
+    );
+    assert!(!controller.is_cql_ready());
+    assert!(
+        controller.accepts_cql_connections(),
+        "keep protocol negotiation and typed refusal responses available"
+    );
+    assert!(
+        controller.consensus_health().is_healthy(),
+        "recoverable quarantine must not poison permanent consensus health"
+    );
+}
+
 #[test]
 fn starts_in_standalone_mode() {
     let dir = tempfile::tempdir().unwrap();

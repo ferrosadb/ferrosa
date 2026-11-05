@@ -996,7 +996,7 @@ impl ModeController {
     /// Pair replicas accept read traffic. Mutation and DDL dispatch enforce
     /// primary authority rather than rejecting a connection before its opcode.
     pub fn is_cql_ready(&self) -> bool {
-        if !self.consensus_health.is_healthy() {
+        if !self.consensus_is_healthy() {
             return false;
         }
         self.accepts_cql_connections()
@@ -1121,7 +1121,7 @@ impl ModeController {
 
     /// Synchronous fast path used by readiness and CQL dispatch.
     pub fn consensus_is_healthy(&self) -> bool {
-        self.consensus_health.is_healthy()
+        self.consensus_health.is_healthy() && self.recovery_admission.admits().is_ok()
     }
 
     /// Get local host_id.
