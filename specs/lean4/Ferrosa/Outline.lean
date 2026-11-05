@@ -114,13 +114,18 @@ def parts : List Part := [
    "transform may rewrite, and which sites in the tree meet either rule. The three before them ask " ++
    "what the pipeline is allowed to assume about a value before any of these modules sees it: one " ++
    "canonical in-memory form, the codec interface a format swap has to fit inside, and what the " ++
-   "code still does to a value on the way in.", [
+   "code still does to a value on the way in. The ownership modules sit beside them: one payload with " ++
+   "N refcounted handles instead of N copies, the moves that make a use after a move unrepresentable, " ++
+   "and the sites where the tree still duplicates a payload a handle would have shared.", [
     "Ferrosa.WritePath",
     "Ferrosa.Storage.Format",
     "Ferrosa.Storage.Mvcc",
     "Ferrosa.Storage.Recovery",
     "Ferrosa.Storage.Tombstone",
     "Ferrosa.Storage.Streaming",
+    "Ferrosa.Ownership.Machine",
+    "Ferrosa.Ownership.Audit",
+    "Ferrosa.Ownership.Obligations",
     "Ferrosa.Codec.Canonical",
     "Ferrosa.Codec.Seam",
     "Ferrosa.Codec.Audit",
@@ -179,7 +184,7 @@ theorem every_ledger_is_placed :
 
 /-- The book covers a fixed number of modules. A module added to the corpus without a home here is
     a build failure rather than a silent omission from the document. -/
-theorem placed_module_count : (parts.map (fun p => p.modules.length)).sum = 73 := by decide
+theorem placed_module_count : (parts.map (fun p => p.modules.length)).sum = 76 := by decide
 
 /-- Part numerals are distinct, so `\ref` cannot collide. -/
 theorem part_numerals_distinct : (parts.map (fun p => p.numeral)).Nodup := by decide

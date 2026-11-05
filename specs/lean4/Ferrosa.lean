@@ -51,6 +51,9 @@ import Ferrosa.Sql.Index
 import Ferrosa.Sql.Txn
 import Ferrosa.Storage.Mvcc
 import Ferrosa.Storage.Streaming
+import Ferrosa.Ownership.Machine
+import Ferrosa.Ownership.Audit
+import Ferrosa.Ownership.Obligations
 import Ferrosa.Codec.Canonical
 import Ferrosa.Codec.Seam
 import Ferrosa.Codec.Audit

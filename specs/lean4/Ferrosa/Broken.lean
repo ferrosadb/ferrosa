@@ -251,16 +251,41 @@ def broken : List Item := [
   ⟨"Codec", "an artifact records which format version wrote it",
    "A stored table does not record which format wrote it. A reader decides how to parse one from which files happen to be present, so a later format that reuses a file name is read as the current one instead of being refused.",
    "ferrosa-sstable/src/reader.rs opens a table from component handles and checks no version; ferrosa-sstable/src/statistics.rs:147-172 has no version field; ferrosa-sstable/src/toc.rs:16-37 lists filenames only",
-   "Ferrosa.Codec.Audit", "an artifact records which format version wrote it"⟩
+   "Ferrosa.Codec.Audit", "an artifact records which format version wrote it"⟩,
+  ⟨"Ownership", "a replication send copies the mutation once instead of encoding it and moving it on",
+   "A replicated write is duplicated in full before it is sent. The copy exists because the local apply needs to own the data while the send still needs it, but the send only reads it to encode, so the copy could be an encode followed by a move.",
+   "ferrosa-cluster/src/pair/coordinator.rs:122 clones the Mutation for apply_locally_async while replicate_to_peer at :181 only borrows it to encode; ferrosa-cluster/src/pair/handler.rs:47 clones again on the primary's forward path",
+   "Ferrosa.Ownership.Obligations", "a replication send does not copy the mutation it is about to encode"⟩,
+  ⟨"Ownership", "a snapshot is handed to each follower as a shared payload",
+   "Every follower that asks for the current snapshot is given its own copy of it. A node serving several lagging followers holds the whole snapshot once per follower, so catching up one more node costs one more full copy on the leader.",
+   "ferrosa-cluster/src/raft/state_machine.rs:599 returns a cloned Vec<u8> from the published slot, and :2855 hands that to every get_current_snapshot caller",
+   "Ferrosa.Ownership.Obligations", "a snapshot is served to every follower through a handle rather than a copy"⟩,
+  ⟨"Ownership", "building a snapshot does not duplicate the state it encodes",
+   "A snapshot build duplicates the whole catalogue state and then serialises the duplicate. The serialiser only reads it, so the copy costs a second full catalogue for the duration of every snapshot.",
+   "ferrosa-cluster/src/raft/state_machine.rs:2541 clones RaftState into SnapshotData although encode_snapshot takes a reference, and :248 clones the bootstrap map a second time",
+   "Ferrosa.Ownership.Obligations", "a snapshot build does not duplicate the state it is about to encode"⟩,
+  ⟨"Ownership", "the encoded snapshot is held once during a build",
+   "While a snapshot is being written, the encoded bytes are held three times at once: the original, the copy published for replication, and the copy the disk write owns. Peak memory for a build is three times the snapshot.",
+   "ferrosa-cluster/src/raft/state_machine.rs:2567 clones the bytes into the published slot and :2571 clones them again for the blocking disk write, while the original is moved into the returned cursor",
+   "Ferrosa.Ownership.Obligations", "the encoded snapshot is not resident three times during a build"⟩,
+  ⟨"Ownership", "a write handed to an observer does not duplicate its row",
+   "When an observer is registered, every write duplicates the row before storing it so that the observer and the memtable can both read it. The duplication is per write, on the hot path, and it copies the row's metadata as well as its cells.",
+   "ferrosa-storage/src/engine.rs:10203 builds the observer Mutation from vec![row.clone()] and then moves the row into the memtable; the batch path does the same at :10325",
+   "Ferrosa.Ownership.Obligations", "a write that hands a row to an observer does not give the observer a second payload"⟩,
+  ⟨"Ownership", "an observer's derived writes are moved, not copied",
+   "Observer-generated writes are duplicated row by row into the target table even though the write they came from is finished with afterwards. Every derived row is copied once more than it needs to be.",
+   "ferrosa-storage/src/engine.rs:9651 and :9698 loop over &dm.rows and clone each row into the target memtable, while dm is owned and dropped at the end of the loop",
+   "Ferrosa.Ownership.Obligations", "an observer drain moves rows out of the mutation it owns"⟩
 ]
 
-/-- Fifty-one built-and-wrong items, pinned so a defect cannot be dropped from the list without the
+/-- Fifty-seven built-and-wrong items, pinned so a defect cannot be dropped from the list without the
 corpus classification breaking. The sysfail row left for `Unimplemented.discharged` when `6c270518`
 closed it; six rows joined when startup, replay and the grant projection were audited, seven when
 the system-table projection layer was modelled, nine when the memory-discipline machine was audited
-against the read and transform paths, and five when the canonical-form and codec-seam audit found
-that the pipeline's value type and the file layout both live in four crates it should not. -/
-theorem broken_has_fifty_one_items : broken.length = 51 := by native_decide
+against the read and transform paths, five when the canonical-form and codec-seam audit found that
+the pipeline's value type and the file layout both live in four crates it should not, and six when
+the ownership machine was audited against the peer send, snapshot and observer paths. -/
+theorem broken_has_fifty_seven_items : broken.length = 57 := by native_decide
 
 /-- The surfaces are where the damage concentrates: five of the thirty-one are SQL or SPARQL, which
     are the two places where a client is most likely to be told something confidently wrong. -/
@@ -276,8 +301,8 @@ theorem five_rows_have_no_verified_site :
 
 /-- The remainder - the rows that name a real location — are what the list's opening claim is about:
     code that was read, not inferred. -/
-theorem forty_six_rows_name_a_site :
-    (broken.filter fun i => !i.site.startsWith "unverified:").length = 46 := by native_decide
+theorem fifty_two_rows_name_a_site :
+    (broken.filter fun i => !i.site.startsWith "unverified:").length = 52 := by native_decide
 
 /-- What a reader of the specification is shown for a row: the sentence that says what is wrong. -/
 def readerText (i : Item) : String := i.plain
