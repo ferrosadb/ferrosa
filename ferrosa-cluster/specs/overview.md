@@ -404,6 +404,11 @@ Role deletion and permission regrant inspect physical metadata through bounded
 32-row pages, including rows hidden by an older partition tombstone. The
 node-local serialized writer chooses a checked successor beyond stored cells,
 row deletions and partition deletions; clock ties/regression cannot resurrect a
-removed role or suppress a later grant. A partition delete preflights both role
-and grant clocks before its first write. This does not establish concurrent or
-cross-node timestamp arbitration, nor repair other projection families.
+removed role or suppress a later grant. Role deletion preflights role, grant
+and owned-membership clocks before its first write. Role updates replace the
+owned membership partition, then write exactly the stored parents above that
+delete; a revoked parent is not retained. Keyspace, table/column, index, type and
+function rows use the same checked successor and restamp all their cells and
+liveness/deletion metadata. This is serialized node-local ordering, not
+concurrent or cross-node timestamp arbitration. Membership reload and cleanup of
+other roles that reference a dropped parent are separate concerns.

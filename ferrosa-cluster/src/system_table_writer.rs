@@ -6,7 +6,7 @@
 //! on both crates, and placing it in either would create a circular dependency.
 //! Correctness: ordered projections inspect bounded physical metadata, including hidden tombstones.
 //! Last revised: 2026-11-05
-//! Last changed: order role deletion and regrant beyond stored partition/row clocks.
+//! Last changed: order canonical schema families and replace stored role membership poststate.
 
 use std::sync::Arc;
 
@@ -143,6 +143,48 @@ impl SystemTableWriter {
         )
     }
 
+    /// Restamp a canonical row beyond the physical metadata it replaces.
+    /// Empty-clustering deletion rows are partition deletes in the storage API,
+    /// so they must dominate all rows, not just the empty clustering key.
+    fn write_ordered(
+        &self,
+        table: &TableId,
+        key: &DecoratedKey,
+        row: Row,
+        wall: i64,
+    ) -> ferrosa_common::Result<()> {
+        let partition_delete =
+            row.clustering.is_empty() && row.cells.is_empty() && !row.deletion.is_live();
+        let target = if partition_delete {
+            None
+        } else {
+            Some(row.clustering.as_slice())
+        };
+        let ts = self.next_projection_timestamp(table, key, target, wall)?;
+        self.write_at(table, key, row, ts)
+    }
+
+    /// Write a preflighted timestamp without rereading clocks. Preserve actual
+    /// local deletion/expiry times: logical ordering is not the GC wall clock.
+    fn write_at(
+        &self,
+        table: &TableId,
+        key: &DecoratedKey,
+        mut row: Row,
+        ts: i64,
+    ) -> ferrosa_common::Result<()> {
+        if row.primary_key_liveness.timestamp != i64::MIN {
+            row.primary_key_liveness.timestamp = ts;
+        }
+        if !row.deletion.is_live() {
+            row.deletion.marked_for_delete_at = ts;
+        }
+        for (_, cell) in &mut row.cells {
+            cell.timestamp = ts;
+        }
+        self.engine.write(table, key, row, ts)
+    }
+
     /// Apply a system table mutation by writing to the storage engine.
     pub fn apply(&self, mutation: SystemTableMutation) -> ferrosa_common::Result<()> {
         #[cfg(test)]
@@ -153,7 +195,7 @@ impl SystemTableWriter {
             SystemTableMutation::KeyspaceCreated(ks) => {
                 let (key, row, ts) = keyspace_to_row(&ks);
                 let tid = TableId::new("system_schema", "keyspaces");
-                self.engine.write(&tid, &key, row, ts)?;
+                self.write_ordered(&tid, &key, row, ts)?;
             }
             SystemTableMutation::KeyspaceDropped(name) => {
                 let ts = now_micros();
@@ -165,12 +207,12 @@ impl SystemTableWriter {
                     deletion: DeletionTime::new(ts, (ts / 1_000_000) as u32),
                     primary_key_liveness: LivenessInfo::NONE,
                 };
-                self.engine.write(&tid, &key, row, ts)?;
+                self.write_ordered(&tid, &key, row, ts)?;
             }
             SystemTableMutation::TableCreated(table) => {
                 let result = table_to_rows(&table);
                 let tables_tid = TableId::new("system_schema", "tables");
-                self.engine.write(
+                self.write_ordered(
                     &tables_tid,
                     &result.table_row.key,
                     result.table_row.row,
@@ -178,8 +220,7 @@ impl SystemTableWriter {
                 )?;
                 let columns_tid = TableId::new("system_schema", "columns");
                 for col_row in result.column_rows {
-                    self.engine
-                        .write(&columns_tid, &col_row.key, col_row.row, result.timestamp)?;
+                    self.write_ordered(&columns_tid, &col_row.key, col_row.row, result.timestamp)?;
                 }
             }
             SystemTableMutation::TableDropped { keyspace, table } => {
@@ -194,31 +235,50 @@ impl SystemTableWriter {
                     deletion: DeletionTime::new(ts, (ts / 1_000_000) as u32),
                     primary_key_liveness: LivenessInfo::NONE,
                 };
-                self.engine.write(&tables_tid, &key, row, ts)?;
+                self.write_ordered(&tables_tid, &key, row, ts)?;
             }
             SystemTableMutation::RoleCreated(role) => {
-                let member_of = role.member_of.clone();
-                let (key, mut row, wall) = role_to_row(&role);
+                let (key, row, wall) = role_to_row(&role);
                 let tid = TableId::new("system_auth", "roles");
-                let ts = self.next_role_timestamp(&key, wall)?;
-                row.primary_key_liveness.timestamp = ts;
-                for (_, cell) in &mut row.cells {
-                    cell.timestamp = ts;
-                }
-                self.engine.write(&tid, &key, row, ts)?;
-
                 let members_tid = TableId::new("system_auth", "role_members");
-                for parent in &member_of {
-                    let member_key =
-                        DecoratedKey::new(PartitionKey::new(role.name.as_bytes().to_vec()));
-                    let member_row = Row {
-                        clustering: parent.as_bytes().to_vec(),
+                // The mutation carries the entire stored role, including its
+                // membership poststate. Preflight before publishing any row.
+                let role_ts = self.next_role_timestamp(&key, wall)?;
+                let members_drop =
+                    self.next_projection_timestamp(&members_tid, &key, None, wall)?;
+                let members_live = if role.member_of.is_empty() {
+                    members_drop
+                } else {
+                    members_drop.checked_add(1).ok_or_else(|| {
+                        ferrosa_common::Error::InvalidData(
+                            "canonical membership timestamp exhausted".into(),
+                        )
+                    })?
+                };
+                self.write_at(&tid, &key, row, role_ts)?;
+                self.write_at(
+                    &members_tid,
+                    &key,
+                    Row {
+                        clustering: vec![],
                         cells: vec![],
-                        deletion: DeletionTime::LIVE,
-                        primary_key_liveness: LivenessInfo::with_timestamp(ts),
-                    };
-                    self.engine
-                        .write(&members_tid, &member_key, member_row, ts)?;
+                        deletion: DeletionTime::new(members_drop, (wall / 1_000_000) as u32),
+                        primary_key_liveness: LivenessInfo::NONE,
+                    },
+                    members_drop,
+                )?;
+                for parent in &role.member_of {
+                    self.write_at(
+                        &members_tid,
+                        &key,
+                        Row {
+                            clustering: parent.as_bytes().to_vec(),
+                            cells: vec![],
+                            deletion: DeletionTime::LIVE,
+                            primary_key_liveness: LivenessInfo::with_timestamp(members_live),
+                        },
+                        members_live,
+                    )?;
                 }
             }
             SystemTableMutation::RoleDropped(name) => {
@@ -226,18 +286,24 @@ impl SystemTableWriter {
                 let key = DecoratedKey::new(PartitionKey::new(name.as_bytes().to_vec()));
                 let tid = TableId::new("system_auth", "roles");
                 let perms_tid = TableId::new("system_auth", "role_permissions");
-                // Preflight both successors before the first effect, including
+                let members_tid = TableId::new("system_auth", "role_members");
+                // Preflight all successors before the first effect, including
                 // overflow, then dominate every stored grant in bounded pages.
                 let role_ts = self.next_projection_timestamp(&tid, &key, None, wall)?;
                 let perms_ts = self.next_projection_timestamp(&perms_tid, &key, None, wall)?;
-                for (table, ts) in [(tid, role_ts), (perms_tid, perms_ts)] {
+                let members_ts = self.next_projection_timestamp(&members_tid, &key, None, wall)?;
+                for (table, ts) in [
+                    (tid, role_ts),
+                    (perms_tid, perms_ts),
+                    (members_tid, members_ts),
+                ] {
                     let row = Row {
                         clustering: vec![],
                         cells: vec![],
                         deletion: DeletionTime::new(ts, (wall / 1_000_000) as u32),
                         primary_key_liveness: LivenessInfo::NONE,
                     };
-                    self.engine.write(&table, &key, row, ts)?;
+                    self.write_at(&table, &key, row, ts)?;
                 }
             }
             SystemTableMutation::GrantUpdated(grant) => {
@@ -248,7 +314,7 @@ impl SystemTableWriter {
                     cell.timestamp = ts;
                 }
                 let tid = TableId::new("system_auth", "role_permissions");
-                self.engine.write(&tid, &key, row, ts)?;
+                self.write_at(&tid, &key, row, ts)?;
             }
             SystemTableMutation::PermissionRevoked {
                 role,
@@ -266,13 +332,13 @@ impl SystemTableWriter {
                     deletion: DeletionTime::new(ts, (now_micros() / 1_000_000) as u32),
                     primary_key_liveness: LivenessInfo::NONE,
                 };
-                self.engine.write(&tid, &key, row, ts)?;
+                self.write_at(&tid, &key, row, ts)?;
             }
             SystemTableMutation::IndexCreated(index) => {
                 let row = index_to_rows(&index);
                 let ts = now_micros();
                 let tid = TableId::new("system_schema", "indexes");
-                self.engine.write(&tid, &row.key, row.row, ts)?;
+                self.write_ordered(&tid, &row.key, row.row, ts)?;
             }
             SystemTableMutation::IndexDropped {
                 keyspace,
@@ -296,13 +362,13 @@ impl SystemTableWriter {
                     deletion: DeletionTime::new(ts, (ts / 1_000_000) as u32),
                     primary_key_liveness: LivenessInfo::NONE,
                 };
-                self.engine.write(&tid, &key, row, ts)?;
+                self.write_ordered(&tid, &key, row, ts)?;
             }
             SystemTableMutation::TypeCreated(udt) => {
                 let row = type_to_row(&udt);
                 let ts = now_micros();
                 let tid = TableId::new("system_schema", "types");
-                self.engine.write(&tid, &row.key, row.row, ts)?;
+                self.write_ordered(&tid, &row.key, row.row, ts)?;
             }
             SystemTableMutation::TypeDropped { keyspace, name } => {
                 let ts = now_micros();
@@ -315,13 +381,13 @@ impl SystemTableWriter {
                     deletion: DeletionTime::new(ts, (ts / 1_000_000) as u32),
                     primary_key_liveness: LivenessInfo::NONE,
                 };
-                self.engine.write(&tid, &key, row, ts)?;
+                self.write_ordered(&tid, &key, row, ts)?;
             }
             SystemTableMutation::FunctionCreated(func) => {
                 let row = function_to_row(&func);
                 let ts = now_micros();
                 let tid = TableId::new("system_schema", "functions");
-                self.engine.write(&tid, &row.key, row.row, ts)?;
+                self.write_ordered(&tid, &row.key, row.row, ts)?;
             }
             SystemTableMutation::FunctionDropped {
                 keyspace,
@@ -339,7 +405,7 @@ impl SystemTableWriter {
                     deletion: DeletionTime::new(ts, (ts / 1_000_000) as u32),
                     primary_key_liveness: LivenessInfo::NONE,
                 };
-                self.engine.write(&tid, &key, row, ts)?;
+                self.write_ordered(&tid, &key, row, ts)?;
             }
         }
         Ok(())
