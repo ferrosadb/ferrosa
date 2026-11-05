@@ -285,7 +285,15 @@ start_memory() {
   while (( SECONDS < deadline )); do
     # No -f: keep a non-2xx body so the timeout diagnostic can show it.
     last="$(curl -sS -m 2 "http://127.0.0.1:$MEM_PORT/healthz/ready" 2>/dev/null || true)"
-    if [ "$last" = "ready" ]; then
+    # Two shapes are legitimate. A daemon that installs a readiness reporter
+    # (ferrosa-memory-mcp does) answers with the serialized ReadinessReport
+    # from ferrosa-memory-core/src/http.rs — {"ready":true,...,"phase":"ready"}
+    # — while the plain serve_http route answers the bare word. Matching the
+    # whole body against "ready" only ever recognised the second, so a server
+    # that was ready in seconds was reported as never ready for the full
+    # budget. `ready:true` in that report already implies connected + migrated
+    # (an incomplete schema forces phase SchemaMigrations and ready=false).
+    if [ "$last" = "ready" ] || [[ "$last" == *'"ready":true'* ]]; then
       ok "ferrosa-memory /healthz/ready=ready (connected to ferrosa, agent_memory keyspace ready)"
       return 0
     fi
