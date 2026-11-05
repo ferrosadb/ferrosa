@@ -96,6 +96,7 @@ async fn fresh_and_rebuilt_raft_storage_share_controller_recovery_admission() {
     use crate::raft::log_store::SledLogStore;
     use crate::raft::state_machine::FerrosStateMachine;
     use openraft::storage::RaftLogStorage;
+    use openraft::{CommittedLeaderId, LogId};
 
     let dir = tempfile::tempdir().unwrap();
     let (controller, _handles) = ModeController::new(
@@ -122,6 +123,50 @@ async fn fresh_and_rebuilt_raft_storage_share_controller_recovery_admission() {
         assert!(
             reader.shares_recovery_admission(&admission),
             "{incarnation} log reader lost the controller gate"
+        );
+
+        // Sharing the gate only matters if `purge` honours it. Raise a durable
+        // watermark so the request clears the snapshot ceiling, hold the
+        // controller's admission, and ask the store to purge: purge authority
+        // must not move while the gate says busy. Released, the same request
+        // must take effect — otherwise "refused" would be indistinguishable
+        // from an inert store.
+        log_store
+            .durable_applied_handle()
+            .store(3, std::sync::atomic::Ordering::Release);
+        let purge_to = LogId::new(CommittedLeaderId::new(1, 0), 1);
+        let epoch = admission.epoch();
+        let held = Arc::clone(&admission);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let publisher = std::thread::spawn(move || {
+            held.with_admission_epoch(epoch, || {
+                ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+            .unwrap();
+        });
+        ready_rx.await.unwrap();
+        let deferred = RaftLogStorage::purge(&mut log_store, purge_to).await;
+        let while_busy = log_store.last_purged_log_id().unwrap();
+        release_tx.send(()).unwrap();
+        publisher.join().unwrap();
+        assert!(
+            deferred.is_ok(),
+            "{incarnation} busy-gate purge must defer, not fail the Core"
+        );
+        assert_eq!(
+            while_busy, None,
+            "{incarnation} log store purged while the controller gate was busy: \
+             its recovery admission is still private"
+        );
+        RaftLogStorage::purge(&mut log_store, purge_to)
+            .await
+            .unwrap();
+        assert_eq!(
+            log_store.last_purged_log_id().unwrap(),
+            Some(purge_to),
+            "{incarnation} purge never advances once the gate is free"
         );
     }
 }
