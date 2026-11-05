@@ -330,9 +330,6 @@ impl SystemTableLoader {
             })?;
 
             for row in &partition.rows {
-                if !row.deletion.is_live() {
-                    continue;
-                }
                 let resource_text = String::from_utf8(row.clustering.clone()).map_err(|e| {
                     FerrosaError::InvalidData(format!(
                         "invalid role_permissions resource utf8: {e}"
@@ -345,6 +342,11 @@ impl SystemTableLoader {
                 else {
                     continue;
                 };
+                // A newer grant can resurrect this permission cell above an
+                // older row tombstone. Older/equal cells remain deleted.
+                if cell.timestamp <= row.deletion.marked_for_delete_at {
+                    continue;
+                }
                 let Some(bytes) = cell.value.as_deref() else {
                     continue;
                 };

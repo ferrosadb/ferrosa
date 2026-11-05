@@ -32,6 +32,8 @@ fn now_micros() -> i64 {
 #[derive(Clone)]
 pub struct SystemTableWriter {
     engine: Arc<StorageEngine>,
+    #[cfg(test)]
+    permission_timestamp: Option<i64>,
     /// Test-only observability seam: records the OS thread on which the most
     /// recent [`SystemTableWriter::apply`] ran. The raft apply-offload
     /// regression test uses this to prove the synchronous system-table write
@@ -47,6 +49,8 @@ impl SystemTableWriter {
         Self {
             engine,
             #[cfg(test)]
+            permission_timestamp: None,
+            #[cfg(test)]
             last_apply_thread: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -57,6 +61,45 @@ impl SystemTableWriter {
         &self,
     ) -> Arc<std::sync::Mutex<Option<std::thread::ThreadId>>> {
         Arc::clone(&self.last_apply_thread)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_permission_timestamp_for_test(&mut self, timestamp: i64) {
+        self.permission_timestamp = Some(timestamp);
+    }
+
+    fn permission_timestamp(&self) -> i64 {
+        #[cfg(test)]
+        if let Some(timestamp) = self.permission_timestamp {
+            return timestamp;
+        }
+        now_micros()
+    }
+
+    /// Raft serializes these projection writes. Advance beyond the actual
+    /// stored cell/tombstone even when the wall clock ties or moves backwards.
+    fn next_permission_timestamp(
+        &self,
+        key: &DecoratedKey,
+        resource: &[u8],
+    ) -> ferrosa_common::Result<i64> {
+        let tid = TableId::new("system_auth", "role_permissions");
+        let mut previous = i64::MIN;
+        if let Some(partition) = self.engine.read(&tid, key)? {
+            previous = partition.deletion.marked_for_delete_at;
+            if let Some(row) = partition.rows.iter().find(|row| row.clustering == resource) {
+                previous = previous
+                    .max(row.deletion.marked_for_delete_at)
+                    .max(row.primary_key_liveness.timestamp);
+                for (_, cell) in &row.cells {
+                    previous = previous.max(cell.timestamp);
+                }
+            }
+        }
+        let successor = previous.checked_add(1).ok_or_else(|| {
+            ferrosa_common::Error::InvalidData("permission projection timestamp exhausted".into())
+        })?;
+        Ok(self.permission_timestamp().max(successor))
     }
 
     /// Apply a system table mutation by writing to the storage engine.
@@ -157,7 +200,12 @@ impl SystemTableWriter {
                 self.engine.write(&perms_tid, &key.clone(), perms_row, ts)?;
             }
             SystemTableMutation::GrantUpdated(grant) => {
-                let (key, row, ts) = grant_to_row(&grant);
+                let (key, mut row, _) = grant_to_row(&grant);
+                let ts = self.next_permission_timestamp(&key, &row.clustering)?;
+                row.primary_key_liveness.timestamp = ts;
+                for (_, cell) in &mut row.cells {
+                    cell.timestamp = ts;
+                }
                 let tid = TableId::new("system_auth", "role_permissions");
                 self.engine.write(&tid, &key, row, ts)?;
             }
@@ -166,15 +214,15 @@ impl SystemTableWriter {
                 resource,
                 permission: _,
             } => {
-                // For simplicity, tombstone the entire resource row.
-                // The next GrantUpdated will re-write remaining permissions.
-                let ts = now_micros();
+                // Only an empty post-state is tombstoned. A subsequent grant
+                // must sort after this deletion even under clock regression.
                 let key = DecoratedKey::new(PartitionKey::new(role.as_bytes().to_vec()));
+                let ts = self.next_permission_timestamp(&key, resource.to_string().as_bytes())?;
                 let tid = TableId::new("system_auth", "role_permissions");
                 let row = Row {
                     clustering: resource.to_string().as_bytes().to_vec(),
                     cells: vec![],
-                    deletion: DeletionTime::new(ts, (ts / 1_000_000) as u32),
+                    deletion: DeletionTime::new(ts, (now_micros() / 1_000_000) as u32),
                     primary_key_liveness: LivenessInfo::NONE,
                 };
                 self.engine.write(&tid, &key, row, ts)?;

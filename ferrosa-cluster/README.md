@@ -1364,3 +1364,22 @@ live caller retains its share through peer ACK and the strict archive barrier.
 Inbound handlers retain their existing primary apply/replicate-back and secondary
 apply-only behavior; they acquire no nested handoff read lease. Cancellation
 produces no successful ACK and can leave an unacknowledged local write.
+
+
+### Raft canonical projection ordering
+
+Canonical system-table persistence is a node-local projection of the ordered Raft
+log. Normal apply entries share one retained durability group until a destructive
+operation needs its next asynchronous compaction drain. Ordered projection writes
+finish before one explicit commit-log fence and group publication; groups with no
+projection writes add no fence. This does not change ordinary data-write sync policy
+or isolate shared physical effects before publication.
+
+Permission projections replace the complete resource permission set. Their local
+timestamps advance beyond the stored resource cell and row tombstone, including
+when the wall clock ties or moves backwards; exhaustion is a storage failure. This
+requires the existing single Raft projection writer and retained-job ordering. It
+is not a deterministic cross-node cell timestamp or an authorization for concurrent
+direct mutations of canonical rows. Normal repair and rebalance exclude system
+keyspaces; arbitrary cross-node reconciliation of these local projection files is
+not covered by this contract.
