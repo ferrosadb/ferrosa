@@ -54,6 +54,7 @@ import Ferrosa.Storage.Streaming
 import Ferrosa.Ownership.Machine
 import Ferrosa.Ownership.Audit
 import Ferrosa.Ownership.Obligations
+import Ferrosa.Admission.Gate
 import Ferrosa.Codec.Canonical
 import Ferrosa.Codec.Seam
 import Ferrosa.Codec.Audit
