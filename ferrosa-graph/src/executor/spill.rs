@@ -99,7 +99,7 @@ pub trait SpillReserver: Send + Sync + std::fmt::Debug {
 pub struct GraphRow(pub RowVals);
 
 impl SpillRow for GraphRow {
-    /// The row's `Vec` header and slot capacity plus [`json_value_heap_bytes`]
+    /// The row's `Vec` header and slot capacity plus `json_value_heap_bytes`
     /// of every value — hidden sort-key columns included, since they are
     /// resident too.
     fn retained_bytes(&self) -> usize {
