@@ -647,6 +647,15 @@ where
 /// it was a member -- the exact bug this is fixing, reintroduced by a
 /// duplicated expression.
 impl ModeController {
+    pub(super) fn bind_raft_recovery_admission(
+        &self,
+        state_machine: &mut FerrosStateMachine,
+        log_store: &mut SledLogStore,
+    ) {
+        state_machine.set_recovery_admission(Arc::clone(&self.recovery_admission));
+        log_store.set_recovery_admission(Arc::clone(&self.recovery_admission));
+    }
+
     /// Move a stranded Raft directory aside and start a clean one, keeping the
     /// `cluster-member` marker.
     ///
@@ -1455,7 +1464,7 @@ impl ModeController {
         // past what this state machine reports durable; without this handshake
         // the watermark stays 0 and the guard is inert.
         state_machine.set_durable_applied_handle(log_store.durable_applied_handle());
-        state_machine.set_recovery_admission(Arc::clone(&self.recovery_admission));
+        self.bind_raft_recovery_admission(&mut state_machine, &mut log_store);
         let mut physical_registration = match self.physical_raft_workers.reserve(
             crate::raft::RaftGroupId::for_dc(&self.config.data_center),
             state_machine.physical_lifecycle(),
@@ -1557,6 +1566,10 @@ impl ModeController {
                                         );
                                     state_machine.set_durable_applied_handle(
                                         log_store.durable_applied_handle(),
+                                    );
+                                    self.bind_raft_recovery_admission(
+                                        &mut state_machine,
+                                        &mut log_store,
                                     );
                                     physical_registration =
                                         match self.physical_raft_workers.reserve(

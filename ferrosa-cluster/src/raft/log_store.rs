@@ -537,6 +537,14 @@ impl SledLogStore {
         self.recovery_admission = admission;
     }
 
+    #[cfg(test)]
+    pub(crate) fn shares_recovery_admission(
+        &self,
+        expected: &std::sync::Arc<super::quarantine::RecoveryAdmission>,
+    ) -> bool {
+        std::sync::Arc::ptr_eq(&self.recovery_admission, expected)
+    }
+
     /// Share this store's durable-applied watermark with the state machine.
     ///
     /// The state machine raises it after each fsynced snapshot; this store

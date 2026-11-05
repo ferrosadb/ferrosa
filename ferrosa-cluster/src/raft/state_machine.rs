@@ -477,6 +477,14 @@ impl FerrosStateMachine {
         self.recovery_admission = admission;
     }
 
+    #[cfg(test)]
+    pub(crate) fn shares_recovery_admission(
+        &self,
+        expected: &Arc<super::quarantine::RecoveryAdmission>,
+    ) -> bool {
+        std::sync::Arc::ptr_eq(&self.recovery_admission, expected)
+    }
+
     pub(crate) fn physical_lifecycle(&self) -> Arc<super::physical_apply::PhysicalApplyLifecycle> {
         Arc::clone(&self.physical_lifecycle)
     }

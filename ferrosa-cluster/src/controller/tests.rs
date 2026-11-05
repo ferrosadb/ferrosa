@@ -91,6 +91,41 @@ async fn start_live_peer_server(
     (server, addr)
 }
 
+#[tokio::test]
+async fn fresh_and_rebuilt_raft_storage_share_controller_recovery_admission() {
+    use crate::raft::log_store::SledLogStore;
+    use crate::raft::state_machine::FerrosStateMachine;
+    use openraft::storage::RaftLogStorage;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (controller, _handles) = ModeController::new(
+        Arc::new(ClusterConfig::default()),
+        Arc::new(NetConfig::default()),
+        Uuid::new_v4(),
+        test_storage(&dir.path().join("storage")),
+        test_schema(),
+        Arc::new(HandlerRegistry::new()),
+    );
+    let admission = controller.recovery_admission();
+    for incarnation in ["fresh", "rebuilt"] {
+        let mut state_machine = FerrosStateMachine::new();
+        let mut log_store = SledLogStore::new(&dir.path().join(incarnation)).unwrap();
+        assert!(!state_machine.shares_recovery_admission(&admission));
+        assert!(!log_store.shares_recovery_admission(&admission));
+        controller.bind_raft_recovery_admission(&mut state_machine, &mut log_store);
+        assert!(state_machine.shares_recovery_admission(&admission));
+        let reader = log_store.get_log_reader().await;
+        assert!(
+            log_store.shares_recovery_admission(&admission),
+            "{incarnation} log store has a private healthy gate"
+        );
+        assert!(
+            reader.shares_recovery_admission(&admission),
+            "{incarnation} log reader lost the controller gate"
+        );
+    }
+}
+
 #[test]
 fn starts_in_standalone_mode() {
     let dir = tempfile::tempdir().unwrap();
