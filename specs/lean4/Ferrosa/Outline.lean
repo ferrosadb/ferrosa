@@ -64,7 +64,9 @@ def parts : List Part := [
    "one rung per module: a single node, a pair, three at RF=2, five at RF=quorum, two datacenters " ++
    "over one WAN link, three in a ring. Each rung is a concrete `Topo`, so its quorum properties are " ++
    "finite and checked by enumeration rather than argued. The Accord modules sit above them and " ++
-   "specify the apply order and the recovery path a client actually observes.", [
+   "specify the apply order and the recovery path a client actually observes. The last two modules " ++
+   "come back down to a single node's apply path: what a client may assume once raft reports a schema " ++
+   "change applied, and the two places that assumption stops.", [
     "Ferrosa.Topology.Single",
     "Ferrosa.Topology.Pair",
     "Ferrosa.Topology.ThreeNode",
@@ -80,7 +82,9 @@ def parts : List Part := [
     "Ferrosa.Accord.History",
     "Ferrosa.Accord.Recovery",
     "Ferrosa.Accord.Edn",
-    "Ferrosa.Accord.AccordMultiDcLean"
+    "Ferrosa.Accord.AccordMultiDcLean",
+    "Ferrosa.Raft.StateMachine",
+    "Ferrosa.Raft.Obligations"
   ]⟩,
 
   ⟨"III", "What leaves the cluster",
@@ -160,7 +164,7 @@ theorem every_ledger_is_placed :
 
 /-- The book covers a fixed number of modules. A module added to the corpus without a home here is
     a build failure rather than a silent omission from the document. -/
-theorem placed_module_count : (parts.map (fun p => p.modules.length)).sum = 61 := by decide
+theorem placed_module_count : (parts.map (fun p => p.modules.length)).sum = 63 := by decide
 
 /-- Part numerals are distinct, so `\ref` cannot collide. -/
 theorem part_numerals_distinct : (parts.map (fun p => p.numeral)).Nodup := by decide

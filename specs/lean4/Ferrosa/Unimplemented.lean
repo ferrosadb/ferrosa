@@ -38,6 +38,7 @@ import Ferrosa.Sql.Txn
 import Ferrosa.Storage.Mvcc
 import Ferrosa.Storage.Streaming
 import Ferrosa.Sql.Consistency
+import Ferrosa.Raft.Obligations
 
 namespace Ferrosa.Unimplemented
 
@@ -96,7 +97,8 @@ def areas : List Area := [
   ⟨"Ferrosa.Testing.JepsenModels", Ferrosa.Testing.Models.ledger, Ferrosa.Testing.Models.main⟩,
   ⟨"Ferrosa.Testing.Histories", Ferrosa.Testing.Histories.ledger, Ferrosa.Testing.Histories.main⟩,
   ⟨"Ferrosa.Testing.Guarantees", Ferrosa.Testing.Guarantees.ledger, Ferrosa.Testing.Guarantees.main⟩,
-  ⟨"Ferrosa.Unsafe.Invariants", Ferrosa.Unsafe.ledger, Ferrosa.Unsafe.main⟩
+  ⟨"Ferrosa.Unsafe.Invariants", Ferrosa.Unsafe.ledger, Ferrosa.Unsafe.main⟩,
+  ⟨"Ferrosa.Raft.Obligations", Ferrosa.Raft.ledger, Ferrosa.Raft.main⟩
 ]
 
 /-- Look up an area ledger by module key. -/
@@ -128,11 +130,11 @@ theorem area_keys_are_distinct : (areas.map (·.key)).Nodup := by decide
 
 /-- Pinned so that dropping a ledger with no reds — which the total cannot see — is still a build
     failure rather than a quietly smaller registry. -/
-theorem registered_ledger_count : areas.length = 21 := by decide
+theorem registered_ledger_count : areas.length = 22 := by decide
 
 /-! ## The total, derived
 
-`ledgerTotal` is the sum of the registered ledgers' red counts and contains no literal term, so there is nothing for it to fall out of step with and `ledgerTotal_is_the_registry_sum` records only its definition. The pin at sixty guards the opposite failure: dropping a whole ledger from `areas` shrinks the total without changing any local count. `ledgerTotal_pinned` makes that a build failure rather than a quieter number.
+`ledgerTotal` is the sum of the registered ledgers' red counts and contains no literal term, so there is nothing for it to fall out of step with and `ledgerTotal_is_the_registry_sum` records only its definition. The pin at sixty-two guards the opposite failure: dropping a whole ledger from `areas` shrinks the total without changing any local count. `ledgerTotal_pinned` makes that a build failure rather than a quieter number.
 -/
 
 /-- The number of red items across the corpus: the sum of the registered ledgers' `redCount`.
@@ -146,7 +148,7 @@ theorem ledgerTotal_is_the_registry_sum :
 
 /-- Pinned so that removing a ledger from the registry — the drift that has recurred here — is a
     build failure rather than a silently smaller total. -/
-theorem ledgerTotal_pinned : ledgerTotal = 60 := by decide
+theorem ledgerTotal_pinned : ledgerTotal = 62 := by decide
 
 /-- Print every registered ledger, with the header its area module prints. -/
 def printAllLedgers : IO Unit := do
@@ -278,7 +280,10 @@ def nonDefects : List Other := [
    "Ferrosa.Cql.AggregateObligations", "COUNT(DISTINCT) is O(1) in memory"⟩,
   ⟨"MVCC", "a snapshot lookup stops at the first file holding the key",
    "requirement: refuted — the newest file's version may be invisible to the snapshot, so every file holding a version must be consulted; one probe per SSTable in the view is the real bound, and that is what is proved",
-   "Ferrosa.Storage.Mvcc", "a snapshot lookup can stop at the first file holding the key"⟩
+   "Ferrosa.Storage.Mvcc", "a snapshot lookup can stop at the first file holding the key"⟩,
+  ⟨"Raft", "the staged copy leaves no trace until it publishes",
+   "requirement: the staged copy clones the metadata but shares the schema, engine and system-writer handles, so the physical transition is visible before publication; what sharing keeps is that the metadata and the published index move together (`Raft.metadata_published_with_index`)",
+   "Ferrosa.Raft.Obligations", "the staged copy leaves no trace until it publishes"⟩
 ]
 
 /-! ## Rows that are discharged now
@@ -360,7 +365,7 @@ theorem every_red_is_classified_exactly_once (a : Area) (ha : a ∈ areas) :
     (a.ledger.filter isRed).all (fun i => rows.count (a.key, i.name) == 1) = true := by
   obtain ⟨k, l, p⟩ := a
   simp only [areas, List.mem_cons, List.not_mem_nil, or_false] at ha
-  rcases ha with ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩
+  rcases ha with ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩
   all_goals decide
 
 /-- **(c)** Each area's rows number exactly that area's reds. -/
@@ -368,7 +373,7 @@ theorem per_area_counts (a : Area) (ha : a ∈ areas) :
     (rows.filter fun r => r.1 == a.key).length = redCount a.ledger := by
   obtain ⟨k, l, p⟩ := a
   simp only [areas, List.mem_cons, List.not_mem_nil, or_false] at ha
-  rcases ha with ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩
+  rcases ha with ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩
   all_goals decide
 
 /-- The pairs the discharged rows name: not part of the classification, but still checked. -/
@@ -406,11 +411,12 @@ theorem every_ledger_item_is_classified :
     code), and packet JE-2 closed the exit-code row. -/
 theorem unimplemented_has_the_right_length : unimplemented.length = 38 := by native_decide
 
-/-- Seven, not eight: two rows were discharged into the ledger itself (see `discharged`), and one
-    new row records the refuted constant-probe claim in the MVCC ledger. -/
-theorem twelve_are_not_defects : nonDefects.length = 7 := by native_decide
+/-- Eight, not seven: two rows were discharged into the ledger itself (see `discharged`), one new
+    row records the refuted constant-probe claim in the MVCC ledger, and one records the staging
+    requirement the staged apply does not meet. -/
+theorem eight_are_not_defects : nonDefects.length = 8 := by native_decide
 
-/-- **Live defects now outnumber everything else.**  Fifteen reds against seven requirements,
+/-- **Live defects now outnumber everything else.**  Sixteen reds against eight requirements,
     proofs, measurements, inherited protocol behaviour and closures. This theorem had the opposite
     direction until the memory specs found three more: the closer the specs get to the code, the
     more of it turns out to be shipping something that is not true. -/

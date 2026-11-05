@@ -132,6 +132,20 @@ pub const REDS: &[Red] = &[
         witness: "Flight.a_stream_ticket_is_not_a_range_select",
     },
     Red {
+        name: "raft_obligations__an_entry_is_published_only_when_its_ordered_system_table_write_landed",
+        module: "Ferrosa.Raft.Obligations",
+        claim: "an entry is published only when its ordered system-table write landed",
+        why: "publication waits for the ordered write to be attempted, not for it to succeed: a failed write is logged and swallowed, so the entry publishes with the durable prefix behind it and replay starts after it",
+        witness: "Raft.sysfail_publishes_without_row",
+    },
+    Red {
+        name: "raft_obligations__the_staged_copy_leaves_no_trace_until_it_publishes",
+        module: "Ferrosa.Raft.Obligations",
+        claim: "the staged copy leaves no trace until it publishes",
+        why: "staged_apply clones the metadata but shares the schema, engine and system-writer handles, so the physical transition is visible on the blocking thread while the published index still points at the previous entry",
+        witness: "Raft.shared_exposes_effects_before_publication",
+    },
+    Red {
         name: "sparql_semantics__optional_scoping_is_specified",
         module: "Ferrosa.Sparql.Semantics",
         claim: "OPTIONAL scoping is specified",

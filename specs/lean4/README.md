@@ -17,7 +17,7 @@ time, no `decide`-by-magic over opaque objects.
 
 ```bash
 cd specs/lean4
-lake build                      # 59 modules, seconds after the toolchain is present
+lake build                      # 63 modules, seconds after the toolchain is present
 lake env lean --run Ferrosa/Accord/RunCheck.lean   # check a real Elle history
 ```
 
@@ -62,7 +62,8 @@ over a concrete configuration, and each use says so above it.
 | 30 | [`Ferrosa/Storage/Mvcc.lean`](Ferrosa/Storage/Mvcc.lean) | Versions over `fnf`: the naive GC rule destroys a version a live snapshot needs; one version per SSTable costs a probe per file, which is exactly the O(1) guarantee the index work needs. |
 | 30a | [`Ferrosa/Topology/DcQuorum.lean`](Ferrosa/Topology/DcQuorum.lean) | DC_QUORUM for **every** topology, transcribed from [`dc_quorum.rs`](../../ferrosa-cluster/src/coordinator/dc_quorum.rs): any two writes share a replica (`dc_quorum_writes_share_a_replica`, `no_partition_admits_two_dc_quorum_writes`), the node gate alone intersects Cassandra's QUORUM, a same-origin read sees the write and a remote one can miss it, verdicts are monotone in acks, a dark majority of DCs blocks writes, and an `rf = 0` DC is inert. [`Ferrosa/Sql/Consistency.lean`](Ferrosa/Sql/Consistency.lean)'s DC rules delegate here. |
 | 31 | [`Ferrosa/Sql/Consistency.lean`](Ferrosa/Sql/Consistency.lean) | Consistency as configuration: ALL/QUORUM/LOCAL_QUORUM/ONE, default QUORUM, an acceptance table the tests check against, and the read/write overlap results. |
-| 32 | [`Ferrosa/Broken.lean`](Ferrosa/Broken.lean) | The red inventory, classified: 38 red items as code / requirement / proof / measurement / inherited / undecided, with the table pinned to the ledgers by count. |
+| 31a | [`Ferrosa/Raft/StateMachine.lean`](Ferrosa/Raft/StateMachine.lean) → [`Obligations`](Ferrosa/Raft/Obligations.lean) | The Raft apply fence in `ferrosa-cluster/src/raft/state_machine.rs`: a schema change is published as applied only after the job that applies it returns. The published index never moves backwards (`applied_monotone`), never skips an entry (`publish_advances_to_pending_index`), and the latch closes the machine after a failed apply (`latch_closed`). Two obligations are red: a failed ordered system-table write still publishes (`sysfail_publishes_without_row`), and the staged copy shares the schema, engine and system-writer handles, so its effects are visible before publication (`shared_exposes_effects_before_publication`). |
+| 32 | [`Ferrosa/Broken.lean`](Ferrosa/Broken.lean) | The red inventory, classified: sixteen built-and-wrong items, each naming the ledger row it classifies, with the table pinned by count. |
 | 33 | [`Ferrosa/Unimplemented.lean`](Ferrosa/Unimplemented.lean) | What is absent rather than wrong, plus the ledger items that are requirements, missing proofs, measurements, inherited protocol behaviour, or closed. |
 | 34 | [`Ferrosa/Witnesses.lean`](Ferrosa/Witnesses.lean) | One `#check` per witness any ledger names. Ledger witnesses are strings, so without this a deleted theorem leaves the ledger citing a name that no longer exists. |
 | 35 | [`Ferrosa/Storage/Streaming.lean`](Ferrosa/Storage/Streaming.lean) | Memory and the pipeline: zero-copy transforms, `inbound` bytes never written, peak memory independent of input size, and the page bound that is in rows rather than bytes. |
@@ -102,7 +103,7 @@ Being explicit about the boundaries keeps the models honest:
 
 ## Status
 
-`lake build` completes over all 59 modules; no `sorry`, no `axiom`, no
+`lake build` completes over all 63 modules; no `sorry`, no `axiom`, no
 dependency outside Lean core. Remaining hygiene step: a `#print axioms` sweep to
 record the same fact as an artifact rather than as an absence of warnings.
 

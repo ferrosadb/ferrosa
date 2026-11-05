@@ -51,6 +51,8 @@ import Ferrosa.Sql.Index
 import Ferrosa.Sql.Txn
 import Ferrosa.Storage.Mvcc
 import Ferrosa.Storage.Streaming
+import Ferrosa.Raft.StateMachine
+import Ferrosa.Raft.Obligations
 import Ferrosa.Sql.Consistency
 import Ferrosa.Cdc.Subscribe
 import Ferrosa.Cql.Subscribe

@@ -29,7 +29,17 @@
       "path": "ferrosa-jepsen/src/orchestrator.rs",
       "line": 1,
       "note": "the harness asserts strict serializability over the whole history; it does not isolate read-only transactions"
+    },
+    "Raft.sysfail_publishes_without_row": {
+      "path": "ferrosa-cluster/src/raft/state_machine.rs",
+      "line": 2166,
+      "note": "a failed ordered system-table write is logged and the job returns; finish_pending_apply then adopts the metadata and advances last_applied at :466-467, so replay starts past the row"
+    },
+    "Raft.shared_exposes_effects_before_publication": {
+      "path": "ferrosa-cluster/src/raft/state_machine.rs",
+      "line": 415,
+      "note": "staged_apply clones the Arc handles, so apply_command mutates the live schema and engine on the blocking thread before publication"
     }
   },
-  "_status": "STOPGAP, hand-maintained. The intended source is Charon's span table from the Aeneas extraction, which records file and line for every function it translates; until that is wired, this file is six hand-checked anchors out of fifty-nine red claims and is not a substitute for it."
+  "_status": "STOPGAP, hand-maintained. The intended source is Charon's span table from the Aeneas extraction, which records file and line for every function it translates; until that is wired, this file is eight hand-checked anchors out of sixty-two red claims and is not a substitute for it."
 }

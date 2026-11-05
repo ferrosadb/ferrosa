@@ -21,6 +21,7 @@ import Ferrosa.Commons.Flow
 import Ferrosa.Commons.Stream
 import Ferrosa.Cql.Subscribe
 import Ferrosa.Flight.Subscribe
+import Ferrosa.Raft.Obligations
 
 #check Ferrosa.Topology.DcQuorum.dc_quorum_writes_share_a_replica
 #check Ferrosa.Topology.DcQuorum.no_partition_admits_two_dc_quorum_writes
@@ -323,3 +324,18 @@ import Ferrosa.Flight.Subscribe
 #check Ferrosa.Unsafe.a_failed_syscall_has_no_out_parameter
 #check Ferrosa.Unsafe.overlapping_writers_are_the_race
 #check Ferrosa.Unsafe.a_handle_after_its_context_is_dropped_is_dangling
+
+#check Ferrosa.Raft.applied_monotone
+#check Ferrosa.Raft.applied_monotone_late
+#check Ferrosa.Raft.publish_advances_to_pending_index
+#check Ferrosa.Raft.latch_closed
+#check Ferrosa.Raft.latch_clears_pending
+#check Ferrosa.Raft.sysfail_publishes_without_row
+#check Ferrosa.Raft.rows_present_when_writes_succeed
+#check Ferrosa.Raft.publish_after_write_attempt
+#check Ferrosa.Raft.shared_exposes_effects_before_publication
+#check Ferrosa.Raft.isolated_hides_effects_until_publication
+#check Ferrosa.Raft.metadata_published_with_index
+#check Ferrosa.Raft.late_cancel_still_publishes
+#check Ferrosa.Raft.early_cancel_publishes_before_write
+#check Ferrosa.Raft.panic_after_physical_latches

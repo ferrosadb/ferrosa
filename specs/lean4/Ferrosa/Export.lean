@@ -362,8 +362,8 @@ def run (args : List String) : IO UInt32 := do
   -- the invariant: the document's red count is the one the corpus pins
   if reds != Ferrosa.Unimplemented.ledgerTotal then
     throw <| IO.userError s!"red count mismatch: document {reds}, ledgerTotal {Ferrosa.Unimplemented.ledgerTotal}"
-  if areas.length != 21 then
-    throw <| IO.userError s!"registered areas {areas.length}, expected 21 (registered_ledger_count)"
+  if areas.length != 22 then
+    throw <| IO.userError s!"registered areas {areas.length}, expected 22 (registered_ledger_count)"
 
   let unplaced := areas.filter (fun a =>
     !Ferrosa.Outline.parts.any (fun p => p.modules.contains a.key))
