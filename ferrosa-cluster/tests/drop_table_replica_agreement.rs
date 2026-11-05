@@ -214,10 +214,35 @@ async fn a_refused_drop_on_the_applying_node_surfaces_and_never_resurrects() {
             },
         )
         .await;
-        assert!(
-            drop.is_err(),
+        let refusal = drop.expect_err(
             "a DROP that the applying node refused must fail loud to the client, \
-             but the cluster route reported success (returned {drop:?})"
+             but the cluster route reported success",
+        );
+        // ... and it must be a *statement* refusal, not a dead Raft worker. A
+        // refused DROP surfaces through the DDL path as `Internal(reason)` built
+        // from the state machine's `RaftResponse::Error`. If it arrives as a
+        // `RaftError` instead, the apply fence treated an undroppable directory
+        // as a storage failure and latched the state machine: every later
+        // proposal then returns that error as `Fatal`, starting with the
+        // same-name re-create below.
+        assert!(
+            matches!(
+                &refusal,
+                ferrosa_cluster::ClusterError::Internal(reason)
+                    if reason.contains("refused on the applying node")
+                        && reason.contains("unregister_table")
+            ),
+            "a refused DROP must surface as the DDL path's statement refusal \
+             carrying the state machine's reason, not as a Raft fault (got \
+             {refusal:?})"
+        );
+        // The core is still serving: the refused DROP left the state machine
+        // usable, so the cluster can keep taking DDL.
+        let running = leader_raft.metrics().borrow().running_state.clone();
+        assert!(
+            running.is_ok(),
+            "the RaftCore must survive a DROP its applying node refused, but it \
+             is no longer running: {running:?}"
         );
 
         // (b) The refused node must not serve the dropped rows afterwards, even
@@ -258,60 +283,39 @@ async fn a_refused_drop_on_the_applying_node_surfaces_and_never_resurrects() {
         );
     }
 
-    // Physical apply failure fences this Core. Recreating through that same
-    // failed owner would incorrectly treat a hard storage error as recoverable
-    // command rejection. It must refuse until verified online repair replaces it.
-    assert!(
-        propose_on_node(&cluster, leader_id, RaftOp::CreateTable(Box::new(table())))
-            .await
-            .is_err(),
-        "the failed applying node must remain fenced"
-    );
+    // The refused DROP must not fence the node: the same-name re-create goes
+    // through the node whose removal was refused. A fenced Core here would mean
+    // one undroppable directory removed a healthy replica from service, with no
+    // online repair path to bring it back.
+    propose_on_node(&cluster, leader_id, RaftOp::CreateTable(Box::new(table())))
+        .await
+        .expect("same-name CreateTable applies on the node that refused the DROP");
 
-    // The surviving quorum can elect and recreate. Watch real metrics rather
-    // than assuming the old leader still owns admission after its apply failed.
-    let survivors: Vec<_> = cluster
-        .nodes()
-        .iter()
-        .filter(|n| n.node_id != leader_id)
-        .map(|n| (n.raft.clone(), n.engine.as_ref().unwrap().clone()))
-        .collect();
-    assert_eq!(survivors.len(), 2);
-    let mut first = survivors[0].0.metrics();
-    let mut second = survivors[1].0.metrics();
-    let healthy_leader = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let a = first.borrow().current_leader;
-            let b = second.borrow().current_leader;
-            if let Some(id) = a.filter(|id| *id != leader_id && Some(*id) == b) {
-                break id;
-            }
-            tokio::select! {
-                result = first.changed() => result.expect("first surviving Core stays online"),
-                result = second.changed() => result.expect("second surviving Core stays online"),
-            }
-        }
-    })
-    .await
-    .expect("surviving quorum elects a healthy leader");
-    propose_on_node(
-        &cluster,
-        healthy_leader,
-        RaftOp::CreateTable(Box::new(table())),
-    )
-    .await
-    .expect("same-name CreateTable applies through the healthy quorum");
+    // Every replica converges on the re-create, including the one whose
+    // physical removal failed: all hold the new rows and none serves the
+    // dropped incarnation's survivors.
     let applied = cluster
-        .raft_for_node_id(healthy_leader)
+        .raft_for_node_id(leader_id)
         .unwrap()
         .metrics()
         .borrow()
         .last_applied
-        .unwrap()
+        .expect("the re-create commits an applied index")
         .index;
-    for (raft, engine) in survivors {
+    let replicas: Vec<_> = cluster
+        .nodes()
+        .iter()
+        .map(|n| {
+            (
+                n.raft.clone(),
+                n.engine.as_ref().expect("engine-backed node").clone(),
+            )
+        })
+        .collect();
+    assert_eq!(replicas.len(), 3);
+    for (raft, engine) in replicas {
         raft.wait(Some(Duration::from_secs(10)))
-            .applied_index_at_least(Some(applied), "healthy replica applies recreation")
+            .applied_index_at_least(Some(applied), "replica applies the re-create")
             .await
             .unwrap();
         for i in 0..2 {
@@ -328,21 +332,8 @@ async fn a_refused_drop_on_the_applying_node_surfaces_and_never_resurrects() {
         assert_eq!(
             engine.count_range(&tid, None, None).expect("count"),
             2,
-            "a same-name re-create must hold ONLY the new rows; the dropped table's rows came back"
+            "a same-name re-create must hold ONLY the new rows; the dropped \
+             incarnation's rows came back"
         );
     }
-    let failed_engine = cluster
-        .nodes()
-        .iter()
-        .find(|n| n.node_id == leader_id)
-        .unwrap()
-        .engine
-        .as_ref()
-        .unwrap()
-        .clone();
-    assert_eq!(
-        failed_engine.count_range(&tid, None, None).unwrap(),
-        0,
-        "healthy-quorum recreation must not reopen the failed node's stale incarnation"
-    );
 }

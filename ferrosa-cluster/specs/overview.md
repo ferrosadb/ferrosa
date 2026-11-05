@@ -44,12 +44,15 @@ schema effects and system-table writes. A retained handle fences later trait
 calls across cancellation; completed state and applied indexes publish in order.
 Committed local Schema/Engine effect failures and projection failures propagate
 through that job and prevent publishing its metadata/index. Ordinary command
-rejection remains non-fatal. The process-local failure latch prevents later
-snapshots or successful apply results. A failed persisted restore retains the
-previous Raft metadata and refuses consensus startup/readiness, preserving its
-files rather than adopting a purge point on a failed restore. This is not a
-rollback of already visible physical effects or automatic recovery. Snapshot
-file publication and network agreement deadlines are separate boundaries.
+rejection remains non-fatal — including a DROP whose physical removal the node
+refuses (`unregister_table`), which is committed metadata plus a refused
+statement, not a log this node could not apply. The process-local failure latch
+prevents later snapshots or successful apply results. A failed persisted restore
+retains the previous Raft metadata and refuses consensus startup/readiness,
+preserving its files rather than adopting a purge point on a failed restore.
+This is not a rollback of already visible physical effects or automatic recovery.
+Snapshot file publication and network agreement deadlines are separate
+boundaries.
 
 Physical retirement also owns the actual OpenRaft SM loop lifetime, independently
 of Core's shutdown join. A sealed start/publication registry waits for that owner
