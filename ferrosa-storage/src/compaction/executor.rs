@@ -2179,8 +2179,8 @@ mod tests {
         parts[1].rows[0].primary_key_liveness = LivenessInfo::with_ttl(2000, 90, 300);
         parts[0].rows[1].deletion = DeletionTime::new(900, 20);
         parts[1].rows[0].deletion = DeletionTime::new(900, 30);
-        // Cell reconciliation's comparator intentionally ignores TTL on exact
-        // timestamp/value/expiry ties, so original source priority also matters.
+        // Same timestamp/value/expiry cells use TTL as the next canonical
+        // tie-breaker; this must also hold when values are deferred.
         parts[0].rows[1]
             .cells
             .push((1, CellValue::expiring(b"same".to_vec(), 2000, 60, 200)));
@@ -2188,6 +2188,8 @@ mod tests {
             .cells
             .push((1, CellValue::expiring(b"same".to_vec(), 2000, 90, 200)));
         let expected = crate::merge::merge_partitions(parts.clone());
+        assert!(expected.rows[0].cells[0].1.value.is_none());
+        assert_eq!(expected.rows[0].cells[1].1.ttl, 90);
         let inputs = parts
             .into_iter()
             .enumerate()
@@ -2209,18 +2211,12 @@ mod tests {
         let result = CompactionExecutor::execute_task(&task).unwrap();
         let reader = open_sstable_reader(&output_dir, &result.metadata.id);
         assert_eq!(collect_reader_partitions(&reader), vec![expected]);
-        assert_eq!(
-            reader
-                .get_clustering_row(&key, &1i32.to_be_bytes())
-                .unwrap()
-                .unwrap()
-                .rows[0]
-                .cells[0]
-                .1
-                .value
-                .as_deref(),
-            Some(b"zeta".as_slice())
-        );
+        let point = reader
+            .get_clustering_row(&key, &1i32.to_be_bytes())
+            .unwrap()
+            .unwrap();
+        assert!(point.rows[0].cells[0].1.value.is_none());
+        assert_eq!(point.rows[0].cells[1].1.ttl, 90);
     }
 
     /// Regression guard for deferred validation scheduling. Discarded versions

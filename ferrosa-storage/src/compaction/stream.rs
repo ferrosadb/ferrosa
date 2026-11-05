@@ -308,18 +308,12 @@ fn supersedes(
 ) -> Result<bool> {
     let cand = &sources[candidate.0].head.as_ref().expect("candidate").cells[candidate.1].1;
     let cur = &sources[current.0].head.as_ref().expect("current").cells[current.1].1;
-    if cand.timestamp != cur.timestamp {
-        return Ok(cand.timestamp > cur.timestamp);
-    }
-    if cand.value.is_some() != cur.value.is_some() {
-        return Ok(cand.value.is_some());
-    }
-    if cand.value.is_none() {
-        return Ok(cand.local_deletion_time > cur.local_deletion_time);
+    if cand.timestamp != cur.timestamp || cand.value.is_none() || cur.value.is_none() {
+        return Ok(ferrosa_common::reconcile_cmp(cand, cur).is_gt());
     }
     sources[candidate.0].copy_value(candidate.1, a)?;
     sources[current.0].copy_value(current.1, b)?;
-    Ok((a.as_slice(), cand.local_deletion_time) > (b.as_slice(), cur.local_deletion_time))
+    Ok(ferrosa_common::reconcile_cmp_with_values(cand, Some(a), cur, Some(b)).is_gt())
 }
 fn copy_candidate(
     sources: &[Source<'_>],
@@ -444,16 +438,19 @@ fn merge_heads(
             {
                 Ok(j) => {
                     let cur = &out.cells[j].1;
-                    let ordering = if value.timestamp != cur.timestamp {
-                        value.timestamp.cmp(&cur.timestamp)
-                    } else if value.value.is_some() != cur.value.is_some() {
-                        value.value.is_some().cmp(&cur.value.is_some())
-                    } else if value.value.is_none() {
-                        value.local_deletion_time.cmp(&cur.local_deletion_time)
+                    let ordering = if value.timestamp != cur.timestamp
+                        || value.value.is_none()
+                        || cur.value.is_none()
+                    {
+                        ferrosa_common::reconcile_cmp(value, cur)
                     } else {
                         sources[candidate.0].copy_value(candidate.1, tie_a)?;
-                        (tie_a.as_slice(), value.local_deletion_time)
-                            .cmp(&(cur.value.as_deref().unwrap_or(&[]), cur.local_deletion_time))
+                        ferrosa_common::reconcile_cmp_with_values(
+                            value,
+                            Some(tie_a),
+                            cur,
+                            cur.value.as_deref(),
+                        )
                     };
                     if ordering.is_gt() || (ordering.is_eq() && candidate.0 < cell_sources[j]) {
                         copy_candidate(sources, candidate, &mut out.cells[j].1)?;

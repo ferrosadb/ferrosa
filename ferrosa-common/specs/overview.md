@@ -157,3 +157,5 @@ the clock contract.
 ### Shared cell reconciliation
 
 `reconcile_cmp` supplies the timestamp-first cell ordering used by memtable and read/compaction/repair merges. At equal timestamps a deletion wins, then the existing full-cell ordering resolves same-kind ties. The comparison borrows payloads and adds no stored fields; it does not make a later operation win every equal timestamp.
+
+Cell reconciliation accepts borrowed deferred payload views with identical ordering to resident cells; the helper owns no payload bytes.
