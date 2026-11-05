@@ -3969,7 +3969,7 @@ impl ModeController {
 
             // Store the raft instance so it is accessible via controller.raft()
             // (ADR-015: keyed by per-DC RaftGroupId).
-            if !physical_registration.publish(|| {
+            physical_registration.publish(|| {
                 let prev = raft_groups_swap.load_full();
                 let mut next: std::collections::HashMap<
                     crate::raft::RaftGroupId,
@@ -3977,9 +3977,7 @@ impl ModeController {
                 > = (*prev).clone();
                 next.insert(local_raft_group_id, raft_arc);
                 raft_groups_swap.store(Arc::new(next));
-            }) {
-                return;
-            }
+            });
         });
     }
 }

@@ -648,7 +648,8 @@ mod physical_handoff_tests {
         let schema = crate::controller::tests::test_schema();
         let controller =
             ModeController::standalone_for_test(Arc::clone(&schema), Arc::clone(&engine));
-        controller.mode.store(Arc::new(DeploymentMode::Cluster));
+        controller
+            .force_mode_override(DeploymentMode::Cluster, "owned physical-retirement fixture");
         let peers = Arc::new(PeerManager::new(
             Arc::new(ferrosa_net::config::NetConfig::default()),
             Uuid::new_v4(),
@@ -828,7 +829,7 @@ mod physical_handoff_tests {
         );
         let controller =
             ModeController::standalone_for_test(crate::controller::tests::test_schema(), engine);
-        controller.mode.store(Arc::new(DeploymentMode::Pair));
+        controller.force_mode_override(DeploymentMode::Pair, "owned stale-retirement fixture");
         let old_partner = Uuid::new_v4();
         let dissolution = crate::controller::dissolution::PairDissolution {
             pair: [controller.local_host_id, old_partner],

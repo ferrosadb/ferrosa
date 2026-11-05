@@ -469,9 +469,11 @@ impl FerrosStateMachine {
 
     fn physical_admission(
         &self,
-    ) -> Result<Arc<super::physical_apply::PhysicalApplyLease>, StorageIOError<u64>> {
+    ) -> Result<Arc<super::physical_apply::PhysicalApplyLease>, Box<StorageIOError<u64>>> {
         self.physical_lifecycle.admit().map_err(|error| {
-            StorageIOError::write_state_machine(to_any_error(std::io::Error::other(error)))
+            Box::new(StorageIOError::write_state_machine(to_any_error(
+                std::io::Error::other(error),
+            )))
         })
     }
 
@@ -923,7 +925,7 @@ impl FerrosStateMachine {
         meta: &SnapshotMeta<u64, BasicNode>,
         bytes: &[u8],
     ) -> Result<(), StorageIOError<u64>> {
-        let _physical = self.physical_admission()?;
+        let _physical = self.physical_admission().map_err(|error| *error)?;
         let lifecycle_schema = self.schema.clone();
         let _lifecycle = lifecycle_schema
             .as_ref()
@@ -2488,7 +2490,7 @@ impl Default for FerrosStateMachine {
 
 impl RaftSnapshotBuilder<FerrosRaftConfig> for FerrosStateMachine {
     async fn build_snapshot(&mut self) -> Result<Snapshot<FerrosRaftConfig>, StorageError<u64>> {
-        let physical = self.physical_admission()?;
+        let physical = self.physical_admission().map_err(|error| *error)?;
         self.finish_pending_apply().await.map_err(|error| *error)?;
         let data = SnapshotData {
             state: self.state.clone(),
@@ -2565,7 +2567,7 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
         I: IntoIterator<Item = Entry<FerrosRaftConfig>> + Send,
         I::IntoIter: Send,
     {
-        let physical = self.physical_admission()?;
+        let physical = self.physical_admission().map_err(|error| *error)?;
         let mut entries = entries.into_iter().peekable();
         let first = entries.peek().map(|entry| entry.log_id.index);
         let required = self.unconsumed_input;
@@ -2766,7 +2768,7 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<u64>> {
         let result = async {
-            let physical = self.physical_admission()?;
+            let physical = self.physical_admission().map_err(|error| *error)?;
             self.finish_pending_apply().await.map_err(|error| *error)?;
             let bytes = snapshot.into_inner();
             self.apply_snapshot_data(meta, &bytes)?;

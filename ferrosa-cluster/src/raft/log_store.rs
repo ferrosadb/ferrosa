@@ -302,9 +302,10 @@ pub(crate) struct CommittedLogReader {
 }
 
 impl CommittedLogReader {
-    pub(crate) fn read(&self) -> Result<Option<LogId<u64>>, StorageIOError<u64>> {
+    pub(crate) fn read(&self) -> Result<Option<LogId<u64>>, Box<StorageIOError<u64>>> {
         Ok(
-            SledLogStore::load_meta::<Option<LogId<u64>>>(&self.meta, META_COMMITTED)?
+            SledLogStore::load_meta::<Option<LogId<u64>>>(&self.meta, META_COMMITTED)
+                .map_err(Box::new)?
                 .unwrap_or(None),
         )
     }
@@ -538,6 +539,7 @@ impl SledLogStore {
         }
     }
 
+    /// Shared durable-snapshot watermark used to bound log purging.
     pub fn durable_applied_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
         self.durable_applied.clone()
     }
