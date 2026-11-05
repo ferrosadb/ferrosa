@@ -54,12 +54,14 @@ pub fn format_metric(name: &str, labels: &[(&str, &str)], value: f64) -> String 
 pub fn render_admission_pools() -> String {
     let mut out = String::new();
     let pools = ferrosa_common::task_pool::blocking_pool_stats();
-    let gauges: [(
-        &str,
-        &str,
-        &str,
+    /// `(name, type, help, value)` for one per-pool series.
+    type PoolSeries = (
+        &'static str,
+        &'static str,
+        &'static str,
         fn(&ferrosa_common::task_pool::BlockingPoolStats) -> f64,
-    ); 5] = [
+    );
+    let gauges: [PoolSeries; 5] = [
         (
             "ferrosa_blocking_pool_capacity",
             "gauge",

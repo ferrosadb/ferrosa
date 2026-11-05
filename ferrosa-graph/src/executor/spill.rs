@@ -540,7 +540,9 @@ pub(super) fn distinct_then_limit<'a>(
 #[derive(Debug)]
 pub(super) enum RowAcc {
     Unordered(Vec<RowVals>),
-    Ordered(OrderBySink),
+    /// Boxed: the sink carries the external sorter and its spill-pool charge,
+    /// ten times the size of the unordered buffer.
+    Ordered(Box<OrderBySink>),
 }
 
 impl RowAcc {
@@ -553,7 +555,7 @@ impl RowAcc {
     ) -> Result<Self> {
         Ok(
             match OrderBySink::new(columns, return_clause, config, label, semantics)? {
-                Some(sink) => Self::Ordered(sink),
+                Some(sink) => Self::Ordered(Box::new(sink)),
                 None => Self::Unordered(Vec::new()),
             },
         )
@@ -733,7 +735,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            matches!(acc, RowAcc::Ordered(OrderBySink::Spill(_))),
+            matches!(&acc, RowAcc::Ordered(sink) if matches!(**sink, OrderBySink::Spill(_))),
             "a LIMIT must not disqualify the spilling sort"
         );
 
