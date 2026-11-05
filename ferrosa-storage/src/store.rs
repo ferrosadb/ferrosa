@@ -1,9 +1,9 @@
 //! Module: Compose lock-free memtable, flush, SSTable read, and metadata views.
 //! Correctness: Correct when every ArcSwap view is internally aligned and read
 //! and compaction planning preserve key bounds without resident-reader fanout.
-//! Last revised: 2026-10-03
-//! Last changed: Removed the per-table locks (write gate, view CAS, rotation
-//! queue, ArcSwap sets), t_d938e6ae.
+//! Last revised: 2026-11-05
+//! Last changed: Added checked writer/rotation retirement and refused late writes
+//! and destructive rotations; reader and durability boundaries remain separate.
 //!
 //! Lock-free composition of memtable, flush, and SSTable reads.
 //!
@@ -1551,7 +1551,7 @@ const MAX_SEALED_MEMTABLE_RETRIES: usize = 10_000;
 /// How long a flush waits for the writers inside a memtable it sealed. Those
 /// writes are in-memory puts; still inside after this, one is stuck and the
 /// flush fails loud rather than snapshot an incomplete memtable.
-const MEMTABLE_SEAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const MEMTABLE_SEAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The memtable indexes of ONE active memtable, together with the catalog
 /// they were built from.
@@ -3871,10 +3871,23 @@ impl<F: FlushTarget> TableStore<F> {
     /// row reaches the indexes or the memtable (t_cf637b6e), so no producer can
     /// put one where a comparison would see it.
     pub fn write(&self, key: &DecoratedKey, mut row: Row) -> Result<()> {
+        if self.retired.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ferrosa_common::Error::InvalidData(
+                "write refused: store is retired".into(),
+            ));
+        }
         normalise_legacy_ns_row(&mut row);
         for _ in 0..MAX_SEALED_MEMTABLE_RETRIES {
             let guard = self.view.load();
             if let Some(_admitted) = guard.indexes.gate.try_enter() {
+                // Retirement may close admission after the first check. An
+                // earlier writer that already passed this check is counted by
+                // the same gate that retire_checked seals and drains.
+                if self.retired.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(ferrosa_common::Error::InvalidData(
+                        "write refused: store is retired".into(),
+                    ));
+                }
                 return self.write_admitted(&guard, key, row);
             }
             // Sealed: a flush already published the next memtable.
@@ -5430,6 +5443,13 @@ impl<F: FlushTarget> TableStore<F> {
                         self.run_rotation_group(std::mem::take(&mut group));
                     }
                     let result = match request.kind {
+                        RotationKind::Truncate
+                            if self.retired.load(std::sync::atomic::Ordering::SeqCst) =>
+                        {
+                            Err(ferrosa_common::Error::InvalidData(
+                                "truncate refused: store is retired".into(),
+                            ))
+                        }
                         RotationKind::Truncate => self.truncate_now(),
                         _ => Ok(FlushOutcome::NothingToFlush),
                     };
@@ -5547,6 +5567,24 @@ impl<F: FlushTarget> TableStore<F> {
                 (name.clone(), index)
             })
             .collect()
+    }
+
+    /// Close store writes, confirm preceding rotations exited, and drain the
+    /// current memtable's admitted writers. A failed drain remains closed and
+    /// returns its error; the caller may retry once the held writers leave.
+    ///
+    /// This preserves in-memory rows but does not flush them, drain readers or
+    /// compaction, or authorize file replacement. Callers must establish those
+    /// separate boundaries before treating a physical checkpoint as installed.
+    pub fn retire_checked(&self, writer_deadline: std::time::Duration) -> Result<()> {
+        self.retired
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.rotate(RotationKind::Barrier)?;
+        self.view
+            .load_full()
+            .indexes
+            .gate
+            .seal_and_drain(writer_deadline)
     }
 
     /// Mark this store dropped: wait for a rotation already running to
@@ -12260,6 +12298,135 @@ mod tests {
     use ferrosa_common::key::PartitionKey;
     use ferrosa_common::schema::ColumnDefinition;
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition};
+
+    #[test]
+    fn checked_retirement_refuses_later_writes_without_losing_existing_rows() {
+        let store = TableStore::new_with_indexes(
+            test_schema(),
+            InMemoryFlushTarget::new(),
+            WriteOptions::default(),
+            vec![],
+        );
+        let key = make_key("retired");
+        store.write(&key, make_row(b"before", 10)).unwrap();
+        store.retire_checked(MEMTABLE_SEAL_DEADLINE).unwrap();
+        assert!(
+            store.write(&key, make_row(b"after", 20)).is_err(),
+            "checked retirement must close store write admission"
+        );
+        let retained = store.read(&key).unwrap().unwrap();
+        assert_eq!(
+            retained.rows[0].cells[0].1,
+            CellValue::live(b"before".to_vec(), 10)
+        );
+    }
+
+    #[test]
+    fn checked_retirement_refuses_later_truncate_without_erasing_rows() {
+        let store = TableStore::new_with_indexes(
+            test_schema(),
+            InMemoryFlushTarget::new(),
+            WriteOptions::default(),
+            vec![],
+        );
+        let key = make_key("retained");
+        store.write(&key, make_row(b"before", 10)).unwrap();
+        store.retire_checked(MEMTABLE_SEAL_DEADLINE).unwrap();
+        assert!(
+            store.truncate().is_err(),
+            "a later destructive rotation must not mutate a checked-retired store"
+        );
+        assert_eq!(
+            store.read(&key).unwrap().unwrap().rows[0].cells[0].1,
+            CellValue::live(b"before".to_vec(), 10)
+        );
+    }
+
+    #[test]
+    fn checked_retirement_reports_a_writer_drain_failure_and_stays_closed() {
+        let store = TableStore::new_with_indexes(
+            test_schema(),
+            InMemoryFlushTarget::new(),
+            WriteOptions::default(),
+            vec![],
+        );
+        let view = store.view.load_full();
+        let ticket = view.indexes.gate.try_enter().unwrap();
+        // Explicit zero drain budget: an actually admitted writer must cause an error,
+        // not an invented queue failure or a timing-based performance assertion.
+        let refused = store.retire_checked(std::time::Duration::ZERO);
+        drop(ticket);
+        assert!(
+            refused.is_err(),
+            "unconfirmed writer drain must not return success"
+        );
+        assert!(store
+            .write(&make_key("closed"), make_row(b"late", 20))
+            .is_err());
+        store.retire_checked(MEMTABLE_SEAL_DEADLINE).unwrap();
+    }
+
+    #[test]
+    fn checked_retirement_waits_for_an_existing_store_writer_ticket() {
+        let store = TableStore::new_with_indexes(
+            test_schema(),
+            InMemoryFlushTarget::new(),
+            WriteOptions::default(),
+            vec![],
+        );
+        let view = store.view.load_full();
+        let ticket = view.indexes.gate.try_enter().unwrap();
+        let (sent, completed) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                sent.send(store.retire_checked(MEMTABLE_SEAL_DEADLINE))
+                    .unwrap()
+            });
+            let start = std::time::Instant::now();
+            let mut early = None;
+            loop {
+                if let Ok(result) = completed.try_recv() {
+                    early = Some(result);
+                    break;
+                }
+                if view.indexes.gate.is_sealed() {
+                    break;
+                }
+                // Safety escape only: no latency or performance assertion.
+                if start.elapsed() > std::time::Duration::from_secs(5) {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            let sealed = view.indexes.gate.is_sealed();
+            let finished_before_release = early.is_some() || completed.try_recv().is_ok();
+            // Finish the admitted write against the old view while its real
+            // ticket still prevents retirement from certifying completion.
+            let key = make_key("old-view-writer");
+            store
+                .write_admitted(&view, &key, make_row(b"completed", 30))
+                .unwrap();
+            drop(ticket);
+            if early.is_none() && !finished_before_release {
+                completed
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+            }
+            assert_eq!(
+                store.read(&key).unwrap().unwrap().rows[0].cells[0].1,
+                CellValue::live(b"completed".to_vec(), 30)
+            );
+            assert!(
+                sealed,
+                "checked retirement must seal actual store write admission"
+            );
+            assert!(
+                !finished_before_release,
+                "retirement cannot certify a writer that still holds its actual admission ticket"
+            );
+        });
+    }
 
     /// Write the components compaction planning sizes, each `len` bytes.
     fn write_sized_components(dir: &std::path::Path, id: &str, len: usize) -> u64 {

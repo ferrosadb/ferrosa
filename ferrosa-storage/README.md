@@ -1841,3 +1841,13 @@ Single-table unregister APIs retain their existing behavior and recovery format.
 The `test-support` feature exposes a callback that holds the active commit-log
 segment's existing file mutex. Sibling-crate progress tests use it to exercise
 real flush/fsync contention with deterministic release and ordinary storage I/O.
+
+### Checked store writer retirement
+
+`TableStore::retire_checked(writer_deadline)` closes new row writes, propagates
+rotation-barrier errors, then seals and drains admitted writers in the current
+memtable. Late truncates are refused. A drain failure remains closed and returns
+an error; a later retry can confirm completion after the existing writers leave.
+Rows already held in the memtable remain readable. This does not flush those rows,
+drain readers or compaction, or authorize replacing physical files. Recovery callers
+must establish those separate boundaries before issuing an installed-content receipt.
