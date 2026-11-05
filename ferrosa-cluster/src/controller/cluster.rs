@@ -1455,6 +1455,7 @@ impl ModeController {
         // past what this state machine reports durable; without this handshake
         // the watermark stays 0 and the guard is inert.
         state_machine.set_durable_applied_handle(log_store.durable_applied_handle());
+        state_machine.set_recovery_admission(Arc::clone(&self.recovery_admission));
         let mut physical_registration = match self.physical_raft_workers.reserve(
             crate::raft::RaftGroupId::for_dc(&self.config.data_center),
             state_machine.physical_lifecycle(),

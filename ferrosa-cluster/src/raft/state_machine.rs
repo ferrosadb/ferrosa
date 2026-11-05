@@ -426,6 +426,7 @@ struct PendingApply {
 pub struct FerrosStateMachine {
     state: RaftState,
     physical_lifecycle: Arc<super::physical_apply::PhysicalApplyLifecycle>,
+    recovery_admission: Arc<super::quarantine::RecoveryAdmission>,
     // RAII owner token is absent from staged copies and snapshot builders.
     _physical_owner: Option<super::physical_apply::PhysicalApplyOwner>,
     pending_apply: Option<PendingApply>,
@@ -471,6 +472,11 @@ pub struct FerrosStateMachine {
 }
 
 impl FerrosStateMachine {
+    /// Use the controller's shared recovery gate for this group and its builders.
+    pub fn set_recovery_admission(&mut self, admission: Arc<super::quarantine::RecoveryAdmission>) {
+        self.recovery_admission = admission;
+    }
+
     pub(crate) fn physical_lifecycle(&self) -> Arc<super::physical_apply::PhysicalApplyLifecycle> {
         Arc::clone(&self.physical_lifecycle)
     }
@@ -504,6 +510,7 @@ impl FerrosStateMachine {
             pending_apply: None,
             unconsumed_input: None,
             physical_lifecycle: Arc::clone(&self.physical_lifecycle),
+            recovery_admission: Arc::clone(&self.recovery_admission),
             _physical_owner: None,
             apply_failure: self.apply_failure.clone(),
             #[cfg(test)]
@@ -664,6 +671,7 @@ impl FerrosStateMachine {
             snapshot_path: None,
             durable_applied: None,
             physical_lifecycle,
+            recovery_admission: Arc::new(super::quarantine::RecoveryAdmission::new()),
             _physical_owner: Some(physical_owner),
             pending_apply: None,
             unconsumed_input: None,
@@ -857,6 +865,7 @@ impl FerrosStateMachine {
             snapshot_path: None,
             durable_applied: None,
             physical_lifecycle,
+            recovery_admission: Arc::new(super::quarantine::RecoveryAdmission::new()),
             _physical_owner: Some(physical_owner),
             pending_apply: None,
             unconsumed_input: None,
@@ -2784,6 +2793,7 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
             pending_apply: None,
             unconsumed_input: None,
             physical_lifecycle: Arc::clone(&self.physical_lifecycle),
+            recovery_admission: Arc::clone(&self.recovery_admission),
             _physical_owner: None,
             apply_failure: self.apply_failure.clone(),
             #[cfg(test)]

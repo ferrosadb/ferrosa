@@ -202,6 +202,7 @@ pub struct ModeController {
     /// Monotonic process-wide consensus health, read synchronously by CQL and
     /// readiness so neither path waits on a failed Raft runtime.
     pub(super) consensus_health: Arc<ConsensusHealth>,
+    pub(super) recovery_admission: Arc<crate::raft::quarantine::RecoveryAdmission>,
     /// Per-follower replication progress, fed by the leader's snapshot pusher
     /// and Raft network; read by readiness and the metrics endpoint.
     pub(super) replication_health: Arc<crate::raft::replication_health::ReplicationHealth>,
@@ -575,6 +576,7 @@ impl ModeController {
         let controller = Arc::new(Self {
             self_weak: std::sync::OnceLock::new(),
             consensus_health,
+            recovery_admission: Arc::new(crate::raft::quarantine::RecoveryAdmission::new()),
             replication_health: Arc::new(crate::raft::replication_health::ReplicationHealth::new()),
             leader_contact: Arc::new(crate::raft::leader_contact::LeaderContact::new()),
             mode: schema.deployment_mode_handle(),
@@ -752,6 +754,7 @@ impl ModeController {
         Arc::new(Self {
             self_weak: std::sync::OnceLock::new(),
             consensus_health: Arc::new(ConsensusHealth::new()),
+            recovery_admission: Arc::new(crate::raft::quarantine::RecoveryAdmission::new()),
             replication_health: Arc::new(crate::raft::replication_health::ReplicationHealth::new()),
             leader_contact: Arc::new(crate::raft::leader_contact::LeaderContact::new()),
             mode: {
@@ -837,6 +840,7 @@ impl ModeController {
         Arc::new(Self {
             self_weak: std::sync::OnceLock::new(),
             consensus_health: Arc::new(ConsensusHealth::new()),
+            recovery_admission: Arc::new(crate::raft::quarantine::RecoveryAdmission::new()),
             replication_health: Arc::new(crate::raft::replication_health::ReplicationHealth::new()),
             leader_contact: Arc::new(crate::raft::leader_contact::LeaderContact::new()),
             mode: {
@@ -1068,6 +1072,11 @@ impl ModeController {
     }
 
     /// Shared, monotonic health gate for the process's consensus lane.
+    /// Shared online-recovery admission fence for client, snapshot and Raft RPC surfaces.
+    pub fn recovery_admission(&self) -> Arc<crate::raft::quarantine::RecoveryAdmission> {
+        Arc::clone(&self.recovery_admission)
+    }
+
     pub fn consensus_health(&self) -> Arc<ConsensusHealth> {
         self.consensus_health.clone()
     }
