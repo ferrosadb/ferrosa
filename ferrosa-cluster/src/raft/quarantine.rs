@@ -1,9 +1,20 @@
 //! Shared recovery admission for inconsistent Raft state.
-//! Correctness: detection and synchronous publication share one transition lock.
+//! Correctness: publishers serialize; detection never waits for publisher I/O.
 //! Last revised: 2026-11-05
 //! Last changed: close all consumers through one epoch-bound recovery gate.
 
-use parking_lot::RwLock;
+use parking_lot::Mutex;
+use std::cell::RefCell;
+
+thread_local! { static PUBLICATIONS: RefCell<std::collections::BTreeSet<usize>> = const { RefCell::new(std::collections::BTreeSet::new()) }; }
+struct PublicationScope(usize);
+impl Drop for PublicationScope {
+    fn drop(&mut self) {
+        PUBLICATIONS.with(|active| {
+            active.borrow_mut().remove(&self.0);
+        });
+    }
+}
 use std::{collections::BTreeMap, fmt};
 
 #[derive(Debug, Clone)]
@@ -32,48 +43,80 @@ struct AdmissionState {
 /// Per-group recovery producers must not clear another group's fault.
 #[derive(Default)]
 pub struct RecoveryAdmission {
-    transition: RwLock<AdmissionState>,
+    transition: Mutex<AdmissionState>,
+    publication: Mutex<()>,
 }
 impl RecoveryAdmission {
     pub fn new() -> Self {
         Self::default()
     }
     pub fn epoch(&self) -> u64 {
-        self.transition.read().epoch
+        self.transition.lock().epoch
     }
     pub fn reason(&self) -> Option<String> {
         self.transition
-            .read()
+            .lock()
             .faults
             .iter()
             .next()
             .map(|(group, reason)| format!("{group}: {reason}"))
     }
     pub fn admits(&self) -> Result<(), RecoveryRefusal> {
-        let state = self.transition.read();
+        let state = self.transition.lock();
         Self::check(&state, None)
     }
     pub fn admits_epoch(&self, epoch: u64) -> Result<(), RecoveryRefusal> {
-        let state = self.transition.read();
+        let state = self.transition.lock();
         Self::check(&state, Some(epoch))
     }
     /// Close in memory before any durable progress I/O or peer repair work.
     pub fn quarantine(&self, group: &str, reason: impl Into<String>) -> u64 {
-        let mut state = self.transition.write();
-        state.faults.insert(group.into(), reason.into());
+        let reason = reason.into();
+        let mut state = self.transition.lock();
+        state.faults.insert(group.into(), reason);
         Self::advance(&mut state)
     }
-    /// The closure is synchronous, short, and must not call this gate recursively.
-    /// It linearizes snapshot slot/watermark publication with detection.
+    /// Serialize publishers, but never hold the fault-state lock across caller
+    /// code. Detection and admission remain callable from the closure. Recursive
+    /// publication on this gate is refused rather than waiting on itself.
+    /// A changed epoch rejects the result; already-admitted I/O is not rolled back.
     pub fn with_admission_epoch<T>(
         &self,
         epoch: u64,
         publish: impl FnOnce() -> T,
     ) -> Result<T, RecoveryRefusal> {
-        let state = self.transition.read();
-        Self::check(&state, Some(epoch))?;
-        Ok(publish())
+        let key = self as *const Self as usize;
+        if PUBLICATIONS.with(|active| active.borrow().contains(&key)) {
+            return Err(RecoveryRefusal {
+                epoch: self.epoch(),
+                reason: "recursive recovery publication".into(),
+            });
+        }
+        let _publisher = self.publication.lock();
+        PUBLICATIONS.with(|active| {
+            active.borrow_mut().insert(key);
+        });
+        let _scope = PublicationScope(key);
+        self.admits_epoch(epoch)?;
+        let result = publish();
+        self.admits_epoch(epoch)?;
+        Ok(result)
     }
+
+    /// Once quarantined, wait for old admitted publication I/O before fixing the
+    /// persisted purge floor and verifying a replacement checkpoint.
+    pub fn drain_publications(&self) -> Result<(), RecoveryRefusal> {
+        let key = self as *const Self as usize;
+        if PUBLICATIONS.with(|active| active.borrow().contains(&key)) {
+            return Err(RecoveryRefusal {
+                epoch: self.epoch(),
+                reason: "recursive recovery publication drain".into(),
+            });
+        }
+        let _publisher = self.publication.lock();
+        Ok(())
+    }
+
     fn check(state: &AdmissionState, epoch: Option<u64>) -> Result<(), RecoveryRefusal> {
         let reason = state
             .faults
@@ -120,9 +163,23 @@ mod tests {
     fn publication_holds_the_transition_lease() {
         let gate = RecoveryAdmission::new();
         gate.with_admission_epoch(gate.epoch(), || {
-            assert!(gate.transition.try_write().is_none());
+            assert!(gate.publication.try_lock().is_none());
         })
         .unwrap();
+    }
+    #[test]
+    fn recursive_checks_and_fault_detection_do_not_wait_on_publication() {
+        let gate = RecoveryAdmission::new();
+        let epoch = gate.epoch();
+        let result = gate.with_admission_epoch(epoch, || {
+            assert!(gate.admits().is_ok());
+            assert!(gate.with_admission_epoch(epoch, || ()).is_err());
+            assert!(gate.drain_publications().is_err());
+            gate.quarantine("dc1", "fault during publication");
+            assert!(gate.admits().is_err());
+        });
+        assert!(result.is_err());
+        assert!(gate.reason().unwrap().contains("fault during publication"));
     }
     #[test]
     fn detection_closes_publication_and_retains_group_reason() {
@@ -135,5 +192,17 @@ mod tests {
             .with_admission_epoch(epoch, || panic!("closed gate published"))
             .is_err());
         assert!(gate.reason().unwrap().contains("index 5"));
+    }
+    #[test]
+    fn recursive_publication_is_refused_before_waiting() {
+        let gate = RecoveryAdmission::new();
+        let epoch = gate.epoch();
+        gate.with_admission_epoch(epoch, || {
+            assert!(
+                gate.with_admission_epoch(epoch, || ()).is_err(),
+                "nested publication must be refused rather than overlap the current publisher"
+            );
+        })
+        .unwrap();
     }
 }
