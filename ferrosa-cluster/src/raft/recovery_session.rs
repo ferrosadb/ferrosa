@@ -16,7 +16,7 @@ pub(crate) struct RecoverySession {
 struct SessionState {
     journal: Option<RecoveryJournal>,
     record: Option<RecoveryRecord>,
-    reopened_unsafe: bool,
+    reopened_unclean: bool,
     highest_started: u64,
 }
 
@@ -82,7 +82,7 @@ impl RecoverySession {
                 std::fs::create_dir_all(parent)?;
             }
             let (journal, record) = RecoveryJournal::open(self.path.clone(), self.group.clone())?;
-            state.reopened_unsafe = record.as_ref().is_some_and(|r| {
+            state.reopened_unclean = record.as_ref().is_some_and(|r| {
                 !matches!(
                     r.phase,
                     RecoveryPhase::SnapshotSynced | RecoveryPhase::Initialized
@@ -101,7 +101,7 @@ impl RecoverySession {
             .lock()
             .map_err(|_| io::Error::other("recovery session poisoned"))?;
         self.initialize(&mut state)?;
-        Ok(state.reopened_unsafe.then(|| {
+        Ok(state.reopened_unclean.then(|| {
             state.record.as_ref().map_or_else(
                 || "unfinished Raft session".into(),
                 |r| format!("{} (failed index {:?})", r.reason, r.failed_at),
@@ -115,7 +115,7 @@ impl RecoverySession {
             .lock()
             .map_err(|_| io::Error::other("recovery session poisoned"))?;
         self.initialize(&mut state)?;
-        if state.reopened_unsafe {
+        if state.reopened_unclean {
             return Err(io::Error::other(
                 "Raft group requires verified online repair",
             ));
@@ -196,7 +196,7 @@ impl RecoverySession {
             .lock()
             .map_err(|_| io::Error::other("recovery session poisoned"))?;
         self.initialize(&mut state)?;
-        if !state.reopened_unsafe {
+        if !state.reopened_unclean {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "healthy session cannot prepare quarantine repair",
@@ -272,7 +272,7 @@ impl RecoverySession {
         record.phase = RecoveryPhase::Quarantined;
         record.reason = reason.into();
         record.failed_at = Some(index);
-        state.reopened_unsafe = true;
+        state.reopened_unclean = true;
         state.record = Some(record.clone());
         // Failed reason persistence leaves the pre-existing armed guard intact.
         state
@@ -288,7 +288,7 @@ impl RecoverySession {
             .lock()
             .map_err(|_| io::Error::other("recovery session poisoned"))?;
         self.initialize(&mut state)?;
-        if state.reopened_unsafe || state.highest_started > index {
+        if state.reopened_unclean || state.highest_started > index {
             return Ok(());
         }
         let Some(mut record) = state.record.clone() else {
