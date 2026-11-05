@@ -204,6 +204,7 @@ impl DdlPath {
                         apply_direct(&op, &schema, &engine)
                     })
                     .await
+                    .await
                     .map_err(|error| {
                         ClusterError::Internal(format!("direct DDL task failed: {error}"))
                     })?

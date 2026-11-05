@@ -666,6 +666,7 @@ impl SledLogStore {
                 Ok(())
             })
             .await
+            .await
             .map_err(|e| StorageIOError::write_logs(to_any_error(e)))?
             .map_err(|e| *e)?;
 
@@ -1220,6 +1221,7 @@ impl openraft::storage::RaftLogStorage<FerrosRaftConfig> for SledLogStore {
                 Ok(())
             })
             .await
+            .await
             .map_err(|e| StorageIOError::write_vote(to_any_error(e)))?
             .map_err(|e| *e)?;
         Ok(())
@@ -1246,6 +1248,7 @@ impl openraft::storage::RaftLogStorage<FerrosRaftConfig> for SledLogStore {
                     .map_err(|e| Box::new(StorageIOError::write(to_any_error(e))))?;
                 Ok(())
             })
+            .await
             .await
             .map_err(|e| StorageIOError::write(to_any_error(e)))?
             .map_err(|e| *e)?;
@@ -1299,6 +1302,7 @@ impl openraft::storage::RaftLogStorage<FerrosRaftConfig> for SledLogStore {
                     .map_err(|e| Box::new(StorageIOError::write_logs(to_any_error(e))))?;
                 Ok(())
             })
+            .await
             .await
             .map_err(|e| StorageIOError::write_logs(to_any_error(e)))?
             .map_err(|e| *e)?;
@@ -1388,6 +1392,7 @@ impl openraft::storage::RaftLogStorage<FerrosRaftConfig> for SledLogStore {
                     .map_err(|e| Box::new(StorageIOError::write_logs(to_any_error(e))))?;
                 Ok(())
             })
+            .await
             .await
             .map_err(|e| StorageIOError::write_logs(to_any_error(e)))?
             .map_err(|e| *e)?;

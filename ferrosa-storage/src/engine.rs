@@ -9350,6 +9350,7 @@ impl StorageEngine {
                         worker_engine.process_pending_time_series_materializations(batch_limit)
                     })
                     .await
+                    .await
                 {
                     Ok(Ok(processed)) if processed > 0 => {
                         tracing::debug!(

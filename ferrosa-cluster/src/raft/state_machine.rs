@@ -2098,6 +2098,7 @@ impl FerrosStateMachine {
                     })
                     .collect::<Vec<_>>()
             })
+            .await
             .await;
 
         let outcomes = match outcomes {
@@ -2170,6 +2171,7 @@ impl RaftSnapshotBuilder<FerrosRaftConfig> for FerrosStateMachine {
                 .spawn_blocking(move || {
                     Self::persist_snapshot_to_disk(&path, &meta_for_disk, &bytes_for_disk)
                 })
+                .await
                 .await
                 .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))??;
             self.mark_durably_applied(meta.last_log_id);
@@ -2306,6 +2308,7 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
                 .spawn_blocking(move || {
                     Self::persist_snapshot_to_disk(&path, &meta_for_disk, &bytes)
                 })
+                .await
                 .await
                 .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))??;
             self.mark_durably_applied(meta.last_log_id);

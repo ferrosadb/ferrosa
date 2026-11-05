@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-common
 doc: roadmap
-last_updated: 2026-10-24
+last_updated: 2026-11-04
 ---
 
 # ferrosa-common — Roadmap
@@ -25,6 +25,11 @@ the code, not from leftover tags.
   rule and the Raft-starvation history).
 
 ## Next
+
+- **Export blocking-pool admission counters (FMEA FC-11 residual).**
+  `blocking_pool_stats()` returns per-pool capacity / in-flight / waiting /
+  total waits, but no Prometheus exporter reads it yet; the binary's metrics
+  endpoint should publish them as gauges and a counter.
 
 - **Property-test `CqlValue` total order (FMEA FC-3).** Add a proptest that the
   cross-type `Ord` (discriminant index + `total_cmp`) is a true total order
