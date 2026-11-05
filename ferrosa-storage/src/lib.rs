@@ -170,3 +170,6 @@ pub(crate) mod test_span_collector {
         names().lock().unwrap().drain(..).collect()
     }
 }
+
+/// Verified fresh-root physical checkpoint staging; not live engine activation.
+pub mod recovery_checkpoint;
