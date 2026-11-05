@@ -1442,3 +1442,8 @@ function rows use the same checked successor and restamp all their cells and
 liveness/deletion metadata. This is serialized node-local ordering, not
 concurrent or cross-node timestamp arbitration. Membership reload and cleanup of
 other roles that reference a dropped parent are separate concerns.
+
+
+### Direct permission projection poststate
+
+The Direct DDL path persists the complete resource permission set after both grants and partial revokes. A revoke writes the existing deletion projection only when the remaining set is empty. The existing schema lifecycle fence covers mutation and poststate lookup; no transaction rollback or new acknowledgment durability guarantee is implied.
