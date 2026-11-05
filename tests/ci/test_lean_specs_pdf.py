@@ -44,13 +44,18 @@ def page(body: str, *, scripts: bool = True) -> str:
     )
 
 
+def load_postprocess_module():
+    renderer = REPO / "specs" / "lean4" / "site" / "postprocess.py"
+    spec = importlib.util.spec_from_file_location("ferrosa_postprocess", renderer)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class OpeningEssayUsesTheExistingRenderer(unittest.TestCase):
     def test_projection_essay_renders_without_losing_its_policy_names(self):
-        renderer = REPO / "specs" / "lean4" / "site" / "postprocess.py"
-        spec = importlib.util.spec_from_file_location("ferrosa_postprocess", renderer)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = load_postprocess_module()
         source = (REPO / "specs" / "lean4" / "Ferrosa" / "SystemTables" / "Projection.lean").read_text()
         header = source.split("/-", 1)[1].split("-/", 1)[0]
         title, body = module.render_essay("Ferrosa.SystemTables.Projection", header)
@@ -59,6 +64,45 @@ class OpeningEssayUsesTheExistingRenderer(unittest.TestCase):
             self.assertIn(f"<code>{policy}</code>", body)
         self.assertIn("merge_rows_into", body)
         self.assertIn("reconcile_ref", body)
+
+
+    def test_quarantine_essay_renders_headings_and_wrapped_list(self):
+        module = load_postprocess_module()
+        source = (REPO / "specs" / "lean4" / "Ferrosa" / "Raft" / "Quarantine.lean").read_text()
+        header = source.split("/-", 1)[1].split("-/", 1)[0]
+        title, body = module.render_essay("Ferrosa.Raft.Quarantine", header)
+        self.assertIn("Quarantine and online repair", title)
+        self.assertIn("<h2>What the code has today, and what it does not</h2>", body)
+        self.assertIn("<h2>What is modelled, and at what abstraction</h2>", body)
+        self.assertEqual(body.count("<ul>"), 1)
+        self.assertEqual(body.count("<li>"), 10)
+        self.assertIn("<code>synced</code> — what the <code>Schema</code>", body)
+        self.assertIn("once preserved, awaiting an explicit decision.</li>", body)
+
+
+    def test_supported_blocks_escape_html_and_refuse_other_markdown(self):
+        module = load_postprocess_module()
+        _, body = module.render_essay("safe", "Title\n=====\n\n## <script> `x`\n\n* **bold** & <tag>\n  wrapped\n* second\n\nparagraph")
+        self.assertEqual(body, "<h2>&lt;script&gt; <code>x</code></h2>\n<ul>\n<li><strong>bold</strong> &amp; &lt;tag&gt; wrapped</li>\n<li>second</li>\n</ul>\n<p>paragraph</p>")
+        for unsupported in ("# top heading", "1. ordered", "> quote", "```python", "| table |", "* item\n  * nested"):
+            with self.subTest(unsupported=unsupported):
+                with self.assertRaises(module.Unexpected):
+                    module.render_essay("strict", "Title\n=====\n\n" + unsupported)
+
+    def test_current_chapter_headers_use_supported_blocks(self):
+        module = load_postprocess_module()
+        checked = 0
+        for path in (REPO / "specs" / "lean4" / "Ferrosa").rglob("*.lean"):
+            source = path.read_text()
+            if "/-" not in source:
+                continue
+            header = source.split("/-", 1)[1].split("-/", 1)[0]
+            if not re.search(r"\n\s*[=-]{3,}\s*\n", header):
+                continue
+            with self.subTest(path=str(path.relative_to(REPO))):
+                module.render_essay(str(path), header)
+            checked += 1
+        self.assertGreater(checked, 0)
 
 
 class WorkflowPrintsTheSite(unittest.TestCase):
