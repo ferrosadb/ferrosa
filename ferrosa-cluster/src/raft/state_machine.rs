@@ -4446,6 +4446,60 @@ mod tests {
             .contains_key(&(incoming.keyspace, incoming.name)));
     }
 
+    /// Every apply group that finished is complete on disk, so a restart whose
+    /// snapshot lags those groups replays them from the log as before. Only a
+    /// group interrupted mid-effect leaves the node quarantined. Before the
+    /// guard settled on completion, every restart that came after an
+    /// un-snapshotted apply quarantined the group. The repair path had no
+    /// installer, so the node never rebuilt Raft and never became ready.
+    #[tokio::test]
+    async fn a_restart_after_completed_applies_is_not_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let path = dir.path().join("restart.snapshot.bin");
+        let mut sm = FerrosStateMachine::with_side_effects_and_snapshot_path(
+            Arc::clone(&schema),
+            Arc::clone(&engine),
+            path.clone(),
+        );
+        sm.apply(vec![make_entry(
+            1,
+            1,
+            RaftOp::CreateKeyspace(simple_keyspace("restart_ks")),
+        )])
+        .await
+        .unwrap();
+        sm.build_snapshot().await.unwrap();
+        sm.apply(vec![make_entry(
+            1,
+            2,
+            RaftOp::CreateTable(Box::new(simple_table("restart_ks", "after_snapshot"))),
+        )])
+        .await
+        .unwrap();
+        drop(sm);
+
+        let mut restarted = FerrosStateMachine::with_side_effects_and_snapshot_path(
+            Arc::clone(&schema),
+            Arc::clone(&engine),
+            path,
+        );
+        let recovered = restarted.recover_from_persisted_snapshot();
+        assert!(
+            !restarted.recovery_requires_repair(),
+            "a completed apply group is not an unclean session: {:?}",
+            restarted.recovery_admission.admits().err()
+        );
+        assert!(restarted.recovery_admission.admits().is_ok());
+        assert!(
+            matches!(recovered, Ok(true)),
+            "the lagging snapshot restores and the log replays the rest: {recovered:?}"
+        );
+        assert_eq!(restarted.last_applied.map(|id| id.index), Some(1));
+    }
+
     /// The durable snapshot may lag a successfully applied DROP/CREATE and
     /// durable user writes in the new UUID. Startup has no authority to erase
     /// that UUID merely to install the older metadata before log replay.
@@ -4537,12 +4591,13 @@ mod tests {
         );
         let result = restarted.recover_from_persisted_snapshot();
         assert!(cold.read(&tid, &key).unwrap().is_some(), "startup must not delete newer durable rows while restoring a lagging snapshot before committed replay");
+        // Both apply groups completed, so this is not an unclean session: the
+        // refusal comes from chronology, not from the recovery guard.
         assert!(
-            matches!(result, Ok(false)),
-            "unclean startup must remain quarantined before snapshot restoration"
+            !restarted.recovery_required,
+            "completed applies must not quarantine"
         );
-        assert!(restarted.recovery_required);
-        assert!(restarted.recovery_admission.admits().is_err());
+        assert!(result.is_err(), "without committed chronology authority startup must preserve and refuse, not guess that the incoming UUID is newer");
         assert!(restarted.last_applied.is_none());
         assert_eq!(
             local_schema.snapshot().tables[&("startup_ks".into(), "survivor".into())].id,

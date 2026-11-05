@@ -82,12 +82,7 @@ impl RecoverySession {
                 std::fs::create_dir_all(parent)?;
             }
             let (journal, record) = RecoveryJournal::open(self.path.clone(), self.group.clone())?;
-            state.reopened_unclean = record.as_ref().is_some_and(|r| {
-                !matches!(
-                    r.phase,
-                    RecoveryPhase::SnapshotSynced | RecoveryPhase::Initialized
-                )
-            });
+            state.reopened_unclean = record.as_ref().is_some_and(|r| !r.phase.is_clean());
             state.highest_started = record.as_ref().map_or(0, |r| r.synced);
             state.record = record;
             state.journal = Some(journal);
@@ -126,12 +121,7 @@ impl RecoverySession {
             .ok_or_else(|| io::Error::other("missing recovery journal"))?;
         let record = match state.record.as_ref() {
             None => journal.arm_session(previous, 0)?,
-            Some(record)
-                if matches!(
-                    record.phase,
-                    RecoveryPhase::SnapshotSynced | RecoveryPhase::Initialized
-                ) =>
-            {
+            Some(record) if record.phase.is_clean() => {
                 let mut record = record.clone();
                 record.phase = RecoveryPhase::SessionArmed;
                 record.reason = "unclean Raft apply session".into();
@@ -160,7 +150,17 @@ impl RecoverySession {
             return Err(error.into());
         }
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(transition)) {
-            Ok(Ok(value)) => Ok(value),
+            Ok(Ok(value)) => {
+                if let Err(error) = self.settled(index) {
+                    // The effects are complete but the guard stays armed, so the
+                    // next restart quarantines. That is fail-closed, and loud.
+                    let reason = format!("cannot settle apply group through {index}: {error}");
+                    tracing::error!(%reason, "Raft recovery guard left armed");
+                    on_failure(&reason);
+                    return Err(error.into());
+                }
+                Ok(value)
+            }
             Ok(Err(error)) => {
                 let reason = error.to_string();
                 on_failure(&reason);
@@ -178,6 +178,40 @@ impl RecoverySession {
                 std::panic::resume_unwind(payload)
             }
         }
+    }
+
+    /// Disarm the guard once the group through `index` completed every effect.
+    ///
+    /// Only the group that armed it may settle it, and a quarantined session
+    /// never settles: its repair, not a later success, clears it.
+    fn settled(&self, index: u64) -> io::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("recovery session poisoned"))?;
+        self.initialize(&mut state)?;
+        if state.reopened_unclean {
+            return Err(io::Error::other("a quarantined Raft session cannot settle"));
+        }
+        let mut record = state
+            .record
+            .clone()
+            .ok_or_else(|| io::Error::other("settle before journal armed"))?;
+        if record.phase != RecoveryPhase::SessionArmed || state.highest_started != index {
+            return Err(io::Error::other(format!(
+                "settle of group {index} does not match the armed group {} ({:?})",
+                state.highest_started, record.phase
+            )));
+        }
+        record.phase = RecoveryPhase::Settled;
+        record.reason = "every armed apply group completed".into();
+        state
+            .journal
+            .as_ref()
+            .ok_or_else(|| io::Error::other("missing recovery journal"))?
+            .persist(&record)?;
+        state.record = Some(record);
+        Ok(())
     }
 
     pub(crate) fn prepare_from_retired(
@@ -323,6 +357,32 @@ mod tests {
             .before_apply(1, 0)
             .expect("different full group names must not share a lock or journal");
     }
+    #[test]
+    fn a_completed_group_settles_and_an_interrupted_one_does_not() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("dc-a/state-machine.snapshot.bin");
+        let session = RecoverySession::for_snapshot(&path);
+        session
+            .execute::<(), io::Error>(3, 2, |_| {}, || Ok(()))
+            .unwrap();
+        drop(session);
+        let reopened = RecoverySession::for_snapshot(&path);
+        assert_eq!(
+            reopened.startup_reason().unwrap(),
+            None,
+            "a group whose effects all completed must not quarantine a restart"
+        );
+
+        // Arm the next group without completing it: the crash window.
+        reopened.before_apply(4, 3).unwrap();
+        drop(reopened);
+        let crashed = RecoverySession::for_snapshot(&path);
+        assert!(
+            crashed.startup_reason().unwrap().is_some(),
+            "a group interrupted mid-effect must still quarantine"
+        );
+    }
+
     #[test]
     fn runtime_review_panicked_worker_persists_fault_without_waiter() {
         let directory = tempfile::tempdir().unwrap();

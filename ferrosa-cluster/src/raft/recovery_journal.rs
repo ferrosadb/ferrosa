@@ -13,10 +13,23 @@ use std::{
 pub enum RecoveryPhase {
     Initialized,
     SessionArmed,
+    /// Every armed apply group completed its physical effects. A restart
+    /// replays the un-snapshotted tail from the log; nothing is half-applied.
+    Settled,
     SnapshotSynced,
     Quarantined,
     Repairing,
     Verifying,
+}
+
+impl RecoveryPhase {
+    /// True when no apply group is half-done, so a restart may replay the log.
+    pub fn is_clean(&self) -> bool {
+        matches!(
+            self,
+            RecoveryPhase::Initialized | RecoveryPhase::Settled | RecoveryPhase::SnapshotSynced
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
