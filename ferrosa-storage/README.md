@@ -1879,3 +1879,20 @@ creating durable drop/sweep intents or retiring the writer. Only the cleanup
 phase follows checked writer retirement and registry removal. The legacy
 `unregister_table` surface still returns the original error. This phase result
 does not certify reader drain, physical checkpoint adoption or recovery admission.
+
+### Isolated physical checkpoint staging
+
+`recovery_checkpoint::{stage_checkpoint, resume_checkpoint_stage}` copy an explicitly
+bounded, versioned manifest into a separate fresh root. The first version supports
+flat numeric-generation SSTable components under `sstables/<keyspace>.<table>/`.
+Copies stream file bytes, verify length and SHA-256, sync promoted files and their
+directories, and run the existing SSTable startup smoke validation. Resume requires
+the same durable manifest identity and rechecks actual file contents; a persistent
+exclusive writer lease prevents competing stage writers. Existing local data and
+colliding destination files are preserved.
+
+`VerifiedStagedCheckpoint` is evidence about the staged files only. The caller supplies
+the anchor and table incarnation inventory; this API does not authenticate the peer,
+prove the logical anchor, freeze donor writes, install files into a running engine,
+or authorize leaving Raft quarantine. Live activation must separately drain owners
+and reverify installed content. Changing staged files invalidates prior evidence.
