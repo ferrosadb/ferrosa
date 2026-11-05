@@ -1,13 +1,34 @@
 //! Shared recovery admission for inconsistent Raft state.
-//! Correctness: publishers serialize; detection never waits for publisher I/O.
+//! Correctness: busy publication is refused; detection never waits for I/O.
 //! Last revised: 2026-11-05
-//! Last changed: refuse busy publication and drain only a quarantined epoch.
+//! Last changed: type retryable refusals and wake drains on publication release.
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, MutexGuard, RwLock};
 use std::{collections::BTreeMap, fmt};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryRefusalKind {
+    Busy,
+    Quarantined,
+    EpochChanged,
+    InvalidDrain,
+}
+
+struct PublicationLease<'a> {
+    guard: Option<MutexGuard<'a, ()>>,
+    released: &'a tokio::sync::Notify,
+}
+impl Drop for PublicationLease<'_> {
+    fn drop(&mut self) {
+        // Unlock before waking waiters, including the unwind path.
+        drop(self.guard.take());
+        self.released.notify_waiters();
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RecoveryRefusal {
+    pub kind: RecoveryRefusalKind,
     pub epoch: u64,
     pub reason: String,
 }
@@ -35,6 +56,7 @@ pub struct RecoveryAdmission {
     transition: RwLock<AdmissionState>,
     publication: Mutex<()>,
     epoch_changed: tokio::sync::Notify,
+    publication_released: tokio::sync::Notify,
 }
 impl RecoveryAdmission {
     pub fn new() -> Self {
@@ -67,35 +89,38 @@ impl RecoveryAdmission {
         let epoch = Self::advance(&mut state);
         drop(state);
         self.epoch_changed.notify_waiters();
+        self.publication_released.notify_waiters();
         epoch
     }
-    /// Register before checking the epoch so a transition cannot be lost between
-    /// the check and suspension. No watch read guard is held by the consumer.
+    /// Register before checking state so a transition cannot be lost before
+    /// suspension. Terminal epoch exhaustion also wakes; callers must recheck
+    /// admission after every wake, even when the returned epoch is unchanged.
     pub async fn changed_since(&self, seen: u64) -> u64 {
         loop {
             let changed = self.epoch_changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            let epoch = self.epoch();
-            if epoch != seen {
-                return epoch;
+            let observed = {
+                let state = self.transition.read();
+                (state.epoch, state.faults.contains_key("epoch"))
+            };
+            if observed.0 != seen || observed.1 {
+                return observed.0;
             }
             changed.await;
         }
     }
-    /// Serialize publishers, but never hold the fault-state lock across caller
-    /// code. Detection and admission remain callable from the closure. Recursive
-    /// publication on this gate is refused rather than waiting on itself.
+    /// Refuse a busy publisher without waiting, including cross-thread nesting.
+    /// No fault-state lock is held across caller code: detection and admission
+    /// remain callable from the closure.
     /// A changed epoch rejects the result; already-admitted I/O is not rolled back.
     pub fn with_admission_epoch<T>(
         &self,
         epoch: u64,
         publish: impl FnOnce() -> T,
     ) -> Result<T, RecoveryRefusal> {
-        let _publisher = self.publication.try_lock().ok_or_else(|| RecoveryRefusal {
-            epoch: self.epoch(),
-            reason: "recovery publication is busy".into(),
-        })?;
+        self.admits_epoch(epoch)?;
+        let _publisher = self.try_publication()?;
         self.admits_epoch(epoch)?;
         let result = publish();
         self.admits_epoch(epoch)?;
@@ -106,37 +131,74 @@ impl RecoveryAdmission {
     /// Busy publication is refused, never waited upon: a cross-thread nested
     /// caller must not create a dependency cycle with the current publisher.
     pub fn drain_publications(&self, expected_epoch: u64) -> Result<(), RecoveryRefusal> {
-        let _publisher = self.publication.try_lock().ok_or_else(|| RecoveryRefusal {
-            epoch: self.epoch(),
-            reason: "recovery publication is still active".into(),
-        })?;
+        self.check_drain(expected_epoch)?;
+        let _publisher = self.try_publication()?;
+        self.check_drain(expected_epoch)
+    }
+    /// Await a busy publication without polling. Exact epoch checks on every
+    /// wake ensure detection cannot accidentally make an old drain valid.
+    pub async fn drain_publications_async(
+        &self,
+        expected_epoch: u64,
+    ) -> Result<(), RecoveryRefusal> {
+        loop {
+            let released = self.publication_released.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            match self.drain_publications(expected_epoch) {
+                Err(error) if error.kind == RecoveryRefusalKind::Busy => released.await,
+                result => return result,
+            }
+        }
+    }
+    fn try_publication(&self) -> Result<PublicationLease<'_>, RecoveryRefusal> {
+        self.publication
+            .try_lock()
+            .map(|guard| PublicationLease {
+                guard: Some(guard),
+                released: &self.publication_released,
+            })
+            .ok_or_else(|| RecoveryRefusal {
+                kind: RecoveryRefusalKind::Busy,
+                epoch: self.epoch(),
+                reason: "recovery publication is busy".into(),
+            })
+    }
+    fn check_drain(&self, expected_epoch: u64) -> Result<(), RecoveryRefusal> {
         let state = self.transition.read();
-        if state.epoch != expected_epoch || state.faults.is_empty() {
+        if state.epoch != expected_epoch {
             return Err(RecoveryRefusal {
+                kind: RecoveryRefusalKind::EpochChanged,
                 epoch: state.epoch,
-                reason: "publication drain requires the current quarantined epoch".into(),
+                reason: "stale recovery publication drain".into(),
+            });
+        }
+        if state.faults.is_empty() {
+            return Err(RecoveryRefusal {
+                kind: RecoveryRefusalKind::InvalidDrain,
+                epoch: state.epoch,
+                reason: "publication drain requires quarantine".into(),
             });
         }
         Ok(())
     }
 
     fn check(state: &AdmissionState, epoch: Option<u64>) -> Result<(), RecoveryRefusal> {
-        let reason = state
-            .faults
-            .iter()
-            .next()
-            .map(|(group, why)| format!("{group}: {why}"));
-        match reason {
-            Some(reason) => Err(RecoveryRefusal {
+        if let Some((group, reason)) = state.faults.iter().next() {
+            return Err(RecoveryRefusal {
+                kind: RecoveryRefusalKind::Quarantined,
                 epoch: state.epoch,
-                reason,
-            }),
-            None if epoch.is_some_and(|value| value != state.epoch) => Err(RecoveryRefusal {
-                epoch: state.epoch,
-                reason: "admission epoch changed".into(),
-            }),
-            None => Ok(()),
+                reason: format!("{group}: {reason}"),
+            });
         }
+        if epoch.is_some_and(|expected| expected != state.epoch) {
+            return Err(RecoveryRefusal {
+                kind: RecoveryRefusalKind::EpochChanged,
+                epoch: state.epoch,
+                reason: "stale recovery admission epoch".into(),
+            });
+        }
+        Ok(())
     }
     fn advance(state: &mut AdmissionState) -> u64 {
         match state.epoch.checked_add(1) {
@@ -255,5 +317,80 @@ mod tests {
         let closed = gate.quarantine("group", "projection failure");
         assert_eq!(wait.await, closed);
         assert_eq!(gate.changed_since(initial).await, closed);
+    }
+    #[tokio::test]
+    async fn terminal_overflow_fault_wakes_without_an_epoch_delta() {
+        use std::{future::Future, task::Poll};
+        let gate = RecoveryAdmission::new();
+        gate.transition.write().epoch = u64::MAX;
+        let mut wait = Box::pin(gate.changed_since(u64::MAX));
+        std::future::poll_fn(|context| {
+            assert!(wait.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        gate.quarantine("group", "projection failure");
+        std::future::poll_fn(|context| {
+            assert!(
+                matches!(wait.as_mut().poll(context), Poll::Ready(u64::MAX)),
+                "terminal fault must wake the registered consumer even though epoch cannot advance"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        assert!(gate.admits().is_err());
+    }
+
+    #[test]
+    fn busy_and_quarantined_refusals_are_distinct() {
+        let gate = RecoveryAdmission::new();
+        gate.with_admission_epoch(gate.epoch(), || {
+            assert_eq!(
+                gate.with_admission_epoch(gate.epoch(), || ())
+                    .unwrap_err()
+                    .kind,
+                RecoveryRefusalKind::Busy
+            );
+        })
+        .unwrap();
+        gate.quarantine("group", "projection failure");
+        assert_eq!(
+            gate.admits().unwrap_err().kind,
+            RecoveryRefusalKind::Quarantined
+        );
+    }
+    #[tokio::test]
+    async fn publication_release_wakes_registered_quarantine_drain() {
+        use std::{future::Future, task::Poll};
+        let gate = RecoveryAdmission::new();
+        let lease = gate.try_publication().unwrap();
+        let closed = gate.quarantine("group", "projection failure");
+        let mut drain = Box::pin(gate.drain_publications_async(closed));
+        std::future::poll_fn(|context| {
+            assert!(drain.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        let newer = gate.quarantine("group", "another projection failure");
+        std::future::poll_fn(|context| {
+            assert!(
+                matches!(drain.as_mut().poll(context), Poll::Ready(Err(error))
+                if error.kind == RecoveryRefusalKind::EpochChanged)
+            );
+            Poll::Ready(())
+        })
+        .await;
+        let mut drain = Box::pin(gate.drain_publications_async(newer));
+        std::future::poll_fn(|context| {
+            assert!(drain.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(lease);
+        std::future::poll_fn(|context| {
+            assert!(matches!(drain.as_mut().poll(context), Poll::Ready(Ok(()))));
+            Poll::Ready(())
+        })
+        .await;
     }
 }
