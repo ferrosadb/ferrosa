@@ -1,20 +1,9 @@
 //! Shared recovery admission for inconsistent Raft state.
 //! Correctness: publishers serialize; detection never waits for publisher I/O.
 //! Last revised: 2026-11-05
-//! Last changed: close all consumers through one epoch-bound recovery gate.
+//! Last changed: refuse busy publication and drain only a quarantined epoch.
 
-use parking_lot::Mutex;
-use std::cell::RefCell;
-
-thread_local! { static PUBLICATIONS: RefCell<std::collections::BTreeSet<usize>> = const { RefCell::new(std::collections::BTreeSet::new()) }; }
-struct PublicationScope(usize);
-impl Drop for PublicationScope {
-    fn drop(&mut self) {
-        PUBLICATIONS.with(|active| {
-            active.borrow_mut().remove(&self.0);
-        });
-    }
-}
+use parking_lot::{Mutex, RwLock};
 use std::{collections::BTreeMap, fmt};
 
 #[derive(Debug, Clone)]
@@ -43,38 +32,56 @@ struct AdmissionState {
 /// Per-group recovery producers must not clear another group's fault.
 #[derive(Default)]
 pub struct RecoveryAdmission {
-    transition: Mutex<AdmissionState>,
+    transition: RwLock<AdmissionState>,
     publication: Mutex<()>,
+    epoch_changed: tokio::sync::Notify,
 }
 impl RecoveryAdmission {
     pub fn new() -> Self {
         Self::default()
     }
     pub fn epoch(&self) -> u64 {
-        self.transition.lock().epoch
+        self.transition.read().epoch
     }
     pub fn reason(&self) -> Option<String> {
         self.transition
-            .lock()
+            .read()
             .faults
             .iter()
             .next()
             .map(|(group, reason)| format!("{group}: {reason}"))
     }
     pub fn admits(&self) -> Result<(), RecoveryRefusal> {
-        let state = self.transition.lock();
+        let state = self.transition.read();
         Self::check(&state, None)
     }
     pub fn admits_epoch(&self, epoch: u64) -> Result<(), RecoveryRefusal> {
-        let state = self.transition.lock();
+        let state = self.transition.read();
         Self::check(&state, Some(epoch))
     }
     /// Close in memory before any durable progress I/O or peer repair work.
     pub fn quarantine(&self, group: &str, reason: impl Into<String>) -> u64 {
         let reason = reason.into();
-        let mut state = self.transition.lock();
+        let mut state = self.transition.write();
         state.faults.insert(group.into(), reason);
-        Self::advance(&mut state)
+        let epoch = Self::advance(&mut state);
+        drop(state);
+        self.epoch_changed.notify_waiters();
+        epoch
+    }
+    /// Register before checking the epoch so a transition cannot be lost between
+    /// the check and suspension. No watch read guard is held by the consumer.
+    pub async fn changed_since(&self, seen: u64) -> u64 {
+        loop {
+            let changed = self.epoch_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let epoch = self.epoch();
+            if epoch != seen {
+                return epoch;
+            }
+            changed.await;
+        }
     }
     /// Serialize publishers, but never hold the fault-state lock across caller
     /// code. Detection and admission remain callable from the closure. Recursive
@@ -85,35 +92,31 @@ impl RecoveryAdmission {
         epoch: u64,
         publish: impl FnOnce() -> T,
     ) -> Result<T, RecoveryRefusal> {
-        let key = self as *const Self as usize;
-        if PUBLICATIONS.with(|active| active.borrow().contains(&key)) {
-            return Err(RecoveryRefusal {
-                epoch: self.epoch(),
-                reason: "recursive recovery publication".into(),
-            });
-        }
-        let _publisher = self.publication.lock();
-        PUBLICATIONS.with(|active| {
-            active.borrow_mut().insert(key);
-        });
-        let _scope = PublicationScope(key);
+        let _publisher = self.publication.try_lock().ok_or_else(|| RecoveryRefusal {
+            epoch: self.epoch(),
+            reason: "recovery publication is busy".into(),
+        })?;
         self.admits_epoch(epoch)?;
         let result = publish();
         self.admits_epoch(epoch)?;
         Ok(result)
     }
 
-    /// Once quarantined, wait for old admitted publication I/O before fixing the
-    /// persisted purge floor and verifying a replacement checkpoint.
-    pub fn drain_publications(&self) -> Result<(), RecoveryRefusal> {
-        let key = self as *const Self as usize;
-        if PUBLICATIONS.with(|active| active.borrow().contains(&key)) {
+    /// Prove no old publisher remains only for the exact quarantined epoch.
+    /// Busy publication is refused, never waited upon: a cross-thread nested
+    /// caller must not create a dependency cycle with the current publisher.
+    pub fn drain_publications(&self, expected_epoch: u64) -> Result<(), RecoveryRefusal> {
+        let _publisher = self.publication.try_lock().ok_or_else(|| RecoveryRefusal {
+            epoch: self.epoch(),
+            reason: "recovery publication is still active".into(),
+        })?;
+        let state = self.transition.read();
+        if state.epoch != expected_epoch || state.faults.is_empty() {
             return Err(RecoveryRefusal {
-                epoch: self.epoch(),
-                reason: "recursive recovery publication drain".into(),
+                epoch: state.epoch,
+                reason: "publication drain requires the current quarantined epoch".into(),
             });
         }
-        let _publisher = self.publication.lock();
         Ok(())
     }
 
@@ -160,7 +163,7 @@ mod tests {
         assert_eq!(gate.with_admission_epoch(epoch, || 7).unwrap(), 7);
     }
     #[test]
-    fn publication_holds_the_transition_lease() {
+    fn publication_holds_the_publisher_lease() {
         let gate = RecoveryAdmission::new();
         gate.with_admission_epoch(gate.epoch(), || {
             assert!(gate.publication.try_lock().is_none());
@@ -174,7 +177,7 @@ mod tests {
         let result = gate.with_admission_epoch(epoch, || {
             assert!(gate.admits().is_ok());
             assert!(gate.with_admission_epoch(epoch, || ()).is_err());
-            assert!(gate.drain_publications().is_err());
+            assert!(gate.drain_publications(epoch).is_err());
             gate.quarantine("dc1", "fault during publication");
             assert!(gate.admits().is_err());
         });
@@ -204,5 +207,53 @@ mod tests {
             );
         })
         .unwrap();
+    }
+    #[test]
+    fn cross_thread_nested_publication_refuses_instead_of_waiting() {
+        let gate = std::sync::Arc::new(RecoveryAdmission::new());
+        let (send, receive) = std::sync::mpsc::channel();
+        let mut child = None;
+        let mut nested_result = None;
+        gate.with_admission_epoch(gate.epoch(), || {
+            let nested = std::sync::Arc::clone(&gate);
+            child = Some(std::thread::spawn(move || {
+                let result = nested.with_admission_epoch(nested.epoch(), || ());
+                send.send(result).unwrap();
+            }));
+            // Cleanup deadline only: the held publication makes the blocked
+            // dependency deterministic; release it before joining on failure.
+            nested_result = receive.recv_timeout(std::time::Duration::from_secs(5)).ok();
+        })
+        .unwrap();
+        child.unwrap().join().unwrap();
+        assert!(
+            matches!(nested_result, Some(Err(_))),
+            "nested cross-thread publisher waited on its parent"
+        );
+    }
+
+    #[test]
+    fn drain_requires_current_quarantined_epoch() {
+        let gate = RecoveryAdmission::new();
+        let healthy = gate.epoch();
+        assert!(gate.drain_publications(healthy).is_err());
+        let closed = gate.quarantine("group", "projection failure");
+        assert!(gate.drain_publications(healthy).is_err());
+        assert!(gate.drain_publications(closed).is_ok());
+    }
+    #[tokio::test]
+    async fn epoch_change_wakes_registered_and_late_waiters() {
+        use std::{future::Future, task::Poll};
+        let gate = RecoveryAdmission::new();
+        let initial = gate.epoch();
+        let mut wait = Box::pin(gate.changed_since(initial));
+        std::future::poll_fn(|context| {
+            assert!(wait.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        let closed = gate.quarantine("group", "projection failure");
+        assert_eq!(wait.await, closed);
+        assert_eq!(gate.changed_since(initial).await, closed);
     }
 }
