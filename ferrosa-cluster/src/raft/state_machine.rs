@@ -358,7 +358,7 @@ struct CompletedApply {
 
 struct PendingApply {
     log_id: LogId<u64>,
-    job: tokio::task::JoinHandle<CompletedApply>,
+    job: tokio::task::JoinHandle<Result<CompletedApply, ferrosa_common::Error>>,
     // Both the queued worker and its owner retain these until physical work
     // and the existing ordered system-table writes have completed.
     pauses: Arc<Vec<ferrosa_storage::compaction::TableCompactionPause>>,
@@ -451,7 +451,17 @@ impl FerrosStateMachine {
             .take()
             .expect("pending handle was retained");
         let completed = match result {
-            Ok(completed) => completed,
+            Ok(Ok(completed)) => completed,
+            Ok(Err(error)) => {
+                let reason = format!("Raft system projection persistence failed: {error}");
+                self.apply_failure = Some(reason.clone());
+                return Err(Box::new(
+                    StorageIOError::write_state_machine(to_any_error(std::io::Error::other(
+                        reason,
+                    )))
+                    .into(),
+                ));
+            }
             Err(error) => {
                 let reason = format!("Raft physical apply job failed: {error}");
                 self.apply_failure = Some(reason.clone());
@@ -2158,9 +2168,13 @@ impl FerrosStateMachine {
     /// Persist the collected system-table writes inside the same owned worker
     /// as physical apply. Cancellation cannot let a subsequent entry overtake
     /// this stage or release compaction pauses before it finishes.
-    fn flush_pending_system_writes(&self, pending: Vec<PendingSystemWrite>) {
+    fn flush_pending_system_writes(
+        &self,
+        pending: Vec<PendingSystemWrite>,
+    ) -> ferrosa_common::Result<()> {
         let Some(writer) = &self.system_writer else {
-            return;
+            // Explicit metadata-only state machines have no configured projection.
+            return Ok(());
         };
         for pending in pending {
             if let Err(error) = writer.apply(pending.mutation) {
@@ -2170,8 +2184,18 @@ impl FerrosStateMachine {
                     }
                     SystemWriteLogLevel::Error => tracing::error!(%error, "{}", pending.context),
                 }
+                // Severity is not permission to lose a canonical row. Current
+                // startup registers system tables before replay; real storage
+                // failures, including WarnReplay sites, must remain replayable.
+                return Err(error);
             }
         }
+        // Periodic write acknowledgement alone is not a disk durability barrier.
+        // Keep this synchronous flush in the retained worker before publication.
+        if let Some(engine) = &self.engine {
+            engine.force_commit_log_sync()?;
+        }
+        Ok(())
     }
 }
 
@@ -2310,11 +2334,11 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
                         .spawn_blocking(move || {
                             let _pauses = worker_pauses;
                             let (response, system_writes) = staged.apply_command(cmd);
-                            staged.flush_pending_system_writes(system_writes);
-                            CompletedApply {
+                            staged.flush_pending_system_writes(system_writes)?;
+                            Ok(CompletedApply {
                                 state: staged.state,
                                 response,
-                            }
+                            })
                         });
                     self.pending_apply = Some(PendingApply {
                         log_id: entry.log_id,
@@ -5003,6 +5027,14 @@ mod tests {
         dir: &std::path::Path,
         sync_strategy: ferrosa_storage::SyncStrategyConfig,
     ) -> Arc<StorageEngine> {
+        test_engine_with_reserve(dir, sync_strategy, 0)
+    }
+
+    fn test_engine_with_reserve(
+        dir: &std::path::Path,
+        sync_strategy: ferrosa_storage::SyncStrategyConfig,
+        reserve_bytes: u64,
+    ) -> Arc<StorageEngine> {
         use ferrosa_storage::engine::StorageEngineConfig;
         use ferrosa_storage::{CommitLogConfig, CompactionConfig};
         let config = StorageEngineConfig {
@@ -5016,7 +5048,7 @@ mod tests {
             compaction: CompactionConfig::from_env(dir.join("compaction")),
             object_store: None,
             local_cache_max_bytes: 1024 * 1024,
-            local_disk_free_reserve_bytes: 0,
+            local_disk_free_reserve_bytes: reserve_bytes,
             flush_threshold_bytes: 4096,
             memtable_backpressure_bytes: u64::MAX,
             flush_max_age_secs: 5,
@@ -5030,6 +5062,60 @@ mod tests {
             cache_hot_window_secs: 900,
         };
         Arc::new(StorageEngine::new(config, None).unwrap())
+    }
+
+    async fn hard_projection_failure_must_not_publish(drop_keyspace: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine_with_reserve(
+            dir.path(),
+            ferrosa_storage::SyncStrategyConfig::Batch,
+            u64::MAX,
+        );
+        engine.register_system_tables().unwrap();
+        assert!(matches!(
+            engine.check_write_admission(),
+            Err(ferrosa_common::Error::InvalidData(_))
+        ));
+        let schema = Arc::new(test_schema_instance());
+        let mut sm = FerrosStateMachine::with_side_effects(Arc::clone(&schema), engine);
+        let keyspace = simple_keyspace("projection_failure");
+        let op = if drop_keyspace {
+            schema.create_keyspace_internal(keyspace.clone()).unwrap();
+            sm.state
+                .keyspaces
+                .insert(keyspace.name.clone(), keyspace.clone());
+            RaftOp::DropKeyspace(keyspace.name)
+        } else {
+            RaftOp::CreateKeyspace(keyspace)
+        };
+        let result = sm.apply(vec![make_entry(1, 1, op)]).await;
+        assert!(
+            result.is_err(),
+            "real canonical projection write refusal must reach storage failure, got {result:?}"
+        );
+        assert!(
+            sm.last_applied.is_none(),
+            "failed canonical projection must remain replayable"
+        );
+        assert!(
+            sm.apply_failure.is_some(),
+            "a true persistence failure must latch"
+        );
+        let mut builder = sm.get_snapshot_builder().await;
+        assert!(
+            builder.build_snapshot().await.is_err(),
+            "failed projection cannot be snapshotted and purged"
+        );
+    }
+
+    #[tokio::test]
+    async fn warn_replay_does_not_hide_real_projection_storage_failure() {
+        hard_projection_failure_must_not_publish(false).await;
+    }
+
+    #[tokio::test]
+    async fn critical_projection_storage_failure_does_not_publish_applied_index() {
+        hard_projection_failure_must_not_publish(true).await;
     }
 
     /// A node that receives a snapshot missing a local data-bearing table must
@@ -5519,7 +5605,7 @@ mod tests {
             pending_apply: Some(PendingApply {
                 log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 1),
                 job: ferrosa_net::task_pool::TaskPool::current("raft-poison-test").spawn_blocking(
-                    || -> CompletedApply {
+                    || -> ferrosa_common::Result<CompletedApply> {
                         panic!("intentional apply panic");
                     },
                 ),

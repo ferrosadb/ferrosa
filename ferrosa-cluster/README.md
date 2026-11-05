@@ -37,8 +37,12 @@ token ring and a Raft-replicated metadata state machine:
 Raft command application owns its blocking schema/storage transition and ordered
 system-table writes in one worker job. Dropping an async waiter retains that job;
 subsequent apply/status/snapshot entry points await it before exposing the applied
-index or constructing a snapshot. A worker panic poisons the state machine and
-returns a storage error rather than publishing staged metadata. Ordinary command
+index or constructing a snapshot. A worker panic or configured system-table persistence failure poisons the state
+machine and returns a storage error rather than publishing staged metadata.
+The retained worker forces the commit log to disk before publication, including
+with Periodic acknowledgement. Log severity does not exempt failed projections.
+Shared schema/storage effects can already be visible; this is not rollback or
+transactional isolation. Ordinary command
 error responses retain the committed intent for replay. Existing snapshot-file
 publication behavior is separate from this command-application fence.
 
