@@ -418,6 +418,9 @@ struct PendingApply {
 pub struct FerrosStateMachine {
     state: RaftState,
     pending_apply: Option<PendingApply>,
+    /// First caller-owned committed index not yet transferred to a retained job.
+    /// Cancellation must not allow a later apply to silently skip this suffix.
+    unconsumed_input: Option<u64>,
     apply_failure: Option<String>,
     #[cfg(test)]
     projection_syncs: Arc<std::sync::atomic::AtomicU64>,
@@ -474,6 +477,7 @@ impl FerrosStateMachine {
             snapshot_path: self.snapshot_path.clone(),
             durable_applied: self.durable_applied.clone(),
             pending_apply: None,
+            unconsumed_input: None,
             apply_failure: self.apply_failure.clone(),
             #[cfg(test)]
             projection_syncs: Arc::clone(&self.projection_syncs),
@@ -628,6 +632,7 @@ impl FerrosStateMachine {
             snapshot_path: None,
             durable_applied: None,
             pending_apply: None,
+            unconsumed_input: None,
             apply_failure: None,
             #[cfg(test)]
             projection_syncs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -816,6 +821,7 @@ impl FerrosStateMachine {
             snapshot_path: None,
             durable_applied: None,
             pending_apply: None,
+            unconsumed_input: None,
             apply_failure: None,
             #[cfg(test)]
             projection_syncs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -917,6 +923,15 @@ impl FerrosStateMachine {
         }
         self.sync_ring();
         self.unregister_tables_dropped_by_snapshot(&dropped);
+        if let Some((_, applied)) = self
+            .unconsumed_input
+            .zip(self.last_applied)
+            .filter(|(required, applied)| applied.index >= *required)
+        {
+            // An authoritative snapshot can supersede the abandoned prefix,
+            // but it cannot authorize skipping its own next committed index.
+            self.unconsumed_input = applied.index.checked_add(1);
+        }
         Ok(())
     }
 
@@ -2504,14 +2519,36 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
         I: IntoIterator<Item = Entry<FerrosRaftConfig>> + Send,
         I::IntoIter: Send,
     {
-        self.finish_pending_apply().await.map_err(|error| *error)?;
-        let mut responses = Vec::new();
-
         let mut entries = entries.into_iter().peekable();
+        let first = entries.peek().map(|entry| entry.log_id.index);
+        let required = self.unconsumed_input;
+        // Capture ownership before even awaiting a preceding job. A cancelled
+        // new caller may otherwise lose its input while that job is reaped.
+        if required.is_none() {
+            self.unconsumed_input = first;
+        }
+        self.finish_pending_apply().await.map_err(|error| *error)?;
+        if let Some((required, first)) = required
+            .zip(first)
+            .filter(|(required, first)| first != required)
+        {
+            return Err(
+                StorageIOError::write_state_machine(to_any_error(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "cancelled Raft input requires committed index {required} before {first}"
+                    ),
+                )))
+                .into(),
+            );
+        }
+        let mut responses = Vec::new();
         while let Some(entry) = entries.next() {
+            self.unconsumed_input = Some(entry.log_id.index);
             match entry.payload {
                 EntryPayload::Blank => {
                     self.last_applied = Some(entry.log_id);
+                    self.unconsumed_input = entries.peek().map(|next| next.log_id.index);
                     responses.push(RaftResponse::Ok);
                 }
                 EntryPayload::Normal(cmd) => {
@@ -2604,6 +2641,8 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
                         job,
                         pauses,
                     });
+                    // The worker now owns the group, but not the caller's suffix.
+                    self.unconsumed_input = entries.peek().map(|next| next.log_id.index);
                     if let Some(group_responses) =
                         self.finish_pending_apply().await.map_err(|error| *error)?
                     {
@@ -2613,6 +2652,7 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
                 EntryPayload::Membership(membership) => {
                     self.last_applied = Some(entry.log_id);
                     self.last_membership = StoredMembership::new(Some(entry.log_id), membership);
+                    self.unconsumed_input = entries.peek().map(|next| next.log_id.index);
                     responses.push(RaftResponse::Ok);
                 }
             }
@@ -2644,6 +2684,7 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
             snapshot_path: self.snapshot_path.clone(),
             durable_applied: self.durable_applied.clone(),
             pending_apply: None,
+            unconsumed_input: None,
             apply_failure: self.apply_failure.clone(),
             #[cfg(test)]
             projection_syncs: Arc::clone(&self.projection_syncs),
@@ -6297,6 +6338,138 @@ mod tests {
             .state
             .tables
             .contains_key(&("cancel_apply".into(), "second".into())));
+    }
+
+    async fn cancelled_mixed_input_requires_reissue(membership: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let mut sm = FerrosStateMachine::with_side_effects(Arc::clone(&schema), engine);
+        sm.apply(vec![make_entry(
+            1,
+            1,
+            RaftOp::CreateKeyspace(simple_keyspace("mixed_cancel")),
+        )])
+        .await
+        .unwrap();
+        let boundary = if membership {
+            Entry {
+                log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 3),
+                payload: EntryPayload::Membership(openraft::Membership::new(
+                    vec![BTreeSet::from([1_u64])],
+                    BTreeMap::from([(1_u64, BasicNode::new("node1"))]),
+                )),
+            }
+        } else {
+            blank_entry(3)
+        };
+        let suffix = make_entry(
+            1,
+            4,
+            RaftOp::CreateTable(Box::new(simple_table("mixed_cancel", "suffix"))),
+        );
+        let later = make_entry(
+            1,
+            5,
+            RaftOp::CreateTable(Box::new(simple_table("mixed_cancel", "later"))),
+        );
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let held = Arc::clone(&schema);
+        let holder = std::thread::spawn(move || {
+            let _lease = held.lifecycle_read();
+            ready_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok()
+        });
+        ready_rx.recv().unwrap();
+        {
+            let apply = sm.apply(vec![
+                make_entry(
+                    1,
+                    2,
+                    RaftOp::CreateTable(Box::new(simple_table("mixed_cancel", "first"))),
+                ),
+                boundary.clone(),
+                suffix.clone(),
+            ]);
+            tokio::pin!(apply);
+            std::future::poll_fn(|cx| match std::future::Future::poll(apply.as_mut(), cx) {
+                std::task::Poll::Pending => std::task::Poll::Ready(()),
+                std::task::Poll::Ready(result) => {
+                    panic!("held first group must remain pending: {result:?}")
+                }
+            })
+            .await;
+        }
+        release_tx.send(()).unwrap();
+        assert!(holder.join().unwrap());
+        assert_eq!(sm.applied_state().await.unwrap().0.unwrap().index, 2);
+        let skipped = sm.apply(vec![later.clone()]).await;
+        assert!(skipped.is_err(), "must not acknowledge index5 while the cancelled input's committed indexes3/4 are unconsumed: {skipped:?}");
+        assert_eq!(sm.last_applied.unwrap().index, 2);
+        assert!(!schema
+            .snapshot()
+            .tables
+            .contains_key(&("mixed_cancel".into(), "later".into())));
+        sm.apply(vec![boundary, suffix]).await.unwrap();
+        assert_eq!(sm.last_applied.unwrap().index, 4);
+        assert!(schema
+            .snapshot()
+            .tables
+            .contains_key(&("mixed_cancel".into(), "suffix".into())));
+        sm.apply(vec![later]).await.unwrap();
+        assert_eq!(sm.last_applied.unwrap().index, 5);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_mixed_blank_input_refuses_skipping_unconsumed_suffix() {
+        cancelled_mixed_input_requires_reissue(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_mixed_membership_input_refuses_skipping_unconsumed_suffix() {
+        cancelled_mixed_input_requires_reissue(true).await;
+    }
+
+    async fn snapshot_supersedes_abandoned_prefix(snapshot_index: u64) {
+        let mut source = FerrosStateMachine::new();
+        source
+            .apply(vec![blank_entry(snapshot_index)])
+            .await
+            .unwrap();
+        let snapshot = source.build_snapshot().await.unwrap();
+        let mut target = FerrosStateMachine::new();
+        // The two held-worker cancellation cases establish this runtime fence.
+        target.unconsumed_input = Some(3);
+        target
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        assert!(
+            target
+                .apply(vec![blank_entry(snapshot_index + 2)])
+                .await
+                .is_err(),
+            "an authoritative snapshot must not permit skipping its next index"
+        );
+        target
+            .apply(vec![blank_entry(snapshot_index + 1)])
+            .await
+            .unwrap();
+        assert_eq!(target.last_applied.unwrap().index, snapshot_index + 1);
+    }
+
+    #[tokio::test]
+    async fn snapshot_covering_part_of_cancelled_suffix_requires_its_next_index() {
+        snapshot_supersedes_abandoned_prefix(3).await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_covering_cancelled_suffix_allows_ordered_progress() {
+        snapshot_supersedes_abandoned_prefix(4).await;
     }
 
     async fn cancelled_projection_waiter_retains_fence(

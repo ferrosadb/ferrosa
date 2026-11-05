@@ -1388,3 +1388,14 @@ is not a deterministic cross-node cell timestamp or an authorization for concurr
 direct mutations of canonical rows. Normal repair and rebalance exclude system
 keyspaces; arbitrary cross-node reconciliation of these local projection files is
 not covered by this contract.
+
+
+An owned apply group survives waiter cancellation; a not-yet-transferred input
+suffix is still caller-owned. The runtime preserves its first required committed
+index and requires a later input to begin there. The Raft caller supplies the
+original contiguous committed entries. Reissuing that missing prefix
+restores normal progress without a poison latch. A successful authoritative
+snapshot advances the requirement to its next index instead of permitting a gap.
+The pinned OpenRaft worker owns and awaits complete input batches; this runtime
+fence also makes direct trait cancellation refuse silent loss of a mixed suffix.
+It is not a persistent incomplete-effect journal.
