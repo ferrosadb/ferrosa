@@ -4537,7 +4537,12 @@ mod tests {
         );
         let result = restarted.recover_from_persisted_snapshot();
         assert!(cold.read(&tid, &key).unwrap().is_some(), "startup must not delete newer durable rows while restoring a lagging snapshot before committed replay");
-        assert!(result.is_err(), "without committed chronology authority startup must preserve and refuse, not guess that the incoming UUID is newer");
+        assert!(
+            matches!(result, Ok(false)),
+            "unclean startup must remain quarantined before snapshot restoration"
+        );
+        assert!(restarted.recovery_required);
+        assert!(restarted.recovery_admission.admits().is_err());
         assert!(restarted.last_applied.is_none());
         assert_eq!(
             local_schema.snapshot().tables[&("startup_ks".into(), "survivor".into())].id,
