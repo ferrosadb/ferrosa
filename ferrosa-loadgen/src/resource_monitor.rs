@@ -434,15 +434,21 @@ fn count_open_fds() -> u64 {
 fn get_fd_limit() -> u64 {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        // SAFETY: `MaybeUninit` is written by `getrlimit` only when it returns 0, and the value is
-        // read (`assume_init`) inside that arm, so the field is never read uninitialised. The error
-        // arm returns the conservative fallback without touching the buffer. `RLIMIT_NOFILE` names a
-        // fixed resource, so no pointer argument is reinterpreted and no memory is written through
-        // the out-param on failure.
+        // The out-param starts fully initialised rather than uninitialised: `getrlimit` writes both
+        // fields on success and leaves them untouched on failure, so neither arm can read a byte the
+        // kernel did not write, and there is no `MaybeUninit`/`assume_init` for the extraction to
+        // model. The zero seed is a placeholder the successful call always overwrites.
+        //
+        // SAFETY: `getrlimit` has no safe wrapper; it takes `*mut rlimit` that must be valid for
+        // writes, which `&mut rlim` is, and `RLIMIT_NOFILE` names a fixed resource so no pointer
+        // argument is reinterpreted.
         unsafe {
-            let mut rlim = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-            if libc::getrlimit(libc::RLIMIT_NOFILE, rlim.as_mut_ptr()) == 0 {
-                rlim.assume_init().rlim_cur
+            let mut rlim = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 {
+                rlim.rlim_cur
             } else {
                 // Conservative fallback.
                 1024

@@ -127,7 +127,7 @@ since  = "2026-11-04"
 file   = "ferrosa-loadgen/src/resource_monitor.rs"
 item   = "get_fd_limit"
 kind   = "syscall"
-reason = "getrlimit has no safe wrapper; the buffer is MaybeUninit and is read (assume_init) only inside the == 0 arm, so the out-param is never read before the kernel has written it, and RLIMIT_NOFILE names a fixed resource with no pointer argument."
+reason = "getrlimit has no safe wrapper; the out-param is a fully initialised libc::rlimit passed as &mut, so no uninitialised byte can be read on either arm, and RLIMIT_NOFILE names a fixed resource with no pointer argument."
 owner  = "loadgen"
 since  = "2026-11-04"
 
