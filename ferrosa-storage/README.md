@@ -1841,3 +1841,20 @@ Single-table unregister APIs retain their existing behavior and recovery format.
 The `test-support` feature exposes a callback that holds the active commit-log
 segment's existing file mutex. Sibling-crate progress tests use it to exercise
 real flush/fsync contention with deterministic release and ordinary storage I/O.
+
+### Isolated physical checkpoint staging
+
+`recovery_checkpoint::{stage_checkpoint, resume_checkpoint_stage}` copy an explicitly
+bounded, versioned manifest into a separate fresh root. The first version supports
+flat numeric-generation SSTable components under `sstables/<keyspace>.<table>/`.
+Copies stream file bytes, verify length and SHA-256, sync promoted files and their
+directories, and run the existing SSTable startup smoke validation. Resume requires
+the same durable manifest identity and rechecks actual file contents; a persistent
+exclusive writer lease prevents competing stage writers. Existing local data and
+colliding destination files are preserved.
+
+`VerifiedStagedCheckpoint` is evidence about the staged files only. The caller supplies
+the anchor and table incarnation inventory; this API does not authenticate the peer,
+prove the logical anchor, freeze donor writes, install files into a running engine,
+or authorize leaving Raft quarantine. Live activation must separately drain owners
+and reverify installed content. Changing staged files invalidates prior evidence.
