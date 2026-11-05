@@ -434,14 +434,15 @@ fn count_open_fds() -> u64 {
 fn get_fd_limit() -> u64 {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        // SAFETY: `rlim` is zeroed as an initial *value*, not as an assumption, because it is only
-        // read inside the `== 0` arm, after `getrlimit` has written it, and the error arm returns 0
-        // without touching it. `RLIMIT_NOFILE` names a fixed resource, so no pointer argument is
-        // reinterpreted and no memory is written through the out-param on failure.
+        // SAFETY: `MaybeUninit` is written by `getrlimit` only when it returns 0, and the value is
+        // read (`assume_init`) inside that arm, so the field is never read uninitialised. The error
+        // arm returns the conservative fallback without touching the buffer. `RLIMIT_NOFILE` names a
+        // fixed resource, so no pointer argument is reinterpreted and no memory is written through
+        // the out-param on failure.
         unsafe {
-            let mut rlim: libc::rlimit = std::mem::zeroed();
-            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 {
-                rlim.rlim_cur
+            let mut rlim = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+            if libc::getrlimit(libc::RLIMIT_NOFILE, rlim.as_mut_ptr()) == 0 {
+                rlim.assume_init().rlim_cur
             } else {
                 // Conservative fallback.
                 1024
@@ -605,6 +606,18 @@ mod tests {
             sstable_count: 5,
             tmp_files: 0,
         }
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn fd_limit_is_read_from_the_kernel_not_left_uninitialised() {
+        // `get_fd_limit` now reads its out-param only inside the `== 0` arm.
+        // The observable property is that it returns a real soft limit: the
+        // fallback is 1024, and any process that can start this test has a
+        // limit above zero. A read of uninitialised memory would be caught by
+        // Miri rather than here, so this pins the value, not the mechanism.
+        let limit = get_fd_limit();
+        assert!(limit >= 256, "implausible soft fd limit: {limit}");
     }
 
     #[test]

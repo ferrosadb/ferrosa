@@ -101,9 +101,16 @@ the ledger previously counted as production (60). That site is `env::remove_var`
 `#[cfg(test)] impl Schema`, so the corrected count is 59; the ledger and the scanner were fixed
 together.
 
+That was the measurement on `main`. On `policy/unsafe-discipline` (2026-11-05) the count is **64
+production sites in 16 files across 6 crates**, and the difference is the two conversions described in
+§6: the commit log's buffer lost its ten `perf` sites and gained sixteen `sync-primitive` ones (a
+smaller, range-scoped primitive where there were ten whole-buffer derefs), and `buffer_bytes` lost its
+`unsafe` entirely; `ferrosa-sstable`'s `KernelStatx::zeroed` lost its `unsafe` the same way. `perf` is
+now zero tree-wide.
+
 | File | Sites | Kinds |
 | --- | --- | --- |
-| `ferrosa-storage/src/commitlog/segment.rs` | 11 | `perf` 10, `syscall` 1 |
+| `ferrosa-storage/src/commitlog/segment.rs` | 17 | `sync-primitive` 16, `syscall` 1 |
 | `ferrosa-udf/src/asc.rs` | 10 | `unknown` 5, `ffi` 5 |
 | `ferrosa/src/main.rs` | 5 | `allocator` 5 |
 | `ferrosa-sstable/src/pump.rs` | 5 | `syscall` 3, `unknown` 2 |
@@ -113,7 +120,7 @@ together.
 | `ferrosa-sstable/src/direct.rs` | 3 | `syscall` 3 |
 | `ferrosa-storage/src/range_merger.rs` | 3 | `unknown` 3 |
 | `ferrosa-loadgen/src/resource_monitor.rs` | 2 | `syscall` 2 |
-| `ferrosa-sstable/src/dio_align.rs` | 2 | `layout` 1, `syscall` 1 |
+| `ferrosa-sstable/src/dio_align.rs` | 1 | `syscall` 1 |
 | `ferrosa-storage/src/flush.rs` | 2 | `mmap` 1, `syscall` 1 |
 | `ferrosa-storage/src/write_set_spill.rs` | 2 | `mmap` 2 |
 | `ferrosa-sstable/src/io.rs` | 1 | `mmap` 1 |
@@ -124,47 +131,74 @@ Totals by kind:
 
 | Kind | Sites |
 | --- | --- |
+| `sync-primitive` | 16 |
 | `syscall` | 14 |
 | `unknown` | 14 |
-| `perf` | 10 |
 | `ffi` | 9 |
 | `mmap` | 6 |
 | `allocator` | 5 |
-| `layout` | 1 |
-| `sync-primitive` | 0 |
+| `layout` | 0 |
+| `perf` | 0 |
 | `ioctl` | 0 |
-| **Total** | **59** |
+| **Total** | **64** |
 
-Twenty-four of the 59 are findings (`perf` 10, `unknown` 14): 41% of the tree's production `unsafe`
-is not permitted by the invariant. Every one is recorded in `scripts/ci-gates/unsafe-allow.toml`
-under `[[debt]]` with the safe alternative that removes it.
+Fourteen of the 64 are findings, all `unknown` — the lifetime-convenience family in §6. Every one is
+recorded in `scripts/ci-gates/unsafe-allow.toml` under `[[debt]]` with the safe alternative that
+removes it. The ten `perf` findings that were here are gone: they were the commit log's buffer, and
+§6 records what replaced them.
 
 ## 6. Findings
 
 Ranked by blast radius — how much of the system depends on the site being reachable and hot.
 
-### `perf` — prohibited
+### `perf` — prohibited, and now zero
 
-| # | Site | Why it is `perf` | Safe alternative |
-| --- | --- | --- | --- |
-| 1 | `commitlog/segment.rs:562,608,648,724,1205` — `&mut *self.buffer.get()` | The commit log is on every write. A `Mutex` around the append buffer is the safe form; these derefs exist to let concurrent writers append without one. | `Mutex<Vec<u8>>` around allocation and copy; or shard the buffer per writer so each shard is owned, not interior-mutable. **Also unsound today** — see below. |
-| 2 | `commitlog/segment.rs:807,977` — `&*self.buffer.get()` | Same buffer, read side, for the flush. | Read through the same `Mutex`/shard ownership; `wait_for_writers()` already orders it, so the lock is not on the hot path. |
-| 3 | `commitlog/segment.rs:1171` — `unsafe { &*self.buffer.get() }.len()` | Reads one `usize` to avoid taking a lock. | `AtomicUsize` updated on append and release. Trivially safe, and the cheapest fix in this list. |
-| 4 | `commitlog/segment.rs:393,394` — `unsafe impl Send/Sync for Segment` | The enabling declaration for the buffer: it exists so a `Segment` can be shared across writer threads without a lock. | Falls out for free once the buffer is a `Mutex`/owned shards. |
+The ten `perf` findings were all in `ferrosa-storage/src/commitlog/segment.rs`: the segment buffer was
+an `UnsafeCell<Vec<u8>>` entered as a whole, `&mut *self.buffer.get()`, by every writer. That is the
+commit log's append path, so it could not be fixed by adding a lock without a decision; it was fixed by
+replacing the buffer with a primitive that only ever hands out the range a writer owns.
 
-**The claim at `segment.rs:562` does not hold.** The SAFETY comment says the CAS allocation gives the
-writer exclusive ownership of `[off, off+total_size)`. That is true of the *bytes*, and it is not what
-the code does: `&mut *self.buffer.get()` produces a `&mut Vec<u8>` covering the **entire** buffer, so
-two concurrent writers hold two overlapping `&mut` to the same allocation. Disjoint byte ranges do not
-make overlapping `&mut` sound under Stacked or Tree Borrows, and Miri reports it as such the moment a
-test drives two writers. This is the highest-priority finding on this branch and the first crate the
-follow-up should take.
+**What the code was, and why it was undefined behaviour.** The CAS on `position` gives each writer an
+exclusive byte range `[off, off+total_size)`. That is true of the *bytes*. It was not true of the
+*references*: `&mut *self.buffer.get()` produced a `&mut Vec<u8>` covering the **entire** buffer, so two
+concurrent writers held two overlapping `&mut` to one allocation. Disjoint byte ranges do not make
+overlapping `&mut` sound under Stacked or Tree Borrows, and Miri reports it the moment a test drives two
+writers (`Data race detected between (1) retag write … and (2) retag write of type std::vec::Vec<u8>` at
+the `&mut *self.buffer.get()` line).
 
-The minimal sound fix when the lock-free design is kept: never form a `&mut Vec<u8>`. Keep the
-`UnsafeCell`, take the base pointer once, and scope the reference to the owned range —
-`slice::from_raw_parts_mut(base.add(off), total_size)` — which is the standard journaling pattern and
-is what the comment already claims. That is still `unsafe`, so it is still a `perf` finding against
-the invariant; it just stops being UB.
+**What replaced it.** `SegmentBuffer` is a small type in the same file with three `unsafe fn`s and one
+rule: a reference always covers exactly one reservation. `range_mut(off, len)` builds
+`slice::from_raw_parts_mut(base.add(off), len)` for the bytes the caller owns; `prefix(end)` builds the
+`&[u8]` a flusher can legally read; `release()` frees the allocation under the same lock every flusher
+takes. Alongside them, the length became atomic:
+
+- `written: AtomicUsize` is published **`Release`** by a writer after the last byte of its range, and
+  loaded **`Acquire`** by a flusher. The pair, rather than `SeqCst`, is what the guarantee needs: the
+  flusher must see the bytes if it sees the end offset, and nothing else is shared. A flush now writes
+  `[0, min(snapshot, written))`, so a reservation whose bytes do not exist yet is never published and
+  never advances the watermark past itself.
+- `len: AtomicUsize` carries the allocated length, so `buffer_bytes()` no longer reads the `Vec` header
+  while writers hold `&mut` into the same allocation. That site had no `unsafe` left to allow.
+
+The one writer that reaches *backwards* — the marker link patch, which writes eight bytes below the
+flush watermark — now takes `file_handle`, the same lock a flusher holds while it reads. That is the
+only new lock in the path, and it costs nothing on append: `allocate_and_link_sync_marker` already held
+`marker_link`, and concurrent `force_sync` callers still fsync in parallel.
+
+**Evidence.** Two tests, both in the module:
+
+- `concurrent_writers_take_disjoint_ranges_and_lose_no_bytes` — eight writers, all eight reservations
+  taken behind a barrier before any write begins, then compared byte-for-byte against the same writes
+  done one at a time. It is RED on the parent commit under Miri and green after, and the on-disk half of
+  the assertion runs on a real target (Miri has no `fdatasync`).
+- `a_flush_between_a_reservation_and_its_write_must_not_publish_unwritten_bytes` — a flush between
+  `allocate()` and `write_entry()` used to write zeros over the range and then move the watermark past
+  it, so the entry never reached disk. RED in plain `cargo test` before the atomic length, green after.
+
+**The follow-up this does not do.** Per-writer shards would let each writer own its buffer outright and
+remove the raw pointer and both `unsafe impl`s with it. That redesigns allocation, the flush watermark
+and the marker chain together, so it is named in `SegmentBuffer`'s documentation rather than folded in
+here.
 
 ### `unknown` — not permitted
 
@@ -186,11 +220,12 @@ per-append path.
 These are `syscall`/`ffi`/`layout` sites whose *kind* is permitted but whose shape is removable. They
 are listed so the follow-up does not treat "the kind is allowed" as "the site is fine":
 
-- **`mem::zeroed()` out-parameters** — `loadgen/src/resource_monitor.rs:438,461` and
-  `sstable/src/dio_align.rs:129`. Prefer `MaybeUninit`, scope it so the return code is checked before
-  `assume_init`. At `resource_monitor.rs:438` and `:461` the SAFETY comment is *"getrlimit is a
-  standard POSIX call"* / *"task_info is a standard mach system call"* — that names the operation, not
-  the mechanism, and would fail §3.
+- **`mem::zeroed()` out-parameters** — `loadgen/src/resource_monitor.rs:442,468`. `ferrosa-sstable`'s
+  `dio_align.rs:129` no longer has one: the kernel's `statx` buffer is a field-by-field zero literal, so
+  the compiler proves it instead of an `unsafe` assertion. `resource_monitor.rs:442` (`getrlimit`) now
+  uses `MaybeUninit` and reads it only inside the `== 0` arm. `resource_monitor.rs:468` (`task_info`,
+  macOS-only) is the remaining one: it cannot be compiled on a Linux host, so it is left for a change
+  made and tested on a Mac rather than edited blind.
 - **`unsafe fn` that should be a safe fn around one block** — `ferrosa/src/jemalloc_tuning.rs:68`
   makes `mallctl_write_ssize` `unsafe fn`, which forces every caller to add its own `unsafe` block
   (`:109`). Nine sites become four.
@@ -213,7 +248,7 @@ Every other sealed crate already carried the attribute; none was removed.
 
 Not sealed, and why:
 
-- `ferrosa-storage` (24), `ferrosa-sstable` (11), `ferrosa-udf` (10), `ferrosa` (9), `ferrosa-cql` (3),
+- `ferrosa-storage` (30), `ferrosa-sstable` (10), `ferrosa-udf` (10), `ferrosa` (9), `ferrosa-cql` (3),
   `ferrosa-loadgen` (2) — at least one production site (§5).
 - **`ferrosa-postgres`, `ferrosa-jepsen`, `ferrosa-schema` have zero production sites and still cannot
   be sealed.** `#![forbid(unsafe_code)]` covers `#[cfg(test)]` code too, and each reaches for the

@@ -32,7 +32,7 @@ cluster. Each states the property the `unsafe` site asserts and the consequence 
 
 | Cluster | Theorem | What it settles |
 | --- | --- | --- |
-| `commitlog/segment.rs` (11) | `two_mutable_borrows_cannot_coexist` | the `UnsafeCell` discipline admits no aliasing mutable borrow |
+| `commitlog/segment.rs` (17) | `two_mutable_borrows_cannot_coexist` | the reservation admits exactly one owner per byte range, so no aliasing `&mut` exists to justify |
 | | `a_shared_borrow_racing_a_mutation_is_the_promised_race` | what `unsafe impl Sync` actually denies |
 | `store.rs` (4) | `a_reference_used_past_its_owner_is_invalid` | quantified over arbitrary lifetimes, so not a claim about one call site |
 | | `a_static_lifetime_does_not_extend_the_region` | `&'static` is sound only while the owner lives — the audit question, stated |
@@ -80,13 +80,21 @@ this is the cheapest open item in the plan, and it is also the one that has an o
 stating. What cannot be proved by any tool: SIGBUS itself is an OS contract. The mapping must also
 hold its own fd and be created with the file open and unlinked, or the contract is unenforceable.
 
-### 4. `segment.rs` — the `UnsafeCell` buffer (11 sites)
+### 4. `segment.rs` — the `SegmentBuffer` (17 sites)
 
-`unsafe impl Send`/`Sync` on a type with `UnsafeCell` is the assertion the discipline theorem checks.
-Kani has no concurrency model, so it cannot discharge this; Loom can test interleavings to a bound, and
-`&mut`-only access would make the marker impls unnecessary. The real question for the audit is
-narrow: which methods take the buffer through `&self` rather than `&mut self`? Those are the ones
-`Sync` has to be justified for.
+This was the `UnsafeCell` buffer entered as a whole, and it was the one place in the tree where the
+audit question had a wrong answer on disk: two writers held two `&mut Vec<u8>` over one allocation, so
+`unsafe impl Send`/`Sync` asserted a discipline the code did not keep. Miri disagreed with the comment
+(`Data race detected … retag write of type std::vec::Vec<u8>`), which is the useful property of this
+class: an aliasing violation is *detectable*, unlike most of the ledger.
+
+What replaced it is the discharge, and it is a design layer rather than a proof: `SegmentBuffer` hands
+out `&mut [u8]` over `[off, off+len)` and nothing wider, so the reservation — one owner per range,
+handed out by the CAS — *is* the invariant, and there is no whole-buffer view left to justify. Kani has
+no concurrency model, so this one is still not Kani's; the evidence is Miri on
+`concurrent_writers_take_disjoint_ranges_and_lose_no_bytes`, which is RED before the change and green
+after. What remains for a type-system discharge is the per-writer-shard redesign named in
+`SegmentBuffer`'s documentation: once each writer owns its buffer outright, both `unsafe impl`s go.
 
 ### 5. libc out-parameters (6 sites)
 

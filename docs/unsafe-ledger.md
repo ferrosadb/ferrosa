@@ -33,7 +33,7 @@ The rule itself, and the definition of evidence, is `docs/unsafe-policy.md`.
 
 | Scope | Sites |
 | --- | --- |
-| Production code (`src/`, outside `#[cfg(test)]`) | **59** |
+| Production code (`src/`, outside `#[cfg(test)]`) | **64** |
 | `#[cfg(test)]` modules inside `src/` | 66 |
 | `tests/` and `examples/` | 299 |
 | WASM example bindings (`examples/**/src/`) | 58 |
@@ -42,7 +42,7 @@ Production sites by crate:
 
 | File | Sites | Category | Invariant this site relies on | Status |
 | --- | --- | --- | --- | --- |
-| `ferrosa-storage/src/commitlog/segment.rs` | 11 | `UnsafeCell` shared buffer, manual `Send`/`Sync` | one writer at a time by construction; buffer is not aliased across the FFI boundary | queued |
+| `ferrosa-storage/src/commitlog/segment.rs` | 17 | `SegmentBuffer`: reservation-scoped slices, manual `Send`/`Sync` | writer w owns `[off, off+len)` because `allocate`'s CAS returned that offset to w alone, so no two writers' views overlap; the length is published `Release` and read `Acquire`; the marker patch and the flusher are serialised by `file_handle` | audited |
 | `ferrosa-udf/src/asc.rs` | 10 | FFI to the JS engine (`rquickjs`) | `CtxPtr`/`SendActive` outlive every use; raw handles come from a live context | queued |
 | `ferrosa-sstable/src/direct.rs` | 3 | `F_NOCACHE`, `posix_fadvise`, one `ioctl` | the fd is open for the duration of the call; each call is a hint the kernel may ignore | audited |
 | `ferrosa-sstable/src/pump.rs` | 5 | `preadv`/`pwritev` scatter-gather, raw slice | `iov_base`/`iov_len` describe the same allocation for the whole call | queued |
@@ -52,7 +52,7 @@ Production sites by crate:
 | `ferrosa-cql/src/prometheus.rs` | 3 | `libc::getrlimit`/`sysconf` | the return code is checked before the out-param is read | queued |
 | `ferrosa-storage/src/range_merger.rs` | 3 | self-referential borrow across an await | the owner is pinned and outlives the stream | queued |
 | `ferrosa-loadgen/src/resource_monitor.rs` | 2 | `libc` resource query | return code checked | queued |
-| `ferrosa-sstable/src/dio_align.rs` | 2 | `mem::zeroed`, `posix_memalign`-style alignment | the zeroed type has no invalid all-zero bit pattern | queued |
+| `ferrosa-sstable/src/dio_align.rs` | 1 | `SYS_statx` for `STATX_DIOALIGN` | the fd is open across the call and the out-param is only read when the syscall returns 0 (the zero buffer is now a safe literal, not `mem::zeroed`) | queued |
 | `ferrosa-storage/src/write_set_spill.rs` | 2 | `memmap2::Mmap` | the file is never truncated or written while mapped | audited |
 | `ferrosa-storage/src/flush.rs` | 2 | `memmap2::Mmap`, `posix_fadvise` | same, plus the fd is valid for the call | mapping audited, `fadvise` queued |
 | `ferrosa-sstable/src/io.rs` | 1 | `memmap2::Mmap` | the file is never truncated or written while mapped | audited |
@@ -65,12 +65,16 @@ compiles only under `cargo test`. The scanner matched `#[cfg(test)]` only before
 that `impl` body as production. It is now excluded, and the test-only total below includes it. The
 same construct is why `ferrosa-schema` cannot be sealed — see *Sealed crates*.
 
-**Five of the seven mappings are audited; nothing else is.** The table is the queue, not a
+**Five of the seven mappings are audited; so is the commit-log buffer.** The table is the queue, not a
 certificate; `Status` moves to `audited` only when a reviewer has checked the invariant against the
 call sites and recorded what they checked — the three artifacts for each are in *The mapping
-contract* below. Most sites still carry no `SAFETY:` comment, and one that does may be restating the
-call rather than the mechanism; `docs/unsafe-policy.md` §3 defines the difference, and
-`scripts/ci-gates/guard-unsafe.py` reports the per-site figure on every run.
+contract* below, and for `segment.rs` the two are the mechanism sentence on `SegmentBuffer` and the
+tests `concurrent_writers_take_disjoint_ranges_and_lose_no_bytes` (RED under Miri on the commit before
+the change: overlapping `&mut Vec<u8>` retags) and
+`a_flush_between_a_reservation_and_its_write_must_not_publish_unwritten_bytes` (RED in plain
+`cargo test` before the atomic length). Most other sites still carry no `SAFETY:` comment, and one
+that does may be restating the call rather than the mechanism; `docs/unsafe-policy.md` §3 defines the
+difference, and `scripts/ci-gates/guard-unsafe.py` reports the per-site figure on every run.
 
 ## The mapping contract
 
@@ -113,7 +117,7 @@ cheap — are removed instead (`direct.rs`, 8 -> 3).
 
 ## Audit order
 
-Not all 60 sites are equally dangerous. Ranked by the consequences of getting the invariant wrong:
+Not all 64 sites are equally dangerous. Ranked by the consequences of getting the invariant wrong:
 
 1. **`store.rs:2122` — `&'static StoreView` from `Arc::as_ptr`.** A fabricated `'static` is the exact
    class of bug that produces a use-after-free the borrow checker cannot see. The question to answer:
@@ -123,9 +127,11 @@ Not all 60 sites are equally dangerous. Ranked by the consequences of getting th
    at minimum, torn data at worst). Every one of these needs the truncation contract written down and
    checked against the rename/GC paths, which is the same question ADR-022 asks about `fnf` segment
    headers.
-3. **`segment.rs` — `UnsafeCell` buffer with hand-written `Send`/`Sync`.** `unsafe impl Send`/`Sync` is
+3. **`segment.rs` — `SegmentBuffer` with hand-written `Send`/`Sync`.** `unsafe impl Send`/`Sync` is
    an assertion that the type's interior mutability is properly synchronised; if it is not, the failure
-   is a data race, which is the one bug class the compiler otherwise rules out.
+   is a data race, which is the one bug class the compiler otherwise rules out. This one is audited and
+   was the live bug it looks like: before the change the buffer was entered as `&mut Vec<u8>`, so two
+   writers held overlapping `&mut` and Miri caught it. What holds now is the reservation, not a comment.
 4. **`direct.rs` — three kernel hints.** `F_NOCACHE`, `posix_fadvise(POSIX_FADV_DONTNEED)` and one
    `ioctl`, each wrapped in `unsafe` only because `libc` is. The contract is narrow and local: the fd
    is open across the call (it is borrowed from a live `File`), and every one of these is advisory —

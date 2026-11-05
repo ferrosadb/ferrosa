@@ -17,6 +17,9 @@
 # gone, because a stale allowlist is how this kind of gate rots.
 #
 # Counted 2026-11-04 at de3eeb2c: 59 production sites in 16 files, 35 permitted and 24 findings.
+# Recounted 2026-11-05 on policy/unsafe-discipline: 64 sites in 16 files, 50 permitted and 14 findings —
+# the commit log's ten `perf` entries became the `sync-primitive` block below, and two `mem::zeroed()`
+# sites disappeared (buffer_bytes and ferrosa-sstable's KernelStatx::zeroed).
 
 # ── ferrosa (the binary) ─────────────────────────────────────────────────────────────────────────────
 
@@ -124,7 +127,7 @@ since  = "2026-11-04"
 file   = "ferrosa-loadgen/src/resource_monitor.rs"
 item   = "get_fd_limit"
 kind   = "syscall"
-reason = "rlim is zeroed as an initial value and read only inside the getrlimit == 0 arm; the error arm returns without touching it, and RLIMIT_NOFILE names a fixed resource with no pointer argument."
+reason = "getrlimit has no safe wrapper; the buffer is MaybeUninit and is read (assume_init) only inside the == 0 arm, so the out-param is never read before the kernel has written it, and RLIMIT_NOFILE names a fixed resource with no pointer argument."
 owner  = "loadgen"
 since  = "2026-11-04"
 
@@ -137,14 +140,6 @@ owner  = "loadgen"
 since  = "2026-11-04"
 
 # ── ferrosa-sstable ──────────────────────────────────────────────────────────────────────────────────
-
-[[allow]]
-file   = "ferrosa-sstable/src/dio_align.rs"
-item   = "zeroed"
-kind   = "layout"
-reason = "KernelStatx is a repr(C) kernel ABI struct whose fields are all integer, so the all-zero bit pattern is a valid value; the mask is 0, meaning no field is trusted until statx has filled it."
-owner  = "sstable"
-since  = "2026-11-04"
 
 [[allow]]
 file   = "ferrosa-sstable/src/dio_align.rs"
@@ -310,99 +305,147 @@ reason = "Ctx::from_raw reconstructs a borrowed handle from the JSContext kept i
 owner  = "udf"
 since  = "2026-11-04"
 
+# ── the commit log's disjoint-ranges buffer ─────────────────────────────────────────────────────────
+# `Segment` is written by several threads at once, each owning a disjoint byte range. std has no
+# primitive for that, so `SegmentBuffer` (ferrosa-storage/src/commitlog/segment.rs) supplies one, and
+# it is the only place that turns a reservation into a reference. These entries are that primitive:
+# `sync-primitive`, because the alternative is a `Mutex<Vec<u8>>` around the append path, which
+# serialises every write.
+
+[[allow]]
+file   = "ferrosa-storage/src/commitlog/segment.rs"
+item   = "unsafe impl Send for Segment"
+kind   = "sync-primitive"
+reason = "A Segment owns a SegmentBuffer, whose UnsafeCell<Vec<u8>> and NonNull<u8> are not Send on their own; the reservation protocol (one owner per [off, off+len)) is what makes moving it between threads sound, and std has no disjoint-ranges type whose impls would carry that."
+owner  = "storage"
+since  = "2026-11-05"
+
+[[allow]]
+file   = "ferrosa-storage/src/commitlog/segment.rs"
+item   = "unsafe impl Sync for Segment"
+kind   = "sync-primitive"
+reason = "The Sync half: every reference the buffer hands out covers one reservation, so two threads never hold overlapping views, and the marker patch is serialised against the flusher by file_handle. It is the same primitive as the Send half."
+owner  = "storage"
+since  = "2026-11-05"
+
+[[allow]]
+file   = "ferrosa-storage/src/commitlog/segment.rs"
+item   = "range_mut"
+kind   = "sync-primitive"
+reason = "From a raw base pointer it builds &mut [u8] over exactly [off, off+len); the caller owns that range because allocate()'s CAS returned the offset to it alone. This is the primitive std lacks: disjoint mutable ranges from one shared allocation."
+owner  = "storage"
+since  = "2026-11-05"
+
+# The `unsafe fn` declaration and the block inside it are two sites under one item, and both are the
+# same invariant: the declaration states the obligation, the block is where the slice is fabricated.
+
+[[allow]]
+file   = "ferrosa-storage/src/commitlog/segment.rs"
+item   = "range_mut"
+kind   = "sync-primitive"
+reason = "The from_raw_parts_mut block inside the signature above: same range, same reservation, after asserting off+len is inside the allocated length so the pointer arithmetic cannot leave the allocation."
+owner  = "storage"
+since  = "2026-11-05"
+
+[[allow]]
+file   = "ferrosa-storage/src/commitlog/segment.rs"
+item   = "prefix"
+kind   = "sync-primitive"
+reason = "The read half of the same primitive: &[u8] over [0, end) where end never exceeds the published length, and the flusher forms it under file_handle after wait_for_writers drained the append path."
+owner  = "storage"
+since  = "2026-11-05"
+
+[[allow]]
+file   = "ferrosa-storage/src/commitlog/segment.rs"
+item   = "prefix"
+kind   = "sync-primitive"
+reason = "The from_raw_parts block inside that signature: the same published prefix, formed after the debug assertions bound end by written() and by the allocated length, so the view is inside the allocation."
+owner  = "storage"
+since  = "2026-11-05"
+
+[[allow]]
+file   = "ferrosa-storage/src/commitlog/segment.rs"
+item   = "release"
+kind   = "sync-primitive"
+reason = "Moves the allocation out of the UnsafeCell; sound because file_handle excludes every flusher that could hold a view, the segment is rotated out of the active slot, and in_flight_writers is asserted zero. An owned per-writer shard design would remove it, and that redesign is named as the follow-up."
+owner  = "storage"
+since  = "2026-11-05"
+
+[[allow]]
+file   = "ferrosa-storage/src/commitlog/segment.rs"
+item   = "release"
+kind   = "sync-primitive"
+reason = "The assignment inside that signature: it replaces the Vec and drops the old allocation, which is why the length is zeroed immediately after and every later accessor refuses instead of following the freed pointer."
+owner  = "storage"
+since  = "2026-11-05"
+
+[[allow]]
+file   = "ferrosa-storage/src/commitlog/segment.rs"
+item   = "write_entry"
+kind   = "sync-primitive"
+reason = "Takes &mut [u8] over its own reservation only — never a &mut Vec<u8> over the whole buffer, which made two writers' references overlap. Writer w owns [off, off+len) because the CAS in allocate returned that offset to w alone, and the length is published with Release after the last byte."
+owner  = "storage"
+since  = "2026-11-05"
+
+[[allow]]
+file   = "ferrosa-storage/src/commitlog/segment.rs"
+item   = "write_single_row_entry"
+kind   = "sync-primitive"
+reason = "The single-row fast path of write_entry: the same range-scoped view over the range its own reservation claims, so the reference covers exactly the bytes this writer owns."
+owner  = "storage"
+since  = "2026-11-05"
+
+[[allow]]
+file   = "ferrosa-storage/src/commitlog/segment.rs"
+item   = "write_sync_marker"
+kind   = "sync-primitive"
+reason = "Reserves the eight marker bytes through allocate_and_begin_write, so the range is this writer's alone and a concurrent flush waits for it, instead of reading position and racing another caller for the same bytes."
+owner  = "storage"
+since  = "2026-11-05"
+
+[[allow]]
+file   = "ferrosa-storage/src/commitlog/segment.rs"
+item   = "write_sync_marker_at"
+kind   = "sync-primitive"
+reason = "Writes the new marker into the range it reserved, under marker_link, so no other marker writer can claim those bytes."
+owner  = "storage"
+since  = "2026-11-05"
+
+[[allow]]
+file   = "ferrosa-storage/src/commitlog/segment.rs"
+item   = "write_sync_marker_at"
+kind   = "sync-primitive"
+reason = "The backwards link patch into the previous marker: marker_link excludes other marker writers and file_handle excludes a flusher that could be reading those eight bytes, which is the only way a write below the flush watermark can coexist with a reader."
+owner  = "storage"
+since  = "2026-11-05"
+
+[[allow]]
+file   = "ferrosa-storage/src/commitlog/segment.rs"
+item   = "flush_inner"
+kind   = "sync-primitive"
+reason = "Reads the published prefix [0, written) under file_handle after wait_for_writers drained the append path, so no writer's mutable view overlaps it and the marker patch cannot land inside it."
+owner  = "storage"
+since  = "2026-11-05"
+
+[[allow]]
+file   = "ferrosa-storage/src/commitlog/segment.rs"
+item   = "force_full_flush"
+kind   = "sync-primitive"
+reason = "The same published-prefix read as flush_inner: bounded by written(), formed under file_handle, with the append path drained first."
+owner  = "storage"
+since  = "2026-11-05"
+
+[[allow]]
+file   = "ferrosa-storage/src/commitlog/segment.rs"
+item   = "release_buffer"
+kind   = "sync-primitive"
+reason = "Calls the buffer's release under file_handle, which is the lock every flusher and the marker patch take before touching the allocation, and asserts no writer is in flight; the freed allocation cannot be reached afterwards."
+owner  = "storage"
+since  = "2026-11-05"
+
 # ── findings ────────────────────────────────────────────────────────────────────────────────────────
 # These are not permitted. Each one is a `perf` or `unknown` site with the safe alternative that
 # removes it. Ranked by blast radius in docs/unsafe-policy.md §6.
-
-[[debt]]
-file   = "ferrosa-storage/src/commitlog/segment.rs"
-item   = "unsafe impl Send for Segment"
-kind   = "perf"
-reason = "exists so a Segment can be shared across writer threads over an UnsafeCell buffer without a lock; it is the enabling declaration for the ten buffer derefs below, not an independent site."
-fix    = "falls out once the buffer is a Mutex<Vec<u8>> or per-writer shards, because then the auto impls apply"
-owner  = "storage"
-since  = "2026-11-04"
-
-[[debt]]
-file   = "ferrosa-storage/src/commitlog/segment.rs"
-item   = "unsafe impl Sync for Segment"
-kind   = "perf"
-reason = "the Sync half of the same declaration: it asserts the UnsafeCell buffer is safe to share, which is what lets the append path skip a lock."
-fix    = "falls out with the buffer redesign; no manual Send/Sync remains"
-owner  = "storage"
-since  = "2026-11-04"
-
-[[debt]]
-file   = "ferrosa-storage/src/commitlog/segment.rs"
-item   = "write_entry"
-kind   = "perf"
-reason = "&mut *self.buffer.get() covers the whole Vec, so concurrent writers hold overlapping &mut to one allocation. The disjoint-byte-range claim does not make overlapping &mut sound: this is UB under Stacked and Tree Borrows, not merely a prohibited perf site."
-fix    = "Mutex<Vec<u8>> around allocate+copy, or per-writer shards; minimal sound form if the lock-free design stays is slice::from_raw_parts_mut(base.add(off), total_size) scoped to the owned range"
-owner  = "storage"
-since  = "2026-11-04"
-
-[[debt]]
-file   = "ferrosa-storage/src/commitlog/segment.rs"
-item   = "write_single_row_entry"
-kind   = "perf"
-reason = "the single-row fast path takes the same whole-buffer &mut as write_entry, for the same reason: to append without a lock."
-fix    = "same as write_entry — one Mutex or per-writer shards covers both entry writers"
-owner  = "storage"
-since  = "2026-11-04"
-
-[[debt]]
-file   = "ferrosa-storage/src/commitlog/segment.rs"
-item   = "write_sync_marker"
-kind   = "perf"
-reason = "writes the sync marker through a whole-buffer &mut rather than a lock, on the assumption that the sync strategy serialises against writers."
-fix    = "write the marker through the same Mutex/shard ownership as the entries"
-owner  = "storage"
-since  = "2026-11-04"
-
-[[debt]]
-file   = "ferrosa-storage/src/commitlog/segment.rs"
-item   = "write_sync_marker_at"
-kind   = "perf"
-reason = "the linking half of the marker write, again through a whole-buffer &mut so the flusher is never blocked by a writer."
-fix    = "same as write_sync_marker"
-owner  = "storage"
-since  = "2026-11-04"
-
-[[debt]]
-file   = "ferrosa-storage/src/commitlog/segment.rs"
-item   = "flush_inner"
-kind   = "perf"
-reason = "reads the buffer through &*self.buffer.get() so the flush does not take the append lock, relying on wait_for_writers() for ordering instead."
-fix    = "read through the Mutex/shard ownership; wait_for_writers already orders it off the hot path, so the lock costs nothing here"
-owner  = "storage"
-since  = "2026-11-04"
-
-[[debt]]
-file   = "ferrosa-storage/src/commitlog/segment.rs"
-item   = "force_full_flush"
-kind   = "perf"
-reason = "the same lock-free read as flush_inner on the operator-triggered full flush path."
-fix    = "as flush_inner"
-owner  = "storage"
-since  = "2026-11-04"
-
-[[debt]]
-file   = "ferrosa-storage/src/commitlog/segment.rs"
-item   = "buffer_bytes"
-kind   = "perf"
-reason = "reads the Vec's length field through a shared &Vec to avoid a lock for a metric; this is a data race against append and release_buffer, so the comment 'no slice access' does not make it sound. Cheapest fix in this file."
-fix    = "an AtomicUsize updated on append and on release_buffer"
-owner  = "storage"
-since  = "2026-11-04"
-
-[[debt]]
-file   = "ferrosa-storage/src/commitlog/segment.rs"
-item   = "release_buffer"
-kind = "perf"
-reason = "swaps the buffer through a whole-buffer &mut while holding the file lock, so the swap does not allocate or lock the append path."
-fix    = "the same Mutex/shard ownership as the writers"
-owner  = "storage"
-since  = "2026-11-04"
 
 [[debt]]
 file   = "ferrosa-storage/src/store.rs"
