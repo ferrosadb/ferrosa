@@ -30,7 +30,7 @@ table below. Adding an `unsafe` site requires adding a row — the count is the 
 
 | Scope | Sites |
 | --- | --- |
-| Production code (`src/`, outside `#[cfg(test)]`) | **60** |
+| Production code (`src/`, outside `#[cfg(test)]`) | **58** |
 | `#[cfg(test)]` modules inside `src/` | 65 |
 | `tests/` and `examples/` | 299 |
 | WASM example bindings (`examples/**/src/`) | 58 |
@@ -39,7 +39,7 @@ Production sites by crate:
 
 | File | Sites | Category | Invariant this site relies on | Status |
 | --- | --- | --- | --- | --- |
-| `ferrosa-storage/src/commitlog/segment.rs` | 11 | `UnsafeCell` shared buffer, manual `Send`/`Sync` | one writer at a time by construction; buffer is not aliased across the FFI boundary | queued |
+| `ferrosa-storage/src/commitlog/segment.rs` | 9 | `UnsafeCell` shared buffer, manual `Send`/`Sync` | one writer at a time by construction; buffer is not aliased across the FFI boundary | queued |
 | `ferrosa-udf/src/asc.rs` | 10 | FFI to the JS engine (`rquickjs`) | `CtxPtr`/`SendActive` outlive every use; raw handles come from a live context | queued |
 | `ferrosa-sstable/src/direct.rs` | 3 | `F_NOCACHE`, `posix_fadvise`, one `ioctl` | the fd is open for the duration of the call; each call is a hint the kernel may ignore | audited |
 | `ferrosa-sstable/src/pump.rs` | 5 | `preadv`/`pwritev` scatter-gather, raw slice | `iov_base`/`iov_len` describe the same allocation for the whole call | queued |

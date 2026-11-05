@@ -114,6 +114,7 @@ dependencies = [
  "num-bigint",
  "serde",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

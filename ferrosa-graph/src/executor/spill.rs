@@ -1,6 +1,6 @@
 //! Module: Spill adapter — lets graph result rows use the storage engine's
 //! bounded-memory external merge sort.
-//! Correctness: Correct when an [`OrderBySink`] orders rows EXACTLY as the
+//! Correctness: Correct when an `OrderBySink` orders rows EXACTLY as the
 //!   operator's in-memory ORDER BY always has (same key evaluation, same
 //!   comparator, same ASC/DESC and Null handling), so spilling changes memory
 //!   behavior and nothing else; and when the hidden sort-key columns it appends
@@ -35,17 +35,17 @@
 //! caller sorted the whole accumulated `Vec` in memory: a silent widening of
 //! the memory bound.
 //!
-//! Now [`OrderKeys::attach`] evaluates every ORDER BY term against the row's
+//! Now `OrderKeys::attach` evaluates every ORDER BY term against the row's
 //! bindings when the row is produced — exactly the evaluation the operator's
 //! in-memory sort performs — and appends the values as hidden trailing columns.
-//! The comparator orders by those columns only; [`OrderKeys::detach`] strips
+//! The comparator orders by those columns only; `OrderKeys::detach` strips
 //! them on the way out, so the `columns` a client sees never change. The hidden
 //! keys are counted in [`GraphRow::estimated_bytes`], so the spill threshold
 //! stays honest about what is resident.
 //!
 //! # Never re-collected
 //!
-//! There is no `finish_rows`. A sink's only output is [`OrderBySink::finish_stream`],
+//! There is no `finish_rows`. A sink's only output is `OrderBySink::finish_stream`,
 //! which reads the merge on pull. A buffered `GraphResult` caller may collect
 //! that stream at its own API boundary, but no operator can collect it.
 //!
@@ -150,7 +150,7 @@ pub enum OrderSemantics {
 /// Resolved to an INDEX up front (rather than carrying the expression) because
 /// the sorter compares rows in isolation — including rows read back from a
 /// spilled run, where no binding context exists. In the executor the index
-/// always points at a hidden key column (see [`OrderKeys`]).
+/// always points at a hidden key column (see `OrderKeys`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GraphOrderTerm {
     pub column: usize,
