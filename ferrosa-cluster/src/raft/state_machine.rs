@@ -417,6 +417,9 @@ struct PendingApply {
 /// (table registration).
 pub struct FerrosStateMachine {
     state: RaftState,
+    physical_lifecycle: Arc<super::physical_apply::PhysicalApplyLifecycle>,
+    // RAII owner token is absent from staged copies and snapshot builders.
+    _physical_owner: Option<super::physical_apply::PhysicalApplyOwner>,
     pending_apply: Option<PendingApply>,
     /// First caller-owned committed index not yet transferred to a retained job.
     /// Cancellation must not allow a later apply to silently skip this suffix.
@@ -460,6 +463,18 @@ pub struct FerrosStateMachine {
 }
 
 impl FerrosStateMachine {
+    pub(crate) fn physical_lifecycle(&self) -> Arc<super::physical_apply::PhysicalApplyLifecycle> {
+        Arc::clone(&self.physical_lifecycle)
+    }
+
+    fn physical_admission(
+        &self,
+    ) -> Result<Arc<super::physical_apply::PhysicalApplyLease>, StorageIOError<u64>> {
+        self.physical_lifecycle.admit().map_err(|error| {
+            StorageIOError::write_state_machine(to_any_error(std::io::Error::other(error)))
+        })
+    }
+
     /// The synchronous transition runs against a staged metadata copy. A
     /// detached waiter leaves the owned handle here, so the next trait call
     /// reaps it before exposing an applied index or constructing a snapshot.
@@ -478,6 +493,8 @@ impl FerrosStateMachine {
             durable_applied: self.durable_applied.clone(),
             pending_apply: None,
             unconsumed_input: None,
+            physical_lifecycle: Arc::clone(&self.physical_lifecycle),
+            _physical_owner: None,
             apply_failure: self.apply_failure.clone(),
             #[cfg(test)]
             projection_syncs: Arc::clone(&self.projection_syncs),
@@ -510,6 +527,7 @@ impl FerrosStateMachine {
                 let reason =
                     format!("Raft local apply or system projection persistence failed: {error}");
                 self.apply_failure = Some(reason.clone());
+                self.physical_lifecycle.fail(&reason);
                 return Err(Box::new(
                     StorageIOError::write_state_machine(to_any_error(std::io::Error::other(
                         reason,
@@ -520,6 +538,7 @@ impl FerrosStateMachine {
             Err(error) => {
                 let reason = format!("Raft physical apply job failed: {error}");
                 self.apply_failure = Some(reason.clone());
+                self.physical_lifecycle.fail(&reason);
                 return Err(Box::new(
                     StorageIOError::write_state_machine(to_any_error(std::io::Error::other(
                         reason,
@@ -530,6 +549,7 @@ impl FerrosStateMachine {
         };
         self.state = completed.state;
         self.last_applied = Some(pending.log_id);
+        self.physical_lifecycle.applied(self.last_applied);
         drop(pending.pauses);
         Ok(Some(completed.responses))
     }
@@ -615,6 +635,8 @@ impl FerrosStateMachine {
 
     /// Create a new state machine with empty state and no side-effect targets.
     pub fn new() -> Self {
+        let (physical_lifecycle, physical_owner) =
+            super::physical_apply::PhysicalApplyLifecycle::new_owner();
         // Default auto_join=true so initial cluster formation works without
         // explicit approval. Production clusters override via UpdateConfig.
         let mut state = RaftState::default();
@@ -631,6 +653,8 @@ impl FerrosStateMachine {
             system_writer: None,
             snapshot_path: None,
             durable_applied: None,
+            physical_lifecycle,
+            _physical_owner: Some(physical_owner),
             pending_apply: None,
             unconsumed_input: None,
             apply_failure: None,
@@ -807,6 +831,8 @@ impl FerrosStateMachine {
     /// Create a new state machine wired to local `Schema` and `StorageEngine`
     /// for side-effect propagation.
     pub fn with_side_effects(schema: Arc<Schema>, engine: Arc<StorageEngine>) -> Self {
+        let (physical_lifecycle, physical_owner) =
+            super::physical_apply::PhysicalApplyLifecycle::new_owner();
         let system_writer = Some(SystemTableWriter::new(Arc::clone(&engine)));
         Self {
             state: RaftState::default(),
@@ -820,6 +846,8 @@ impl FerrosStateMachine {
             system_writer,
             snapshot_path: None,
             durable_applied: None,
+            physical_lifecycle,
+            _physical_owner: Some(physical_owner),
             pending_apply: None,
             unconsumed_input: None,
             apply_failure: None,
@@ -895,6 +923,7 @@ impl FerrosStateMachine {
         meta: &SnapshotMeta<u64, BasicNode>,
         bytes: &[u8],
     ) -> Result<(), StorageIOError<u64>> {
+        let _physical = self.physical_admission()?;
         let lifecycle_schema = self.schema.clone();
         let _lifecycle = lifecycle_schema
             .as_ref()
@@ -917,6 +946,7 @@ impl FerrosStateMachine {
             self.last_membership = previous_membership;
             let reason = format!("Raft snapshot local restoration failed: {error}");
             self.apply_failure = Some(reason.clone());
+            self.physical_lifecycle.fail(&reason);
             return Err(StorageIOError::read_state_machine(to_any_error(
                 std::io::Error::other(reason),
             )));
@@ -1293,20 +1323,27 @@ impl FerrosStateMachine {
 
     #[allow(clippy::result_large_err)]
     pub fn recover_from_persisted_snapshot(&mut self) -> Result<bool, StorageIOError<u64>> {
-        let Some(path) = self.snapshot_path.clone() else {
-            return Ok(false);
-        };
-        if !path.exists() {
-            return Ok(false);
-        }
+        let result = (|| {
+            let Some(path) = self.snapshot_path.clone() else {
+                return Ok(false);
+            };
+            if !path.exists() {
+                return Ok(false);
+            }
 
-        let bytes = std::fs::read(&path)
-            .map_err(|e| StorageIOError::read_state_machine(to_any_error(e)))?;
-        let persisted: PersistedSnapshot = bincode::deserialize(&bytes)
-            .map_err(|e| StorageIOError::read_state_machine(to_any_error(e)))?;
-        self.apply_snapshot_data(&persisted.meta, &persisted.bytes)?;
-        self.publish_snapshot(persisted.meta, persisted.bytes);
-        Ok(true)
+            let bytes = std::fs::read(&path)
+                .map_err(|e| StorageIOError::read_state_machine(to_any_error(e)))?;
+            let persisted: PersistedSnapshot = bincode::deserialize(&bytes)
+                .map_err(|e| StorageIOError::read_state_machine(to_any_error(e)))?;
+            self.apply_snapshot_data(&persisted.meta, &persisted.bytes)?;
+            self.publish_snapshot(persisted.meta, persisted.bytes);
+            self.physical_lifecycle.applied(self.last_applied);
+            Ok(true)
+        })();
+        if let Err(error) = &result {
+            self.physical_lifecycle.fail(error);
+        }
+        result
     }
 
     /// Rebuild the live `TokenRing` from current `RaftState` and store it.
@@ -2451,6 +2488,7 @@ impl Default for FerrosStateMachine {
 
 impl RaftSnapshotBuilder<FerrosRaftConfig> for FerrosStateMachine {
     async fn build_snapshot(&mut self) -> Result<Snapshot<FerrosRaftConfig>, StorageError<u64>> {
+        let physical = self.physical_admission()?;
         self.finish_pending_apply().await.map_err(|error| *error)?;
         let data = SnapshotData {
             state: self.state.clone(),
@@ -2482,11 +2520,18 @@ impl RaftSnapshotBuilder<FerrosRaftConfig> for FerrosStateMachine {
         self.publish_snapshot(meta.clone(), bytes.clone());
         if let Some(path) = self.snapshot_path.clone() {
             let meta_for_disk = meta.clone();
+            let disk_lifecycle = Arc::clone(&self.physical_lifecycle);
             let bytes_for_disk = bytes.clone();
             #[allow(clippy::result_large_err)]
             ferrosa_net::task_pool::TaskPool::current("raft-log-store")
                 .spawn_blocking(move || {
-                    Self::persist_snapshot_to_disk(&path, &meta_for_disk, &bytes_for_disk)
+                    let _physical = physical.into_job();
+                    let result =
+                        Self::persist_snapshot_to_disk(&path, &meta_for_disk, &bytes_for_disk);
+                    if let Err(error) = &result {
+                        disk_lifecycle.fail(error);
+                    }
+                    result
                 })
                 .await
                 .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))??;
@@ -2511,6 +2556,7 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
         &mut self,
     ) -> Result<(Option<LogId<u64>>, StoredMembership<u64, BasicNode>), StorageError<u64>> {
         self.finish_pending_apply().await.map_err(|error| *error)?;
+        self.physical_lifecycle.applied(self.last_applied);
         Ok((self.last_applied, self.last_membership.clone()))
     }
 
@@ -2519,6 +2565,7 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
         I: IntoIterator<Item = Entry<FerrosRaftConfig>> + Send,
         I::IntoIter: Send,
     {
+        let physical = self.physical_admission()?;
         let mut entries = entries.into_iter().peekable();
         let first = entries.peek().map(|entry| entry.log_id.index);
         let required = self.unconsumed_input;
@@ -2548,6 +2595,7 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
             match entry.payload {
                 EntryPayload::Blank => {
                     self.last_applied = Some(entry.log_id);
+                    self.physical_lifecycle.applied(self.last_applied);
                     self.unconsumed_input = entries.peek().map(|next| next.log_id.index);
                     responses.push(RaftResponse::Ok);
                 }
@@ -2620,21 +2668,32 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
                     let pauses = Arc::new(pauses);
                     let worker_pauses = Arc::clone(&pauses);
                     let mut staged = self.staged_apply();
+                    let physical_job = Arc::clone(&physical).into_job();
+                    let job_lifecycle = Arc::clone(&self.physical_lifecycle);
                     let job = ferrosa_net::task_pool::TaskPool::current("raft-physical-apply")
                         .spawn_blocking(move || {
+                            let _physical = physical_job;
                             let _pauses = worker_pauses;
-                            let mut responses = Vec::with_capacity(commands.len());
-                            let mut dirty = false;
-                            for command in commands {
-                                let (response, system_writes) = staged.apply_command(command)?;
-                                dirty |= staged.flush_pending_system_writes(system_writes)?;
-                                responses.push(response);
+                            let result: ferrosa_common::Result<CompletedApply> = (|| {
+                                let mut responses = Vec::with_capacity(commands.len());
+                                let mut dirty = false;
+                                for command in commands {
+                                    let (response, system_writes) =
+                                        staged.apply_command(command)?;
+                                    dirty |= staged.flush_pending_system_writes(system_writes)?;
+                                    responses.push(response);
+                                }
+                                staged.sync_projection(dirty)?;
+                                Ok(CompletedApply {
+                                    state: staged.state,
+                                    responses,
+                                })
+                            })(
+                            );
+                            if let Err(error) = &result {
+                                job_lifecycle.fail(error);
                             }
-                            staged.sync_projection(dirty)?;
-                            Ok(CompletedApply {
-                                state: staged.state,
-                                responses,
-                            })
+                            result
                         });
                     self.pending_apply = Some(PendingApply {
                         log_id: last_log_id,
@@ -2651,6 +2710,7 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
                 }
                 EntryPayload::Membership(membership) => {
                     self.last_applied = Some(entry.log_id);
+                    self.physical_lifecycle.applied(self.last_applied);
                     self.last_membership = StoredMembership::new(Some(entry.log_id), membership);
                     self.unconsumed_input = entries.peek().map(|next| next.log_id.index);
                     responses.push(RaftResponse::Ok);
@@ -2685,6 +2745,8 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
             durable_applied: self.durable_applied.clone(),
             pending_apply: None,
             unconsumed_input: None,
+            physical_lifecycle: Arc::clone(&self.physical_lifecycle),
+            _physical_owner: None,
             apply_failure: self.apply_failure.clone(),
             #[cfg(test)]
             projection_syncs: Arc::clone(&self.projection_syncs),
@@ -2703,23 +2765,38 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
         meta: &SnapshotMeta<u64, BasicNode>,
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<u64>> {
-        self.finish_pending_apply().await.map_err(|error| *error)?;
-        let bytes = snapshot.into_inner();
-        self.apply_snapshot_data(meta, &bytes)?;
-        self.publish_snapshot(meta.clone(), bytes.clone());
-        if let Some(path) = self.snapshot_path.clone() {
-            let meta_for_disk = meta.clone();
-            #[allow(clippy::result_large_err)]
-            ferrosa_net::task_pool::TaskPool::current("raft-log-store")
-                .spawn_blocking(move || {
-                    Self::persist_snapshot_to_disk(&path, &meta_for_disk, &bytes)
-                })
-                .await
-                .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))??;
-            self.mark_durably_applied(meta.last_log_id);
-        }
+        let result = async {
+            let physical = self.physical_admission()?;
+            self.finish_pending_apply().await.map_err(|error| *error)?;
+            let bytes = snapshot.into_inner();
+            self.apply_snapshot_data(meta, &bytes)?;
+            self.publish_snapshot(meta.clone(), bytes.clone());
+            if let Some(path) = self.snapshot_path.clone() {
+                let meta_for_disk = meta.clone();
+                let disk_lifecycle = Arc::clone(&self.physical_lifecycle);
+                #[allow(clippy::result_large_err)]
+                ferrosa_net::task_pool::TaskPool::current("raft-log-store")
+                    .spawn_blocking(move || {
+                        let _physical = physical.into_job();
+                        let result = Self::persist_snapshot_to_disk(&path, &meta_for_disk, &bytes);
+                        if let Err(error) = &result {
+                            disk_lifecycle.fail(error);
+                        }
+                        result
+                    })
+                    .await
+                    .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))??;
+                self.mark_durably_applied(meta.last_log_id);
+            }
+            self.physical_lifecycle.applied(self.last_applied);
 
-        Ok(())
+            Ok(())
+        }
+        .await;
+        if let Err(error) = &result {
+            self.physical_lifecycle.fail(error);
+        }
+        result
     }
 
     async fn get_current_snapshot(
@@ -6065,6 +6142,89 @@ mod tests {
     /// We pre-create the file, then issue `RaftOp::CreateTable` and
     /// confirm apply refuses publication with the original registration reason,
     /// retains the preceding index, and prevents a successor from applying.
+    #[tokio::test]
+    async fn physical_retirement_tracks_successful_snapshot_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut source = FerrosStateMachine::new();
+        source
+            .apply(vec![make_entry(
+                1,
+                7,
+                RaftOp::CreateKeyspace(simple_keyspace("installed_ks")),
+            )])
+            .await
+            .unwrap();
+        let snapshot = source.build_snapshot().await.unwrap();
+        let expected = snapshot.meta.last_log_id;
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let path = dir.path().join("installed.snapshot.bin");
+        let mut target = FerrosStateMachine::with_side_effects_and_snapshot_path(
+            Arc::clone(&schema),
+            engine,
+            path.clone(),
+        );
+        let lifecycle = target.physical_lifecycle();
+        target
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        assert!(schema.snapshot().keyspaces.contains_key("installed_ks"));
+        assert_eq!(target.last_applied, expected);
+        assert!(path.is_file());
+        drop(target);
+        assert_eq!(
+            lifecycle.drain().await.unwrap(),
+            expected,
+            "completed snapshot must cover the persisted committed retirement target"
+        );
+    }
+
+    #[tokio::test]
+    async fn physical_retirement_refuses_failed_snapshot_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut source = FerrosStateMachine::new();
+        source
+            .apply(vec![
+                make_entry(
+                    1,
+                    1,
+                    RaftOp::CreateKeyspace(simple_keyspace("failed_install")),
+                ),
+                make_entry(
+                    1,
+                    2,
+                    RaftOp::CreateTable(Box::new(simple_table("failed_install", "victim"))),
+                ),
+            ])
+            .await
+            .unwrap();
+        let snapshot = source.build_snapshot().await.unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let blocker = dir.path().join("sstables/failed_install.victim");
+        std::fs::create_dir_all(blocker.parent().unwrap()).unwrap();
+        std::fs::write(&blocker, b"owned physical refusal").unwrap();
+        let mut target = FerrosStateMachine::with_side_effects_and_snapshot_path(
+            Arc::new(test_schema_instance()),
+            engine,
+            dir.path().join("failed.snapshot.bin"),
+        );
+        let lifecycle = target.physical_lifecycle();
+        assert!(target
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .is_err());
+        assert!(target.last_applied.is_none());
+        drop(target);
+        assert!(
+            lifecycle.drain().await.is_err(),
+            "failed restore must not authorize Pair retirement"
+        );
+        assert_eq!(std::fs::read(blocker).unwrap(), b"owned physical refusal");
+    }
+
     #[tokio::test]
     async fn apply_command_propagates_engine_register_failure() {
         let dir = tempfile::tempdir().unwrap();

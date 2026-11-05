@@ -55,6 +55,14 @@ renames it, and flushes the directory before reporting success. Cancelled async
 waiters cannot make concurrent writers truncate or rename one another's staging
 files.
 
+Controller retirement separately tracks the actual state-machine owner and its
+queued/running physical jobs. Core shutdown alone is not a drain. Before replacing
+Raft authority with Pair, the controller seals new group starts, waits for the SM
+queue and retained jobs, and checks applied coverage against persisted commitment.
+Failed jobs and unresolved committed suffixes refuse the handoff. Snapshot install
+progress is reported only after successful completion. These in-memory leases add
+no per-entry disk I/O; they do not implement a durable failed-apply repair journal.
+
 2. **Read/write coordination** (`coordinator/`) — fans writes and reads out to
    replicas with tunable CQL consistency-level (CL) enforcement, write
    backpressure, read repair, batchlog, and range/streaming reads.
@@ -854,11 +862,16 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   i.e. every ring member other than this node and the named, connected peer is
   down, and only if those downed members are a Raft-voter MINORITY. Two-phase
   and fenced (t_47bbeb66, `controller/dissolution.rs`): the peer durably
-  records `dissolved-into-pair.json` and stops its Raft group first
-  (`PairDissolve`), then this node does the same and installs the pair path.
-  A node holding the marker never starts Raft, restarts `Standalone` rather
-  than as a returning member, and admits only its partner as a peer, so the
-  members taken down can never re-form the old cluster (CL-42, CL-45).
+  records retirement intent in `dissolved-into-pair.json`, drains its Core,
+  state-machine queue and physical jobs, then confirms `retirement_complete`
+  before installing Pair (`PairDissolve`). This node follows the same sequence.
+  A confirmed marker disables Raft and retains the existing partner-only
+  `Standalone` restart path. An incomplete or legacy unconfirmed marker instead
+  keeps the node degraded, unhealthy and closed to peers; its bytes remain for
+  verified recovery. Concurrent public retirement operations refuse rather than
+  retiring different peers, and stale checks cannot rewrite partner authority.
+  The legacy unversioned peer `Done` reply is not cross-version retirement proof;
+  mixed-version dissolution and lost phase-one reply recovery remain unqualified.
 
 ### Accord transactions (`accord/`)
 - **A PostgreSQL snapshot's staleness is judged on the transaction's OWN keys, never on a

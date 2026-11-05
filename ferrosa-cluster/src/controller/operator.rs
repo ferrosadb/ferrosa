@@ -186,6 +186,11 @@ impl ModeController {
     /// no Raft group or Raft directory; the T-300 jsonb guard; no peer manager;
     /// the peer not confirming phase 1.
     pub async fn downgrade_to_pair(&self, named_peer: Option<Uuid>) -> Result<Uuid> {
+        let _operation = self.raft_retirement_operation.try_lock().map_err(|_| {
+            ClusterError::ModeTransitionRejected(
+                "another Raft retirement operation is in progress".into(),
+            )
+        })?;
         let Some(named_peer) = named_peer else {
             return Err(ClusterError::ModeTransitionRejected(
                 "downgrade to pair requires a named peer to replicate to; pass the \
@@ -225,6 +230,11 @@ impl ModeController {
         &self,
         req: super::dissolution::PairDissolveRequest,
     ) -> Result<()> {
+        let _operation = self.raft_retirement_operation.try_lock().map_err(|_| {
+            ClusterError::ModeTransitionRejected(
+                "another Raft retirement operation is in progress".into(),
+            )
+        })?;
         if req.peer != self.local_host_id {
             return Err(ClusterError::ModeTransitionRejected(format!(
                 "pair dissolution addressed to {}, but this node is {}",
@@ -380,20 +390,29 @@ impl ModeController {
         Ok(voters)
     }
 
-    /// Record the dissolution durably, stop Raft, and install the pair path
-    /// with `partner`. The marker is written FIRST: a crash after it leaves a
-    /// node that refuses Raft on restart, never one that rejoins the old group.
+    /// Record dissolution intent, drain Raft and its physical workers, then
+    /// confirm retirement durably before installing Pair. An incomplete marker
+    /// refuses both Raft and local/Pair write ownership after restart.
     async fn dissolve_locally(&self, partner: Uuid, checked: &CheckedDissolution) -> Result<()> {
-        let dissolution = super::dissolution::PairDissolution {
+        let mut dissolution = super::dissolution::PairDissolution {
             pair: [self.local_host_id, partner],
             former_voters: checked.voters.clone(),
             dissolved_at_ms: super::dissolution::now_ms(),
+            retirement_complete: false,
         };
-        super::dissolution::write_dissolution(&checked.raft_dir, &dissolution)?;
-        self.dissolution
-            .store(Arc::new(super::dissolution::DissolutionState::Dissolved(
-                dissolution,
-            )));
+        {
+            let _guard = self.transition_guard.lock();
+            if **self.mode.load() != DeploymentMode::Cluster {
+                return Err(ClusterError::ModeTransitionRejected(
+                    "stale dissolution: this node no longer owns Cluster mode".into(),
+                ));
+            }
+            super::dissolution::write_dissolution(&checked.raft_dir, &dissolution)?;
+            self.dissolution
+                .store(Arc::new(super::dissolution::DissolutionState::Unreadable(
+                    "physical retirement is pending; Pair write ownership is not confirmed".into(),
+                )));
+        }
         self.stop_raft_for_downgrade().await?;
         {
             // Hold `transition_guard` across the transition so the mode cannot
@@ -409,11 +428,16 @@ impl ModeController {
                      changed underneath it; not installing the pair path"
                 );
                 return Err(ClusterError::ModeTransitionRejected(format!(
-                    "Raft was stopped but the mode changed to {now} before the pair \
-                     transition; the dissolution is recorded, so restart the node to \
-                     come up as half of the pair"
+                    "Raft was stopped but the mode changed to {now}; retirement intent \
+                     remains incomplete and requires verified recovery"
                 )));
             }
+            dissolution.retirement_complete = true;
+            super::dissolution::write_dissolution(&checked.raft_dir, &dissolution)?;
+            self.dissolution
+                .store(Arc::new(super::dissolution::DissolutionState::Dissolved(
+                    dissolution,
+                )));
             self.transition_to_pair_operator_override(partner, checked.partner_addr);
         }
         if **self.mode.load() != DeploymentMode::Pair {
@@ -436,14 +460,16 @@ impl ModeController {
     /// longer a voter. A failed shutdown aborts the downgrade.
     async fn stop_raft_for_downgrade(&self) -> Result<()> {
         let groups = self.raft_groups.load_full();
-        for (id, raft) in groups.iter() {
-            raft.shutdown().await.map_err(|e| {
+        self.physical_raft_workers
+            .stop_and_drain(&groups)
+            .await
+            .map_err(|error| {
+                self.consensus_health
+                    .fail("raft_retirement_incomplete", format_args!("{error}"));
                 ClusterError::RaftError(format!(
-                    "downgrade to pair: failed to stop Raft group {id:?}: {e}"
+                    "downgrade to pair: physical retirement failed: {error}"
                 ))
             })?;
-            tracing::warn!(group = ?id, "OPERATOR ACTION: Raft group stopped for downgrade to pair");
-        }
         self.raft_groups
             .store(Arc::new(std::collections::HashMap::new()));
         Ok(())
@@ -542,4 +568,300 @@ struct CheckedDissolution {
     /// Members taken down (host ids).
     down: Vec<Uuid>,
     raft_dir: std::path::PathBuf,
+}
+
+#[cfg(test)]
+mod physical_handoff_tests {
+    use super::*;
+    use crate::raft::log_store::SledLogStore;
+    use crate::raft::network::FerrosRaftNetworkFactory;
+    use crate::raft::state_machine::FerrosStateMachine;
+    use crate::raft::{FerrosRaft, FerrosRaftConfig, RaftCommand, RaftOp};
+    use ferrosa_net::peer::{PeerEventListener, PeerManager};
+    use ferrosa_storage::observer::{ObserverMode, WriteObserver};
+    use ferrosa_storage::{
+        Mutation, StorageEngine, StorageEngineConfig, SyncStrategyConfig, TableId,
+    };
+    use openraft::raft::AppendEntriesRequest;
+    use openraft::{BasicNode, CommittedLeaderId, Entry, EntryPayload, LogId, Membership, Vote};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+    struct NoopListener;
+    impl PeerEventListener for NoopListener {
+        fn on_peer_connected(&self, _: ferrosa_net::rpc::PeerId) {}
+        fn on_peer_disconnected(&self, _: ferrosa_net::rpc::PeerId) {}
+        fn on_peer_suspected(&self, _: ferrosa_net::rpc::PeerId) {}
+        fn on_peer_recovered(&self, _: Uuid) {}
+        fn on_peer_failed(&self, _: Uuid) {}
+    }
+
+    struct WriteWitness {
+        key: Vec<u8>,
+        reached: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+    impl WriteObserver for WriteWitness {
+        fn mode(&self) -> ObserverMode {
+            ObserverMode::Sync
+        }
+        fn tables(&self) -> Vec<TableId> {
+            vec![TableId::new("system_schema", "keyspaces")]
+        }
+        fn on_write(&self, _: &TableId, mutation: &Mutation) -> Vec<Mutation> {
+            if mutation.key.key.as_bytes() == self.key {
+                if let Some(reached) = self.reached.lock().take() {
+                    let _ = reached.send(());
+                }
+            }
+            Vec::new()
+        }
+    }
+
+    fn keyspace(name: &str) -> ferrosa_schema::metadata::keyspace::KeyspaceMetadata {
+        ferrosa_schema::metadata::keyspace::KeyspaceMetadata {
+            name: name.into(),
+            durable_writes: true,
+            replication: ferrosa_schema::metadata::keyspace::ReplicationParams {
+                strategy: "SimpleStrategy".into(),
+                options: HashMap::from([("replication_factor".into(), "1".into())]),
+            },
+        }
+    }
+    fn entry(index: u64, name: &str) -> Entry<FerrosRaftConfig> {
+        Entry {
+            log_id: LogId::new(CommittedLeaderId::new(5, 99), index),
+            payload: EntryPayload::Normal(RaftCommand {
+                op: RaftOp::CreateKeyspace(keyspace(name)),
+                schema_version: Uuid::new_v4(),
+            }),
+        }
+    }
+
+    /// Real follower commits, a real blocked WAL file, and a second queued SM
+    /// command distinguish Core shutdown from physical worker retirement.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn physical_worker_retirement_precedes_pair_handoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(&dir.path().join("data"));
+        config.commit_log.sync_strategy = SyncStrategyConfig::default();
+        let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+        engine.register_system_tables().unwrap();
+        let schema = crate::controller::tests::test_schema();
+        let controller =
+            ModeController::standalone_for_test(Arc::clone(&schema), Arc::clone(&engine));
+        controller.mode.store(Arc::new(DeploymentMode::Cluster));
+        let peers = Arc::new(PeerManager::new(
+            Arc::new(ferrosa_net::config::NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+        controller
+            .peer_manager
+            .store(Arc::new(Some(Arc::clone(&peers))));
+        let network = FerrosRaftNetworkFactory::new(
+            peers,
+            Arc::new(crate::raft::replication_health::ReplicationHealth::new()),
+        );
+        let raft_dir = dir.path().join("raft");
+        let log = SledLogStore::new(&raft_dir).unwrap();
+        let sm = FerrosStateMachine::with_side_effects(Arc::clone(&schema), Arc::clone(&engine));
+        let physical = controller
+            .physical_raft_workers
+            .reserve(
+                crate::raft::RaftGroupId::default_dc(),
+                sm.physical_lifecycle(),
+            )
+            .unwrap();
+        physical.bind_log(log.committed_reader());
+        let raft = Arc::new(
+            FerrosRaft::new(
+                1,
+                Arc::new(
+                    openraft::Config {
+                        enable_elect: false,
+                        ..Default::default()
+                    }
+                    .validate()
+                    .unwrap(),
+                ),
+                network,
+                log,
+                sm,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(physical.install_raft(Arc::clone(&raft)));
+        controller.set_raft_for_group(crate::raft::RaftGroupId::default_dc(), Arc::clone(&raft));
+
+        let (reached, first_write) = tokio::sync::oneshot::channel();
+        engine.register_observer(Arc::new(WriteWitness {
+            key: b"held_effect".to_vec(),
+            reached: parking_lot::Mutex::new(Some(reached)),
+        }));
+        let (release, released) = std::sync::mpsc::channel();
+        let (locked, acquired) = tokio::sync::oneshot::channel();
+        let held_engine = Arc::clone(&engine);
+        let holder = std::thread::spawn(move || {
+            held_engine.with_commit_log_flush_held_for_test(|| {
+                locked.send(()).unwrap();
+                released
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("fixture releases actual WAL mutex");
+            })
+        });
+        acquired.await.unwrap();
+        let membership = Entry {
+            log_id: LogId::new(CommittedLeaderId::new(5, 99), 0),
+            payload: EntryPayload::Membership(Membership::new(
+                vec![BTreeSet::from([1, 99])],
+                BTreeMap::from([(1, BasicNode::default()), (99, BasicNode::default())]),
+            )),
+        };
+        raft.append_entries(AppendEntriesRequest {
+            vote: Vote::new_committed(5, 99),
+            prev_log_id: None,
+            entries: vec![membership, entry(1, "held_effect")],
+            leader_commit: Some(LogId::new(CommittedLeaderId::new(5, 99), 1)),
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), first_write)
+            .await
+            .expect("exact canonical write entered")
+            .unwrap();
+        raft.append_entries(AppendEntriesRequest {
+            vote: Vote::new_committed(5, 99),
+            prev_log_id: Some(LogId::new(CommittedLeaderId::new(5, 99), 1)),
+            entries: vec![entry(2, "queued_effect")],
+            leader_commit: Some(LogId::new(CommittedLeaderId::new(5, 99), 2)),
+        })
+        .await
+        .unwrap();
+        assert!(!schema.snapshot().keyspaces.contains_key("queued_effect"));
+        raft.shutdown().await.unwrap();
+        let partner = Uuid::new_v4();
+        let checked = CheckedDissolution {
+            partner_addr: "127.0.0.1:1".parse().unwrap(),
+            voters: vec![1, 99, 100],
+            down: vec![Uuid::new_v4()],
+            raft_dir,
+        };
+        let mut transition = Box::pin(controller.dissolve_locally(partner, &checked));
+        let first_poll = futures::poll!(transition.as_mut());
+        let waited = first_poll.is_pending();
+        let stayed_cluster = **controller.mode.load() == DeploymentMode::Cluster;
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        match first_poll {
+            std::task::Poll::Pending => transition.await.unwrap(),
+            std::task::Poll::Ready(result) => result.unwrap(),
+        }
+        assert!(
+            waited && stayed_cluster,
+            "Core shutdown must not install Pair while old shared-engine work is held"
+        );
+        assert_eq!(**controller.mode.load(), DeploymentMode::Pair);
+        assert!(schema.snapshot().keyspaces.contains_key("held_effect"));
+        assert!(
+            schema.snapshot().keyspaces.contains_key("queued_effect"),
+            "committed queued suffix must land before Pair owns writes"
+        );
+    }
+    #[tokio::test]
+    async fn incomplete_retirement_refuses_local_write_ownership_after_restart() {
+        for completion in [None, Some(false), Some(true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = Arc::new(crate::ClusterConfig {
+                raft_data_dir: Some(dir.path().join("raft")),
+                ..Default::default()
+            });
+            let raft_dir = crate::controller::cluster::configured_raft_dir(&config).unwrap();
+            std::fs::create_dir_all(&raft_dir).unwrap();
+            let local = Uuid::new_v4();
+            let partner = Uuid::new_v4();
+            let mut record = serde_json::json!({"pair":[local,partner],"former_voters":[1,2,3],"dissolved_at_ms":1});
+            if let Some(complete) = completion {
+                record["retirement_complete"] = complete.into();
+            }
+            let path = crate::controller::dissolution::marker_path(&raft_dir);
+            let bytes = serde_json::to_vec(&record).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            let engine = Arc::new(
+                StorageEngine::new(
+                    StorageEngineConfig::test_config(&dir.path().join("data")),
+                    None,
+                )
+                .unwrap(),
+            );
+            let (controller, _) = ModeController::new(
+                config,
+                Arc::new(ferrosa_net::config::NetConfig::default()),
+                local,
+                engine,
+                crate::controller::tests::test_schema(),
+                Arc::new(ferrosa_net::rpc::HandlerRegistry::new()),
+            );
+            if completion == Some(true) {
+                assert_eq!(
+                    controller.mode(),
+                    DeploymentMode::Standalone,
+                    "confirmed retirement retains existing Pair restart path"
+                );
+                assert!(controller.consensus_health.is_healthy());
+            } else {
+                assert_eq!(controller.mode(), DeploymentMode::DegradedCluster, "intent-only or legacy unproven marker must not confer local/Pair write ownership");
+                assert!(!controller.consensus_health.is_healthy());
+                assert!(!controller.dissolution.load().admits_peer(local, partner));
+            }
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                bytes,
+                "startup must preserve repair evidence"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn physical_stale_dissolution_cannot_rebind_confirmed_partner() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap(),
+        );
+        let controller =
+            ModeController::standalone_for_test(crate::controller::tests::test_schema(), engine);
+        controller.mode.store(Arc::new(DeploymentMode::Pair));
+        let old_partner = Uuid::new_v4();
+        let dissolution = crate::controller::dissolution::PairDissolution {
+            pair: [controller.local_host_id, old_partner],
+            former_voters: vec![1, 2, 3],
+            dissolved_at_ms: 1,
+            retirement_complete: true,
+        };
+        let raft_dir = dir.path().join("raft");
+        crate::controller::dissolution::write_dissolution(&raft_dir, &dissolution).unwrap();
+        controller.dissolution.store(Arc::new(
+            crate::controller::dissolution::DissolutionState::Dissolved(dissolution),
+        ));
+        let path = crate::controller::dissolution::marker_path(&raft_dir);
+        let before = std::fs::read(&path).unwrap();
+        let checked = CheckedDissolution {
+            partner_addr: "127.0.0.1:1".parse().unwrap(),
+            voters: vec![1, 2, 3],
+            down: vec![Uuid::new_v4()],
+            raft_dir,
+        };
+        assert!(controller
+            .dissolve_locally(Uuid::new_v4(), &checked)
+            .await
+            .is_err());
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            before,
+            "stale checked operation must not rewrite durable partner authority"
+        );
+        assert_eq!(**controller.mode.load(), DeploymentMode::Pair);
+        assert!(controller
+            .dissolution
+            .load()
+            .admits_peer(controller.local_host_id, old_partner));
+    }
 }

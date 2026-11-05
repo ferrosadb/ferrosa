@@ -51,6 +51,17 @@ files rather than adopting a purge point on a failed restore. This is not a
 rollback of already visible physical effects or automatic recovery. Snapshot
 file publication and network agreement deadlines are separate boundaries.
 
+Physical retirement also owns the actual OpenRaft SM loop lifetime, independently
+of Core's shutdown join. A sealed start/publication registry waits for that owner
+and every retained blocking job, then verifies applied coverage of durable
+commitment before Pair takes authority. Snapshot completion advances that coverage;
+orphaned job panics retain failure even if an async lease share survives unwind.
+Public retirement operations use a nonblocking operation permit before phase one.
+Intent-only/legacy dissolution records refuse standalone/Pair restart authority;
+`retirement_complete` is persisted only after the drain and final mode check.
+These guards add no per-entry fsync and do not implement automatic failed-apply
+repair or prove legacy/mixed-version peer receipts.
+
 ## Module map
 
 | Module | Responsibility |

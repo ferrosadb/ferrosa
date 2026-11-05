@@ -294,6 +294,22 @@ pub struct SledLogStore {
     durable_applied: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
+/// A read-only view retained for verifying retirement after Core has stopped.
+/// It introduces no new persistence or acknowledgement boundary.
+#[derive(Clone)]
+pub(crate) struct CommittedLogReader {
+    meta: sled::Tree,
+}
+
+impl CommittedLogReader {
+    pub(crate) fn read(&self) -> Result<Option<LogId<u64>>, StorageIOError<u64>> {
+        Ok(
+            SledLogStore::load_meta::<Option<LogId<u64>>>(&self.meta, META_COMMITTED)?
+                .unwrap_or(None),
+        )
+    }
+}
+
 /// Counts of entries cleared by [`SledLogStore::reset`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResetCounts {
@@ -516,6 +532,12 @@ impl SledLogStore {
     /// reads it to bound `purge`. They must be the same cell, which is why it
     /// is handed over at construction rather than passed per call -- openraft
     /// owns the two halves separately once Raft is running.
+    pub(crate) fn committed_reader(&self) -> CommittedLogReader {
+        CommittedLogReader {
+            meta: self.meta.clone(),
+        }
+    }
+
     pub fn durable_applied_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
         self.durable_applied.clone()
     }

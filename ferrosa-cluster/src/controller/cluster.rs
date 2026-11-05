@@ -1455,6 +1455,17 @@ impl ModeController {
         // past what this state machine reports durable; without this handshake
         // the watermark stays 0 and the guard is inert.
         state_machine.set_durable_applied_handle(log_store.durable_applied_handle());
+        let mut physical_registration = match self.physical_raft_workers.reserve(
+            crate::raft::RaftGroupId::for_dc(&self.config.data_center),
+            state_machine.physical_lifecycle(),
+        ) {
+            Ok(registration) => registration,
+            Err(error) => {
+                self.consensus_health
+                    .fail("raft_physical_retirement", format_args!("{error}"));
+                return;
+            }
+        };
 
         let recovered_persisted_snapshot = match state_machine.recover_from_persisted_snapshot() {
             Ok(recovered) => recovered,
@@ -1546,6 +1557,22 @@ impl ModeController {
                                     state_machine.set_durable_applied_handle(
                                         log_store.durable_applied_handle(),
                                     );
+                                    physical_registration =
+                                        match self.physical_raft_workers.reserve(
+                                            crate::raft::RaftGroupId::for_dc(
+                                                &self.config.data_center,
+                                            ),
+                                            state_machine.physical_lifecycle(),
+                                        ) {
+                                            Ok(registration) => registration,
+                                            Err(error) => {
+                                                self.consensus_health.fail(
+                                                    "raft_physical_retirement",
+                                                    format_args!("{error}"),
+                                                );
+                                                return;
+                                            }
+                                        };
                                 }
                                 Err(e) => {
                                     tracing::error!(
@@ -1868,6 +1895,7 @@ impl ModeController {
 
         // Spawn background Raft initialization — Raft::new() is async and
         // must not block the PeerEventListener callback.
+        physical_registration.bind_log(log_store.committed_reader());
         let raft_groups_swap = self.raft_groups.clone();
         let local_raft_group_id = crate::raft::RaftGroupId::for_dc(&self.config.data_center);
         // CL-76: handles the election loop needs to notice a completed DC membership
@@ -2589,6 +2617,10 @@ impl ModeController {
             };
 
             let raft_arc = Arc::new(raft);
+            if !physical_registration.install_raft(Arc::clone(&raft_arc)) {
+                let _ = raft_arc.shutdown().await;
+                return;
+            }
 
             // Publish the Raft instance — handlers waiting in LazyRaft::get() will unblock.
             // If no subscribers are listening (LazyRaft was never queried), the
@@ -2597,6 +2629,7 @@ impl ModeController {
             // of the Raft handle, so the node will silently fall behind.
             // Surface this as an error and increment the silent-failure
             // counter so the situation is observable.
+            if !physical_registration.publish(|| {
             if let Err(e) = raft_tx.send(Some(raft_arc.clone())) {
                 RAFT_PUBLISH_NO_SUBSCRIBERS.fetch_add(1, AtomicOrdering::Relaxed);
                 tracing::error!(
@@ -2612,6 +2645,7 @@ impl ModeController {
                     "raft instance published to ClusterMembershipForward watch with no subscribers"
                 );
             }
+            }) { return; }
 
             // Also publish to the controller's raft_groups map so that
             // controller.raft() returns Some() during the election loop.
@@ -2622,7 +2656,7 @@ impl ModeController {
             // from the configured data_center. Single-DC deployments install
             // exactly one group; multi-DC bootstrap (Sprint 6 W6.3) extends
             // this to one per DC.
-            {
+            if !physical_registration.publish(|| {
                 let prev = raft_groups_swap.load_full();
                 let mut next: std::collections::HashMap<
                     crate::raft::RaftGroupId,
@@ -2630,6 +2664,8 @@ impl ModeController {
                 > = (*prev).clone();
                 next.insert(local_raft_group_id, raft_arc.clone());
                 raft_groups_swap.store(Arc::new(next));
+            }) {
+                return;
             }
 
             // Spawn the election-storm watchdog (P0-17 fix, path c).
@@ -3933,7 +3969,7 @@ impl ModeController {
 
             // Store the raft instance so it is accessible via controller.raft()
             // (ADR-015: keyed by per-DC RaftGroupId).
-            {
+            if !physical_registration.publish(|| {
                 let prev = raft_groups_swap.load_full();
                 let mut next: std::collections::HashMap<
                     crate::raft::RaftGroupId,
@@ -3941,6 +3977,8 @@ impl ModeController {
                 > = (*prev).clone();
                 next.insert(local_raft_group_id, raft_arc);
                 raft_groups_swap.store(Arc::new(next));
+            }) {
+                return;
             }
         });
     }

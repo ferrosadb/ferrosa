@@ -254,6 +254,8 @@ pub struct ModeController {
     /// [`RaftGroupId::default_dc`]. Replaces the prior single
     /// `raft_instance` field — see ADR-015.
     pub(super) raft_groups: Arc<ArcSwap<HashMap<RaftGroupId, Arc<FerrosRaft>>>>,
+    pub(super) physical_raft_workers: Arc<crate::raft::physical_apply::PhysicalRaftWorkers>,
+    pub(super) raft_retirement_operation: tokio::sync::Mutex<()>,
     /// Known DC for each connected peer. Populated by
     /// [`Self::record_peer_dc`] when a peer announces its DC during the
     /// connection handshake. Used by `transition_to_cluster` to filter
@@ -521,6 +523,15 @@ impl ModeController {
         let initial_mode = match super::controller::cluster::configured_raft_dir(&config) {
             // A dissolved cluster outranks the cluster-member marker: the node
             // is half of a pair now, never a returning member (t_47bbeb66).
+            Some(_)
+                if matches!(
+                    dissolution_state,
+                    dissolution::DissolutionState::Unreadable(_)
+                ) =>
+            {
+                tracing::error!(reason = ?dissolution_state.raft_refusal(), "dissolution retirement is incomplete; refusing local write ownership");
+                DeploymentMode::DegradedCluster
+            }
             Some(_) if dissolution_state != dissolution::DissolutionState::None => {
                 tracing::warn!(
                     reason = ?dissolution_state.raft_refusal(),
@@ -551,9 +562,19 @@ impl ModeController {
         // jsonb DDL gate reads it at every entry and apply, so it can never
         // lag a transition the controller has made.
         schema.set_deployment_mode(initial_mode);
+        let consensus_health = Arc::new(ConsensusHealth::new());
+        if matches!(
+            dissolution_state,
+            dissolution::DissolutionState::Unreadable(_)
+        ) {
+            consensus_health.fail(
+                "raft_retirement_incomplete",
+                format_args!("{:?}", dissolution_state.raft_refusal()),
+            );
+        }
         let controller = Arc::new(Self {
             self_weak: std::sync::OnceLock::new(),
-            consensus_health: Arc::new(ConsensusHealth::new()),
+            consensus_health,
             replication_health: Arc::new(crate::raft::replication_health::ReplicationHealth::new()),
             leader_contact: Arc::new(crate::raft::leader_contact::LeaderContact::new()),
             mode: schema.deployment_mode_handle(),
@@ -574,6 +595,10 @@ impl ModeController {
             dissolution: ArcSwap::from_pointee(dissolution_state),
             pair_dissolve_transport: ArcSwap::from_pointee(None),
             raft_groups: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            physical_raft_workers: Arc::new(
+                crate::raft::physical_apply::PhysicalRaftWorkers::default(),
+            ),
+            raft_retirement_operation: tokio::sync::Mutex::new(()),
             peer_dcs: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             peer_racks: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             hint_store,
@@ -750,6 +775,10 @@ impl ModeController {
             dissolution: ArcSwap::from_pointee(dissolution::DissolutionState::None),
             pair_dissolve_transport: ArcSwap::from_pointee(None),
             raft_groups: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            physical_raft_workers: Arc::new(
+                crate::raft::physical_apply::PhysicalRaftWorkers::default(),
+            ),
+            raft_retirement_operation: tokio::sync::Mutex::new(()),
             peer_dcs: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             peer_racks: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             hint_store,
@@ -831,6 +860,10 @@ impl ModeController {
             dissolution: ArcSwap::from_pointee(dissolution::DissolutionState::None),
             pair_dissolve_transport: ArcSwap::from_pointee(None),
             raft_groups: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            physical_raft_workers: Arc::new(
+                crate::raft::physical_apply::PhysicalRaftWorkers::default(),
+            ),
+            raft_retirement_operation: tokio::sync::Mutex::new(()),
             peer_dcs: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             peer_racks: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             hint_store,

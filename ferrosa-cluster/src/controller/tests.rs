@@ -4696,6 +4696,7 @@ async fn a_dissolved_node_refuses_to_start_raft() {
             pair: [me, partner],
             former_voters: vec![1, 2, 3],
             dissolved_at_ms: 1,
+            retirement_complete: true,
         },
     )
     .unwrap();
