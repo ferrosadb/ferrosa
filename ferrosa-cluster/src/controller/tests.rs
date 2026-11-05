@@ -12,9 +12,9 @@ use ferrosa_net::rpc::server::RpcServer;
 use ferrosa_net::rpc::{PeerId, RpcHandler};
 use proptest::prelude::*;
 
-fn test_storage(dir: &std::path::Path) -> Arc<StorageEngine> {
+fn test_storage_config(dir: &std::path::Path) -> ferrosa_storage::StorageEngineConfig {
     use ferrosa_storage::{CommitLogConfig, CompactionConfig, StorageEngineConfig};
-    let config = StorageEngineConfig {
+    StorageEngineConfig {
         commit_log: CommitLogConfig {
             log_dir: dir.to_path_buf(),
             checkpoint_dir: dir.to_path_buf(),
@@ -36,8 +36,11 @@ fn test_storage(dir: &std::path::Path) -> Arc<StorageEngine> {
         max_pending_replay_mutations_without_schema: 1024,
         memtable_num_shards: 64,
         cache_hot_window_secs: 900,
-    };
-    Arc::new(StorageEngine::new(config, None).unwrap())
+    }
+}
+
+fn test_storage(dir: &std::path::Path) -> Arc<StorageEngine> {
+    Arc::new(StorageEngine::new(test_storage_config(dir), None).unwrap())
 }
 
 /// The controller's own schema fixture. `pub(crate)` so the in-crate test modules of
@@ -177,6 +180,38 @@ async fn fresh_and_rebuilt_raft_storage_share_controller_recovery_admission() {
             "{incarnation} purge never advances once the gate is free"
         );
     }
+}
+
+#[tokio::test]
+async fn recovery_quarantine_closes_common_readiness_without_closing_protocol_handshake() {
+    let dir = tempfile::tempdir().unwrap();
+    let (controller, _handles) = ModeController::new(
+        Arc::new(ClusterConfig::default()),
+        Arc::new(NetConfig::default()),
+        Uuid::new_v4(),
+        test_storage(dir.path()),
+        test_schema(),
+        Arc::new(HandlerRegistry::new()),
+    );
+    assert!(controller.consensus_is_healthy());
+    assert!(controller.is_cql_ready());
+    assert!(controller.accepts_cql_connections());
+    controller
+        .recovery_admission()
+        .quarantine("owned-raft-group", "verified repair is still pending");
+    assert!(
+        !controller.consensus_is_healthy(),
+        "shared quarantine must close data/readiness admission"
+    );
+    assert!(!controller.is_cql_ready());
+    assert!(
+        controller.accepts_cql_connections(),
+        "keep protocol negotiation and typed refusal responses available"
+    );
+    assert!(
+        controller.consensus_health().is_healthy(),
+        "recoverable quarantine must not poison permanent consensus health"
+    );
 }
 
 #[test]
@@ -6092,8 +6127,14 @@ async fn switchover_drains_admitted_writes_before_granting_the_peer_authority() 
 /// Build a controller wired to a peer manager, ready to transition, and return
 /// it with the peer ids/addresses a transition will name.
 async fn boot_gate_controller(dir: &std::path::Path) -> (Arc<ModeController>, Uuid, SocketAddr) {
-    let storage = test_storage(dir);
-    let schema = test_schema();
+    boot_gate_controller_with_storage(dir, test_storage(dir), test_schema()).await
+}
+
+async fn boot_gate_controller_with_storage(
+    dir: &std::path::Path,
+    storage: Arc<StorageEngine>,
+    schema: Arc<Schema>,
+) -> (Arc<ModeController>, Uuid, SocketAddr) {
     let config = Arc::new(ClusterConfig {
         raft_data_dir: Some(dir.join("raft")),
         ..ClusterConfig::default()
@@ -8038,4 +8079,264 @@ async fn corrupt_persisted_restore_refuses_cluster_transition_without_erasing_ev
         raft_dir.is_dir(),
         "Do not replace or discard failed recovery evidence."
     );
+}
+
+#[tokio::test]
+async fn failed_raft_drop_cold_start_enters_online_quarantine() {
+    use crate::raft::state_machine::FerrosStateMachine;
+    use crate::raft::{FerrosRaftConfig, RaftCommand, RaftOp};
+    use ferrosa_common::{DecoratedKey, PartitionKey};
+    use ferrosa_storage::TableId;
+    use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+    let entry = |index, op| Entry::<FerrosRaftConfig> {
+        log_id: LogId::new(CommittedLeaderId::new(1, 1), index),
+        payload: EntryPayload::Normal(RaftCommand {
+            op,
+            schema_version: Uuid::new_v4(),
+        }),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    storage.register_system_tables().unwrap();
+    let schema = test_schema();
+    let table = switchover_kv_table(false);
+    let tid = TableId::new(&table.keyspace, &table.name);
+    let snapshot = super::cluster::raft_log_dir_for_dc(
+        &dir.path().join("raft"),
+        &ClusterConfig::default().data_center,
+    )
+    .join("state-machine.snapshot.bin");
+    let mut sm = FerrosStateMachine::with_side_effects_and_snapshot_path(
+        Arc::clone(&schema),
+        Arc::clone(&storage),
+        snapshot.clone(),
+    );
+    let keyspace = ferrosa_schema::metadata::keyspace::KeyspaceMetadata {
+        name: table.keyspace.clone(),
+        durable_writes: true,
+        replication: ferrosa_schema::metadata::keyspace::ReplicationParams {
+            strategy: "SimpleStrategy".into(),
+            options: [("replication_factor".into(), "1".into())]
+                .into_iter()
+                .collect(),
+        },
+    };
+    sm.apply(vec![
+        entry(1, RaftOp::CreateKeyspace(keyspace)),
+        entry(2, RaftOp::CreateTable(Box::new(table.clone()))),
+    ])
+    .await
+    .unwrap();
+    let key = DecoratedKey::new(PartitionKey::new(b"acknowledged-row".to_vec()));
+    storage
+        .write(
+            &tid,
+            &key,
+            ferrosa_sstable::types::Row {
+                clustering: vec![],
+                cells: vec![],
+                deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
+            },
+            1,
+        )
+        .unwrap();
+    storage.flush(&tid).unwrap();
+    assert_eq!(storage.read(&tid, &key).unwrap().unwrap().rows.len(), 1);
+    sm.build_snapshot().await.unwrap();
+    let original = std::fs::read(&snapshot).unwrap();
+    storage
+        .unregister_table(&TableId::new("system_schema", "tables"))
+        .unwrap();
+    assert!(sm
+        .apply(vec![entry(
+            3,
+            RaftOp::DropTable {
+                keyspace: table.keyspace.clone(),
+                table: table.name.clone()
+            }
+        )])
+        .await
+        .is_err());
+    assert_eq!(sm.last_applied_index(), Some(2));
+    drop(sm);
+    drop(storage);
+    drop(schema);
+
+    let (cold, pending) = StorageEngine::open(test_storage_config(dir.path()), None).unwrap();
+    cold.register_system_tables().unwrap();
+    cold.replay_mutations(pending).unwrap();
+    let (controller, peer_id, _) =
+        boot_gate_controller_with_storage(dir.path(), Arc::new(cold), test_schema()).await;
+    assert!(
+        controller.is_cql_ready(),
+        "unpoisoned standalone fixture must admit CQL before actual recovery"
+    );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    controller.transition_to_cluster(vec![(peer_id, listener.local_addr().unwrap())]);
+    let reason = controller.recovery_admission().reason();
+    assert!(
+        reason.is_some(),
+        "failed DROP must enter shared online quarantine on cold startup; the recorded inconsistency cannot become a healthy empty table"
+    );
+    assert!(
+        !controller.is_cql_ready(),
+        "the mounted CQL admission predicate must refuse reads after failed DROP recovery"
+    );
+    // Quarantine must retain recovery material. It does not declare the
+    // absence of a Raft instance to be a completed, terminal boot refusal.
+    assert_eq!(std::fs::read(snapshot).unwrap(), original);
+}
+
+#[tokio::test]
+async fn cold_quarantine_retirement_uses_real_committed_and_purged_bounds() {
+    use crate::raft::log_store::SledLogStore;
+    use crate::raft::state_machine::FerrosStateMachine;
+    use crate::raft::{FerrosRaftConfig, RaftCommand, RaftOp};
+    use ferrosa_common::{DecoratedKey, PartitionKey};
+    use ferrosa_storage::TableId;
+    use openraft::storage::{RaftLogStorage, RaftSnapshotBuilder, RaftStateMachine};
+    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+    let entry = |index, op| Entry::<FerrosRaftConfig> {
+        log_id: LogId::new(CommittedLeaderId::new(1, 1), index),
+        payload: EntryPayload::Normal(RaftCommand {
+            op,
+            schema_version: Uuid::new_v4(),
+        }),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    storage.register_system_tables().unwrap();
+    let schema = test_schema();
+    let table = switchover_kv_table(false);
+    let tid = TableId::new(&table.keyspace, &table.name);
+    let dc = ClusterConfig::default().data_center;
+    let raft_dir = super::cluster::raft_log_dir_for_dc(&dir.path().join("raft"), &dc);
+    let snapshot = raft_dir.join("state-machine.snapshot.bin");
+    let mut sm = FerrosStateMachine::with_side_effects_and_snapshot_path(
+        schema.clone(),
+        storage.clone(),
+        snapshot.clone(),
+    );
+    let keyspace = ferrosa_schema::metadata::keyspace::KeyspaceMetadata {
+        name: table.keyspace.clone(),
+        durable_writes: true,
+        replication: ferrosa_schema::metadata::keyspace::ReplicationParams {
+            strategy: "SimpleStrategy".into(),
+            options: [("replication_factor".into(), "1".into())]
+                .into_iter()
+                .collect(),
+        },
+    };
+    let setup = vec![
+        entry(1, RaftOp::CreateKeyspace(keyspace)),
+        entry(2, RaftOp::CreateTable(Box::new(table.clone()))),
+    ];
+    sm.apply(setup.clone()).await.unwrap();
+    let key = DecoratedKey::new(PartitionKey::new(b"acknowledged-row".to_vec()));
+    storage
+        .write(
+            &tid,
+            &key,
+            ferrosa_sstable::types::Row {
+                clustering: vec![],
+                cells: vec![],
+                deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
+            },
+            1,
+        )
+        .unwrap();
+    storage.flush(&tid).unwrap();
+    assert!(storage.read(&tid, &key).unwrap().is_some());
+    sm.build_snapshot().await.unwrap();
+    let original_snapshot = std::fs::read(&snapshot).unwrap();
+    let committed = LogId::new(CommittedLeaderId::new(1, 1), 3);
+    let purged = LogId::new(CommittedLeaderId::new(1, 1), 2);
+    let mut log = SledLogStore::new(&raft_dir).unwrap();
+    log.append_recovery_fixture(setup).await.unwrap();
+    log.save_committed(Some(purged)).await.unwrap();
+    log.durable_applied_handle()
+        .store(2, std::sync::atomic::Ordering::Release);
+    log.purge(purged).await.unwrap();
+    let drop_entry = entry(
+        3,
+        RaftOp::DropTable {
+            keyspace: table.keyspace.clone(),
+            table: table.name.clone(),
+        },
+    );
+    log.append_recovery_fixture(vec![drop_entry.clone()])
+        .await
+        .unwrap();
+    log.save_committed(Some(committed)).await.unwrap();
+    assert_eq!(log.read_committed().await.unwrap(), Some(committed));
+    assert_eq!(log.last_purged_log_id().unwrap(), Some(purged));
+    drop(log);
+    storage
+        .unregister_table(&TableId::new("system_schema", "tables"))
+        .unwrap();
+    assert!(sm.apply(vec![drop_entry]).await.is_err());
+    assert_eq!(sm.last_applied_index(), Some(2));
+    drop(sm);
+    drop(storage);
+    drop(schema);
+    let (cold, pending) = StorageEngine::open(test_storage_config(dir.path()), None).unwrap();
+    cold.register_system_tables().unwrap();
+    cold.replay_mutations(pending).unwrap();
+    let (controller, peer, _) =
+        boot_gate_controller_with_storage(dir.path(), Arc::new(cold), test_schema()).await;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    controller.transition_to_cluster(vec![(peer, listener.local_addr().unwrap())]);
+    let native = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        controller.wait_for_raft_repair_preparation(&dc),
+    )
+    .await
+    .expect("native preparation must finish")
+    .expect("native preparation must succeed");
+    // Repeated discovery must retain the prepared owner, not reopen its locked files.
+    controller.transition_to_cluster(vec![(peer, listener.local_addr().unwrap())]);
+    let repeated = controller
+        .wait_for_raft_repair_preparation(&dc)
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&native, &repeated));
+    drop(repeated);
+    let epoch = controller.recovery_admission().epoch();
+    let retired = controller
+        .retire_raft_group_for_recovery(&dc, epoch)
+        .await
+        .expect("cold quarantine must bind actual log metadata before retiring the owner");
+    assert_eq!(retired.group(), crate::raft::RaftGroupId::for_dc(&dc));
+    assert_eq!(retired.owners().len(), 1);
+    assert_eq!(retired.owners()[0].committed, Some(committed));
+    assert_eq!(retired.owners()[0].purged, Some(purged));
+    let prepared = &native.preparation;
+    assert_eq!(prepared.retirement_scope, retired.scope());
+    assert_eq!(
+        prepared.required_snapshot_index, 2,
+        "need=max(synced,purged), not committed target3"
+    );
+    assert_eq!(prepared.committed_target.as_ref().unwrap().index, 3);
+    let scope = retired.scope();
+    assert!(controller.recovery_admission().admits().is_err());
+    drop(native);
+    drop(retired);
+    drop(controller);
+    let resumed = crate::raft::recovery_session::RecoverySession::for_snapshot(&snapshot);
+    let record = resumed.record().unwrap().unwrap();
+    assert_eq!(
+        record.phase,
+        crate::raft::recovery_journal::RecoveryPhase::Repairing
+    );
+    assert_eq!(record.retirement_scope, Some(scope));
+    assert_eq!(record.committed_target.as_ref().unwrap().index, 3);
+    assert_eq!(record.purge_point, 2);
+    assert!(
+        resumed.startup_reason().unwrap().is_some(),
+        "preparation is never healthy admission"
+    );
+    assert_eq!(std::fs::read(snapshot).unwrap(), original_snapshot);
 }

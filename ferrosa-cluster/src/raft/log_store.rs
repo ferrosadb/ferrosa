@@ -690,6 +690,14 @@ impl SledLogStore {
     /// also exercise the error path here directly without needing to
     /// construct a `LogFlushed` callback (which has a `pub(crate)`
     /// constructor inside openraft).
+    #[cfg(test)]
+    pub(crate) async fn append_recovery_fixture(
+        &mut self,
+        entries: Vec<Entry<FerrosRaftConfig>>,
+    ) -> Result<(), StorageError<u64>> {
+        self.append_inner(entries).await
+    }
+
     async fn append_inner<I>(&mut self, entries: I) -> Result<(), StorageError<u64>>
     where
         I: IntoIterator<Item = Entry<FerrosRaftConfig>> + Send,

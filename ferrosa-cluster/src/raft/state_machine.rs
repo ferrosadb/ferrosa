@@ -529,6 +529,8 @@ pub struct FerrosStateMachine {
     state: RaftState,
     physical_lifecycle: Arc<super::physical_apply::PhysicalApplyLifecycle>,
     recovery_admission: Arc<super::quarantine::RecoveryAdmission>,
+    recovery_session: Option<Arc<super::recovery_session::RecoverySession>>,
+    recovery_required: bool,
     // RAII owner token is absent from staged copies and snapshot builders.
     _physical_owner: Option<super::physical_apply::PhysicalApplyOwner>,
     pending_apply: Option<PendingApply>,
@@ -575,6 +577,15 @@ pub struct FerrosStateMachine {
 
 impl FerrosStateMachine {
     /// Use the controller's shared recovery gate for this group and its builders.
+    pub(crate) fn recovery_requires_repair(&self) -> bool {
+        self.recovery_required
+    }
+    pub(crate) fn recovery_session_handle(
+        &self,
+    ) -> Option<Arc<super::recovery_session::RecoverySession>> {
+        self.recovery_session.clone()
+    }
+
     pub fn set_recovery_admission(&mut self, admission: Arc<super::quarantine::RecoveryAdmission>) {
         self.recovery_admission = admission;
     }
@@ -621,6 +632,8 @@ impl FerrosStateMachine {
             unconsumed_input: None,
             physical_lifecycle: Arc::clone(&self.physical_lifecycle),
             recovery_admission: Arc::clone(&self.recovery_admission),
+            recovery_session: self.recovery_session.clone(),
+            recovery_required: self.recovery_required,
             _physical_owner: None,
             apply_failure: self.apply_failure.clone(),
             #[cfg(test)]
@@ -782,6 +795,8 @@ impl FerrosStateMachine {
             durable_applied: None,
             physical_lifecycle,
             recovery_admission: Arc::new(super::quarantine::RecoveryAdmission::new()),
+            recovery_session: None,
+            recovery_required: false,
             _physical_owner: Some(physical_owner),
             pending_apply: None,
             unconsumed_input: None,
@@ -976,6 +991,8 @@ impl FerrosStateMachine {
             durable_applied: None,
             physical_lifecycle,
             recovery_admission: Arc::new(super::quarantine::RecoveryAdmission::new()),
+            recovery_session: None,
+            recovery_required: false,
             _physical_owner: Some(physical_owner),
             pending_apply: None,
             unconsumed_input: None,
@@ -992,6 +1009,9 @@ impl FerrosStateMachine {
         snapshot_path: PathBuf,
     ) -> Self {
         let mut sm = Self::with_side_effects(schema, engine);
+        sm.recovery_session = Some(Arc::new(
+            super::recovery_session::RecoverySession::for_snapshot(&snapshot_path),
+        ));
         sm.snapshot_path = Some(snapshot_path);
         sm
     }
@@ -1476,6 +1496,24 @@ impl FerrosStateMachine {
     #[allow(clippy::result_large_err)]
     pub fn recover_from_persisted_snapshot(&mut self) -> Result<bool, StorageIOError<u64>> {
         let result = (|| {
+            if let Some(session) = &self.recovery_session {
+                match session.startup_reason() {
+                    Ok(None) => {}
+                    Ok(Some(reason)) => {
+                        self.recovery_required = true;
+                        self.recovery_admission.quarantine("local-raft", &reason);
+                        return Ok(false);
+                    }
+                    Err(error) => {
+                        self.recovery_required = true;
+                        self.recovery_admission.quarantine(
+                            "local-raft",
+                            format!("cannot validate recovery session: {error}"),
+                        );
+                        return Ok(false);
+                    }
+                }
+            }
             let Some(path) = self.snapshot_path.clone() else {
                 return Ok(false);
             };
@@ -2730,12 +2768,25 @@ impl RaftSnapshotBuilder<FerrosRaftConfig> for FerrosStateMachine {
             let meta_for_disk = meta.clone();
             let disk_lifecycle = Arc::clone(&self.physical_lifecycle);
             let bytes_for_disk = bytes.clone();
+            let disk_session = self.recovery_session.clone();
             #[allow(clippy::result_large_err)]
             ferrosa_net::task_pool::TaskPool::current("raft-log-store")
                 .spawn_blocking(move || {
                     let _physical = physical.into_job();
                     let result =
-                        Self::persist_snapshot_to_disk(&path, &meta_for_disk, &bytes_for_disk);
+                        Self::persist_snapshot_to_disk(&path, &meta_for_disk, &bytes_for_disk)
+                            .and_then(|()| {
+                                if let Some(session) = &disk_session {
+                                    session
+                                        .snapshot_synced(
+                                            meta_for_disk.last_log_id.map_or(0, |id| id.index),
+                                        )
+                                        .map_err(|error| {
+                                            StorageIOError::write_state_machine(to_any_error(error))
+                                        })?;
+                                }
+                                Ok(())
+                            });
                     if let Err(error) = &result {
                         disk_lifecycle.fail(error);
                     }
@@ -2878,11 +2929,14 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
                     let mut staged = self.staged_apply();
                     let physical_job = Arc::clone(&physical).into_job();
                     let job_lifecycle = Arc::clone(&self.physical_lifecycle);
+                    let recovery_session = self.recovery_session.clone();
+                    let recovery_admission = Arc::clone(&self.recovery_admission);
+                    let previous_index = self.last_applied.map_or(0, |id| id.index);
                     let job = ferrosa_net::task_pool::TaskPool::current("raft-physical-apply")
                         .spawn_blocking(move || {
                             let _physical = physical_job;
                             let _pauses = worker_pauses;
-                            let result: ferrosa_common::Result<CompletedApply> = (|| {
+                            let transition = || {
                                 let mut responses = Vec::with_capacity(commands.len());
                                 let mut dirty = false;
                                 for command in commands {
@@ -2896,9 +2950,24 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
                                     state: staged.state,
                                     responses,
                                 })
-                            })(
-                            );
+                            };
+                            let result: ferrosa_common::Result<CompletedApply> =
+                                match &recovery_session {
+                                    Some(session) => session.execute(
+                                        last_log_id.index,
+                                        previous_index,
+                                        |reason| {
+                                            recovery_admission.quarantine("local-raft", reason);
+                                            job_lifecycle.fail(reason);
+                                        },
+                                        transition,
+                                    ),
+                                    None => transition(),
+                                };
                             if let Err(error) = &result {
+                                if recovery_session.is_none() {
+                                    recovery_admission.quarantine("local-raft", error.to_string());
+                                }
                                 job_lifecycle.fail(error);
                             }
                             result
@@ -2955,6 +3024,8 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
             unconsumed_input: None,
             physical_lifecycle: Arc::clone(&self.physical_lifecycle),
             recovery_admission: Arc::clone(&self.recovery_admission),
+            recovery_session: self.recovery_session.clone(),
+            recovery_required: self.recovery_required,
             _physical_owner: None,
             apply_failure: self.apply_failure.clone(),
             #[cfg(test)]

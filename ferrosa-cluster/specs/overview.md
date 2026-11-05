@@ -445,3 +445,6 @@ ordinary group starts/publication and global Pair retirement refuse; unrelated
 group registration remains available. The returned observations are quiescence
 and log-position evidence, not a storage-adoption or healthy-state receipt.
 There is no fault-clear or replacement-release operation in this prerequisite.
+
+
+Recovery sessions retain a durable pre-effect guard beside each Raft group directory. After an unsafe restart, native startup keeps admission closed, drains that group’s actual state-machine owner, and records the retirement scope plus committed and purged bounds for repair preparation. Repeated peer discovery retains that session rather than reopening its files. Preparation does not authorize data installation, Core replacement, or healthy admission; verified physical-data installation and the corresponding release path remain unfinished.
