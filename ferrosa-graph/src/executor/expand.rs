@@ -588,14 +588,10 @@ fn return_only_stream<'a>(
         .limit
         .map(|limit| limit.max(0) as usize)
         .unwrap_or(usize::MAX);
-    let row = futures::stream::once(async move {
-        let bindings = HashMap::new();
-        Ok(return_clause
-            .items
-            .iter()
-            .map(|item| eval::eval_expr(&item.expr, &bindings).unwrap_or(serde_json::Value::Null))
-            .collect::<Vec<_>>())
-    });
+    let row =
+        futures::stream::once(
+            async move { eval_return_items(&return_clause.items, &HashMap::new()) },
+        );
     let stats = QueryStats {
         vertices_read: 0,
         edges_read: 0,
@@ -1432,32 +1428,16 @@ async fn execute_unwind(
             .limit
             .map(|l| l.max(0) as usize)
             .unwrap_or(usize::MAX);
-        let projected = futures::stream::iter(states.iter()).map(|state| {
-            Ok(return_clause
-                .items
-                .iter()
-                .map(|item| {
-                    eval::eval_expr(&item.expr, &state.bindings).unwrap_or(serde_json::Value::Null)
-                })
-                .collect::<Vec<_>>())
-        });
+        let projected = futures::stream::iter(states.iter())
+            .map(|state| eval_return_items(&return_clause.items, &state.bindings));
         let stream: crate::executor::stream::RowStream<'_> = Box::pin(projected.take(limit));
         crate::executor::stream::collect_rows(stream).await?
     } else {
-        let mut rows = Vec::new();
+        let mut rows = Vec::with_capacity(states.len());
         for state in &states {
-            rows.push(
-                return_clause
-                    .items
-                    .iter()
-                    .map(|item| {
-                        eval::eval_expr(&item.expr, &state.bindings)
-                            .unwrap_or(serde_json::Value::Null)
-                    })
-                    .collect::<Vec<_>>(),
-            );
+            rows.push(eval_return_items(&return_clause.items, &state.bindings)?);
         }
-        sort_projected_rows_by_bindings(&mut rows, &states, return_clause);
+        sort_projected_rows_by_bindings(&mut rows, &states, return_clause)?;
         if let Some(limit) = return_clause.limit {
             rows.truncate(limit.max(0) as usize);
         }
@@ -2293,7 +2273,7 @@ async fn project_state(
             )
             .await?
         } else {
-            eval::eval_expr(&item.expr, &state.bindings).unwrap_or(serde_json::Value::Null)
+            eval::eval_expr(&item.expr, &state.bindings)?
         };
         row.push(value);
     }
@@ -2479,37 +2459,73 @@ fn project_owned_properties(
         .collect()
 }
 
+/// Evaluate RETURN/WITH items against one row's bindings.
+///
+/// An evaluation error fails the row, and so the query. Cypher's own nulls
+/// (an unbound variable, a missing property, null input to an operator) are
+/// `Ok(Null)` from [`eval::eval_expr`] and stay Null cells; what this refuses
+/// to do is turn a real error (`x IN <non-list>`, an unbound parameter, an
+/// unknown function, ...) into a Null cell on a query reporting success.
+pub(super) fn eval_return_items(
+    items: &[crate::parser::ReturnItem],
+    bindings: &HashMap<String, serde_json::Value>,
+) -> Result<Vec<serde_json::Value>> {
+    items
+        .iter()
+        .map(|item| eval::eval_expr(&item.expr, bindings))
+        .collect()
+}
+
+/// Sort UNWIND's projected rows by bindings semantics. The keys are computed
+/// once per row before sorting, so an ORDER BY term that fails to evaluate
+/// fails the query instead of sorting as Null.
 fn sort_projected_rows_by_bindings(
     rows: &mut Vec<Vec<serde_json::Value>>,
     states: &[ExpandState],
     return_clause: &ReturnClause,
-) {
-    if return_clause.order_by.is_empty() || rows.len() != states.len() {
-        if !return_clause.order_by.is_empty() {
-            let columns = build_columns(return_clause);
-            sort_rows(rows, &columns, &return_clause.order_by);
-        }
-        return;
+) -> Result<()> {
+    if return_clause.order_by.is_empty() {
+        return Ok(());
+    }
+    if rows.len() != states.len() {
+        return Err(GraphError::Internal(format!(
+            "ORDER BY over {} projected rows paired with {} binding states",
+            rows.len(),
+            states.len()
+        )));
     }
 
     let columns = build_columns(return_clause);
-    let mut paired: Vec<(Vec<serde_json::Value>, &ExpandState)> =
-        rows.drain(..).zip(states.iter()).collect();
-    paired.sort_by(|(row_a, a), (row_b, b)| {
-        for order in &return_clause.order_by {
-            let av = projected_order_value(&order.expr, &columns, row_a, &a.bindings);
-            let bv = projected_order_value(&order.expr, &columns, row_b, &b.bindings);
-            let cmp = pipeline_value_cmp(&av, &bv);
-            if cmp != std::cmp::Ordering::Equal {
-                return match order.direction {
-                    SortDir::Asc => cmp,
-                    SortDir::Desc => cmp.reverse(),
-                };
-            }
+    let mut keyed = Vec::with_capacity(rows.len());
+    for (row, state) in rows.drain(..).zip(states.iter()) {
+        let keys = return_clause
+            .order_by
+            .iter()
+            .map(|order| projected_order_value(&order.expr, &columns, &row, &state.bindings))
+            .collect::<Result<Vec<_>>>()?;
+        keyed.push((keys, row));
+    }
+    keyed.sort_by(|(a, _), (b, _)| compare_order_keys(a, b, &return_clause.order_by));
+    rows.extend(keyed.into_iter().map(|(_, row)| row));
+    Ok(())
+}
+
+/// Compare two precomputed ORDER BY key vectors with the bindings comparator.
+fn compare_order_keys(
+    a: &[serde_json::Value],
+    b: &[serde_json::Value],
+    order_by: &[crate::parser::OrderItem],
+) -> std::cmp::Ordering {
+    for ((av, bv), order) in a.iter().zip(b).zip(order_by) {
+        let cmp = pipeline_value_cmp(av, bv);
+        if cmp != std::cmp::Ordering::Equal {
+            return match order.direction {
+                SortDir::Asc => cmp,
+                SortDir::Desc => cmp.reverse(),
+            };
         }
-        std::cmp::Ordering::Equal
-    });
-    rows.extend(paired.into_iter().map(|(row, _)| row));
+    }
+    std::cmp::Ordering::Equal
 }
 
 /// The value an ORDER BY term sorts by under bindings semantics: the term
@@ -2517,22 +2533,30 @@ fn sort_projected_rows_by_bindings(
 /// (an alias, or a value only the projection computes). Also the hidden-key
 /// evaluation of `spill::OrderSemantics::Bindings`, so a spilled Expand sort
 /// orders exactly like this in-memory one.
+///
+/// When the binding-level evaluation fails, the projected column decides: a
+/// projected term (e.g. a pattern predicate or comprehension that only the
+/// graph-aware projection can evaluate) was already computed for this row, so
+/// its column is the value. A term that fails AND is not projected has no
+/// value at all, and the error propagates — it is never sorted as Null.
 pub(super) fn projected_order_value(
     expr: &Expr,
     columns: &[String],
     row: &[serde_json::Value],
     bindings: &HashMap<String, serde_json::Value>,
-) -> serde_json::Value {
-    let value = eval::eval_expr(expr, bindings).unwrap_or(serde_json::Value::Null);
-    if !value.is_null() {
-        return value;
-    }
+) -> Result<serde_json::Value> {
     let column_name = expr_to_column_name(expr);
-    columns
-        .iter()
-        .position(|col| col == &column_name)
-        .and_then(|idx| row.get(idx).cloned())
-        .unwrap_or(serde_json::Value::Null)
+    let projected = || {
+        columns
+            .iter()
+            .position(|col| col == &column_name)
+            .and_then(|idx| row.get(idx).cloned())
+    };
+    match eval::eval_expr(expr, bindings) {
+        Ok(value) if !value.is_null() => Ok(value),
+        Ok(_) => Ok(projected().unwrap_or(serde_json::Value::Null)),
+        Err(err) => projected().ok_or(err),
+    }
 }
 
 /// The bindings-semantics comparator (see [`projected_order_value`]).
@@ -2559,8 +2583,7 @@ fn apply_with_pipeline(
     for state in states {
         let mut bindings = HashMap::new();
         for item in &with_pipeline.clause.items {
-            let value =
-                eval::eval_expr(&item.expr, &state.bindings).unwrap_or(serde_json::Value::Null);
+            let value = eval::eval_expr(&item.expr, &state.bindings)?;
             let name = item
                 .alias
                 .clone()
@@ -2587,22 +2610,17 @@ fn apply_with_pipeline(
     }
 
     if !with_pipeline.clause.order_by.is_empty() {
-        projected.sort_by(|a, b| {
-            for order in &with_pipeline.clause.order_by {
-                let av =
-                    eval::eval_expr(&order.expr, &a.bindings).unwrap_or(serde_json::Value::Null);
-                let bv =
-                    eval::eval_expr(&order.expr, &b.bindings).unwrap_or(serde_json::Value::Null);
-                let cmp = pipeline_value_cmp(&av, &bv);
-                if cmp != std::cmp::Ordering::Equal {
-                    return match order.direction {
-                        SortDir::Asc => cmp,
-                        SortDir::Desc => cmp.reverse(),
-                    };
-                }
-            }
-            std::cmp::Ordering::Equal
-        });
+        let order_by = &with_pipeline.clause.order_by;
+        let mut keyed = Vec::with_capacity(projected.len());
+        for state in projected {
+            let keys = order_by
+                .iter()
+                .map(|order| eval::eval_expr(&order.expr, &state.bindings))
+                .collect::<Result<Vec<_>>>()?;
+            keyed.push((keys, state));
+        }
+        keyed.sort_by(|(a, _), (b, _)| compare_order_keys(a, b, order_by));
+        projected = keyed.into_iter().map(|(_, state)| state).collect();
     }
 
     if let Some(limit) = with_pipeline.clause.limit {
@@ -7221,11 +7239,16 @@ fn execute_virtual_anchor(
     // it lets a large or live virtual table avoid the intermediate `Vec`
     // entirely, while the default adapter keeps every existing table working.
     //
-    // The body is sync and infallible (`eval_expr(..).unwrap_or(Null)`), so it
-    // drops into the visitor closure unchanged.
+    // The visitor closure cannot return an error, and projection can fail (an
+    // evaluation error is a query error, never a Null cell). The first failure
+    // is captured, every later row is skipped, and the query returns it.
     let mut rows = Vec::new();
     let mut vertices_read = 0usize;
+    let mut projection_error: Option<GraphError> = None;
     vtable.visit_rows(None, &mut |vrow| {
+        if projection_error.is_some() {
+            return;
+        }
         vertices_read += 1;
 
         // Construct a JSON object from virtual row cells, keyed by column name.
@@ -7239,14 +7262,14 @@ fn execute_virtual_anchor(
         let mut bindings = HashMap::new();
         bindings.insert(anchor_var.to_string(), row_json);
 
-        let row: Vec<serde_json::Value> = return_clause
-            .items
-            .iter()
-            .map(|item| eval::eval_expr(&item.expr, &bindings).unwrap_or(serde_json::Value::Null))
-            .collect();
-
-        rows.push(row);
+        match eval_return_items(&return_clause.items, &bindings) {
+            Ok(row) => rows.push(row),
+            Err(err) => projection_error = Some(err),
+        }
     });
+    if let Some(err) = projection_error {
+        return Err(err);
+    }
     stats.vertices_read = vertices_read;
 
     stats.execution_ms = start.elapsed().as_millis() as u64;
@@ -7778,6 +7801,252 @@ mod tests {
         );
     }
 
+    // --- evaluation errors fail the query; only Cypher's own nulls are Null --
+
+    /// `1 IN 2`: `IN` with a non-list right-hand side is an evaluation ERROR
+    /// in `eval_expr`, not a Cypher null. Every projection site used
+    /// `eval_expr(..).unwrap_or(Null)`, which turned it into a Null cell on a
+    /// query that reported success.
+    fn bad_in() -> Expr {
+        Expr::In {
+            value: Box::new(Expr::Literal(Literal::Integer(1))),
+            list: Box::new(Expr::Literal(Literal::Integer(2))),
+        }
+    }
+
+    fn missing_property() -> Expr {
+        Expr::Property {
+            var: "n".to_string(),
+            name: "no_such_property".to_string(),
+        }
+    }
+
+    fn items(exprs: &[Expr]) -> Vec<crate::parser::ReturnItem> {
+        exprs
+            .iter()
+            .enumerate()
+            .map(|(i, expr)| crate::parser::ReturnItem {
+                expr: expr.clone(),
+                alias: Some(format!("c{i}")),
+            })
+            .collect()
+    }
+
+    fn clause_of(exprs: &[Expr], order_by: Option<Expr>) -> ReturnClause {
+        ReturnClause {
+            distinct: false,
+            items: items(exprs),
+            order_by: order_by
+                .into_iter()
+                .map(|expr| crate::parser::OrderItem {
+                    expr,
+                    direction: SortDir::Asc,
+                })
+                .collect(),
+            limit: None,
+        }
+    }
+
+    fn assert_eval_error(result: Result<Vec<Vec<serde_json::Value>>>, site: &str) {
+        match result {
+            Err(GraphError::Validation(msg)) => assert!(
+                msg.contains("IN expects a list"),
+                "{site}: wrong error: {msg}"
+            ),
+            Err(other) => panic!("{site}: expected the evaluation error, got {other:?}"),
+            Ok(rows) => panic!(
+                "{site}: an evaluation error must fail the query, but it returned \
+                 Ok({rows:?})"
+            ),
+        }
+    }
+
+    async fn drain_plan(plan: PhysicalPlan) -> Result<Vec<Vec<serde_json::Value>>> {
+        let (_tmp, wp) = streaming_test_write_path();
+        let config = GraphEngineConfig::default();
+        let (_, rows, _) = execute_streaming(plan, &wp, "social", &config, None, None).await?;
+        crate::executor::stream::collect_rows(rows).await
+    }
+
+    #[tokio::test]
+    async fn return_only_projection_error_fails_the_query() {
+        let plan = PhysicalPlan::ReturnOnly {
+            return_clause: clause_of(&[bad_in()], None),
+        };
+        assert_eval_error(drain_plan(plan).await, "RETURN");
+    }
+
+    #[tokio::test]
+    async fn unwind_projection_and_order_by_errors_fail_the_query() {
+        let list = Expr::List(vec![
+            Expr::Literal(Literal::Integer(2)),
+            Expr::Literal(Literal::Integer(1)),
+        ]);
+        let x = Expr::Var("x".to_string());
+        for (site, return_clause) in [
+            ("UNWIND RETURN", clause_of(&[bad_in()], None)),
+            (
+                "UNWIND RETURN ... ORDER BY",
+                clause_of(&[bad_in()], Some(x.clone())),
+            ),
+            (
+                "UNWIND ORDER BY a failing key",
+                clause_of(std::slice::from_ref(&x), Some(bad_in())),
+            ),
+        ] {
+            let plan = PhysicalPlan::Unwind {
+                expr: list.clone(),
+                var: "x".to_string(),
+                with_pipeline: None,
+                return_clause,
+            };
+            assert_eval_error(drain_plan(plan).await, site);
+        }
+    }
+
+    /// The binding-only `project_state` path (no pattern comprehension).
+    #[tokio::test]
+    async fn expand_projection_error_fails_the_query() {
+        let (_tmp, wp) = streaming_test_write_path();
+        let stream = project_states_stream(
+            vec![projection_state("Alice")],
+            projection_ctx(&wp, clause_of(&[bad_in()], None), false),
+        );
+        assert_eval_error(
+            crate::executor::stream::collect_rows(stream).await,
+            "Expand RETURN",
+        );
+    }
+
+    /// The ordered Expand tail: a projection error, and an ORDER BY key that
+    /// cannot be evaluated and is not a projected column — with and without
+    /// a spill backend.
+    #[tokio::test]
+    async fn expand_order_by_errors_fail_the_query() {
+        use crate::executor::spill::test_support::{spilling_config, TempDirReserver};
+        let (_tmp, wp) = streaming_test_write_path();
+        let spill_dir = tempfile::tempdir().unwrap();
+        let spill = spilling_config(
+            TempDirReserver::new(spill_dir.path()),
+            GraphEngineConfig::default(),
+        );
+        let name = Expr::Property {
+            var: "n".to_string(),
+            name: "name".to_string(),
+        };
+        for (backend, config) in [
+            ("spill", spill),
+            ("in-memory", GraphEngineConfig::default()),
+        ] {
+            for (site, clause) in [
+                ("RETURN", clause_of(&[bad_in()], Some(name.clone()))),
+                (
+                    "ORDER BY",
+                    clause_of(std::slice::from_ref(&name), Some(bad_in())),
+                ),
+            ] {
+                let proj = projection_ctx(&wp, clause, false);
+                let result = match order_states_stream(
+                    &[projection_state("Alice"), projection_state("Bob")],
+                    &proj,
+                    &config,
+                    Instant::now(),
+                    "t",
+                )
+                .await
+                {
+                    Ok(stream) => crate::executor::stream::collect_rows(stream).await,
+                    Err(e) => Err(e),
+                };
+                assert_eval_error(result, &format!("{backend} Expand {site}"));
+            }
+        }
+    }
+
+    #[test]
+    fn with_pipeline_projection_and_order_by_errors_fail_the_query() {
+        let name = Expr::Property {
+            var: "n".to_string(),
+            name: "name".to_string(),
+        };
+        for (site, clause) in [
+            ("WITH", clause_of(&[bad_in()], None)),
+            ("WITH ... ORDER BY", clause_of(&[name], Some(bad_in()))),
+        ] {
+            let pipeline = crate::parser::WithPipeline {
+                clause,
+                where_clause: None,
+            };
+            let result = apply_with_pipeline(
+                vec![projection_state("Alice"), projection_state("Bob")],
+                &pipeline,
+            )
+            .map(|states| states.into_iter().map(|_| Vec::new()).collect());
+            assert_eval_error(result, site);
+        }
+    }
+
+    #[tokio::test]
+    async fn virtual_anchor_projection_error_fails_the_query() {
+        let registry = VirtualTableRegistry::new();
+        registry.register(Arc::new(TestVirtualTable {
+            table_name: "connections".to_string(),
+            ks: "system_observability".to_string(),
+            cols: vec![VirtualColumnDef {
+                name: "peer_address".to_string(),
+                data_type: DataType::Text,
+            }],
+            rows: vec![VirtualRow {
+                cells: vec![CellValue::live(b"10.0.0.1".to_vec(), 1000)],
+            }],
+        }));
+        let mut plan = virtual_anchor_plan("system_observability", "connections", &[]);
+        if let PhysicalPlan::Expand { return_clause, .. } = &mut plan {
+            *return_clause = clause_of(&[bad_in()], None);
+        }
+        let (_tmp, wp) = streaming_test_write_path();
+        let result = execute(
+            plan,
+            &wp,
+            "system_observability",
+            &GraphEngineConfig::default(),
+            Some(&registry),
+            None,
+        )
+        .await
+        .map(|r| r.rows);
+        assert_eval_error(result, "virtual-table RETURN");
+    }
+
+    /// The line this must not cross: a property that is simply absent is a
+    /// Cypher null, and stays a Null cell with the query succeeding.
+    #[tokio::test]
+    async fn a_missing_property_is_still_null_not_an_error() {
+        let (_tmp, wp) = streaming_test_write_path();
+        let stream = project_states_stream(
+            vec![projection_state("Alice")],
+            projection_ctx(
+                &wp,
+                clause_of(
+                    &[
+                        missing_property(),
+                        Expr::Arithmetic {
+                            left: Box::new(missing_property()),
+                            op: crate::parser::ArithOp::Add,
+                            right: Box::new(Expr::Literal(Literal::Integer(1))),
+                        },
+                    ],
+                    None,
+                ),
+                false,
+            ),
+        );
+        assert_eq!(
+            crate::executor::stream::collect_rows(stream).await.unwrap(),
+            vec![vec![serde_json::Value::Null, serde_json::Value::Null]]
+        );
+    }
+
     /// `ExpandVarLength` must reach the transport as a stream, for the same
     /// reason as `WcoJoin` below: falling through to `other =>` still returns
     /// correct rows, but collected — and the spilled sort undone.
@@ -7862,7 +8131,7 @@ mod tests {
                 .iter()
                 .map(|s| vec![s.bindings["n"]["name"].clone()])
                 .collect();
-            sort_projected_rows_by_bindings(&mut reference, &states, &return_clause);
+            sort_projected_rows_by_bindings(&mut reference, &states, &return_clause).unwrap();
 
             let spill_dir = tempfile::tempdir().unwrap();
             let reserver = TempDirReserver::new(spill_dir.path());

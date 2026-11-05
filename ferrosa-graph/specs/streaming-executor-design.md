@@ -276,6 +276,16 @@ the same whether or not the sort spilled. Var-length and WCO ORDER BY on a
 non-projected expression used to be silently ignored (`sort_rows` skipped it);
 it now orders.
 
+Projection and sort-key evaluation errors propagate (t_64be7fd7). Every site
+used `eval_expr(..).unwrap_or(Null)`, so `RETURN 1 IN 2` returned `Ok` with a
+Null cell. They now share `expand::eval_return_items`; WITH ORDER BY and
+UNWIND ORDER BY precompute their keys with `?` before sorting (a comparator
+cannot fail); the virtual-table visitor captures the first error and returns
+it after the visit. `projected_order_value` returns `Result`: a binding-level
+failure on a projected term takes the projected column, otherwise it
+propagates. Cypher nulls (missing variable or property, null input) are
+`Ok(Null)` from `eval_expr` and are unchanged.
+
 #### Increment 7 (HTTP done, Bolt not started)
 
 `Body::from_stream` requires `Stream + Send + 'static`, and the response body

@@ -487,11 +487,7 @@ pub async fn execute_var_length_streaming(
             bindings.insert(anchor_var.to_string(), row_json);
         }
 
-        let row: Vec<serde_json::Value> = return_clause
-            .items
-            .iter()
-            .map(|item| eval::eval_expr(&item.expr, &bindings).unwrap_or(serde_json::Value::Null))
-            .collect();
+        let row = super::expand::eval_return_items(&return_clause.items, &bindings)?;
         acc.push(row, &bindings)?;
     }
 
@@ -703,6 +699,44 @@ mod tests {
             }],
             order_by: vec![],
             limit: None,
+        }
+    }
+
+    /// `RETURN 1 IN 2` over a var-length path: an evaluation error must fail
+    /// the query. The projection used `eval_expr(..).unwrap_or(Null)`, so it
+    /// came back as `Ok` with a Null cell.
+    #[tokio::test]
+    async fn varpath_projection_error_fails_the_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = setup_storage(tmp.path());
+        write_vertex(&storage, "test_ks", "person_v", b"A");
+        write_adjacency(&storage, "test_ks", b"A", "KNOWS", b"B");
+        let wp = WritePath::direct(storage);
+        let mut return_clause = simple_return("b");
+        return_clause.items[0].expr = Expr::In {
+            value: Box::new(Expr::Literal(crate::parser::Literal::Integer(1))),
+            list: Box::new(Expr::Literal(crate::parser::Literal::Integer(2))),
+        };
+        let result = execute_var_length(
+            &wp,
+            "test_ks",
+            &make_anchor("a"),
+            &make_hop("b"),
+            1,
+            1,
+            &return_clause,
+            &test_config(),
+            Instant::now(),
+            None,
+            None,
+        )
+        .await;
+        match result {
+            Err(err) => assert!(err.to_string().contains("IN expects a list"), "{err}"),
+            Ok(ok) => panic!(
+                "an evaluation error must fail the query, but it returned Ok({:?})",
+                ok.rows
+            ),
         }
     }
 

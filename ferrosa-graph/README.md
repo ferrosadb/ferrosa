@@ -134,6 +134,18 @@ use those same stored endpoint keys.
   observable fallback: one `warn` on first use and a process-wide count in
   `spill::in_memory_order_by_sorts()`. `UNWIND`'s ORDER BY still sorts its
   (literal, already-resident) list in memory.
+- **Projection errors fail the query** (`expand::eval_return_items`) — every
+  RETURN / WITH / ORDER BY evaluation site (bare RETURN, UNWIND, Expand, WITH
+  pipelines, the virtual-table anchor, var-length paths, `WcoJoin`) propagates
+  an `eval_expr` error instead of writing a Null cell. Null stays Null where
+  Cypher says so: an unbound variable, a missing property, null input to an
+  operator. What now errors: an unbound `$parameter`, `x IN <non-list>`, an
+  unknown function or wrong arity, a list comprehension over a non-list, a map
+  projection on a non-map, and a pattern predicate / pattern comprehension in a
+  position only the binding-level evaluator reaches (a WITH item, a
+  non-projected ORDER BY term). An ORDER BY term that fails at binding level
+  but is a projected column sorts by that column, which the graph-aware
+  projection already computed.
 - **Buffered variants** — every other variant computes the buffered
   `GraphResult` and is wrapped with `stream_from_rows`: `UNION` without `ALL`
   (whole-result dedup), `DELETE` (two passes over the matched rows — validate,

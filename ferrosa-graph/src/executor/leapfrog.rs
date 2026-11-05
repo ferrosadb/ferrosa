@@ -553,11 +553,7 @@ async fn project_bindings(
         }
     }
 
-    let row: Vec<serde_json::Value> = return_clause
-        .items
-        .iter()
-        .map(|item| eval::eval_expr(&item.expr, &json_bindings).unwrap_or(serde_json::Value::Null))
-        .collect();
+    let row = super::expand::eval_return_items(&return_clause.items, &json_bindings)?;
 
     Ok((row, json_bindings))
 }
@@ -806,6 +802,48 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// A WCO join's projection: an evaluation error (`1 IN 2`) fails the row,
+    /// while a missing property is still a Null cell.
+    #[tokio::test]
+    async fn wco_projection_error_fails_the_row_but_a_missing_property_is_null() {
+        let (_dir, wp) = failing_adjacency_fixture();
+        let plan = WcoJoinPlan {
+            variables: vec!["a".to_string()],
+            relations: vec![],
+            var_tables: HashMap::from([("a".to_string(), person())]),
+        };
+        let bindings = HashMap::from([("a".to_string(), b"A".to_vec())]);
+        let clause = |expr| ReturnClause {
+            distinct: false,
+            items: vec![crate::parser::ReturnItem { expr, alias: None }],
+            order_by: vec![],
+            limit: None,
+        };
+        let bad_in = crate::parser::Expr::In {
+            value: Box::new(crate::parser::Expr::Literal(
+                crate::parser::Literal::Integer(1),
+            )),
+            list: Box::new(crate::parser::Expr::Literal(
+                crate::parser::Literal::Integer(2),
+            )),
+        };
+        let mut stats = QueryStats::default();
+        match project_bindings(&wp, &plan, &bindings, &clause(bad_in), &mut stats, None).await {
+            Err(err) => assert!(err.to_string().contains("IN expects a list"), "{err}"),
+            Ok((row, _)) => {
+                panic!("an evaluation error must fail the row, but it projected Ok({row:?})")
+            }
+        }
+        let missing = crate::parser::Expr::Property {
+            var: "a".to_string(),
+            name: "no_such_property".to_string(),
+        };
+        let (row, _) = project_bindings(&wp, &plan, &bindings, &clause(missing), &mut stats, None)
+            .await
+            .unwrap();
+        assert_eq!(row, vec![serde_json::Value::Null]);
     }
 
     #[test]

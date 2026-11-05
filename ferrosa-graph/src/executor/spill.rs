@@ -263,7 +263,7 @@ impl OrderKeys {
                     &self.columns,
                     &row[..visible],
                     bindings,
-                ),
+                )?,
                 OrderSemantics::ProjectedColumns => {
                     let name = super::expand::expr_to_column_name(&item.expr);
                     match self.columns.iter().position(|c| c == &name) {
