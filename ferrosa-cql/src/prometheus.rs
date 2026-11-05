@@ -47,6 +47,91 @@ pub fn format_metric(name: &str, labels: &[(&str, &str)], value: f64) -> String 
 ///
 /// This is called on every Prometheus scrape — it reads from virtual
 /// tables which return cached snapshots and never block.
+/// The node's memory-admission controls: every bounded blocking pool
+/// (`TaskPool::spawn_blocking`) and the node-wide spill pool. A saturated pool
+/// or a rising `ferrosa_spill_pool_forced_total` (rows admitted over the limit
+/// by the forward-progress floor) is the signal that the node is at its bound.
+pub fn render_admission_pools() -> String {
+    let mut out = String::new();
+    let pools = ferrosa_common::task_pool::blocking_pool_stats();
+    let gauges: [(
+        &str,
+        &str,
+        &str,
+        fn(&ferrosa_common::task_pool::BlockingPoolStats) -> f64,
+    ); 5] = [
+        (
+            "ferrosa_blocking_pool_capacity",
+            "gauge",
+            "Blocking jobs a pool admits at once.",
+            |s| s.capacity as f64,
+        ),
+        (
+            "ferrosa_blocking_pool_in_flight",
+            "gauge",
+            "Blocking jobs currently admitted.",
+            |s| s.in_flight as f64,
+        ),
+        (
+            "ferrosa_blocking_pool_waiting",
+            "gauge",
+            "Callers waiting for admission.",
+            |s| s.waiting as f64,
+        ),
+        (
+            "ferrosa_blocking_pool_waits_total",
+            "counter",
+            "Callers that had to wait for admission.",
+            |s| s.waits_total as f64,
+        ),
+        (
+            "ferrosa_blocking_pool_saturated",
+            "gauge",
+            "1 while callers are waiting for admission.",
+            |s| f64::from(u8::from(s.saturated)),
+        ),
+    ];
+    for (name, kind, help, value) in gauges {
+        out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n"));
+        for pool in &pools {
+            out.push_str(&format_metric(name, &[("pool", pool.name)], value(pool)));
+        }
+    }
+
+    let spill = ferrosa_storage::SpillPool::global();
+    let spill_metrics: [(&str, &str, &str, f64); 4] = [
+        (
+            "ferrosa_spill_pool_limit_bytes",
+            "gauge",
+            "Node-wide bytes all spilling operators may hold in memory together.",
+            spill.limit() as f64,
+        ),
+        (
+            "ferrosa_spill_pool_used_bytes",
+            "gauge",
+            "Bytes currently held in memory by spilling operators.",
+            spill.used() as f64,
+        ),
+        (
+            "ferrosa_spill_pool_refused_total",
+            "counter",
+            "Charges refused because the pool was full (the operator spilled early).",
+            spill.refused_total() as f64,
+        ),
+        (
+            "ferrosa_spill_pool_forced_total",
+            "counter",
+            "Rows admitted over the limit by the one-row forward-progress floor.",
+            spill.forced_total() as f64,
+        ),
+    ];
+    for (name, kind, help, value) in spill_metrics {
+        out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n"));
+        out.push_str(&format_metric(name, &[], value));
+    }
+    out
+}
+
 pub fn render_metrics(registry: &VirtualTableRegistry) -> String {
     let mut output = String::new();
 
@@ -85,6 +170,7 @@ pub fn render_metrics(registry: &VirtualTableRegistry) -> String {
         &[],
         emfile_total() as f64,
     ));
+    output.push_str(&render_admission_pools());
     output.push_str(&ferrosa_net::metrics::render_prometheus());
     output.push_str(&ferrosa_cluster::coordinator::metrics::render_prometheus());
     output.push_str(&ferrosa_storage::commitlog::render_prometheus());
@@ -776,6 +862,41 @@ mod tests {
     fn format_gauge_metric() {
         let line = format_metric("ferrosa_connections_active", &[("state", "ready")], 42.0);
         assert_eq!(line, "ferrosa_connections_active{state=\"ready\"} 42\n");
+    }
+
+    /// t_1fd08a78: the bounded blocking pools and the node-wide spill pool keep
+    /// counters that nothing exported, so saturation and the spill floor were
+    /// visible only in logs.
+    #[test]
+    fn admission_pools_are_exported() {
+        let pool = ferrosa_common::task_pool::TaskPool::current("prometheus-export-test");
+        let stats = pool.blocking_stats();
+        let text = render_admission_pools();
+        assert!(
+            text.contains(&format!(
+                "ferrosa_blocking_pool_capacity{{pool=\"prometheus-export-test\"}} {}\n",
+                stats.capacity
+            )),
+            "{text}"
+        );
+        for name in [
+            "ferrosa_blocking_pool_in_flight",
+            "ferrosa_blocking_pool_waiting",
+            "ferrosa_blocking_pool_waits_total",
+            "ferrosa_blocking_pool_saturated",
+            "ferrosa_spill_pool_limit_bytes",
+            "ferrosa_spill_pool_used_bytes",
+            "ferrosa_spill_pool_refused_total",
+            "ferrosa_spill_pool_forced_total",
+        ] {
+            assert!(
+                text.contains(&format!("# TYPE {name} ")),
+                "{name} missing:\n{text}"
+            );
+        }
+        assert!(
+            render_metrics(&VirtualTableRegistry::new()).contains("ferrosa_spill_pool_limit_bytes")
+        );
     }
 
     #[test]
