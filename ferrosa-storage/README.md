@@ -1082,11 +1082,17 @@ controls already passed before the fix (`tests/count_payload_alloc.rs`).
   (`SpillPool::global`) shared by every spilling operator in the process, not one
   allowance per operator: each `ExternalSorter` (CQL ORDER BY, result cursors,
   graph ORDER BY, SQL blocking operators, sidecar conversion) and SQL's
-  `ReplayBuffer` charges what it buffers and spills its own buffer when the pool
-  has no room. Total resident spill memory is the pool plus at most one row per
-  live operator (the forward-progress floor, counted in `forced_total`); the pool
-  logs the edges of exhaustion and recovery. The per-call `threshold_bytes` still
-  caps a single operator.
+  `ReplayBuffer` charges what it buffers. The unit is `SpillRow::retained_bytes`
+  (slots plus buffer capacity, including a shared slice's whole backing; it
+  omits allocator rounding and map-node overhead). An operator the pool refuses
+  keeps buffering up to its FLOOR (default `min(1 MiB, threshold)`, counted in
+  `forced_total`) and only then spills, so a starved operator never writes
+  one-row runs; while the pool is exhausted, an operator over its fair share
+  (`max(floor, limit / live operators)`) spills to make room. Total resident
+  spill memory is bounded by `limit + live operators × (floor + one row)`; the
+  pool logs the edges of exhaustion and recovery, and `/metrics` exports
+  `ferrosa_spill_pool_{limit_bytes,used_bytes,operators,refused_total,forced_total}`.
+  The per-call `threshold_bytes` still caps a single operator.
 - **External merge sort** (`external_sort.rs`) — bounded-memory spilling sort of
   CQL result rows (`Vec<Option<CqlValue>>`) for the unbounded `ORDER BY` (no
   `LIMIT`) shape. `ExternalSorter` moves rows into a buffer, spills sorted runs to

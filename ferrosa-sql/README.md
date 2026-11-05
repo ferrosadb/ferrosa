@@ -195,8 +195,11 @@ on finish, fail loud on any spill/merge I/O error.
 - **Concurrent operators share one budget**: every operator built from a
   `SpillCtx` charges the storage engine's node-wide `SpillPool` (overridable with
   `SpillCtx::with_pool`), so three concurrent sorts hold one budget between them,
-  not three. A join's `ReplayBuffer` moves its group to disk as soon as the pool is
-  full.
+  not three. When the pool is full, a join's `ReplayBuffer` keeps its group in
+  memory up to the pool floor (`SpillCtx::with_floor`, default
+  `min(1 MiB, threshold)`) and then moves it to disk; it also moves it when it
+  holds more than its fair share of an exhausted pool. Row size is
+  `row_retained_bytes` (slots and buffer capacity).
 - **Cancellation and cleanup share one path**: the temp directory is held by a
   `TempSortTableReservation` moved into the output stream, so dropping the stream
   — exhausted, cancelled or abandoned — removes it. `sweep_orphaned_temp_dirs`

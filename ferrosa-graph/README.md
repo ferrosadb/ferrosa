@@ -150,8 +150,10 @@ use those same stored endpoint keys.
   `GraphResult` and is wrapped with `stream_from_rows`: `UNION` without `ALL`
   (whole-result dedup), `DELETE` (two passes over the matched rows — validate,
   then tombstone), `Unwind`, `Create` / `Merge`, and the virtual-table anchor.
-  A var-length path without an ORDER BY still buffers its projected rows (its
-  result keys are already resident from the BFS) before streaming them.
+  A var-length path or `WcoJoin` without an ORDER BY no longer buffers its
+  projected rows: they spill keyed by arrival number (`OrderSemantics::Arrival`)
+  and stream back in production order. Without a spill backend that falls back
+  to a `Vec`, warned once and counted in `spill::in_memory_unordered_results()`.
   `Aggregate` is deliberately **not** in that materializing set:
   `execute_aggregate` streams its inner plan and folds each row as it
   arrives, so its memory is proportional to the number of GROUPS (bounded by

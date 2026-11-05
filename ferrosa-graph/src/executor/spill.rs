@@ -40,7 +40,7 @@
 //! in-memory sort performs — and appends the values as hidden trailing columns.
 //! The comparator orders by those columns only; `OrderKeys::detach` strips
 //! them on the way out, so the `columns` a client sees never change. The hidden
-//! keys are counted in [`GraphRow::estimated_bytes`], so the spill threshold
+//! keys are counted in `GraphRow::retained_bytes`, so the spill threshold
 //! stays honest about what is resident.
 //!
 //! # Never re-collected
@@ -99,29 +99,36 @@ pub trait SpillReserver: Send + Sync + std::fmt::Debug {
 pub struct GraphRow(pub RowVals);
 
 impl SpillRow for GraphRow {
-    /// Approximate footprint for spill-threshold accounting. Need not be exact —
-    /// only monotonic in real memory use, so the buffer spills before the
-    /// process is starved. Strings and arrays/objects carry their payload.
-    /// Includes the hidden sort-key columns: they are resident too.
-    fn estimated_bytes(&self) -> usize {
-        self.0.iter().map(json_value_bytes).sum::<usize>()
-            + self.0.len() * std::mem::size_of::<serde_json::Value>()
+    /// The row's `Vec` header and slot capacity plus [`json_value_heap_bytes`]
+    /// of every value — hidden sort-key columns included, since they are
+    /// resident too.
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.0.capacity() * std::mem::size_of::<serde_json::Value>()
+            + self.0.iter().map(json_value_heap_bytes).sum::<usize>()
     }
 }
 
-/// Payload bytes of a JSON value beyond its fixed enum size.
-fn json_value_bytes(v: &serde_json::Value) -> usize {
+/// Heap bytes a JSON value keeps alive beyond its fixed enum size: string and
+/// array CAPACITY, and for an object each entry's key string, value slot, key
+/// capacity and nested value. Map-node overhead is not counted.
+fn json_value_heap_bytes(v: &serde_json::Value) -> usize {
     match v {
-        serde_json::Value::String(s) => s.len(),
+        serde_json::Value::String(s) => s.capacity(),
         serde_json::Value::Array(items) => {
-            items.iter().map(json_value_bytes).sum::<usize>()
-                + items.len() * std::mem::size_of::<serde_json::Value>()
+            items.capacity() * std::mem::size_of::<serde_json::Value>()
+                + items.iter().map(json_value_heap_bytes).sum::<usize>()
         }
         serde_json::Value::Object(map) => map
             .iter()
-            .map(|(k, val)| k.len() + json_value_bytes(val))
+            .map(|(k, val)| {
+                std::mem::size_of::<String>()
+                    + std::mem::size_of::<serde_json::Value>()
+                    + k.capacity()
+                    + json_value_heap_bytes(val)
+            })
             .sum::<usize>(),
-        _ => 0,
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => 0,
     }
 }
 
@@ -143,6 +150,9 @@ pub enum OrderSemantics {
     /// (`projected_order_value`); compared with `pipeline_value_cmp`. Used by
     /// Expand.
     Bindings,
+    /// No ORDER BY: the single hidden key is the row's arrival number, compared
+    /// as a `u64`, so a spilled unordered result returns in production order.
+    Arrival,
 }
 
 /// One resolved ORDER BY term: the row column index, and whether ascending.
@@ -188,6 +198,10 @@ impl GraphRowOrder {
                     a.get(term.column).unwrap_or(&NULL),
                     b.get(term.column).unwrap_or(&NULL),
                 ),
+                OrderSemantics::Arrival => {
+                    let arrival = |row: &RowVals| row.get(term.column).and_then(|v| v.as_u64());
+                    arrival(a).cmp(&arrival(b))
+                }
             };
             let cmp = if term.ascending { cmp } else { cmp.reverse() };
             if cmp != Ordering::Equal {
@@ -205,12 +219,16 @@ impl SpillOrder<GraphRow> for GraphRowOrder {
 }
 
 /// The hidden sort-key layout for one query: `visible` projected columns,
-/// followed by one key column per ORDER BY term.
+/// followed by one key column per ORDER BY term — or, for a result with no
+/// ORDER BY, a single arrival-number key, so an unordered result can spill
+/// and still come back in exactly the order it was produced.
 #[derive(Debug, Clone)]
 pub(super) struct OrderKeys {
     order_by: Vec<crate::parser::OrderItem>,
     columns: Vec<String>,
     semantics: OrderSemantics,
+    /// `Some(next)` in arrival-order mode: the number the next row is keyed by.
+    next_arrival: Option<u64>,
 }
 
 impl OrderKeys {
@@ -219,6 +237,18 @@ impl OrderKeys {
             order_by: return_clause.order_by.clone(),
             columns: columns.to_vec(),
             semantics,
+            next_arrival: None,
+        }
+    }
+
+    /// Keys for a result with no ORDER BY: each row is keyed by its arrival
+    /// number, so the merge reproduces production order.
+    fn arrival_order(columns: &[String]) -> Self {
+        Self {
+            order_by: Vec::new(),
+            columns: columns.to_vec(),
+            semantics: OrderSemantics::Arrival,
+            next_arrival: Some(0),
         }
     }
 
@@ -226,9 +256,27 @@ impl OrderKeys {
         self.columns.len()
     }
 
+    /// How many hidden key columns follow the visible ones.
+    fn key_count(&self) -> usize {
+        if self.next_arrival.is_some() {
+            1
+        } else {
+            self.order_by.len()
+        }
+    }
+
     /// The comparator over the hidden key columns.
     fn row_order(&self) -> GraphRowOrder {
         let visible = self.visible();
+        if self.next_arrival.is_some() {
+            return GraphRowOrder::with_semantics(
+                vec![GraphOrderTerm {
+                    column: visible,
+                    ascending: true,
+                }],
+                OrderSemantics::Arrival,
+            );
+        }
         let terms = self
             .order_by
             .iter()
@@ -241,10 +289,11 @@ impl OrderKeys {
         GraphRowOrder::with_semantics(terms, self.semantics)
     }
 
-    /// Append one hidden key per ORDER BY term to a projected row, evaluated
+    /// Append the hidden keys to a projected row: its arrival number in
+    /// arrival-order mode, otherwise one key per ORDER BY term evaluated
     /// against the bindings the row was projected from.
     pub(super) fn attach(
-        &self,
+        &mut self,
         mut row: RowVals,
         bindings: &HashMap<String, serde_json::Value>,
     ) -> Result<RowVals> {
@@ -254,6 +303,11 @@ impl OrderKeys {
                 "ORDER BY key attach: row has {} values, projection has {visible} columns",
                 row.len()
             )));
+        }
+        if let Some(next) = self.next_arrival.as_mut() {
+            row.push(serde_json::Value::from(*next));
+            *next += 1;
+            return Ok(row);
         }
         row.reserve(self.order_by.len());
         for item in &self.order_by {
@@ -271,6 +325,11 @@ impl OrderKeys {
                         None => super::eval::eval_expr(&item.expr, bindings)?,
                     }
                 }
+                OrderSemantics::Arrival => {
+                    return Err(GraphError::Internal(
+                        "ORDER BY key attach: arrival semantics given ORDER BY terms".to_string(),
+                    ))
+                }
             };
             row.push(key);
         }
@@ -283,7 +342,7 @@ impl OrderKeys {
     /// key value as if it were a projected one.
     pub(super) fn detach(&self, mut row: RowVals) -> Result<RowVals> {
         let visible = self.visible();
-        let expected = visible + self.order_by.len();
+        let expected = visible + self.key_count();
         if row.len() != expected {
             return Err(GraphError::Internal(format!(
                 "ORDER BY key detach: row has {} values, expected {expected}",
@@ -335,13 +394,35 @@ impl SpillSortSink {
         label: &str,
         semantics: OrderSemantics,
     ) -> Result<Option<Self>> {
-        let Some(reserver) = config.spill.as_ref() else {
-            return Ok(None);
-        };
         if return_clause.order_by.is_empty() {
             return Ok(None);
         }
-        let keys = OrderKeys::new(columns, return_clause, semantics);
+        Self::with_keys(
+            OrderKeys::new(columns, return_clause, semantics),
+            config,
+            label,
+        )
+    }
+
+    /// A sink for a result with NO ORDER BY: rows spill keyed by arrival
+    /// number, and the stream returns them in production order. `Ok(None)`
+    /// only when no spill backend is configured.
+    pub(super) fn try_new_in_arrival_order(
+        columns: &[String],
+        config: &super::expand::GraphEngineConfig,
+        label: &str,
+    ) -> Result<Option<Self>> {
+        Self::with_keys(OrderKeys::arrival_order(columns), config, label)
+    }
+
+    fn with_keys(
+        keys: OrderKeys,
+        config: &super::expand::GraphEngineConfig,
+        label: &str,
+    ) -> Result<Option<Self>> {
+        let Some(reserver) = config.spill.as_ref() else {
+            return Ok(None);
+        };
         let reservation = reserver
             .reserve(label)
             .map_err(|e| GraphError::Internal(format!("ORDER BY temp-sort setup failed: {e}")))?;
@@ -534,15 +615,32 @@ pub(super) fn distinct_then_limit<'a>(
     rows
 }
 
-/// Where an operator's produced rows go: an [`OrderBySink`] when the query has
-/// an ORDER BY, otherwise a plain buffer (the unordered row set, unchanged
-/// from before).
+/// Every unordered result buffered in memory because no spill backend was
+/// configured.
+static IN_MEMORY_UNORDERED_RESULTS: AtomicU64 = AtomicU64::new(0);
+
+/// How many results with no ORDER BY were held in a `Vec` for lack of a spill
+/// backend since process start. Zero in a server: the engine always configures
+/// one.
+pub fn in_memory_unordered_results() -> u64 {
+    IN_MEMORY_UNORDERED_RESULTS.load(AtomicOrdering::Relaxed)
+}
+
+/// Where an operator's produced rows go.
+///
+/// With a spill backend, every result spills: an ORDER BY through its sort
+/// keys, and an unordered result keyed by arrival number so it comes back in
+/// production order. Without a backend (unit tests, embedded use) the designed
+/// in-memory fallbacks apply, and each is counted and warned about once.
 #[derive(Debug)]
 pub(super) enum RowAcc {
-    Unordered(Vec<RowVals>),
+    /// No ORDER BY and no spill backend: a counted in-memory buffer.
+    InMemoryUnordered(Vec<RowVals>),
     /// Boxed: the sink carries the external sorter and its spill-pool charge,
-    /// ten times the size of the unordered buffer.
+    /// ten times the size of the in-memory buffer.
     Ordered(Box<OrderBySink>),
+    /// No ORDER BY, spill backend configured: spills in arrival order.
+    ArrivalOrder(Box<SpillSortSink>),
 }
 
 impl RowAcc {
@@ -553,12 +651,22 @@ impl RowAcc {
         label: &str,
         semantics: OrderSemantics,
     ) -> Result<Self> {
-        Ok(
-            match OrderBySink::new(columns, return_clause, config, label, semantics)? {
-                Some(sink) => Self::Ordered(Box::new(sink)),
-                None => Self::Unordered(Vec::new()),
-            },
-        )
+        if let Some(sink) = OrderBySink::new(columns, return_clause, config, label, semantics)? {
+            return Ok(Self::Ordered(Box::new(sink)));
+        }
+        if let Some(sink) = SpillSortSink::try_new_in_arrival_order(columns, config, label)? {
+            return Ok(Self::ArrivalOrder(Box::new(sink)));
+        }
+        let prior = IN_MEMORY_UNORDERED_RESULTS.fetch_add(1, AtomicOrdering::Relaxed);
+        if prior == 0 {
+            tracing::warn!(
+                "graph result is buffered in memory: no spill backend is configured \
+                 (GraphEngineConfig::spill is None), so it is not bounded by \
+                 spill_threshold_bytes. Expected only in unit tests and embedded use; \
+                 further occurrences are counted by in_memory_unordered_results()"
+            );
+        }
+        Ok(Self::InMemoryUnordered(Vec::new()))
     }
 
     pub(super) fn push(
@@ -567,11 +675,12 @@ impl RowAcc {
         bindings: &HashMap<String, serde_json::Value>,
     ) -> Result<()> {
         match self {
-            Self::Unordered(rows) => {
+            Self::InMemoryUnordered(rows) => {
                 rows.push(row);
                 Ok(())
             }
             Self::Ordered(sink) => sink.push(row, bindings),
+            Self::ArrivalOrder(sink) => sink.push(row, bindings),
         }
     }
 
@@ -579,8 +688,9 @@ impl RowAcc {
     /// LIMIT.
     pub(super) fn into_stream(self, return_clause: &ReturnClause) -> Result<RowStream<'static>> {
         let rows = match self {
-            Self::Unordered(rows) => super::stream::stream_from_rows(rows),
+            Self::InMemoryUnordered(rows) => super::stream::stream_from_rows(rows),
             Self::Ordered(sink) => sink.finish_stream()?,
+            Self::ArrivalOrder(sink) => sink.finish_stream()?,
         };
         Ok(distinct_then_limit(rows, return_clause))
     }
@@ -756,6 +866,46 @@ mod tests {
             "the limit must be applied to the SORTED stream, so it returns the \
              smallest rows rather than the first three pushed"
         );
+    }
+
+    /// Without an ORDER BY, the accumulator used to collect every row in a
+    /// `Vec` before streaming (PR #651 review: the largest remaining memory
+    /// hole). With a spill backend it now spills in arrival order and the
+    /// stream returns exactly the production order.
+    #[tokio::test]
+    async fn an_unordered_result_spills_and_streams_in_arrival_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let reserver = TempDirReserver::new(dir.path());
+        let config = spilling_config(reserver.clone());
+        let clause = return_n_clause();
+
+        let mut acc = RowAcc::new(
+            &["n".to_string()],
+            &clause,
+            &config,
+            "test",
+            OrderSemantics::ProjectedColumns,
+        )
+        .unwrap();
+        let produced = [9i64, 2, 7, 1, 8, 3];
+        for n in produced {
+            acc.push(vec![serde_json::json!(n)], &no_bindings())
+                .unwrap();
+        }
+        let stream = acc.into_stream(&clause).unwrap();
+        assert!(
+            reserver.live_run_files() > 0,
+            "an unordered result must spill to disk, not sit in a Vec"
+        );
+        let got: Vec<i64> = drain(stream)
+            .await
+            .iter()
+            .map(|row| {
+                assert_eq!(row.len(), 1, "the arrival key must be stripped");
+                row[0].as_i64().unwrap()
+            })
+            .collect();
+        assert_eq!(got, produced.to_vec(), "arrival order is preserved");
     }
 
     #[tokio::test]

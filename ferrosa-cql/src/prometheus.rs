@@ -101,29 +101,35 @@ pub fn render_admission_pools() -> String {
     }
 
     let spill = ferrosa_storage::SpillPool::global();
-    let spill_metrics: [(&str, &str, &str, f64); 4] = [
+    let spill_metrics: [(&str, &str, &str, f64); 5] = [
         (
             "ferrosa_spill_pool_limit_bytes",
             "gauge",
-            "Node-wide bytes all spilling operators may hold in memory together.",
+            "Node-wide retained bytes all spilling operators may hold in memory together.",
             spill.limit() as f64,
         ),
         (
             "ferrosa_spill_pool_used_bytes",
             "gauge",
-            "Bytes currently held in memory by spilling operators.",
+            "Retained bytes currently held in memory by spilling operators.",
             spill.used() as f64,
+        ),
+        (
+            "ferrosa_spill_pool_operators",
+            "gauge",
+            "Spilling operators currently holding a pool charge.",
+            spill.live_charges() as f64,
         ),
         (
             "ferrosa_spill_pool_refused_total",
             "counter",
-            "Charges refused because the pool was full (the operator spilled early).",
+            "Charges refused because the pool was full.",
             spill.refused_total() as f64,
         ),
         (
             "ferrosa_spill_pool_forced_total",
             "counter",
-            "Rows admitted over the limit by the one-row forward-progress floor.",
+            "Rows admitted over the limit within an operator's forward-progress floor.",
             spill.forced_total() as f64,
         ),
     ];
@@ -888,6 +894,7 @@ mod tests {
             "ferrosa_blocking_pool_saturated",
             "ferrosa_spill_pool_limit_bytes",
             "ferrosa_spill_pool_used_bytes",
+            "ferrosa_spill_pool_operators",
             "ferrosa_spill_pool_refused_total",
             "ferrosa_spill_pool_forced_total",
         ] {

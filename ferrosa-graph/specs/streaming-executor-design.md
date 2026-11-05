@@ -266,8 +266,13 @@ Fixed by:
   same `RowAcc`. Sort → DISTINCT → LIMIT is applied on the stream
   (`distinct_then_limit`). Only the buffered `execute()` API collects, at its
   own boundary.
+- **Unordered results spill too** (PR #651 review). With no ORDER BY, `RowAcc`
+  spills through the same sink keyed by arrival number
+  (`OrderSemantics::Arrival`, compared as `u64`), so the stream returns rows in
+  production order without a `Vec` of the result.
 - **No backend** is the one in-memory fallback, observable: `warn` on first use,
-  counted by `spill::in_memory_order_by_sorts()`.
+  counted by `spill::in_memory_order_by_sorts()` (ordered) and
+  `spill::in_memory_unordered_results()` (unordered).
 
 Behavior changes a client can observe: an Expand ORDER BY that spilled used to
 compare with `compare_json_values`; it now uses `pipeline_value_cmp` like the

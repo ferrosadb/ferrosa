@@ -101,7 +101,7 @@ impl<'de> Deserialize<'de> for StoredRow {
     }
 }
 impl SpillRow for StoredRow {
-    fn estimated_bytes(&self) -> usize {
+    fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             + self.0.clustering.capacity()
             + self.0.cells.capacity() * std::mem::size_of::<(u16, CellValue)>()
@@ -123,8 +123,8 @@ struct OrderedRow {
     ordinal: u64,
 }
 impl SpillRow for OrderedRow {
-    fn estimated_bytes(&self) -> usize {
-        self.row.estimated_bytes() + 8
+    fn retained_bytes(&self) -> usize {
+        self.row.retained_bytes() + 8
     }
 }
 #[derive(Clone)]

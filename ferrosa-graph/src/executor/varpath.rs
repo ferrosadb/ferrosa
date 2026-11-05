@@ -110,11 +110,11 @@ pub async fn execute_var_length(
 /// of the given hop. Uses a visited set for cycle detection and a total
 /// vertex budget for DoS protection (threat T13, FMEA F3).
 ///
-/// With an ORDER BY, each projected row is pushed into the spilling sink as it
-/// is produced (no interim `Vec`), with every order term carried as a hidden
+/// Each projected row is pushed into a spilling sink as it is produced (no
+/// interim `Vec`). With an ORDER BY every order term is carried as a hidden
 /// key — so ordering by an expression that is not a projected column works,
-/// and spills, instead of being skipped. The returned stream reads the merge
-/// on pull.
+/// and spills, instead of being skipped; without one, the hidden key is the
+/// arrival number. The returned stream reads the merge on pull.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_var_length_streaming(
     write_path: &dyn GraphWrite,
@@ -441,9 +441,10 @@ pub async fn execute_var_length_streaming(
     // Traversal is still bounded by `max_var_path_visited`, which limits WORK
     // (a DoS control), not the result buffer.
     //
-    // With an ORDER BY the rows go straight into the spilling sink, keys
-    // evaluated from each row's bindings; without one they are buffered as
-    // before (the result keys are already resident from the BFS).
+    // Every row goes straight into a spilling sink: with an ORDER BY, keyed by
+    // its order terms evaluated from the row's bindings; without one, keyed by
+    // arrival number so the stream keeps production order. Only the BFS result
+    // keys stay resident (bounded by `max_var_path_visited`), never the rows.
     let mut acc = RowAcc::new(
         &columns,
         return_clause,
