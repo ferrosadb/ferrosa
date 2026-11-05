@@ -366,7 +366,9 @@ Snapshot writers coordinate through a persistent per-path writer lock. The
 comparison with the stored log and membership positions and the durable rename
 run under that same lock, so a delayed builder cannot overwrite a newer file.
 A stale candidate synchronizes the accepted file and directory before reporting
-success. Header inspection avoids reading a second complete snapshot payload.
+success. Before accepting a stale candidate, complete outer-record framing is
+validated with bounded read scratch rather than another payload allocation.
+This framing check is not a checksum or semantic bit-rot guarantee.
 
 Each attempt creates its own staging file and streams the existing bincode
 format into it. File and parent-directory synchronization failures propagate;

@@ -283,6 +283,34 @@ fn snapshot_precedes(
         < (current.last_log_id, current.last_membership.log_id())
 }
 
+/// Validate the complete outer record without allocating its byte-vector payload.
+/// This establishes framing, not a checksum or semantic bit-rot guarantee.
+fn validate_snapshot_record(
+    reader: &mut std::io::BufReader<&std::fs::File>,
+    file_len: u64,
+) -> std::io::Result<()> {
+    let payload_len: u64 = bincode::deserialize_from(&mut *reader)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let prefix_len = std::io::Seek::stream_position(reader)?;
+    if prefix_len.checked_add(payload_len) != Some(file_len) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "persisted snapshot payload length does not match the complete record",
+        ));
+    }
+    let copied = std::io::copy(
+        &mut std::io::Read::take(&mut *reader, payload_len),
+        &mut std::io::sink(),
+    )?;
+    if copied != payload_len || !std::io::BufRead::fill_buf(reader)?.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "persisted snapshot record is incomplete or has trailing bytes",
+        ));
+    }
+    Ok(())
+}
+
 /// Keep the coordination inode after unlocking: another process may hold it.
 struct SnapshotWriterLock(std::fs::File);
 
@@ -1161,15 +1189,21 @@ impl FerrosStateMachine {
             .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
         let _lock = SnapshotWriterLock(lock_file);
 
-        // Read only the leading metadata, not another full snapshot payload.
+        // Compare leading metadata without allocating another snapshot payload.
         // The comparison and promotion share the same per-path lock, including
         // independent state-machine instances and cancelled async waiters.
         match std::fs::File::open(path) {
             Ok(file) => {
-                let current: SnapshotMeta<u64, BasicNode> =
-                    bincode::deserialize_from(std::io::BufReader::new(&file))
-                        .map_err(|e| StorageIOError::read_state_machine(to_any_error(e)))?;
+                let mut reader = std::io::BufReader::new(&file);
+                let current: SnapshotMeta<u64, BasicNode> = bincode::deserialize_from(&mut reader)
+                    .map_err(|e| StorageIOError::read_state_machine(to_any_error(e)))?;
                 if snapshot_precedes(meta, &current) {
+                    let file_len = file
+                        .metadata()
+                        .map_err(|e| StorageIOError::read_state_machine(to_any_error(e)))?
+                        .len();
+                    validate_snapshot_record(&mut reader, file_len)
+                        .map_err(|e| StorageIOError::read_state_machine(to_any_error(e)))?;
                     // A prior rename may have returned a directory-sync error.
                     // Establish durability before allowing any caller to advance
                     // its watermark, even when its older candidate is skipped.
@@ -5234,6 +5268,40 @@ mod tests {
             bincode::deserialize(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(stored.meta.last_membership, newer.meta.last_membership);
         assert_eq!(stored.bytes, newer_bytes);
+    }
+
+    async fn reject_incomplete_newer_snapshot_record(metadata_only: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.bin");
+        let (meta, bytes) = snapshot_at(2).await;
+        let malformed = if metadata_only {
+            bincode::serialize(&meta).unwrap()
+        } else {
+            let mut encoded = bincode::serialize(&PersistedSnapshot { meta, bytes }).unwrap();
+            encoded.pop();
+            encoded
+        };
+        std::fs::write(&path, &malformed).unwrap();
+        let durable = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut builder = FerrosStateMachine::with_snapshot_path(path.clone());
+        builder.set_durable_applied_handle(Arc::clone(&durable));
+        builder.apply(vec![blank_entry(1)]).await.unwrap();
+        assert!(
+            builder.build_snapshot().await.is_err(),
+            "a newer metadata prefix is not proof of a complete durable snapshot"
+        );
+        assert_eq!(durable.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert_eq!(std::fs::read(path).unwrap(), malformed);
+    }
+
+    #[tokio::test]
+    async fn stale_snapshot_rejects_metadata_only_file() {
+        reject_incomplete_newer_snapshot_record(true).await;
+    }
+
+    #[tokio::test]
+    async fn stale_snapshot_rejects_truncated_payload() {
+        reject_incomplete_newer_snapshot_record(false).await;
     }
 
     /// Steps for T-F1-3's interleavings.
