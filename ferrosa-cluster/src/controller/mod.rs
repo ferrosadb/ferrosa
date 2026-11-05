@@ -1308,6 +1308,30 @@ impl ModeController {
         }
     }
 
+    /// Fence and drain one quarantined Raft group without sealing other groups.
+    /// The returned scope is quiescence evidence only; it never clears a fault,
+    /// authorizes storage activation or reopens admission.
+    pub async fn retire_raft_group_for_recovery(
+        &self,
+        dc_name: &str,
+        recovery_epoch: u64,
+    ) -> crate::error::Result<Arc<crate::raft::RetiredRaftGroup>> {
+        self.recovery_admission
+            .drain_publications_async(recovery_epoch)
+            .await
+            .map_err(|error| crate::error::ClusterError::RaftError(error.to_string()))?;
+        let retired = self
+            .physical_raft_workers
+            .stop_group_for_recovery(RaftGroupId::for_dc(dc_name), &self.raft_groups.load_full())
+            .await
+            .map_err(crate::error::ClusterError::RaftError)?;
+        self.recovery_admission
+            .drain_publications_async(recovery_epoch)
+            .await
+            .map_err(|error| crate::error::ClusterError::RaftError(error.to_string()))?;
+        Ok(retired)
+    }
+
     /// Record a connected peer's DC. Called by the peer handshake (or
     /// tests, before triggering `transition_to_cluster`) so that the
     /// per-DC Raft formation path (W6.3) can filter local-DC voters

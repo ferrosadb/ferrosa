@@ -44,13 +44,14 @@ The retained worker forces the commit log to disk before publication, including
 with Periodic acknowledgement. Log severity does not exempt failed projections.
 Shared schema/storage effects can already be visible; this is not rollback or
 transactional isolation. Ordinary domain rejection remains a command error
-response and does not poison the machine. A DROP whose physical removal the node
-refuses (`unregister_table`: permission denied on the table directory, a locked
-file) is one of those rejections, not a storage failure: the entry is committed
-and the table is gone from canonical metadata everywhere, so latching the worker
-would turn one undroppable directory into `Fatal` for every later proposal. The
-caller still receives the refusal, and the orphaned bytes are swept by the next
-same-name CREATE. A failed persisted snapshot restore
+response and does not poison the machine. Only directory-cleanup refusal after durable drop/sweep intents and checked
+writer retirement plus registry removal is an ordinary DROP rejection. It stays
+loud to the caller, leaves the Core usable, and a later same-name CREATE sweeps
+the orphaned bytes. Creating those intents, retiring the store, or other
+persistence failures remain hard storage errors: they may leave the original
+physical table readable and cannot advertise a completed DROP. The typed storage
+result records this phase without matching error text. This is not reader-drain
+or installed-checkpoint authority. A failed persisted snapshot restore
 keeps the prior Raft metadata and closes startup readiness instead of continuing
 with a partially restored shared schema; the snapshot and log files are retained
 for recovery. Persisted startup also refuses a different physical table UUID before
@@ -1453,3 +1454,11 @@ other roles that reference a dropped parent are separate concerns.
 ### Direct permission projection poststate
 
 The Direct DDL path persists the complete resource permission set after both grants and partial revokes. A revoke writes the existing deletion projection only when the remaining set is empty. The existing schema lifecycle fence covers mutation and poststate lookup; no transaction rollback or new acknowledgment durability guarantee is implied.
+
+Group recovery has a separate retirement operation from the global Pair handoff.
+It fences one group, stops its actual Core, drains its state-machine owner and
+owned jobs, and reports observed applied/committed/purged positions and failures.
+Other groups are not physically stopped. The opaque retirement scope does not
+clear a fault, authorize storage adoption, or reopen traffic; no release exists
+without verified live-storage activation. Normal and rebuilt state machines and
+log readers share the controller's recovery admission.

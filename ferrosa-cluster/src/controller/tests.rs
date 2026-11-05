@@ -147,22 +147,30 @@ async fn fresh_and_rebuilt_raft_storage_share_controller_recovery_admission() {
             .unwrap();
         });
         ready_rx.await.unwrap();
-        let deferred = RaftLogStorage::purge(&mut log_store, purge_to).await;
+        let deferred = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            RaftLogStorage::purge(&mut log_store, purge_to),
+        )
+        .await;
         let while_busy = log_store.last_purged_log_id().unwrap();
         release_tx.send(()).unwrap();
         publisher.join().unwrap();
         assert!(
-            deferred.is_ok(),
-            "{incarnation} busy-gate purge must defer, not fail the Core"
+            matches!(deferred, Ok(Ok(()))),
+            "{incarnation} busy-gate purge must defer promptly, not wait or fail the Core"
         );
         assert_eq!(
             while_busy, None,
             "{incarnation} log store purged while the controller gate was busy: \
              its recovery admission is still private"
         );
-        RaftLogStorage::purge(&mut log_store, purge_to)
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            RaftLogStorage::purge(&mut log_store, purge_to),
+        )
+        .await
+        .expect("released-gate purge must finish")
+        .unwrap();
         assert_eq!(
             log_store.last_purged_log_id().unwrap(),
             Some(purge_to),

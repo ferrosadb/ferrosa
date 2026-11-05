@@ -44,9 +44,10 @@ schema effects and system-table writes. A retained handle fences later trait
 calls across cancellation; completed state and applied indexes publish in order.
 Committed local Schema/Engine effect failures and projection failures propagate
 through that job and prevent publishing its metadata/index. Ordinary command
-rejection remains non-fatal — including a DROP whose physical removal the node
-refuses (`unregister_table`), which is committed metadata plus a refused
-statement, not a log this node could not apply. The process-local failure latch
+rejection remains non-fatal. For DROP, only directory cleanup after durable
+intents and checked writer/registry retirement is a typed statement refusal.
+Pre-retirement intent or persistence failures remain hard faults; the original
+physical table can still be live, so its index must not advance. The process-local failure latch
 prevents later snapshots or successful apply results. A failed persisted restore
 retains the previous Raft metadata and refuses consensus startup/readiness,
 preserving its files rather than adopting a purge point on a failed restore.
@@ -427,3 +428,14 @@ other roles that reference a dropped parent are separate concerns.
 ### Direct permission projection poststate
 
 The Direct DDL path persists the complete resource permission set after both grants and partial revokes. A revoke writes the existing deletion projection only when the remaining set is empty. The existing schema lifecycle fence covers mutation and poststate lookup; no transaction rollback or new acknowledgment durability guarantee is implied.
+
+### Group-scoped retirement
+
+`ModeController::retire_raft_group_for_recovery` requires the exact quarantined
+admission epoch and completed publication drain. The physical-worker registry
+then fences only the selected group before awaiting its Core and physical owner.
+Retries retain the same scope and failed-owner history. While it is fenced,
+ordinary group starts/publication and global Pair retirement refuse; unrelated
+group registration remains available. The returned observations are quiescence
+and log-position evidence, not a storage-adoption or healthy-state receipt.
+There is no fault-clear or replacement-release operation in this prerequisite.
