@@ -44,6 +44,23 @@ def page(body: str, *, scripts: bool = True) -> str:
     )
 
 
+class OpeningEssayUsesTheExistingRenderer(unittest.TestCase):
+    def test_projection_essay_renders_without_losing_its_policy_names(self):
+        renderer = REPO / "specs" / "lean4" / "site" / "postprocess.py"
+        spec = importlib.util.spec_from_file_location("ferrosa_postprocess", renderer)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        source = (REPO / "specs" / "lean4" / "Ferrosa" / "SystemTables" / "Projection.lean").read_text()
+        header = source.split("/-", 1)[1].split("-/", 1)[0]
+        title, body = module.render_essay("Ferrosa.SystemTables.Projection", header)
+        self.assertIn("projection layer", title)
+        for policy in ("timestampOnly", "timestampSeq", "seqFirst"):
+            self.assertIn(f"<code>{policy}</code>", body)
+        self.assertIn("merge_rows_into", body)
+        self.assertIn("reconcile_ref", body)
+
+
 class WorkflowPrintsTheSite(unittest.TestCase):
     def setUp(self):
         self.workflow = WORKFLOW.read_text()

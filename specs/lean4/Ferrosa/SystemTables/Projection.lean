@@ -14,12 +14,13 @@
   log index, so the only ordering information in durable state is the wall clock.  Reads then apply
   two different tie rules:
 
-  * `merge_rows_into` / `cell_supersedes` (`ferrosa-storage/src/merge.rs:137-190`) keep the higher
+  `merge_rows_into` / `cell_supersedes` (`ferrosa-storage/src/merge.rs:137-190`) keep the higher
     timestamp, and on a tie a live cell beats a tombstone and the lexicographically greater value
     wins.  This is the read and compaction path.  The payload is `serde_json` of a `Vec` built from
     a `HashSet` (`persistence.rs:421-423`), so its element order is the hash iteration order and
     which payload is greater is not a function of the permission sets.
-  * `merge_into_existing_row` / `reconcile_ref` (`ferrosa-storage/src/memtable/sharded.rs:520-560`,
+
+  `merge_into_existing_row` / `reconcile_ref` (`ferrosa-storage/src/memtable/sharded.rs:520-560`,
     `ferrosa-common/src/complex_cell.rs:63-77`) keep the higher timestamp, and on a tie a tombstone
     beats a live cell.  This is the memtable write path.
 
@@ -32,9 +33,11 @@
   `Cell` is one (partition, clustering) key, and the policy parameter is the merge rule the
   projection might have had:
 
-  * `timestampOnly` — the code's rule: timestamp, then the code's tie-break.
-  * `timestampSeq`  — timestamp, then a monotone per-cell sequence (the smallest fix for a tie).
-  * `seqFirst`      — per-cell sequence first, timestamp second (the durable fix for any clock).
+  `timestampOnly` — the code's rule: timestamp, then the code's tie-break.
+
+  `timestampSeq`  — timestamp, then a monotone per-cell sequence (the smallest fix for a tie).
+
+  `seqFirst`      — per-cell sequence first, timestamp second (the durable fix for any clock).
 
   Visibility is a second parameter because the code has a second defect: `absorbing` is the loader's
   present rule (any row tombstone hides the cell forever), `suppressing` is timestamp-ordered
