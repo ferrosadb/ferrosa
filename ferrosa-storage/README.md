@@ -1857,3 +1857,5 @@ count times the requested page size.
 ### Consistent cell ties across storage paths
 
 Read, compaction and repair cell comparison delegates to the same common ordering as the memtable. An equal-timestamp cell deletion therefore remains a deletion across a flush and cold reopen. This changes reconciliation of previously conflicting ties, not the SSTable or commit-log format.
+
+WAL readers reject future header versions before interpreting entries. The writer still emits the existing version; a future mutation generation requires a compatible reader rollout across WAL and Pair transport.
