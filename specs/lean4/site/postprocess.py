@@ -40,7 +40,7 @@ class Unexpected(Exception):
 
 
 # ---------------------------------------------------------------------------------------------------
-# The header essay: a setext title, paragraphs, h2-h6 headings and flat unordered lists,
+# The header essay: a setext title, paragraphs, h2-h6 headings, flat lists and fenced code,
 # with `code`, **bold** and *italic*. Other Markdown is refused rather than guessed at.
 
 UNSUPPORTED = re.compile(r"^\s*([-*+] |\d+[.)] |\||```|#|>|    \S)")
@@ -80,11 +80,13 @@ def render_essay(key: str, text: str) -> tuple[str, str]:
 
 
 def render_blocks(key: str, lines: list[str]) -> str:
-    """Render the supported block grammar without silently flattening Markdown."""
+    """Render supported blocks; preserve fenced bytes rather than interpreting them."""
     blocks: list[tuple[str, str]] = []
     current: list[str] = []
     kind = "p"
     margin = min((len(ln) - len(ln.lstrip()) for ln in lines if ln.strip()), default=0)
+    fence: tuple[int, str, int] | None = None
+    code: list[str] = []
 
     def flush() -> None:
         if current:
@@ -93,16 +95,31 @@ def render_blocks(key: str, lines: list[str]) -> str:
 
     for raw in lines:
         ln = raw.strip()
+        indent = len(raw) - len(raw.lstrip())
+        if fence is not None:
+            if re.fullmatch(r"`{3,}", ln) and len(ln) >= fence[0]:
+                blocks.append(("code:" + fence[1], "\n".join(code) + ("\n" if code else "")))
+                fence = None
+                code = []
+            else:
+                code.append(raw[min(indent, fence[2]):])
+            continue
+        opening = re.fullmatch(r"(`{3,})[ \t]*([A-Za-z0-9_+-]*)[ \t]*", ln)
         heading = re.fullmatch(r"(#{2,6})[ \t]+(.+)", ln)
         bullet = re.fullmatch(r"[-*+][ \t]+(\S.*)", ln)
-        if heading:
+        numbered = re.fullmatch(r"([0-9]{1,9})[.)][ \t]+(\S.*)", ln)
+        if opening and indent == margin:
+            flush()
+            kind = "p"
+            fence = (len(opening[1]), opening[2], indent)
+        elif heading:
             flush()
             blocks.append((f"h{len(heading[1])}", heading[2]))
             kind = "p"
-        elif bullet and len(raw) - len(raw.lstrip()) == margin:
+        elif (bullet or numbered) and indent == margin:
             flush()
-            kind = "li"
-            current.append(bullet[1])
+            kind = "li" if bullet else "ol:" + numbered[1]
+            current.append(bullet[1] if bullet else numbered[2])
         elif UNSUPPORTED.match(ln) and not ln.startswith("**"):
             raise Unexpected(f"{key}: header essay uses Markdown the renderer does not handle: {ln!r}")
         elif ln:
@@ -110,20 +127,37 @@ def render_blocks(key: str, lines: list[str]) -> str:
         else:
             flush()
             kind = "p"
+    if fence is not None:
+        raise Unexpected(f"{key}: unclosed fenced code block")
     flush()
 
     rendered: list[str] = []
-    in_list = False
+    active_list: str | None = None
+    expected_number = 1
     for tag, content in blocks:
-        if tag == "li" and not in_list:
-            rendered.append("<ul>")
-            in_list = True
-        elif tag != "li" and in_list:
-            rendered.append("</ul>")
-            in_list = False
-        rendered.append(f"<{tag}>{render_inline(content)}</{tag}>")
-    if in_list:
-        rendered.append("</ul>")
+        number = int(tag[3:]) if tag.startswith("ol:") else None
+        list_kind = "ol" if number is not None else "ul" if tag == "li" else None
+        if list_kind != active_list:
+            if active_list:
+                rendered.append(f"</{active_list}>")
+            if list_kind:
+                start = f' start="{number}"' if number is not None and number != 1 else ""
+                rendered.append(f"<{list_kind}{start}>")
+                expected_number = number if number is not None else 1
+            active_list = list_kind
+        if tag.startswith("code:"):
+            language = tag[5:]
+            attr = f' class="language-{html.escape(language, quote=True)}"' if language else ""
+            rendered.append(f"<pre><code{attr}>{html.escape(content, quote=False)}</code></pre>")
+        elif list_kind:
+            value = f' value="{number}"' if number is not None and number != expected_number else ""
+            rendered.append(f"<li{value}>{render_inline(content)}</li>")
+            if number is not None:
+                expected_number = number + 1
+        else:
+            rendered.append(f"<{tag}>{render_inline(content)}</{tag}>")
+    if active_list:
+        rendered.append(f"</{active_list}>")
     return "\n".join(rendered)
 
 

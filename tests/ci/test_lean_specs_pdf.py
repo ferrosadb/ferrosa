@@ -84,10 +84,23 @@ class OpeningEssayUsesTheExistingRenderer(unittest.TestCase):
         module = load_postprocess_module()
         _, body = module.render_essay("safe", "Title\n=====\n\n## <script> `x`\n\n* **bold** & <tag>\n  wrapped\n* second\n\nparagraph")
         self.assertEqual(body, "<h2>&lt;script&gt; <code>x</code></h2>\n<ul>\n<li><strong>bold</strong> &amp; &lt;tag&gt; wrapped</li>\n<li>second</li>\n</ul>\n<p>paragraph</p>")
-        for unsupported in ("# top heading", "1. ordered", "> quote", "```python", "| table |", "* item\n  * nested"):
+        for unsupported in ("# top heading", "1. item\n  2. nested", "> quote", "```python", "| table |", "* item\n  * nested"):
             with self.subTest(unsupported=unsupported):
                 with self.assertRaises(module.Unexpected):
                     module.render_essay("strict", "Title\n=====\n\n" + unsupported)
+
+    def test_fenced_code_preserves_bytes_and_escapes_html(self):
+        module = load_postprocess_module()
+        _, body = module.render_essay("code", "Title\n=====\n\n```text\n<script>& `code` **literal**\n  indented\n```\n\nparagraph")
+        self.assertEqual(body, '<pre><code class="language-text">&lt;script&gt;&amp; `code` **literal**\n  indented\n</code></pre>\n<p>paragraph</p>')
+        for bad in ("```text\nunclosed", '```text onclick="bad"\nx\n```'):
+            with self.subTest(bad=bad), self.assertRaises(module.Unexpected):
+                module.render_essay("strict", "Title\n=====\n\n" + bad)
+
+    def test_ordered_lists_keep_numbering_wrapped_text_and_block_boundaries(self):
+        module = load_postprocess_module()
+        _, body = module.render_essay("list", "Title\n=====\n\n3. **first**\n   wrapped\n4. `second`\n7. <last>\n\n* bullet\n\nparagraph")
+        self.assertEqual(body, '<ol start="3">\n<li><strong>first</strong> wrapped</li>\n<li><code>second</code></li>\n<li value="7">&lt;last&gt;</li>\n</ol>\n<ul>\n<li>bullet</li>\n</ul>\n<p>paragraph</p>')
 
     def test_current_chapter_headers_use_supported_blocks(self):
         module = load_postprocess_module()
