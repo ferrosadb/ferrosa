@@ -1,4 +1,6 @@
 //! Exercise the real Bolt RUN/PULL dispatch against storage, without network races.
+#[path = "order_by_spill_tests.rs"]
+mod order_by_spill_tests;
 #[path = "transaction_auto_schema_tests.rs"]
 mod transaction_auto_schema_tests;
 use super::*;

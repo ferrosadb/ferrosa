@@ -203,12 +203,12 @@ pub async fn execute(
 /// Everything else, including `UNION` *without* `ALL` (its `HashSet` dedup
 /// spans the whole concatenation), `DeleteNodes` (it walks the matched rows
 /// twice — validate every vertex, then tombstone — and streaming it would
-/// partially delete), `Aggregate`, DISTINCT, ORDER BY, and
-/// `ExpandVarLength`.
+/// partially delete) and `Aggregate`.
 ///
-/// `WcoJoin` moved into the streaming set: its accumulator already spilled to
-/// disk, and only the final `finish_rows()` was pulling the result back into
-/// memory.
+/// `WcoJoin` and `ExpandVarLength` moved into the streaming set: their ORDER BY
+/// accumulators spill while rows are produced, and the merge is consumed only
+/// as a stream (`OrderBySink::finish_stream`) — there is no `finish_rows` that
+/// could pull it back into memory.
 ///
 /// # Stats
 ///
@@ -490,6 +490,32 @@ fn execute_streaming_inner<'a>(
                     write_path,
                     keyspace,
                     &plan,
+                    &return_clause,
+                    config,
+                    start,
+                    virtual_tables,
+                    schema,
+                )
+                .await
+            }
+
+            // Variable-length path. Its ORDER BY sink spills while the rows
+            // are produced; routing it here is what lets the merge reach the
+            // transport on pull instead of being collected by the fallback.
+            PhysicalPlan::ExpandVarLength {
+                anchor,
+                hop,
+                min_hops,
+                max_hops,
+                return_clause,
+            } => {
+                super::varpath::execute_var_length_streaming(
+                    write_path,
+                    keyspace,
+                    &anchor,
+                    &hop,
+                    min_hops,
+                    max_hops,
                     &return_clause,
                     config,
                     start,
@@ -1549,9 +1575,14 @@ async fn execute_expand_streaming<'a>(
 
     // ORDER BY (with or without DISTINCT) is a pipeline breaker: no row is
     // final until every row is projected. But "must see every row" does not
-    // mean "must hold every row": when the spilling sorter applies, project
-    // each state straight INTO it and stream the merged output — the full
-    // result set is never resident (t_3f2f961a).
+    // mean "must hold every row": project each state straight INTO the
+    // ORDER BY sink and stream the merged output — the full result set is
+    // never resident (t_3f2f961a).
+    //
+    // There is no buffered fallback here any more. It used to catch an order
+    // term that was not a projected column, which then sorted the whole
+    // result in memory; that term now travels as a hidden sort key, so every
+    // ORDER BY takes this arm.
     //
     // DISTINCT used to be excluded here because the buffered tail re-sorted by
     // debug string after the ORDER BY sort, so streaming it would have changed
@@ -1560,64 +1591,28 @@ async fn execute_expand_streaming<'a>(
     // forms are first-seen order and the exclusion has nothing left to protect.
     if !parts.return_clause.order_by.is_empty() {
         let columns = build_columns(&parts.return_clause);
-        {
-            if let Some(mut sink) = crate::executor::spill::SpillSortSink::try_new(
-                &columns,
-                &parts.return_clause,
-                ctx.config,
-                "graph_order_by_stream",
-            )? {
-                let proj = ExpandProjection {
-                    needs_graph_projection: parts
-                        .return_clause
-                        .items
-                        .iter()
-                        .any(|item| expr_has_pattern_comprehension(&item.expr)),
-                    anchor_var: parts.anchor.var.clone().unwrap_or_default(),
-                    return_clause: parts.return_clause.clone(),
-                    write_path: ctx.write_path,
-                    keyspace: ctx.keyspace,
-                    schema: ctx.schema,
-                };
-                project_states_into_sink(
-                    &states,
-                    &proj,
-                    &mut sink,
-                    ctx.start,
-                    ctx.config.query_timeout,
-                )
-                .await?;
-                stats.execution_ms = ctx.start.elapsed().as_millis() as u64;
-                let mut sorted = sink.finish_stream()?;
-
-                // DISTINCT on the sorted stream, in the same order the buffered
-                // tail applies it: sort, then dedup, then limit.
-                //
-                // `dedup_stream` hashes every row it has emitted, so this is
-                // bounded by the number of DISTINCT rows rather than by the
-                // number of candidate rows — inherent to DISTINCT without a
-                // spilling set, and still far below materialising everything.
-                // Adjacent-only dedup would be O(1) but WRONG here: the stream
-                // is sorted by the ORDER BY terms, which may be a subset of the
-                // projected columns, so equal rows are not necessarily adjacent.
-                if parts.return_clause.distinct {
-                    sorted = crate::executor::stream::dedup_stream(sorted);
-                }
-
-                // LIMIT applies to the sorted, deduplicated output. Taking it
-                // here is what lets the sink accept a LIMIT at all: the sort
-                // still sees every candidate row, but only `limit` are pulled.
-                if let Some(limit) = parts.return_clause.limit {
-                    use futures::StreamExt as _;
-                    sorted = Box::pin(sorted.take(limit.max(0) as usize));
-                }
-                return Ok((columns, sorted, stats));
-            }
-        }
-        // Fallback: no spill backend, LIMIT present, an order term that is not
-        // a projected column (needs the states' bindings), or DISTINCT.
-        let result = finish_expand_buffered(states, stats, plan, ctx).await?;
-        return Ok((result.columns, stream_from_rows(result.rows), result.stats));
+        let proj = ExpandProjection {
+            needs_graph_projection: parts
+                .return_clause
+                .items
+                .iter()
+                .any(|item| expr_has_pattern_comprehension(&item.expr)),
+            anchor_var: parts.anchor.var.clone().unwrap_or_default(),
+            return_clause: parts.return_clause.clone(),
+            write_path: ctx.write_path,
+            keyspace: ctx.keyspace,
+            schema: ctx.schema,
+        };
+        let sorted = order_states_stream(
+            &states,
+            &proj,
+            ctx.config,
+            ctx.start,
+            "graph_order_by_stream",
+        )
+        .await?;
+        stats.execution_ms = ctx.start.elapsed().as_millis() as u64;
+        return Ok((columns, sorted, stats));
     }
 
     let columns = build_columns(&parts.return_clause);
@@ -2102,48 +2097,18 @@ async fn finish_expand_buffered(
     // unbounded ORDER BY now SPILLS instead of being capped, which is the
     // honest answer rather than a quiet wrong one.
     //
-    // When the spilling sorter applies, each projected row goes straight INTO
-    // it — the interim rows `Vec` and the per-state clones (only ever needed by
-    // the bindings-based fallback sort) are skipped entirely, so projection
-    // memory is bounded by the spill threshold rather than the result size
-    // (t_3f2f961a). The final `Vec` below is this function's buffered
-    // contract; the streaming entry point avoids even that.
-    //
-    // ORDER BY runs before projection-only values disappear: Cypher permits
-    // ordering by expressions that are not part of RETURN, and exactly that
-    // case is why the fallback sorts via the states' bindings — a spilled row
-    // carries no binding context, so `SpillSortSink::try_new` refuses it.
-    let sink = crate::executor::spill::SpillSortSink::try_new(
-        &columns,
-        return_clause,
-        config,
-        "graph_order_by",
-    )?;
-    let mut rows = Vec::new();
-    match sink {
-        Some(mut sink) => {
-            let proj = ExpandProjection {
-                return_clause: return_clause.clone(),
-                anchor_var: anchor_var.to_string(),
-                needs_graph_projection,
-                write_path,
-                keyspace,
-                schema,
-            };
-            project_states_into_sink(
-                &current_states,
-                &proj,
-                &mut sink,
-                start,
-                config.query_timeout,
-            )
-            .await?;
-            rows = sink.finish_rows()?;
-        }
-        None => {
-            let mut result_states = Vec::new();
-            for state in &current_states {
-                let row = project_state(
+    // An ORDER BY goes through the same sink as the streaming entry point:
+    // each projected row goes straight INTO it with its sort keys attached as
+    // hidden columns, so a non-projected term (Cypher permits ordering by
+    // expressions not in RETURN) no longer needs the per-state clones and the
+    // whole-result in-memory sort it used to (t_3f2f961a). Collecting the
+    // sorted stream below is this function's buffered `GraphResult` contract
+    // and nothing else; the streaming entry point does not collect.
+    let rows = if return_clause.order_by.is_empty() {
+        let mut rows = Vec::new();
+        for state in &current_states {
+            rows.push(
+                project_state(
                     return_clause,
                     needs_graph_projection,
                     write_path,
@@ -2152,24 +2117,31 @@ async fn finish_expand_buffered(
                     anchor_var,
                     state,
                 )
-                .await?;
-                result_states.push(state.clone());
-                rows.push(row);
-            }
-            sort_projected_rows_by_bindings(&mut rows, &result_states, return_clause);
+                .await?,
+            );
         }
-    }
-
-    // Apply DISTINCT.
-    if return_clause.distinct {
-        dedup_preserving_order(&mut rows);
-    }
-
-    // Apply LIMIT.
-    if let Some(limit) = return_clause.limit {
-        let limit = limit.max(0) as usize;
-        rows.truncate(limit);
-    }
+        // Apply DISTINCT.
+        if return_clause.distinct {
+            dedup_preserving_order(&mut rows);
+        }
+        // Apply LIMIT.
+        if let Some(limit) = return_clause.limit {
+            rows.truncate(limit.max(0) as usize);
+        }
+        rows
+    } else {
+        let proj = ExpandProjection {
+            return_clause: return_clause.clone(),
+            anchor_var: anchor_var.to_string(),
+            needs_graph_projection,
+            write_path,
+            keyspace,
+            schema,
+        };
+        let sorted =
+            order_states_stream(&current_states, &proj, config, start, "graph_order_by").await?;
+        crate::executor::stream::collect_rows(sorted).await?
+    };
 
     stats.execution_ms = start.elapsed().as_millis() as u64;
 
@@ -2342,10 +2314,10 @@ struct ExpandProjection<'a> {
 }
 
 /// Project every surviving state sequentially, pushing each row straight into
-/// the spilling ORDER BY sorter — the interim rows `Vec` never exists, so
-/// projection memory is bounded by the spill threshold rather than the result
-/// size (t_3f2f961a). Shared by the streaming and buffered ORDER BY tails so
-/// they cannot drift.
+/// the ORDER BY sink together with the bindings it was projected from (the
+/// sink evaluates the hidden sort keys from them) — the interim rows `Vec`
+/// never exists, so projection memory is bounded by the spill threshold
+/// rather than the result size (t_3f2f961a).
 ///
 /// Checks the query timeout once per state: projection can read storage (a
 /// pattern comprehension traverses per row), so it is WORK and gets the same
@@ -2354,7 +2326,7 @@ struct ExpandProjection<'a> {
 async fn project_states_into_sink(
     states: &[ExpandState],
     proj: &ExpandProjection<'_>,
-    sink: &mut crate::executor::spill::SpillSortSink,
+    sink: &mut crate::executor::spill::OrderBySink,
     start: Instant,
     query_timeout: std::time::Duration,
 ) -> Result<()> {
@@ -2370,9 +2342,46 @@ async fn project_states_into_sink(
             state,
         )
         .await?;
-        sink.push(row)?;
+        sink.push(row, &state.bindings)?;
     }
     Ok(())
+}
+
+/// Phase B for an ordered Expand, shared by the streaming and buffered entry
+/// points so they cannot drift: project every state into an [`OrderBySink`]
+/// with `sort_projected_rows_by_bindings` semantics, then sort → DISTINCT →
+/// LIMIT on the merged stream.
+///
+/// The sink is spill-backed whenever a backend is configured, whether or not
+/// the ORDER BY terms are projected; the hidden keys are stripped before the
+/// stream yields a row.
+///
+/// [`OrderBySink`]: crate::executor::spill::OrderBySink
+async fn order_states_stream(
+    states: &[ExpandState],
+    proj: &ExpandProjection<'_>,
+    config: &GraphEngineConfig,
+    start: Instant,
+    label: &str,
+) -> Result<RowStream<'static>> {
+    let columns = build_columns(&proj.return_clause);
+    let Some(mut sink) = crate::executor::spill::OrderBySink::new(
+        &columns,
+        &proj.return_clause,
+        config,
+        label,
+        crate::executor::spill::OrderSemantics::Bindings,
+    )?
+    else {
+        return Err(GraphError::Internal(
+            "ordered Expand tail reached without an ORDER BY".to_string(),
+        ));
+    };
+    project_states_into_sink(states, proj, &mut sink, start, config.query_timeout).await?;
+    Ok(crate::executor::spill::distinct_then_limit(
+        sink.finish_stream()?,
+        &proj.return_clause,
+    ))
 }
 
 /// Project the surviving expand states lazily: one [`project_state`] call per
@@ -2385,10 +2394,9 @@ async fn project_states_into_sink(
 ///   so an ordered Expand keeps the buffered tail.
 /// - It does not dedup. `DISTINCT` composes on top via
 ///   [`dedup_stream`](crate::executor::stream::dedup_stream).
-/// - It drops the buffered loop's `result_states.push(state.clone())` — that
-///   per-row deep clone of every binding map existed only to let
-///   `sort_projected_rows_by_bindings` order by non-projected expressions,
-///   which is the `ORDER BY` path this stream never takes.
+/// - It never needed a per-state clone of the bindings: that existed only to
+///   let `sort_projected_rows_by_bindings` order by non-projected
+///   expressions, and the ordered tail now carries those as hidden sort keys.
 ///
 /// The states themselves are still materialized by the hop loop; making the
 /// hops lazy is a later increment.
@@ -2504,7 +2512,12 @@ fn sort_projected_rows_by_bindings(
     rows.extend(paired.into_iter().map(|(row, _)| row));
 }
 
-fn projected_order_value(
+/// The value an ORDER BY term sorts by under bindings semantics: the term
+/// evaluated against the row's bindings, falling back to its projected column
+/// (an alias, or a value only the projection computes). Also the hidden-key
+/// evaluation of `spill::OrderSemantics::Bindings`, so a spilled Expand sort
+/// orders exactly like this in-memory one.
+pub(super) fn projected_order_value(
     expr: &Expr,
     columns: &[String],
     row: &[serde_json::Value],
@@ -2522,7 +2535,11 @@ fn projected_order_value(
         .unwrap_or(serde_json::Value::Null)
 }
 
-fn pipeline_value_cmp(a: &serde_json::Value, b: &serde_json::Value) -> std::cmp::Ordering {
+/// The bindings-semantics comparator (see [`projected_order_value`]).
+pub(super) fn pipeline_value_cmp(
+    a: &serde_json::Value,
+    b: &serde_json::Value,
+) -> std::cmp::Ordering {
     match (a, b) {
         (serde_json::Value::Number(an), serde_json::Value::Number(bn)) => an
             .as_f64()
@@ -7731,8 +7748,8 @@ mod tests {
             .nth(1)
             .expect("the streaming ORDER BY arm must exist");
         let arm = &body[..body
-            .find("// Fallback:")
-            .expect("the fallback comment must exist")];
+            .find("return Ok((columns, sorted, stats));")
+            .expect("the streaming ORDER BY arm must return the sorted stream")];
 
         assert!(
             !arm.contains("if !parts.return_clause.distinct"),
@@ -7741,9 +7758,126 @@ mod tests {
              preserve by materialising"
         );
         assert!(
-            arm.contains("dedup_stream"),
-            "the streaming arm must apply DISTINCT to the sorted stream"
+            arm.contains("order_states_stream"),
+            "the streaming arm must go through the shared ordered tail, which \
+             applies DISTINCT to the sorted stream"
         );
+        assert!(
+            !arm.contains("finish_expand_buffered"),
+            "no ORDER BY may fall back to the buffered tail: a non-projected \
+             term is a hidden sort key now, not a reason to sort in memory"
+        );
+        let tail = src
+            .split("async fn order_states_stream")
+            .nth(1)
+            .expect("the shared ordered tail must exist");
+        let tail = &tail[..tail.find("\n}\n").expect("end of order_states_stream")];
+        assert!(
+            tail.contains("distinct_then_limit") && tail.contains("finish_stream"),
+            "the ordered tail must sort, then DISTINCT and LIMIT on the stream"
+        );
+    }
+
+    /// `ExpandVarLength` must reach the transport as a stream, for the same
+    /// reason as `WcoJoin` below: falling through to `other =>` still returns
+    /// correct rows, but collected — and the spilled sort undone.
+    #[test]
+    fn var_length_is_routed_to_the_streaming_dispatch_not_the_buffered_fallback() {
+        let src = include_str!("expand.rs");
+        let dispatch = src
+            .split("fn execute_streaming_inner")
+            .nth(1)
+            .expect("execute_streaming_inner must exist");
+        let dispatch = &dispatch[..dispatch
+            .find("// --- everything else")
+            .expect("the buffered fallback arm must exist")];
+        assert!(dispatch.contains("PhysicalPlan::ExpandVarLength"));
+        assert!(
+            dispatch.contains("execute_var_length_streaming"),
+            "the ExpandVarLength arm must call the streaming form, not the \
+             collecting wrapper"
+        );
+    }
+
+    /// Hidden-key spilling must order Expand rows EXACTLY as the in-memory
+    /// bindings sort (`sort_projected_rows_by_bindings`) does, including on
+    /// the values where its comparator is idiosyncratic — Null, booleans,
+    /// mixed types — and for a term that is not projected.
+    #[tokio::test]
+    async fn spilled_expand_order_matches_the_in_memory_bindings_sort() {
+        use crate::executor::spill::test_support::{spilling_config, TempDirReserver};
+        use crate::parser::{Expr, OrderItem, ReturnClause, ReturnItem, SortDir};
+        use serde_json::json;
+
+        let values = [
+            json!(3),
+            json!("b"),
+            serde_json::Value::Null,
+            json!(true),
+            json!(1.5),
+            json!(false),
+            json!("a"),
+            json!([1, 2]),
+            json!(-4),
+        ];
+        let states: Vec<ExpandState> = values
+            .iter()
+            .enumerate()
+            .map(|(i, rank)| {
+                let mut bindings = HashMap::new();
+                bindings.insert(
+                    "n".to_string(),
+                    json!({ "name": format!("v{i}"), "rank": rank }),
+                );
+                ExpandState {
+                    current_key: DecoratedKey::new(PartitionKey::new(vec![i as u8])),
+                    bindings,
+                }
+            })
+            .collect();
+        let (_tmp, wp) = streaming_test_write_path();
+
+        for direction in [SortDir::Asc, SortDir::Desc] {
+            let return_clause = ReturnClause {
+                distinct: false,
+                items: vec![ReturnItem {
+                    expr: Expr::Property {
+                        var: "n".to_string(),
+                        name: "name".to_string(),
+                    },
+                    alias: None,
+                }],
+                order_by: vec![OrderItem {
+                    expr: Expr::Property {
+                        var: "n".to_string(),
+                        name: "rank".to_string(),
+                    },
+                    direction,
+                }],
+                limit: None,
+            };
+
+            // The reference: the in-memory bindings sort, as it always ran.
+            let mut reference: Vec<Vec<serde_json::Value>> = states
+                .iter()
+                .map(|s| vec![s.bindings["n"]["name"].clone()])
+                .collect();
+            sort_projected_rows_by_bindings(&mut reference, &states, &return_clause);
+
+            let spill_dir = tempfile::tempdir().unwrap();
+            let reserver = TempDirReserver::new(spill_dir.path());
+            let config = spilling_config(reserver.clone(), GraphEngineConfig::default());
+            let proj = projection_ctx(&wp, return_clause.clone(), false);
+            let sorted = order_states_stream(&states, &proj, &config, Instant::now(), "t")
+                .await
+                .unwrap();
+            assert!(
+                reserver.live_run_files() > 1,
+                "the non-projected ORDER BY must have spilled"
+            );
+            let spilled = crate::executor::stream::collect_rows(sorted).await.unwrap();
+            assert_eq!(spilled, reference, "{direction:?}");
+        }
     }
 
     /// DISTINCT must not discard the ORDER BY the query asked for.

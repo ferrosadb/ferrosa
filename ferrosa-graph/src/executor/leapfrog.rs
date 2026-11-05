@@ -21,39 +21,14 @@ use ferrosa_storage::TableId;
 
 use crate::adjacency::schema::adjacency_keyspace_name;
 use crate::error::{GraphError, Result};
+use crate::executor::eval;
 use crate::executor::expand::{
     build_columns, check_timeout, extract_neighbor_id, GraphEngineConfig,
 };
 use crate::executor::result::{GraphResult, QueryStats};
-use crate::executor::spill::SpillSortSink;
-use crate::executor::stream::RowVals;
-use crate::executor::{eval, sort_rows};
+use crate::executor::spill::{OrderSemantics, RowAcc};
 use crate::parser::ReturnClause;
 use crate::planner::physical::WcoJoinPlan;
-
-/// Where enumerated result rows go.
-///
-/// `Spilling` pushes each row into the external merge sort AS IT IS PRODUCED,
-/// so an unbounded ORDER BY result never sits fully in memory (t_3f2f961a).
-/// `Buffered` is the fallback when the sink cannot apply (no backend, LIMIT
-/// present, no ORDER BY, or an order term that is not a projected column) —
-/// identical to the old accumulation.
-enum RowAcc {
-    Buffered(Vec<RowVals>),
-    Spilling(SpillSortSink),
-}
-
-impl RowAcc {
-    fn push(&mut self, row: RowVals) -> Result<()> {
-        match self {
-            Self::Buffered(rows) => {
-                rows.push(row);
-                Ok(())
-            }
-            Self::Spilling(sink) => sink.push(row),
-        }
-    }
-}
 
 /// A sorted iterator over neighbor IDs from the adjacency index.
 /// Supports seek (advance to a position >= target) and next.
@@ -273,17 +248,20 @@ pub async fn execute_wco_join_streaming<'a>(
 
     let columns = build_columns(return_clause);
 
-    // Result accumulation is spill-backed when the sorter applies, so an
-    // unbounded ORDER BY never holds the full result in memory. The silent
-    // `max_result_rows` truncation that used to stop enumeration is REMOVED
-    // (result caps are bugs: a client could not tell a partial answer from a
-    // complete one). Work stays bounded by `check_timeout`, which every
-    // enumeration step already consults.
-    let mut acc =
-        match SpillSortSink::try_new(&columns, return_clause, config, "graph_wco_order_by")? {
-            Some(sink) => RowAcc::Spilling(sink),
-            None => RowAcc::Buffered(Vec::new()),
-        };
+    // With an ORDER BY, result accumulation goes into the ORDER BY sink —
+    // spill-backed whenever a backend is configured, with every order term a
+    // hidden key — so an unbounded ORDER BY never holds the full result in
+    // memory, projected terms or not. The silent `max_result_rows` truncation
+    // that used to stop enumeration is REMOVED (result caps are bugs: a client
+    // could not tell a partial answer from a complete one). Work stays bounded
+    // by `check_timeout`, which every enumeration step already consults.
+    let mut acc = RowAcc::new(
+        &columns,
+        return_clause,
+        config,
+        "graph_wco_order_by",
+        OrderSemantics::ProjectedColumns,
+    )?;
 
     let mut candidates = write_path.range_read_stream_all(&first_table_id, 0).await?;
     while let Some(candidate) = candidates.next().await {
@@ -316,36 +294,17 @@ pub async fn execute_wco_join_streaming<'a>(
         .await?;
     }
 
-    // Terminal ORDER BY: the spilling accumulator already sorted while
-    // accumulating and hands back a stream that reads its spilled runs on pull;
-    // the buffered fallback sorts in memory, which is bounded by the threshold
-    // that would have made it spill.
-    let mut rows: crate::executor::RowStream<'static> = match acc {
-        RowAcc::Spilling(sink) => sink.finish_stream()?,
-        RowAcc::Buffered(mut buffered) => {
-            if !return_clause.order_by.is_empty() {
-                sort_rows(&mut buffered, &columns, &return_clause.order_by);
-            }
-            crate::executor::stream::stream_from_rows(buffered)
-        }
-    };
-
-    // DISTINCT on the stream. The buffered form sorted the whole result by its
-    // debug representation and then deduped, which needed every row present at
-    // once — and incidentally returned RETURN DISTINCT in string-repr sorted
-    // order. `dedup_stream` is first-seen order, matching the streaming paths
-    // that already made that change deliberately (t_4ce82a3e).
-    if return_clause.distinct {
-        rows = crate::executor::stream::dedup_stream(rows);
-    }
-
-    // LIMIT on the stream. `Vec::truncate` had to build the whole result before
-    // discarding most of it; `take` stops pulling.
-    if let Some(limit) = return_clause.limit {
-        use futures::StreamExt as _;
-        let limit = limit.max(0) as usize;
-        rows = Box::pin(rows.take(limit));
-    }
+    // Terminal ORDER BY, then DISTINCT, then LIMIT, all on the stream. The
+    // sink already sorted while accumulating and hands back a stream that
+    // reads its spilled runs on pull, hidden keys stripped.
+    //
+    // DISTINCT: the buffered form sorted the whole result by its debug
+    // representation and then deduped, which needed every row present at once
+    // — and incidentally returned RETURN DISTINCT in string-repr sorted order.
+    // `dedup_stream` is first-seen order, matching the streaming paths that
+    // already made that change deliberately (t_4ce82a3e). LIMIT: `take` stops
+    // pulling where `Vec::truncate` had to build the whole result first.
+    let rows = acc.into_stream(return_clause)?;
 
     stats.execution_ms = start.elapsed().as_millis() as u64;
 
@@ -380,11 +339,12 @@ async fn enumerate_bindings(
     if var_idx >= variables.len() {
         // Check that every relation is satisfied with current bindings.
         if verify_all_relations(write_path, adj_table_id, plan, var_bindings, stats).await? {
-            // Build a result row from the bindings.
-            let row =
+            // Build a result row from the bindings; the ORDER BY sink takes
+            // the JSON bindings too, to evaluate the hidden sort keys.
+            let (row, json_bindings) =
                 project_bindings(write_path, plan, var_bindings, return_clause, stats, schema)
                     .await?;
-            acc.push(row)?;
+            acc.push(row, &json_bindings)?;
         }
         return Ok(());
     }
@@ -559,6 +519,7 @@ async fn verify_all_relations(
 }
 
 /// Project variable bindings into a result row according to the return clause.
+/// Returns the JSON bindings the row was evaluated against alongside it.
 async fn project_bindings(
     write_path: &dyn GraphWrite,
     plan: &WcoJoinPlan,
@@ -566,7 +527,7 @@ async fn project_bindings(
     return_clause: &ReturnClause,
     stats: &mut QueryStats,
     schema: Option<&ferrosa_schema::Schema>,
-) -> Result<Vec<serde_json::Value>> {
+) -> Result<(Vec<serde_json::Value>, HashMap<String, serde_json::Value>)> {
     // Build JSON bindings for eval_expr by reading each variable's partition.
     let mut json_bindings: HashMap<String, serde_json::Value> = HashMap::new();
 
@@ -597,7 +558,7 @@ async fn project_bindings(
         .map(|item| eval::eval_expr(&item.expr, &json_bindings).unwrap_or(serde_json::Value::Null))
         .collect();
 
-    Ok(row)
+    Ok((row, json_bindings))
 }
 
 #[cfg(test)]

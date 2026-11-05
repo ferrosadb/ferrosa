@@ -112,20 +112,36 @@ use those same stored endpoint keys.
   Streaming today: `Subscribe`, `Union { all: true }` (via `chain_streams`),
   `ReturnOnly`, the **Expand projection** — one `project_state` per pull, so
   `LIMIT k` projects k states instead of projecting everything and truncating —
-  and **`WcoJoin`** (its accumulator already spilled while accumulating; only
-  the final `finish_rows()` pulled the result back into memory, so
-  `leapfrog::execute_wco_join_streaming` now hands back the spill-backed stream
-  of the smallest rows in order). `DISTINCT` composes as `dedup_stream`.
-  SET/REMOVE consume their inner expand as a stream (their own output is one
-  summary row, so it cannot stream). `ORDER BY` on a streamed plan is no longer
-  a whole-result buffer: the spilling external merge sort takes each projected
-  row as it arrives and streams the merged output (`executor/spill.rs`; the
-  Expand tail in `executor/expand.rs`). Every other variant computes the buffered
+  **`WcoJoin`** (`leapfrog::execute_wco_join_streaming`) and
+  **`ExpandVarLength`** (`varpath::execute_var_length_streaming`). `DISTINCT`
+  composes as `dedup_stream`. SET/REMOVE consume their inner expand as a stream
+  (their own output is one summary row, so it cannot stream).
+- **ORDER BY** (`executor/spill.rs`) — never a whole-result buffer when a spill
+  backend is configured (the engine always configures one). Each operator
+  (Expand, `WcoJoin`, `ExpandVarLength`) pushes every projected row into an
+  `OrderBySink` as it is produced; the external merge sort spills sorted runs
+  past `spill_threshold_bytes` and the merge is consumed **only** as a stream
+  (`finish_stream`; there is no `finish_rows`), then `DISTINCT` and `LIMIT` apply
+  on that stream. Every ORDER BY term is evaluated against the row's bindings at
+  projection time and carried as a **hidden trailing sort-key column**, so
+  `RETURN n.name ORDER BY n.age` spills exactly like a projected term; the keys
+  are stripped before a row leaves the sink, so `columns` and row widths never
+  change, and `DISTINCT` dedups the visible row. Each operator keeps the
+  comparator its in-memory sort always used: Expand orders like
+  `sort_projected_rows_by_bindings` (`pipeline_value_cmp`), var-length paths and
+  `WcoJoin` like `sort_rows` (`compare_json_values`). With **no** spill backend
+  (unit tests, embedded) the same keyed rows sort in memory — the designed,
+  observable fallback: one `warn` on first use and a process-wide count in
+  `spill::in_memory_order_by_sorts()`. `UNWIND`'s ORDER BY still sorts its
+  (literal, already-resident) list in memory.
+- **Buffered variants** — every other variant computes the buffered
   `GraphResult` and is wrapped with `stream_from_rows`: `UNION` without `ALL`
   (whole-result dedup), `DELETE` (two passes over the matched rows — validate,
-  then tombstone), `ExpandVarLength`, `Unwind`, `Create` / `Merge`, and the
-  virtual-table anchor. `Aggregate` is deliberately **not** in that materializing
-  set: `execute_aggregate` streams its inner plan and folds each row as it
+  then tombstone), `Unwind`, `Create` / `Merge`, and the virtual-table anchor.
+  A var-length path without an ORDER BY still buffers its projected rows (its
+  result keys are already resident from the BFS) before streaming them.
+  `Aggregate` is deliberately **not** in that materializing set:
+  `execute_aggregate` streams its inner plan and folds each row as it
   arrives, so its memory is proportional to the number of GROUPS (bounded by
   `config.max_groups`) rather than to the input — a `count(n)` over a billion
   rows holds group state, not the billion (the buffered form is what used to hold

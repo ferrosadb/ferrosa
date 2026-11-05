@@ -585,8 +585,9 @@ type StatsFinalizer = Box<dyn FnOnce(usize) -> crate::executor::QueryStats + Sen
 /// Server-side buffering of the *result* is gone for every plan the executor
 /// streams. It is NOT gone for the query as a whole: phase A of `Expand` still
 /// materializes the frontier before the first row is projected, and the plans
-/// that legitimately buffer (ORDER BY, aggregation, DELETE, `WcoJoin`,
-/// `ExpandVarLength`) still hand back a fully-materialized stream. A
+/// that still buffer (DELETE, UNION without ALL, UNWIND, CREATE/MERGE, a
+/// var-length path without ORDER BY) hand back a materialized stream. ORDER BY
+/// does not: its sort spills and the merge streams here on pull. A
 /// high-fan-out query can still exhaust memory in phase A.
 ///
 /// # Failure after the first chunk

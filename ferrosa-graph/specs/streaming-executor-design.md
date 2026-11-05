@@ -226,7 +226,8 @@ Every other variant computes today's buffered `GraphResult` and is wrapped with
   then tombstone). A single pass would delete a prefix and then fail validation:
   partial deletion.
 - `Aggregate`, DISTINCT, ORDER BY, `WcoJoin`, `ExpandVarLength` — pipeline
-  breakers, scheduled for increments 5–6.
+  breakers, scheduled for increments 5–6. (Since converted: see *Hidden sort
+  keys* below.)
 - The sequential-vs-concurrent hop split (`expand.rs`, capped hops run
   sequentially) is untouched: completion-order draining changes which rows a
   LIMIT returns.
@@ -236,6 +237,44 @@ Every other variant computes today's buffered `GraphResult` and is wrapped with
 
 Known behavior preserved rather than fixed: the buffered `UNION` never summed
 `edges_deleted` across arms, and the streaming one does not either.
+
+#### Hidden sort keys (ORDER BY never re-collects)
+
+PR 648's streaming audit found three ways ORDER BY still held the whole result:
+`SpillSortSink::finish_rows` drained the merge into a `Vec` (used by the
+buffered Expand tail and `spill_order_by`); the var-length path built a `rows`
+Vec, drained it into the sorter via `spill_order_by`, and went through the
+buffered dispatch fallback; and `SpillSortSink::try_new` refused any ORDER BY
+term that was not a projected column, sending the query to an in-memory sort of
+the whole result.
+
+Fixed by:
+
+- **Hidden sort keys.** `spill::OrderKeys::attach` evaluates every ORDER BY term
+  against the row's bindings at projection time and appends the values as
+  trailing hidden columns; the comparator reads only those; `detach` strips them
+  (failing loud on a width mismatch) before any consumer sees a row, so
+  `columns` and row widths are unchanged and DISTINCT dedups the visible row.
+  `try_new` now refuses only "no backend" and "no ORDER BY". Each operator keeps
+  its historical in-memory semantics (`OrderSemantics::Bindings` for Expand =
+  `projected_order_value` + `pipeline_value_cmp`; `ProjectedColumns` for
+  var-length and WCO = column value + `compare_json_values`).
+- **Stream, never re-collect.** `finish_rows` and `spill_order_by` are deleted;
+  `finish_stream` is the only output. Expand's two tails share
+  `order_states_stream`; var-length pushes each row into a `spill::RowAcc` and
+  has a streaming dispatch arm (`execute_var_length_streaming`); WCO uses the
+  same `RowAcc`. Sort → DISTINCT → LIMIT is applied on the stream
+  (`distinct_then_limit`). Only the buffered `execute()` API collects, at its
+  own boundary.
+- **No backend** is the one in-memory fallback, observable: `warn` on first use,
+  counted by `spill::in_memory_order_by_sorts()`.
+
+Behavior changes a client can observe: an Expand ORDER BY that spilled used to
+compare with `compare_json_values`; it now uses `pipeline_value_cmp` like the
+in-memory path always did, so booleans, mixed types and Null-vs-boolean order
+the same whether or not the sort spilled. Var-length and WCO ORDER BY on a
+non-projected expression used to be silently ignored (`sort_rows` skipped it);
+it now orders.
 
 #### Increment 7 (HTTP done, Bolt not started)
 
@@ -293,8 +332,8 @@ phase A is still fully materializing. What was converted:
   so `LIMIT k` projects k states instead of projecting everything and
   truncating. It also drops the buffered loop's `result_states.push(state.clone())`,
   a per-row deep clone of every binding map that only the `ORDER BY` tail needed.
-  An Expand with an `ORDER BY` still uses `finish_expand_buffered` (pipeline
-  breaker, and it keeps the spill path).
+  An Expand with an `ORDER BY` now goes through `order_states_stream` on both
+  entry points (see *Hidden sort keys*).
 - **`DISTINCT`** — now `stream::dedup_stream` on top of the projection, for
   Expands without an `ORDER BY`.
 - **SET / REMOVE** — consume their inner expand as a `RowStream` instead of a
