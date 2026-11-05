@@ -434,7 +434,10 @@ fn count_open_fds() -> u64 {
 fn get_fd_limit() -> u64 {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        // SAFETY: getrlimit is a standard POSIX call.
+        // SAFETY: `rlim` is zeroed as an initial *value*, not as an assumption, because it is only
+        // read inside the `== 0` arm, after `getrlimit` has written it, and the error arm returns 0
+        // without touching it. `RLIMIT_NOFILE` names a fixed resource, so no pointer argument is
+        // reinterpreted and no memory is written through the out-param on failure.
         unsafe {
             let mut rlim: libc::rlimit = std::mem::zeroed();
             if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 {
@@ -456,7 +459,10 @@ fn process_vsz_bytes() -> u64 {
     #[cfg(target_os = "macos")]
     {
         // Use task_info mach API for fast VSZ without subprocess.
-        // SAFETY: task_info is a standard mach system call.
+        // SAFETY: `info` is zeroed as an initial value and is only read when `kr == 0`, i.e. after
+        // the kernel has filled it; `count` is passed as the buffer's capacity in `natural_t`s,
+        // which is exactly `size_of::<data_t>() / size_of::<natural_t>()`. The error arm returns 0
+        // without reading `info`, so a failed call never exposes uninitialised bytes.
         #[allow(deprecated)] // libc::mach_task_self — mach2 crate not needed for this
         unsafe {
             let mut info: libc::mach_task_basic_info_data_t = std::mem::zeroed();

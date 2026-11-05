@@ -88,6 +88,10 @@ fn mallctl_read_ssize(name: &str) -> std::io::Result<i64> {
     let cname = CString::new(name).expect("mallctl option name has no interior NUL");
     let mut value: i64 = 0;
     let mut len = std::mem::size_of::<i64>();
+    // SAFETY: `cname` is NUL-terminated by `CString` and lives until this function returns, so the
+    // name pointer stays valid for the call. `value` and `len` are live locals sized exactly for an
+    // `ssize_t` option, which is the buffer `mallctl` writes into when `oldp` is non-null; jemalloc
+    // checks `len` against the size the named option expects before it writes anything.
     let rc: c_int = unsafe {
         tikv_jemalloc_sys::mallctl(
             cname.as_ptr() as *const c_char,
@@ -106,6 +110,10 @@ fn mallctl_read_ssize(name: &str) -> std::io::Result<i64> {
 
 /// Apply one decay knob and prove it took: write, then read back.
 fn set_decay(name: &str, want: i64) {
+    // SAFETY: `want.clone()` is a fresh `i64` on this frame, and `mallctl_write_ssize` only writes
+    // one `ssize_t` into it before returning, so the temporary outlives the borrow for the call.
+    // Every option name passed to this function is an `ssize_t` knob — `set_decay` is only called
+    // with names that `mallctl_read_ssize` reads back as `i64`.
     if let Err(e) = unsafe { mallctl_write_ssize(name, &mut want.clone()) } {
         eprintln!("jemalloc: could not apply {name}={want}: {e}; leaving it unchanged");
         return;
