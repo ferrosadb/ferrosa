@@ -7,6 +7,9 @@
 //! Snapshots are serialized with bincode because `serde_json` does not support
 //! non-string map keys (our `BTreeMap<(String, String), _>` tuple keys).
 
+//! Last revised: 2026-11-04.
+//! Last changed: Retain owned physical command application through waiter cancellation.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -348,6 +351,19 @@ impl std::error::Error for RecoveryError {}
 /// The current-snapshot slot one live state machine shares with its builders.
 type SharedSnapshotSlot = Arc<parking_lot::RwLock<Option<(SnapshotMeta<u64, BasicNode>, Vec<u8>)>>>;
 
+struct CompletedApply {
+    state: RaftState,
+    response: RaftResponse,
+}
+
+struct PendingApply {
+    log_id: LogId<u64>,
+    job: tokio::task::JoinHandle<CompletedApply>,
+    // Both the queued worker and its owner retain these until physical work
+    // and the existing ordered system-table writes have completed.
+    pauses: Arc<Vec<ferrosa_storage::compaction::TableCompactionPause>>,
+}
+
 /// Openraft state machine for Ferrosa.
 ///
 /// Applies [`RaftCommand`] entries to [`RaftState`] and optionally propagates
@@ -355,6 +371,8 @@ type SharedSnapshotSlot = Arc<parking_lot::RwLock<Option<(SnapshotMeta<u64, Basi
 /// (table registration).
 pub struct FerrosStateMachine {
     state: RaftState,
+    pending_apply: Option<PendingApply>,
+    apply_failure: Option<String>,
     last_applied: Option<LogId<u64>>,
     last_membership: StoredMembership<u64, BasicNode>,
     /// Current snapshot data + metadata, served by `get_current_snapshot`.
@@ -391,6 +409,66 @@ pub struct FerrosStateMachine {
 }
 
 impl FerrosStateMachine {
+    /// The synchronous transition runs against a staged metadata copy. A
+    /// detached waiter leaves the owned handle here, so the next trait call
+    /// reaps it before exposing an applied index or constructing a snapshot.
+    fn staged_apply(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+            last_applied: self.last_applied,
+            last_membership: self.last_membership.clone(),
+            current_snapshot: self.current_snapshot.clone(),
+            schema: self.schema.clone(),
+            engine: self.engine.clone(),
+            ring: self.ring.clone(),
+            ring_observer: self.ring_observer.clone(),
+            system_writer: self.system_writer.clone(),
+            snapshot_path: self.snapshot_path.clone(),
+            durable_applied: self.durable_applied.clone(),
+            pending_apply: None,
+            apply_failure: self.apply_failure.clone(),
+        }
+    }
+
+    async fn finish_pending_apply(
+        &mut self,
+    ) -> Result<Option<RaftResponse>, Box<StorageError<u64>>> {
+        if let Some(reason) = &self.apply_failure {
+            return Err(Box::new(
+                StorageIOError::write_state_machine(to_any_error(std::io::Error::other(
+                    reason.clone(),
+                )))
+                .into(),
+            ));
+        }
+        let Some(pending) = self.pending_apply.as_mut() else {
+            return Ok(None);
+        };
+        // Poll the retained handle, not a temporary that cancellation can lose.
+        let result = (&mut pending.job).await;
+        let pending = self
+            .pending_apply
+            .take()
+            .expect("pending handle was retained");
+        let completed = match result {
+            Ok(completed) => completed,
+            Err(error) => {
+                let reason = format!("Raft physical apply job failed: {error}");
+                self.apply_failure = Some(reason.clone());
+                return Err(Box::new(
+                    StorageIOError::write_state_machine(to_any_error(std::io::Error::other(
+                        reason,
+                    )))
+                    .into(),
+                ));
+            }
+        };
+        self.state = completed.state;
+        self.last_applied = Some(pending.log_id);
+        drop(pending.pauses);
+        Ok(Some(completed.response))
+    }
+
     /// Publish `meta`/`bytes` as the snapshot replication serves, unless the
     /// slot already holds a newer one. Returns whether the slot changed.
     ///
@@ -488,6 +566,8 @@ impl FerrosStateMachine {
             system_writer: None,
             snapshot_path: None,
             durable_applied: None,
+            pending_apply: None,
+            apply_failure: None,
         }
     }
 
@@ -672,6 +752,8 @@ impl FerrosStateMachine {
             system_writer,
             snapshot_path: None,
             durable_applied: None,
+            pending_apply: None,
+            apply_failure: None,
         }
     }
 
@@ -876,7 +958,9 @@ impl FerrosStateMachine {
                             format!("{context}: inspect unbound table {tid}: {e}")
                         })? =>
                     {
-                        return Err(format!("{context}: table {tid} has data but no authoritative local incarnation; restore schema provenance before retrying"));
+                        return Err(format!(
+                            "{context}: table {tid} has data but no authoritative local incarnation; restore schema provenance before retrying"
+                        ));
                     }
                     _ => {}
                 }
@@ -2025,51 +2109,20 @@ impl FerrosStateMachine {
         (response, pending_system_writes)
     }
 
-    /// Execute the system-table writes collected by `apply_command` on a
-    /// blocking thread, then emit the per-mutation log lines on the worker.
-    ///
-    /// The `engine.write` calls inside `SystemTableWriter::apply` are
-    /// synchronous and would otherwise park the raft apply worker, delaying
-    /// heartbeat responses (1s lane deadline). Running them under
-    /// `spawn_blocking` isolates that work; awaiting the handle here preserves
-    /// openraft's sequential apply ordering. A `JoinError` is surfaced loudly
-    /// rather than swallowed.
-    async fn flush_pending_system_writes(&self, pending: Vec<PendingSystemWrite>) {
-        if pending.is_empty() {
-            return;
-        }
-        let Some(writer) = self.system_writer.clone() else {
+    /// Persist the collected system-table writes inside the same owned worker
+    /// as physical apply. Cancellation cannot let a subsequent entry overtake
+    /// this stage or release compaction pauses before it finishes.
+    fn flush_pending_system_writes(&self, pending: Vec<PendingSystemWrite>) {
+        let Some(writer) = &self.system_writer else {
             return;
         };
-
-        let outcomes = ferrosa_net::task_pool::TaskPool::current("raft-system-table-apply")
-            .spawn_blocking(move || {
-                pending
-                    .into_iter()
-                    .map(|p| {
-                        let result = writer.apply(p.mutation);
-                        (p.level, p.context, result.err())
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .await;
-
-        let outcomes = match outcomes {
-            Ok(outcomes) => outcomes,
-            Err(e) => {
-                tracing::error!(
-                    %e,
-                    "Raft apply: system-table write task panicked or was cancelled"
-                );
-                return;
-            }
-        };
-
-        for (level, context, err) in outcomes {
-            if let Some(e) = err {
-                match level {
-                    SystemWriteLogLevel::WarnReplay => tracing::warn!(%e, "{context}"),
-                    SystemWriteLogLevel::Error => tracing::error!(%e, "{context}"),
+        for pending in pending {
+            if let Err(error) = writer.apply(pending.mutation) {
+                match pending.level {
+                    SystemWriteLogLevel::WarnReplay => {
+                        tracing::warn!(%error, "{}", pending.context)
+                    }
+                    SystemWriteLogLevel::Error => tracing::error!(%error, "{}", pending.context),
                 }
             }
         }
@@ -2088,6 +2141,7 @@ impl Default for FerrosStateMachine {
 
 impl RaftSnapshotBuilder<FerrosRaftConfig> for FerrosStateMachine {
     async fn build_snapshot(&mut self) -> Result<Snapshot<FerrosRaftConfig>, StorageError<u64>> {
+        self.finish_pending_apply().await.map_err(|error| *error)?;
         let data = SnapshotData {
             state: self.state.clone(),
             last_applied: self.last_applied,
@@ -2146,6 +2200,7 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
     async fn applied_state(
         &mut self,
     ) -> Result<(Option<LogId<u64>>, StoredMembership<u64, BasicNode>), StorageError<u64>> {
+        self.finish_pending_apply().await.map_err(|error| *error)?;
         Ok((self.last_applied, self.last_membership.clone()))
     }
 
@@ -2154,13 +2209,13 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
         I: IntoIterator<Item = Entry<FerrosRaftConfig>> + Send,
         I::IntoIter: Send,
     {
+        self.finish_pending_apply().await.map_err(|error| *error)?;
         let mut responses = Vec::new();
 
         for entry in entries {
-            self.last_applied = Some(entry.log_id);
-
             match entry.payload {
                 EntryPayload::Blank => {
+                    self.last_applied = Some(entry.log_id);
                     responses.push(RaftResponse::Ok);
                 }
                 EntryPayload::Normal(cmd) => {
@@ -2202,15 +2257,32 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
                             _ => {}
                         }
                     }
-                    let (resp, pending) = self.apply_command(cmd);
-                    // Drain the collected system-table writes off the raft
-                    // worker. Awaiting here (before the next entry) preserves
-                    // openraft's sequential apply ordering while keeping the
-                    // blocking `engine.write` calls off the worker thread.
-                    self.flush_pending_system_writes(pending).await;
-                    responses.push(resp);
+                    let pauses = Arc::new(pauses);
+                    let worker_pauses = Arc::clone(&pauses);
+                    let mut staged = self.staged_apply();
+                    let job = ferrosa_net::task_pool::TaskPool::current("raft-physical-apply")
+                        .spawn_blocking(move || {
+                            let _pauses = worker_pauses;
+                            let (response, system_writes) = staged.apply_command(cmd);
+                            staged.flush_pending_system_writes(system_writes);
+                            CompletedApply {
+                                state: staged.state,
+                                response,
+                            }
+                        });
+                    self.pending_apply = Some(PendingApply {
+                        log_id: entry.log_id,
+                        job,
+                        pauses,
+                    });
+                    if let Some(response) =
+                        self.finish_pending_apply().await.map_err(|error| *error)?
+                    {
+                        responses.push(response);
+                    }
                 }
                 EntryPayload::Membership(membership) => {
+                    self.last_applied = Some(entry.log_id);
                     self.last_membership = StoredMembership::new(Some(entry.log_id), membership);
                     responses.push(RaftResponse::Ok);
                 }
@@ -2221,6 +2293,11 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+        if let Err(error) = self.finish_pending_apply().await {
+            // This trait method cannot return an error; the returned builder
+            // retains the sticky failure and build_snapshot reports it.
+            tracing::error!(%error, "Raft snapshot builder refused failed apply");
+        }
         // The builder is a point-in-time copy of the state (openraft runs it in
         // a detached task while apply continues), but it SHARES the
         // current-snapshot slot: what it builds is what the live machine's
@@ -2237,12 +2314,15 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
             system_writer: None, // snapshot builder doesn't need system writer
             snapshot_path: self.snapshot_path.clone(),
             durable_applied: self.durable_applied.clone(),
+            pending_apply: None,
+            apply_failure: self.apply_failure.clone(),
         }
     }
 
     async fn begin_receiving_snapshot(
         &mut self,
     ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<u64>> {
+        self.finish_pending_apply().await.map_err(|error| *error)?;
         Ok(Box::new(Cursor::new(Vec::new())))
     }
 
@@ -2251,6 +2331,7 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
         meta: &SnapshotMeta<u64, BasicNode>,
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<u64>> {
+        self.finish_pending_apply().await.map_err(|error| *error)?;
         let bytes = snapshot.into_inner();
         self.apply_snapshot_data(meta.clone(), bytes.clone())?;
         if let Some(path) = self.snapshot_path.clone() {
@@ -2271,6 +2352,7 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<FerrosRaftConfig>>, StorageError<u64>> {
+        self.finish_pending_apply().await.map_err(|error| *error)?;
         Ok(self
             .current_snapshot_cloned()
             .map(|(meta, bytes)| Snapshot {
@@ -4868,6 +4950,13 @@ mod tests {
     }
 
     fn test_engine(dir: &std::path::Path) -> Arc<StorageEngine> {
+        test_engine_with_strategy(dir, Default::default())
+    }
+
+    fn test_engine_with_strategy(
+        dir: &std::path::Path,
+        sync_strategy: ferrosa_storage::SyncStrategyConfig,
+    ) -> Arc<StorageEngine> {
         use ferrosa_storage::engine::StorageEngineConfig;
         use ferrosa_storage::{CommitLogConfig, CompactionConfig};
         let config = StorageEngineConfig {
@@ -4875,6 +4964,7 @@ mod tests {
                 log_dir: dir.to_path_buf(),
                 checkpoint_dir: dir.to_path_buf(),
                 archive: None,
+                sync_strategy,
                 ..CommitLogConfig::default()
             },
             compaction: CompactionConfig::from_env(dir.join("compaction")),
@@ -5056,6 +5146,26 @@ mod tests {
             }
             other => panic!("expected RaftResponse::Error, got {other:?}"),
         }
+        assert!(
+            sm.apply_failure.is_none(),
+            "ordinary command errors must not poison apply"
+        );
+        let next = sm
+            .apply(vec![make_entry(
+                1,
+                3,
+                RaftOp::CreateTable(Box::new(simple_table("regress_ks", "valid_tbl"))),
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(&next[0], RaftResponse::Ok));
+        assert_eq!(sm.applied_state().await.unwrap().0.unwrap().index, 3);
+        assert!(
+            sm.state
+                .tables
+                .contains_key(&("regress_ks".into(), "victim_tbl".into())),
+            "committed failed intent remains for replay"
+        );
     }
 
     /// Repro for forge t_86f9259d: a keyspace created through the Raft
@@ -5139,6 +5249,289 @@ mod tests {
             "CreateKeyspace apply must reconcile the shared Schema so fresh \
              connections see the keyspace, even when self.state already had it"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn held_schema_lease_allows_async_observer_control() {
+        let schema = Arc::new(test_schema_instance());
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _lease = schema.lifecycle_read();
+            ready_tx.send(()).unwrap();
+            progress_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok()
+        });
+        ready_rx.recv().unwrap();
+        tokio::task::yield_now().await;
+        progress_tx.send(()).unwrap();
+        assert!(
+            holder.join().unwrap(),
+            "observer must run while the fixture lease is held"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn raft_create_table_keeps_async_progress_while_schema_lease_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let mut sm = FerrosStateMachine::with_side_effects(Arc::clone(&schema), engine);
+        sm.apply(vec![make_entry(
+            1,
+            1,
+            RaftOp::CreateKeyspace(simple_keyspace("async_apply")),
+        )])
+        .await
+        .unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let held_schema = Arc::clone(&schema);
+        let holder = std::thread::spawn(move || {
+            let _lease = held_schema.lifecycle_read();
+            ready_tx.send(()).unwrap();
+            // Cleanup bound, not a scheduling deadline: a broken apply must
+            // eventually release so the test reports its assertion failure.
+            progress_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok()
+        });
+        ready_rx.recv().unwrap();
+        let apply = sm.apply(vec![make_entry(
+            1,
+            2,
+            RaftOp::CreateTable(Box::new(simple_table("async_apply", "t"))),
+        )]);
+        tokio::pin!(apply);
+        tokio::select! {
+            biased;
+            result = &mut apply => { result.unwrap(); }
+            () = async { let _released_after_cleanup = progress_tx.send(()); } => { apply.await.unwrap(); }
+        }
+        assert!(
+            holder.join().unwrap(),
+            "Raft apply blocked the only async worker while waiting for the schema lease"
+        );
+        assert!(schema
+            .snapshot()
+            .tables
+            .contains_key(&("async_apply".into(), "t".into())));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_raft_schema_lease_apply_is_reaped_before_snapshot_and_next_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let mut sm = FerrosStateMachine::with_side_effects(Arc::clone(&schema), engine);
+        sm.apply(vec![make_entry(
+            1,
+            1,
+            RaftOp::CreateKeyspace(simple_keyspace("cancel_apply")),
+        )])
+        .await
+        .unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let held_schema = Arc::clone(&schema);
+        let holder = std::thread::spawn(move || {
+            let _lease = held_schema.lifecycle_read();
+            ready_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok()
+        });
+        ready_rx.recv().unwrap();
+        {
+            let apply = sm.apply(vec![make_entry(
+                1,
+                2,
+                RaftOp::CreateTable(Box::new(simple_table("cancel_apply", "first"))),
+            )]);
+            tokio::pin!(apply);
+            std::future::poll_fn(|cx| match std::future::Future::poll(apply.as_mut(), cx) {
+                std::task::Poll::Pending => std::task::Poll::Ready(()),
+                std::task::Poll::Ready(result) => {
+                    panic!("held lease must leave apply pending: {result:?}")
+                }
+            })
+            .await;
+            // Drop only the waiter. The admitted operation must remain owned.
+        }
+        let _released_after_cleanup = release_tx.send(());
+        assert!(
+            holder.join().unwrap(),
+            "cancelling apply must not wait for the fixture cleanup deadline"
+        );
+        let mut builder = sm.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let data = decode_snapshot(snapshot.snapshot.get_ref()).unwrap();
+        assert_eq!(data.last_applied.unwrap().index, 2);
+        assert!(data
+            .state
+            .tables
+            .contains_key(&("cancel_apply".into(), "first".into())));
+        sm.apply(vec![make_entry(
+            1,
+            3,
+            RaftOp::CreateTable(Box::new(simple_table("cancel_apply", "second"))),
+        )])
+        .await
+        .unwrap();
+        assert_eq!(sm.applied_state().await.unwrap().0.unwrap().index, 3);
+        assert!(sm
+            .state
+            .tables
+            .contains_key(&("cancel_apply".into(), "first".into())));
+        assert!(sm
+            .state
+            .tables
+            .contains_key(&("cancel_apply".into(), "second".into())));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_raft_system_write_is_reaped_before_applied_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            test_engine_with_strategy(dir.path(), ferrosa_storage::SyncStrategyConfig::Batch);
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let mut sm = FerrosStateMachine::with_side_effects(schema, Arc::clone(&engine));
+        sm.apply(vec![make_entry(
+            1,
+            1,
+            RaftOp::CreateKeyspace(simple_keyspace("system_wait")),
+        )])
+        .await
+        .unwrap();
+        let recorder = sm
+            .system_writer
+            .as_ref()
+            .unwrap()
+            .last_apply_thread_handle();
+        *recorder.lock().unwrap() = None;
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let held_engine = Arc::clone(&engine);
+        let holder = std::thread::spawn(move || {
+            let mut progressed = false;
+            held_engine.with_commit_log_flush_held_for_test(|| {
+                ready_tx.send(()).unwrap();
+                progressed = release_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .is_ok();
+            });
+            progressed
+        });
+        ready_rx.recv().unwrap();
+        {
+            let apply = sm.apply(vec![make_entry(
+                1,
+                2,
+                RaftOp::CreateTable(Box::new(simple_table("system_wait", "t"))),
+            )]);
+            tokio::pin!(apply);
+            std::future::poll_fn(|cx| match std::future::Future::poll(apply.as_mut(), cx) {
+                std::task::Poll::Pending => std::task::Poll::Ready(()),
+                std::task::Poll::Ready(result) => {
+                    panic!("held flush must leave apply pending: {result:?}")
+                }
+            })
+            .await;
+            while recorder.lock().unwrap().is_none() {
+                tokio::task::yield_now().await;
+            }
+        }
+        assert_eq!(
+            sm.last_applied.unwrap().index,
+            1,
+            "system writes must finish before publication"
+        );
+        let applied = sm.applied_state();
+        tokio::pin!(applied);
+        let waited = tokio::select! {
+            biased;
+            result = &mut applied => { result.unwrap(); false }
+            () = async { let _after_cleanup = release_tx.send(()); } => { applied.await.unwrap(); true }
+        };
+        assert!(
+            holder.join().unwrap(),
+            "fixture must release on observer progress"
+        );
+        assert!(
+            waited,
+            "applied_state must await the retained system-table write"
+        );
+    }
+
+    #[tokio::test]
+    async fn panicked_raft_apply_poison_refuses_every_trait_barrier() {
+        let mut sm = FerrosStateMachine {
+            pending_apply: Some(PendingApply {
+                log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 1),
+                job: ferrosa_net::task_pool::TaskPool::current("raft-poison-test").spawn_blocking(
+                    || -> CompletedApply {
+                        panic!("intentional apply panic");
+                    },
+                ),
+                pauses: Arc::new(Vec::new()),
+            }),
+            ..Default::default()
+        };
+        let error = sm.applied_state().await.unwrap_err().to_string();
+        assert!(error.contains("Raft physical apply job failed"));
+        assert!(sm.last_applied.is_none());
+        assert!(sm.state.tables.is_empty());
+        assert!(sm
+            .apply(vec![make_entry(
+                1,
+                2,
+                RaftOp::CreateKeyspace(simple_keyspace("not_applied"))
+            )])
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Raft physical apply job failed"));
+        assert!(sm
+            .begin_receiving_snapshot()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Raft physical apply job failed"));
+        assert!(sm
+            .get_current_snapshot()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Raft physical apply job failed"));
+        assert!(sm
+            .build_snapshot()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Raft physical apply job failed"));
+        let meta = SnapshotMeta {
+            last_log_id: None,
+            last_membership: StoredMembership::default(),
+            snapshot_id: "poison".into(),
+        };
+        assert!(sm
+            .install_snapshot(&meta, Box::new(Cursor::new(Vec::new())))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Raft physical apply job failed"));
+        let mut builder = sm.get_snapshot_builder().await;
+        assert!(builder
+            .build_snapshot()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Raft physical apply job failed"));
+        assert!(sm.last_applied.is_none());
     }
 
     /// Companion to the keyspace reconciliation repro: a `CreateTable` apply

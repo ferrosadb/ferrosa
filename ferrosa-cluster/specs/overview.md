@@ -39,6 +39,13 @@ machine but are otherwise loosely coupled:
 4. **Anti-entropy** — Merkle repair + hinted handoff to converge replicas.
 5. **Transactions** — Accord for strict-serializable multi-key / LWT operations.
 
+Raft command apply stages metadata in an owned blocking job together with physical
+schema effects and system-table writes. A retained handle fences later trait
+calls across cancellation; completed state and applied indexes publish in order.
+Unexpected worker failure is sticky and prevents new snapshots or successful
+apply results. This command fence does not change snapshot persistence or network
+agreement deadlines.
+
 ## Module map
 
 | Module | Responsibility |

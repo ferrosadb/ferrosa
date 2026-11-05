@@ -34,6 +34,14 @@ token ring and a Raft-replicated metadata state machine:
    ferrosa fork with a CheckQuorum extension; a PreVote gate also exists in the
    fork but is **disabled by default** — its network transport is unimplemented,
    see below). The state machine is in-memory `RaftState`; the log is sled-backed.
+Raft command application owns its blocking schema/storage transition and ordered
+system-table writes in one worker job. Dropping an async waiter retains that job;
+subsequent apply/status/snapshot entry points await it before exposing the applied
+index or constructing a snapshot. A worker panic poisons the state machine and
+returns a storage error rather than publishing staged metadata. Ordinary command
+error responses retain the committed intent for replay. Existing snapshot-file
+publication behavior is separate from this command-application fence.
+
 2. **Read/write coordination** (`coordinator/`) — fans writes and reads out to
    replicas with tunable CQL consistency-level (CL) enforcement, write
    backpressure, read repair, batchlog, and range/streaming reads.
