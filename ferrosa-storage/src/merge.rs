@@ -170,38 +170,13 @@ fn merge_rows_into(a: &mut Row, b: &mut Row) {
     });
 }
 
-/// Deterministic last-write-wins comparison for a single cell.
+/// Whether a candidate wins the common cell reconciliation order.
 ///
-/// Higher timestamp wins. On an **equal** timestamp the outcome must not depend
-/// on merge order, or two compactions that group SSTables differently (STCS vs
-/// UCS) — or two replicas — would diverge. The order-independent tie-break is:
-/// a write (a cell with a value) beats a tombstone so equal-timestamp data is
-/// preserved; among writes the lexicographically greater value wins; two
-/// tombstones are broken by local deletion time.
-/// Deterministic last-write-wins between two cells for the same
-/// `(column, path)`.
-///
-/// Newest timestamp wins; at equal timestamps the order is
-/// `(has_value, value_bytes, local_deletion_time)`. That is a total order, so
-/// every replica computes the same winner independently — which is what lets
-/// anti-entropy repair decide what to stream without each node preferring its
-/// own copy.
-///
-/// Public so the cluster repair crate can agree with the engine rather than
-/// reimplementing this rule and drifting from it.
+/// Shares the memtable rule: newest timestamp first, deletion wins an equal
+/// timestamp, then the full-cell ordering breaks same-kind ties. Exact equality
+/// is not a change. Repair callers use the same rule as reads and compaction.
 pub fn cell_supersedes(cand: &ferrosa_common::CellValue, cur: &ferrosa_common::CellValue) -> bool {
-    if cand.timestamp != cur.timestamp {
-        return cand.timestamp > cur.timestamp;
-    }
-    (
-        cand.value.is_some(),
-        cand.value.as_deref().unwrap_or(&[]),
-        cand.local_deletion_time,
-    ) > (
-        cur.value.is_some(),
-        cur.value.as_deref().unwrap_or(&[]),
-        cur.local_deletion_time,
-    )
+    ferrosa_common::reconcile_cmp(cand, cur).is_gt()
 }
 
 /// Apply deletion suppression to a merged partition.
@@ -320,6 +295,101 @@ mod tests {
             static_row: None,
             rows,
         }
+    }
+
+    #[test]
+    fn equal_timestamp_deletion_agrees_in_memtable_and_after_flush() {
+        use crate::engine::{StorageEngine, StorageEngineConfig};
+        use crate::TableId;
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_system_tables().unwrap();
+        let tid = TableId::new("system_auth", "role_permissions");
+        let local_delete = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i32;
+        let row = |cell| make_row_with_clustering(b"resource", vec![(0, cell)], 42);
+        let read = |engine: &StorageEngine, name: &str| {
+            engine
+                .read(&tid, &make_key(name))
+                .unwrap()
+                .and_then(|p| p.rows.into_iter().next())
+                .and_then(|r| r.cells.into_iter().next())
+                .map(|(_, cell)| cell)
+        };
+        engine
+            .write(
+                &tid,
+                &make_key("memory"),
+                row(CellValue::live(b"SELECT".to_vec(), 42)),
+                42,
+            )
+            .unwrap();
+        assert_eq!(
+            read(&engine, "memory").unwrap().value.as_deref(),
+            Some(&b"SELECT"[..])
+        );
+        engine
+            .write(
+                &tid,
+                &make_key("memory"),
+                row(CellValue::tombstone(42, local_delete)),
+                42,
+            )
+            .unwrap();
+        let memory = read(&engine, "memory");
+        assert!(
+            memory.as_ref().is_none_or(CellValue::is_tombstone),
+            "same-memtable deletion positive control"
+        );
+        engine
+            .write(
+                &tid,
+                &make_key("flushed"),
+                row(CellValue::live(b"SELECT".to_vec(), 42)),
+                42,
+            )
+            .unwrap();
+        engine
+            .write(
+                &tid,
+                &make_key("unrelated"),
+                row(CellValue::live(b"keep".to_vec(), 42)),
+                42,
+            )
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        assert_eq!(
+            read(&engine, "flushed").unwrap().value.as_deref(),
+            Some(&b"SELECT"[..])
+        );
+        engine
+            .write(
+                &tid,
+                &make_key("flushed"),
+                row(CellValue::tombstone(42, local_delete)),
+                42,
+            )
+            .unwrap();
+        let across_flush = read(&engine, "flushed");
+        engine.flush(&tid).unwrap();
+        engine.force_commit_log_sync().unwrap();
+        drop(engine);
+        let (reopened, pending) =
+            StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        reopened.register_system_tables().unwrap();
+        reopened.replay_mutations(pending).unwrap();
+        assert_eq!(
+            read(&reopened, "unrelated").unwrap().value.as_deref(),
+            Some(&b"keep"[..]),
+            "cold engine must retain the unrelated positive control"
+        );
+        let cold = read(&reopened, "flushed");
+        assert!(across_flush.as_ref().is_none_or(CellValue::is_tombstone)
+            && cold.as_ref().is_none_or(CellValue::is_tombstone),
+            "equal-timestamp deletion must agree with memtable before/after reopen: memory={memory:?}, across_flush={across_flush:?}, cold={cold:?}");
     }
 
     /// t_a0f922a3: `merge_partitions` leaves a single-source partition in its

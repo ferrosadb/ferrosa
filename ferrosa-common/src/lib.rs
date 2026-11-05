@@ -51,8 +51,8 @@ pub use cell::{CellValue, Timestamp, NO_DELETION_TIME, NO_TIMESTAMP, NO_TTL};
 pub use cell_bytes::{CellBytes, CellBytesMut, CellReadBuffer};
 pub use cell_ts::{is_legacy_ns, normalize_cell_ts, LEGACY_NS_THRESHOLD};
 pub use complex_cell::{
-    accord_list_cell_path, list_path_element_seq, reconcile, reconcile_ref, CellPath,
-    ComplexColumn, CounterCell, CounterShard, CounterShardId,
+    accord_list_cell_path, list_path_element_seq, reconcile, reconcile_cmp, reconcile_ref,
+    CellPath, ComplexColumn, CounterCell, CounterShard, CounterShardId,
 };
 pub use cql_type::{jsonb_canonical_text, CqlType, CqlValue};
 pub use data_type::DataType;

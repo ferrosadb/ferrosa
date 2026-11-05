@@ -61,19 +61,22 @@ pub fn reconcile(a: &CellValue, b: &CellValue) -> CellValue {
 
 /// [`reconcile`] by reference: the winner of the two, without copying it.
 pub fn reconcile_ref<'a>(a: &'a CellValue, b: &'a CellValue) -> &'a CellValue {
-    use std::cmp::Ordering;
-    match a.timestamp.cmp(&b.timestamp) {
-        Ordering::Greater => a,
-        Ordering::Less => b,
-        Ordering::Equal => match (a.is_tombstone(), b.is_tombstone()) {
-            // Equal timestamp: a deletion wins the tie (Cassandra semantics).
-            (true, false) => a,
-            (false, true) => b,
-            // Same kind: deterministic total-order tiebreak (larger value / cell wins),
-            // symmetric so `reconcile(a,b) == reconcile(b,a)`.
-            _ => a.max(b),
-        },
+    if reconcile_cmp(a, b).is_gt() {
+        a
+    } else {
+        b
     }
+}
+
+/// The cell ordering shared by memtable, read/compaction, and repair merges.
+/// Timestamp wins first; at equal timestamps deletion wins, then the existing
+/// full-cell ordering breaks same-kind ties. Equal cells do not supersede one
+/// another. This compares borrowed bytes and allocates no payload buffers.
+pub fn reconcile_cmp(a: &CellValue, b: &CellValue) -> std::cmp::Ordering {
+    a.timestamp
+        .cmp(&b.timestamp)
+        .then_with(|| a.is_tombstone().cmp(&b.is_tombstone()))
+        .then_with(|| a.cmp(b))
 }
 
 /// A complex (collection) column as a set of per-element cells reconciled by

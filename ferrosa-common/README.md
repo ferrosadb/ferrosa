@@ -297,3 +297,8 @@ await occurs while holding the lock except reading the system clock. Callers
 sharing one node clock may contend; an end-to-end latency budget has not been
 measured. Concurrent uniqueness and the existing drift/monotonicity tests cover
 the clock contract.
+
+
+### Shared cell reconciliation
+
+`reconcile_cmp` supplies the timestamp-first cell ordering used by memtable and read/compaction/repair merges. At equal timestamps a deletion wins, then the existing full-cell ordering resolves same-kind ties. The comparison borrows payloads and adds no stored fields; it does not make a later operation win every equal timestamp.

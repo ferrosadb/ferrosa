@@ -618,3 +618,8 @@ physical clustering cursors; table/partition deletion watermarks remain attached
 It is not a logical query result. Existing read APIs retain their deletion
 visibility rules and retry/corruption policy. Memory remains bounded by source
 count times the requested page size.
+
+
+### Consistent cell ties across storage paths
+
+Read, compaction and repair cell comparison delegates to the same common ordering as the memtable. An equal-timestamp cell deletion therefore remains a deletion across a flush and cold reopen. This changes reconciliation of previously conflicting ties, not the SSTable or commit-log format.
