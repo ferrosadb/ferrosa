@@ -93,13 +93,10 @@ impl SystemTableWriter {
     ) -> ferrosa_common::Result<i64> {
         let mut previous = i64::MIN;
         let mut cursor: Option<Vec<u8>> = None;
-        'pages: loop {
-            let Some(partition) =
-                self.engine
-                    .read_projection_rows(table, key, cursor.as_deref(), 32)?
-            else {
-                break;
-            };
+        'pages: while let Some(partition) =
+            self.engine
+                .read_projection_rows(table, key, cursor.as_deref(), 32)?
+        {
             previous = previous.max(partition.deletion.marked_for_delete_at);
             for row in &partition.rows {
                 if let Some(target) = target {
