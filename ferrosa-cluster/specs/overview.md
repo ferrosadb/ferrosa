@@ -47,7 +47,13 @@ through that job and prevent publishing its metadata/index. Ordinary command
 rejection remains non-fatal. For DROP, only directory cleanup after durable
 intents and checked writer/registry retirement is a typed statement refusal.
 Pre-retirement intent or persistence failures remain hard faults; the original
-physical table can still be live, so its index must not advance. The process-local failure latch
+physical table can still be live, so its index must not advance. A CREATE whose
+registration the node refuses (`register_table`: an unremovable same-name
+directory, `EACCES`, a mount point) and an ALTER of a table its engine holds no
+registration for are the same class — committed metadata plus a refused
+statement, not a log this node could not apply. `ApplyError::fences_replica`
+classifies every variant explicitly; a latch means the durable bytes are
+untrustworthy, never that a statement was refused. The process-local failure latch
 prevents later snapshots or successful apply results. A failed persisted restore
 retains the previous Raft metadata and refuses consensus startup/readiness,
 preserving its files rather than adopting a purge point on a failed restore.

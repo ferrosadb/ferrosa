@@ -51,7 +51,17 @@ the orphaned bytes. Creating those intents, retiring the store, or other
 persistence failures remain hard storage errors: they may leave the original
 physical table readable and cannot advertise a completed DROP. The typed storage
 result records this phase without matching error text. This is not reader-drain
-or installed-checkpoint authority. A failed persisted snapshot restore
+or installed-checkpoint authority. A CREATE whose registration the node refuses
+(`register_table`: the same unremovable directory, `EACCES`, a mount point) is
+the same class — committed metadata plus a refused statement — so the CREATE is
+reported as an error while the node keeps serving; a re-issued CREATE after the
+directory is usable registers the table without a restart. An ALTER of a table
+this node's engine holds no registration for is refused the same way, for the
+same reason: with no registration no write reaches a memtable, so no flush can
+be built from a stale header. The refusals live in `ApplyError::fences_replica`,
+which classifies every variant explicitly; a latch means the durable bytes are
+untrustworthy (a stale per-table engine schema, an index built from a failed
+rotation), never that a statement was refused. A failed persisted snapshot restore
 keeps the prior Raft metadata and closes startup readiness instead of continuing
 with a partially restored shared schema; the snapshot and log files are retained
 for recovery. Persisted startup also refuses a different physical table UUID before

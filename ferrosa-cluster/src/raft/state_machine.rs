@@ -51,39 +51,79 @@ use crate::ring::TokenRing;
 
 /// A failed committed local Schema or Engine effect during `apply_command`.
 ///
-/// These errors propagate through the retained worker as a storage failure —
-/// except [`Self::EngineDropCleanupRefused`], which is a refusal of the DROP
-/// itself and is returned to the caller as a `RaftResponse::Error` without
-/// latching the machine (see the response decision at the end of
-/// `apply_command`).
-/// The owner keeps its previous metadata and applied index, latches the error,
-/// and refuses further apply/snapshot progress. Ordinary domain rejection is
-/// a separate `RaftResponse::Error` and does not poison the machine.
+/// A *storage failure* propagates through the retained worker, latches the
+/// machine, and refuses further apply/snapshot progress. A *refusal* — a DROP
+/// whose only failing step was directory cleanup, a CREATE whose
+/// `engine.register_table` was refused, an ALTER of a table this node's engine
+/// does not hold — is returned to the caller as a `RaftResponse::Error` and the
+/// machine keeps applying (see `fences_replica` and the response decision at the
+/// end of `apply_command`). Ordinary domain rejection is a separate
+/// `RaftResponse::Error` and does not poison the machine either.
+///
 /// Shared physical effects may already be visible; this is not transactional
 /// rollback, a persistent failure journal, or automatic recovery.
 #[derive(Debug, Clone)]
 pub enum ApplyError {
-    /// `engine.register_table` failed — writes to the table will not
-    /// land in storage.  The most dangerous class of error.
+    /// `engine.register_table` refused — this node could not take ownership of
+    /// the table's directory (an unremovable same-name directory left by a DROP
+    /// that could not sweep it, `EACCES`, a mount point, a path that is not a
+    /// directory).
+    ///
+    /// Refusal, not storage failure: the entry is committed and canonical
+    /// metadata agrees on every replica, so applying it is what keeps replicas
+    /// in agreement. The table is unusable on this node only, loudly, and a
+    /// re-issued CREATE after the directory is usable again registers it.
     EngineRegisterTable {
         keyspace: String,
         table: String,
         reason: String,
     },
-    /// `engine.unregister_table` failed — stale data may persist
-    /// after a DropTable / DropKeyspace.
+    /// `engine.unregister_table` failed before the durable drop intent or before
+    /// the table's writers were retired.
+    ///
+    /// Storage failure, not a refusal: the original table is still registered and
+    /// its rows are still readable, so the DROP did not take effect.
     EngineUnregisterTable {
         keyspace: String,
         table: String,
         reason: String,
     },
     /// Registry retirement and durable intents succeeded; only directory cleanup refused.
+    ///
+    /// Refusal, not storage failure: the table is gone from canonical metadata on
+    /// every replica, the surviving bytes are unreachable and swept by the next
+    /// same-name CREATE.
     EngineDropCleanupRefused {
         keyspace: String,
         table: String,
         reason: String,
     },
-    /// Catch-all for sites not yet migrated to a typed variant.
+    /// This node's engine holds no registration for a table the committed log
+    /// says exists, so a per-table effect (`update_table_schema`) had nothing to
+    /// act on.
+    ///
+    /// Refusal, not storage failure: with no registration no write can reach a
+    /// memtable, so no flush can be built from a wrong header. The table is
+    /// unusable on this node, loudly, and a re-issued CREATE registers it with
+    /// the metadata the log has accumulated since.
+    EngineTableNotRegistered {
+        keyspace: String,
+        table: String,
+        reason: String,
+    },
+    /// A local effect whose failure leaves the bytes this node will *persist*
+    /// wrong, or whose durable effect is not established. Latching.
+    ///
+    /// Three classes live here today, all local storage failures rather than
+    /// command refusals: a stale per-table schema handed to the engine
+    /// (`update_table_schema` — subsequent flushes would build SSTables from a
+    /// wrong `SerializationHeader`), and failures while building/rotating index
+    /// state (`build_replicated_index`, `engine.drop_index`) that can leave the
+    /// on-disk index disagreeing with committed metadata and silently
+    /// under-answer reads. Also the shared-registry reconciliation sites
+    /// (`schema.*_internal`): those are deterministic across replicas and have
+    /// no demonstrated safe serving state after divergence, so they stay
+    /// latched pending evidence rather than being downgraded on assumption.
     Other(String),
 }
 
@@ -106,6 +146,21 @@ impl ApplyError {
                 table,
                 reason,
             }
+        }
+    }
+
+    /// Whether this failure means the replica's *durable* state can no longer
+    /// be trusted with the committed log, so the state machine must latch and
+    /// stop serving.
+    ///
+    /// Exhaustive on purpose: adding a variant forces a classification decision
+    /// here instead of silently inheriting the latch (or silently escaping it).
+    fn fences_replica(&self) -> bool {
+        match self {
+            Self::EngineRegisterTable { .. }
+            | Self::EngineDropCleanupRefused { .. }
+            | Self::EngineTableNotRegistered { .. } => false,
+            Self::EngineUnregisterTable { .. } | Self::Other(_) => true,
         }
     }
 }
@@ -133,6 +188,15 @@ impl std::fmt::Display for ApplyError {
             } => write!(
                 f,
                 "engine.unregister_table({keyspace}.{table}) failed: {reason}"
+            ),
+            Self::EngineTableNotRegistered {
+                keyspace,
+                table,
+                reason,
+            } => write!(
+                f,
+                "engine.update_table_schema({keyspace}.{table}) failed: this node's engine \
+                 has no registration for a table the committed log says exists: {reason}"
             ),
             Self::Other(msg) => f.write_str(msg),
         }
@@ -1711,7 +1775,12 @@ impl FerrosStateMachine {
                 }
                 if let Some(engine) = &self.engine {
                     if let Err(e) = engine.register_table(table.to_storage_schema()) {
-                        tracing::error!(%e, "Raft apply: register_table failed — writes to this table will silently fail");
+                        // A refusal, not a storage failure: this node could not
+                        // take ownership of the table's directory. The caller
+                        // sees `RaftResponse::Error`; writes here fail loudly
+                        // until the directory is usable and the CREATE is
+                        // re-issued. See `ApplyError::fences_replica`.
+                        tracing::error!(%e, "Raft apply: register_table refused — this node serves no writes to the table");
                         apply_errors.push(ApplyError::EngineRegisterTable {
                             keyspace: table.keyspace.clone(),
                             table: table.name.clone(),
@@ -1833,7 +1902,27 @@ impl FerrosStateMachine {
                 // (bug-sstable-writer-produces-zero-byte-rows-db.md).
                 if let (Some(engine), Some(new_schema)) = (&self.engine, new_storage_schema) {
                     let tid = TableId::new(&keyspace, &table);
-                    if let Err(e) = engine.update_table_schema(&tid, new_schema) {
+                    if engine.table_schema(&tid).is_none() {
+                        // Refusal, not a storage failure: this node's engine has
+                        // no registration for a table the committed log says
+                        // exists (typically a CREATE whose registration was
+                        // refused above). There is no schema to rotate and no
+                        // memtable a flush could build from a wrong header, so
+                        // refusing the ALTER keeps the node serving — latching
+                        // here would resurrect the refused-CREATE fence one
+                        // statement later.
+                        tracing::error!(
+                            keyspace = %keyspace,
+                            table = %table,
+                            "Raft apply: update_table_schema refused — the engine has no \
+                             registration for this table"
+                        );
+                        apply_errors.push(ApplyError::EngineTableNotRegistered {
+                            keyspace: keyspace.clone(),
+                            table: table.clone(),
+                            reason: "engine has no registration for the table".to_string(),
+                        });
+                    } else if let Err(e) = engine.update_table_schema(&tid, new_schema) {
                         tracing::error!(%e, "Raft apply: update_table_schema failed — future flushes may be corrupt");
                         apply_errors.push(ApplyError::Other(format!(
                             "update_table_schema failed — future flushes may be corrupt: {e}"
@@ -2507,19 +2596,26 @@ impl FerrosStateMachine {
         // publishable command response. The retained worker propagates it to
         // the sticky apply fence before adopting staged metadata or log ID.
         //
-        // One class is not a storage failure: refusing to remove a dropped
-        // table's bytes (`engine.unregister_table` — permission denied on the
-        // table directory, a locked file). The entry is already committed and
-        // the table is gone from canonical metadata on every replica, so
-        // applying it is what keeps replicas in agreement; the surviving bytes
-        // are unreachable and swept by the next same-name CREATE. Latching the
-        // machine for it made one undroppable directory return `Fatal` to every
-        // later proposal and stop RaftCore — a DROP the node refused, not a log
-        // it could not apply. It stays loud to the caller as a
-        // `RaftResponse::Error` instead: the DROP still never reports success.
+        // Two classes are not storage failures — they are *refusals*:
+        //
+        //  - `engine.unregister_table` could not remove a dropped table's bytes
+        //    (permission denied on the table directory, a locked file).
+        //  - `engine.register_table` could not take ownership of a created
+        //    table's directory (an unremovable same-name directory left by such
+        //    a DROP, `EACCES`, a mount point).
+        //
+        // In both cases the entry is already committed and canonical metadata
+        // agrees on every replica, so applying it is what keeps replicas in
+        // agreement. Latching the machine for either made one undroppable
+        // directory return `Fatal` to every later proposal and stop RaftCore —
+        // a DDL the node refused, not a log it could not apply — with no online
+        // repair path. They stay loud to the caller as `RaftResponse::Error`
+        // instead: the DDL never reports success, and the node keeps serving.
+        // Everything else still latches; see `ApplyError::fences_replica` for
+        // which variant is which and why.
         let (refusals, fatal): (Vec<ApplyError>, Vec<ApplyError>) = apply_errors
             .into_iter()
-            .partition(|error| matches!(error, ApplyError::EngineDropCleanupRefused { .. }));
+            .partition(|error| !error.fences_replica());
         if !fatal.is_empty() {
             let summary = fatal
                 .iter()
@@ -6448,8 +6544,21 @@ mod tests {
         assert_eq!(std::fs::read(blocker).unwrap(), b"owned physical refusal");
     }
 
+    /// A CREATE whose local registration is refused is a command this node
+    /// refused, not a log it could not apply.
+    ///
+    /// `engine.register_table` refuses when it cannot take ownership of the
+    /// table's directory — an unremovable same-name directory left by a DROP
+    /// that could not sweep it, a permission error, a mount point. The entry is
+    /// already committed, canonical metadata agrees on every replica, and every
+    /// other node registers the table normally; latching this machine would take
+    /// a healthy replica out of service for one directory, with no online
+    /// repair. The caller must still see the refusal, the node must keep
+    /// applying, and the refusal must be recoverable online: once the directory
+    /// is usable again a re-issued CREATE registers the table and a DROP clears
+    /// it.
     #[tokio::test]
-    async fn apply_command_propagates_engine_register_failure() {
+    async fn refused_engine_register_surfaces_and_keeps_applying() {
         let dir = tempfile::tempdir().unwrap();
         let engine = test_engine(dir.path());
         engine.register_system_tables().unwrap();
@@ -6472,31 +6581,191 @@ mod tests {
         let create_tbl_entry = make_entry(1, 2, RaftOp::CreateTable(Box::new(table)));
 
         sm.apply(vec![create_ks_entry]).await.unwrap();
-        let error = sm.apply(vec![create_tbl_entry]).await.unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("engine.register_table"), "{message}");
+        let responses = sm
+            .apply(vec![create_tbl_entry])
+            .await
+            .expect("a refused registration must surface to the caller, not fail the apply");
+        let refusal = match responses.first() {
+            Some(RaftResponse::Error(reason)) => reason.clone(),
+            other => panic!("a refused CREATE must be an error response, got {other:?}"),
+        };
+        assert!(refusal.contains("engine.register_table"), "{refusal}");
         assert!(
-            message.contains("regress_ks") && message.contains("victim_tbl"),
-            "{message}"
+            refusal.contains("regress_ks") && refusal.contains("victim_tbl"),
+            "{refusal}"
         );
         assert!(
-            sm.apply_failure.is_some(),
-            "A physical refusal must close the apply fence."
+            sm.apply_failure.is_none(),
+            "a refused CREATE must not close the apply fence: {refusal}"
         );
-        assert_eq!(sm.last_applied.unwrap().index, 1);
-        assert!(!sm.state.tables.contains_key(&("regress_ks".into(), "victim_tbl".into())),
-            "The unacknowledged log entry, not published metadata, retains the committed intent for replay.");
-        assert!(sm
+        assert_eq!(
+            sm.last_applied.unwrap().index,
+            2,
+            "the committed entry must be published so the next one can apply"
+        );
+
+        // A later command applies on the same node.
+        let next = sm
             .apply(vec![make_entry(
                 1,
                 3,
-                RaftOp::CreateTable(Box::new(simple_table("regress_ks", "valid_tbl")))
+                RaftOp::CreateTable(Box::new(simple_table("regress_ks", "valid_tbl"))),
             )])
             .await
-            .is_err());
+            .expect("the node must still apply after a refused CREATE");
+        assert!(matches!(next[0], RaftResponse::Ok), "{next:?}");
         assert!(engine
             .table_schema(&TableId::new("regress_ks", "valid_tbl"))
+            .is_some());
+
+        // Repair online: clear the blocker and re-issue the CREATE. The table
+        // the node refused is registered without restarting it.
+        std::fs::remove_file(&target).unwrap();
+        let retried = sm
+            .apply(vec![make_entry(
+                1,
+                4,
+                RaftOp::CreateTable(Box::new(simple_table("regress_ks", "victim_tbl"))),
+            )])
+            .await
+            .expect("the re-issued CREATE must apply");
+        assert!(matches!(retried[0], RaftResponse::Ok), "{retried:?}");
+        assert!(engine
+            .table_schema(&TableId::new("regress_ks", "victim_tbl"))
+            .is_some());
+
+        // ... and a DROP of it still works.
+        let dropped = sm
+            .apply(vec![make_entry(
+                1,
+                5,
+                RaftOp::DropTable {
+                    keyspace: "regress_ks".into(),
+                    table: "victim_tbl".into(),
+                },
+            )])
+            .await
+            .expect("a DROP after the refused CREATE must apply");
+        assert!(matches!(dropped[0], RaftResponse::Ok), "{dropped:?}");
+        assert!(engine
+            .table_schema(&TableId::new("regress_ks", "victim_tbl"))
             .is_none());
+    }
+
+    /// An ALTER of a table this node's engine does not hold is a refusal, not a
+    /// storage failure.
+    ///
+    /// Nothing can be rotated and no memtable can be flushed from a stale
+    /// header when there is no registration to begin with, so latching here
+    /// would only re-fence a node that is already correctly refusing writes to
+    /// that table — exactly what a refused CREATE leaves behind. The ALTER must
+    /// reach the caller, the node must keep applying, and re-registering the
+    /// table (what a re-issued CREATE does) must make the next ALTER work.
+    #[tokio::test]
+    async fn refused_alter_without_engine_registration_surfaces_and_keeps_applying() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = test_schema_instance();
+        let mut sm = FerrosStateMachine::with_side_effects(Arc::new(schema), Arc::clone(&engine));
+
+        sm.apply(vec![
+            make_entry(
+                1,
+                1,
+                RaftOp::CreateKeyspace(simple_keyspace("unregistered_ks")),
+            ),
+            make_entry(
+                1,
+                2,
+                RaftOp::CreateTable(Box::new(simple_table("unregistered_ks", "victim"))),
+            ),
+        ])
+        .await
+        .unwrap();
+
+        // The engine loses the registration while committed metadata keeps the
+        // table — the state a refused CREATE leaves behind.
+        let tid = TableId::new("unregistered_ks", "victim");
+        engine.unregister_table(&tid).unwrap();
+        assert!(engine.table_schema(&tid).is_none());
+
+        let add_column = |name: &str| ferrosa_schema::metadata::table::TableUpdates {
+            params: None,
+            drop_columns: vec![],
+            extensions: None,
+            add_columns: vec![ColumnMetadata {
+                name: name.into(),
+                kind: ColumnKind::Regular,
+                position: 1,
+                column_type: "text".into(),
+                clustering_order: ClusteringOrder::None,
+                mask: None,
+            }],
+        };
+
+        let responses = sm
+            .apply(vec![make_entry(
+                1,
+                3,
+                RaftOp::AlterTable {
+                    keyspace: "unregistered_ks".into(),
+                    table: "victim".into(),
+                    updates: Box::new(add_column("added")),
+                },
+            )])
+            .await
+            .expect("a refused ALTER must surface to the caller, not fail the apply");
+        let refusal = match responses.first() {
+            Some(RaftResponse::Error(reason)) => reason.clone(),
+            other => panic!("a refused ALTER must be an error response, got {other:?}"),
+        };
+        assert!(refusal.contains("no registration"), "{refusal}");
+        assert!(
+            sm.apply_failure.is_none(),
+            "a refused ALTER must not close the apply fence: {refusal}"
+        );
+        assert_eq!(sm.last_applied.unwrap().index, 3);
+
+        // The node still applies after the refusal.
+        let next = sm
+            .apply(vec![make_entry(
+                1,
+                4,
+                RaftOp::CreateTable(Box::new(simple_table("unregistered_ks", "later"))),
+            )])
+            .await
+            .expect("the node must still apply after a refused ALTER");
+        assert!(matches!(next[0], RaftResponse::Ok), "{next:?}");
+
+        // The repair is a DDL: re-registering the table with the metadata the
+        // log has accumulated makes the same ALTER apply.
+        let current = sm
+            .state
+            .tables
+            .get(&("unregistered_ks".into(), "victim".into()))
+            .expect("committed metadata keeps the table")
+            .to_storage_schema();
+        engine.register_table(current).unwrap();
+        let repaired = sm
+            .apply(vec![make_entry(
+                1,
+                5,
+                RaftOp::AlterTable {
+                    keyspace: "unregistered_ks".into(),
+                    table: "victim".into(),
+                    updates: Box::new(add_column("added_after_repair")),
+                },
+            )])
+            .await
+            .expect("an ALTER after re-registration must apply");
+        assert!(matches!(repaired[0], RaftResponse::Ok), "{repaired:?}");
+        assert!(engine
+            .table_schema(&tid)
+            .expect("registered")
+            .regular_columns
+            .iter()
+            .any(|c| c.name == "added_after_repair"));
     }
 
     /// Repro for forge t_86f9259d: a keyspace created through the Raft
@@ -9186,57 +9455,6 @@ mod tests {
         assert_eq!(sm.last_applied.unwrap().index, 2);
         assert!(sm.applied_state().await.is_err());
         assert!(sm.build_snapshot().await.is_err());
-    }
-
-    #[tokio::test]
-    async fn physical_table_failure_keeps_committed_index_unpublished_and_latches() {
-        let dir = tempfile::tempdir().unwrap();
-        let engine = test_engine(dir.path());
-        engine.register_system_tables().unwrap();
-        let schema = Arc::new(test_schema_instance());
-        let mut sm = FerrosStateMachine::with_side_effects(schema, engine.clone());
-        sm.apply(vec![make_entry(
-            1,
-            1,
-            RaftOp::CreateKeyspace(simple_keyspace("physical_failure")),
-        )])
-        .await
-        .unwrap();
-        let previous = sm.state.clone();
-        let sabotage = dir.path().join("sstables/physical_failure.victim");
-        std::fs::write(&sabotage, b"owned filesystem refusal").unwrap();
-        let result = sm
-            .apply(vec![make_entry(
-                1,
-                2,
-                RaftOp::CreateTable(Box::new(simple_table("physical_failure", "victim"))),
-            )])
-            .await;
-        assert!(result.is_err(), "A failed physical effect must be a state-machine failure, not a published command response: {result:?}");
-        assert_eq!(sm.last_applied.unwrap().index, 1);
-        assert_eq!(sm.state.schema_version, previous.schema_version);
-        assert!(!sm
-            .state
-            .tables
-            .contains_key(&("physical_failure".into(), "victim".into())));
-        assert!(sm.apply_failure.is_some());
-        assert!(sm.applied_state().await.is_err());
-        assert!(sm.build_snapshot().await.is_err());
-        assert!(sm
-            .apply(vec![make_entry(
-                1,
-                3,
-                RaftOp::CreateTable(Box::new(simple_table("physical_failure", "later")))
-            )])
-            .await
-            .is_err());
-        assert!(engine
-            .table_schema(&TableId::new("physical_failure", "later"))
-            .is_none());
-        assert_eq!(
-            std::fs::read(sabotage).unwrap(),
-            b"owned filesystem refusal"
-        );
     }
 
     #[tokio::test]
