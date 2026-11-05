@@ -7,8 +7,8 @@
 //! Snapshots are serialized with bincode because `serde_json` does not support
 //! non-string map keys (our `BTreeMap<(String, String), _>` tuple keys).
 
-//! Last revised: 2026-11-04.
-//! Last changed: Retain owned physical command application through waiter cancellation.
+//! Last revised: 2026-11-05.
+//! Last changed: Serialize durable snapshot promotion and reject stale builders on disk.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
@@ -283,6 +283,33 @@ struct PersistedSnapshot {
     bytes: Vec<u8>,
 }
 
+/// The metadata prefix orders both replication and durable snapshot publication.
+fn snapshot_precedes(
+    incoming: &SnapshotMeta<u64, BasicNode>,
+    current: &SnapshotMeta<u64, BasicNode>,
+) -> bool {
+    (incoming.last_log_id, incoming.last_membership.log_id())
+        < (current.last_log_id, current.last_membership.log_id())
+}
+
+/// Keep the coordination inode after unlocking: another process may hold it.
+struct SnapshotWriterLock(std::fs::File);
+
+impl Drop for SnapshotWriterLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+/// Remove only this attempt's uniquely owned staging file on failure or unwind.
+struct SnapshotStagingFile(PathBuf);
+
+impl Drop for SnapshotStagingFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // FerrosStateMachine
 // ---------------------------------------------------------------------------
@@ -490,7 +517,7 @@ impl FerrosStateMachine {
     fn publish_snapshot(&self, meta: SnapshotMeta<u64, BasicNode>, bytes: Vec<u8>) -> bool {
         let mut slot = self.current_snapshot.write();
         if let Some((current, _)) = slot.as_ref() {
-            if meta.last_log_id < current.last_log_id {
+            if snapshot_precedes(&meta, current) {
                 tracing::info!(
                     stale = ?meta.last_log_id,
                     current = ?current.last_log_id,
@@ -1109,15 +1136,50 @@ impl FerrosStateMachine {
         meta: &SnapshotMeta<u64, BasicNode>,
         bytes: &[u8],
     ) -> Result<(), StorageIOError<u64>> {
-        let persisted = PersistedSnapshot {
-            meta: meta.clone(),
-            bytes: bytes.to_vec(),
-        };
-        let encoded = bincode::serialize(&persisted)
-            .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
+        }
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".writer.lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(PathBuf::from(lock_path))
+            .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
+        lock_file
+            .lock()
+            .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
+        let _lock = SnapshotWriterLock(lock_file);
+
+        // Read only the leading metadata, not another full snapshot payload.
+        // The comparison and promotion share the same per-path lock, including
+        // independent state-machine instances and cancelled async waiters.
+        match std::fs::File::open(path) {
+            Ok(file) => {
+                let current: SnapshotMeta<u64, BasicNode> =
+                    bincode::deserialize_from(std::io::BufReader::new(&file))
+                        .map_err(|e| StorageIOError::read_state_machine(to_any_error(e)))?;
+                if snapshot_precedes(meta, &current) {
+                    // A prior rename may have returned a directory-sync error.
+                    // Establish durability before allowing any caller to advance
+                    // its watermark, even when its older candidate is skipped.
+                    file.sync_all()
+                        .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
+                    if let Some(parent) = path.parent() {
+                        std::fs::File::open(parent)
+                            .and_then(|dir| dir.sync_all())
+                            .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
+                    }
+                    return Ok(());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(StorageIOError::read_state_machine(to_any_error(error)));
+            }
         }
         // Durable, not merely written.
         //
@@ -1132,31 +1194,43 @@ impl FerrosStateMachine {
         //
         // Returning Ok for a write that may not survive a crash is the "never
         // fake success" failure, and the caller cannot tell the difference.
-        let tmp = path.with_extension("tmp");
+        let mut staging_name = path.file_name().unwrap_or_default().to_os_string();
+        staging_name.push(format!(".{}.tmp", Uuid::new_v4()));
+        let tmp = path.with_file_name(staging_name);
         {
-            let file = std::fs::File::create(&tmp)
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
                 .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
+            let _staging = SnapshotStagingFile(tmp.clone());
             {
+                // Borrowed fields serialize identically to PersistedSnapshot;
+                // stream directly to the file instead of copying its payload.
+                #[derive(Serialize)]
+                struct SnapshotOnDisk<'a> {
+                    meta: &'a SnapshotMeta<u64, BasicNode>,
+                    bytes: &'a [u8],
+                }
                 let mut writer = std::io::BufWriter::new(&file);
-                std::io::Write::write_all(&mut writer, &encoded)
+                bincode::serialize_into(&mut writer, &SnapshotOnDisk { meta, bytes })
                     .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
                 std::io::Write::flush(&mut writer)
                     .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
             }
             file.sync_all()
                 .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
+            std::fs::rename(&tmp, path)
+                .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
         }
-        std::fs::rename(&tmp, path)
-            .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
 
         // fsync the directory too, or the rename itself can be lost while the
         // file contents survive -- leaving the snapshot under its temp name
         // and the node with no snapshot at all.
         if let Some(parent) = path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                dir.sync_all()
-                    .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
-            }
+            std::fs::File::open(parent)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
         }
         Ok(())
     }
@@ -4662,6 +4736,160 @@ mod tests {
             meta10.snapshot_id,
             "the installed snapshot itself must still be the one served"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_builder_cannot_replace_newer_durable_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state-machine.snapshot.bin");
+        let durable = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut live = FerrosStateMachine::with_snapshot_path(path.clone());
+        live.set_durable_applied_handle(Arc::clone(&durable));
+        live.apply(vec![make_entry(
+            1,
+            1,
+            RaftOp::CreateKeyspace(simple_keyspace("before")),
+        )])
+        .await
+        .unwrap();
+        let mut stale = live.get_snapshot_builder().await;
+        let mut newer = FerrosStateMachine::new();
+        newer
+            .apply(vec![
+                make_entry(1, 1, RaftOp::CreateKeyspace(simple_keyspace("before"))),
+                make_entry(1, 2, RaftOp::CreateKeyspace(simple_keyspace("after"))),
+            ])
+            .await
+            .unwrap();
+        let installed = newer.build_snapshot().await.unwrap();
+        live.install_snapshot(&installed.meta, installed.snapshot)
+            .await
+            .unwrap();
+        stale.build_snapshot().await.unwrap();
+
+        assert_eq!(
+            current_snapshot_index(&live.get_current_snapshot().await.unwrap()),
+            Some(2)
+        );
+        assert_eq!(durable.load(std::sync::atomic::Ordering::Acquire), 2);
+        let mut restarted = FerrosStateMachine::with_snapshot_path(path);
+        assert!(restarted.recover_from_persisted_snapshot().unwrap());
+        assert_eq!(
+            restarted.last_applied_index(),
+            Some(2),
+            "the durable file must cover the advertised purge watermark"
+        );
+        assert!(restarted.state().keyspaces.contains_key("after"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_file_survives_cancelled_waiter_and_concurrent_promotion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.bin");
+        let legacy_staging = path.with_extension("tmp");
+        std::fs::write(&legacy_staging, b"another attempt owns this file").unwrap();
+        let lock_path = dir.path().join("snapshot.bin.writer.lock");
+        let coordinator = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        coordinator.lock().unwrap();
+        let (meta1, bytes1) = snapshot_at(1).await;
+        let (meta2, bytes2) = snapshot_at(2).await;
+        let expected = bytes2.clone();
+        let first_path = path.clone();
+        let (started, running) = tokio::sync::oneshot::channel();
+        let (finished, completion) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            ferrosa_net::task_pool::TaskPool::current("raft-log-store")
+                .spawn_blocking(move || {
+                    let _ = started.send(());
+                    let result =
+                        FerrosStateMachine::persist_snapshot_to_disk(&first_path, &meta1, &bytes1);
+                    let _ = finished.send(result);
+                })
+                .await
+                .unwrap();
+        });
+        running.await.unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        let second_path = path.clone();
+        let second =
+            ferrosa_net::task_pool::TaskPool::current("raft-log-store").spawn_blocking(move || {
+                FerrosStateMachine::persist_snapshot_to_disk(&second_path, &meta2, &bytes2)
+                    .map_err(Box::new)
+            });
+        coordinator.unlock().unwrap();
+        completion.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+
+        let stored: PersistedSnapshot =
+            bincode::deserialize(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored.meta.last_log_id.map(|id| id.index), Some(2));
+        assert_eq!(stored.bytes, expected);
+        assert_eq!(
+            std::fs::read(&legacy_staging).unwrap(),
+            b"another attempt owns this file"
+        );
+        assert!(lock_path.is_file(), "the coordination inode must persist");
+        let staging: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with("snapshot.bin."))
+            .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(
+            staging.is_empty(),
+            "completed attempts must leave no staging files"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_file_preserves_legacy_bincode_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.bin");
+        let (meta, bytes) = snapshot_at(3).await;
+        let expected = bincode::serialize(&PersistedSnapshot {
+            meta: meta.clone(),
+            bytes: bytes.clone(),
+        })
+        .unwrap();
+        FerrosStateMachine::persist_snapshot_to_disk(&path, &meta, &bytes).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn snapshot_file_keeps_newer_membership_at_the_same_applied_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.bin");
+        let (older, older_bytes) = snapshot_at(5).await;
+        let mut source = FerrosStateMachine::new();
+        source
+            .apply(vec![
+                Entry {
+                    log_id: LogId::new(CommittedLeaderId::new(1, 1), 3),
+                    payload: EntryPayload::Membership(openraft::Membership::new(
+                        vec![BTreeSet::from([1_u64])],
+                        BTreeMap::from([(1_u64, BasicNode::new("node1"))]),
+                    )),
+                },
+                blank_entry(5),
+            ])
+            .await
+            .unwrap();
+        let newer = source.build_snapshot().await.unwrap();
+        let newer_bytes = newer.snapshot.into_inner();
+        FerrosStateMachine::persist_snapshot_to_disk(&path, &newer.meta, &newer_bytes).unwrap();
+        FerrosStateMachine::persist_snapshot_to_disk(&path, &older, &older_bytes).unwrap();
+        assert!(!source.publish_snapshot(older, older_bytes));
+        let stored: PersistedSnapshot =
+            bincode::deserialize(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(stored.meta.last_membership, newer.meta.last_membership);
+        assert_eq!(stored.bytes, newer_bytes);
     }
 
     /// Steps for T-F1-3's interleavings.

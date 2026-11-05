@@ -353,3 +353,18 @@ live caller retains its share through peer ACK and the strict archive barrier.
 Inbound handlers retain their existing primary apply/replicate-back and secondary
 apply-only behavior; they acquire no nested handoff read lease. Cancellation
 produces no successful ACK and can leave an unacknowledged local write.
+
+
+### Durable snapshot file promotion
+
+Snapshot writers coordinate through a persistent per-path writer lock. The
+comparison with the stored log and membership positions and the durable rename
+run under that same lock, so a delayed builder cannot overwrite a newer file.
+A stale candidate synchronizes the accepted file and directory before reporting
+success. Header inspection avoids reading a second complete snapshot payload.
+
+Each attempt creates its own staging file and streams the existing bincode
+format into it. File and parent-directory synchronization failures propagate;
+failed or unwound attempts remove only their own staging file. Cancellation of
+an async waiter does not cancel an already-running blocking file operation.
+This file-ownership rule is separate from state-machine restore publication.

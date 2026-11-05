@@ -44,7 +44,11 @@ with Periodic acknowledgement. Log severity does not exempt failed projections.
 Shared schema/storage effects can already be visible; this is not rollback or
 transactional isolation. Ordinary command
 error responses retain the committed intent for replay. Existing snapshot-file
-publication behavior is separate from this command-application fence.
+publication has a separate per-path writer fence. A durable file cannot regress
+behind its stored log or membership position when an older builder finishes.
+Each attempt owns a unique staging file; it flushes the file, renames it, and
+flushes the directory before reporting success. Cancelled async waiters cannot
+make concurrent writers truncate or rename one another's staging files.
 
 2. **Read/write coordination** (`coordinator/`) — fans writes and reads out to
    replicas with tunable CQL consistency-level (CL) enforcement, write
