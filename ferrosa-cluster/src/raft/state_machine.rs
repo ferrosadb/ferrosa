@@ -51,7 +51,11 @@ use crate::ring::TokenRing;
 
 /// A failed committed local Schema or Engine effect during `apply_command`.
 ///
-/// These errors propagate through the retained worker as a storage failure.
+/// These errors propagate through the retained worker as a storage failure —
+/// except [`Self::EngineUnregisterTable`], which is a refusal of the DROP
+/// itself and is returned to the caller as a `RaftResponse::Error` without
+/// latching the machine (see the response decision at the end of
+/// `apply_command`).
 /// The owner keeps its previous metadata and applied index, latches the error,
 /// and refuses further apply/snapshot progress. Ordinary domain rejection is
 /// a separate `RaftResponse::Error` and does not poison the machine.
@@ -2472,15 +2476,38 @@ impl FerrosStateMachine {
         // A committed local effect failure is a storage failure, not a
         // publishable command response. The retained worker propagates it to
         // the sticky apply fence before adopting staged metadata or log ID.
-        if !apply_errors.is_empty() {
-            let summary = apply_errors
+        //
+        // One class is not a storage failure: refusing to remove a dropped
+        // table's bytes (`engine.unregister_table` — permission denied on the
+        // table directory, a locked file). The entry is already committed and
+        // the table is gone from canonical metadata on every replica, so
+        // applying it is what keeps replicas in agreement; the surviving bytes
+        // are unreachable and swept by the next same-name CREATE. Latching the
+        // machine for it made one undroppable directory return `Fatal` to every
+        // later proposal and stop RaftCore — a DROP the node refused, not a log
+        // it could not apply. It stays loud to the caller as a
+        // `RaftResponse::Error` instead: the DROP still never reports success.
+        let (refusals, fatal): (Vec<ApplyError>, Vec<ApplyError>) = apply_errors
+            .into_iter()
+            .partition(|error| matches!(error, ApplyError::EngineUnregisterTable { .. }));
+        if !fatal.is_empty() {
+            let summary = fatal
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join("; ");
             return Err(ferrosa_common::Error::Io(std::io::Error::other(summary)));
         }
-        let response = command_rejection
+        let rejection = command_rejection.or_else(|| {
+            (!refusals.is_empty()).then(|| {
+                refusals
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+        });
+        let response = rejection
             .map(RaftResponse::Error)
             .unwrap_or(RaftResponse::Ok);
         Ok((response, pending_system_writes))

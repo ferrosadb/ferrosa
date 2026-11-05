@@ -44,7 +44,13 @@ The retained worker forces the commit log to disk before publication, including
 with Periodic acknowledgement. Log severity does not exempt failed projections.
 Shared schema/storage effects can already be visible; this is not rollback or
 transactional isolation. Ordinary domain rejection remains a command error
-response and does not poison the machine. A failed persisted snapshot restore
+response and does not poison the machine. A DROP whose physical removal the node
+refuses (`unregister_table`: permission denied on the table directory, a locked
+file) is one of those rejections, not a storage failure: the entry is committed
+and the table is gone from canonical metadata everywhere, so latching the worker
+would turn one undroppable directory into `Fatal` for every later proposal. The
+caller still receives the refusal, and the orphaned bytes are swept by the next
+same-name CREATE. A failed persisted snapshot restore
 keeps the prior Raft metadata and closes startup readiness instead of continuing
 with a partially restored shared schema; the snapshot and log files are retained
 for recovery. Persisted startup also refuses a different physical table UUID before
