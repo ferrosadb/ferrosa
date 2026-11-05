@@ -603,6 +603,30 @@ and retains the group's recovery intents; it does not acknowledge an unfinished
 drop. The caller serializes schema recreation with the shared lifecycle writer.
 Single-table unregister APIs retain their existing behavior and recovery format.
 
+### Commit-log sync markers: reserve-ahead, write-once
+
+A segment is a chain of sections, each opened by an 8-byte head marker
+(`next` u32 BE + CRC32(segment_id || next); encoding unchanged). The slot at
+`HEADER_SIZE` is the first head. `Segment::flush_to_disk` is the only path to
+disk, and every call closes the current section under `marker_link`: it
+reserves the next head slot `S` (counted as an in-flight writer), writes the
+current head with `next = S`, then writes `[last_flushed, S)` at its own offset
+and syncs. `last_flushed` becomes `S`. A flush with nothing allocated since the
+head reserves nothing. When no slot fits, or the segment is sealed for
+rotation, the final head is written with `next = 0`, the chain is closed and
+the segment takes no more appends.
+
+Invariant: no byte below the durable watermark is ever written again. The
+previous writer patched the PREVIOUS marker in place (below the watermark), so
+a reader tailing the open segment could see one offset change from EOF to a
+link (PR 648's streaming audit). `SegmentReader` reads both layouts;
+`refresh()` still re-reads the current marker so old segments stay correct.
+Tests: `commitlog::tests::no_durable_byte_is_rewritten_by_a_later_flush`,
+`commitlog::segment::tests::{a_tailing_reader_sees_every_entry_and_no_seen_byte_changes,
+concurrent_writers_and_flushers_keep_every_entry_and_never_rewrite,
+a_segment_in_the_old_patched_layout_still_replays,
+a_full_segment_closes_its_final_section_to_eof_and_replays}`.
+
 ### Commit-log contention test support
 
 The `test-support` feature exposes a callback that holds the active commit-log

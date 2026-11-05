@@ -99,6 +99,14 @@ impl SegmentReader {
     /// Refresh the durable tail of an already-open active segment. The reader
     /// keeps its current entry/marker offsets, so this never rescans entries
     /// that were already yielded.
+    ///
+    /// The current writer never rewrites a marker that is on disk
+    /// (reserve-ahead: each head is written once, by the flush that closes its
+    /// section, and the file ends at the next, unwritten head slot), so for
+    /// its segments the re-read below returns the value already held. It is
+    /// kept because segments written by older binaries ended their open
+    /// section in an EOF marker (`next = 0`) that a later force_sync patched
+    /// in place to a forward link, and re-reading is correct for both.
     pub(crate) fn refresh(&mut self) -> ferrosa_common::Result<()> {
         self.file_len = self.file.metadata()?.len();
         if self.section_active {

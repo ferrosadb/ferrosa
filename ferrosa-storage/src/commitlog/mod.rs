@@ -300,7 +300,7 @@ fn write_prometheus(out: &mut String) {
     out.push_str("# HELP ferrosa_commitlog_syncs_total Successful commit-log fsync calls.\n");
     out.push_str("# TYPE ferrosa_commitlog_syncs_total counter\n");
     let _ = writeln!(out, "ferrosa_commitlog_syncs_total {}", flush.syncs);
-    out.push_str("# HELP ferrosa_commitlog_sync_seconds_total Total wall time spent in commit-log flush_to_disk/force_full_flush calls that performed fsync.\n");
+    out.push_str("# HELP ferrosa_commitlog_sync_seconds_total Total wall time spent in commit-log flush_to_disk calls that performed fsync.\n");
     out.push_str("# TYPE ferrosa_commitlog_sync_seconds_total counter\n");
     let _ = writeln!(
         out,
@@ -1606,24 +1606,10 @@ impl CommitLog {
     /// segment buffer to disk. Used before catch-up replay to ensure
     /// all mutations are readable.
     pub fn force_sync(&self) -> ferrosa_common::Result<()> {
-        let segment = self.active.load();
-        // Reserve an EOF sync marker and link it in, so SegmentReader can
-        // follow the chain. Reserving and linking are one call because doing
-        // them apart lets two concurrent callers link their markers in the
-        // reverse of the order they reserved them, which ends the chain early
-        // and loses every entry after it.
-        let Some(prev_marker_offset) = segment.allocate_and_link_sync_marker() else {
-            // The segment cannot hold another marker; the chain already ends
-            // where it ends, and the buffered entries still owe durability.
-            return segment.flush_to_disk();
-        };
-        // Linking patches the PREVIOUS marker so it points at this one, and
-        // that write goes backwards — below the watermark an incremental
-        // flush writes forward from. Hand the flush that offset so it repairs
-        // those eight bytes in place. Rewriting the whole segment to carry one
-        // backwards patch made this quadratic in the bytes already
-        // accumulated, on a path that runs per Accord apply.
-        segment.flush_to_disk_repairing_marker(prev_marker_offset)
+        // Every flush closes its section (reserve-ahead; see the segment
+        // module docs), so a forced sync is an ordinary flush. No marker that
+        // is already on disk is ever rewritten.
+        self.active.load().flush_to_disk()
     }
 
     /// Health of the sync machinery, for the node supervisor and metrics.
@@ -1848,7 +1834,7 @@ mod tests {
         "# HELP ferrosa_commitlog_syncs_total Successful commit-log fsync calls.",
         "# TYPE ferrosa_commitlog_syncs_total counter",
         "ferrosa_commitlog_syncs_total",
-        "# HELP ferrosa_commitlog_sync_seconds_total Total wall time spent in commit-log flush_to_disk/force_full_flush calls that performed fsync.",
+        "# HELP ferrosa_commitlog_sync_seconds_total Total wall time spent in commit-log flush_to_disk calls that performed fsync.",
         "# TYPE ferrosa_commitlog_sync_seconds_total counter",
         "ferrosa_commitlog_sync_seconds_total",
         "# HELP ferrosa_commitlog_sync_seconds_max Maximum observed wall time for a commit-log fsync call.",
@@ -3106,7 +3092,7 @@ mod tests {
     /// binary bumps them while this one runs, so a delta taken around these
     /// calls proves nothing. This watches the file instead. A sentinel planted
     /// in the segment HEADER is a byte the in-memory buffer disagrees with,
-    /// and the header is a region no incremental flush and no marker patch
+    /// and the header is a region no flush ever writes twice
     /// ever writes. A full rewrite restores it from the buffer; an incremental
     /// flush cannot touch it. Its survival across N force_syncs is exactly the
     /// claim that each call writes its own bytes and not the whole segment.
@@ -3150,12 +3136,63 @@ mod tests {
         cl.shutdown().unwrap();
     }
 
+    /// No byte a flush made durable is ever written again.
+    ///
+    /// After flush N the file holds `[0, watermark_N)`. Flush N+1 may only
+    /// append past that watermark: a reader tailing the open segment, and the
+    /// Lean audit of the streaming path, both rely on durable bytes being
+    /// immutable. The old writer patched the PREVIOUS sync marker in place so
+    /// it pointed forward, which changed eight bytes below the watermark on
+    /// every force_sync after the first.
+    #[test]
+    fn no_durable_byte_is_rewritten_by_a_later_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig {
+            segment_size: 64 * 1024,
+            ..CommitLogConfig::test_config(dir.path())
+        };
+        let cl = CommitLog::new(config).unwrap();
+        let path = cl.active.load().path().to_path_buf();
+
+        cl.append(&mutation_for_table("ks", "t0")).unwrap();
+        cl.force_sync().unwrap();
+        let mut durable = std::fs::read(&path).unwrap();
+        for round in 1..8 {
+            cl.append(&mutation_for_table("ks", &format!("t{round}")))
+                .unwrap();
+            // Alternate the two public flush entry points: both must obey it.
+            if round % 2 == 0 {
+                cl.active.load().flush_to_disk().unwrap();
+            } else {
+                cl.force_sync().unwrap();
+            }
+            let now = std::fs::read(&path).unwrap();
+            assert!(
+                now.len() >= durable.len(),
+                "round {round}: the file shrank from {} to {} bytes",
+                durable.len(),
+                now.len()
+            );
+            if let Some(changed) = (0..durable.len()).find(|&i| now[i] != durable[i]) {
+                panic!(
+                    "round {round}: durable byte {changed} (watermark {}) was rewritten: \
+                     {:#04x} -> {:#04x}",
+                    durable.len(),
+                    durable[changed],
+                    now[changed]
+                );
+            }
+            durable = now;
+        }
+        cl.shutdown().unwrap();
+    }
+
     /// Repeated force_syncs must leave a chain a reader can still walk.
     ///
-    /// Each call links a new EOF marker in by patching the PREVIOUS marker,
-    /// which by then sits behind the flush watermark. Those eight bytes are
-    /// what the reader follows from section to section, so losing them would
-    /// truncate replay at the first force_sync boundary.
+    /// Each call closes a section: it writes that section's head marker,
+    /// linked forward to the slot it reserves for the next one. Those eight
+    /// bytes are what the reader follows from section to section, so a wrong
+    /// link would truncate replay at the first force_sync boundary.
     #[test]
     fn repeated_force_sync_keeps_every_entry_replayable() {
         let dir = tempfile::tempdir().unwrap();
@@ -3189,16 +3226,10 @@ mod tests {
 
     /// `force_sync` must stay correct while a background flusher races it.
     ///
-    /// The marker patch goes backwards, behind the watermark a forward flush
-    /// writes from, and a periodic flush can move that watermark — or write
-    /// the marker's bytes before they exist — in between. Every entry must
+    /// Both close sections on the same segment; a flusher holding an earlier
+    /// section end must never write past it, and the one holding the later
+    /// end must find every head before it already linked. Every entry must
     /// still be reachable by walking the chain from the file alone.
-    ///
-    /// One force_sync caller, not several: concurrent force_syncs corrupt the
-    /// chain on `main` too (each picks its predecessor independently, and the
-    /// markers can end up linked out of order), so a multi-writer version of
-    /// this test fails identically with and without this change. That is a
-    /// separate defect, not one this test should be flaky about.
     #[test]
     fn force_sync_survives_a_concurrent_periodic_flusher() {
         let dir = tempfile::tempdir().unwrap();
@@ -3237,12 +3268,11 @@ mod tests {
     ///
     /// `StorageEngine::write_atomic_batch` force_syncs on every Accord apply,
     /// from whatever thread applies, so this is the production shape. Each
-    /// call links a new marker in by patching its predecessor — and when two
-    /// callers choose that predecessor independently, one link is overwritten
-    /// by the other, or the two markers end up linked in the reverse of the
-    /// order they were allocated in. `SegmentReader::open_next_section` stops
-    /// at a `next` that does not advance, so everything past the break is
-    /// unreplayable: entries this log told its caller were durable.
+    /// call reserves the next head slot and links the current head to it
+    /// under `marker_link`, so the chain comes out in allocation order; were
+    /// two heads linked out of order, `SegmentReader::open_next_section`
+    /// would stop at a `next` that does not advance and everything past the
+    /// break would be unreplayable.
     ///
     /// The assertion counts DISTINCT tables rather than comparing a sequence,
     /// because the interleaving — and so the replay order — is genuinely

@@ -627,9 +627,8 @@ impl SyncStrategy for BatchSync {
         }
         observe_sync_batch(1, bytes, Duration::ZERO);
         let ticket = self.health.begin_sync(Instant::now());
-        // No sync marker needed: BatchSync flushes every entry individually,
-        // so every entry is already durable. Markers are only useful for
-        // PeriodicSync/GroupSync where batches of entries are flushed together.
+        // Every flush closes its section (writes its head marker, reserves
+        // the next), so each entry here gets its own durable section.
         match segment.flush_to_disk() {
             Ok(()) => {
                 report_sync_success("batch", &self.health, ticket);
@@ -1862,9 +1861,11 @@ mod tests {
             "segment file must exist after stop() flushes pending data"
         );
         let contents = std::fs::read(path).unwrap();
+        // Everything up to the head slot the flush reserved for the next
+        // section, which is not written until that section closes.
         assert_eq!(
             contents.len(),
-            segment.current_position() as usize,
+            segment.current_position() as usize - super::super::segment::SYNC_MARKER_SIZE,
             "file should contain all written data after stop()"
         );
     }

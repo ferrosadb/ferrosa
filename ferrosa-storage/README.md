@@ -85,7 +85,14 @@ controls already passed before the fix (`tests/count_payload_alloc.rs`).
   (FMEA ST-66).
 - **Commit log** (`commitlog/`) — segmented WAL with CAS-based lock-free
   allocation, forward-linked sync markers, crash-recovery replay, CDC reader,
-  S3 archiver for PITR, and per-table checkpoints. Three sync strategies
+  S3 archiver for PITR, and per-table checkpoints. Sync markers are
+  **reserve-ahead and write-once**: every flush reserves the next section's
+  head slot, writes the current head (linked to that slot) and syncs up to but
+  not including the slot, so no byte below the flush watermark is ever
+  rewritten and a reader tailing the open segment never sees a marker change.
+  A full or sealed segment closes its final head with `next = 0`. Segments
+  from older binaries (which patched the previous marker in place) still
+  replay unchanged. Three sync strategies
   (`Batch`, `Periodic`, `Group`); **default is `Periodic`** → a bounded
   durability window (see FMEA). Open-time replay re-logs every mutation it
   keeps only in memory into the new log generation (`ReplayRelog`) and fsyncs
