@@ -1259,6 +1259,55 @@ impl ModeController {
         self.set_raft_for_group(RaftGroupId::for_dc(dc_name), raft);
     }
 
+    /// Publish an externally constructed group with its actual physical owner.
+    ///
+    /// The supplied state machine must be the one owned by this Raft worker,
+    /// and the log store must be the store used to create that worker. This
+    /// adapter preserves the normal retirement and committed-coverage checks.
+    pub fn set_tracked_raft_for_dc(
+        self: &Arc<Self>,
+        dc_name: &str,
+        raft: Arc<FerrosRaft>,
+        state_machine: &crate::raft::state_machine::FerrosStateMachine,
+        log_store: &crate::raft::log_store::SledLogStore,
+    ) -> impl std::future::Future<Output = crate::error::Result<()>> + Send + 'static {
+        // Capture actual ownership synchronously. The returned future borrows
+        // neither the machine nor its observer lock while shutdown is awaited.
+        let group = RaftGroupId::for_dc(dc_name);
+        let lifecycle = state_machine.physical_lifecycle();
+        let committed = log_store.committed_reader();
+        let controller = Arc::clone(self);
+        async move {
+            // An unpolled publication must not reserve a live worker. Once
+            // polled, reserve/install/publish complete without an intervening
+            // await, so cancellation cannot abandon a half-installed owner.
+            let registration = controller
+                .physical_raft_workers
+                .reserve(group, lifecycle)
+                .inspect(|registration| registration.bind_log(committed));
+            let publication = registration.and_then(|registration| {
+                if registration.install_raft(Arc::clone(&raft))
+                    && registration.publish(|| {
+                        controller.set_raft_for_group(group, Arc::clone(&raft));
+                    })
+                {
+                    Ok(())
+                } else {
+                    Err("physical Raft registration sealed before publication".into())
+                }
+            });
+            if let Err(reason) = publication {
+                raft.shutdown().await.map_err(|error| {
+                    crate::error::ClusterError::RaftError(format!(
+                        "stop unpublished tracked Raft worker: {error}"
+                    ))
+                })?;
+                return Err(crate::error::ClusterError::RaftError(reason));
+            }
+            Ok(())
+        }
+    }
+
     /// Record a connected peer's DC. Called by the peer handshake (or
     /// tests, before triggering `transition_to_cluster`) so that the
     /// per-DC Raft formation path (W6.3) can filter local-DC voters
