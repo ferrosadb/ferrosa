@@ -258,18 +258,62 @@ async fn a_refused_drop_on_the_applying_node_surfaces_and_never_resurrects() {
         );
     }
 
-    // A same-name re-create must sweep the orphaned directory and hold only the
-    // new rows, never the dropped incarnation's survivors.
-    propose_on_node(&cluster, leader_id, RaftOp::CreateTable(Box::new(table())))
-        .await
-        .expect("same-name CreateTable applies");
-    {
-        let nodes = cluster.nodes();
-        let leader = nodes
-            .iter()
-            .find(|n| n.node_id == leader_id)
-            .expect("leader node present");
-        let engine = leader.engine.as_ref().expect("engine-backed leader");
+    // Physical apply failure fences this Core. Recreating through that same
+    // failed owner would incorrectly treat a hard storage error as recoverable
+    // command rejection. It must refuse until verified online repair replaces it.
+    assert!(
+        propose_on_node(&cluster, leader_id, RaftOp::CreateTable(Box::new(table())))
+            .await
+            .is_err(),
+        "the failed applying node must remain fenced"
+    );
+
+    // The surviving quorum can elect and recreate. Watch real metrics rather
+    // than assuming the old leader still owns admission after its apply failed.
+    let survivors: Vec<_> = cluster
+        .nodes()
+        .iter()
+        .filter(|n| n.node_id != leader_id)
+        .map(|n| (n.raft.clone(), n.engine.as_ref().unwrap().clone()))
+        .collect();
+    assert_eq!(survivors.len(), 2);
+    let mut first = survivors[0].0.metrics();
+    let mut second = survivors[1].0.metrics();
+    let healthy_leader = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let a = first.borrow().current_leader;
+            let b = second.borrow().current_leader;
+            if let Some(id) = a.filter(|id| *id != leader_id && Some(*id) == b) {
+                break id;
+            }
+            tokio::select! {
+                result = first.changed() => result.expect("first surviving Core stays online"),
+                result = second.changed() => result.expect("second surviving Core stays online"),
+            }
+        }
+    })
+    .await
+    .expect("surviving quorum elects a healthy leader");
+    propose_on_node(
+        &cluster,
+        healthy_leader,
+        RaftOp::CreateTable(Box::new(table())),
+    )
+    .await
+    .expect("same-name CreateTable applies through the healthy quorum");
+    let applied = cluster
+        .raft_for_node_id(healthy_leader)
+        .unwrap()
+        .metrics()
+        .borrow()
+        .last_applied
+        .unwrap()
+        .index;
+    for (raft, engine) in survivors {
+        raft.wait(Some(Duration::from_secs(10)))
+            .applied_index_at_least(Some(applied), "healthy replica applies recreation")
+            .await
+            .unwrap();
         for i in 0..2 {
             let pk = format!("new{i}");
             engine
@@ -284,8 +328,21 @@ async fn a_refused_drop_on_the_applying_node_surfaces_and_never_resurrects() {
         assert_eq!(
             engine.count_range(&tid, None, None).expect("count"),
             2,
-            "a same-name re-create must hold ONLY the new rows; the dropped \
-             table's rows came back"
+            "a same-name re-create must hold ONLY the new rows; the dropped table's rows came back"
         );
     }
+    let failed_engine = cluster
+        .nodes()
+        .iter()
+        .find(|n| n.node_id == leader_id)
+        .unwrap()
+        .engine
+        .as_ref()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        failed_engine.count_range(&tid, None, None).unwrap(),
+        0,
+        "healthy-quorum recreation must not reopen the failed node's stale incarnation"
+    );
 }
