@@ -6,10 +6,10 @@
   a different category from a feature that was never written — an unimplemented item can be scheduled
   against a milestone, a broken one is already lying to someone. Each row names a witness theorem in
   its area's ledger, so the claim is not a mood. The damage concentrates on the surfaces a client
-  trusts: five of the sixteen are SQL or SPARQL, the two places where a confidently wrong answer is
+  trusts: five of the nineteen are SQL or SPARQL, the two places where a confidently wrong answer is
   most likely to be acted on.
 
-  **A row's `site` is either a Rust location or the word `unverified:`.** Eleven rows point at code
+  **A row's `site` is either a Rust location or the word `unverified:`.** Fourteen rows point at code
   that was read at this revision. Five were checked on 2026-10-31 and describe a hazard that exists
   in the Lean model but **not in the shipping implementation**: the code does the correct thing and
   has tests pinning it. Those rows say so in place, because a row claiming a site that does not
@@ -104,19 +104,31 @@ def broken : List Item := [
   ⟨"Raft", "an entry is published only when its ordered system-table write landed",
    "A schema change is reported as applied even when the write that makes it durable failed. The failure is logged and dropped, the applied index advances, and a restart replays from after that entry, so the system-table row can stay missing.",
    "ferrosa-cluster/src/raft/state_machine.rs:2166-2174 logs a failed ordered write and returns (the Error level at :2171 is a log line, not a latch), so the job completes and :466-467 adopt the completed metadata and advance last_applied; replay then starts at the next index, so the write is never re-issued",
-   "Ferrosa.Raft.Obligations", "an entry is published only when its ordered system-table write landed"⟩
+   "Ferrosa.Raft.Obligations", "an entry is published only when its ordered system-table write landed"⟩,
+  ⟨"Raft", "the durable snapshot on disk never moves backwards",
+   "A node that finishes building an old snapshot after it has installed a newer one writes the old one over the newer one on disk. The two durable facts then disagree, so the node refuses to start, throws away its raft log and has to be rebuilt from a peer.",
+   "ferrosa-cluster/src/raft/state_machine.rs:2218 discards the boolean publish_snapshot returns when it refuses to replace a newer snapshot, and :2225 then persists snapshot_path unconditionally, so a builder taken at index 5 that finishes after install_snapshot at 10 writes 5 over 10 while mark_durably_applied (:2229) stays at 10 because it is a fetch_max; the guard is only tested with snapshot_path None (the test at :4501 builds on FerrosStateMachine::new())",
+   "Ferrosa.Raft.Obligations", "the durable snapshot on disk never moves backwards"⟩,
+  ⟨"Raft", "a snapshot is restored as a whole or the node does not boot on it",
+   "If restoring the saved snapshot fails part-way, the node logs a warning and starts anyway, with the raft state at the snapshot's index and the schema it serves from unchanged. Tables the cluster believes exist cannot be resolved on that node until it is restarted.",
+   "ferrosa-cluster/src/raft/state_machine.rs:838-839 adopt data.state and meta.last_log_id before sync_schema_and_engine_from_state can fail at :841-844, and ferrosa-cluster/src/controller/cluster.rs:1459-1465 downgrades recover_from_persisted_snapshot's error to tracing::warn! and boots; the retirement of superseded table incarnations at :1001-1005 runs before the apply_snapshot at :1061 that can still fail",
+   "Ferrosa.Raft.Obligations", "a snapshot is restored as a whole or the node does not boot on it"⟩,
+  ⟨"Raft", "a failed local side effect is repaired without a restart",
+   "When registering a table with the local storage engine fails during an apply, the cluster keeps the table and only that node cannot serve it, and nothing retries until it restarts. A client that retries sees a table that exists everywhere except there.",
+   "ferrosa-cluster/src/raft/state_machine.rs:1412 inserts the table into state and :1436-1443 pushes ApplyError::EngineRegisterTable when register_table fails, and :2142-2155 folds the collected errors into RaftResponse::Error, a value nothing replays, while the staged state publishes at :466-467; the registration at :1435-1444 is unconditional and so re-runs on replay, but a replay needs a restart or an install (install_snapshot at :2382), and the design is pinned in place by apply_command_propagates_engine_register_failure (:5148, 'committed failed intent remains for replay')",
+   "Ferrosa.Raft.Obligations", "a failed local side effect is repaired without a restart"⟩
 ]
 
-/-- Sixteen built-and-wrong items, pinned so a defect cannot be dropped from the list without the
-    corpus classification breaking. -/
-theorem broken_has_sixteen_items : broken.length = 16 := by native_decide
+/-- Nineteen built-and-wrong items, pinned so a defect cannot be dropped from the list without the
+corpus classification breaking. -/
+theorem broken_has_nineteen_items : broken.length = 19 := by native_decide
 
-/-- The surfaces are where the damage concentrates: five of the sixteen are SQL or SPARQL, which are
-    the two places a client is most likely to be told something confidently wrong. -/
+/-- The surfaces are where the damage concentrates: five of the nineteen are SQL or SPARQL, which are
+    the two places where a client is most likely to be told something confidently wrong. -/
 theorem the_surfaces_carry_five : (broken.filter fun i => i.area == "SQL").length
     + (broken.filter fun i => i.area == "SPARQL").length = 5 := by native_decide
 
-/-- Five of the sixteen could not be anchored to the shipping code: four describe an implementation
+/-- Five of the nineteen could not be anchored to the shipping code: four describe an implementation
     that does the correct thing at this revision (with tests pinning it) and one is stale because the
     fix it says is unmerged has been merged since. Counted, so a later edit cannot quietly turn a
     model-only hazard back into an assertion about code. -/
@@ -125,8 +137,8 @@ theorem five_rows_have_no_verified_site :
 
 /-- The remainder — the rows that name a real location — are what the list's opening claim is about:
     code that was read, not inferred. -/
-theorem eleven_rows_name_a_site :
-    (broken.filter fun i => !i.site.startsWith "unverified:").length = 11 := by native_decide
+theorem fourteen_rows_name_a_site :
+    (broken.filter fun i => !i.site.startsWith "unverified:").length = 14 := by native_decide
 
 /-- What a reader of the specification is shown for a row: the sentence that says what is wrong. -/
 def readerText (i : Item) : String := i.plain

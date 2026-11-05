@@ -13,11 +13,17 @@
   `engine` and `system_writer` with the live machine, so physical effects are visible before the
   published index moves; only the metadata transition is genuinely isolated.
 
+  The area continues in `Ferrosa/Raft/Surfaces.lean`, which audits the rest of the surface — the
+  snapshot a builder produces, the file it is written to, the purge ceiling and the two restart paths
+  — for the same shape of failure. Three more obligations are red there and four are proved, and this
+  file's `ledger` appends them so one area still prints and counts as one list.
+
   The proved statements quantify over every trace and are closed by induction on it. A disproof is a
   single trace whose fields reduce under `decide`, which is all a counterexample needs.
 -/
 import Ferrosa.Ledger
 import Ferrosa.Raft.StateMachine
+import Ferrosa.Raft.Surfaces
 
 namespace Ferrosa.Raft
 
@@ -438,9 +444,11 @@ theorem panic_after_physical_latches :
 
 /-! ## The ledger
 
-Five obligations, each with the theorem that settles it. Three hold over every trace; two are red,
+Twelve obligations, each with the theorem that settles it. Seven hold over every trace; five are red,
 each naming the single trace that refutes it. Reading this table answers what a client may assume
-about a schema change once raft reports the entry applied, and where that assumption stops.
+about a schema change once raft reports the entry applied, and where that assumption stops — and,
+from `Ferrosa/Raft/Surfaces.lean`, what an operator may assume about the snapshot that is supposed to
+make the answer survive a restart.
 -/
 
 def ledger : List SpecItem := [
@@ -458,11 +466,12 @@ def ledger : List SpecItem := [
    .failing
      "staged_apply clones the metadata but shares the schema, engine and system-writer handles, so the physical transition is visible on the blocking thread while the published index still points at the previous entry"
      "Raft.shared_exposes_effects_before_publication"⟩
-]
+] ++ surfaceItems
 
-/-- The area records five obligations of which two are unmet, and both numbers are pinned here:
-    closing one, or adding a claim, forces this table to be updated in the same change. -/
-theorem raft_has_five_items_and_two_red : ledger.length = 5 ∧ redCount ledger = 2 := by
+/-- The area records twelve obligations of which five are unmet — the fence's two and the three the
+    snapshot, purge and restart surface adds — and both numbers are pinned here: closing one, or
+    adding a claim, forces this table to be updated in the same change. -/
+theorem raft_has_twelve_items_and_five_red : ledger.length = 12 ∧ redCount ledger = 5 := by
   decide
 
 def main : IO Unit :=

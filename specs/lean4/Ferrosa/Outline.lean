@@ -84,6 +84,7 @@ def parts : List Part := [
     "Ferrosa.Accord.Edn",
     "Ferrosa.Accord.AccordMultiDcLean",
     "Ferrosa.Raft.StateMachine",
+    "Ferrosa.Raft.Surfaces",
     "Ferrosa.Raft.Obligations"
   ]⟩,
 
@@ -164,7 +165,7 @@ theorem every_ledger_is_placed :
 
 /-- The book covers a fixed number of modules. A module added to the corpus without a home here is
     a build failure rather than a silent omission from the document. -/
-theorem placed_module_count : (parts.map (fun p => p.modules.length)).sum = 63 := by decide
+theorem placed_module_count : (parts.map (fun p => p.modules.length)).sum = 64 := by decide
 
 /-- Part numerals are distinct, so `\ref` cannot collide. -/
 theorem part_numerals_distinct : (parts.map (fun p => p.numeral)).Nodup := by decide

@@ -132,11 +132,32 @@ pub const REDS: &[Red] = &[
         witness: "Flight.a_stream_ticket_is_not_a_range_select",
     },
     Red {
+        name: "raft_obligations__a_failed_local_side_effect_is_repaired_without_a_restart",
+        module: "Ferrosa.Raft.Obligations",
+        claim: "a failed local side effect is repaired without a restart",
+        why: "an engine or schema effect that fails during apply becomes RaftResponse::Error (state_machine.rs:2142-2155), which is not durable and not replayed, while the entry publishes and the state adopts the mutation; the effect is re-attempted only by a replay from a snapshot behind it — register_table is unconditional at :1435-1444, so it re-runs on replay — and a replay needs a restart or an install, so until then the node advertises a table its engine cannot serve",
+        witness: "Raft.a_failed_local_effect_leaves_a_permanent_gap",
+    },
+    Red {
+        name: "raft_obligations__a_snapshot_is_restored_as_a_whole_or_the_node_does_not_boot_on_it",
+        module: "Ferrosa.Raft.Obligations",
+        claim: "a snapshot is restored as a whole or the node does not boot on it",
+        why: "apply_snapshot_data adopts the state and the published index (state_machine.rs:838-839) before sync_schema_and_engine_from_state (:841-844) can fail, and controller/cluster.rs:1459-1465 downgrades that failure to a warning, so the process runs with RaftState at the snapshot index and a shared Schema and StorageEngine that never saw it; nothing on the apply path closes the gap, and the retirement of superseded incarnations (:1001-1005) happens before the sync that can still fail",
+        witness: "Raft.a_failed_restore_boots_with_a_stale_schema",
+    },
+    Red {
         name: "raft_obligations__an_entry_is_published_only_when_its_ordered_system_table_write_landed",
         module: "Ferrosa.Raft.Obligations",
         claim: "an entry is published only when its ordered system-table write landed",
         why: "publication waits for the ordered write to be attempted, not for it to succeed: a failed write is logged and swallowed, so the entry publishes with the durable prefix behind it and replay starts after it",
         witness: "Raft.sysfail_publishes_without_row",
+    },
+    Red {
+        name: "raft_obligations__the_durable_snapshot_on_disk_never_moves_backwards",
+        module: "Ferrosa.Raft.Obligations",
+        claim: "the durable snapshot on disk never moves backwards",
+        why: "build_snapshot discards publish_snapshot's refusal (state_machine.rs:2218) and writes snapshot_path unconditionally (:2225), so a builder taken before an install persists its older snapshot over the installed one while mark_durably_applied stays at the newer index; the slot keeps the newer snapshot so replication is unaffected, and the log store is free to purge to it, so the node boots as StrandedBehindPurge and discards its raft directory",
+        witness: "Raft.stale_builder_overwrites_the_durable_snapshot",
     },
     Red {
         name: "raft_obligations__the_staged_copy_leaves_no_trace_until_it_publishes",

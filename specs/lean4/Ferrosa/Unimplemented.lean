@@ -147,8 +147,9 @@ theorem ledgerTotal_is_the_registry_sum :
     ledgerTotal = (areas.map fun a => redCount a.ledger).sum := rfl
 
 /-- Pinned so that removing a ledger from the registry — the drift that has recurred here — is a
-    build failure rather than a silently smaller total. -/
-theorem ledgerTotal_pinned : ledgerTotal = 62 := by decide
+    build failure rather than a silently smaller total. Sixty-five: the raft surface audit added
+    three reds without adding an area. -/
+theorem ledgerTotal_pinned : ledgerTotal = 65 := by decide
 
 /-- Print every registered ledger, with the header its area module prints. -/
 def printAllLedgers : IO Unit := do
@@ -416,10 +417,11 @@ theorem unimplemented_has_the_right_length : unimplemented.length = 38 := by nat
     requirement the staged apply does not meet. -/
 theorem eight_are_not_defects : nonDefects.length = 8 := by native_decide
 
-/-- **Live defects now outnumber everything else.**  Sixteen reds against eight requirements,
+/-- **Live defects now outnumber everything else.**  Nineteen reds against eight requirements,
     proofs, measurements, inherited protocol behaviour and closures. This theorem had the opposite
     direction until the memory specs found three more: the closer the specs get to the code, the
-    more of it turns out to be shipping something that is not true. -/
+    more of it turns out to be shipping something that is not true. The raft surface audit added
+    three, all of them a durable effect that did not happen while publication advanced. -/
 theorem live_defects_outnumber_the_rest : nonDefects.length < Ferrosa.Broken.broken.length := by
   native_decide
 
