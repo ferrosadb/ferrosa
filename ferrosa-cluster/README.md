@@ -1422,3 +1422,14 @@ fails the projection. The role lookup retains at most one target row and one
 metadata row. Role and permission reload accepts newer cells above older partition
 tombstones. This is a node-local serialized-writer rule; other schema projection
 families and role-membership partition reconciliation have separate ordering rules.
+
+
+### Physical projection timestamp inspection
+
+Role deletion and permission regrant inspect physical metadata through bounded
+32-row pages, including rows hidden by an older partition tombstone. The
+node-local serialized writer chooses a checked successor beyond stored cells,
+row deletions and partition deletions; clock ties/regression cannot resurrect a
+removed role or suppress a later grant. A partition delete preflights both role
+and grant clocks before its first write. This does not establish concurrent or
+cross-node timestamp arbitration, nor repair other projection families.

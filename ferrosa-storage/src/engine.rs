@@ -1,8 +1,8 @@
 //! Module: Compose commit log, memtable, flush, compaction, object storage, and cache.
 //! Correctness: Correct when admitted writes are durable before visibility and reads,
 //! replay, flush, and maintenance preserve table and cursor invariants.
-//! Last revised: 2026-10-24
-//! Last changed: Share immutable observer payloads across bounded lossless queues.
+//! Last revised: 2026-11-05
+//! Last changed: retain bounded physical metadata for canonical projection ordering.
 //!
 //! [`StorageEngine`] is the entry point for all storage operations. It owns:
 //! - A [`CommitLog`] for write-ahead durability.
@@ -10637,6 +10637,33 @@ impl StorageEngine {
         state
             .last_foreground_read_unix_ms
             .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Read bounded physical metadata for serialized canonical projections.
+    /// Retains tombstones and their covered rows/cells; never use this as a
+    /// logical query result. `start_clustering` is an exclusive cursor and
+    /// `row_limit` must be nonzero, including when the table is absent.
+    pub fn read_projection_rows(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        start_clustering: Option<&[u8]>,
+        row_limit: usize,
+    ) -> ferrosa_common::Result<Option<Partition>> {
+        if row_limit == 0 {
+            return Err(ferrosa_common::Error::InvalidData(
+                "projection metadata reads require a nonzero row limit".into(),
+            ));
+        }
+        match self.table_state(table_id) {
+            Some(state) => {
+                state.note_foreground_read();
+                state
+                    .store
+                    .read_projection_rows(key, start_clustering, row_limit)
+            }
+            None => Ok(None),
+        }
     }
 
     /// Read at most `row_limit` rows strictly after `start_clustering` from one

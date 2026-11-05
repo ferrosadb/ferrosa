@@ -1,8 +1,8 @@
 //! Module: Compose lock-free memtable, flush, SSTable read, and metadata views.
 //! Correctness: Correct when every ArcSwap view is internally aligned and read
 //! and compaction planning preserve key bounds without resident-reader fanout.
-//! Last revised: 2026-10-03
-//! Last changed: Removed the per-table locks (write gate, view CAS, rotation
+//! Last revised: 2026-11-05
+//! Last changed: retain bounded physical metadata for canonical projection ordering.
 //! queue, ArcSwap sets), t_d938e6ae.
 //!
 //! Lock-free composition of memtable, flush, and SSTable reads.
@@ -4091,7 +4091,7 @@ impl<F: FlushTarget> TableStore<F> {
         row_limit: usize,
     ) -> Result<Option<Partition>> {
         self.with_retried_view("read_limited_rows", |view| {
-            self.read_with_view(view, key, row_limit, None)
+            self.read_with_view(view, key, row_limit, None, false)
         })
     }
 
@@ -4105,7 +4105,27 @@ impl<F: FlushTarget> TableStore<F> {
         row_limit: usize,
     ) -> Result<Option<Partition>> {
         self.with_retried_view("read_limited_rows_from", |view| {
-            self.read_with_view(view, key, row_limit, Some(start_clustering))
+            self.read_with_view(view, key, row_limit, Some(start_clustering), false)
+        })
+    }
+
+    /// Read bounded physical projection metadata, retaining deletion-covered
+    /// rows/cells and their clustering cursor. This is not query-visible data.
+    /// Every source and the result retain at most `row_limit` rows; zero is
+    /// refused so a projection cannot accidentally materialize a partition.
+    pub fn read_projection_rows(
+        &self,
+        key: &DecoratedKey,
+        start_clustering: Option<&[u8]>,
+        row_limit: usize,
+    ) -> Result<Option<Partition>> {
+        if row_limit == 0 {
+            return Err(ferrosa_common::Error::InvalidData(
+                "projection metadata reads require a nonzero row limit".into(),
+            ));
+        }
+        self.with_retried_view("read_projection_rows", |view| {
+            self.read_with_view(view, key, row_limit, start_clustering, true)
         })
     }
 
@@ -4644,6 +4664,7 @@ impl<F: FlushTarget> TableStore<F> {
         key: &DecoratedKey,
         row_limit: usize,
         start_clustering: Option<&[u8]>,
+        retain_projection_metadata: bool,
     ) -> Result<(Option<Partition>, Option<CorruptSstableId>)> {
         let started = Instant::now();
         let schema = self.schema.load();
@@ -4812,15 +4833,27 @@ impl<F: FlushTarget> TableStore<F> {
             return Ok((None, corrupt));
         }
 
-        let mut merged = merge::merge_partitions(sources);
+        let mut merged = if retain_projection_metadata {
+            merge::merge_projection_metadata(sources)
+        } else {
+            merge::merge_partitions(sources)
+        };
         // Resolving the reserved-key tombstone can meet an SSTable the sources
         // above never opened; an unconsultable one drives the same fresh-view
         // retry rather than failing the read on a transient compaction window.
         let (table_delete, probe_corrupt) = self.table_deletion(guard)?;
         corrupt = corrupt.or(probe_corrupt);
-        merge::apply_table_deletion(&mut merged, table_delete);
+        if retain_projection_metadata {
+            if table_delete.marked_for_delete_at > merged.deletion.marked_for_delete_at {
+                merged.deletion = table_delete;
+            }
+        } else {
+            merge::apply_table_deletion(&mut merged, table_delete);
+        }
         if row_limit > 0 {
-            merge::apply_deletions(&mut merged);
+            if !retain_projection_metadata {
+                merge::apply_deletions(&mut merged);
+            }
             merged.rows.truncate(row_limit);
         }
         crate::metrics::observe_read_limited_rows(
@@ -14549,7 +14582,7 @@ mod tests {
         }));
 
         let view = store.view.load_full();
-        let (result, corrupt) = store.read_with_view(&view, &key, 0, None).unwrap();
+        let (result, corrupt) = store.read_with_view(&view, &key, 0, None, false).unwrap();
         assert!(
             result.is_none(),
             "the truncated source yields no rows on this single view snapshot"

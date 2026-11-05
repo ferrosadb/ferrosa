@@ -1841,3 +1841,14 @@ Single-table unregister APIs retain their existing behavior and recovery format.
 The `test-support` feature exposes a callback that holds the active commit-log
 segment's existing file mutex. Sibling-crate progress tests use it to exercise
 real flush/fsync contention with deterministic release and ordinary storage I/O.
+
+
+### Bounded physical projection metadata
+
+`StorageEngine::read_projection_rows` is a nonzero-bounded, exclusive-cursor
+metadata read for serialized canonical projection writers. It merges source
+metadata without deletion suppression, preserving hidden row tombstones and
+physical clustering cursors; table/partition deletion watermarks remain attached.
+It is not a logical query result. Existing read APIs retain their deletion
+visibility rules and retry/corruption policy. Memory remains bounded by source
+count times the requested page size.

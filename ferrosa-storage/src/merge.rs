@@ -1,5 +1,5 @@
-//! Last revised: 2026-10-23
-//! Last changed: Fold rows and cells in retained storage.
+//! Last revised: 2026-11-05
+//! Last changed: retain bounded physical metadata for canonical projection ordering.
 //! Correctness: Stable LWW reconciliation and collection-path tests.
 //!
 //! Read-path merge for partitions from multiple SSTables and memtables.
@@ -29,6 +29,17 @@ use ferrosa_sstable::types::{DeletionTime, Partition, Row};
 ///
 /// Panics if `sources` is empty.
 pub fn merge_partitions(sources: Vec<Partition>) -> Partition {
+    merge_partition_metadata(sources, true)
+}
+
+/// Merge projection metadata without discarding cells or clustering cursors
+/// covered by tombstones. Callers must apply their own visibility rules; this
+/// is not a logical query result. Input pages remain bounded by the store.
+pub(crate) fn merge_projection_metadata(sources: Vec<Partition>) -> Partition {
+    merge_partition_metadata(sources, false)
+}
+
+fn merge_partition_metadata(sources: Vec<Partition>, suppress_deletions: bool) -> Partition {
     assert!(
         !sources.is_empty(),
         "merge_partitions requires at least one source"
@@ -36,7 +47,9 @@ pub fn merge_partitions(sources: Vec<Partition>) -> Partition {
 
     if sources.len() == 1 {
         let mut result = sources.into_iter().next().unwrap();
-        apply_deletions(&mut result);
+        if suppress_deletions {
+            apply_deletions(&mut result);
+        }
         return result;
     }
 
@@ -75,7 +88,9 @@ pub fn merge_partitions(sources: Vec<Partition>) -> Partition {
         rows: all_rows,
     };
 
-    apply_deletions(&mut result);
+    if suppress_deletions {
+        apply_deletions(&mut result);
+    }
     result
 }
 

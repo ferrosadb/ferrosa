@@ -4,6 +4,9 @@
 //! types and row conversion functions) with `ferrosa-storage` (which provides
 //! the write API). This module lives in `ferrosa-cluster` because it depends
 //! on both crates, and placing it in either would create a circular dependency.
+//! Correctness: ordered projections inspect bounded physical metadata, including hidden tombstones.
+//! Last revised: 2026-11-05
+//! Last changed: order role deletion and regrant beyond stored partition/row clocks.
 
 use std::sync::Arc;
 
@@ -76,55 +79,71 @@ impl SystemTableWriter {
         now_micros()
     }
 
-    /// Preserve node-local serialized projection order for a role row. Logical
-    /// exact-row reads omit partition-only tombstones, so probe that metadata
-    /// separately with a one-row bound before inspecting the target row.
-    fn next_role_timestamp(&self, key: &DecoratedKey, wall: i64) -> ferrosa_common::Result<i64> {
-        let tid = TableId::new("system_auth", "roles");
+    /// Compute a node-local successor from bounded physical metadata pages.
+    /// Raft serializes canonical projection mutation; other simultaneous writers
+    /// are not supported by this ordering contract. Logical reads are unsuitable:
+    /// an older partition delete can hide a newer row tombstone whose PK is old.
+    /// `target=None` covers the entire partition before a partition delete.
+    fn next_projection_timestamp(
+        &self,
+        table: &TableId,
+        key: &DecoratedKey,
+        target: Option<&[u8]>,
+        wall: i64,
+    ) -> ferrosa_common::Result<i64> {
         let mut previous = i64::MIN;
-        if let Some(partition) = self.engine.read_limited_rows(&tid, key, 1)? {
-            previous = partition.deletion.marked_for_delete_at;
-        }
-        if let Some(partition) = self.engine.read_clustering_row(&tid, key, &[])? {
+        let mut cursor: Option<Vec<u8>> = None;
+        'pages: loop {
+            let Some(partition) =
+                self.engine
+                    .read_projection_rows(table, key, cursor.as_deref(), 32)?
+            else {
+                break;
+            };
             previous = previous.max(partition.deletion.marked_for_delete_at);
             for row in &partition.rows {
+                if let Some(target) = target {
+                    match row.clustering.as_slice().cmp(target) {
+                        std::cmp::Ordering::Less => continue,
+                        std::cmp::Ordering::Greater => break 'pages,
+                        std::cmp::Ordering::Equal => {}
+                    }
+                }
                 previous = previous
                     .max(row.deletion.marked_for_delete_at)
                     .max(row.primary_key_liveness.timestamp);
                 for (_, cell) in &row.cells {
                     previous = previous.max(cell.timestamp);
                 }
+                if target.is_some() {
+                    break 'pages;
+                }
             }
+            let Some(last) = partition.rows.last() else {
+                break;
+            };
+            cursor = Some(last.clustering.clone());
         }
         Ok(wall.max(previous.checked_add(1).ok_or_else(|| {
-            ferrosa_common::Error::InvalidData("role projection timestamp exhausted".into())
+            ferrosa_common::Error::InvalidData("canonical projection timestamp exhausted".into())
         })?))
     }
 
-    /// Raft serializes these projection writes. Advance beyond the actual
-    /// stored cell/tombstone even when the wall clock ties or moves backwards.
+    fn next_role_timestamp(&self, key: &DecoratedKey, wall: i64) -> ferrosa_common::Result<i64> {
+        self.next_projection_timestamp(&TableId::new("system_auth", "roles"), key, Some(&[]), wall)
+    }
+
     fn next_permission_timestamp(
         &self,
         key: &DecoratedKey,
         resource: &[u8],
     ) -> ferrosa_common::Result<i64> {
-        let tid = TableId::new("system_auth", "role_permissions");
-        let mut previous = i64::MIN;
-        if let Some(partition) = self.engine.read(&tid, key)? {
-            previous = partition.deletion.marked_for_delete_at;
-            if let Some(row) = partition.rows.iter().find(|row| row.clustering == resource) {
-                previous = previous
-                    .max(row.deletion.marked_for_delete_at)
-                    .max(row.primary_key_liveness.timestamp);
-                for (_, cell) in &row.cells {
-                    previous = previous.max(cell.timestamp);
-                }
-            }
-        }
-        let successor = previous.checked_add(1).ok_or_else(|| {
-            ferrosa_common::Error::InvalidData("permission projection timestamp exhausted".into())
-        })?;
-        Ok(self.permission_timestamp().max(successor))
+        self.next_projection_timestamp(
+            &TableId::new("system_auth", "role_permissions"),
+            key,
+            Some(resource),
+            self.permission_timestamp(),
+        )
     }
 
     /// Apply a system table mutation by writing to the storage engine.
@@ -206,28 +225,23 @@ impl SystemTableWriter {
                 }
             }
             SystemTableMutation::RoleDropped(name) => {
-                let ts = now_micros();
+                let wall = now_micros();
                 let key = DecoratedKey::new(PartitionKey::new(name.as_bytes().to_vec()));
-
-                // Tombstone in system_auth.roles.
                 let tid = TableId::new("system_auth", "roles");
-                let row = Row {
-                    clustering: vec![],
-                    cells: vec![],
-                    deletion: DeletionTime::new(ts, (ts / 1_000_000) as u32),
-                    primary_key_liveness: LivenessInfo::NONE,
-                };
-                self.engine.write(&tid, &key, row, ts)?;
-
-                // Tombstone in system_auth.role_permissions.
                 let perms_tid = TableId::new("system_auth", "role_permissions");
-                let perms_row = Row {
-                    clustering: vec![],
-                    cells: vec![],
-                    deletion: DeletionTime::new(ts, (ts / 1_000_000) as u32),
-                    primary_key_liveness: LivenessInfo::NONE,
-                };
-                self.engine.write(&perms_tid, &key.clone(), perms_row, ts)?;
+                // Preflight both successors before the first effect, including
+                // overflow, then dominate every stored grant in bounded pages.
+                let role_ts = self.next_projection_timestamp(&tid, &key, None, wall)?;
+                let perms_ts = self.next_projection_timestamp(&perms_tid, &key, None, wall)?;
+                for (table, ts) in [(tid, role_ts), (perms_tid, perms_ts)] {
+                    let row = Row {
+                        clustering: vec![],
+                        cells: vec![],
+                        deletion: DeletionTime::new(ts, (wall / 1_000_000) as u32),
+                        primary_key_liveness: LivenessInfo::NONE,
+                    };
+                    self.engine.write(&table, &key, row, ts)?;
+                }
             }
             SystemTableMutation::GrantUpdated(grant) => {
                 let (key, mut row, _) = grant_to_row(&grant);

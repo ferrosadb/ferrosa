@@ -775,6 +775,251 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canonical_role_drop_dominates_stored_future_rows_after_reopen() {
+        use ferrosa_schema::system::persistence::{role_to_row, SystemTableMutation};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let role = RoleMetadata {
+            name: "drop_future_role".into(),
+            is_superuser: false,
+            can_login: true,
+            salted_hash: None,
+            member_of: Default::default(),
+            scram: None,
+        };
+        let future = i64::MAX - 2048;
+        let (key, mut row, _) = role_to_row(&role);
+        row.primary_key_liveness.timestamp = future;
+        for (_, cell) in &mut row.cells {
+            cell.timestamp = future;
+        }
+        let roles = TableId::new("system_auth", "roles");
+        let permissions = TableId::new("system_auth", "role_permissions");
+        engine.write(&roles, &key, row, future).unwrap();
+        let mut writer = SystemTableWriter::new(Arc::clone(&engine));
+        writer.set_permission_timestamp_for_test(future);
+        writer
+            .apply(SystemTableMutation::GrantUpdated(GrantEntry {
+                role: role.name.clone(),
+                resource: Resource::Keyspace("ks".into()),
+                permissions: [Permission::Select].into_iter().collect(),
+            }))
+            .unwrap();
+        writer
+            .apply(SystemTableMutation::RoleDropped(role.name.clone()))
+            .unwrap();
+        let loader = SystemTableLoader::new(Arc::clone(&engine));
+        let live_roles = loader.load_roles().unwrap();
+        let live_grants = loader.load_role_permissions().unwrap();
+        engine.flush(&roles).unwrap();
+        engine.flush(&permissions).unwrap();
+        engine.force_commit_log_sync().unwrap();
+        drop(loader);
+        drop(writer);
+        drop(engine);
+        let reopened = SystemTableLoader::new(reopen_test_engine(dir.path()));
+        assert!(
+            !live_roles.iter().any(|r| r.name == role.name)
+                && !live_grants.iter().any(|g| g.role == role.name)
+                && !reopened.load_roles().unwrap().iter().any(|r| r.name == role.name)
+                && !reopened.load_role_permissions().unwrap().iter().any(|g| g.role == role.name),
+            "committed role deletion must dominate stored future role/grants in memory and after cold reopen; roles={live_roles:?}, grants={live_grants:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_regrant_dominates_row_tombstone_hidden_by_partition_delete() {
+        use ferrosa_schema::system::persistence::SystemTableMutation;
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let mut writer = SystemTableWriter::new(Arc::clone(&engine));
+        writer.set_permission_timestamp_for_test(1_000_000);
+        let grant = GrantEntry {
+            role: "hidden_tombstone_role".into(),
+            resource: Resource::Keyspace("ks".into()),
+            permissions: [Permission::Select].into_iter().collect(),
+        };
+        writer
+            .apply(SystemTableMutation::GrantUpdated(grant.clone()))
+            .unwrap();
+        let tid = TableId::new("system_auth", "role_permissions");
+        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            grant.role.as_bytes().to_vec(),
+        ));
+        // Legacy revocation followed by a backward-clock role deletion. Both
+        // are real persisted records, not clock mocks or synthetic read results.
+        engine
+            .write(
+                &tid,
+                &key,
+                Row {
+                    clustering: grant.resource.to_string().into_bytes(),
+                    cells: vec![],
+                    deletion: DeletionTime::new(8_000_000, 8),
+                    primary_key_liveness: LivenessInfo::NONE,
+                },
+                8_000_000,
+            )
+            .unwrap();
+        engine
+            .write(
+                &tid,
+                &key,
+                Row {
+                    clustering: vec![],
+                    cells: vec![],
+                    deletion: DeletionTime::new(3_000_000, 3),
+                    primary_key_liveness: LivenessInfo::NONE,
+                },
+                3_000_000,
+            )
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        engine.force_commit_log_sync().unwrap();
+        assert!(
+            engine
+                .read_clustering_row(&tid, &key, grant.resource.to_string().as_bytes())
+                .unwrap()
+                .is_none(),
+            "logical lookup hides the older PK even though its row tombstone is newer"
+        );
+        writer
+            .apply(SystemTableMutation::GrantUpdated(GrantEntry {
+                permissions: [Permission::Modify].into_iter().collect(),
+                ..grant.clone()
+            }))
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        engine.force_commit_log_sync().unwrap();
+        drop(writer);
+        drop(engine);
+        let grants = SystemTableLoader::new(reopen_test_engine(dir.path()))
+            .load_role_permissions()
+            .unwrap();
+        assert!(grants.iter().any(|g| g.role == grant.role
+            && g.permissions == [Permission::Modify].into_iter().collect()),
+            "later canonical regrant must dominate hidden stored row tombstone after reopen: {grants:?}");
+    }
+
+    #[tokio::test]
+    async fn canonical_role_drop_crosses_hidden_prefix_in_bounded_metadata_pages() {
+        use ferrosa_schema::system::persistence::SystemTableMutation;
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine_with_flush_threshold(dir.path(), 1 << 20);
+        engine.register_system_tables().unwrap();
+        let tid = TableId::new("system_auth", "role_permissions");
+        let role = "paged_role";
+        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            role.as_bytes().to_vec(),
+        ));
+        let mut writer = SystemTableWriter::new(Arc::clone(&engine));
+        for i in 0..65 {
+            writer.set_permission_timestamp_for_test(if i == 64 {
+                i64::MAX - 2048
+            } else {
+                1_000_000
+            });
+            writer
+                .apply(SystemTableMutation::GrantUpdated(GrantEntry {
+                    role: role.into(),
+                    resource: Resource::Keyspace(format!("ks{i:03}")),
+                    permissions: [Permission::Select].into_iter().collect(),
+                }))
+                .unwrap();
+        }
+        // Compare against the real persisted clock: legacy nanosecond-shaped
+        // inputs are normalized by StorageEngine before reaching the store.
+        let late_resource = Resource::Keyspace("ks064".into()).to_string();
+        let late = engine
+            .read_clustering_row(&tid, &key, late_resource.as_bytes())
+            .unwrap()
+            .unwrap();
+        let late_clock = late
+            .rows
+            .iter()
+            .flat_map(|row| row.cells.iter().map(|(_, cell)| cell.timestamp))
+            .max()
+            .unwrap();
+        assert!(
+            late_clock
+                > std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_micros() as i64
+        );
+        engine
+            .write(
+                &tid,
+                &key,
+                Row {
+                    clustering: vec![],
+                    cells: vec![],
+                    deletion: DeletionTime::new(3_000_000, 3),
+                    primary_key_liveness: LivenessInfo::NONE,
+                },
+                3_000_000,
+            )
+            .unwrap();
+        assert!(
+            engine
+                .read_limited_rows(&tid, &key, 32)
+                .unwrap()
+                .unwrap()
+                .rows
+                .is_empty(),
+            "ordinary logical page must still suppress the partition-deleted prefix"
+        );
+        let mut cursor = None;
+        let mut rows = 0;
+        let mut greatest = i64::MIN;
+        loop {
+            let page = engine
+                .read_projection_rows(&tid, &key, cursor.as_deref(), 32)
+                .unwrap()
+                .unwrap();
+            assert!(page.rows.len() <= 32);
+            assert_eq!(page.deletion.marked_for_delete_at, 3_000_000);
+            for row in &page.rows {
+                rows += 1;
+                for (_, cell) in &row.cells {
+                    greatest = greatest.max(cell.timestamp);
+                }
+            }
+            let Some(last) = page.rows.last() else { break };
+            cursor = Some(last.clustering.clone());
+        }
+        assert_eq!(rows, 65, "physical cursor must cross both hidden pages");
+        assert_eq!(greatest, late_clock, "late future grant must be inspected");
+        assert!(engine.read_projection_rows(&tid, &key, None, 0).is_err());
+        assert!(engine
+            .read_projection_rows(&TableId::new("missing", "missing"), &key, None, 0)
+            .is_err());
+        writer
+            .apply(SystemTableMutation::GrantUpdated(GrantEntry {
+                role: "unrelated_role".into(),
+                resource: Resource::Keyspace("safe".into()),
+                permissions: [Permission::Select].into_iter().collect(),
+            }))
+            .unwrap();
+        writer
+            .apply(SystemTableMutation::RoleDropped(role.into()))
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        engine.force_commit_log_sync().unwrap();
+        drop(writer);
+        drop(engine);
+        let grants = SystemTableLoader::new(reopen_test_engine(dir.path()))
+            .load_role_permissions()
+            .unwrap();
+        assert!(!grants.iter().any(|g| g.role == role));
+        assert!(grants.iter().any(|g| g.role == "unrelated_role"));
+    }
+
+    #[tokio::test]
     async fn canonical_regrant_survives_role_partition_tombstone() {
         use ferrosa_schema::system::persistence::SystemTableMutation;
         let dir = tempfile::tempdir().unwrap();
