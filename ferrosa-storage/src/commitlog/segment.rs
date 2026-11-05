@@ -370,8 +370,20 @@ impl SegmentBuffer {
     /// while this one lives, because the flusher forms it under `file_handle`
     /// after draining the append path.
     unsafe fn prefix(&self, end: usize) -> &[u8] {
-        debug_assert!(end <= self.written(), "prefix past the published bytes");
-        debug_assert!(end <= self.allocated(), "prefix past the allocation");
+        // `assert!`, not `debug_assert!`: the safety argument below is that `end`
+        // is inside the allocation, so the bound must hold in release builds
+        // too. It costs one load per flush and it is what turns "the caller
+        // promises" into a checked precondition.
+        assert!(
+            end <= self.allocated(),
+            "prefix {end} past the {}-byte allocation",
+            self.allocated()
+        );
+        assert!(
+            end <= self.written(),
+            "prefix {end} past the {} published bytes",
+            self.written()
+        );
         // SAFETY: `end` is inside the allocation because the assertions above
         // bound it, and no mutable view overlaps the prefix because the caller
         // holds the lock that excludes the marker patch and the append path.
@@ -387,11 +399,14 @@ impl SegmentBuffer {
     /// `file_handle` — the lock a flusher takes before it forms its view — and
     /// the segment has been rotated out of the active slot.
     unsafe fn release(&self) {
-        // SAFETY: exclusive by the caller's precondition. Replacing the `Vec`
-        // drops the old allocation, which is exactly why `len` goes to zero
-        // immediately after.
-        unsafe { *self.storage.get() = Vec::new() };
+        // Zero the length FIRST, then free. The other order leaves a window in
+        // which `allocated()` still reports the old size while `base` is already
+        // dangling, so a concurrent `range_mut` would pass its guard and write
+        // into freed memory. With this order the guard fails closed.
         self.len.store(0, Ordering::Release);
+        // SAFETY: exclusive by the caller's precondition. Replacing the `Vec`
+        // drops the old allocation.
+        unsafe { *self.storage.get() = Vec::new() };
     }
 }
 
