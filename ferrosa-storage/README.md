@@ -1871,3 +1871,11 @@ an error; a later retry can confirm completion after the existing writers leave.
 Rows already held in the memtable remain readable. This does not flush those rows,
 drain readers or compaction, or authorize replacing physical files. Recovery callers
 must establish those separate boundaries before issuing an installed-content receipt.
+
+### Unregister failure phases
+
+`unregister_table_classified` distinguishes failed directory cleanup from failures
+creating durable drop/sweep intents or retiring the writer. Only the cleanup
+phase follows checked writer retirement and registry removal. The legacy
+`unregister_table` surface still returns the original error. This phase result
+does not certify reader drain, physical checkpoint adoption or recovery admission.

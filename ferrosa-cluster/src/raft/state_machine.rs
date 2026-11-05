@@ -52,7 +52,7 @@ use crate::ring::TokenRing;
 /// A failed committed local Schema or Engine effect during `apply_command`.
 ///
 /// These errors propagate through the retained worker as a storage failure —
-/// except [`Self::EngineUnregisterTable`], which is a refusal of the DROP
+/// except [`Self::EngineDropCleanupRefused`], which is a refusal of the DROP
 /// itself and is returned to the caller as a `RaftResponse::Error` without
 /// latching the machine (see the response decision at the end of
 /// `apply_command`).
@@ -77,8 +77,37 @@ pub enum ApplyError {
         table: String,
         reason: String,
     },
+    /// Registry retirement and durable intents succeeded; only directory cleanup refused.
+    EngineDropCleanupRefused {
+        keyspace: String,
+        table: String,
+        reason: String,
+    },
     /// Catch-all for sites not yet migrated to a typed variant.
     Other(String),
+}
+
+impl ApplyError {
+    fn unregister(
+        keyspace: String,
+        table: String,
+        error: ferrosa_storage::engine::TableUnregistrationFailure,
+    ) -> Self {
+        let reason = error.to_string();
+        if error.is_cleanup_refusal() {
+            Self::EngineDropCleanupRefused {
+                keyspace,
+                table,
+                reason,
+            }
+        } else {
+            Self::EngineUnregisterTable {
+                keyspace,
+                table,
+                reason,
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for ApplyError {
@@ -93,6 +122,11 @@ impl std::fmt::Display for ApplyError {
                 "engine.register_table({keyspace}.{table}) failed: {reason}"
             ),
             Self::EngineUnregisterTable {
+                keyspace,
+                table,
+                reason,
+            }
+            | Self::EngineDropCleanupRefused {
                 keyspace,
                 table,
                 reason,
@@ -1600,13 +1634,9 @@ impl FerrosStateMachine {
                 if let Some(engine) = &self.engine {
                     for (ks, tbl) in dropped_tables {
                         let tid = TableId::new(&ks, &tbl);
-                        if let Err(e) = engine.unregister_table(&tid) {
+                        if let Err(e) = engine.unregister_table_classified(&tid) {
                             tracing::error!(%e, "Raft apply: unregister_table failed");
-                            apply_errors.push(ApplyError::EngineUnregisterTable {
-                                keyspace: ks,
-                                table: tbl,
-                                reason: e.to_string(),
-                            });
+                            apply_errors.push(ApplyError::unregister(ks, tbl, e));
                         }
                     }
                 }
@@ -1723,13 +1753,13 @@ impl FerrosStateMachine {
                 }
                 if let Some(engine) = &self.engine {
                     let tid = TableId::new(&keyspace, &table);
-                    if let Err(e) = engine.unregister_table(&tid) {
+                    if let Err(e) = engine.unregister_table_classified(&tid) {
                         tracing::error!(%e, "Raft apply: unregister_table failed — stale table data may remain");
-                        apply_errors.push(ApplyError::EngineUnregisterTable {
-                            keyspace: keyspace.clone(),
-                            table: table.clone(),
-                            reason: e.to_string(),
-                        });
+                        apply_errors.push(ApplyError::unregister(
+                            keyspace.clone(),
+                            table.clone(),
+                            e,
+                        ));
                     }
                 }
                 if self.system_writer.is_some() {
@@ -2489,7 +2519,7 @@ impl FerrosStateMachine {
         // `RaftResponse::Error` instead: the DROP still never reports success.
         let (refusals, fatal): (Vec<ApplyError>, Vec<ApplyError>) = apply_errors
             .into_iter()
-            .partition(|error| matches!(error, ApplyError::EngineUnregisterTable { .. }));
+            .partition(|error| matches!(error, ApplyError::EngineDropCleanupRefused { .. }));
         if !fatal.is_empty() {
             let summary = fatal
                 .iter()
@@ -9083,6 +9113,79 @@ mod tests {
         assert!(engine
             .table_schema(&TableId::new("schema_failure", "later"))
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn drop_intent_write_failure_is_not_a_safe_statement_refusal() {
+        use ferrosa_common::{DecoratedKey, PartitionKey};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let mut sm = FerrosStateMachine::with_side_effects(schema, engine.clone());
+        sm.apply(vec![
+            make_entry(
+                1,
+                1,
+                RaftOp::CreateKeyspace(simple_keyspace("intent_fault")),
+            ),
+            make_entry(
+                1,
+                2,
+                RaftOp::CreateTable(Box::new(simple_table("intent_fault", "victim"))),
+            ),
+        ])
+        .await
+        .unwrap();
+        let table = TableId::new("intent_fault", "victim");
+        let key = DecoratedKey::new(PartitionKey::new(b"acknowledged".to_vec()));
+        engine
+            .write(
+                &table,
+                &key,
+                ferrosa_sstable::types::Row {
+                    clustering: vec![],
+                    cells: vec![],
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
+                },
+                1,
+            )
+            .unwrap();
+        engine.flush(&table).unwrap();
+        assert!(
+            engine.read(&table, &key).unwrap().is_some(),
+            "real ACKed row positive control"
+        );
+        // A directory at the exact ledger filename deterministically refuses
+        // the durable intent before engine retirement, regardless of test UID.
+        let ledger = dir
+            .path()
+            .join(ferrosa_storage::table_drops::DROPPED_TABLES_FILE);
+        assert!(!ledger.exists());
+        std::fs::create_dir(&ledger).unwrap();
+        let result = sm
+            .apply(vec![make_entry(
+                1,
+                3,
+                RaftOp::DropTable {
+                    keyspace: "intent_fault".into(),
+                    table: "victim".into(),
+                },
+            )])
+            .await;
+        assert!(
+            engine.table_schema(&table).is_some(),
+            "failed intent never retired physical table"
+        );
+        assert!(
+            engine.read(&table, &key).unwrap().is_some(),
+            "physical row remains visible without a successful retirement"
+        );
+        assert!(result.is_err(), "failure before durable intent/retirement is a hard apply fault, not a committed statement refusal: {result:?}");
+        assert_eq!(sm.last_applied.unwrap().index, 2);
+        assert!(sm.applied_state().await.is_err());
+        assert!(sm.build_snapshot().await.is_err());
     }
 
     #[tokio::test]

@@ -44,9 +44,10 @@ schema effects and system-table writes. A retained handle fences later trait
 calls across cancellation; completed state and applied indexes publish in order.
 Committed local Schema/Engine effect failures and projection failures propagate
 through that job and prevent publishing its metadata/index. Ordinary command
-rejection remains non-fatal — including a DROP whose physical removal the node
-refuses (`unregister_table`), which is committed metadata plus a refused
-statement, not a log this node could not apply. The process-local failure latch
+rejection remains non-fatal. For DROP, only directory cleanup after durable
+intents and checked writer/registry retirement is a typed statement refusal.
+Pre-retirement intent or persistence failures remain hard faults; the original
+physical table can still be live, so its index must not advance. The process-local failure latch
 prevents later snapshots or successful apply results. A failed persisted restore
 retains the previous Raft metadata and refuses consensus startup/readiness,
 preserving its files rather than adopting a purge point on a failed restore.
