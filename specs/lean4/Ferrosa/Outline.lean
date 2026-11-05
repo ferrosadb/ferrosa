@@ -87,7 +87,8 @@ def parts : List Part := [
     "Ferrosa.Raft.Surfaces",
     "Ferrosa.Raft.Startup",
     "Ferrosa.Raft.Partial",
-    "Ferrosa.Raft.Obligations"
+    "Ferrosa.Raft.Obligations",
+    "Ferrosa.SystemTables.Projection"
   ]⟩,
 
   ⟨"III", "What leaves the cluster",
@@ -167,7 +168,7 @@ theorem every_ledger_is_placed :
 
 /-- The book covers a fixed number of modules. A module added to the corpus without a home here is
     a build failure rather than a silent omission from the document. -/
-theorem placed_module_count : (parts.map (fun p => p.modules.length)).sum = 66 := by decide
+theorem placed_module_count : (parts.map (fun p => p.modules.length)).sum = 67 := by decide
 
 /-- Part numerals are distinct, so `\ref` cannot collide. -/
 theorem part_numerals_distinct : (parts.map (fun p => p.numeral)).Nodup := by decide

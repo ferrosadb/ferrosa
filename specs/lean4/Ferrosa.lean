@@ -56,6 +56,7 @@ import Ferrosa.Raft.Surfaces
 import Ferrosa.Raft.Startup
 import Ferrosa.Raft.Partial
 import Ferrosa.Raft.Obligations
+import Ferrosa.SystemTables.Projection
 import Ferrosa.Sql.Consistency
 import Ferrosa.Cdc.Subscribe
 import Ferrosa.Cql.Subscribe

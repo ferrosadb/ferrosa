@@ -39,6 +39,7 @@ import Ferrosa.Storage.Mvcc
 import Ferrosa.Storage.Streaming
 import Ferrosa.Sql.Consistency
 import Ferrosa.Raft.Obligations
+import Ferrosa.SystemTables.Projection
 
 namespace Ferrosa.Unimplemented
 
@@ -98,7 +99,8 @@ def areas : List Area := [
   ⟨"Ferrosa.Testing.Histories", Ferrosa.Testing.Histories.ledger, Ferrosa.Testing.Histories.main⟩,
   ⟨"Ferrosa.Testing.Guarantees", Ferrosa.Testing.Guarantees.ledger, Ferrosa.Testing.Guarantees.main⟩,
   ⟨"Ferrosa.Unsafe.Invariants", Ferrosa.Unsafe.ledger, Ferrosa.Unsafe.main⟩,
-  ⟨"Ferrosa.Raft.Obligations", Ferrosa.Raft.ledger, Ferrosa.Raft.main⟩
+  ⟨"Ferrosa.Raft.Obligations", Ferrosa.Raft.ledger, Ferrosa.Raft.main⟩,
+  ⟨"Ferrosa.SystemTables.Projection", Ferrosa.SystemTables.ledger, Ferrosa.SystemTables.main⟩
 ]
 
 /-- Look up an area ledger by module key. -/
@@ -130,7 +132,7 @@ theorem area_keys_are_distinct : (areas.map (·.key)).Nodup := by decide
 
 /-- Pinned so that dropping a ledger with no reds — which the total cannot see — is still a build
     failure rather than a quietly smaller registry. -/
-theorem registered_ledger_count : areas.length = 22 := by decide
+theorem registered_ledger_count : areas.length = 23 := by decide
 
 /-! ## The total, derived
 
@@ -147,10 +149,10 @@ theorem ledgerTotal_is_the_registry_sum :
     ledgerTotal = (areas.map fun a => redCount a.ledger).sum := rfl
 
 /-- Pinned so that removing a ledger from the registry — the drift that has recurred here — is a
-    build failure rather than a silently smaller total. Seventy: the raft surface audit added three
-    reds without adding an area, the startup and replay audit added three, partial application two,
-    the grant projection one, and `6c270518` closed one. -/
-theorem ledgerTotal_pinned : ledgerTotal = 70 := by decide
+    build failure rather than a silently smaller total. Seventy-seven: the raft surface audit added
+    three reds without adding an area, the startup and replay audit added three, partial application
+    two, the grant projection one, `6c270518` closed one, and the projection layer added seven. -/
+theorem ledgerTotal_pinned : ledgerTotal = 77 := by decide
 
 /-- Print every registered ledger, with the header its area module prints. -/
 def printAllLedgers : IO Unit := do
@@ -376,7 +378,7 @@ theorem every_red_is_classified_exactly_once (a : Area) (ha : a ∈ areas) :
     (a.ledger.filter isRed).all (fun i => rows.count (a.key, i.name) == 1) = true := by
   obtain ⟨k, l, p⟩ := a
   simp only [areas, List.mem_cons, List.not_mem_nil, or_false] at ha
-  rcases ha with ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩
+  rcases ha with ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩
   all_goals decide
 
 /-- **(c)** Each area's rows number exactly that area's reds. -/
@@ -384,7 +386,7 @@ theorem per_area_counts (a : Area) (ha : a ∈ areas) :
     (rows.filter fun r => r.1 == a.key).length = redCount a.ledger := by
   obtain ⟨k, l, p⟩ := a
   simp only [areas, List.mem_cons, List.not_mem_nil, or_false] at ha
-  rcases ha with ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩
+  rcases ha with ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩
   all_goals decide
 
 /-- The pairs the discharged rows name: not part of the classification, but still checked. -/
@@ -427,11 +429,12 @@ theorem unimplemented_has_the_right_length : unimplemented.length = 38 := by nat
     requirement the staged apply does not meet. -/
 theorem eight_are_not_defects : nonDefects.length = 8 := by native_decide
 
-/-- **Live defects now outnumber everything else.**  Nineteen reds against eight requirements,
+/-- **Live defects now outnumber everything else.**  Thirty-one reds against eight requirements,
     proofs, measurements, inherited protocol behaviour and closures. This theorem had the opposite
     direction until the memory specs found three more: the closer the specs get to the code, the
     more of it turns out to be shipping something that is not true. The raft surface audit added
-    three, all of them a durable effect that did not happen while publication advanced. -/
+    three, all of them a durable effect that did not happen while publication advanced, and the
+    system-table projection layer added seven. -/
 theorem live_defects_outnumber_the_rest : nonDefects.length < Ferrosa.Broken.broken.length := by
   native_decide
 

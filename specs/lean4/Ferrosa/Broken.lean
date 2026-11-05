@@ -6,10 +6,10 @@
   a different category from a feature that was never written — an unimplemented item can be scheduled
   against a milestone, a broken one is already lying to someone. Each row names a witness theorem in
   its area's ledger, so the claim is not a mood. The damage concentrates on the surfaces a client
-  trusts: five of the nineteen are SQL or SPARQL, the two places where a confidently wrong answer is
+  trusts: five of the thirty-one are SQL or SPARQL, the two places where a confidently wrong answer is
   most likely to be acted on.
 
-  **A row's `site` is either a Rust location or the word `unverified:`.** Fourteen rows point at code
+  **A row's `site` is either a Rust location or the word `unverified:`.** Twenty-one rows point at code
   that was read at this revision. Five were checked on 2026-10-31 and describe a hazard that exists
   in the Lean model but **not in the shipping implementation**: the code does the correct thing and
   has tests pinning it. Those rows say so in place, because a row claiming a site that does not
@@ -136,20 +136,56 @@ def broken : List Item := [
   ⟨"Raft", "a failed local side effect is repaired without a restart",
    "When registering a table with the local storage engine fails during an apply, the cluster keeps the table and only that node cannot serve it, and nothing retries until it restarts. A client that retries sees a table that exists everywhere except there.",
    "ferrosa-cluster/src/raft/state_machine.rs:1412 inserts the table into state and :1436-1443 pushes ApplyError::EngineRegisterTable when register_table fails, and :2142-2155 folds the collected errors into RaftResponse::Error, a value nothing replays, while the staged state publishes at :466-467; the registration at :1435-1444 is unconditional and so re-runs on replay, but a replay needs a restart or an install (install_snapshot at :2382), and the design is pinned in place by apply_command_propagates_engine_register_failure (:5148, 'committed failed intent remains for replay')",
-   "Ferrosa.Raft.Obligations", "a failed local side effect is repaired without a restart"⟩
+   "Ferrosa.Raft.Obligations", "a failed local side effect is repaired without a restart"⟩,
+  ⟨"Projection", "a persisted cell converges to the in-memory post-state",
+   "Two permission changes can land in the same microsecond. The stored row is then ordered by which value sorts higher rather than by which change came second, so a restart can read back a permission set the cluster already replaced.",
+   "grant_to_row stamps rows with now_micros() (ferrosa-schema/src/system/persistence.rs:417-432) and PermissionRevoked does the same (ferrosa-cluster/src/system_table_writer.rs:164-181); cell_supersedes keeps the higher timestamp and, on a tie, the lexicographically greater payload (ferrosa-storage/src/merge.rs:137-190), so two live writes to one cell in one microsecond resolve to whichever payload sorts higher, not to the later write; load_role_permissions reads it back at boot (ferrosa-cluster/src/system_table_loader.rs:320-371)",
+   "Ferrosa.SystemTables.Projection",
+   "a cell's persisted row converges to its in-memory value under the code's merge rule"⟩,
+  ⟨"Projection", "the projection orders two writes by the log, not by the wall clock",
+   "Stored rows are ordered by the machine's wall clock rather than by the order the cluster applied them. If the clock steps backwards, a restart restores the value a later change had already superseded.",
+   "no row carries a sequence, generation or log index; the only version is the cell timestamp set by now_micros() at projection time (ferrosa-schema/src/system/persistence.rs:417-432), so a later apply whose SystemTime is smaller than the write it supersedes loses under cell_supersedes (ferrosa-storage/src/merge.rs:177-183)",
+   "Ferrosa.SystemTables.Projection",
+   "a timestamp with a per-cell sequence converges for every clock"⟩,
+  ⟨"Projection", "a later write wins an equal timestamp",
+   "When two writes carry the same timestamp the stored row keeps the larger value rather than the later one. Removing a permission makes the value smaller, so the removal can lose to the set it shortened.",
+   "cell_supersedes compares (timestamp, has_value, value_bytes, local_deletion_time) (ferrosa-storage/src/merge.rs:177-190); with the timestamp equal the payload decides, so the lexicographically smaller later row loses. The apply arms emit one mutation per cell (ferrosa-cluster/src/raft/state_machine.rs:1883-1947) but two applies can share a microsecond",
+   "Ferrosa.SystemTables.Projection",
+   "two writes to one cell with equal timestamps: the later one wins"⟩,
+  ⟨"Projection", "a revoked permission is not resurrected by a restart",
+   "A permission removed by a later change can be present again after a restart. The earlier row carried the larger set and the tie went to it, so a role has access the cluster removed.",
+   "the later revoke writes the remaining set and the earlier grant wrote the larger set; at an equal timestamp cell_supersedes keeps the greater payload (ferrosa-storage/src/merge.rs:177-190), which is the earlier one, and load_role_permissions replays it on the next boot (ferrosa-cluster/src/system_table_loader.rs:320-371)",
+   "Ferrosa.SystemTables.Projection",
+   "a revoked permission is not resurrected by an equal-timestamp write"⟩,
+  ⟨"Projection", "a cell re-granted after a full revoke is visible again",
+   "Removing the last permission on a resource writes a deletion marker that a later grant never clears. Until compaction purges it, a restart reads the resource as having no permissions at all.",
+   "PermissionRevoked writes a row-level deletion (ferrosa-cluster/src/system_table_writer.rs:164-181); load_role_permissions skips any row whose merged deletion is not live (ferrosa-cluster/src/system_table_loader.rs:333-335); merge_rows_into keeps the maximum deletion and merge_into_existing_row only raises it (ferrosa-storage/src/merge.rs:137-143, ferrosa-storage/src/memtable/sharded.rs:549), so a later grant never clears the marker until compaction purges it after gc_grace (ferrosa-storage/src/compaction/purge.rs:119-153); ferrosa-cluster/src/ddl_path.rs:444-467 writes the same tombstone for a partial revoke in direct mode",
+   "Ferrosa.SystemTables.Projection",
+   "a cell re-granted after a full revoke is visible again"⟩,
+  ⟨"Projection", "convergence does not rest on a caller convention",
+   "The stored rows have no sequence of their own, so correctness rests on the caller writing each cell once per apply and on the clock moving forward. A new mutation that writes a cell twice breaks that with nothing detecting it.",
+   "the apply arms happen to emit one mutation per cell (ferrosa-cluster/src/raft/state_machine.rs:1883-1947) but system_table_writer.rs holds no per-cell guard or version, and a REVOKE emits one Raft operation per permission (ferrosa-cql/src/router.rs:14123-14167), so one statement writes the same cell in consecutive applies",
+   "Ferrosa.SystemTables.Projection",
+   "convergence does not rest on a caller convention"⟩,
+  ⟨"Projection", "the write path and the read path resolve a tie the same way",
+   "The in-memory and on-disk merge paths choose opposite winners when timestamps are equal. What a restart reads can depend on whether the row had already been flushed.",
+   "reconcile_ref gives an equal-timestamp tie to the tombstone (ferrosa-common/src/complex_cell.rs:63-77, called from ferrosa-storage/src/memtable/sharded.rs:556-585) while cell_supersedes gives it to the live value (ferrosa-storage/src/merge.rs:177-190); the same pair of versions resolves to opposite winners in the memtable and on the read/compaction merge",
+   "Ferrosa.SystemTables.Projection",
+   "the write path and the read path agree on an equal-timestamp tie"⟩
 ]
 
-/-- Twenty-four built-and-wrong items, pinned so a defect cannot be dropped from the list without the
+/-- Thirty-one built-and-wrong items, pinned so a defect cannot be dropped from the list without the
 corpus classification breaking. The sysfail row left for `Unimplemented.discharged` when `6c270518`
-closed it; six rows joined when startup, replay and the grant projection were audited. -/
-theorem broken_has_twenty_four_items : broken.length = 24 := by native_decide
+closed it; six rows joined when startup, replay and the grant projection were audited, and seven when
+the system-table projection layer was modelled. -/
+theorem broken_has_thirty_one_items : broken.length = 31 := by native_decide
 
-/-- The surfaces are where the damage concentrates: five of the twenty-four are SQL or SPARQL, which
+/-- The surfaces are where the damage concentrates: five of the thirty-one are SQL or SPARQL, which
     are the two places where a client is most likely to be told something confidently wrong. -/
 theorem the_surfaces_carry_five : (broken.filter fun i => i.area == "SQL").length
     + (broken.filter fun i => i.area == "SPARQL").length = 5 := by native_decide
 
-/-- Five of the twenty-four could not be anchored to the shipping code: four describe an
+/-- Five of the thirty-one could not be anchored to the shipping code: four describe an
     implementation that does the correct thing at this revision (with tests pinning it) and one is
     stale because the fix it says is unmerged has been merged since. Counted, so a later edit cannot
     quietly turn a model-only hazard back into an assertion about code. -/
@@ -158,8 +194,8 @@ theorem five_rows_have_no_verified_site :
 
 /-- The remainder — the rows that name a real location — are what the list's opening claim is about:
     code that was read, not inferred. -/
-theorem nineteen_rows_name_a_site :
-    (broken.filter fun i => !i.site.startsWith "unverified:").length = 19 := by native_decide
+theorem twenty_six_rows_name_a_site :
+    (broken.filter fun i => !i.site.startsWith "unverified:").length = 26 := by native_decide
 
 /-- What a reader of the specification is shown for a row: the sentence that says what is wrong. -/
 def readerText (i : Item) : String := i.plain
