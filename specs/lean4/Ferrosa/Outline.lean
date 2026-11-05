@@ -109,13 +109,18 @@ def parts : List Part := [
    "target, applied to the memtable, acknowledged, and only then flushed to an SSTable. Each arrow " ++
    "in that sentence is a constructor of `Step` in `WritePath`, which is why the trace can be " ++
    "checked rather than described. The storage modules then take the path apart: the cell format, " ++
-   "the visibility rule, what survives a crash, and what a delete leaves behind.", [
+   "the visibility rule, what survives a crash, and what a delete leaves behind. The three last " ++
+   "modules turn the same questions on the memory a path needs: what a read may hold, what a " ++
+   "transform may rewrite, and which sites in the tree meet either rule.", [
     "Ferrosa.WritePath",
     "Ferrosa.Storage.Format",
     "Ferrosa.Storage.Mvcc",
     "Ferrosa.Storage.Recovery",
     "Ferrosa.Storage.Tombstone",
-    "Ferrosa.Storage.Streaming"
+    "Ferrosa.Storage.Streaming",
+    "Ferrosa.Streaming.Machine",
+    "Ferrosa.Streaming.Obligations",
+    "Ferrosa.Streaming.Audit"
   ]⟩,
 
   ⟨"V", "Foundations",
@@ -168,7 +173,7 @@ theorem every_ledger_is_placed :
 
 /-- The book covers a fixed number of modules. A module added to the corpus without a home here is
     a build failure rather than a silent omission from the document. -/
-theorem placed_module_count : (parts.map (fun p => p.modules.length)).sum = 67 := by decide
+theorem placed_module_count : (parts.map (fun p => p.modules.length)).sum = 70 := by decide
 
 /-- Part numerals are distinct, so `\ref` cannot collide. -/
 theorem part_numerals_distinct : (parts.map (fun p => p.numeral)).Nodup := by decide

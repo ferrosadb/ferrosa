@@ -47,7 +47,7 @@ fn every_red_names_its_reason_and_witness() {
 fn red_count_is_pinned() {
     assert_eq!(
         REDS.len(),
-        83,
+        97,
         "the number of reds changed; update this pin and say why"
     );
 }

@@ -22,6 +22,7 @@ import Ferrosa.Sql.Index
 import Ferrosa.Sql.Txn
 import Ferrosa.Storage.Mvcc
 import Ferrosa.Storage.Streaming
+import Ferrosa.Streaming.Audit
 import Ferrosa.Sql.Consistency
 import Ferrosa.Cdc.Subscribe
 import Ferrosa.Cql.Subscribe

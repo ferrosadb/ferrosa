@@ -195,14 +195,51 @@ def broken : List Item := [
    "The in-memory and on-disk merge paths choose opposite winners when timestamps are equal. What a restart reads can depend on whether the row had already been flushed.",
    "reconcile_ref gives an equal-timestamp tie to the tombstone (ferrosa-common/src/complex_cell.rs:63-77, called from ferrosa-storage/src/memtable/sharded.rs:556-585) while cell_supersedes gives it to the live value (ferrosa-storage/src/merge.rs:177-190); the same pair of versions resolves to opposite winners in the memtable and on the read/compaction merge",
    "Ferrosa.SystemTables.Projection",
-   "the write path and the read path agree on an equal-timestamp tie"⟩
+   "the write path and the read path agree on an equal-timestamp tie"⟩,
+  ⟨"Streaming", "no durable artifact changes under a reader",
+   "The commit log rewrites eight bytes of a segment that is already on disk. A reader tailing that segment can see the same position change from end-of-log to a pointer at the next section, and a replay that read the old value stops early.",
+   "repair_marker_in_place pwrites the previous sync marker with write_all_at (ferrosa-storage/src/commitlog/segment.rs:226-247) whenever the marker sits below the flush watermark, reached at :898 and :931; marker_patch_to_rewrite (:672-684) is the predicate that selects an already-durable range",
+   "Ferrosa.Streaming.Audit", "no durable artifact changes under a reader"⟩,
+  ⟨"Streaming", "an operator that spills does not re-collect its result",
+   "A graph ORDER BY sorts through a disk-backed spill and then loads every sorted row back into one vector. Peak memory is the result set, so a ten-row answer still holds every candidate row.",
+   "SpillSortSink::finish_rows allocates Vec::with_capacity(rows_pushed) and drains the merged stream into it (ferrosa-graph/src/executor/spill.rs:235-250), while the streaming alternative finish_stream (:268) is what Bolt, leapfrog and expand use",
+   "Ferrosa.Streaming.Audit", "an operator that spills does not re-collect its result"⟩,
+  ⟨"Streaming", "a spilling sort's input is not already a vector of every row",
+   "Variable-length path expansion collects one row for every path before it sorts anything. The spill bounds the sort's own buffer and leaves the input list untouched, so the query still holds every path it found.",
+   "rows.push(row) per expanded path at ferrosa-graph/src/executor/varpath.rs:437, then spill_order_by at :445 drains that vector into the sink; when the sink declines, sort_rows at :450 sorts the same vector in memory",
+   "Ferrosa.Streaming.Audit", "a spilling sort's input is not already a vector of every row"⟩,
+  ⟨"Streaming", "a system-table load does not hold the whole table",
+   "The boot loader reads system tables one partition at a time and keeps them all. A cluster with a large role or grant table needs memory proportional to that table before it can serve a query.",
+   "SystemTableLoader::walk_all_partitions streams the merged view (ferrosa-cluster/src/system_table_loader.rs:78-85), but load_roles pushes every partition (:172) and load_role_permissions pushes every grant (:370); the capped read this replaced was removed because it dropped the tail",
+   "Ferrosa.Streaming.Audit", "a system-table load does not hold the whole table"⟩,
+  ⟨"Streaming", "a snapshot restore does not read the whole artifact into memory",
+   "Restoring the saved snapshot reads the whole file and then decodes a second copy of it. A node with a large catalog needs both in memory before it can apply either.",
+   "recover_from_persisted_snapshot does std::fs::read(&path) and bincode::deserialize (ferrosa-cluster/src/raft/state_machine.rs:1376-1379) before apply_snapshot_data_from, with no streaming decode or chunked apply",
+   "Ferrosa.Streaming.Audit", "a snapshot restore does not read the whole artifact into memory"⟩,
+  ⟨"Streaming", "a snapshot build does not copy its payload once per publisher",
+   "Building a snapshot copies the cluster state, encodes it, and then copies the encoded bytes again for the publish slot and again for the disk write. Three copies of the same state are live at once.",
+   "build_snapshot clones state (ferrosa-cluster/src/raft/state_machine.rs:2531-2534), encodes it at :2546, then calls publish_snapshot with bytes.clone() at :2567 and clones again for the blocking disk job at :2571",
+   "Ferrosa.Streaming.Audit", "a snapshot build does not copy its payload once per publisher"⟩,
+  ⟨"Streaming", "the spill threshold is the process bound, not each operator's share of it",
+   "Each query sizes its spill threshold at half the process memory budget. Two such queries hold the whole budget and a third has nothing left, so a bound that looks like half is really twice the budget.",
+   "SpillCtx::default() is constructed per call (ferrosa-sql/src/plan.rs:255, ferrosa-postgres/src/result_stream.rs:211) at process_spill_threshold_bytes, which is half the detected budget (ferrosa-storage/src/spill_budget.rs:211-238) with no divisor for concurrency",
+   "Ferrosa.Streaming.Audit", "the spill threshold is the process bound, not each operator's share of it"⟩,
+  ⟨"Streaming", "an ORDER BY that cannot spill refuses instead of sorting in memory",
+   "An ORDER BY whose sort term is not a projected column silently sorts in memory instead of refusing. The query answers correctly and holds every row, and nothing reports that the spill was skipped.",
+   "SpillSortSink::try_new returns None when a term is not a projected column (ferrosa-graph/src/executor/spill.rs:197-207) and spill_order_by returns false (:305-312), after which varpath sorts the accumulated vector in memory (ferrosa-graph/src/executor/varpath.rs:450)",
+   "Ferrosa.Streaming.Audit", "an ORDER BY that cannot spill refuses instead of sorting in memory"⟩,
+  ⟨"Streaming", "blocking work is queued against a capacity",
+   "A snapshot's bytes are handed to a blocking pool whose queue has no limit. If the pool is busy the payload waits in that queue, holding its memory, and nothing bounds how many wait.",
+   "TaskPool::spawn_blocking forwards to tokio's blocking pool (ferrosa-common/src/task_pool.rs:60-68), whose queue is unbounded, and the closure owns a full snapshot byte vector cloned at ferrosa-cluster/src/raft/state_machine.rs:2571",
+   "Ferrosa.Streaming.Audit", "blocking work is queued against a capacity"⟩
 ]
 
-/-- Thirty-seven built-and-wrong items, pinned so a defect cannot be dropped from the list without the
+/-- Forty-six built-and-wrong items, pinned so a defect cannot be dropped from the list without the
 corpus classification breaking. The sysfail row left for `Unimplemented.discharged` when `6c270518`
-closed it; six rows joined when startup, replay and the grant projection were audited, and seven when
-the system-table projection layer was modelled. -/
-theorem broken_has_thirty_seven_items : broken.length = 37 := by native_decide
+closed it; six rows joined when startup, replay and the grant projection were audited, seven when
+the system-table projection layer was modelled, and nine when the memory-discipline machine was audited
+against the read and transform paths. -/
+theorem broken_has_forty_six_items : broken.length = 46 := by native_decide
 
 /-- The surfaces are where the damage concentrates: five of the thirty-one are SQL or SPARQL, which
     are the two places where a client is most likely to be told something confidently wrong. -/
@@ -218,8 +255,8 @@ theorem five_rows_have_no_verified_site :
 
 /-- The remainder - the rows that name a real location — are what the list's opening claim is about:
     code that was read, not inferred. -/
-theorem thirty_two_rows_name_a_site :
-    (broken.filter fun i => !i.site.startsWith "unverified:").length = 32 := by native_decide
+theorem forty_one_rows_name_a_site :
+    (broken.filter fun i => !i.site.startsWith "unverified:").length = 41 := by native_decide
 
 /-- What a reader of the specification is shown for a row: the sentence that says what is wrong. -/
 def readerText (i : Item) : String := i.plain

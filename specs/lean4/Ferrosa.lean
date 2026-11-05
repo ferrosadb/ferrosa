@@ -51,6 +51,9 @@ import Ferrosa.Sql.Index
 import Ferrosa.Sql.Txn
 import Ferrosa.Storage.Mvcc
 import Ferrosa.Storage.Streaming
+import Ferrosa.Streaming.Machine
+import Ferrosa.Streaming.Obligations
+import Ferrosa.Streaming.Audit
 import Ferrosa.Raft.StateMachine
 import Ferrosa.Raft.Surfaces
 import Ferrosa.Raft.Startup
