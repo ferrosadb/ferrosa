@@ -37,6 +37,65 @@ A row's status is `ok` or `stale:<reason>`. `stale` means the extraction cannot 
 the installed toolchain, and the reason names what blocks it. The check reports it every run rather
 than passing silently, because a generated file nobody can reproduce is a claim resting on nothing.
 
+## What the scope buys, measured (and what generated code costs)
+
+Extraction has a scope, and it is a file: `scope.toml`. Three kinds of entry, each with a reason, an
+owner and a date — every ferrosa crate (30 of them), four dependencies named as *critical*, one
+blanket exclusion for everything else, and `[[item]]` entries for anything left out inside an
+included crate.
+
+The decision behind it is that this package reasons about ferrosa's code, not about its dependency
+tree. A blanket "everything else" is safe only because it is written down and machine-checked:
+`scope-check.py` fails when a workspace crate has no entry (`UNSCOPED`), when an entry has no
+reason/owner/date, when a second blanket exclusion appears, and when an item is left out that no
+entry explains (`SILENT`). It reads the emitted Lean, not a flag somebody passed: charon's `--opaque`
+makes aeneas emit the item as `def … := sorry` with its charon name pattern in an
+`@[rust_fun "…"]` attribute, so "what was assumed" is greppable in a committed file.
+
+Where the translator drops the declaration instead of carrying it (it does that for an opaque
+trait-impl method nothing reachable calls), `scope.lock` carries the row. That ledger is written by
+`extract.sh` through `scope-check.py record` from charon's llbc and the emitted Lean — never by hand
+— and `check` refuses a row no scope entry explains, a row for a module with no generated file, two
+rows for one entry, and a row that claims `in-lean` when the module has no such declaration. The
+ledger exists because neither tool can be told "declare this and stop"; if it could, the entry would
+be visible in the Lean and the row would say `in-lean`.
+
+Measured 2026-11-04, `ferrosa-view` — the cheapest crate the ceiling blocks, 988 lines. Its
+`#[derive(Deserialize)]` on `ViewMetadata` generates a visitor whose `visit_map` reaches **8,192
+exits** (`widest=(w=8192, arms=[8191,1]) at metadata.rs 76:49-76:60`); the blocked run sat in that
+one function for 13 minutes at 2.2 GiB and had not finished its first function at the 4 GiB ceiling.
+With `--opaque` on the five derived `Deserialize` impls, under `lean-scoped-run.sh` (`MEM_MAX=4G`,
+`-memory-limit-mb 3500`):
+
+    llbc               23 MB → 8.6 MB (the visitor's 8,192-path body is not in it)
+    aeneas             wall 27.9 s, peak 2,329 MiB, non-empty Lean emitted (437,356 bytes)
+    internal errors    9 in the runs measured (they are the trait/lifetime failures below)
+
+That is the ceiling answer: the crate translates. It still does not install, and the reason is
+*not* the exclusion — aeneas reports `[Error] Unimplemented: found an occurrence of a lifetime
+constraint` while translating the signature of `ViewMetadata::primary_key` and
+`validate::base_pk_names`, both `-> impl Iterator<Item = &'_ str>`, and the emitted module then fails
+to elaborate on the `core.iter.traits.iterator.Iterator` records (`chain`, `map`, `filter`, `collect`
+are not fields of the structure). `--translate-all-methods` makes that worse (75 elaboration errors,
+37 internal errors). So `modules.txt` has no `View` row and `scope.toml` has no `[[item]]` entry: an
+entry no module can satisfy is the rot the checker exists to catch.
+
+The cost of leaving generated code out is stated where it is paid: the wire format of `ViewMetadata`
+is **assumed, not proved** — nothing in this package says a `ViewMetadata` serializes to the bytes
+the schema revision promises. That is the assumption a reader should carry, and it is why the entry
+carries a reason rather than a shrug.
+
+Two facts about the tools are worth keeping, because both defeat a check someone would otherwise
+trust:
+
+  - charon accepts an `--opaque` pattern that matches nothing, exits 0 and says nothing (measured on
+    `ferrosa-alloc-count`), so a rotted entry excludes nothing and looks fine. That is why `record`
+    re-matches every entry against the llbc's own `// Full name:` lines.
+  - aeneas emits no declaration at all for an opaque trait-impl method that nothing reachable calls,
+    even with charon's `--start-from` marking it (measured: the item is `started_from=true`,
+    `opacity=Opaque` in the llbc, and the Lean is byte-identical to the run without the exclusion).
+    That is why the ledger exists rather than a rule "the Lean must show it".
+
 ## What is verified, and what is only asserted
 
   - `Sstable` (from `ferrosa-sstable/src/compression.rs`) regenerated at aeneas `a4c75c4`, twice,

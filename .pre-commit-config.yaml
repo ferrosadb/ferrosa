@@ -57,6 +57,18 @@ repos:
         types: [rust]
         pass_filenames: false
 
+      # Pre-commit: the extraction scope is a claim about committed files, so it can be checked
+      # against them in milliseconds -- no charon, no aeneas, no network. Failing here is the point:
+      # a generated module that declares an item `:= sorry` with no scope entry explaining it is an
+      # assumption nobody signed for, and the same edit would otherwise sail through review looking
+      # like a regeneration.
+      - id: lean-extraction-scope
+        name: extraction scope explains every assumption in the generated Lean
+        entry: python3 specs/lean4-rust/scope-check.py check
+        language: system
+        always_run: true
+        pass_filenames: false
+
       # Pre-commit: format check only. Anything slower belongs on pre-push.
       - id: cargo-fmt
         name: cargo fmt --check

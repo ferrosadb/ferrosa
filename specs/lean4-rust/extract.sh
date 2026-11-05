@@ -45,6 +45,22 @@ IFS=',' read -r -a scopes <<<"$scope"
 scope_args=()
 for s in "${scopes[@]}"; do scope_args+=(--start-from "$s"); done
 
+# What this crate leaves out of the Lean, as charon name patterns. The list comes from
+# `scope.toml`, not from this invocation: an exclusion that is not written down and justified in
+# the scope file does not happen, and `scope-check.py` refuses an entry without a reason, an owner
+# and a date. `--opaque` is used rather than `--exclude` on purpose -- an opaque item keeps its
+# declaration (aeneas emits `def ... := sorry`, carrying the pattern in an `@[rust_fun "..."]`
+# attribute), so the assumption is visible to a reader of the generated file. `--exclude` would
+# delete it, and a deletion nobody can see is the failure mode this whole mechanism is for.
+python3 "$pkg/scope-check.py" included "$crate" || {
+  echo "FAIL: $crate is not in the extraction scope (specs/lean4-rust/scope.toml)"
+  exit 1
+}
+opaque_args=()
+while IFS= read -r pattern; do
+  [ -n "$pattern" ] && opaque_args+=(--opaque "$pattern")
+done < <(python3 "$pkg/scope-check.py" items "$crate")
+
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
@@ -54,8 +70,17 @@ trap 'rm -rf "$work"' EXIT
 # `ferrosa_alloc_count.llbc` and the diff was the only thing that said so.
 llbc=$work/extract.llbc
 ( cd "$crate_dir" && "$CHARON" cargo --preset=aeneas --dest-file "$llbc" \
-    "${scope_args[@]}" -- --lib ) > "$work/charon.log" 2>&1
+    "${scope_args[@]}" ${opaque_args[@]+"${opaque_args[@]}"} -- --lib ) > "$work/charon.log" 2>&1
 [ -f "$llbc" ] || { echo "FAIL: charon produced no .llbc for $crate"; tail -5 "$work/charon.log"; exit 1; }
+
+# charon drops a name pattern it cannot parse (`filter_map` over the parsed patterns in
+# options.rs), so a malformed scope entry would silently exclude nothing. Say so here rather than
+# let the run translate the item it was told to leave out.
+if bad=$(grep -o "failed to parse pattern \`[^\`]*\`" "$work/charon.log"); then
+  echo "FAIL: charon rejected a scope entry — $bad"
+  echo "      an entry it cannot parse excludes nothing; fix specs/lean4-rust/scope.toml"
+  exit 1
+fi
 
 "$AENEAS" -backend lean -dest "$work/out" "$llbc" > "$work/aeneas.log" 2>&1
 generated=$(ls "$work"/out/*.lean 2>/dev/null | head -1)
@@ -73,7 +98,6 @@ previous=$work/previous.lean
 had_previous=0
 [ -f "$pkg/FerrosaRust/$module.lean" ] && { cp "$pkg/FerrosaRust/$module.lean" "$previous"; had_previous=1; }
 cp "$generated" "$pkg/FerrosaRust/$module.lean"
-rm -f "$llbc"
 
 LEAN_NUM_THREADS=2 lake build > "$work/build.log" 2>&1 || {
   echo "FAIL: the regenerated FerrosaRust/$module.lean does not elaborate"
@@ -86,6 +110,35 @@ LEAN_NUM_THREADS=2 lake build > "$work/build.log" 2>&1 || {
   fi
   exit 1
 }
+
+# The scope is a claim about this file, and the file is the evidence: every scope entry has to be
+# real. `record` asks charon's llbc whether the entry still names an item (charon says nothing for
+# a pattern that matches nothing -- measured -- so a rotted entry would exclude nothing and stay
+# silent) and the emitted Lean whether the assumption is visible there. Aeneas drops the
+# declaration of an opaque trait-impl method that nothing reachable calls, so for those the row in
+# scope.lock IS the record; for everything else the row must name a declaration that exists.
+python3 "$pkg/scope-check.py" record "$module" --llbc "$llbc" --charon "$CHARON" || {
+  echo "FAIL: an item entry in specs/lean4-rust/scope.toml matched nothing in the extraction"
+  if [ $had_previous -eq 1 ]; then
+    cp "$previous" "$pkg/FerrosaRust/$module.lean"
+    echo "      previous FerrosaRust/$module.lean restored -- the recorded extraction still stands"
+  else
+    rm -f "$pkg/FerrosaRust/$module.lean"
+  fi
+  exit 1
+}
+
+python3 "$pkg/scope-check.py" check --module "$module" || {
+  echo "FAIL: FerrosaRust/$module.lean and specs/lean4-rust/scope.toml disagree (see above)"
+  if [ $had_previous -eq 1 ]; then
+    cp "$previous" "$pkg/FerrosaRust/$module.lean"
+    echo "      previous FerrosaRust/$module.lean restored -- the recorded extraction still stands"
+  else
+    rm -f "$pkg/FerrosaRust/$module.lean"
+  fi
+  exit 1
+}
+rm -f "$llbc"
 
 # Record what the file was produced from, so a later run can tell whether it is still that. The
 # toolchain belongs in the record: the same sources under a different translator are a different

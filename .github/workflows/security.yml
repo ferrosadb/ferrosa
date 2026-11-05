@@ -39,6 +39,58 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      # GitHub's westus2 DNS/proxy experiment can bypass the agent's DNS,
+      # dropping an IP for an explicitly allowed host. Mirror the narrow
+      # upstream repair before hardening, independent of remote feature flags:
+      # https://github.com/step-security/agent/blob/v0.18.1/github_dns_experiment.go
+      # Inline because checking out PR code before hardening would weaken it.
+      - &prepare_hardened_dns
+        name: Restore standard hosted-runner DNS before hardening
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${RUNNER_ENVIRONMENT:-}" != github-hosted || "${RUNNER_OS:-}" != Linux ]]; then
+            exit 0
+          fi
+          # Empty on the runner; disposable filesystem fixtures override this.
+          root="${FERROSA_CI_DNS_ROOT:-}"
+          resolv="$root/etc/resolv.conf"
+          stub="$root/run/systemd/resolve/stub-resolv.conf"
+          services=(egress-dns-resolver.service egress-outbound-proxy.service)
+          present=false
+          for prefix in etc run; do
+            if [[ -e "$root/$prefix/systemd/resolved.conf.d/90-egress-proxy.conf" ]]; then
+              present=true
+            fi
+          done
+          if [[ "$present" = false ]]; then
+            for service in "${services[@]}"; do
+              if sudo systemctl is-active --quiet "$service"; then present=true; fi
+            done
+          fi
+          if grep -Eq '^[[:space:]]*nameserver[[:space:]]+127[.]0[.]0[.]100([[:space:]]|$)' "$resolv"; then
+            present=true
+          fi
+          if [[ "$present" = false ]]; then exit 0; fi
+          # Refuse before changing anything if the standard resolver is absent.
+          [[ -f "$stub" && ! -d "$resolv" ]] || { echo 'standard DNS stub unavailable' >&2; exit 1; }
+          backup="$(mktemp -d "$RUNNER_TEMP/ferrosa-dns.XXXXXX")"
+          for prefix in etc run; do
+            drop_in="$root/$prefix/systemd/resolved.conf.d/90-egress-proxy.conf"
+            if [[ -e "$drop_in" || -L "$drop_in" ]]; then
+              sudo mv -- "$drop_in" "$backup/$prefix-90-egress-proxy.conf"
+            fi
+          done
+          sudo systemctl restart systemd-resolved
+          link_dir="$(sudo mktemp -d "$root/etc/.ferrosa-resolv.XXXXXX")"
+          trap 'sudo rm -f -- "$link_dir/resolv.conf"; sudo rmdir -- "$link_dir"' EXIT
+          sudo ln -s -- "$stub" "$link_dir/resolv.conf"
+          sudo mv -f -- "$link_dir/resolv.conf" "$resolv"
+          # Only stop the experiment after standard DNS is restored.
+          for service in "${services[@]}"; do
+            if sudo systemctl is-active --quiet "$service"; then sudo systemctl stop "$service"; fi
+          done
+          sudo resolvectl flush-caches
       - name: Harden the runner
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
@@ -70,6 +122,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      - *prepare_hardened_dns
       - name: Harden the runner
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
@@ -107,6 +160,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - *prepare_hardened_dns
       - name: Harden the runner
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
@@ -125,6 +179,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - *prepare_hardened_dns
       - name: Harden the runner
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
@@ -162,6 +217,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      - *prepare_hardened_dns
       - name: Harden the runner
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
