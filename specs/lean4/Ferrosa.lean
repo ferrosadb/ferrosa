@@ -57,6 +57,7 @@ import Ferrosa.Codec.Audit
 import Ferrosa.Streaming.Machine
 import Ferrosa.Streaming.Obligations
 import Ferrosa.Streaming.Audit
+import Ferrosa.Streaming.Pinning
 import Ferrosa.Raft.StateMachine
 import Ferrosa.Raft.Surfaces
 import Ferrosa.Raft.Startup
