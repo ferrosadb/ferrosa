@@ -53,6 +53,15 @@
 //! logged on its EDGES: one `warn!` when a caller first has to wait, one
 //! `info!` when the last waiter is admitted — not a line per wait.
 //!
+//! # One level per pool
+//!
+//! A job must not submit more work to its OWN pool and wait for it (via
+//! `Handle::block_on`): it would wait for a permit while holding one, and at
+//! capacity every job does that and nothing finishes. `spawn_blocking` panics,
+//! naming the pool, when called from a job of the same pool — always, not only
+//! at capacity, so the mistake fails in tests. Calling a different pool is
+//! allowed.
+//!
 //! # Closed semaphore
 //!
 //! The semaphores are private to this module and never closed. A closed one is
@@ -151,9 +160,12 @@ impl TaskPool {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
+        refuse_reentry(self.name);
         let permit = admission_for(self.name).acquire().await;
+        let name = self.name;
         let job = move || {
             let _permit = permit;
+            let _held = HeldPermit::enter(name);
             f()
         };
         if let Some(runtime) = &self.runtime {
@@ -167,6 +179,50 @@ impl TaskPool {
     /// same name). Registers the pool if it has not been used yet.
     pub fn blocking_stats(&self) -> BlockingPoolStats {
         admission_for(self.name).stats()
+    }
+}
+
+thread_local! {
+    /// The blocking pool whose permit the job on this thread holds, if any.
+    static HELD_POOL: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// Marks this thread as running a job of `name` for the job's lifetime, and
+/// restores the previous mark on drop (also when the job panics).
+struct HeldPermit {
+    previous: Option<&'static str>,
+}
+
+impl HeldPermit {
+    fn enter(name: &'static str) -> Self {
+        Self {
+            previous: HELD_POOL.with(|held| held.replace(Some(name))),
+        }
+    }
+}
+
+impl Drop for HeldPermit {
+    fn drop(&mut self) {
+        HELD_POOL.with(|held| held.set(self.previous));
+    }
+}
+
+/// Panic if this thread is already running a job of pool `name`.
+///
+/// A blocking job cannot `.await`, so a job that needs more work from its own
+/// pool reaches for `Handle::block_on(pool.spawn_blocking(..))` — and then
+/// waits for a permit while holding one. At capacity every job does that and
+/// nothing finishes, with no error anywhere. The rule is one level per pool;
+/// refusing at once, even while a permit is free, makes a violation fail in
+/// any test that exercises it instead of only under production load. Calling
+/// a DIFFERENT pool from a job is allowed.
+fn refuse_reentry(name: &'static str) {
+    if HELD_POOL.with(std::cell::Cell::get) == Some(name) {
+        panic!(
+            "a job re-entered blocking pool {name:?}: it would wait for a permit while \
+             holding one, which deadlocks once the pool is at capacity. Do the inner work \
+             in the same job, or submit it from async code"
+        );
     }
 }
 
@@ -556,6 +612,49 @@ mod tests {
         holder.await.expect("holder job");
         let output = second_job.await.expect("second caller");
         assert_eq!(output.expect("second job"), "second");
+    }
+
+    /// A job that blocks on its own pool waits for a permit while holding one;
+    /// at capacity that deadlocks silently. The re-entry is refused loudly at
+    /// once instead — even with a free permit, so the bug shows in tests rather
+    /// than only under production load.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_that_reenters_its_own_pool_fails_loud_instead_of_deadlocking() {
+        const POOL: &str = "test-reentry";
+        configure_blocking_capacity(POOL, nz(2)).expect("fresh pool");
+        let pool = TaskPool::current(POOL);
+        let runtime = tokio::runtime::Handle::current();
+        let inner = pool.clone();
+        let outcome = pool
+            .spawn_blocking(move || {
+                runtime.block_on(async { inner.spawn_blocking(|| 1).await.await })
+            })
+            .await
+            .await;
+        let err = outcome.expect_err("re-entering the same pool must panic");
+        let message = err
+            .into_panic()
+            .downcast::<String>()
+            .map(|s| *s)
+            .unwrap_or_default();
+        assert!(
+            message.contains("re-entered blocking pool \"test-reentry\""),
+            "panic must name the pool: {message:?}"
+        );
+        assert_eq!(pool.blocking_stats().in_flight, 0);
+
+        // A different pool is not re-entry.
+        configure_blocking_capacity("test-reentry-other", nz(1)).expect("fresh pool");
+        let other = TaskPool::current("test-reentry-other");
+        let runtime = tokio::runtime::Handle::current();
+        let nested = pool
+            .spawn_blocking(move || {
+                runtime.block_on(async { other.spawn_blocking(|| 2).await.await })
+            })
+            .await
+            .await
+            .expect("calling another pool from a job is allowed");
+        assert_eq!(nested.expect("inner job"), 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

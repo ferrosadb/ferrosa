@@ -69,6 +69,12 @@ here — it lives in `ferrosa-cql` / `ferrosa-row-bridge`.
   tokio (whose blocking queue has no capacity), and the permit is released when
   the closure returns or panics. The semaphore lives in a process-wide registry
   keyed by pool name, so every ad-hoc `TaskPool::current("x")` shares one bound.
+  That budget is per NAME, process-wide, not per `TaskPool` value: two
+  subsystems that pick the same name share (and can exhaust) one budget, so
+  give each subsystem its own name. A job must not block on its own pool
+  (`Handle::block_on(pool.spawn_blocking(..))` from inside a job): that waits
+  for a permit while holding one and deadlocks at capacity, so it panics naming
+  the pool, every time. Calling a different pool from a job is allowed.
   Capacity defaults to `4 × available_parallelism` clamped to `[8, 128]`;
   override with `FERROSA_BLOCKING_POOL_CAPACITY` (all pools) or
   `FERROSA_BLOCKING_POOL_CAPACITY_<NAME>` (one pool, `-` → `_`, upper-cased).
