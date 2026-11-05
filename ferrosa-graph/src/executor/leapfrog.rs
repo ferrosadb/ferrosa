@@ -41,17 +41,16 @@ struct AdjacencyIterator {
 
 impl AdjacencyIterator {
     /// Create from a vertex's adjacency partition, filtering by optional label.
+    ///
+    /// A failed read is an error, not an empty neighbour list: treating it as
+    /// "no neighbours" made the join return a silently short answer.
     async fn from_partition(
         write_path: &dyn GraphWrite,
         adj_table_id: &TableId,
         vertex_key: &DecoratedKey,
         edge_label: Option<&str>,
-    ) -> Self {
-        let partition = write_path
-            .read(adj_table_id, vertex_key)
-            .await
-            .ok()
-            .flatten();
+    ) -> Result<Self> {
+        let partition = write_path.read(adj_table_id, vertex_key).await?;
         let mut neighbors = Vec::new();
         if let Some(p) = partition {
             for row in &p.rows {
@@ -62,7 +61,7 @@ impl AdjacencyIterator {
         }
         neighbors.sort();
         neighbors.dedup();
-        Self { neighbors, pos: 0 }
+        Ok(Self { neighbors, pos: 0 })
     }
 
     /// Create from an already-known list of neighbor IDs (pre-sorted, pre-deduped).
@@ -364,7 +363,7 @@ async fn enumerate_bindings(
                     &src_key,
                     rel.edge_label.as_deref(),
                 )
-                .await;
+                .await?;
                 stats.edges_read += it.neighbors.len();
                 iterators.push(it);
             }
@@ -381,7 +380,7 @@ async fn enumerate_bindings(
                 // For leapfrog, we need the set of source vertices that
                 // have an edge TO dst. We read dst's IN-adjacency.
                 let dst_key = DecoratedKey::new(PartitionKey::new(dst_bytes.clone()));
-                let partition = write_path.read(adj_table_id, &dst_key).await.ok().flatten();
+                let partition = write_path.read(adj_table_id, &dst_key).await?;
                 let mut neighbors = Vec::new();
                 if let Some(p) = partition {
                     for row in &p.rows {
@@ -496,7 +495,9 @@ async fn verify_all_relations(
 
         // Check that src has an OUT edge to dst with the given label.
         let src_key = DecoratedKey::new(PartitionKey::new(src_bytes.clone()));
-        let partition = write_path.read(adj_table_id, &src_key).await.ok().flatten();
+        // A failed read must fail the join: as "edge absent" it silently
+        // dropped a valid match.
+        let partition = write_path.read(adj_table_id, &src_key).await?;
         let found = if let Some(p) = partition {
             stats.edges_read += 1;
             p.rows.iter().any(|row| {
@@ -584,6 +585,227 @@ mod tests {
     /// at a time and never holds the intersection in memory.
     fn drain_intersection(iterators: &mut [AdjacencyIterator]) -> Vec<Vec<u8>> {
         std::iter::from_fn(|| next_common_value(iterators)).collect()
+    }
+
+    // --- storage errors must fail the join, not shorten it ----------------
+
+    /// Delegates to a real `WritePath`, except that every point read of the
+    /// adjacency table fails — the shape of a storage I/O error mid-join.
+    struct FailingAdjacencyReads {
+        inner: ferrosa_cluster::write_path::WritePath,
+        adjacency: TableId,
+    }
+
+    #[async_trait::async_trait]
+    impl GraphWrite for FailingAdjacencyReads {
+        async fn read(
+            &self,
+            table_id: &TableId,
+            key: &DecoratedKey,
+        ) -> ferrosa_common::Result<Option<ferrosa_sstable::types::Partition>> {
+            if table_id == &self.adjacency {
+                return Err(ferrosa_common::Error::InvalidFormat(
+                    "injected adjacency read failure".to_string(),
+                ));
+            }
+            self.inner.read(table_id, key).await
+        }
+        async fn pk_read(
+            &self,
+            table_id: &TableId,
+            key: &DecoratedKey,
+            cl: ferrosa_cluster::consistency::ConsistencyLevel,
+            strategy: &ferrosa_cluster::ring::strategy::ReplicationStrategy,
+        ) -> ferrosa_common::Result<Option<ferrosa_sstable::types::Partition>> {
+            GraphWrite::pk_read(&self.inner, table_id, key, cl, strategy).await
+        }
+        async fn range_read_stream_all(
+            &self,
+            table_id: &TableId,
+            row_limit: usize,
+        ) -> ferrosa_cluster::error::Result<ferrosa_cluster::write_path::PartitionResultStream>
+        {
+            GraphWrite::range_read_stream_all(&self.inner, table_id, row_limit).await
+        }
+        async fn count_range_with(
+            &self,
+            table_id: &TableId,
+            cl: ferrosa_cluster::consistency::ConsistencyLevel,
+            strategy: &ferrosa_cluster::ring::strategy::ReplicationStrategy,
+        ) -> ferrosa_cluster::error::Result<u64> {
+            GraphWrite::count_range_with(&self.inner, table_id, cl, strategy).await
+        }
+        fn declares_index_locally(&self, table_id: &TableId, index_name: &str) -> bool {
+            GraphWrite::declares_index_locally(&self.inner, table_id, index_name)
+        }
+        fn index_is_current(&self, table_id: &TableId, index_name: &str) -> bool {
+            GraphWrite::index_is_current(&self.inner, table_id, index_name)
+        }
+        async fn index_read_stream(
+            &self,
+            table_id: &TableId,
+            index_name: &str,
+            index_key: &ferrosa_index::IndexKey,
+            after: Option<&ferrosa_index::RowPosition>,
+        ) -> ferrosa_cluster::error::Result<ferrosa_cluster::write_path::PartitionResultStream>
+        {
+            GraphWrite::index_read_stream(&self.inner, table_id, index_name, index_key, after).await
+        }
+        async fn write(
+            &self,
+            table_id: &TableId,
+            key: &DecoratedKey,
+            row: ferrosa_sstable::types::Row,
+            timestamp: i64,
+            cl: ferrosa_cluster::consistency::ConsistencyLevel,
+            strategy: &ferrosa_cluster::ring::strategy::ReplicationStrategy,
+        ) -> ferrosa_common::Result<()> {
+            GraphWrite::write(&self.inner, table_id, key, row, timestamp, cl, strategy).await
+        }
+        async fn write_batch(
+            &self,
+            mutations: Vec<ferrosa_storage::Mutation>,
+            cl: ferrosa_cluster::consistency::ConsistencyLevel,
+            rf: usize,
+        ) -> ferrosa_common::Result<()> {
+            GraphWrite::write_batch(&self.inner, mutations, cl, rf).await
+        }
+    }
+
+    /// One vertex `A` in `test_ks.person_v`, behind a write path whose
+    /// adjacency reads all fail.
+    fn failing_adjacency_fixture() -> (tempfile::TempDir, FailingAdjacencyReads) {
+        use ferrosa_common::schema::TableSchema;
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(
+            ferrosa_storage::StorageEngine::new(
+                ferrosa_storage::StorageEngineConfig::test_config(dir.path()),
+                None,
+            )
+            .unwrap(),
+        );
+        storage
+            .register_table(TableSchema {
+                keyspace: "test_ks".to_string(),
+                table: "person_v".to_string(),
+                key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                clustering_columns: vec![],
+                static_columns: vec![],
+                regular_columns: vec![],
+                extensions: Default::default(),
+            })
+            .unwrap();
+        storage
+            .write(
+                &TableId::new("test_ks", "person_v"),
+                &DecoratedKey::new(PartitionKey::new(b"A".to_vec())),
+                Row {
+                    clustering: vec![],
+                    cells: vec![],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(1),
+                },
+                1,
+            )
+            .unwrap();
+        let adjacency = TableId::new(adjacency_keyspace_name("test_ks"), "adjacency");
+        let wp = FailingAdjacencyReads {
+            inner: ferrosa_cluster::write_path::WritePath::direct(storage),
+            adjacency,
+        };
+        (dir, wp)
+    }
+
+    fn person() -> crate::planner::logical::ResolvedTable {
+        crate::planner::logical::ResolvedTable {
+            keyspace: "test_ks".to_string(),
+            table: "person_v".to_string(),
+            graph_type: "vertex".to_string(),
+            label: "Person".to_string(),
+        }
+    }
+
+    fn relation(src: &str, dst: &str) -> crate::planner::physical::JoinRelation {
+        crate::planner::physical::JoinRelation {
+            src_var: src.to_string(),
+            dst_var: dst.to_string(),
+            direction: crate::parser::Direction::Out,
+            edge_label: Some("KNOWS".to_string()),
+            edge_table: None,
+        }
+    }
+
+    /// Each WCO adjacency read site used `.ok().flatten()`, so a storage error
+    /// read as "this vertex has no neighbours" and the join returned a
+    /// silently SHORT answer — `Ok` with fewer rows than exist. One plan per
+    /// site, each shaped so that site performs the first adjacency read:
+    /// - `a->b`: the OUT iterator for `b` (`AdjacencyIterator::from_partition`);
+    /// - `b->a`: the IN-adjacency read for `b` in `enumerate_bindings`;
+    /// - `a->a`: the closing-edge check (`verify_all_relations`).
+    #[tokio::test]
+    async fn a_failed_adjacency_read_fails_the_join_instead_of_shortening_it() {
+        let cases: [(
+            &str,
+            Vec<String>,
+            Vec<crate::planner::physical::JoinRelation>,
+        ); 3] = [
+            (
+                "from_partition",
+                vec!["a".to_string(), "b".to_string()],
+                vec![relation("a", "b")],
+            ),
+            (
+                "IN-adjacency read",
+                vec!["a".to_string(), "b".to_string()],
+                vec![relation("b", "a")],
+            ),
+            (
+                "verify_all_relations",
+                vec!["a".to_string()],
+                vec![relation("a", "a")],
+            ),
+        ];
+        for (site, variables, relations) in cases {
+            let (_dir, wp) = failing_adjacency_fixture();
+            let var_tables = variables.iter().map(|v| (v.clone(), person())).collect();
+            let plan = WcoJoinPlan {
+                variables,
+                relations,
+                var_tables,
+            };
+            let return_clause = ReturnClause {
+                distinct: false,
+                items: vec![crate::parser::ReturnItem {
+                    expr: crate::parser::Expr::Var("a".to_string()),
+                    alias: None,
+                }],
+                order_by: vec![],
+                limit: None,
+            };
+            let result = execute_wco_join(
+                &wp,
+                "test_ks",
+                &plan,
+                &return_clause,
+                &GraphEngineConfig::default(),
+                Instant::now(),
+                None,
+                None,
+            )
+            .await;
+            match result {
+                Err(err) => assert!(
+                    err.to_string().contains("injected adjacency read failure"),
+                    "{site}: the storage error must surface, got {err}"
+                ),
+                Ok(ok) => panic!(
+                    "{site}: a failed adjacency read must fail the join, but it \
+                     returned Ok with {} rows",
+                    ok.rows.len()
+                ),
+            }
+        }
     }
 
     #[test]

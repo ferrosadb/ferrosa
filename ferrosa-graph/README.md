@@ -193,6 +193,11 @@ use those same stored endpoint keys.
 - **Variable-length paths** (`executor/varpath.rs`, `leapfrog.rs`) — BFS over
   `min..=max` hops with a visited set for cycle detection and a
   `max_var_path_visited` vertex budget (threat T13).
+- **WCO join** (`executor/leapfrog.rs`) — leapfrog triejoin over sorted
+  adjacency lists. Every adjacency read (the per-variable iterators, the
+  IN-adjacency read and the closing-edge check) propagates a storage error and
+  fails the query; it used to read a failed read as "no neighbours", which
+  returned a silently short join.
 - **Property write encoding** (`executor/expand.rs`) — schema-less CREATE/MERGE
   accept literal values only; a map, list or computed expression returns
   `GraphError::Validation` rather than storing empty bytes (FMEA G-11).
