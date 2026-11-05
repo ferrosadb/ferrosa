@@ -443,14 +443,14 @@ pub const REDS: &[Red] = &[
         name: "systemtables_projection__a_cell_s_persisted_row_converges_to_its_in_memory_value_under_the_code_s_merge_rule",
         module: "Ferrosa.SystemTables.Projection",
         claim: "a cell's persisted row converges to its in-memory value under the code's merge rule",
-        why: "there is no sequence or generation column: grant_to_row stamps now_micros() (ferrosa-schema/src/system/persistence.rs:417-432) and PermissionRevoked does the same (ferrosa-cluster/src/system_table_writer.rs:164-181), while cell_supersedes orders an equal timestamp by the greater payload (ferrosa-storage/src/merge.rs:177-190). Two live writes to one cell in one microsecond can therefore resolve to the earlier, larger set, so a restart reads back a permission set the state machine no longer holds. One apply emits at most one write per cell (state_machine.rs:1883-1947), but two applies can share a microsecond and the projection has nothing else to order them by",
+        why: "there is no sequence or generation column: grant_to_row stamps now_micros() (ferrosa-schema/src/system/persistence.rs:417-432) and PermissionRevoked does the same (ferrosa-cluster/src/system_table_writer.rs:164-181), while cell_supersedes orders an equal timestamp by the greater payload (ferrosa-storage/src/merge.rs:177-190), and that payload is serde_json of a HashSet-derived Vec (persistence.rs:421-423), so its order is the hash order. Two live writes to one cell in one microsecond can therefore resolve to the earlier write, so a restart reads back a permission set the state machine no longer holds. One apply emits at most one write per cell (state_machine.rs:1883-1947), but two applies can share a microsecond and the projection has nothing else to order them by",
         witness: "SystemTables.tsOnly_tie_fails_convergence",
     },
     Red {
         name: "systemtables_projection__a_revoked_permission_is_not_resurrected_by_an_equal_timestamp_write",
         module: "Ferrosa.SystemTables.Projection",
         claim: "a revoked permission is not resurrected by an equal-timestamp write",
-        why: "the later revoke writes the remaining set and the earlier grant wrote the larger set; at an equal timestamp cell_supersedes keeps the lexicographically greater payload, which is the earlier one, so the removed permission is present again after a restart and the role's authorization answers change with nothing logged and nothing failing",
+        why: "the later revoke writes the remaining set and the earlier grant wrote the larger set; at an equal timestamp cell_supersedes keeps the greater payload (ferrosa-storage/src/merge.rs:177-190), which can be the earlier one because the payload's order is the set's hash order (ferrosa-schema/src/system/persistence.rs:421-423), so the removed permission is present again after a restart and the role's authorization answers change with nothing logged and nothing failing",
         witness: "SystemTables.tsOnly_tie_resurrects_a_revoked_permission",
     },
     Red {
@@ -478,7 +478,7 @@ pub const REDS: &[Red] = &[
         name: "systemtables_projection__two_writes_to_one_cell_with_equal_timestamps_the_later_one_wins",
         module: "Ferrosa.SystemTables.Projection",
         claim: "two writes to one cell with equal timestamps: the later one wins",
-        why: "with no sequence the tie is broken by the serialized payload (ferrosa-storage/src/merge.rs:177-190), not by which write the log applied later, so a removal that shortens the set loses to the set it shortened. The fix's structural rule (one mutation per cell per apply, state_machine.rs:1883-1947) removes the intra-apply pair but not a tie between two applies, and it does not make the order the log's",
+        why: "with no sequence the tie is broken by the serialized payload (ferrosa-storage/src/merge.rs:177-190), not by which write the log applied later. That payload is serde_json of a HashSet-derived Vec (ferrosa-schema/src/system/persistence.rs:421-423), so its element order is the hash iteration order: a removal can lose to the set it shortened, and which side wins is not a function of the permission sets at all. The fix's structural rule (one mutation per cell per apply, state_machine.rs:1883-1947) removes the intra-apply pair but not a tie between two applies, and it does not make the order the log's",
         witness: "SystemTables.tsOnly_tie_breaks_toward_the_older_write",
     },
     Red {
