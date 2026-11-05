@@ -7921,3 +7921,32 @@ async fn pair_grant_requires_explicit_supported_version_and_correct_peer() {
     );
     assert_eq!(**role.load(), PairRole::Primary);
 }
+
+#[tokio::test]
+async fn corrupt_persisted_restore_refuses_cluster_transition_without_erasing_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let (controller, peer_id, _) = boot_gate_controller(dir.path()).await;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let owned_peer = listener.local_addr().unwrap();
+    let raft_dir = super::cluster::raft_log_dir_for_dc(
+        &dir.path().join("raft"),
+        &controller.config.data_center,
+    );
+    std::fs::create_dir_all(&raft_dir).unwrap();
+    let snapshot = raft_dir.join("state-machine.snapshot.bin");
+    let bytes = b"owned corrupt snapshot evidence";
+    std::fs::write(&snapshot, bytes).unwrap();
+    controller.transition_to_cluster(vec![(peer_id, owned_peer)]);
+    assert!(
+        !controller.consensus_health().is_healthy(),
+        "A failed persisted restore must close readiness instead of booting on stale schema."
+    );
+    assert!(!write_path_is_cluster(&controller));
+    assert!(controller.raft().is_none());
+    assert!(!controller.is_cql_ready());
+    assert_eq!(std::fs::read(snapshot).unwrap(), bytes);
+    assert!(
+        raft_dir.is_dir(),
+        "Do not replace or discard failed recovery evidence."
+    );
+}

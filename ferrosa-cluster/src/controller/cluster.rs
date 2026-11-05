@@ -1459,8 +1459,10 @@ impl ModeController {
         let recovered_persisted_snapshot = match state_machine.recover_from_persisted_snapshot() {
             Ok(recovered) => recovered,
             Err(e) => {
-                tracing::warn!(%e, "failed to recover persisted raft snapshot");
-                false
+                tracing::error!(%e, "refusing Raft startup after persisted snapshot recovery failed");
+                self.consensus_health
+                    .fail("raft_snapshot_recovery", format_args!("{e}"));
+                return;
             }
         };
 
