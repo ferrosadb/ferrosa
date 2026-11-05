@@ -16,7 +16,9 @@
 
   * `merge_rows_into` / `cell_supersedes` (`ferrosa-storage/src/merge.rs:137-190`) keep the higher
     timestamp, and on a tie a live cell beats a tombstone and the lexicographically greater value
-    wins.  This is the read and compaction path.
+    wins.  This is the read and compaction path.  The payload is `serde_json` of a `Vec` built from
+    a `HashSet` (`persistence.rs:421-423`), so its element order is the hash iteration order and
+    which payload is greater is not a function of the permission sets.
   * `merge_into_existing_row` / `reconcile_ref` (`ferrosa-storage/src/memtable/sharded.rs:520-560`,
     `ferrosa-common/src/complex_cell.rs:63-77`) keep the higher timestamp, and on a tie a tombstone
     beats a live cell.  This is the memtable write path.
@@ -78,8 +80,10 @@ def tomb (ts : Ts) : Write := ⟨none, ts⟩
 /-- Whether a write carries no value. -/
 def Write.isTomb (w : Write) : Bool := w.val.isNone
 
-/-- The byte comparison `cell_supersedes` uses for two live values at the same timestamp: the
-    lexicographically greater payload wins, so a longer prefix-extension beats its own prefix. -/
+/-- Byte-wise comparison of two serialized payloads, as `cell_supersedes` does.  The payload's
+    element order is the hash iteration order of the permission set
+    (`ferrosa-schema/src/system/persistence.rs:421-423`), so the greater side is not determined by
+    the sets alone. -/
 def lexLt : Val → Val → Bool
   | [], [] => false
   | [], _ :: _ => true
@@ -247,32 +251,32 @@ theorem seqFirst_suppressing_never_resurrects (w : Write) (older : List Write) (
 /-! ## Timestamp first: a tie is not a tie-break for the log
 
 With no sequence, the projection orders two writes by their payload when their timestamps agree, and
-a later mutation is not necessarily the greater payload.  Removing a permission shortens the set, so
-the earlier, larger value wins the tie and the removal is undone by a restart. -/
+the payload's element order is the set's hash order rather than the log's.  One reachable
+serialization makes the earlier, larger set win the tie, undoing the removal. -/
 
-/-- Two live writes to one cell in the same microsecond, the newer one smaller: revoke keeps
-    `[0]` in memory, the older `[0, 1]` on disk. -/
-def tieLog : List Write := [live [0] 5, live [0, 1] 5]
+/-- Two live writes to one cell in one microsecond: the newer revoke leaves `[0]`, the older grant
+    serialized as `[2, 0]`.  The older payload compares greater, so a restart resurrects `2`. -/
+def tieLog : List Write := [live [0] 5, live [2, 0] 5]
 
 /-- **TIE-SAFETY FAILS UNDER THE CODE'S RULE.** The later write is the one the caller committed, and
     the reloaded value is the earlier one. -/
 theorem tsOnly_tie_breaks_toward_the_older_write :
-    reload .timestampOnly .absorbing tieLog = some [0, 1] := by
+    reload .timestampOnly .absorbing tieLog = some [2, 0] := by
   decide
 
 /-- **CONVERGENCE FAILS UNDER THE CODE'S RULE.** The same history: memory holds `[0]` after the
-    revoke, a restart reads `[0, 1]`. -/
+    revoke, a restart reads `[2, 0]`. -/
 theorem tsOnly_tie_fails_convergence :
-    reload .timestampOnly .absorbing tieLog = some [0, 1] ∧
+    reload .timestampOnly .absorbing tieLog = some [2, 0] ∧
     (run tieLog).mem = some [0] := by
   decide
 
-/-- **NO RESURRECTION FAILS.** Element `1` was removed by the later write and is present after the
+/-- **NO RESURRECTION FAILS.** Element `2` was removed by the later write and is present after the
     restart, which is the production symptom: a role loses a permission, restarts, and has it back. -/
 theorem tsOnly_tie_resurrects_a_revoked_permission :
     (run tieLog).mem = some [0] ∧
-    reload .timestampOnly .absorbing tieLog = some [0, 1] ∧
-    1 ∈ (reload .timestampOnly .absorbing tieLog).getD [] := by
+    reload .timestampOnly .absorbing tieLog = some [2, 0] ∧
+    2 ∈ (reload .timestampOnly .absorbing tieLog).getD [] := by
   decide
 
 /-- **A SEQUENCE FIXES THE TIE.** `timestampSeq` never lets an equal-timestamp write displace the
@@ -469,7 +473,7 @@ and a tombstone that hides only the writes it is newer than.
 def ledger : List SpecItem := [
   ⟨"a cell's persisted row converges to its in-memory value under the code's merge rule",
    .failing
-     "there is no sequence or generation column: grant_to_row stamps now_micros() (ferrosa-schema/src/system/persistence.rs:417-432) and PermissionRevoked does the same (ferrosa-cluster/src/system_table_writer.rs:164-181), while cell_supersedes orders an equal timestamp by the greater payload (ferrosa-storage/src/merge.rs:177-190). Two live writes to one cell in one microsecond can therefore resolve to the earlier, larger set, so a restart reads back a permission set the state machine no longer holds. One apply emits at most one write per cell (state_machine.rs:1883-1947), but two applies can share a microsecond and the projection has nothing else to order them by"
+     "there is no sequence or generation column: grant_to_row stamps now_micros() (ferrosa-schema/src/system/persistence.rs:417-432) and PermissionRevoked does the same (ferrosa-cluster/src/system_table_writer.rs:164-181), while cell_supersedes orders an equal timestamp by the greater payload (ferrosa-storage/src/merge.rs:177-190), and that payload is serde_json of a HashSet-derived Vec (persistence.rs:421-423), so its order is the hash order. Two live writes to one cell in one microsecond can therefore resolve to the earlier write, so a restart reads back a permission set the state machine no longer holds. One apply emits at most one write per cell (state_machine.rs:1883-1947), but two applies can share a microsecond and the projection has nothing else to order them by"
      "SystemTables.tsOnly_tie_fails_convergence"⟩,
   ⟨"a timestamp with a per-cell sequence converges for every clock",
    .failing
@@ -479,13 +483,13 @@ def ledger : List SpecItem := [
    .met "SystemTables.converges_seqFirst_suppressing"⟩,
   ⟨"two writes to one cell with equal timestamps: the later one wins",
    .failing
-     "with no sequence the tie is broken by the serialized payload (ferrosa-storage/src/merge.rs:177-190), not by which write the log applied later, so a removal that shortens the set loses to the set it shortened. The fix's structural rule (one mutation per cell per apply, state_machine.rs:1883-1947) removes the intra-apply pair but not a tie between two applies, and it does not make the order the log's"
+     "with no sequence the tie is broken by the serialized payload (ferrosa-storage/src/merge.rs:177-190), not by which write the log applied later. That payload is serde_json of a HashSet-derived Vec (ferrosa-schema/src/system/persistence.rs:421-423), so its element order is the hash iteration order: a removal can lose to the set it shortened, and which side wins is not a function of the permission sets at all. The fix's structural rule (one mutation per cell per apply, state_machine.rs:1883-1947) removes the intra-apply pair but not a tie between two applies, and it does not make the order the log's"
      "SystemTables.tsOnly_tie_breaks_toward_the_older_write"⟩,
   ⟨"a per-cell sequence makes the later write win an equal timestamp",
    .met "SystemTables.timestampSeq_tie_keeps_the_later_write"⟩,
   ⟨"a revoked permission is not resurrected by an equal-timestamp write",
    .failing
-     "the later revoke writes the remaining set and the earlier grant wrote the larger set; at an equal timestamp cell_supersedes keeps the lexicographically greater payload, which is the earlier one, so the removed permission is present again after a restart and the role's authorization answers change with nothing logged and nothing failing"
+     "the later revoke writes the remaining set and the earlier grant wrote the larger set; at an equal timestamp cell_supersedes keeps the greater payload (ferrosa-storage/src/merge.rs:177-190), which can be the earlier one because the payload's order is the set's hash order (ferrosa-schema/src/system/persistence.rs:421-423), so the removed permission is present again after a restart and the role's authorization answers change with nothing logged and nothing failing"
      "SystemTables.tsOnly_tie_resurrects_a_revoked_permission"⟩,
   ⟨"a revoked permission is not resurrected under a per-cell sequence",
    .met "SystemTables.seqFirst_suppressing_never_resurrects"⟩,

@@ -42,9 +42,14 @@ machine but are otherwise loosely coupled:
 Raft command apply stages metadata in an owned blocking job together with physical
 schema effects and system-table writes. A retained handle fences later trait
 calls across cancellation; completed state and applied indexes publish in order.
-Unexpected worker failure is sticky and prevents new snapshots or successful
-apply results. This command fence does not change snapshot persistence or network
-agreement deadlines.
+Committed local Schema/Engine effect failures and projection failures propagate
+through that job and prevent publishing its metadata/index. Ordinary command
+rejection remains non-fatal. The process-local failure latch prevents later
+snapshots or successful apply results. A failed persisted restore retains the
+previous Raft metadata and refuses consensus startup/readiness, preserving its
+files rather than adopting a purge point on a failed restore. This is not a
+rollback of already visible physical effects or automatic recovery. Snapshot
+file publication and network agreement deadlines are separate boundaries.
 
 ## Module map
 

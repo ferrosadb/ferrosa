@@ -37,18 +37,23 @@ token ring and a Raft-replicated metadata state machine:
 Raft command application owns its blocking schema/storage transition and ordered
 system-table writes in one worker job. Dropping an async waiter retains that job;
 subsequent apply/status/snapshot entry points await it before exposing the applied
-index or constructing a snapshot. A worker panic or configured system-table persistence failure poisons the state
-machine and returns a storage error rather than publishing staged metadata.
+index or constructing a snapshot. A worker panic, failed committed local Schema/Engine effect, or configured
+system-table persistence failure poisons the state machine and returns a storage
+error rather than publishing staged metadata or advancing the applied index.
 The retained worker forces the commit log to disk before publication, including
 with Periodic acknowledgement. Log severity does not exempt failed projections.
 Shared schema/storage effects can already be visible; this is not rollback or
-transactional isolation. Ordinary command
-error responses retain the committed intent for replay. Existing snapshot-file
-publication has a separate per-path writer fence. A durable file cannot regress
-behind its stored log or membership position when an older builder finishes.
-Each attempt owns a unique staging file; it flushes the file, renames it, and
-flushes the directory before reporting success. Cancelled async waiters cannot
-make concurrent writers truncate or rename one another's staging files.
+transactional isolation. Ordinary domain rejection remains a command error
+response and does not poison the machine. A failed persisted snapshot restore
+keeps the prior Raft metadata and closes startup readiness instead of continuing
+with a partially restored shared schema; the snapshot and log files are retained
+for recovery. The apply latch is currently process-local, not an automatic repair
+mechanism. Snapshot-file publication has a separate per-path writer fence. A
+file cannot regress behind its stored log or membership position when an older
+builder finishes. Each attempt owns a unique staging file; it flushes the file,
+renames it, and flushes the directory before reporting success. Cancelled async
+waiters cannot make concurrent writers truncate or rename one another's staging
+files.
 
 2. **Read/write coordination** (`coordinator/`) — fans writes and reads out to
    replicas with tunable CQL consistency-level (CL) enforcement, write
@@ -1364,3 +1369,22 @@ live caller retains its share through peer ACK and the strict archive barrier.
 Inbound handlers retain their existing primary apply/replicate-back and secondary
 apply-only behavior; they acquire no nested handoff read lease. Cancellation
 produces no successful ACK and can leave an unacknowledged local write.
+
+
+### Raft canonical projection ordering
+
+Canonical system-table persistence is a node-local projection of the ordered Raft
+log. Normal apply entries share one retained durability group until a destructive
+operation needs its next asynchronous compaction drain. Ordered projection writes
+finish before one explicit commit-log fence and group publication; groups with no
+projection writes add no fence. This does not change ordinary data-write sync policy
+or isolate shared physical effects before publication.
+
+Permission projections replace the complete resource permission set. Their local
+timestamps advance beyond the stored resource cell and row tombstone, including
+when the wall clock ties or moves backwards; exhaustion is a storage failure. This
+requires the existing single Raft projection writer and retained-job ordering. It
+is not a deterministic cross-node cell timestamp or an authorization for concurrent
+direct mutations of canonical rows. Normal repair and rebalance exclude system
+keyspaces; arbitrary cross-node reconciliation of these local projection files is
+not covered by this contract.
