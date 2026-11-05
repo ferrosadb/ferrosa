@@ -192,6 +192,11 @@ on finish, fail loud on any spill/merge I/O error.
 - **Temp location is configurable per node**: inject a `SpillReserver`, or set
   `FERROSA_SQL_TEMP_DIR`; the threshold follows the storage engine's
   `FERROSA_RANGE_SPILL_THRESHOLD_*`.
+- **Concurrent operators share one budget**: every operator built from a
+  `SpillCtx` charges the storage engine's node-wide `SpillPool` (overridable with
+  `SpillCtx::with_pool`), so three concurrent sorts hold one budget between them,
+  not three. A join's `ReplayBuffer` moves its group to disk as soon as the pool is
+  full.
 - **Cancellation and cleanup share one path**: the temp directory is held by a
   `TempSortTableReservation` moved into the output stream, so dropping the stream
   — exhausted, cancelled or abandoned — removes it. `sweep_orphaned_temp_dirs`

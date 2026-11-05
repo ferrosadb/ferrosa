@@ -61,6 +61,7 @@ pub mod self_heal;
 pub mod size_units;
 pub mod snapshot;
 pub mod spill_budget;
+pub mod spill_pool;
 pub mod spilling_dedup;
 pub(crate) mod sstable_health;
 pub(crate) mod staged_pages;
@@ -105,6 +106,7 @@ pub use memtable::Memtable;
 pub use merge::merge_partitions;
 pub use observer::{ObserverConfig, ObserverMode, WriteObserver};
 pub use spill_budget::{process_spill_threshold_bytes, spill_threshold_bytes};
+pub use spill_pool::{SpillCharge, SpillPool};
 pub use store::{range_scan_resumes_total, TableStore, VectorIndexMethod};
 pub use subscription_observer::{
     SubscriptionConfig, SubscriptionFilter, SubscriptionId, SubscriptionObserver,

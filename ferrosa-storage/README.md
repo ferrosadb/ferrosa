@@ -1071,6 +1071,15 @@ controls already passed before the fix (`tests/count_payload_alloc.rs`).
   spill threshold defaults to 50% of the budget, tunable via
   `FERROSA_RANGE_SPILL_THRESHOLD_PCT` / `FERROSA_RANGE_SPILL_THRESHOLD_BYTES`
   (`process_spill_threshold_bytes`).
+- **Node-wide spill pool** (`spill_pool.rs`) — that threshold sizes ONE pool
+  (`SpillPool::global`) shared by every spilling operator in the process, not one
+  allowance per operator: each `ExternalSorter` (CQL ORDER BY, result cursors,
+  graph ORDER BY, SQL blocking operators, sidecar conversion) and SQL's
+  `ReplayBuffer` charges what it buffers and spills its own buffer when the pool
+  has no room. Total resident spill memory is the pool plus at most one row per
+  live operator (the forward-progress floor, counted in `forced_total`); the pool
+  logs the edges of exhaustion and recovery. The per-call `threshold_bytes` still
+  caps a single operator.
 - **External merge sort** (`external_sort.rs`) — bounded-memory spilling sort of
   CQL result rows (`Vec<Option<CqlValue>>`) for the unbounded `ORDER BY` (no
   `LIMIT`) shape. `ExternalSorter` moves rows into a buffer, spills sorted runs to

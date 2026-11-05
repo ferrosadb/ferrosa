@@ -38,8 +38,11 @@ use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use ferrosa_common::{CqlValue, Error, Result};
+
+use crate::spill_pool::{SpillCharge, SpillPool};
 
 /// A single result row: one optional value per output column.
 pub type Row = Vec<Option<CqlValue>>;
@@ -249,12 +252,27 @@ pub struct ExternalSorter<T = Row, C = RowOrder> {
     runs: Vec<PathBuf>,
     /// Whether at least one spill to disk occurred (observability + tests).
     spilled: bool,
+    /// This sorter's share of the node-wide spill pool: always equal to
+    /// `buffer_bytes`. The pool, not `threshold_bytes`, is what bounds the
+    /// process — `threshold_bytes` only caps one operator.
+    charge: SpillCharge,
 }
 
 impl<T: SpillRow, C: SpillOrder<T>> ExternalSorter<T, C> {
     /// Create a sorter that spills into `dir` once the in-memory buffer's
-    /// estimated size reaches `threshold_bytes`.
+    /// estimated size reaches `threshold_bytes`, or earlier when the node-wide
+    /// [`SpillPool::global`] has no room for the next row.
     pub fn new(dir: impl Into<PathBuf>, order: C, threshold_bytes: u64) -> Self {
+        Self::with_pool(dir, order, threshold_bytes, Arc::clone(SpillPool::global()))
+    }
+
+    /// [`ExternalSorter::new`] charging `pool` instead of the global pool.
+    pub fn with_pool(
+        dir: impl Into<PathBuf>,
+        order: C,
+        threshold_bytes: u64,
+        pool: Arc<SpillPool>,
+    ) -> Self {
         Self {
             dir: dir.into(),
             order,
@@ -264,7 +282,13 @@ impl<T: SpillRow, C: SpillOrder<T>> ExternalSorter<T, C> {
             buffer_bytes: 0,
             runs: Vec::new(),
             spilled: false,
+            charge: pool.charge(),
         }
+    }
+
+    /// Estimated bytes currently buffered in memory (not yet in a run).
+    pub fn buffered_bytes(&self) -> u64 {
+        self.buffer_bytes as u64
     }
 
     /// Whether any run has been spilled to disk. Used by tests/metrics to
@@ -280,8 +304,21 @@ impl<T: SpillRow, C: SpillOrder<T>> ExternalSorter<T, C> {
 
     /// Push one row (moved, never cloned). Spills the buffer to a run file if it
     /// crosses the threshold.
+    ///
+    /// Before buffering, the row's bytes are charged to the pool. When the pool
+    /// refuses, this sorter spills what it holds (returning its charge) and
+    /// tries again; when it holds nothing and the pool still refuses — other
+    /// operators hold it all — the forward-progress floor admits this one row
+    /// over the limit (counted and edge-logged by the pool).
     pub fn push(&mut self, row: T) -> Result<()> {
-        self.buffer_bytes += row.estimated_bytes();
+        let bytes = row.estimated_bytes();
+        if !self.charge.try_grow(bytes as u64) {
+            self.spill_buffer()?;
+            if !self.charge.try_grow(bytes as u64) {
+                self.charge.force_grow(bytes as u64);
+            }
+        }
+        self.buffer_bytes += bytes;
         self.buffer.push(row);
         if self.buffer_bytes >= self.threshold_bytes {
             self.spill_buffer()?;
@@ -306,6 +343,7 @@ impl<T: SpillRow, C: SpillOrder<T>> ExternalSorter<T, C> {
         w.flush()
             .map_err(|e| io_error(format!("external sort: flush run {}: {e}", path.display())))?;
         self.buffer_bytes = 0;
+        self.charge.release_all();
         self.runs.push(path);
         self.spilled = true;
         Ok(())
@@ -324,7 +362,14 @@ impl<T: SpillRow, C: SpillOrder<T>> ExternalSorter<T, C> {
         if self.runs.is_empty() {
             self.buffer.sort_by(|a, b| self.order.compare(a, b));
             let rows = std::mem::take(&mut self.buffer);
-            return Ok(SortedRows::InMemory(rows.into_iter()));
+            // The rows stay resident while a consumer reads them, so the
+            // charge travels with them.
+            let empty = self.charge.pool().charge();
+            let charge = std::mem::replace(&mut self.charge, empty);
+            return Ok(SortedRows::InMemory {
+                rows: rows.into_iter(),
+                _charge: charge,
+            });
         }
         // Spill whatever remains so the merge reads uniformly from run files.
         self.spill_buffer()?;
@@ -406,8 +451,13 @@ fn merge_runs_into<T: SpillRow, C: SpillOrder<T>>(
 /// Each item is a `Result<Row>`: the merge does real I/O, so a read error on a
 /// spilled run surfaces here rather than being swallowed.
 pub enum SortedRows<T = Row, C = RowOrder> {
-    /// Fast path: everything fit in memory; already-sorted rows.
-    InMemory(std::vec::IntoIter<T>),
+    /// Fast path: everything fit in memory; already-sorted rows. The charge
+    /// holds their bytes against the spill pool until the result is parked on
+    /// disk or dropped (conservatively, including rows already yielded).
+    InMemory {
+        rows: std::vec::IntoIter<T>,
+        _charge: SpillCharge,
+    },
     /// Spilled path: a bounded k-way merge over run files.
     Merged(KWayMerge<T, C>),
 }
@@ -433,9 +483,11 @@ impl<T: SpillRow, C: SpillOrder<T>> SortedRows<T, C> {
     /// with them); the run is created with `create_new`, so a second call into
     /// the same directory fails loud rather than overwriting rows.
     pub fn into_disk_backed(self, dir: &std::path::Path, order: C) -> Result<Self> {
-        let rows = match self {
+        // `_charge` drops at the end of this function, once the rows it
+        // accounts for are on disk.
+        let (rows, _charge) = match self {
             SortedRows::Merged(merger) => return Ok(SortedRows::Merged(merger)),
-            SortedRows::InMemory(rows) => rows,
+            SortedRows::InMemory { rows, _charge } => (rows, _charge),
         };
         let path = dir.join("parked-run.bin");
         let file = std::fs::OpenOptions::new()
@@ -458,7 +510,7 @@ impl<T: SpillRow, C: SpillOrder<T>> Iterator for SortedRows<T, C> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            SortedRows::InMemory(iter) => iter.next().map(Ok),
+            SortedRows::InMemory { rows, .. } => rows.next().map(Ok),
             SortedRows::Merged(merger) => merger.next_row().transpose(),
         }
     }
@@ -667,6 +719,77 @@ mod tests {
         assert!(!s.spilled());
         let out: Vec<i64> = s.finish().unwrap().map(|r| ival(&r.unwrap())).collect();
         assert_eq!(out, vec![1, 2, 3, 4, 5]);
+    }
+
+    /// Streaming audit, `Streaming.per_operator_thresholds_multiply`: every
+    /// operator used to receive the whole process threshold, so three of them
+    /// held three thresholds. Each sorter here is handed the full pool size as
+    /// its OWN threshold — exactly the shipped shape — and together they must
+    /// still stay within one pool plus the one-row-per-operator floor.
+    #[test]
+    fn concurrent_sorters_share_one_pool_instead_of_one_threshold_each() {
+        let row_bytes = estimate_row_bytes(&irow(0)) as u64;
+        let limit = row_bytes * 10;
+        let pool = SpillPool::new("test", limit);
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let order = RowOrder::new(vec![(0, true)]);
+        let mut sorters: Vec<_> = dirs
+            .iter()
+            .map(|d| ExternalSorter::with_pool(d.path(), order.clone(), limit, Arc::clone(&pool)))
+            .collect();
+        let mut peak = 0;
+        for v in 0..30i64 {
+            for i in 0..sorters.len() {
+                sorters[i].push(irow(29 - v)).unwrap();
+                // What the sorters really hold, not what they claim to the pool.
+                let resident: u64 = sorters.iter().map(|s| s.buffered_bytes()).sum();
+                peak = peak.max(resident);
+                assert_eq!(pool.used(), resident, "the pool charge is the resident set");
+            }
+        }
+        assert!(
+            peak <= limit + 3 * row_bytes,
+            "three sorters held {peak} bytes against a {limit}-byte pool"
+        );
+        assert!(
+            sorters.iter().any(|s| s.spilled()),
+            "the shared pool must force a spill before any single threshold is reached"
+        );
+        for s in sorters {
+            let out: Vec<i64> = s.finish().unwrap().map(|r| ival(&r.unwrap())).collect();
+            assert_eq!(out, (0..30).collect::<Vec<_>>());
+        }
+        assert_eq!(
+            pool.used(),
+            0,
+            "every charge is returned once the results drop"
+        );
+    }
+
+    /// An un-spilled result still holds its rows while a consumer reads it, so
+    /// its charge must live as long as the rows do — and parking it on disk
+    /// returns the charge.
+    #[test]
+    fn an_in_memory_result_keeps_its_charge_until_parked_or_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = SpillPool::new("test", u64::MAX / 2);
+        let order = RowOrder::new(vec![(0, true)]);
+        let mut s =
+            ExternalSorter::with_pool(dir.path(), order.clone(), u64::MAX, Arc::clone(&pool));
+        for v in [3i64, 1, 2] {
+            s.push(irow(v)).unwrap();
+        }
+        let held = pool.used();
+        assert!(held > 0);
+        let rows = s.finish().unwrap();
+        assert_eq!(
+            pool.used(),
+            held,
+            "finishing in memory must not return the charge early"
+        );
+        let rows = rows.into_disk_backed(dir.path(), order).unwrap();
+        assert_eq!(pool.used(), 0, "a parked result holds no pool bytes");
+        drop(rows);
     }
 
     /// Parking an in-memory result moves its REMAINING rows to disk, in order,

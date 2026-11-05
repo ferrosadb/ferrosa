@@ -417,6 +417,11 @@ pub struct SpillCtx {
     /// before a spill. It bounds memory, never rows — no result is ever capped.
     threshold_bytes: u64,
     stats: Arc<SpillStats>,
+    /// The memory every operator built from this context charges. The node-wide
+    /// pool by default, so concurrent operators share one budget instead of each
+    /// taking `threshold_bytes` (streaming audit,
+    /// `Streaming.per_operator_thresholds_multiply`).
+    pool: Arc<ferrosa_storage::SpillPool>,
 }
 
 impl SpillCtx {
@@ -425,11 +430,23 @@ impl SpillCtx {
             reserver,
             threshold_bytes: threshold_bytes.max(1),
             stats: Arc::new(SpillStats::default()),
+            pool: Arc::clone(ferrosa_storage::SpillPool::global()),
         }
     }
 
+    /// The same context charging `pool` instead of the node-wide pool.
+    pub fn with_pool(mut self, pool: Arc<ferrosa_storage::SpillPool>) -> Self {
+        self.pool = pool;
+        self
+    }
+
+    /// The per-operator cap. The process bound is [`SpillCtx::pool`].
     pub fn threshold_bytes(&self) -> u64 {
         self.threshold_bytes
+    }
+
+    pub fn pool(&self) -> &Arc<ferrosa_storage::SpillPool> {
+        &self.pool
     }
 
     pub fn stats(&self) -> &SpillStats {
@@ -445,8 +462,10 @@ impl SpillCtx {
 }
 
 impl Default for SpillCtx {
-    /// The process-wide default: spill under [`default_temp_root`], at the
-    /// storage engine's own detected spill threshold (`FERROSA_RANGE_SPILL_*`).
+    /// The process-wide default: spill under [`default_temp_root`], capped per
+    /// operator at the storage engine's detected spill threshold
+    /// (`FERROSA_RANGE_SPILL_*`) and bounded across operators by the node-wide
+    /// [`ferrosa_storage::SpillPool::global`].
     ///
     /// Constructing it also runs the one-shot orphan sweep, so a node that
     /// restarted mid-query does not leave its temp tables behind forever.
@@ -570,7 +589,12 @@ impl SpillSort {
     /// Reserve temp state and start sorting under `order`.
     pub fn new(ctx: &SpillCtx, order: SqlOrder, label: &'static str) -> Result<Self, SpillError> {
         let reservation = ctx.reserve(label)?;
-        let sorter = ExternalSorter::new(reservation.path(), order, ctx.threshold_bytes());
+        let sorter = ExternalSorter::with_pool(
+            reservation.path(),
+            order,
+            ctx.threshold_bytes(),
+            Arc::clone(ctx.pool()),
+        );
         Ok(Self {
             reservation,
             sorter,
@@ -683,6 +707,9 @@ pub struct ReplayBuffer {
     writer: Option<BufWriter<std::fs::File>>,
     len: usize,
     generation: usize,
+    /// `mem_bytes` charged to the context's spill pool; returned on spill,
+    /// clear and drop.
+    charge: ferrosa_storage::SpillCharge,
 }
 
 impl ReplayBuffer {
@@ -699,6 +726,7 @@ impl ReplayBuffer {
             writer: None,
             len: 0,
             generation: 0,
+            charge: ctx.pool().charge(),
         }
     }
 
@@ -710,12 +738,18 @@ impl ReplayBuffer {
         self.len == 0
     }
 
+    /// Whether this group has moved to its run file.
+    pub fn is_on_disk(&self) -> bool {
+        self.writer.is_some()
+    }
+
     /// Drop every buffered row and any file backing them, ready for the next
     /// key group. Fails loud if the file cannot be removed — a stale run left
     /// behind would be replayed into the next group's output.
     pub fn clear(&mut self) -> Result<(), SpillError> {
         self.mem = Arc::new(Vec::new());
         self.mem_bytes = 0;
+        self.charge.release_all();
         self.writer = None;
         if let Some(path) = self.file.take() {
             std::fs::remove_file(&path).map_err(|e| {
@@ -736,7 +770,15 @@ impl ReplayBuffer {
         if self.writer.is_some() {
             return self.write_one(&item);
         }
-        self.mem_bytes += item.estimated_bytes() as u64;
+        let bytes = item.estimated_bytes() as u64;
+        if !self.charge.try_grow(bytes) {
+            // The node pool is full: move this group to its run file now, and
+            // the row with it, rather than holding it past the pool. No floor is
+            // needed — once on disk, rows never return to memory.
+            self.spill_to_file()?;
+            return self.write_one(&item);
+        }
+        self.mem_bytes += bytes;
         Arc::get_mut(&mut self.mem)
             .expect("no replay outlives a push")
             .push(item);
@@ -763,7 +805,9 @@ impl ReplayBuffer {
         for item in &resident {
             self.write_one(item)?;
         }
+        drop(resident);
         self.mem_bytes = 0;
+        self.charge.release_all();
         self.stats.note_spilled(self.stats.runs() + 1);
         Ok(())
     }
@@ -1050,6 +1094,57 @@ mod tests {
             assert_eq!(from_disk, rows);
         }
         assert!(disk_ctx.stats().spilled());
+    }
+
+    /// Streaming audit, `Streaming.per_operator_thresholds_multiply`: each
+    /// operator built from `SpillCtx::default()` got the whole process
+    /// threshold. A join's replay buffer and a sort running together must share
+    /// ONE pool: with a 1 GiB per-operator threshold and a pool of a few rows,
+    /// the replay buffer has to go to disk once the sort holds the pool.
+    #[test]
+    fn a_replay_buffer_and_a_sort_share_the_node_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let one = SeqRow::new(0, row(vec![Value::Int(0), Value::Text("x".into())]))
+            .estimated_bytes() as u64;
+        let pool = ferrosa_storage::SpillPool::new("test", one * 8);
+        let ctx = ctx_in(dir.path(), 1 << 30).with_pool(Arc::clone(&pool));
+        let mut sort = SpillSort::new(
+            &ctx,
+            SqlOrder::Sql(vec![SortKey {
+                col: 0,
+                dir: SortDir::Asc,
+            }]),
+            "sort",
+        )
+        .unwrap();
+        for i in 0..8i64 {
+            sort.push(row(vec![Value::Int(i), Value::Text("x".into())]))
+                .unwrap();
+        }
+        let mut join = ReplayBuffer::new(dir.path(), &ctx, "hash_join");
+        for i in 0..8u64 {
+            join.push(SeqRow::new(
+                i,
+                row(vec![Value::Int(i as i64), Value::Text("x".into())]),
+            ))
+            .unwrap();
+            assert!(
+                pool.used() <= one * 8 + one,
+                "the pool holds {} bytes against an {}-byte limit",
+                pool.used(),
+                one * 8
+            );
+        }
+        assert!(
+            join.is_on_disk(),
+            "the replay buffer must spill when the pool is full, not at its own 1 GiB threshold"
+        );
+        let got: Vec<SeqRow> = join.replay().unwrap().map(|r| r.unwrap()).collect();
+        assert_eq!(got.len(), 8);
+        join.clear().unwrap();
+        drop(join);
+        drop(sort);
+        assert_eq!(pool.used(), 0);
     }
 
     #[test]
