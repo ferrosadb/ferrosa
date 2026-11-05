@@ -135,7 +135,9 @@ fn cell_wins(cand: &CellValue, cur: &CellValue) -> bool {
     tie_rank(cand) > tie_rank(cur)
 }
 
-fn tie_rank(c: &CellValue) -> (bool, Option<&[u8]>, i32, i32, Option<&[u8]>) {
+type CellTieRank<'a> = (bool, Option<&'a [u8]>, i32, i32, Option<&'a [u8]>);
+
+fn tie_rank(c: &CellValue) -> CellTieRank<'_> {
     (
         c.value.is_none(),
         c.value.as_deref(),
