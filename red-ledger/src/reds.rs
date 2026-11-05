@@ -86,7 +86,7 @@ pub const REDS: &[Red] = &[
         name: "codec_audit__every_path_hands_the_pipeline_one_canonical_value_type",
         module: "Ferrosa.Codec.Audit",
         claim: "every path hands the pipeline one canonical value type",
-        why: "the pipeline's value type is the codec crate's: 540 references from 101 shipping files in 12 crates, and the type's own module says it is format-specific (ferrosa-sstable/src/types.rs:1-14). Two front-end value types are converted into it at one door (ferrosa-row-bridge/src/row.rs:804) while 199 sites build cells without it",
+        why: "the pipeline's value type is the codec crate's: 540 references from 101 shipping files in 12 crates, and the type's own module says it is format-specific (ferrosa-sstable/src/types.rs:1-14). Two front-end value types are converted into it at one door (ferrosa-row-bridge/src/row.rs:804) while 210 sites in 41 shipping files build cells without it",
         witness: "none (implementation item)",
     },
     Red {

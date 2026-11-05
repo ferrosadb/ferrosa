@@ -234,7 +234,7 @@ def broken : List Item := [
    "Ferrosa.Streaming.Audit", "blocking work is queued against a capacity"⟩,
   ⟨"Codec", "every path hands the pipeline one canonical value type",
    "The value a query path produces is the on-disk format's own type, defined inside the storage-format crate. A change to how data is stored therefore changes the type every front end passes around, so the change cannot be confined to the file-format code.",
-   "ferrosa-sstable/src/types.rs:1-14 declares the type format-specific and format-shaped; 540 references to it from 101 shipping files in 12 crates (ferrosa-storage 236, ferrosa-cluster 161, ferrosa-cql 58, ferrosa-postgres 27, ferrosa-graph 23, and seven smaller holders), and 199 direct CellValue constructions in 38 shipping files bypass the one builder at ferrosa-row-bridge/src/row.rs:804",
+   "ferrosa-sstable/src/types.rs:1-14 declares the type format-specific and format-shaped; 540 references to it from 101 shipping files in 12 crates (ferrosa-storage 236, ferrosa-cluster 161, ferrosa-cql 58, ferrosa-postgres 27, ferrosa-graph 23, and seven smaller holders), and 210 direct CellValue constructions in 41 shipping files bypass the one builder at ferrosa-row-bridge/src/row.rs:804",
    "Ferrosa.Codec.Audit", "every path hands the pipeline one canonical value type"⟩,
   ⟨"Codec", "on-disk layout knowledge is confined to the codec module",
    "The names of the files a stored table is made of are written out again in four other components instead of being taken from the storage-format crate that defines them. Renaming or replacing a file layout is therefore a change in four components rather than in one.",

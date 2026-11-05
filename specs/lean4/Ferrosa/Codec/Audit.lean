@@ -125,7 +125,7 @@ def findings : List Finding := [
    "ferrosa-sstable/src/reader.rs opens a BTI table from component handles and checks no version; ferrosa-sstable/src/statistics.rs:147-172 carries no version field; ferrosa-sstable/src/toc.rs:16-37 lists filenames only. Dispatch is by which files exist, so a future format that reuses a component name is read as this one",
    "open"⟩,
   ⟨"the value type a stage receives is the canonical one, not the one the front end parsed",
-   "two front-end value types reach the storage pipeline: ferrosa-common/src/cql_type/mod.rs:103 (CqlValue) and ferrosa-sql/src/types.rs:40 (Value), both converted at ferrosa-row-bridge/src/row.rs:804 (build_row). 199 direct CellValue constructions in 38 shipping files build cells without it, so the canonicalisation is a convention rather than the only door",
+   "two front-end value types reach the storage pipeline: ferrosa-common/src/cql_type/mod.rs:103 (CqlValue) and ferrosa-sql/src/types.rs:40 (Value), both converted at ferrosa-row-bridge/src/row.rs:804 (build_row). 210 direct CellValue constructions in 41 shipping files build cells without it, so the canonicalisation is a convention rather than the only door",
    "open"⟩
 ]
 
@@ -176,7 +176,7 @@ def ledger : List SpecItem := [
    .met "Seam.canonicalise_is_per_record"⟩,
   ⟨"every path hands the pipeline one canonical value type",
    .failing
-     "the pipeline's value type is the codec crate's: 540 references from 101 shipping files in 12 crates, and the type's own module says it is format-specific (ferrosa-sstable/src/types.rs:1-14). Two front-end value types are converted into it at one door (ferrosa-row-bridge/src/row.rs:804) while 199 sites build cells without it"
+     "the pipeline's value type is the codec crate's: 540 references from 101 shipping files in 12 crates, and the type's own module says it is format-specific (ferrosa-sstable/src/types.rs:1-14). Two front-end value types are converted into it at one door (ferrosa-row-bridge/src/row.rs:804) while 210 sites in 41 shipping files build cells without it"
      "none (implementation item)"⟩,
   ⟨"on-disk layout knowledge is confined to the codec module",
    .failing
