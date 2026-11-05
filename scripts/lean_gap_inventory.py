@@ -7,12 +7,19 @@ code), so a change in a dependency invalidates the dependents. Measuring in DAG 
 each row on a fingerprint of (crate sources + transitive workspace dependency sources + toolchain)
 means a re-run only touches what actually changed.
 
+Correctness: identity uses the same project/toolchain context as elaboration.
+Last revised: 2026-11-03
+Last changed: Probe Lean in the built backend project without assuming a global elan default.
+
 Per crate it measures the *whole* crate. A module sample is opt-in (`--sample`), because a sample is
 not coverage: `ferrosa-jsonb`'s `reader` module elaborated with no Lean errors while the whole crate
 dies inside aeneas in the region pass, so a green sample can hide a red crate. There is no time
 budget by default either -- the bound that protects the host is memory, and lean_gap_report.py
-enforces it per extraction. A crate the ceiling kills is covered module by module instead: *every*
-module gets its own run and its own record, and the crate settles only when all of them concluded.
+enforces it per extraction. A crate a memory limit stops is covered module by module instead: every
+module the crate root declares gets its own run and its own record, and the crate settles only when
+all of them concluded. A kill is not a conclusion -- it replaces the reds that crate would have
+reported with nothing -- so the row carries the reason it stopped (`crate_level`, `stopped`) and
+the coverage gate still fails.
 
 Usage:
   lean_gap_inventory.py                 # measure the whole of every crate whose sources changed
@@ -36,6 +43,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -43,6 +51,11 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+try:                                      # 3.11+
+    import tomllib
+except ModuleNotFoundError:               # pragma: no cover - CI and the dev boxes are 3.11+
+    tomllib = None                        # type: ignore[assignment]
 
 REPO = Path(os.environ.get("REPO", Path.home() / "src/ferrosa-suite/ferrosa"))
 GAPS = REPO / "specs/lean/gaps"
@@ -52,6 +65,12 @@ DAG_MD = GAPS / "dag.md"
 CHARON = os.environ.get("CHARON", str(Path.home() / "src/aeneas/charon/bin/charon"))
 AENEAS = os.environ.get("AENEAS", str(Path.home() / "src/aeneas/src/_build/default/main.exe"))
 LEAN_PKG = os.environ.get("LEAN_PKG", str(Path.home() / ".local/aeneas/backends/lean"))
+# The sources the two binaries were built from. CI builds a pinned commit in a clone, so
+# the identity has to come from wherever that clone is, not from `$HOME/src/aeneas` on the
+# developer's machine -- a state.json that names the wrong build is the drift the ratchet
+# exists to catch.
+AENEAS_SRC = Path(os.environ.get("AENEAS_SRC") or Path.home() / "src/aeneas")
+CHARON_SRC = Path(os.environ.get("CHARON_SRC") or AENEAS_SRC / "charon")
 # No time budget by default. A cap turns "this crate needs eleven minutes" into "this crate is
 # unmeasured", and the sweep exists for coverage, not for a fast report. The bound that actually
 # protects the host is memory: lean_gap_report.py puts every extraction in a cgroup with a ceiling
@@ -109,7 +128,8 @@ def dag(crates: dict[str, dict]) -> list[str]:
     return order
 
 
-def tool_identity(cmd: list[str], what: str, budget: int = 300) -> str:
+def tool_identity(cmd: list[str], what: str, budget: int = 300,
+                  *, cwd: str | Path | None = None) -> str:
     """One line naming `what`, or a loud failure.
 
     A toolchain that cannot be named is a measurement that cannot be reproduced. It used to be
@@ -117,7 +137,8 @@ def tool_identity(cmd: list[str], what: str, budget: int = 300) -> str:
     dropped the whole cache -- so a host that was merely busy read as a new toolchain.
     """
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=budget, cwd=REPO)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=budget,
+                           cwd=REPO if cwd is None else cwd)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise SystemExit(f"lean_gap_inventory: cannot identify {what}: {exc} "
                          f"({cmd[0]}); point the environment at the toolchain and re-run")
@@ -132,22 +153,33 @@ def toolchain() -> dict:
     """Identity of the toolchain a measurement is valid under.
 
     `lean` is asked through `lake env lean` first, because that is what elaborates a measurement,
-    then through the elan shim, which needs no package directory and still answers while the host
-    is busy extracting. A timeout in the first form says the host was loaded, not that Lean moved.
+    then through the elan shim. Both probes run in the built backend project:
+    its lean-toolchain selects the compiler even when elan has no global default.
+    A timeout in the first form says the host was loaded, not that Lean moved.
+
+    charon and aeneas are identified by the *sources* their binaries were built from, read from
+    the checkouts named by CHARON_SRC and AENEAS_SRC. A version string cannot do this job for
+    either tool, and a developer's `$HOME/src/aeneas` is not the build CI ran.
     """
-    pin = Path.home() / "src/aeneas/charon-pin"
-    if pin.is_file():
-        # The pin file carries a comment line above the commit it names.
-        charon_id = next((ln.strip() for ln in reversed(pin.read_text().splitlines())
-                          if ln.strip() and not ln.lstrip().startswith("#")), "")
-        if not charon_id:
-            raise SystemExit(f"lean_gap_inventory: {pin} names no charon commit")
-    else:
-        charon_id = tool_identity([CHARON, "--version"], "charon")
+    charon_id = git_identity(CHARON_SRC, "charon")
+    if charon_id is None:
+        pin = AENEAS_SRC / "charon-pin"
+        if pin.is_file():
+            # The pin file carries a comment line above the commit it names.
+            charon_id = next((ln.strip() for ln in reversed(pin.read_text().splitlines())
+                              if ln.strip() and not ln.lstrip().startswith("#")), "")
+            if not charon_id:
+                raise SystemExit(f"lean_gap_inventory: {pin} names no charon commit")
+        else:
+            charon_id = tool_identity([CHARON, "--version"], "charon")
+    aeneas_id = git_identity(AENEAS_SRC, "aeneas")
+    if aeneas_id is None:
+        raise SystemExit(f"lean_gap_inventory: {AENEAS_SRC} is not a git checkout; set AENEAS_SRC "
+                         f"to the source the aeneas binary was built from")
     lean = None
     for cmd in (["lake", "env", "lean", "--version"], ["lean", "--version"]):
         try:
-            lean = tool_identity(cmd, "lean")
+            lean = tool_identity(cmd, "lean", cwd=LEAN_PKG)
             break
         except SystemExit:
             continue
@@ -155,10 +187,22 @@ def toolchain() -> dict:
         raise SystemExit("lean_gap_inventory: cannot identify lean through lake or through elan")
     return {
         "charon": charon_id,
-        "aeneas": tool_identity(["git", "-C", str(Path.home() / "src/aeneas"),
-                                 "rev-parse", "--short", "HEAD"], "aeneas"),
+        "aeneas": aeneas_id,
         "lean": lean,
     }
+
+
+def git_identity(repo: Path, what: str) -> str | None:
+    """The full commit of a checkout, or None when it is not one."""
+    try:
+        r = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                           capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    sha = (r.stdout or "").strip()
+    if r.returncode != 0 or not sha:
+        return None
+    return sha
 
 
 def crate_fingerprint(name: str, crates: dict[str, dict], tc: dict) -> str:
@@ -212,12 +256,98 @@ def should_adopt(prev: dict, fingerprint_at_recorded_tc: str, fingerprint: str,
             and toolchain_only_unresolved(recorded_tc, current_tc))
 
 
-def modules(crate_dir: Path) -> list[str]:
-    """Every top-level module in the crate, by name, in a stable order.
+# A `mod NAME;` declaration in a crate root, with whatever attributes sit directly above it.
+# Only the `;` form is matched: an inline `mod x { ... }` has no file of its own and no prefix
+# of its own to start a run from.
+_MOD_DECL = re.compile(
+    r"(?P<attrs>(?:^[ \t]*#\[[^\n]*\][ \t]*\r?\n)*)"
+    r"^[ \t]*(?:pub(?:[ \t]*\([^)\n]*\))?[ \t]+)?mod[ \t]+(?P<name>[A-Za-z_][A-Za-z0-9_]*)[ \t]*;",
+    re.MULTILINE)
+_CFG_ATTR = re.compile(r"^[ \t]*#\[[ \t]*cfg[ \t]*\((.*)\)[ \t]*\][ \t]*$", re.MULTILINE)
 
-    This is what a crate that cannot be extracted whole is covered by: one run per module instead
-    of one run for the crate. `lib.rs` is the crate root and owns no module name, so it is not a
-    prefix of its own; a directory counts when it holds Rust files.
+
+def default_features(crate_dir: Path) -> set[str]:
+    """The features a plain `--lib` build compiles with. Empty when the manifest is unreadable."""
+    if tomllib is None:
+        return set()
+    try:
+        manifest = tomllib.loads((crate_dir / "Cargo.toml").read_text())
+    except (OSError, ValueError):
+        return set()
+    default = (manifest.get("features") or {}).get("default") or []
+    return {str(name) for name in default if not str(name).startswith("dep:")}
+
+
+def _split_top_level(expr: str) -> list[str]:
+    parts, depth, current = [], 0, []
+    for char in expr:
+        if char == "," and depth == 0:
+            parts.append("".join(current))
+            current = []
+            continue
+        depth += 1 if char == "(" else -1 if char == ")" else 0
+        current.append(char)
+    if "".join(current).strip():
+        parts.append("".join(current))
+    return [part.strip() for part in parts]
+
+
+def cfg_value(expr: str, features: set[str]) -> bool | None:
+    """Whether a `cfg(...)` body holds for a plain `--lib` build; None when it cannot be told.
+
+    Only the two facts this build actually has are evaluated: `test` is false (charon compiles
+    `--lib`, never `--test`) and a `feature = "x"` is true only when `x` is on by default.
+    Anything else -- `target_os`, a cfg alias -- is unknown, and unknown means *keep the
+    module*: a module dropped on a guess is coverage lost with nothing to show for it.
+    """
+    expr = expr.strip()
+    call = re.match(r"^(any|all|not)\s*\((.*)\)$", expr, re.S)
+    if call:
+        op, values = call.group(1), [cfg_value(p, features) for p in
+                                     _split_top_level(call.group(2))]
+        if op == "not":
+            value = values[0] if values else None
+            return None if value is None else not value
+        if op == "any":
+            return True if True in values else (None if None in values else False)
+        return False if False in values else (None if None in values else True)
+    feature = re.match(r'^feature\s*=\s*"(.*)"$', expr)
+    if feature:
+        return feature.group(1) in features
+    if re.match(r"^[A-Za-z_][\w-]*$", expr):
+        return False if expr == "test" else None
+    return None
+
+
+def declared_modules(crate_dir: Path) -> list[str]:
+    """Top-level modules the crate root declares *and this build compiles*.
+
+    A directory listing is not a module list. `ferrosa-sstable`'s `src/` also holds `bin/`
+    (binary targets), files no `mod` line mentions, and modules behind `#[cfg(test)]` or a
+    non-default feature. charon only translates the library, so a prefix naming one of those
+    matches no item, produces no `.llbc`, and can never conclude -- which made the crate
+    permanently `modules-partial` however well every real module measured.
+    """
+    try:
+        text = (crate_dir / "src/lib.rs").read_text()
+    except OSError:
+        return []
+    features = default_features(crate_dir)
+    found = []
+    for match in _MOD_DECL.finditer(text):
+        gates = _CFG_ATTR.findall(match.group("attrs"))
+        if any(cfg_value(gate, features) is False for gate in gates):
+            continue
+        found.append(match.group("name"))
+    return sorted(found)
+
+
+def scan_modules(crate_dir: Path) -> list[str]:
+    """Every file stem and Rust-bearing directory under `src/`, by name.
+
+    The fallback for a crate root this script cannot read: a `lib.rs` that `include!`s its
+    modules or declares none. Narrowing the module set on a parse failure would drop coverage
+    silently, so the older, wider answer is the safe one here.
     """
     src = crate_dir / "src"
     if not src.is_dir():
@@ -229,6 +359,16 @@ def modules(crate_dir: Path) -> list[str]:
         elif path.is_dir() and any(path.glob("*.rs")):
             found.append(path.name)
     return found
+
+
+def modules(crate_dir: Path) -> list[str]:
+    """The module set a crate that cannot be extracted whole is covered by, one run each.
+
+    Read from the crate root, because a module the library does not contain has no prefix charon
+    can start from. A root that declares nothing falls back to the directory, so an unreadable
+    file never shrinks the set.
+    """
+    return declared_modules(crate_dir) or scan_modules(crate_dir)
 
 
 def sample_module(crate_dir: Path) -> str | None:
@@ -249,7 +389,9 @@ def sample_module(crate_dir: Path) -> str | None:
 
 # A stage that means the crate was actually read end to end. `aeneas-crash` counts: it is a
 # deterministic property of this crate under this toolchain, and re-running it produces the same
-# exception until the translator is fixed -- a bad answer, but an answer.
+# exception until the translator is fixed -- a bad answer, but an answer. A kill is not on this
+# list on purpose: `oom` and `killed` say the reds were never read, so treating either as an
+# answer would let a smaller host report a smaller gap.
 CONCLUDED_STAGES = ("aeneas", "compiled", "aeneas-crash")
 
 
@@ -326,12 +468,17 @@ def coverage_row(rows: dict[str, dict], crate_level: str) -> dict:
     module, so summing `lean_errors` across modules would count shared code more than once. The
     per-module rows are the authoritative numbers; this row only says how much of the crate
     concluded.
+
+    A partial row names *where* it stopped and *why*. Without that, `modules (1 measured)` -- the
+    string the 2026-11-04 job printed -- is a count with no cause, and a reader has to guess
+    whether the cap, the budget or the module itself was at fault.
     """
     stages = [r.get("stage") for r in rows.values()]
     concluded = [s for s in stages if s in CONCLUDED_STAGES]
-    return {
+    complete = bool(stages) and len(concluded) == len(stages)
+    row = {
         "scope": f"modules ({len(concluded)}/{len(stages)})",
-        "stage": "modules" if stages and len(concluded) == len(stages) else "modules-partial",
+        "stage": "modules" if complete else "modules-partial",
         "translation_errors": None,
         "lean_errors": None,
         "sorry": None,
@@ -339,10 +486,77 @@ def coverage_row(rows: dict[str, dict], crate_level: str) -> dict:
         "crate_level": crate_level,
         "modules": rows,
     }
+    if stages and not complete:
+        module, mrow = next((name, r) for name, r in rows.items()
+                            if r.get("stage") not in CONCLUDED_STAGES)
+        row["scope"] = f"{row['scope']}; stopped at {module}: {mrow.get('stage')}"
+        row["stopped"] = {"module": module, "stage": mrow.get("stage"),
+                          "error": mrow.get("error")}
+    return row
+
+
+class RunStamp:
+    """Which on-disk rows this run wrote, so its own writes are never read as a rival's.
+
+    `stale_writer` exists because two runs covering the same crate are a genuine conflict and the
+    newer result must win. A module sweep writes a row after every module, and those rows are
+    *this* run's: comparing them to the run's own start time made every write after the first
+    look like a competitor's. On 2026-11-04 that cost `ferrosa-sstable` thirteen measured modules
+    -- it kept the first row, discarded the rest -- and the ratchet correctly called the result a
+    coverage regression.
+    """
+
+    def __init__(self) -> None:
+        # Second resolution, like `measured_at` itself: two writes inside one second are one
+        # stamp, and both are still ours.
+        self.own: set[str] = set()
+        self.started: datetime | None = None
+
+    def begin(self) -> datetime:
+        """Stamp a run start and return it."""
+        self.started = datetime.now(timezone.utc)
+        return self.started
+
+    def stamp(self) -> str:
+        """Record a timestamp this run is about to write."""
+        at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        self.own.add(at)
+        return at
+
+    def is_foreign(self, measured_at: str | None) -> bool:
+        """Whether a row on disk was written by another run, after this one started."""
+        if not measured_at or measured_at in self.own or self.started is None:
+            return False
+        try:
+            return datetime.fromisoformat(measured_at) > self.started
+        except ValueError:
+            return False
+
+
+def publish(crates_on_disk: dict, state: dict, stamps: dict, owned: set[str]) -> dict:
+    """Merge this run's rows into what is on disk instead of replacing the file.
+
+    `persist` merges one crate at a time so a concurrent run's crates survive; a whole-file write
+    at the end would undo that, and would also re-instate the row of a crate this run discarded
+    in favour of a newer measurement. Each crate keeps its own stamp: a rival row can be newer
+    than the crate it competes for and older than the run's last crate, so one run-wide stamp
+    would not see it.
+    """
+    rows = crates_on_disk if isinstance(crates_on_disk, dict) else {}
+    for name in owned:
+        row = (state["crates"] or {}).get(name)
+        if row is None:
+            continue
+        stamp = stamps.get(name)
+        if stamp is not None and stamp.is_foreign((rows.get(name) or {}).get("measured_at")):
+            continue
+        rows[name] = row
+    return rows
 
 
 def measure_modules(crate: str, crates: dict[str, dict], whole: dict,
-                    on_row=None, prior: dict | None = None) -> dict:
+                    on_row=None, prior: dict | None = None,
+                    on_crate_level=None) -> dict:
     """Cover a crate that cannot be extracted whole, one run per module.
 
     `ferrosa-net` dies inside aeneas above 25 GiB, so no crate-level row is obtainable on this
@@ -351,10 +565,14 @@ def measure_modules(crate: str, crates: dict[str, dict], whole: dict,
     will not do -- a clean sample can hide a crashing crate (`ferrosa-jsonb`).
 
     `on_row` is called after each module with `(module, row)` so a sweep that is interrupted keeps
-    what it has measured; this loop runs for tens of minutes per crate.
+    what it has measured; this loop runs for tens of minutes per crate. `on_crate_level` is called
+    once with the crate-level stage, so the resumable row can say why the crate needed modules
+    instead of claiming a constant.
     """
     ident = crate.replace("-", "_")
     mods = modules(crates[crate]["dir"])
+    if on_crate_level is not None:
+        on_crate_level(whole.get("stage"))
     if not mods:
         return {"scope": "none", "stage": "no_module", "translation_errors": None,
                 "lean_errors": None, "sorry": None, "seconds": whole.get("seconds", 0),
@@ -380,7 +598,7 @@ def measure_modules(crate: str, crates: dict[str, dict], whole: dict,
 
 
 def measure(crate: str, crates: dict[str, dict], sample: bool = False,
-            on_row=None, prior: dict | None = None) -> dict:
+            on_row=None, prior: dict | None = None, on_crate_level=None) -> dict:
     """Measure the whole crate. A module sample is opt-in, because a sample is not coverage.
 
     The two units answer different questions: ferrosa-jsonb's `reader` module elaborated with no
@@ -394,10 +612,12 @@ def measure(crate: str, crates: dict[str, dict], sample: bool = False,
         # would claim a measurement this run never made.
         whole["scope"] = "crate"
         return whole
-    if whole["stage"] == "oom":
+    if whole["stage"] in ("oom", "killed"):
         # A crate that cannot be extracted whole still has to be covered whole: fall back to every
-        # module, not to one.
-        return measure_modules(crate, crates, whole, on_row=on_row, prior=prior)
+        # module, not to one. `killed` is the same fact recorded honestly: the child died of
+        # memory, but at the host's limit rather than at a ceiling this script applied.
+        return measure_modules(crate, crates, whole, on_row=on_row, prior=prior,
+                               on_crate_level=on_crate_level)
     if not sample or whole["stage"] != "timeout":
         whole["scope"] = "crate"
         return whole
@@ -543,11 +763,16 @@ def main() -> int:
         render(crates, order, state)
         return 0
 
+    owned: set[str] = set()
+    stamps: dict[str, RunStamp] = {}
     for i, (name, fp) in enumerate(todo, 1):
         print(f"[{datetime.now().strftime('%H:%M:%S')}] ({i}/{len(todo)}) {name} ...", flush=True)
-        started = datetime.now(timezone.utc)
+        owned.add(name)
+        stamp = RunStamp()
+        stamp.begin()
+        stamps[name] = stamp
 
-        def stale_writer(_name: str = name, _started: datetime = started) -> bool:
+        def stale_writer(_name: str = name, _stamp: RunStamp = stamp) -> bool:
             """True when the file already holds a measurement newer than this run's start.
 
             Two runs that cover the same crate both hold state.json open and the last writer wins,
@@ -556,15 +781,18 @@ def main() -> int:
             before an aeneas fix, and finishing 20 minutes later it overwrote the post-fix
             measurement (`aeneas`, 0 Lean errors) with its own pre-fix crash. Comparing timestamps
             is enough here because `measured_at` is the completion time of the run that wrote it.
+
+            What it must *not* catch is this run's own progress writes, which is what `_stamp`
+            is for: a module sweep writes a row per module, and treating the second one as a
+            rival's discarded the whole measurement.
             """
             try:
                 on_disk = (json.loads(STATE.read_text()).get("crates") or {}).get(_name) or {}
-                at = on_disk.get("measured_at")
-                return bool(at) and datetime.fromisoformat(at) > _started
             except (OSError, ValueError):
                 return False
+            return _stamp.is_foreign(on_disk.get("measured_at"))
 
-        def persist(_name: str = name) -> None:
+        def persist(_name: str = name, _stamp: RunStamp = stamp) -> None:
             """Write this crate's entry into the file as it is ON DISK, not as this run remembers it.
 
             `state` is loaded once at startup, so writing it straight back replaces every crate with
@@ -585,6 +813,8 @@ def main() -> int:
                 crates_on_disk = {}
                 on_disk["crates"] = crates_on_disk
             crates_on_disk[_name] = state["crates"][_name]
+            # Stamped, so the next `stale_writer` call knows this row is ours and not a rival's.
+            _stamp.own.add(state["crates"][_name]["measured_at"])
             on_disk["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
             STATE.write_text(json.dumps(on_disk, indent=2) + "\n")
             state["crates"] = on_disk["crates"]
@@ -594,29 +824,34 @@ def main() -> int:
         # interrupted run resumes instead of starting the crate over.
         prior = ((state["crates"].get(name) or {}).get("measurement") or {}).get("modules")
         partial: dict[str, dict] = dict(prior or {})
+        crate_level = {"stage": "unknown"}
+
+        def note_crate_level(stage: str | None, _level: dict = crate_level) -> None:
+            _level["stage"] = stage or "unknown"
 
         def progress(mod: str, mrow: dict, _name: str = name, _fp: str = fp,
-                     _partial: dict = partial) -> None:
-            if stale_writer():
+                     _partial: dict = partial, _level: dict = crate_level,
+                     _stamp: RunStamp = stamp) -> None:
+            if stale_writer(_name):
                 return
             _partial[mod] = mrow
-            row_p = coverage_row(_partial, "oom")
-            row_p["scope"] = f"modules ({len(_partial)} measured)"
+            row_p = coverage_row(_partial, _level["stage"])
             state["crates"][_name] = {
                 "fingerprint": _fp,
-                "measured_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "measured_at": _stamp.stamp(),
                 "measurement": row_p,
             }
             persist(_name)
 
-        row = measure(name, crates, args.sample, on_row=progress, prior=prior)
+        row = measure(name, crates, args.sample, on_row=progress, prior=prior,
+                      on_crate_level=note_crate_level)
         if stale_writer():
             print(f"    -> discarded: state.json already holds a newer measurement of {name}",
                   flush=True)
             continue
         state["crates"][name] = {
             "fingerprint": fp,
-            "measured_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "measured_at": stamp.stamp(),
             "measurement": row,
         }
         print(f"    -> {row.get('scope')} {row['stage']} transl={row.get('translation_errors')} "
@@ -626,7 +861,21 @@ def main() -> int:
         render(crates, order, state)
 
     state["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    STATE.write_text(json.dumps(state, indent=2) + "\n")
+    # Merge, never replace: `persist` kept every crate it wrote, and a crate this run discarded
+    # in favour of a newer measurement must stay discarded.
+    try:
+        on_disk = json.loads(STATE.read_text())
+        if not isinstance(on_disk, dict):
+            raise ValueError("not an object")
+    except (OSError, ValueError):
+        on_disk = {}
+    on_disk["crates"] = publish(on_disk.get("crates") or {}, state, stamps, owned)
+    for key in ("toolchain", "budgets"):
+        if state.get(key) is not None:
+            on_disk[key] = state[key]
+    on_disk["updated_at"] = state["updated_at"]
+    STATE.write_text(json.dumps(on_disk, indent=2) + "\n")
+    state["crates"] = on_disk["crates"]
     render(crates, order, state)
     print(f"wrote {STATE}, {DAG_JSON}, {DAG_MD}")
     return 0

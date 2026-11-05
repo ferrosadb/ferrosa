@@ -1,7 +1,7 @@
 {
   "stage": "aeneas",
-  "llbc": "/home/bkearns/src/ferrosa-suite/ferrosa/ferrosa_alloc_count.llbc",
-  "lean": "/home/bkearns/.hermes/cache/scratch/leangap-ferrosa-alloc-count-al4447j5/FerrosaAllocCount.lean",
+  "llbc": "/home/bkearns/.hermes/cache/scratch/ferrosa-ratchet/ferrosa_alloc_count.llbc",
+  "lean": "/home/bkearns/.hermes/cache/scratch/leangap-ferrosa-alloc-count-368hbox0/FerrosaAllocCount.lean",
   "translation_errors": 0,
   "translation_unique_reported": null,
   "translation_messages": [],
@@ -12,11 +12,11 @@
   "compiled": true,
   "crate": "ferrosa-alloc-count",
   "prefix": "ferrosa_alloc_count::*",
-  "generated_at": "2026-10-31T17:36:58+00:00",
+  "generated_at": "2026-11-01T05:54:39+00:00",
   "memory_max": "18G",
   "toolchain": {
     "charon": "/home/bkearns/src/aeneas/charon/bin/charon",
-    "aeneas": "/home/bkearns/src/aeneas/src/_build/default/main.exe",
+    "aeneas": "/home/bkearns/.hermes/cache/scratch/aeneas-pin/src/_build/default/main.exe",
     "lean_pkg": "/home/bkearns/.local/aeneas/backends/lean"
   }
 }

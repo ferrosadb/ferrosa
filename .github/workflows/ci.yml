@@ -59,6 +59,8 @@ jobs:
       # refuse to release below the latest stable tag.
       - name: Check release version comes from main
         run: python3 -m unittest -q tests/ci/test_release_version_from_main.py
+      - name: Check hardened runner DNS prerequisites
+        run: python3 -m unittest -q tests.ci.test_security_dns_prerequisite
       - name: Check CI cache workflow contract
         run: python3 -m unittest -q tests/ci/test_ci_cache_workflow.py
       - name: Check node image artifact provenance
@@ -86,12 +88,19 @@ jobs:
         run: python3 -m unittest -q tests/ci/test_check_no_new_waivers.py
       - name: Check the Lean linkage report reads Broken rows by field name
         run: python3 -m unittest -q tests/ci/test_lean_linkage_rows.py
+
+      - name: Check Lean inventory uses the backend project toolchain
+        run: python3 -m unittest -q tests.ci.test_lean_gap_inventory_state
       - name: Check the red ledger is data, not ignored tests
         run: python3 -m unittest -q tests/ci/test_red_ledger_generator.py
       - name: Check the theorem register tells counterexamples from reds
         run: python3 -m unittest -q tests/ci/test_gen_register.py
       - name: Check the extraction sync check runs without an aeneas checkout
         run: python3 -m unittest -q tests/ci/test_lean4_rust_check_sync.py
+      # The scope file is the only place an exclusion may be declared, and the emitted Lean is the
+      # evidence that it was. Both are committed, so this needs no charon, no aeneas and no network.
+      - name: Check the extraction scope explains every assumption in the generated Lean
+        run: python3 -m unittest -q tests/ci/test_lean4_rust_scope.py
       - name: Check local CI mirror prerequisites
         run: python3 -m unittest tests.ci.test_pre_push_prerequisites
       - name: Check local and CI dependency gate parity
@@ -163,6 +172,15 @@ jobs:
           tests/ci/test_lean_gap_memory_cap.py
           tests/ci/test_lean_gap_exclusions.py
           tests/ci/test_lean_gap_inventory_state.py
+      # The ratchet's rules (growth fails, shrinking passes, a mismatched toolchain is
+      # refused) and the workflow that runs it. Pure Python: no charon, no Lean, seconds.
+      - name: Ratchet and ratchet-workflow tests
+        run: >-
+          python3 -m unittest -q
+          tests.ci.test_lean_gap_ratchet
+          tests.ci.test_lean_gap_ratchet_workflow
+          tests.ci.test_lean_gap_bootstrap
+          tests.ci.test_lean_gap_diagnostics
 
   # Every `--all-features --workspace` lane must exclude the tests behind
   # `live-infra-tests`: they are absent from the default target and panic by

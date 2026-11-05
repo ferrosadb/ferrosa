@@ -34,6 +34,11 @@ Two separate ceilings, because they stop two different ways of taking the host d
   its own limits) is then a belt on top of braces rather than the only thing standing between the
   scan and the session.
 
+  Where no scope can be created -- a GitHub runner has no delegated cgroup tree -- the ceilings are
+  only requests, the child runs unbounded, and the host's own limit is what kills it. That kill is
+  recorded as `killed`, naming the requested ceiling and saying it was never applied, because a
+  record that calls it "the 9G ceiling" sends the reader to a knob nobody connected.
+
 Exit status is 0 when the crate extracts and elaborates, 1 otherwise: this is meant to run
 in CI where the exit code is the signal and the JSON is the diagnosis.
 """
@@ -101,6 +106,19 @@ def mem_swap_cap() -> str:
     return os.environ.get("LEAN_GAP_MEM_SWAP_MAX", "1G")
 
 
+def ceiling_in_force() -> str | None:
+    """The ceiling a child actually runs under, or None when none could be applied.
+
+    `mem_cap()` is a *request*. `bounded()` can only honour it inside a user cgroup scope, and
+    a GitHub runner has no delegated cgroup tree, so there it runs children unbounded. Reading
+    the requested size back as if it had been enforced records a kill under a constraint that
+    did not exist.
+    """
+    cap = mem_cap()
+    return cap if cap and scope_available() else None
+
+
+
 def scope_available() -> bool:
     """Whether a child can be put in a memory-limited user scope on this host.
 
@@ -129,6 +147,27 @@ def killed_by_cap(returncode: int, cap: str | None) -> bool:
     when a ceiling was actually in force.
     """
     return bool(cap) and returncode in (137, -9)
+
+
+def death_stage(what: str, returncode: int, applied: str | None,
+                configured: str | None) -> tuple[str | None, str | None]:
+    """`(stage, reason)` when a child died of memory, else `(None, None)`.
+
+    `applied` is the ceiling the child actually ran under and `configured` is what the
+    environment asked for. They differ on a host with no delegated cgroup, which is every CI
+    runner: there `bounded()` leaves the command alone and the kernel's own limit is what kills
+    it. Recording that as "killed at the 9G memory ceiling" sends the reader to a knob that was
+    never connected, so the two cases get different stages and different sentences. Neither is a
+    measurement, so neither may conclude a crate.
+    """
+    if killed_by_cap(returncode, applied):
+        return "oom", f"{what} killed at the {applied} memory ceiling"
+    if returncode in (137, -9) and configured:
+        return "killed", (f"{what} killed by signal {abs(returncode)}: no cgroup ceiling was in "
+                          f"force (LEAN_GAP_MEM_MAX={configured} was requested, not applied), so "
+                          f"the host's own memory limit killed it")
+    return None, None
+
 
 
 def bounded(cmd: list[str]) -> list[str]:
@@ -293,17 +332,22 @@ def extract(crate: str, prefix: str, work: Path) -> dict:
     crate_dir = crate_dir_for(crate)
     if crate_dir is None:
         return {"stage": "locate", "error": f"no crate directory for {crate}"}
+    # Asked once, before any child runs: whether a ceiling can be applied is a property of this
+    # host, and a kill has to be attributed to the ceiling that was in force, not to the one that
+    # was requested.
+    applied, configured = ceiling_in_force(), mem_cap()
 
     CHARON_TARGET.mkdir(parents=True, exist_ok=True)
     started = time.time()
     charon = run(charon_cmd(crate, prefix, exclusions(crate)),
                  cwd=crate_dir, env={"CARGO_TARGET_DIR": str(CHARON_TARGET)})
-    if killed_by_cap(charon.returncode, mem_cap()):
-        # The scope killed charon for exceeding the ceiling. That is not a translator error and not
-        # a timeout: it is this crate being too large for one whole-crate run, which is exactly the
-        # case the module sample exists for.
-        return {"stage": "oom", "memory_max": mem_cap(),
-                "error": f"charon killed at the {mem_cap()} memory ceiling"}
+    stage, why = death_stage("charon", charon.returncode, applied, configured)
+    if stage:
+        # charon died of memory. That is not a translator error and not a timeout: it is this
+        # crate being too large for one whole-crate run, which is exactly the case the module
+        # coverage exists for.
+        return {"stage": stage, "memory_max": configured, "memory_in_force": applied,
+                "error": why}
 
     # charon writes the .llbc at the workspace root, which is not the crate directory when the
     # crate is a workspace member -- look in both, and only accept files this run produced.
@@ -320,9 +364,10 @@ def extract(crate: str, prefix: str, work: Path) -> dict:
 
     t_aeneas = time.time() - 1
     aeneas = run([AENEAS, "-backend", "lean", "-dest", str(work), str(llbc_path)], cwd=crate_dir)
-    if killed_by_cap(aeneas.returncode, mem_cap()):
-        return {"stage": "oom", "memory_max": mem_cap(), "llbc": str(llbc_path),
-                "error": f"aeneas killed at the {mem_cap()} memory ceiling"}
+    stage, why = death_stage("aeneas", aeneas.returncode, applied, configured)
+    if stage:
+        return {"stage": stage, "memory_max": configured, "memory_in_force": applied,
+                "llbc": str(llbc_path), "error": why}
     raw = (aeneas.stdout or "") + (aeneas.stderr or "")
     out = "\n".join(l for l in raw.splitlines() if not l.lstrip().startswith(("Applied", "[", "|")))
     out = "\n".join(l for l in out.splitlines() if "prepasses" not in l and "\r" not in l)
@@ -364,10 +409,10 @@ def elaborate(lean_file: Path) -> dict:
     """Compile the generated module against the Aeneas Lean library."""
     res = run(["lake", "env", "lean", str(lean_file.resolve())], cwd=Path(LEAN_PKG),
               timeout=1800)
-    if killed_by_cap(res.returncode, mem_cap()):
-        return {"stage": "oom", "memory_max": mem_cap(), "lean_errors": None,
-                "sorry_declarations": None, "compiled": False,
-                "error": f"elaboration killed at the {mem_cap()} memory ceiling"}
+    stage, why = death_stage("elaboration", res.returncode, ceiling_in_force(), mem_cap())
+    if stage:
+        return {"stage": stage, "memory_max": mem_cap(), "lean_errors": None,
+                "sorry_declarations": None, "compiled": False, "error": why}
     out = (res.stdout or "") + (res.stderr or "")
     errors = []
     for line in out.splitlines():

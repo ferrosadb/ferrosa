@@ -1,0 +1,303 @@
+# What this package extracts, and why everything else is out of it.
+#
+# The extraction exists so that claims about ferrosa are claims about ferrosa's code. That purpose
+# decides the scope, and it is narrower than "the workspace":
+#
+#   * every ferrosa crate is in scope -- it is the subject;
+#   * a few dependencies are in scope by name, because their behaviour is part of what we reason
+#     about (a wire format, an identity, a compression frame);
+#   * every other dependency is out of scope, once, in [blanket];
+#   * an individual item may be left out inside an included crate, and that is an assumption, not
+#     a convenience: it is listed under [[item]] with the reason it is safe to leave unproved.
+#
+# The rules are checked by `scope-check.py` (run it: `python3 specs/lean4-rust/scope-check.py
+# check`), which fails on four things -- an item opaque in the Lean that no entry explains, an
+# entry that no longer matches anything, a workspace crate with no decision, an entry with no
+# reason/owner/date. `extract.sh` reads this file, so there is no second place where a flag could
+# be passed by hand: an exclusion that is not written here does not happen, and an exclusion that
+# happens is visible in the emitted Lean as `def ... := sorry`.
+#
+# Every entry needs `reason`, `owner` and `date`. The date is when the decision was taken, not
+# when the file was edited: an entry that has survived three regenerations unchanged is still the
+# same decision and keeps its date.
+
+schema = 1
+
+# --------------------------------------------------------------------------------------------------
+# Ferrosa's own crates. `own` is exactly the cargo workspace membership: `scope-check.py` fails if a
+# member is missing here or if a name here is not a member.
+# --------------------------------------------------------------------------------------------------
+
+[[crate]]
+name = "ferrosa"
+kind = "own"
+reason = "the engine: CQL front end, storage, cluster, everything the product is"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "ferrosa-common"
+kind = "own"
+reason = "error and value types every other crate passes around; a wrong rule here is silent damage"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "ferrosa-cdc"
+kind = "own"
+reason = "change-data-capture stream semantics: ordered delivery and gap accounting"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "ferrosa-ctl"
+kind = "own"
+reason = "operator-facing control surface over cluster state"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "ferrosa-cluster"
+kind = "own"
+reason = "membership, Raft wiring and topology decisions"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "ferrosa-cql"
+kind = "own"
+reason = "CQL statement semantics and the coordinator's execution path"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "ferrosa-flight"
+kind = "own"
+reason = "Arrow Flight endpoint: ticket and stream contracts"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "ferrosa-graph"
+kind = "own"
+reason = "graph query surface"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "ferrosa-index"
+kind = "own"
+reason = "secondary-index maintenance: the accelerator that must never change an answer"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "ferrosa-jsonb"
+kind = "own"
+reason = "JSONB value type: equality, ordering and containment decide what two documents being equal means"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "red-ledger"
+kind = "own"
+reason = "the ledger of failing properties the corpus tracks; generated data, still our code"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "ferrosa-net"
+kind = "own"
+reason = "peer framing and the transport errors a client can observe"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "ferrosa-postgres"
+kind = "own"
+reason = "PostgreSQL wire front end and its planner"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "ferrosa-row-bridge"
+kind = "own"
+reason = "row encoding shared between the CQL and SQL front ends"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "ferrosa-sched"
+kind = "own"
+reason = "scheduler: shared-pool allocation and the no-silent-loss invariant"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "ferrosa-schema"
+kind = "own"
+reason = "schema evolution: what a table means across versions"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "ferrosa-session"
+kind = "own"
+reason = "session state and prepared-statement identity"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "ferrosa-sql"
+kind = "own"
+reason = "SQL front end"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "ferrosa-sstable"
+kind = "own"
+reason = "on-disk table format: framing, compression, recovery"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "ferrosa-storage"
+kind = "own"
+reason = "memtable/commitlog/compaction: the durability path"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "ferrosa-udf"
+kind = "own"
+reason = "user-defined functions: determinism and coercion rules"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "ferrosa-view"
+kind = "own"
+reason = "materialized-view metadata and delta computation: the DDL contract"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "ferrosa-worker"
+kind = "own"
+reason = "background work: what runs without a client waiting"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "ferrosa-jepsen"
+kind = "own"
+reason = "the consistency harness; its checks are claims about the engine and are worth translating"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "ferrosa-loadgen"
+kind = "own"
+reason = "load generator: carries workload semantics (which operations, in which order) worth specifying"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "ferrosa-sparql"
+kind = "own"
+reason = "SPARQL front end"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "ferrosa-index-builder"
+kind = "own"
+reason = "offline index build: the same index rules, applied without a live write path"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "ferrosa-sim"
+kind = "own"
+reason = "simulation harness: the model the corpus compares against the engine"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "xtask"
+kind = "own"
+reason = "workspace build tasks; listed because it is a member, not because it has data semantics"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "ferrosa-alloc-count"
+kind = "own"
+reason = "allocation accounting tool; its counter arithmetic is a property worth checking"
+owner = "bkearns"
+date = "2026-11-04"
+
+# --------------------------------------------------------------------------------------------------
+# Critical dependencies. A dependency is `critical` when a rule inside it is a rule ferrosa relies
+# on, so "out of scope" would be an assumption dressed as a boundary. Keep this list short: every
+# entry is a promise to reason about somebody else's code.
+# --------------------------------------------------------------------------------------------------
+
+[[crate]]
+name = "serde"
+kind = "critical"
+reason = "the serialized form of schema, view metadata and index definitions is a wire and on-disk contract; what serde accepts and rejects is part of that contract"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "serde_json"
+kind = "critical"
+reason = "the JSONB representation and the conformance corpus are JSON documents; number and duplicate-key handling decide equality"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "uuid"
+kind = "critical"
+reason = "table and view identities are UUIDs whose parsing and variant rules appear in stored keys"
+owner = "bkearns"
+date = "2026-11-04"
+
+[[crate]]
+name = "lz4_flex"
+kind = "critical"
+reason = "an SSTable compression frame is only readable by an implementation whose block format the reader agrees with"
+owner = "bkearns"
+date = "2026-11-04"
+
+# --------------------------------------------------------------------------------------------------
+# The blanket exclusion: everything else. One entry, because a second category-level exclusion is
+# how a scope file stops meaning anything. Naming a dependency we have looked at and decided
+# against is different from this: that is an explicit [[crate]] entry and it is welcome.
+# --------------------------------------------------------------------------------------------------
+
+[blanket]
+reason = "every other dependency is out of scope: the extraction reasons about ferrosa and the four crates above, not about its dependency tree. Charon still needs a dependency's types to compile a crate, but nothing in it is extracted, so a dependency cannot be silently half-in-scope"
+owner = "bkearns"
+date = "2026-11-04"
+
+# --------------------------------------------------------------------------------------------------
+# Item exclusions inside included crates. Each one is a place where the Lean says `sorry` instead of
+# a body, so a reader of the generated module sees it -- or, where the translator cannot carry the
+# declaration, a row in `scope.lock` says so and `scope-check.py` refuses a row this file does not
+# explain. `kind` must be `opaque`: an entry that asked for `--exclude` would delete the declaration
+# instead, and silence is what this file prevents.
+#
+# There is no entry here yet, and that is a fact about the translator rather than a decision. The
+# first one belongs to `ferrosa-view`, whose derived `Deserialize` visitors cannot be translated:
+# `visit_map` for `ViewMetadata` reaches 8,192 exits and the run dies at the memory ceiling, and the
+# other four derives fail their `visit_bytes`/`visit_enum` bodies. Excluding all five by
+# `{impl serde_core::de::Deserialize<…>}` lets the crate translate in 28 s at 2.3 GiB peak instead
+# of never, but the module still does not elaborate: aeneas reports `[Error] Unimplemented: found an
+# occurrence of a lifetime constraint` on `ViewMetadata::primary_key` and `validate::base_pk_names`,
+# both of which return `impl Iterator<Item = &'_ str>`. That is a translator gap, not a scope
+# question, so the entries go in when the module does -- an entry here that no module can satisfy is
+# the rot this file exists to prevent. See SYNC.md, "What the scope buys, measured".
+# --------------------------------------------------------------------------------------------------

@@ -2,10 +2,38 @@
 
 Status: in progress. Measured 2026-10-31 with aeneas `9b1eec9` (branch
 `fix/unsupported-sig-is-not-fatal`, merged as ferrosadb/aeneas#1 at
-`90110883`), charon `7b462d9159db2ed3015162352183906a30bfafc6`.
+`90110883`), charon `7b462d9159db2ed3015162352183906a30bfafc6`. Re-baselined 2026-11-01
+under aeneas `80b690a9` when the ratchet was installed -- see "The ratchet, and the pin CI
+builds" below.
 
 Source of the numbers: `ferrosa/specs/lean/gaps/*.json`, produced by
-`scripts/lean_gap_inventory.py` (charon -> aeneas -> `lake env lean`). 1057 reds.
+`scripts/lean_gap_inventory.py` (charon -> aeneas -> `lake env lean`). 1057 reds — that
+figure is the sum of `lean_errors` over every record file, including the per-module rows
+for `ferrosa-net` (294 of them). A crate row now supersedes its module rows, so the same
+inventory reports **763 reds across the 25 crates that concluded**; compare it with that,
+not with 1057.
+
+## The ratchet, and the pin CI builds
+
+The inventory is no longer refreshed by hand. `scripts/lean_gap_ratchet.py` compares the
+records in `specs/lean/gaps/` against the committed `baseline.json` and fails when any
+error class grew -- a class that appeared counts as growth from zero, and a crate that
+used to elaborate and now crashes or times out is a coverage regression, not a fix.
+Shrinking always passes and is recorded with `lean_gap_ratchet.py update`, which refuses
+to raise a count. `.github/workflows/lean-gap-ratchet.yml` rebuilds the pinned toolchain,
+re-measures the gated crates and runs that check weekly.
+
+The pin is a commit on `ferrosadb/aeneas` main -- **aeneas `80b690a9`**, charon
+`7b462d9` (from that checkout's `charon-pin`), Lean 4.35.0 from the Aeneas backend's
+`lean-toolchain`. It has to be a fetchable commit: the identity recorded before this was
+`d8480a0e`, which is on no remote ref (it was replaced by the merged noncomputable-section
+change), so a CI job pinning it could never reproduce the numbers it was comparing. The
+records were re-measured under `80b690a9`; no Lean error class moved, and the only count
+that changed was `red-ledger`'s sorry holes (0 -> 3).
+
+The ceiling covers 451 of the 763 reds, over 19 crates. Five crates are measured but not
+gated, because one measurement of them does not fit a hosted runner;
+`specs/lean/gaps/ratchet-scope.txt` names each one and why.
 
 ## What the reds actually are
 
