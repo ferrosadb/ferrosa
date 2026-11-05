@@ -7,9 +7,12 @@ Lean corpus reasons about a specified machine, Aeneas explicitly cannot translat
 only sees the paths a test happens to execute. So the only defence is that the set is small, known,
 and reviewed.
 
-**The ledger is enforced.** `tests/ci/test_unsafe_ledger.py` scans `*/src/**/*.rs` for unsafe
-constructs outside `#[cfg(test)]` modules and fails the build when the per-file counts drift from the
-table below. Adding an `unsafe` site requires adding a row — the count is the ratchet.
+**The ledger is enforced, twice, in different directions.** `tests/ci/test_unsafe_ledger.py` scans
+`*/src/**/*.rs` for unsafe constructs outside `#[cfg(test)]` bodies and fails the build when the
+per-file counts drift from the table below — the count is the ratchet. `scripts/ci-gates/guard-unsafe.py`
+is the admission rule: it fails on a site with no `[[allow]]` entry, on a `perf` or `unknown` kind, on
+an entry whose site is gone, and on a permitted site whose `// SAFETY:` comment names no mechanism.
+The rule itself, and the definition of evidence, is `docs/unsafe-policy.md`.
 
 ## Policy
 
@@ -30,8 +33,8 @@ table below. Adding an `unsafe` site requires adding a row — the count is the 
 
 | Scope | Sites |
 | --- | --- |
-| Production code (`src/`, outside `#[cfg(test)]`) | **60** |
-| `#[cfg(test)]` modules inside `src/` | 65 |
+| Production code (`src/`, outside `#[cfg(test)]`) | **59** |
+| `#[cfg(test)]` modules inside `src/` | 66 |
 | `tests/` and `examples/` | 299 |
 | WASM example bindings (`examples/**/src/`) | 58 |
 
@@ -52,16 +55,22 @@ Production sites by crate:
 | `ferrosa-sstable/src/dio_align.rs` | 2 | `mem::zeroed`, `posix_memalign`-style alignment | the zeroed type has no invalid all-zero bit pattern | queued |
 | `ferrosa-storage/src/write_set_spill.rs` | 2 | `memmap2::Mmap` | the file is never truncated or written while mapped | audited |
 | `ferrosa-storage/src/flush.rs` | 2 | `memmap2::Mmap`, `posix_fadvise` | same, plus the fd is valid for the call | mapping audited, `fadvise` queued |
-| `ferrosa-schema/src/registry.rs` | 1 | `libc` | return code checked | queued |
 | `ferrosa-sstable/src/io.rs` | 1 | `memmap2::Mmap` | the file is never truncated or written while mapped | audited |
 | `ferrosa-storage/src/index/sidecar.rs` | 1 | `memmap2::Mmap` | same | audited |
 | `ferrosa-storage/src/write_set_stage.rs` | 1 | `memmap2::Mmap` | same | audited |
 
+**The count fell from 60 to 59 because one site was misclassified, not removed.**
+`ferrosa-schema/src/registry.rs`'s `env::remove_var` sits inside `#[cfg(test)] impl Schema`, which
+compiles only under `cargo test`. The scanner matched `#[cfg(test)]` only before a `mod`, so it counted
+that `impl` body as production. It is now excluded, and the test-only total below includes it. The
+same construct is why `ferrosa-schema` cannot be sealed — see *Sealed crates*.
+
 **Five of the seven mappings are audited; nothing else is.** The table is the queue, not a
 certificate; `Status` moves to `audited` only when a reviewer has checked the invariant against the
 call sites and recorded what they checked — the three artifacts for each are in *The mapping
-contract* below. 33 of the 188 sites in `src/` carry a `SAFETY:` comment today, so most rows also need
-the comment written before they can be audited at all.
+contract* below. Most sites still carry no `SAFETY:` comment, and one that does may be restating the
+call rather than the mechanism; `docs/unsafe-policy.md` §3 defines the difference, and
+`scripts/ci-gates/guard-unsafe.py` reports the per-site figure on every run.
 
 ## The mapping contract
 
@@ -127,18 +136,30 @@ Not all 60 sites are equally dangerous. Ranked by the consequences of getting th
 
 ## Sealed crates
 
-These crates have no `unsafe` in `src/` and carry `#![forbid(unsafe_code)]`, so any addition is a
-compile error:
+These crates have no `unsafe` anywhere in `src/` — production **or** `#[cfg(test)]` — and carry
+`#![forbid(unsafe_code)]`, so any addition is a compile error:
 
 `ferrosa-cdc`, `ferrosa-cluster`, `ferrosa-common`, `ferrosa-ctl`, `ferrosa-flight`, `ferrosa-graph`,
-`ferrosa-index`, `ferrosa-index-builder`, `ferrosa-jsonb`, `ferrosa-jsonb-conformance`, `ferrosa-net`,
-`ferrosa-row-bridge`, `ferrosa-sched`, `ferrosa-session`, `ferrosa-sim`, `ferrosa-sparql`,
-`ferrosa-sql`, `ferrosa-view`, `ferrosa-worker`.
+`ferrosa-index`, `ferrosa-index-builder`, `ferrosa-jsonb`, `ferrosa-net`, `ferrosa-row-bridge`,
+`ferrosa-sched`, `ferrosa-session`, `ferrosa-sim`, `ferrosa-sparql`, `ferrosa-sql`, `ferrosa-view`,
+`ferrosa-worker`, `red-ledger`, `xtask`, `tools/alloc-count`.
 
-Not sealed, and why: `ferrosa-storage`, `ferrosa-sstable`, `ferrosa-udf`, `ferrosa-cql`,
-`ferrosa-schema`, `ferrosa-loadgen`, `ferrosa-jepsen`, and the `ferrosa` binary all contain at least one
-production site. Tooling crates (`fuzz`, `xtask`, `sstable-compat`) are unsealed by omission rather
-than by argument.
+Not sealed, and why:
+
+- `ferrosa-storage`, `ferrosa-sstable`, `ferrosa-udf`, `ferrosa-cql`, `ferrosa-loadgen` and the
+  `ferrosa` binary contain at least one production site.
+- **`ferrosa-postgres`, `ferrosa-jepsen` and `ferrosa-schema` have zero production sites but cannot be
+  sealed yet.** `#![forbid(unsafe_code)]` covers `#[cfg(test)]` code too, and each of them reaches for
+  the platform from a test: an allocation-counting `GlobalAlloc` in `ferrosa-postgres/src/mvcc.rs`,
+  `env::set_var` in `ferrosa-jepsen/src/test_env.rs`, `env::remove_var` in
+  `ferrosa-schema/src/registry.rs`. They are one test-helper away from being sealed, and that is the
+  cheapest remaining ratchet in the tree.
+- `ferrosa-jsonb-conformance` is a separate workspace with no `src/` at all — only `tests/` — so there
+  is no crate root to seal.
+- Tooling crates (`fuzz`, `sstable-compat`) are unsealed by omission rather than by argument.
+
+Removing a `#![forbid(unsafe_code)]` is a reviewed change, not a side effect — see
+`docs/unsafe-policy.md` §4.
 
 ## Adding a site
 

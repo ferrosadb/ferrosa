@@ -92,18 +92,19 @@ is routine and needs no separate review — that direction always shrinks the se
 ## 5. Inventory
 
 Measured on `main` at `de3eeb2c`, by `scripts/ci-gates/guard-unsafe.py` scanning `*/src/**/*.rs` and
-excluding `#[cfg(test)]` modules — inline and `mod x;` declarations, transitively.
+excluding `#[cfg(test)]` bodies — inline modules, `mod x;` declarations resolved transitively, and
+`#[cfg(test)] impl`/`fn`, which the older scanner in `tests/ci/test_unsafe_ledger.py` did not
+recognise.
 
-**60 sites in 17 files across 7 crates.** One of the 60 (`ferrosa-schema/src/registry.rs`, an
-`env::remove_var` inside a `#[cfg(test)] impl`) sits in a test-only `impl` block that the older
-scanner in `tests/ci/test_unsafe_ledger.py` does not recognise, because it only looks for
-`#[cfg(test)] mod`. The true production count is **59**; the inventory slice of this branch corrects
-the ledger and the scanner together.
+**59 production sites in 16 files across 6 crates**, plus one test-only site in `ferrosa-schema` that
+the ledger previously counted as production (60). That site is `env::remove_var` inside a
+`#[cfg(test)] impl Schema`, so the corrected count is 59; the ledger and the scanner were fixed
+together.
 
 | File | Sites | Kinds |
 | --- | --- | --- |
 | `ferrosa-storage/src/commitlog/segment.rs` | 11 | `perf` 10, `syscall` 1 |
-| `ferrosa-udf/src/asc.rs` | 10 | `ffi` 7, `unknown` 3 |
+| `ferrosa-udf/src/asc.rs` | 10 | `unknown` 5, `ffi` 5 |
 | `ferrosa/src/main.rs` | 5 | `allocator` 5 |
 | `ferrosa-sstable/src/pump.rs` | 5 | `syscall` 3, `unknown` 2 |
 | `ferrosa/src/jemalloc_tuning.rs` | 4 | `ffi` 4 |
@@ -115,7 +116,6 @@ the ledger and the scanner together.
 | `ferrosa-sstable/src/dio_align.rs` | 2 | `layout` 1, `syscall` 1 |
 | `ferrosa-storage/src/flush.rs` | 2 | `mmap` 1, `syscall` 1 |
 | `ferrosa-storage/src/write_set_spill.rs` | 2 | `mmap` 2 |
-| `ferrosa-schema/src/registry.rs` | 1 | `syscall` 1 (test-only) |
 | `ferrosa-sstable/src/io.rs` | 1 | `mmap` 1 |
 | `ferrosa-storage/src/index/sidecar.rs` | 1 | `mmap` 1 |
 | `ferrosa-storage/src/write_set_stage.rs` | 1 | `mmap` 1 |
@@ -124,16 +124,20 @@ Totals by kind:
 
 | Kind | Sites |
 | --- | --- |
-| `syscall` | 15 |
-| `unknown` | 12 |
-| `ffi` | 11 |
+| `syscall` | 14 |
+| `unknown` | 14 |
 | `perf` | 10 |
+| `ffi` | 9 |
 | `mmap` | 6 |
 | `allocator` | 5 |
 | `layout` | 1 |
 | `sync-primitive` | 0 |
 | `ioctl` | 0 |
-| **Total** | **60** |
+| **Total** | **59** |
+
+Twenty-four of the 59 are findings (`perf` 10, `unknown` 14): 41% of the tree's production `unsafe`
+is not permitted by the invariant. Every one is recorded in `scripts/ci-gates/unsafe-allow.toml`
+under `[[debt]]` with the safe alternative that removes it.
 
 ## 6. Findings
 
@@ -170,10 +174,11 @@ the invariant; it just stops being UB.
 | 6 | `range_merger.rs:1450,1565,1577` | `Box::leak` + `&*runs_ptr` to extend a `Box<[...]>` to `'a`, a manual `unsafe impl Send`, and `Box::from_raw` in `Drop`. | Store the `Box<[Vec<..>]>` in the struct and hand out indices, not references; or `Arc<[Vec<..>]>`, which is `Send + Sync` for free and removes the manual `Send` and the `Drop` impl. |
 | 7 | `pump.rs:448` | `slice::from_raw_parts(self.ptr, self.len)` — a raw pointer walk over buffers owned by the flusher batch. | Make `PumpBuffer<'a>` hold `&'a [u8]` and let `as_slice` be `self.bytes`. The batch already outlives the call; the raw pointer only exists because the struct erased the borrow. |
 | 8 | `pump.rs:529` | `unsafe impl Send for FileSink`, justified by "the `Vec`'s own allocation moves, not the data the stale pointers pointed to". | Goes away with 7: once `FileSink` holds no stale raw pointers, `Send` is automatic. |
-| 9 | `udf/asc.rs:252,253` | `unsafe impl Send + Sync for SendActive(Rc<ActiveCtx>)` — laundering an `Rc` across wasmtime's `Send + Sync` host-callback bound. | Keep the active-context cell in a `thread_local!` and reach it from the host closure by key; nothing then crosses a thread boundary and no impl is needed. |
-| 10 | `udf/asc.rs:299` | `&mut *active` reinterpreted as `&mut StoreContextMut<'static, ShimData>`. | Same thread-local as 9; the push/pop discipline becomes a scoped borrow instead of a `'static` assertion. |
+| 9 | `udf/asc.rs:234,235` | `unsafe impl Send + Sync for CtxPtr(NonNull<JSContext>)` — declared so wasmtime's host-closure bound is met, while the type's own comment says single-threaded use only. The impl contradicts the documented usage. | Keep the context in a `thread_local!` keyed by the calling store; nothing `Send`-required then holds the pointer. |
+| 10 | `udf/asc.rs:252,253` | `unsafe impl Send + Sync for SendActive(Rc<ActiveCtx>)` — laundering an `Rc` across the same bound. std has `Arc` and `Mutex`, so this is convenience, not a missing primitive. | `thread_local!` for the active-context cell, reached by key from the host closure. |
+| 11 | `udf/asc.rs:299` | `&mut *active` reinterpreted as `&mut StoreContextMut<'static, ShimData>`. | Same thread-local as 10; the push/pop discipline becomes a scoped borrow instead of a `'static` assertion. |
 
-Sites 7–10 are ranked below 5–6 because they are on the SSTable-flush and UDF-compile paths, not the
+Sites 7–11 are ranked below 5–6 because they are on the SSTable-flush and UDF-compile paths, not the
 per-append path.
 
 ### Structural symptoms attached to otherwise-permitted sites
@@ -198,19 +203,27 @@ A crate with zero production sites carries `#![forbid(unsafe_code)]`, so a later
 error instead of a code-review omission. An existing `forbid` is never removed as a side effect of
 anything (§4).
 
-Sealed (24): `ferrosa-cdc`, `ferrosa-cluster`, `ferrosa-common`, `ferrosa-ctl`, `ferrosa-flight`,
-`ferrosa-graph`, `ferrosa-index`, `ferrosa-index-builder`, `ferrosa-jsonb`, `ferrosa-jsonb-conformance`,
-`ferrosa-net`, `ferrosa-postgres`, `ferrosa-row-bridge`, `ferrosa-sched`, `ferrosa-session`,
-`ferrosa-sim`, `ferrosa-sparql`, `ferrosa-sql`, `ferrosa-view`, `ferrosa-worker`, `red-ledger`,
-`xtask`, `tools/alloc-count`, `ferrosa-jepsen`.
+Sealed (21): `ferrosa-cdc`, `ferrosa-cluster`, `ferrosa-common`, `ferrosa-ctl`, `ferrosa-flight`,
+`ferrosa-graph`, `ferrosa-index`, `ferrosa-index-builder`, `ferrosa-jsonb`, `ferrosa-net`,
+`ferrosa-row-bridge`, `ferrosa-sched`, `ferrosa-session`, `ferrosa-sim`, `ferrosa-sparql`,
+`ferrosa-sql`, `ferrosa-view`, `ferrosa-worker`, `red-ledger`, `xtask`, `tools/alloc-count`.
+
+Sealing `red-ledger` and `xtask` on this branch is new: both had zero `unsafe` anywhere in `src/`.
+Every other sealed crate already carried the attribute; none was removed.
 
 Not sealed, and why:
 
-- `ferrosa-storage`, `ferrosa-sstable`, `ferrosa-udf`, `ferrosa-cql`, `ferrosa-loadgen`, `ferrosa` —
-  at least one production site (§5).
-- `ferrosa-schema` — its only site is `registry.rs:2078`, inside `#[cfg(test)] impl Schema`.
-  `#![forbid(unsafe_code)]` covers test code too, so the crate cannot be sealed until that line is
-  gone; the fix is to stop reading the environment in a test helper, not to allow the unsafe.
+- `ferrosa-storage` (24), `ferrosa-sstable` (11), `ferrosa-udf` (10), `ferrosa` (9), `ferrosa-cql` (3),
+  `ferrosa-loadgen` (2) — at least one production site (§5).
+- **`ferrosa-postgres`, `ferrosa-jepsen`, `ferrosa-schema` have zero production sites and still cannot
+  be sealed.** `#![forbid(unsafe_code)]` covers `#[cfg(test)]` code too, and each reaches for the
+  platform from a test: an allocation-counting `GlobalAlloc` in `ferrosa-postgres/src/mvcc.rs`,
+  `env::set_var` in `ferrosa-jepsen/src/test_env.rs`, `env::remove_var` in
+  `ferrosa-schema/src/registry.rs`. Each is one test-helper away from being sealable, and that is the
+  cheapest remaining ratchet in the tree. `ferrosa-schema`'s site is the one the ledger used to count
+  as production.
+- `ferrosa-jsonb-conformance` is a separate workspace with no `src/` — only `tests/` — so there is no
+  crate root to seal.
 
 ## 8. The gate
 
@@ -218,24 +231,42 @@ Not sealed, and why:
 python3 scripts/ci-gates/guard-unsafe.py            # exit 0 clean, 1 violation, 2 cannot scan
 ```
 
-CI runs it in the `unsafe-allowlist` job, alongside its own unit tests. It fails on:
+CI runs it in the `unsafe-allowlist` job, alongside its own unit tests. The allowlist has two tables:
+`[[allow]]` for permitted sites, and `[[debt]]` for the recorded findings — `perf` and `unknown` sites
+that exist today, each with the `fix` that removes it. Keeping them apart is what makes the rule
+enforceable while the tree still contains findings: a `perf` site cannot be admitted as *permitted*, it
+can only be admitted as *debt*, and adding a debt entry is a reviewed change (§4).
+
+It fails on:
 
 | Failure | Meaning |
 | --- | --- |
-| `unlisted` | `unsafe` present in production code with no `[[allow]]` entry. |
+| `unlisted` | `unsafe` present in production code with neither an `[[allow]]` nor a `[[debt]]` entry. |
 | `stale` | An entry whose site no longer exists — rot in the other direction. Delete the entry in the commit that removes the site. |
-| `perf` / `unknown` | The entry's kind is a finding, not a category. |
-| `missing-field` | An entry without `file`, `item`, `kind`, `reason`, `owner`, `since`. |
-| `no-safety-comment` | A listed site with no `// SAFETY:` comment above it. |
-| `weak-safety-comment` | The comment exists but names no mechanism. Heuristic: it must contain one of a small set of mechanism words (`because`, `only if`, `guarded`, `initializes`, `outlives`, `immutable`, `renamed`, `checked`, `exclusive`, `declared before`, `never`) **and** be at least 40 characters. Short or purely descriptive comments fail. |
+| `duplicate` | More entries than sites for one `(file, item)`. |
+| `perf` / `unknown` in `[[allow]]` | The entry's kind is a finding, not a permitted kind. Move it to `[[debt]]`. |
+| `not-a-finding` | A `[[debt]]` entry whose kind is a permitted one — a permitted site belongs in `[[allow]]`. |
+| `missing-field` | An entry without `file`, `item`, `kind`, `reason`, `owner`, `since`; a `[[debt]]` entry also needs `fix`. |
+| `no-safety-comment` | A permitted site with no `// SAFETY:` comment above it. |
+| `weak-safety-comment` | The comment exists but names no mechanism. Heuristic: at least 40 characters and at least one term from a mechanism vocabulary (`because`, `only if`, `guarded`, `initializes`, `outlives`, `immutable`, `renamed`, `checked`, `exclusive`, `declared before`, `never`, `for the duration`, `owns`, `scoped`, `cannot`, `lifetime`, `synchronized`, `atomic`, `valid`, …). A comment that only restates the call fails. The gate prints the vocabulary; it is a floor, not a substitute for §3's test. |
 | `sealed` | A production site in a crate carrying `#![forbid(unsafe_code)]`. |
 
-`item` is the enclosing `fn`/`impl` header, not a line number, so entries survive code moving.
+`item` is the enclosing `fn`/`impl` name with its signature and generics stripped, not a line number,
+so entries survive a parameter being added.
+`[[debt]]` entries are exempt from the comment check on purpose: a finding is a site whose justification
+is absent or invalid, so requiring the comment it lacks would make the two classes contradict each
+other. The debt entry's own `reason` and `fix` stand in its place.
+
+Every class above has a RED test in `tests/ci/test_guard_unsafe.py`, and each test was mutation-checked:
+the corresponding check was disabled and the test was confirmed to fail.
 
 ## 9. Adding a site
 
 1. Write the mechanism sentence in a `// SAFETY:` comment above the block, in the shape §3 asks for.
-2. Add a `[[allow]]` entry with `file`, `item`, `kind`, `reason`, `owner`, `since`.
-3. If `kind` is `perf` or `unknown`, stop — the gate and the reviewer will both reject it. Rewrite the
-   construct safely, or bring it to the operator with the benchmark.
+2. Add an `[[allow]]` entry with `file`, `item`, `kind`, `reason`, `owner`, `since`.
+3. If the kind would be `perf` or `unknown`, stop — the gate and the reviewer will both reject it as a
+   permitted site. Rewrite the construct safely, or bring it to the operator with the benchmark. If it
+   must land anyway, it goes in `[[debt]]` with a `fix`, and that is a reviewed change (§4).
 4. If the crate is sealed, do not remove the seal. That is §4.
+5. When a site is converted, delete its entry in the **same commit**. `stale` is a failure, because a
+   stale allowlist is how this kind of gate rots.
