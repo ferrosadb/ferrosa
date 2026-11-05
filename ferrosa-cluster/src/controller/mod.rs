@@ -203,6 +203,12 @@ pub struct ModeController {
     /// readiness so neither path waits on a failed Raft runtime.
     pub(super) consensus_health: Arc<ConsensusHealth>,
     pub(super) recovery_admission: Arc<crate::raft::quarantine::RecoveryAdmission>,
+    pub(super) repair_preparations: Arc<
+        parking_lot::Mutex<
+            HashMap<RaftGroupId, crate::raft::recovery_session::RepairPreparationState>,
+        >,
+    >,
+    pub(super) repair_preparation_changed: Arc<tokio::sync::Notify>,
     /// Per-follower replication progress, fed by the leader's snapshot pusher
     /// and Raft network; read by readiness and the metrics endpoint.
     pub(super) replication_health: Arc<crate::raft::replication_health::ReplicationHealth>,
@@ -577,6 +583,8 @@ impl ModeController {
             self_weak: std::sync::OnceLock::new(),
             consensus_health,
             recovery_admission: Arc::new(crate::raft::quarantine::RecoveryAdmission::new()),
+            repair_preparations: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            repair_preparation_changed: Arc::new(tokio::sync::Notify::new()),
             replication_health: Arc::new(crate::raft::replication_health::ReplicationHealth::new()),
             leader_contact: Arc::new(crate::raft::leader_contact::LeaderContact::new()),
             mode: schema.deployment_mode_handle(),
@@ -755,6 +763,8 @@ impl ModeController {
             self_weak: std::sync::OnceLock::new(),
             consensus_health: Arc::new(ConsensusHealth::new()),
             recovery_admission: Arc::new(crate::raft::quarantine::RecoveryAdmission::new()),
+            repair_preparations: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            repair_preparation_changed: Arc::new(tokio::sync::Notify::new()),
             replication_health: Arc::new(crate::raft::replication_health::ReplicationHealth::new()),
             leader_contact: Arc::new(crate::raft::leader_contact::LeaderContact::new()),
             mode: {
@@ -841,6 +851,8 @@ impl ModeController {
             self_weak: std::sync::OnceLock::new(),
             consensus_health: Arc::new(ConsensusHealth::new()),
             recovery_admission: Arc::new(crate::raft::quarantine::RecoveryAdmission::new()),
+            repair_preparations: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            repair_preparation_changed: Arc::new(tokio::sync::Notify::new()),
             replication_health: Arc::new(crate::raft::replication_health::ReplicationHealth::new()),
             leader_contact: Arc::new(crate::raft::leader_contact::LeaderContact::new()),
             mode: {
@@ -996,7 +1008,7 @@ impl ModeController {
     /// Pair replicas accept read traffic. Mutation and DDL dispatch enforce
     /// primary authority rather than rejecting a connection before its opcode.
     pub fn is_cql_ready(&self) -> bool {
-        if !self.consensus_health.is_healthy() {
+        if !self.consensus_is_healthy() {
             return false;
         }
         self.accepts_cql_connections()
@@ -1120,8 +1132,34 @@ impl ModeController {
     }
 
     /// Synchronous fast path used by readiness and CQL dispatch.
+    #[cfg(test)]
+    pub(crate) async fn wait_for_raft_repair_preparation(
+        &self,
+        dc: &str,
+    ) -> Result<Arc<crate::raft::recovery_session::ActiveRaftRepair>, String> {
+        loop {
+            let notified = self.repair_preparation_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self
+                .repair_preparations
+                .lock()
+                .get(&RaftGroupId::for_dc(dc))
+            {
+                Some(crate::raft::recovery_session::RepairPreparationState::Prepared(value)) => {
+                    return Ok(Arc::clone(value))
+                }
+                Some(crate::raft::recovery_session::RepairPreparationState::Failed(error)) => {
+                    return Err(error.clone())
+                }
+                _ => {}
+            }
+            notified.await;
+        }
+    }
+
     pub fn consensus_is_healthy(&self) -> bool {
-        self.consensus_health.is_healthy()
+        self.consensus_health.is_healthy() && self.recovery_admission.admits().is_ok()
     }
 
     /// Get local host_id.

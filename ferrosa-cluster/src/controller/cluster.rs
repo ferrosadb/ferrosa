@@ -1227,6 +1227,26 @@ impl ModeController {
     /// 5. ClusterCoordinator for replica-aware writes
     /// 6. Swaps write path, DDL path, and cluster state atomically
     pub(super) fn transition_to_cluster(&self, peers: Vec<(Uuid, SocketAddr)>) {
+        // Repeated peer discovery must retain the existing session and its file leases.
+        if let Some(preparation) = self
+            .repair_preparations
+            .lock()
+            .get(&crate::raft::RaftGroupId::for_dc(&self.config.data_center))
+        {
+            match preparation {
+                crate::raft::recovery_session::RepairPreparationState::Pending => {
+                    tracing::debug!("Raft repair preparation is still draining")
+                }
+                crate::raft::recovery_session::RepairPreparationState::Prepared(active) => {
+                    tracing::debug!(epoch = active.epoch, required_snapshot_index = active.preparation.required_snapshot_index, committed_target = ?active.preparation.committed_target, "Raft repair awaits verified installation")
+                }
+                crate::raft::recovery_session::RepairPreparationState::Failed(reason) => {
+                    tracing::warn!(%reason, "Raft repair preparation remains quarantined")
+                }
+            }
+            return;
+        }
+
         // A node whose cluster was dissolved into a pair never runs Raft again
         // (t_47bbeb66): rebuilding it from the persisted log would rejoin the
         // old group beside the pair.
@@ -1486,6 +1506,84 @@ impl ModeController {
                 return;
             }
         };
+
+        if state_machine.recovery_requires_repair() {
+            physical_registration.bind_log(log_store.committed_reader());
+            let Some(session) = state_machine.recovery_session_handle() else {
+                tracing::error!("quarantined state machine has no recovery session");
+                return;
+            };
+            drop(state_machine);
+            drop(log_store);
+            let group = crate::raft::RaftGroupId::for_dc(&self.config.data_center);
+            let epoch = self.recovery_admission.epoch();
+            let admission = Arc::clone(&self.recovery_admission);
+            let workers = Arc::clone(&self.physical_raft_workers);
+            let groups = self.raft_groups.load_full();
+            let preparations = Arc::clone(&self.repair_preparations);
+            let changed = Arc::clone(&self.repair_preparation_changed);
+            preparations.lock().insert(
+                group,
+                crate::raft::recovery_session::RepairPreparationState::Pending,
+            );
+            ferrosa_net::task_pool::TaskPool::current("raft-repair-prepare").spawn(async move {
+                let result = async {
+                    admission
+                        .drain_publications_async(epoch)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let retired = workers.stop_group_for_recovery(group, &groups).await?;
+                    admission
+                        .drain_publications_async(epoch)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let prepared = ferrosa_net::task_pool::TaskPool::current("raft-repair-journal")
+                        .spawn_blocking(move || {
+                            let preparation = session.prepare_from_retired(&retired)?;
+                            Ok::<_, std::io::Error>(Arc::new(
+                                crate::raft::recovery_session::ActiveRaftRepair::new(
+                                    preparation,
+                                    epoch,
+                                    session,
+                                    retired,
+                                ),
+                            ))
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .map_err(|e| e.to_string())?;
+                    admission
+                        .drain_publications_async(prepared.epoch)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let record = prepared
+                        .record()
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| "prepared repair journal disappeared".to_owned())?;
+                    if record.retirement_scope != Some(prepared.preparation.retirement_scope) {
+                        return Err("prepared repair scope changed".to_owned());
+                    }
+                    Ok::<_, String>(prepared)
+                }
+                .await;
+                preparations.lock().insert(
+                    group,
+                    match result {
+                        Ok(value) => {
+                            crate::raft::recovery_session::RepairPreparationState::Prepared(value)
+                        }
+                        Err(error) => {
+                            crate::raft::recovery_session::RepairPreparationState::Failed(error)
+                        }
+                    },
+                );
+                drop(groups);
+                drop(workers);
+                drop(preparations);
+                changed.notify_waiters();
+            });
+            return;
+        }
 
         // Reconcile the state machine against the log store's purge point
         // BEFORE openraft reads either. Two durable facts have to agree for a

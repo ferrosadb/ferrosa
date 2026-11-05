@@ -1472,3 +1472,6 @@ Other groups are not physically stopped. The opaque retirement scope does not
 clear a fault, authorize storage adoption, or reopen traffic; no release exists
 without verified live-storage activation. Normal and rebuilt state machines and
 log readers share the controller's recovery admission.
+
+
+Recovery sessions retain a durable pre-effect guard beside each Raft group directory. After an unsafe restart, native startup keeps admission closed, drains that group’s actual state-machine owner, and records the retirement scope plus committed and purged bounds for repair preparation. Repeated peer discovery retains that session rather than reopening its files. Preparation does not authorize data installation, Core replacement, or healthy admission; verified physical-data installation and the corresponding release path remain unfinished.
