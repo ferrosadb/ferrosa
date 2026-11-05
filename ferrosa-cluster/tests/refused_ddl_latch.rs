@@ -282,3 +282,162 @@ async fn a_refused_drop_keyspace_surfaces_and_leaves_the_core_serving() {
         "the Core must still be running after the refused DROP KEYSPACE: {running:?}"
     );
 }
+
+/// A CREATE whose local registration is refused must not fence the node.
+///
+/// The refusal arrives the way the DROP refusal above does: a DROP this node
+/// could not complete leaves the previous incarnation's directory (and its
+/// pending-sweep record) in place, so the same-name CREATE refuses to load it —
+/// `engine.register_table` cannot sweep what it cannot remove. That is a command
+/// the node refused, not a log it could not apply: the entry is committed,
+/// canonical metadata agrees on every replica, and every other node registers
+/// the table normally. Latching here would take a healthy replica out of service
+/// over one directory with no online repair.
+///
+/// The caller must still see the refusal, the Core must survive it, and a later
+/// DROP of that table must still work — the repair is a DDL, not a restart.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_over_an_unremovable_directory_surfaces_and_leaves_the_core_serving() {
+    const KS: &str = "reg_agree_ks";
+    const TBL: &str = "reg_agree_tbl";
+
+    let cluster = TestCluster::with_voters_and_engines(3).await;
+    let leader_id = cluster
+        .wait_for_all_voters_leader(Duration::from_secs(10))
+        .await
+        .expect("all voters should agree on a leader");
+
+    propose_on_node(
+        &cluster,
+        leader_id,
+        RaftOp::CreateKeyspace(keyspace_named(KS)),
+    )
+    .await
+    .expect("CreateKeyspace applies");
+    propose_on_node(
+        &cluster,
+        leader_id,
+        RaftOp::CreateTable(Box::new(table_named(KS, TBL))),
+    )
+    .await
+    .expect("CreateTable applies");
+
+    let tid = TableId::new(KS, TBL);
+    let leader_raft = cluster.raft_for_node_id(leader_id).expect("leader raft");
+    let table_dir = {
+        let nodes = cluster.nodes();
+        let leader = nodes
+            .iter()
+            .find(|n| n.node_id == leader_id)
+            .expect("leader node present");
+        let engine = leader.engine.as_ref().expect("engine-backed leader");
+        for i in 0..3 {
+            engine
+                .write(
+                    &tid,
+                    &DecoratedKey::new(PartitionKey::new(format!("old{i}").into_bytes())),
+                    row(b"stale", 1),
+                    1,
+                )
+                .unwrap_or_else(|e| panic!("seed row on leader: {e}"));
+        }
+        engine.flush(&tid).expect("flush seed rows");
+        let table_dir = engine.data_dir().join("sstables").join(tid.to_string());
+        assert!(
+            table_dir.exists(),
+            "precondition: the table directory exists on disk before the DROP"
+        );
+        table_dir
+    };
+
+    {
+        let _restore = make_undeletable(&table_dir);
+
+        // The DROP is refused (bytes survive) but not fatal. It leaves the
+        // pending-sweep record behind.
+        let drop = execute_via_raft(
+            &leader_raft,
+            &DdlOperation::DropTable {
+                keyspace: KS.to_string(),
+                table: TBL.to_string(),
+            },
+        )
+        .await;
+        assert!(
+            drop.is_err(),
+            "precondition: the DROP cannot complete while the directory is unremovable"
+        );
+
+        // The same-name CREATE must sweep that directory before it loads it, and
+        // it cannot: registration is refused.
+        let create = execute_via_raft(
+            &leader_raft,
+            &DdlOperation::CreateTable(Box::new(table_named(KS, TBL))),
+        )
+        .await;
+        let refusal = create.expect_err(
+            "a CREATE that cannot clear the previous incarnation's directory must be \
+             refused, not reported as success",
+        );
+        // A statement refusal carrying the state machine's reason — not a Raft
+        // fault. A `RaftError` here is the defect: the apply fence treated an
+        // unremovable directory as a storage failure and latched the machine.
+        assert!(
+            matches!(
+                &refusal,
+                ferrosa_cluster::ClusterError::Internal(reason)
+                    if reason.contains("refused on the applying node")
+                        && reason.contains("register_table")
+            ),
+            "a refused CREATE must surface as the DDL path's statement refusal, not \
+             as a Raft fault (got {refusal:?})"
+        );
+
+        let running = leader_raft.metrics().borrow().running_state.clone();
+        assert!(
+            running.is_ok(),
+            "the RaftCore must survive a CREATE whose registration it refused, but \
+             it is no longer running: {running:?}"
+        );
+
+        // The node kept applying after the refusal: it published the refused
+        // entry, so the keyspace it was created in is still visible in state.
+        let state = {
+            let nodes = cluster.nodes();
+            let node = nodes
+                .iter()
+                .find(|n| n.node_id == leader_id)
+                .expect("leader node present");
+            node.state_machine.snapshot_state().await
+        };
+        assert!(
+            state.keyspaces.contains_key(KS),
+            "the node stopped applying after a refused CREATE"
+        );
+    }
+
+    // The directory is usable again. A later DROP of the table the node could
+    // not register must still work — the repair path is a DDL, not a restart.
+    let dropped = propose_on_node(
+        &cluster,
+        leader_id,
+        RaftOp::DropTable {
+            keyspace: KS.to_string(),
+            table: TBL.to_string(),
+        },
+    )
+    .await
+    .expect("a DROP after the refused CREATE must apply");
+    assert!(
+        matches!(dropped, RaftResponse::Ok),
+        "a DROP after the refused CREATE must succeed once the directory is \
+         removable again, got {dropped:?}"
+    );
+
+    let running = leader_raft.metrics().borrow().running_state.clone();
+    assert!(
+        running.is_ok(),
+        "the Core must still be running: {running:?}"
+    );
+}
