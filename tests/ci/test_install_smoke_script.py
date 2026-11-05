@@ -57,6 +57,32 @@ class InstallSmokeScriptTest(unittest.TestCase):
             "consume the whole wall-clock budget",
         )
 
+    def test_readiness_accepts_the_structured_readiness_report(self):
+        """ferrosa-memory answers /healthz/ready with a JSON ReadinessReport.
+
+        `serve_http_with_readiness_report` (ferrosa-memory-core/src/http.rs) is
+        what ferrosa-memory-mcp installs, and it answers the probe with the
+        serialized report — `{"ready":true,...,"schema_migrations_complete":...}`
+        — not the bare `ready` the plain `serve_http` route returns. Comparing
+        the whole body to `ready` therefore never matched, so a server that was
+        ready in seconds was reported as "never became ready" for the full 300 s
+        budget. Accept BOTH shapes: the JSON report (current) and the bare word
+        (older daemons, and what this host's install still serves).
+        """
+        start_memory = self._start_memory()
+
+        self.assertIn(
+            '"ready":true',
+            start_memory,
+            "the readiness probe must recognise the JSON ReadinessReport body; "
+            "an exact match on 'ready' can never pass against it",
+        )
+        self.assertIn(
+            '= "ready"',
+            start_memory,
+            "the bare-word body must keep working for daemons that still serve it",
+        )
+
     def test_timeout_reports_why_instead_of_blaming_ferrosa(self):
         start_memory = self._start_memory()
 
