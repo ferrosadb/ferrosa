@@ -47,7 +47,11 @@ transactional isolation. Ordinary domain rejection remains a command error
 response and does not poison the machine. A failed persisted snapshot restore
 keeps the prior Raft metadata and closes startup readiness instead of continuing
 with a partially restored shared schema; the snapshot and log files are retained
-for recovery. The apply latch is currently process-local, not an automatic repair
+for recovery. Persisted startup also refuses a different physical table UUID before
+retirement: the file can lag committed DROP/CREATE and durable rows in the newer
+incarnation. Installed snapshots use a separate source path. This preservation
+check does not reconstruct the retained committed target or repair a failed
+projection. The apply latch is currently process-local, not an automatic repair
 mechanism. Snapshot-file publication has a separate per-path writer fence. A
 file cannot regress behind its stored log or membership position when an older
 builder finishes. Each attempt owns a unique staging file; it flushes the file,

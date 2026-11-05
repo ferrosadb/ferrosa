@@ -394,6 +394,14 @@ impl std::fmt::Display for RecoveryError {
 
 impl std::error::Error for RecoveryError {}
 
+/// A local file supplies a durable metadata cut, not the ordering of an
+/// already-registered physical incarnation against retained committed entries.
+#[derive(Clone, Copy)]
+enum SnapshotSource {
+    Persisted,
+    Installed,
+}
+
 /// The current-snapshot slot one live state machine shares with its builders.
 type SharedSnapshotSlot = Arc<parking_lot::RwLock<Option<(SnapshotMeta<u64, BasicNode>, Vec<u8>)>>>;
 
@@ -925,7 +933,17 @@ impl FerrosStateMachine {
         meta: &SnapshotMeta<u64, BasicNode>,
         bytes: &[u8],
     ) -> Result<(), StorageIOError<u64>> {
-        let _physical = self.physical_admission().map_err(|error| *error)?;
+        self.apply_snapshot_data_from(meta, bytes, SnapshotSource::Installed)
+            .map_err(|error| *error)
+    }
+
+    fn apply_snapshot_data_from(
+        &mut self,
+        meta: &SnapshotMeta<u64, BasicNode>,
+        bytes: &[u8],
+        source: SnapshotSource,
+    ) -> Result<(), Box<StorageIOError<u64>>> {
+        let _physical = self.physical_admission()?;
         let lifecycle_schema = self.schema.clone();
         let _lifecycle = lifecycle_schema
             .as_ref()
@@ -942,16 +960,16 @@ impl FerrosStateMachine {
         let previous_membership = self.last_membership.clone();
         self.last_applied = meta.last_log_id;
         self.last_membership = meta.last_membership.clone();
-        if let Err(error) = self.sync_schema_and_engine_from_state("Raft snapshot") {
+        if let Err(error) = self.sync_schema_and_engine_from_state("Raft snapshot", source) {
             self.state = previous_state;
             self.last_applied = previous_applied;
             self.last_membership = previous_membership;
             let reason = format!("Raft snapshot local restoration failed: {error}");
             self.apply_failure = Some(reason.clone());
             self.physical_lifecycle.fail(&reason);
-            return Err(StorageIOError::read_state_machine(to_any_error(
+            return Err(Box::new(StorageIOError::read_state_machine(to_any_error(
                 std::io::Error::other(reason),
-            )));
+            ))));
         }
         self.sync_ring();
         self.unregister_tables_dropped_by_snapshot(&dropped);
@@ -1079,7 +1097,11 @@ impl FerrosStateMachine {
         }
     }
 
-    fn sync_schema_and_engine_from_state(&self, context: &'static str) -> Result<(), String> {
+    fn sync_schema_and_engine_from_state(
+        &self,
+        context: &'static str,
+        source: SnapshotSource,
+    ) -> Result<(), String> {
         let _lifecycle = self.schema.as_ref().map(|schema| schema.lifecycle_write());
         // A same-name table with a different UUID owns none of the local old
         // incarnation's rows. Retire physical state before publishing its identity.
@@ -1115,6 +1137,15 @@ impl FerrosStateMachine {
                     }
                     _ => {}
                 }
+            }
+            // Startup must not roll physical data backwards to a lagging
+            // snapshot before retained committed DROP/CREATE entries replay.
+            // Without that chronology, even a valid local UUID cannot prove
+            // which incarnation may be erased. Preserve and refuse instead.
+            if let (SnapshotSource::Persisted, Some(table)) = (source, retired.first()) {
+                return Err(format!(
+                    "{context}: persisted snapshot cannot establish replacement order for {table}; local physical data preserved, verified committed-log recovery required"
+                ));
             }
             // Validate every table before retiring any data.
             for tid in retired {
@@ -1337,7 +1368,12 @@ impl FerrosStateMachine {
                 .map_err(|e| StorageIOError::read_state_machine(to_any_error(e)))?;
             let persisted: PersistedSnapshot = bincode::deserialize(&bytes)
                 .map_err(|e| StorageIOError::read_state_machine(to_any_error(e)))?;
-            self.apply_snapshot_data(&persisted.meta, &persisted.bytes)?;
+            self.apply_snapshot_data_from(
+                &persisted.meta,
+                &persisted.bytes,
+                SnapshotSource::Persisted,
+            )
+            .map_err(|error| *error)?;
             self.publish_snapshot(persisted.meta, persisted.bytes);
             self.physical_lifecycle.applied(self.last_applied);
             Ok(true)
@@ -4107,8 +4143,11 @@ mod tests {
             (incoming.keyspace.clone(), incoming.name.clone()),
             incoming.clone(),
         );
-        sm.sync_schema_and_engine_from_state("known incarnation regression")
-            .unwrap();
+        sm.sync_schema_and_engine_from_state(
+            "known incarnation regression",
+            SnapshotSource::Installed,
+        )
+        .unwrap();
         assert!(engine.read(&tid, &key).unwrap().is_some());
         assert_eq!(
             schema.snapshot().tables[&(incoming.keyspace, incoming.name)].id,
@@ -4148,8 +4187,11 @@ mod tests {
             incoming.clone(),
         );
         assert!(
-            sm.sync_schema_and_engine_from_state("unbound incarnation regression")
-                .is_err(),
+            sm.sync_schema_and_engine_from_state(
+                "unbound incarnation regression",
+                SnapshotSource::Installed
+            )
+            .is_err(),
             "data without an authoritative local UUID must not be assigned an incoming UUID"
         );
         assert!(
@@ -4160,6 +4202,106 @@ mod tests {
             .snapshot()
             .tables
             .contains_key(&(incoming.keyspace, incoming.name)));
+    }
+
+    /// The durable snapshot may lag a successfully applied DROP/CREATE and
+    /// durable user writes in the new UUID. Startup has no authority to erase
+    /// that UUID merely to install the older metadata before log replay.
+    #[tokio::test]
+    async fn startup_snapshot_preserves_newer_durable_incarnation_before_replay() {
+        use ferrosa_common::{DecoratedKey, PartitionKey};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let path = dir.path().join("startup.snapshot.bin");
+        let old = simple_table("startup_ks", "survivor");
+        let mut current = old.clone();
+        current.id = Uuid::new_v4();
+        let mut sm = FerrosStateMachine::with_side_effects_and_snapshot_path(
+            Arc::clone(&schema),
+            Arc::clone(&engine),
+            path.clone(),
+        );
+        sm.apply(vec![
+            make_entry(1, 1, RaftOp::CreateKeyspace(simple_keyspace("startup_ks"))),
+            make_entry(1, 2, RaftOp::CreateTable(Box::new(old.clone()))),
+        ])
+        .await
+        .unwrap();
+        sm.build_snapshot().await.unwrap();
+        let original_snapshot = std::fs::read(&path).unwrap();
+        sm.apply(vec![
+            make_entry(
+                1,
+                3,
+                RaftOp::DropTable {
+                    keyspace: "startup_ks".into(),
+                    table: "survivor".into(),
+                },
+            ),
+            make_entry(1, 4, RaftOp::CreateTable(Box::new(current.clone()))),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(sm.last_applied.unwrap().index, 4);
+        let tid = TableId::new("startup_ks", "survivor");
+        let key = DecoratedKey::new(PartitionKey::new(b"new-incarnation-row".to_vec()));
+        engine
+            .write(
+                &tid,
+                &key,
+                ferrosa_sstable::types::Row {
+                    clustering: vec![],
+                    cells: vec![],
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
+                },
+                1,
+            )
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        assert!(engine.read(&tid, &key).unwrap().is_some());
+        assert_eq!(
+            schema.snapshot().tables[&("startup_ks".into(), "survivor".into())].id,
+            current.id
+        );
+        drop(sm);
+        drop(engine);
+        drop(schema);
+
+        let (cold, pending) = StorageEngine::open(
+            test_storage_config(dir.path(), ferrosa_storage::SyncStrategyConfig::Batch, 0),
+            None,
+        )
+        .unwrap();
+        cold.register_system_tables().unwrap();
+        cold.register_table(current.to_storage_schema()).unwrap();
+        cold.replay_mutations(pending).unwrap();
+        let cold = Arc::new(cold);
+        let local_schema = Arc::new(test_schema_instance());
+        local_schema
+            .create_keyspace_internal(simple_keyspace("startup_ks"))
+            .unwrap();
+        local_schema.create_table_internal(current.clone()).unwrap();
+        assert!(
+            cold.read(&tid, &key).unwrap().is_some(),
+            "cold positive control must load durable new-UUID SSTable rows"
+        );
+        let mut restarted = FerrosStateMachine::with_side_effects_and_snapshot_path(
+            Arc::clone(&local_schema),
+            Arc::clone(&cold),
+            path.clone(),
+        );
+        let result = restarted.recover_from_persisted_snapshot();
+        assert!(cold.read(&tid, &key).unwrap().is_some(), "startup must not delete newer durable rows while restoring a lagging snapshot before committed replay");
+        assert!(result.is_err(), "without committed chronology authority startup must preserve and refuse, not guess that the incoming UUID is newer");
+        assert!(restarted.last_applied.is_none());
+        assert_eq!(
+            local_schema.snapshot().tables[&("startup_ks".into(), "survivor".into())].id,
+            current.id
+        );
+        assert_eq!(std::fs::read(path).unwrap(), original_snapshot);
     }
 
     #[test]
@@ -4188,7 +4330,7 @@ mod tests {
             (old.keyspace.clone(), old.name.clone()),
             replacement.clone(),
         );
-        sm.sync_schema_and_engine_from_state("incarnation regression")
+        sm.sync_schema_and_engine_from_state("incarnation regression", SnapshotSource::Installed)
             .unwrap();
         assert!(
             engine.read(&tid, &key).unwrap().is_none(),
@@ -4220,6 +4362,7 @@ mod tests {
             },
         );
         let extended_columns = extended.to_storage_schema().regular_columns.len();
+        let incarnation = extended.id;
         source
             .apply(vec![make_entry(
                 1,
@@ -4233,7 +4376,10 @@ mod tests {
         // Recovering node: engine ALREADY holds the table, with the stale
         // (pre-ALTER) column set — the situation node3 was stuck in.
         let engine = test_engine(dir.path());
-        let stale = simple_table("agent_memory", "entity_store").to_storage_schema();
+        let mut stale = simple_table("agent_memory", "entity_store");
+        // ALTER changes columns, not the table incarnation.
+        stale.id = incarnation;
+        let stale = stale.to_storage_schema();
         let stale_columns = stale.regular_columns.len();
         engine.register_table(stale).unwrap();
         assert!(
