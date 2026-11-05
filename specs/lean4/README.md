@@ -67,7 +67,10 @@ over a concrete configuration, and each use says so above it.
 | 33 | [`Ferrosa/Unimplemented.lean`](Ferrosa/Unimplemented.lean) | What is absent rather than wrong, plus the ledger items that are requirements, missing proofs, measurements, inherited protocol behaviour, or closed. |
 | 34 | [`Ferrosa/Witnesses.lean`](Ferrosa/Witnesses.lean) | One `#check` per witness any ledger names. Ledger witnesses are strings, so without this a deleted theorem leaves the ledger citing a name that no longer exists. |
 | 35 | [`Ferrosa/Storage/Streaming.lean`](Ferrosa/Storage/Streaming.lean) | Memory and the pipeline: zero-copy transforms, `inbound` bytes never written, peak memory independent of input size, and the page bound that is in rows rather than bytes. |
-| 36 | [`FINDINGS.md`](FINDINGS.md) | Every inconsistency, with the theorem that exhibits it. |
+| 36 | [`Ferrosa/Codec/Canonical.lean`](Ferrosa/Codec/Canonical.lean) | The one canonical in-memory form, and the equality a fidelity claim uses: a tombstone and a zero-length value are different types, an expired cell is still a value, a map loses its entry order and nothing else. |
+| 37 | [`Ferrosa/Codec/Seam.lean`](Ferrosa/Codec/Seam.lean) | The codec interface and its two laws, two deliberately different codecs, and `store_roundtrip` quantified over any codec — so the `fnf` swap re-establishes the codec's law and every store obligation comes back for free. Plus what the framing has to deliver: a short record refused, a verified record consuming exactly its bytes. |
+| 38 | [`Ferrosa/Codec/Audit.lean`](Ferrosa/Codec/Audit.lean) | How closed the seam actually is: 540 references to the format's value type from 101 shipping files in 12 crates, 437 literal component filenames in 21, and the four places the canonicalisation changes data on the way in. |
+| 39 | [`FINDINGS.md`](FINDINGS.md) | Every inconsistency, with the theorem that exhibits it. |
 
 ## How to read a spec file
 

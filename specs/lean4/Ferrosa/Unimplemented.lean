@@ -41,6 +41,7 @@ import Ferrosa.Streaming.Audit
 import Ferrosa.Sql.Consistency
 import Ferrosa.Raft.Obligations
 import Ferrosa.SystemTables.Projection
+import Ferrosa.Codec.Audit
 
 namespace Ferrosa.Unimplemented
 
@@ -102,7 +103,8 @@ def areas : List Area := [
   ⟨"Ferrosa.Testing.Guarantees", Ferrosa.Testing.Guarantees.ledger, Ferrosa.Testing.Guarantees.main⟩,
   ⟨"Ferrosa.Unsafe.Invariants", Ferrosa.Unsafe.ledger, Ferrosa.Unsafe.main⟩,
   ⟨"Ferrosa.Raft.Obligations", Ferrosa.Raft.ledger, Ferrosa.Raft.main⟩,
-  ⟨"Ferrosa.SystemTables.Projection", Ferrosa.SystemTables.ledger, Ferrosa.SystemTables.main⟩
+  ⟨"Ferrosa.SystemTables.Projection", Ferrosa.SystemTables.ledger, Ferrosa.SystemTables.main⟩,
+  ⟨"Ferrosa.Codec.Audit", Ferrosa.Codec.ledger, Ferrosa.Codec.main⟩
 ]
 
 /-- Look up an area ledger by module key. -/
@@ -134,7 +136,7 @@ theorem area_keys_are_distinct : (areas.map (·.key)).Nodup := by decide
 
 /-- Pinned so that dropping a ledger with no reds — which the total cannot see — is still a build
     failure rather than a quietly smaller registry. -/
-theorem registered_ledger_count : areas.length = 24 := by decide
+theorem registered_ledger_count : areas.length = 25 := by decide
 
 /-! ## The total, derived
 
@@ -156,7 +158,7 @@ theorem ledgerTotal_is_the_registry_sum :
     two, the grant projection one, `6c270518` closed one, the projection layer added seven, the
     quarantine design added six, and the memory-discipline audit added an area of thirty-six items
     with fourteen reds. -/
-theorem ledgerTotal_pinned : ledgerTotal = 97 := by decide
+theorem ledgerTotal_pinned : ledgerTotal = 102 := by decide
 
 /-- Print every registered ledger, with the header its area module prints. -/
 def printAllLedgers : IO Unit := do
@@ -392,7 +394,7 @@ theorem every_red_is_classified_exactly_once (a : Area) (ha : a ∈ areas) :
     (a.ledger.filter isRed).all (fun i => rows.count (a.key, i.name) == 1) = true := by
   obtain ⟨k, l, p⟩ := a
   simp only [areas, List.mem_cons, List.not_mem_nil, or_false] at ha
-  rcases ha with ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩
+  rcases ha with ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩
   all_goals decide
 
 /-- **(c)** Each area's rows number exactly that area's reds. -/
@@ -400,7 +402,7 @@ theorem per_area_counts (a : Area) (ha : a ∈ areas) :
     (rows.filter fun r => r.1 == a.key).length = redCount a.ledger := by
   obtain ⟨k, l, p⟩ := a
   simp only [areas, List.mem_cons, List.not_mem_nil, or_false] at ha
-  rcases ha with ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩
+  rcases ha with ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩
   all_goals decide
 
 /-- The pairs the discharged rows name: not part of the classification, but still checked. -/

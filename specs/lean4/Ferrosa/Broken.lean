@@ -231,15 +231,36 @@ def broken : List Item := [
   ⟨"Streaming", "blocking work is queued against a capacity",
    "A snapshot's bytes are handed to a blocking pool whose queue has no limit. If the pool is busy the payload waits in that queue, holding its memory, and nothing bounds how many wait.",
    "TaskPool::spawn_blocking forwards to tokio's blocking pool (ferrosa-common/src/task_pool.rs:60-68), whose queue is unbounded, and the closure owns a full snapshot byte vector cloned at ferrosa-cluster/src/raft/state_machine.rs:2571",
-   "Ferrosa.Streaming.Audit", "blocking work is queued against a capacity"⟩
+   "Ferrosa.Streaming.Audit", "blocking work is queued against a capacity"⟩,
+  ⟨"Codec", "every path hands the pipeline one canonical value type",
+   "The value a query path produces is the on-disk format's own type, defined inside the storage-format crate. A change to how data is stored therefore changes the type every front end passes around, so the change cannot be confined to the file-format code.",
+   "ferrosa-sstable/src/types.rs:1-14 declares the type format-specific and format-shaped; 540 references to it from 101 shipping files in 12 crates (ferrosa-storage 236, ferrosa-cluster 161, ferrosa-cql 58, ferrosa-postgres 27, ferrosa-graph 23, and seven smaller holders), and 199 direct CellValue constructions in 38 shipping files bypass the one builder at ferrosa-row-bridge/src/row.rs:804",
+   "Ferrosa.Codec.Audit", "every path hands the pipeline one canonical value type"⟩,
+  ⟨"Codec", "on-disk layout knowledge is confined to the codec module",
+   "The names of the files a stored table is made of are written out again in four other components instead of being taken from the storage-format crate that defines them. Renaming or replacing a file layout is therefore a change in four components rather than in one.",
+   "437 literal component filenames in 21 shipping files (ferrosa-storage 365, ferrosa-cluster 43, ferrosa-ctl 22, ferrosa-index-builder 7) while the codec exports them as toc::DATA and siblings (ferrosa-sstable/src/toc.rs:16-37); ferrosa-storage/src/flush.rs:123-129 additionally re-derives the Statistics header's local-deletion-time width and sentinel",
+   "Ferrosa.Codec.Audit", "on-disk layout knowledge is confined to the codec module"⟩,
+  ⟨"Codec", "the canonical form is a function of the request, not of the writer's clock",
+   "A delete, and a value written with an expiry, record the time they were processed rather than a time the write carries. Running the same statement twice therefore stores two different values, and a retry can decide which of two writes wins.",
+   "ferrosa-row-bridge/src/row.rs:815-817 stamps a null's local deletion time from SystemTime::now() and :826-830 computes an expiry as now + ttl; ferrosa-storage/src/merge.rs:177-190 compares that field on the equal-timestamp path, so which of two writes wins can differ between two executions of one statement",
+   "Ferrosa.Codec.Audit", "the canonical form is a function of the request, not of the writer's clock"⟩,
+  ⟨"Codec", "a deletion time is computed the same, and width-safe, on every path",
+   "One internal writer computes an expiry by dividing a microsecond timestamp straight into a signed 32-bit second count with no bound, while two other paths clamp the same quantity. Past 2038 a cell written by the first reads as already expired.",
+   "ferrosa-cluster/src/telemetry/writer.rs:131 casts (ts / 1_000_000) as i32 with no clamp; ferrosa-graph/src/executor/expand.rs:6082 and ferrosa-graph/src/adjacency/reconcile.rs:866 clamp the same quantity into u32",
+   "Ferrosa.Codec.Audit", "a deletion time is computed the same, and width-safe, on every path"⟩,
+  ⟨"Codec", "an artifact records which format version wrote it",
+   "A stored table does not record which format wrote it. A reader decides how to parse one from which files happen to be present, so a later format that reuses a file name is read as the current one instead of being refused.",
+   "ferrosa-sstable/src/reader.rs opens a table from component handles and checks no version; ferrosa-sstable/src/statistics.rs:147-172 has no version field; ferrosa-sstable/src/toc.rs:16-37 lists filenames only",
+   "Ferrosa.Codec.Audit", "an artifact records which format version wrote it"⟩
 ]
 
-/-- Forty-six built-and-wrong items, pinned so a defect cannot be dropped from the list without the
+/-- Fifty-one built-and-wrong items, pinned so a defect cannot be dropped from the list without the
 corpus classification breaking. The sysfail row left for `Unimplemented.discharged` when `6c270518`
 closed it; six rows joined when startup, replay and the grant projection were audited, seven when
-the system-table projection layer was modelled, and nine when the memory-discipline machine was audited
-against the read and transform paths. -/
-theorem broken_has_forty_six_items : broken.length = 46 := by native_decide
+the system-table projection layer was modelled, nine when the memory-discipline machine was audited
+against the read and transform paths, and five when the canonical-form and codec-seam audit found
+that the pipeline's value type and the file layout both live in four crates it should not. -/
+theorem broken_has_fifty_one_items : broken.length = 51 := by native_decide
 
 /-- The surfaces are where the damage concentrates: five of the thirty-one are SQL or SPARQL, which
     are the two places where a client is most likely to be told something confidently wrong. -/
@@ -255,8 +276,8 @@ theorem five_rows_have_no_verified_site :
 
 /-- The remainder - the rows that name a real location — are what the list's opening claim is about:
     code that was read, not inferred. -/
-theorem forty_one_rows_name_a_site :
-    (broken.filter fun i => !i.site.startsWith "unverified:").length = 41 := by native_decide
+theorem forty_six_rows_name_a_site :
+    (broken.filter fun i => !i.site.startsWith "unverified:").length = 46 := by native_decide
 
 /-- What a reader of the specification is shown for a row: the sentence that says what is wrong. -/
 def readerText (i : Item) : String := i.plain

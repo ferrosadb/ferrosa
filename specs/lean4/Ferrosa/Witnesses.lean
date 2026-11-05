@@ -22,6 +22,7 @@ import Ferrosa.Commons.Stream
 import Ferrosa.Cql.Subscribe
 import Ferrosa.Flight.Subscribe
 import Ferrosa.Raft.Obligations
+import Ferrosa.Codec.Audit
 
 #check Ferrosa.Topology.DcQuorum.dc_quorum_writes_share_a_replica
 #check Ferrosa.Topology.DcQuorum.no_partition_admits_two_dc_quorum_writes
@@ -351,3 +352,20 @@ import Ferrosa.Raft.Obligations
 #check Ferrosa.Raft.a_drop_that_never_publishes_is_read_as_an_empty_table
 #check Ferrosa.Raft.the_persisted_delta_contradicts_the_live_cell
 #check Ferrosa.Raft.a_tie_goes_to_the_tombstone
+
+-- The canonical form, its awkward cases, and the codec seam (`Ferrosa/Codec/`).
+#check Ferrosa.Codec.tombstone_is_not_empty_string
+#check Ferrosa.Codec.expired_is_still_a_value
+#check Ferrosa.Codec.timestamp_extremes_are_representable
+#check Ferrosa.Codec.sortEntries_mem
+#check Ferrosa.Codec.map_canon_ignores_entry_order
+#check Ferrosa.Codec.obsEq_iff_eq
+#check Ferrosa.Codec.codecA_roundtrip
+#check Ferrosa.Codec.codecB_roundtrip
+#check Ferrosa.Codec.codecA_accepts_only_encodings
+#check Ferrosa.Codec.store_roundtrip
+#check Ferrosa.Codec.store_fidelity
+#check Ferrosa.Codec.short_record_is_refused
+#check Ferrosa.Codec.verified_record_consumes_exactly
+#check Ferrosa.Codec.another_formats_artifact_is_refused
+#check Ferrosa.Codec.canonicalise_is_per_record

@@ -111,17 +111,23 @@ def parts : List Part := [
    "checked rather than described. The storage modules then take the path apart: the cell format, " ++
    "the visibility rule, what survives a crash, and what a delete leaves behind. The three last " ++
    "modules turn the same questions on the memory a path needs: what a read may hold, what a " ++
-   "transform may rewrite, and which sites in the tree meet either rule.", [
+   "transform may rewrite, and which sites in the tree meet either rule. The three before them ask " ++
+   "what the pipeline is allowed to assume about a value before any of these modules sees it: one " ++
+   "canonical in-memory form, the codec interface a format swap has to fit inside, and what the " ++
+   "code still does to a value on the way in.", [
     "Ferrosa.WritePath",
     "Ferrosa.Storage.Format",
     "Ferrosa.Storage.Mvcc",
     "Ferrosa.Storage.Recovery",
     "Ferrosa.Storage.Tombstone",
     "Ferrosa.Storage.Streaming",
+    "Ferrosa.Codec.Canonical",
+    "Ferrosa.Codec.Seam",
+    "Ferrosa.Codec.Audit",
     "Ferrosa.Streaming.Machine",
     "Ferrosa.Streaming.Obligations",
     "Ferrosa.Streaming.Audit"
-  ]⟩,
+   ]⟩,
 
   ⟨"V", "Foundations",
    "Reference, not an introduction, kept near the back deliberately: the counting lemma every " ++
@@ -173,7 +179,7 @@ theorem every_ledger_is_placed :
 
 /-- The book covers a fixed number of modules. A module added to the corpus without a home here is
     a build failure rather than a silent omission from the document. -/
-theorem placed_module_count : (parts.map (fun p => p.modules.length)).sum = 70 := by decide
+theorem placed_module_count : (parts.map (fun p => p.modules.length)).sum = 73 := by decide
 
 /-- Part numerals are distinct, so `\ref` cannot collide. -/
 theorem part_numerals_distinct : (parts.map (fun p => p.numeral)).Nodup := by decide
