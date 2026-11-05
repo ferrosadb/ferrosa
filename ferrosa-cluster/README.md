@@ -1453,3 +1453,11 @@ other roles that reference a dropped parent are separate concerns.
 ### Direct permission projection poststate
 
 The Direct DDL path persists the complete resource permission set after both grants and partial revokes. A revoke writes the existing deletion projection only when the remaining set is empty. The existing schema lifecycle fence covers mutation and poststate lookup; no transaction rollback or new acknowledgment durability guarantee is implied.
+
+Group recovery has a separate retirement operation from the global Pair handoff.
+It fences one group, stops its actual Core, drains its state-machine owner and
+owned jobs, and reports observed applied/committed/purged positions and failures.
+Other groups are not physically stopped. The opaque retirement scope does not
+clear a fault, authorize storage adoption, or reopen traffic; no release exists
+without verified live-storage activation. Normal and rebuilt state machines and
+log readers share the controller's recovery admission.

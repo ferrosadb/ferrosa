@@ -404,6 +404,8 @@ pub fn uuid_to_node_id(id: Uuid) -> u64 {
 // Tests
 // ---------------------------------------------------------------------------
 
+pub use physical_apply::{RetiredRaftGroup, RetiredRaftOwner};
+
 #[cfg(test)]
 mod tests {
     use super::*;

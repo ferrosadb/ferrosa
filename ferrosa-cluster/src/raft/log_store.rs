@@ -310,6 +310,10 @@ impl CommittedLogReader {
                 .unwrap_or(None),
         )
     }
+
+    pub(crate) fn read_purged(&self) -> Result<Option<LogId<u64>>, String> {
+        SledLogStore::load_meta(&self.meta, META_LAST_PURGED).map_err(|error| error.to_string())
+    }
 }
 
 /// Counts of entries cleared by [`SledLogStore::reset`].
