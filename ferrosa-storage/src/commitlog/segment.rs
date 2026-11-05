@@ -60,7 +60,18 @@
 //!
 //! The on-disk encoding did not change: segments written by older binaries,
 //! which patched the previous marker in place and ended in a `next = 0`
-//! marker, are read by the same [`SegmentReader`](super::reader::SegmentReader).
+//! marker, are read by the same [`SegmentReader`](super::reader::SegmentReader),
+//! and an older binary reads this writer's segments.
+//!
+//! Compatibility is only ever a READ question, because no binary — old or new
+//! — appends to a segment it did not create in the same process: segment files
+//! are always created fresh (`truncate(true)`), and startup replays existing
+//! segments, re-logs what it keeps into new ones, and deletes the old files. So
+//! an older binary can never patch a marker in a segment this writer made.
+//!
+//! A torn head (bad CRC) ends the chain: the sections before it replay, and
+//! the bytes after it are reported as rejected so the segment is retained
+//! (`a_torn_section_head_is_rejected_not_followed`).
 //!
 //! # Safety
 //!
@@ -1381,6 +1392,76 @@ mod tests {
             "a cleanly written segment must not reject any bytes"
         );
         stamps
+    }
+
+    /// Two flushed sections, `[0, 1]` then `[2]`; returns the segment path and
+    /// the offset of the second section's head marker.
+    fn two_flushed_sections(dir: &Path) -> (std::path::PathBuf, u64) {
+        let segment = Segment::new(7, 4096, dir);
+        append(&segment, &mutation_n(0));
+        append(&segment, &mutation_n(1));
+        let second_head = segment.current_position();
+        segment.flush_to_disk().unwrap();
+        append(&segment, &mutation_n(2));
+        segment.flush_to_disk().unwrap();
+        assert_eq!(replay(segment.path()), vec![0, 1, 2]);
+        (segment.path().to_path_buf(), second_head)
+    }
+
+    fn replay_with_rejection(path: &Path) -> (Vec<i64>, bool) {
+        let mut reader = super::super::reader::SegmentReader::open(path).unwrap();
+        let stamps = reader
+            .read_all()
+            .unwrap()
+            .into_iter()
+            .map(|(_, m)| m.timestamp)
+            .collect();
+        (stamps, reader.rejected_records())
+    }
+
+    /// PR #651 review: a reserve-ahead head whose CRC is torn must not be
+    /// followed. The sections before it replay; the bytes after it are
+    /// REJECTED (reported, so replay keeps the segment), never read as entries.
+    #[test]
+    fn a_torn_section_head_is_rejected_not_followed() {
+        use std::os::unix::fs::FileExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (path, second_head) = two_flushed_sections(dir.path());
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut crc_byte = [0u8; 1];
+        file.read_exact_at(&mut crc_byte, second_head + 5).unwrap();
+        file.write_all_at(&[crc_byte[0] ^ 0xFF], second_head + 5)
+            .unwrap();
+        drop(file);
+
+        let (stamps, rejected) = replay_with_rejection(&path);
+        assert_eq!(
+            stamps,
+            vec![0, 1],
+            "only the section before the torn head replays"
+        );
+        assert!(
+            rejected,
+            "the entries behind a torn head must be reported as rejected, not dropped silently"
+        );
+    }
+
+    /// A crash mid-way through writing a head (the 8-byte marker half on
+    /// disk) leaves the earlier sections intact and nothing to reject.
+    #[test]
+    fn a_half_written_section_head_ends_replay_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, second_head) = two_flushed_sections(dir.path());
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(second_head + (SYNC_MARKER_SIZE as u64) / 2)
+            .unwrap();
+        drop(file);
+
+        assert_eq!(replay_with_rejection(&path), (vec![0, 1], false));
     }
 
     #[test]
