@@ -1889,9 +1889,15 @@ impl FerrosStateMachine {
                 } else {
                     grants.push(entry.clone());
                 }
+                let stored = grants
+                    .iter()
+                    .find(|g| g.resource == entry.resource)
+                    .expect("the just-applied grant exists")
+                    .clone();
                 if self.system_writer.is_some() {
                     pending_system_writes.push(PendingSystemWrite {
-                        mutation: SystemTableMutation::GrantUpdated(entry.clone()),
+                        // The row contains the entire permission set, not a delta.
+                        mutation: SystemTableMutation::GrantUpdated(stored),
                         level: SystemWriteLogLevel::Error,
                         context: "Raft apply: system table write failed",
                     });
@@ -1917,12 +1923,22 @@ impl FerrosStateMachine {
                     }
                 }
                 if self.system_writer.is_some() {
-                    pending_system_writes.push(PendingSystemWrite {
-                        mutation: SystemTableMutation::PermissionRevoked {
+                    let remaining =
+                        self.state.grants.get(&role).and_then(|grants| {
+                            grants.iter().find(|g| g.resource == resource).cloned()
+                        });
+                    // A partial revoke must replace the full permission cell.
+                    // Do not tombstone and rewrite: equal timestamps can mask it.
+                    let mutation = match remaining {
+                        Some(grant) => SystemTableMutation::GrantUpdated(grant),
+                        None => SystemTableMutation::PermissionRevoked {
                             role: role.clone(),
                             resource: resource.clone(),
                             permission,
                         },
+                    };
+                    pending_system_writes.push(PendingSystemWrite {
+                        mutation,
                         level: SystemWriteLogLevel::Error,
                         context: "Raft apply: system table write failed for PermissionRevoked",
                     });
@@ -4448,6 +4464,104 @@ mod tests {
         assert!(!sm.state().grants.contains_key("analyst"));
     }
 
+    async fn grant_projection_matches_full_state(revoke: bool) {
+        use crate::system_table_loader::SystemTableLoader;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let mut sm = FerrosStateMachine::with_side_effects(schema, Arc::clone(&engine));
+        let original = GrantEntry {
+            role: "projection_analyst".into(),
+            resource: Resource::Keyspace("projection_ks".into()),
+            permissions: [Permission::Select, Permission::Modify]
+                .into_iter()
+                .collect(),
+        };
+        let unrelated = GrantEntry {
+            role: "unrelated_analyst".into(),
+            resource: Resource::Keyspace("other_ks".into()),
+            permissions: [Permission::Select].into_iter().collect(),
+        };
+        let initial = if revoke {
+            original.clone()
+        } else {
+            GrantEntry {
+                permissions: [Permission::Select].into_iter().collect(),
+                ..original.clone()
+            }
+        };
+        sm.apply(vec![
+            make_entry(1, 1, RaftOp::Grant(initial)),
+            make_entry(1, 2, RaftOp::Grant(unrelated.clone())),
+        ])
+        .await
+        .unwrap();
+        let op = if revoke {
+            RaftOp::Revoke {
+                role: original.role.clone(),
+                resource: original.resource.clone(),
+                permission: Permission::Modify,
+            }
+        } else {
+            RaftOp::Grant(GrantEntry {
+                permissions: [Permission::Modify].into_iter().collect(),
+                ..original.clone()
+            })
+        };
+        sm.apply(vec![make_entry(1, 3, op)]).await.unwrap();
+        let grants = SystemTableLoader::new(Arc::clone(&engine))
+            .load_role_permissions()
+            .unwrap();
+        let persisted = grants
+            .iter()
+            .find(|g| g.role == original.role && g.resource == original.resource)
+            .expect("remaining grant must exist physically");
+        assert_eq!(persisted.permissions, sm.state.grants[&original.role][0].permissions,
+            "canonical row must contain the complete post-state, not the delta or a whole-row tombstone");
+        assert!(grants.iter().any(|g| g.role == unrelated.role
+            && g.resource == unrelated.resource
+            && g.permissions == unrelated.permissions));
+        let expected = persisted.permissions.clone();
+        engine
+            .flush(&ferrosa_storage::TableId::new(
+                "system_auth",
+                "role_permissions",
+            ))
+            .unwrap();
+        drop(sm);
+        drop(engine);
+        let (reopened, pending) = StorageEngine::open(
+            test_storage_config(dir.path(), ferrosa_storage::SyncStrategyConfig::Batch, 0),
+            None,
+        )
+        .unwrap();
+        reopened.register_system_tables().unwrap();
+        reopened.replay_mutations(pending).unwrap();
+        let rows = SystemTableLoader::new(Arc::new(reopened))
+            .load_role_permissions()
+            .unwrap();
+        assert!(
+            rows.iter().any(|g| g.role == original.role
+                && g.resource == original.resource
+                && g.permissions == expected),
+            "cold engine recovery must preserve the complete permission set"
+        );
+        assert!(rows.iter().any(|g| g.role == unrelated.role
+            && g.resource == unrelated.resource
+            && g.permissions == unrelated.permissions));
+    }
+
+    #[tokio::test]
+    async fn grant_projection_persists_accumulated_permissions() {
+        grant_projection_matches_full_state(false).await;
+    }
+
+    #[tokio::test]
+    async fn revoke_projection_preserves_remaining_permissions() {
+        grant_projection_matches_full_state(true).await;
+    }
+
     #[tokio::test]
     async fn get_current_snapshot_returns_none_initially() {
         let mut sm = FerrosStateMachine::new();
@@ -5035,9 +5149,17 @@ mod tests {
         sync_strategy: ferrosa_storage::SyncStrategyConfig,
         reserve_bytes: u64,
     ) -> Arc<StorageEngine> {
-        use ferrosa_storage::engine::StorageEngineConfig;
+        let config = test_storage_config(dir, sync_strategy, reserve_bytes);
+        Arc::new(StorageEngine::new(config, None).unwrap())
+    }
+
+    fn test_storage_config(
+        dir: &std::path::Path,
+        sync_strategy: ferrosa_storage::SyncStrategyConfig,
+        reserve_bytes: u64,
+    ) -> ferrosa_storage::engine::StorageEngineConfig {
         use ferrosa_storage::{CommitLogConfig, CompactionConfig};
-        let config = StorageEngineConfig {
+        ferrosa_storage::engine::StorageEngineConfig {
             commit_log: CommitLogConfig {
                 log_dir: dir.to_path_buf(),
                 checkpoint_dir: dir.to_path_buf(),
@@ -5060,8 +5182,7 @@ mod tests {
             max_pending_replay_mutations_without_schema: 1024,
             memtable_num_shards: 64,
             cache_hot_window_secs: 900,
-        };
-        Arc::new(StorageEngine::new(config, None).unwrap())
+        }
     }
 
     async fn hard_projection_failure_must_not_publish(drop_keyspace: bool) {
