@@ -549,23 +549,20 @@ the latch closes the node instead of repairing it.
 classification are checked there rather than asserted here.
 -/
 
+/-- A startup inconsistency must be repaired in place or quarantined explicitly; serving and refusing
+    to boot are no longer discharges. `Ferrosa/Raft/Quarantine.lean` models the design. -/
 def startupItems : List SpecItem := [
-  ⟨"a startup failure either serves, refuses naming the cause, or names a resync path",
-   .failing
-     "two boot paths report an index the node cannot honour. apply_snapshot_data adopts state and last_applied (state_machine.rs:848-849) before sync_schema_and_engine_from_state (:851-854) can fail, and controller/cluster.rs:1459-1465 logs that failure and boots, so the classifier — asked about the already-adopted last_applied (:1485-1489) — answers Usable; and when the snapshot does not decode at all, last_applied stays None, recover_from_purge_point (:621-632) sets it to the purge point without restoring state, and the node publishes above the purge point forever with an empty RaftState. Both run, both open readiness, and neither has a retry or a repair. The strand and hole families do hold: both take the reset path at cluster.rs:1518-1526"
-     "Raft.an_unreadable_snapshot_skips_the_purged_log"⟩,
-  ⟨"the apply latch survives a restart",
-   .failing
-     "apply_failure is a plain Option<String> on the in-memory state machine (state_machine.rs:375), absent from SnapshotData, and the constructor sets it to None (:580), so every restart clears it: the latch describes a process, not a node, and nothing at boot asks whether the condition that set it is still true"
-     "Raft.restart_clears_the_latch"⟩,
-  ⟨"a restart cannot repeat a persistent projection failure without progress",
-   .failing
-     "a persistent precondition — a disk below its write reserve refusing engine.write via check_write_admission (ferrosa-storage/src/engine.rs:3354-3372, :10109), or a commit-log fsync that keeps failing (state_machine.rs:2196) — re-fails the same entry on every boot. The cycle restart→boot→physical→projectionFail is a fixed point, so applied never passes the entry and the node alternates between openraft Fatal and replaying the same failure; 6c270518 widened this set by making every WarnReplay site fatal as well"
-     "Raft.cycles_never_advance_the_published_index"⟩,
-  ⟨"replay re-runs every entry whose ordered projection write did not land",
-   .met "Raft.a_withheld_entry_is_still_in_the_replay_range"⟩,
-  ⟨"replay of the committed log terminates",
-   .met "Raft.replay_reaches_the_log_end"⟩
+  SpecItem.mk "a startup inconsistency is repaired in place, serves consistent state, or stays quarantined naming the cause" (Status.failing
+     "two boot paths report an index the node cannot honour. apply_snapshot_data_from adopts state and last_applied (ferrosa-cluster/src/raft/state_machine.rs:959-960) before sync_schema_and_engine_from_state (:1100-1180) can fail, and controller/cluster.rs:1467-1472 logs that failure and boots, so the classifier - asked about the already-adopted last_applied (:1492-1496) - answers Usable; and when the snapshot does not decode at all, last_applied stays None, recover_from_purge_point (:713-724) sets it to the purge point without restoring state, and the node publishes above the purge point forever with an empty RaftState. Both run, both open readiness, and neither has a retry or a repair: /readyz (ferrosa/src/web/readiness.rs:191-372) and is_cql_ready (ferrosa-cluster/src/controller/mod.rs:994-999) never compare the state the node would answer from against the index it reports. The third branch is not a discharge either: the path that returns without openraft (controller/cluster.rs:1588-1594, then :1439-1445) leaves the node up and permanently outside the cluster (Raft.the_refusal_path_is_terminal). What the operator now requires is quarantine-and-repair: refuse traffic, stay a member, pull the state from a peer, and verify it before serving again - modelled in Ferrosa/Raft/Quarantine.lean, where Raft.a_sufficient_peer_repairs_the_node is the proof that it works and Raft.the_code_answers_from_state_it_does_not_have is the code that does not have it"
+     "Raft.an_unreadable_snapshot_skips_the_purged_log"),
+  SpecItem.mk "the apply latch survives a restart" (Status.failing
+     "apply_failure is a plain Option<String> on the in-memory state machine (ferrosa-cluster/src/raft/state_machine.rs:435), absent from SnapshotData (:390-400), and the constructor sets it to None (:670), so every restart clears it: the latch describes a process, not a node, and nothing at boot asks whether the condition that set it is still true. Under quarantine the same requirement is stronger and still unmet - the quarantine reason and any repair position must survive a restart too, and neither has a durable field (Raft.a_restart_forgets_the_repair_position)"
+     "Raft.restart_clears_the_latch"),
+  SpecItem.mk "a restart cannot repeat a persistent projection failure without progress" (Status.failing
+     "a persistent precondition - a disk below its write reserve refusing engine.write via check_write_admission (ferrosa-storage/src/engine.rs:3354-3372, :10109), or a commit-log fsync that keeps failing (ferrosa-cluster/src/raft/state_machine.rs:2196) - re-fails the same entry on every boot. The cycle restart, boot, physical, projectionFail is a fixed point, so applied never passes the entry and the node alternates between openraft Fatal and replaying the same failure; 6c270518 widened this set by making every WarnReplay site fatal as well. Repairing in place would discharge it - Raft.three_repair_cycles_pass_the_poisoned_entry proves the entry is passed once the node adopts a peer's state instead of re-running its own - but the code still has no such path and no repair position to resume from (Raft.the_code_never_passes_the_poisoned_entry)"
+     "Raft.restart_cycle_never_passes_a_poisoned_entry"),
+  SpecItem.mk "replay re-runs every entry whose ordered projection write did not land" (Status.met "Raft.a_withheld_entry_is_still_in_the_replay_range"),
+  SpecItem.mk "replay of the committed log terminates" (Status.met "Raft.replay_reaches_the_log_end")
 ]
 
 /-- Five obligations on startup and replay, three of them unmet, pinned here so closing one or

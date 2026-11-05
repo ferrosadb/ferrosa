@@ -101,10 +101,34 @@ def broken : List Item := [
    "Model only: this row is stale. The socket setting it says is missing, TCP_NODELAY, is set on every client and internode socket. Whether replies still go out as several small writes, and what that costs, has not been measured.",
    "unverified: stale as written. The premise that NODELAY exists only on unmerged c38add89 is false — `git merge-base --is-ancestor c38add89 HEAD` exits 0, and ferrosa-cql/src/server.rs:303-311 sets `stream.set_nodelay(true)` on every accepted CQL socket (same at ferrosa-postgres/src/server.rs:2237-2245, ferrosa-graph/src/bolt/server.rs:136-142, ferrosa-net/src/rpc/server.rs:267-273). Whether replies are still several small writes, and what that costs per statement, has not been re-measured. Do not re-site this row before measuring",
    "Ferrosa.Storage.Streaming", "acks are coalesced so a high-latency pipe is not ack-starved"⟩,
-  ⟨"Raft", "a startup failure either serves, refuses naming the cause, or names a resync path",
-   "When the saved Raft snapshot cannot be restored, or cannot be read at all, the node logs a warning and starts anyway, reporting an applied index it cannot back with real schema or table state. It looks healthy, answers questions from state that is not there, and nothing retries or repairs it.",
-   "ferrosa-cluster/src/raft/state_machine.rs:848-854 adopt state and last_applied before the sync that can fail, and controller/cluster.rs:1459-1465 logs that error and boots; the classifier at :1485-1489 is asked about the already-adopted index, so it answers Usable. When the file does not decode at all, last_applied stays None and recover_from_purge_point (state_machine.rs:621-632) sets it to the purge point without restoring state",
-   "Ferrosa.Raft.Obligations", "a startup failure either serves, refuses naming the cause, or names a resync path"⟩,
+  ⟨"Raft", "a startup inconsistency is repaired in place, serves consistent state, or stays quarantined naming the cause",
+   "When the saved snapshot cannot be restored, or cannot be read at all, the node logs a warning and starts anyway, reporting an applied index it cannot back with real schema or table state. It looks healthy, answers questions from state that is not there, and nothing retries or repairs it.",
+   "ferrosa-cluster/src/raft/state_machine.rs:959-960 adopt state and last_applied before sync_schema_and_engine_from_state (:1100-1180) can fail, and ferrosa-cluster/src/controller/cluster.rs:1467-1472 logs that error and boots; the classifier at :1492-1496 is asked about the already-adopted index, so it answers Usable. When the file does not decode at all, last_applied stays None and recover_from_purge_point (state_machine.rs:713-724) sets it to the purge point without restoring state. Neither ferrosa-cluster/src/controller/mod.rs:994-999 nor ferrosa/src/web/readiness.rs:191-372 compares synced against applied; the branch that returns without openraft (controller/cluster.rs:1588-1594) leaves the node up and permanently out of the cluster",
+   "Ferrosa.Raft.Obligations", "a startup inconsistency is repaired in place, serves consistent state, or stays quarantined naming the cause"⟩,
+  ⟨"Raft", "code: a node whose restore failed answers reads and reports ready on state it does not have",
+   "A node whose saved state fails to restore starts anyway. It reports an applied index it cannot back with real table state, answers queries from data that is not there, and reports itself ready.",
+   "ferrosa-cluster/src/raft/state_machine.rs:960 adopts last_applied while :1100-1180 can still fail; ferrosa-cluster/src/controller/cluster.rs:1467-1472 logs and boots; ferrosa-cluster/src/controller/mod.rs:994-999 checks consensus health, write path, DDL path and declared topology, and ferrosa/src/web/readiness.rs:191-372 checks supervised tasks, listeners, set-aside mutations and Raft liveness - neither reads synced; build_snapshot at state_machine.rs:2528-2583 then publishes that unhonoured state and mark_durably_applied (:2576) lets the log purge to it",
+   "Ferrosa.Raft.Obligations", "code: a node whose restore failed answers reads and reports ready on state it does not have"⟩,
+  ⟨"Raft", "code: the node exits an inconsistent state on an index it was told, not on state it holds",
+   "A node that cannot read its saved snapshot adopts the log position it had already discarded. It then claims the whole log is applied while holding no catalog, and never replays the entries it skipped.",
+   "ferrosa-cluster/src/raft/local_state.rs:88-102 compares last_applied against last_purged, two numbers, and ferrosa-cluster/src/raft/state_machine.rs:713-724 sets last_applied to the purge point without touching state; nothing in the boot path compares RaftState against the entries it claims to have applied",
+   "Ferrosa.Raft.Obligations", "code: the node exits an inconsistent state on an index it was told, not on state it holds"⟩,
+  ⟨"Raft", "code: a latched node cannot install the snapshot that would repair it, and never becomes healthy again",
+   "When a node has already failed to apply a change, the one message that could repair it is refused before it is read. The node can never recover without a restart, and the restart reproduces the failure.",
+   "ferrosa-cluster/src/raft/state_machine.rs:2801-2837 has install_snapshot begin with finish_pending_apply (:2804), which returns the apply_failure error for every call while the latch is set (:527-529); ferrosa-cluster/src/consensus_health.rs:97-125 has fail/is_healthy/failure/failure_count and no reset, so the failure is process-lifetime",
+   "Ferrosa.Raft.Obligations", "code: a latched node cannot install the snapshot that would repair it, and never becomes healthy again"⟩,
+  ⟨"Raft", "code: a repair replaces local state wholesale and records nothing it discarded",
+   "Repairing a node from a peer replaces its local state wholesale. Rows written locally that are newer than the peer's copy are dropped, and no record says they existed.",
+   "ferrosa-cluster/src/raft/state_machine.rs:959 assigns self.state = data.state and :960 takes last_applied from the snapshot; the guards at :947-952 and :997-1016 refuse only a snapshot that drops a table with local artifacts, and :1138-1146 refuses only a persisted startup snapshot with no replacement order - none merges or records a row for a table the snapshot also carries",
+   "Ferrosa.Raft.Obligations", "code: a repair replaces local state wholesale and records nothing it discarded"⟩,
+  ⟨"Raft", "code: a node whose projection diverged still votes and is counted toward quorum",
+   "A node whose local state disagrees with the index it reports still answers vote requests and counts toward quorum, so it can help elect a leader while unable to honour the state it holds.",
+   "ferrosa-cluster/src/raft/handlers.rs:1014-1019 forwards a VoteRequest straight to raft.vote with no state-machine or health term, so a node that booted with last_applied ahead of its RaftState (ferrosa-cluster/src/raft/state_machine.rs:960, ferrosa-cluster/src/controller/cluster.rs:1467-1472) votes and is counted",
+   "Ferrosa.Raft.Obligations", "code: a node whose projection diverged still votes and is counted toward quorum"⟩,
+  ⟨"Raft", "code: a restart replays the same failure and the repair position is not durable",
+   "The reason a node stopped applying changes lives only in memory, and no repair position is written down. Every restart replays the same failure and any repair in flight starts over.",
+   "ferrosa-cluster/src/raft/state_machine.rs:435 is a plain field, absent from SnapshotData (:390-400) and set to None by the constructor (:670), and ferrosa-cluster/src/controller/cluster.rs:1531-1552 repairs only by moving the raft directory aside and taking a fresh snapshot; when that reset fails the node returns without raft (:1588-1594)",
+   "Ferrosa.Raft.Obligations", "code: a restart replays the same failure and the repair position is not durable"⟩,
   ⟨"Raft", "the apply latch survives a restart",
    "The flag that stops a node applying changes lives only in memory, so a restart always clears it, and nothing at startup asks whether the reason for the failure is still true.",
    "ferrosa-cluster/src/raft/state_machine.rs:375 is a plain field, absent from SnapshotData (state, last_applied, last_membership), and the constructor at :580 sets it to None; controller/cluster.rs:1449-1453 builds a fresh machine on every boot",
@@ -174,11 +198,11 @@ def broken : List Item := [
    "the write path and the read path agree on an equal-timestamp tie"⟩
 ]
 
-/-- Thirty-one built-and-wrong items, pinned so a defect cannot be dropped from the list without the
+/-- Thirty-seven built-and-wrong items, pinned so a defect cannot be dropped from the list without the
 corpus classification breaking. The sysfail row left for `Unimplemented.discharged` when `6c270518`
 closed it; six rows joined when startup, replay and the grant projection were audited, and seven when
 the system-table projection layer was modelled. -/
-theorem broken_has_thirty_one_items : broken.length = 31 := by native_decide
+theorem broken_has_thirty_seven_items : broken.length = 37 := by native_decide
 
 /-- The surfaces are where the damage concentrates: five of the thirty-one are SQL or SPARQL, which
     are the two places where a client is most likely to be told something confidently wrong. -/
@@ -192,10 +216,10 @@ theorem the_surfaces_carry_five : (broken.filter fun i => i.area == "SQL").lengt
 theorem five_rows_have_no_verified_site :
     (broken.filter fun i => i.site.startsWith "unverified:").length = 5 := by native_decide
 
-/-- The remainder — the rows that name a real location — are what the list's opening claim is about:
+/-- The remainder - the rows that name a real location — are what the list's opening claim is about:
     code that was read, not inferred. -/
-theorem twenty_six_rows_name_a_site :
-    (broken.filter fun i => !i.site.startsWith "unverified:").length = 26 := by native_decide
+theorem thirty_two_rows_name_a_site :
+    (broken.filter fun i => !i.site.startsWith "unverified:").length = 32 := by native_decide
 
 /-- What a reader of the specification is shown for a row: the sentence that says what is wrong. -/
 def readerText (i : Item) : String := i.plain

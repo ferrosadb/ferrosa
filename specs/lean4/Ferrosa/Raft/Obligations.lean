@@ -19,12 +19,16 @@
   `system_writer` with the live machine, so physical effects are visible before the published index
   moves. Only the metadata transition is genuinely isolated.
 
-  The area continues in three siblings, and this file's ledger appends all of them so one area still
+  The area continues in four siblings, and this file's ledger appends all of them so one area still
   prints and counts as one list. `Ferrosa/Raft/Surfaces.lean` audits the snapshot, the purge ceiling
   and the two restart paths. `Ferrosa/Raft/Startup.lean` asks what the node does on the next boot —
   whether a failure state repairs, refuses, or resyncs — and finds that the apply latch is in-memory
   and every restart replays the same failure. `Ferrosa/Raft/Partial.lean` enumerates what a partially
   applied entry leaves behind and classifies it: safe, divergent, corrupt, or stalled.
+  `Ferrosa/Raft/Quarantine.lean` models the discharge the operator settled on — refuse traffic, stay a
+  member, repair from a peer, verify before serving — and records, for each of its six obligations,
+  the design property that holds and the code path that does not have it yet. Refusing to boot is no
+  longer one of the accepted answers, so `Startup.lean`'s trichotomy row was restated.
 
   The proved statements quantify over every trace and are closed by induction on it. A disproof is a
   single trace whose fields reduce under `decide`, which is all a counterexample needs.
@@ -34,6 +38,7 @@ import Ferrosa.Raft.StateMachine
 import Ferrosa.Raft.Surfaces
 import Ferrosa.Raft.Startup
 import Ferrosa.Raft.Partial
+import Ferrosa.Raft.Quarantine
 
 namespace Ferrosa.Raft
 
@@ -519,13 +524,15 @@ def ledger : List SpecItem := [
    .failing
      "staged_apply clones the metadata but shares the schema, engine and system-writer handles, so the physical transition is visible on the blocking thread while the published index still points at the previous entry"
      "Raft.shared_exposes_effects_before_publication"⟩
-] ++ surfaceItems ++ startupItems ++ partialItems ++ grantItems
+] ++ surfaceItems ++ startupItems ++ partialItems ++ grantItems ++ quarantineItems
 
-/-- The area records twenty-two obligations of which ten are unmet — the fence's one, the snapshot
-    surface's three, startup's three, partial application's two and the grant projection's one — and
-    both numbers are pinned here: closing one, or adding a claim, forces this table to be updated in
-    the same change. -/
-theorem raft_has_twenty_two_items_and_ten_red : ledger.length = 22 ∧ redCount ledger = 10 := by
+/-- The area records thirty-four obligations of which sixteen are unmet — the fence's one, the snapshot
+    surface's three, startup's three, partial application's two, the grant projection's one and the
+    quarantine design's six — and both numbers are pinned here: closing one, or adding a claim, forces
+    this table to be updated in the same change. The quarantine list is six `design:` rows that hold
+    and six `code:` rows that do not, so its six reds are the gap between the target lifecycle and the
+    process as it boots today. -/
+theorem raft_has_thirty_four_items_and_sixteen_red : ledger.length = 34 ∧ redCount ledger = 16 := by
   decide
 
 def main : IO Unit :=

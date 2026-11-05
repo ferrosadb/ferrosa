@@ -149,10 +149,12 @@ theorem ledgerTotal_is_the_registry_sum :
     ledgerTotal = (areas.map fun a => redCount a.ledger).sum := rfl
 
 /-- Pinned so that removing a ledger from the registry — the drift that has recurred here — is a
-    build failure rather than a silently smaller total. Seventy-seven: the raft surface audit added
+    build failure rather than a silently smaller total. Eighty-three: the raft surface audit added
     three reds without adding an area, the startup and replay audit added three, partial application
-    two, the grant projection one, `6c270518` closed one, and the projection layer added seven. -/
-theorem ledgerTotal_pinned : ledgerTotal = 77 := by decide
+    two, the grant projection one, `6c270518` closed one, the projection layer added seven, and the
+    quarantine design added six — one per obligation, each the gap between the lifecycle the operator
+    specified and the boot path that ships. -/
+theorem ledgerTotal_pinned : ledgerTotal = 83 := by decide
 
 /-- Print every registered ledger, with the header its area module prints. -/
 def printAllLedgers : IO Unit := do
