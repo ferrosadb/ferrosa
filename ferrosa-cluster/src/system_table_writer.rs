@@ -76,6 +76,31 @@ impl SystemTableWriter {
         now_micros()
     }
 
+    /// Preserve node-local serialized projection order for a role row. Logical
+    /// exact-row reads omit partition-only tombstones, so probe that metadata
+    /// separately with a one-row bound before inspecting the target row.
+    fn next_role_timestamp(&self, key: &DecoratedKey, wall: i64) -> ferrosa_common::Result<i64> {
+        let tid = TableId::new("system_auth", "roles");
+        let mut previous = i64::MIN;
+        if let Some(partition) = self.engine.read_limited_rows(&tid, key, 1)? {
+            previous = partition.deletion.marked_for_delete_at;
+        }
+        if let Some(partition) = self.engine.read_clustering_row(&tid, key, &[])? {
+            previous = previous.max(partition.deletion.marked_for_delete_at);
+            for row in &partition.rows {
+                previous = previous
+                    .max(row.deletion.marked_for_delete_at)
+                    .max(row.primary_key_liveness.timestamp);
+                for (_, cell) in &row.cells {
+                    previous = previous.max(cell.timestamp);
+                }
+            }
+        }
+        Ok(wall.max(previous.checked_add(1).ok_or_else(|| {
+            ferrosa_common::Error::InvalidData("role projection timestamp exhausted".into())
+        })?))
+    }
+
     /// Raft serializes these projection writes. Advance beyond the actual
     /// stored cell/tombstone even when the wall clock ties or moves backwards.
     fn next_permission_timestamp(
@@ -157,8 +182,13 @@ impl SystemTableWriter {
             }
             SystemTableMutation::RoleCreated(role) => {
                 let member_of = role.member_of.clone();
-                let (key, row, ts) = role_to_row(&role);
+                let (key, mut row, wall) = role_to_row(&role);
                 let tid = TableId::new("system_auth", "roles");
+                let ts = self.next_role_timestamp(&key, wall)?;
+                row.primary_key_liveness.timestamp = ts;
+                for (_, cell) in &mut row.cells {
+                    cell.timestamp = ts;
+                }
                 self.engine.write(&tid, &key, row, ts)?;
 
                 let members_tid = TableId::new("system_auth", "role_members");

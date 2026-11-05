@@ -1399,3 +1399,13 @@ snapshot advances the requirement to its next index instead of permitting a gap.
 The pinned OpenRaft worker owns and awaits complete input batches; this runtime
 fence also makes direct trait cancellation refuse silent loss of a mixed suffix.
 It is not a persistent incomplete-effect journal.
+
+
+### Role projection clock and reload visibility
+
+Role-row updates advance beyond the stored role cells and row/partition deletion
+clock before writing, including after wall-clock regression. Checked exhaustion
+fails the projection. The role lookup retains at most one target row and one
+metadata row. Role and permission reload accepts newer cells above older partition
+tombstones. This is a node-local serialized-writer rule; other schema projection
+families and role-membership partition reconciliation have separate ordering rules.

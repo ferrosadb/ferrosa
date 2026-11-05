@@ -375,3 +375,13 @@ format into it. File and parent-directory synchronization failures propagate;
 failed or unwound attempts remove only their own staging file. Cancellation of
 an async waiter does not cancel an already-running blocking file operation.
 This file-ownership rule is separate from state-machine restore publication.
+
+
+### Role projection clock and reload visibility
+
+Role-row updates advance beyond the stored role cells and row/partition deletion
+clock before writing, including after wall-clock regression. Checked exhaustion
+fails the projection. The role lookup retains at most one target row and one
+metadata row. Role and permission reload accepts newer cells above older partition
+tombstones. This is a node-local serialized-writer rule; other schema projection
+families and role-membership partition reconciliation have separate ordering rules.

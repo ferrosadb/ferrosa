@@ -105,13 +105,18 @@ impl SystemTableLoader {
         let mut roles = Vec::new();
 
         self.walk_all_partitions(&tid, |partition| {
-            if !partition.deletion.is_live() {
-                return Ok(());
-            }
             let name = String::from_utf8(partition.key.key.as_bytes().to_vec()).map_err(|e| {
                 FerrosaError::InvalidData(format!("invalid roles role key utf8: {e}"))
             })?;
-            let Some(row) = partition.rows.iter().find(|row| row.deletion.is_live()) else {
+            let Some(row) = partition.rows.iter().find(|row| {
+                row.cells.iter().any(|(_, cell)| {
+                    cell.timestamp
+                        > partition
+                            .deletion
+                            .marked_for_delete_at
+                            .max(row.deletion.marked_for_delete_at)
+                })
+            }) else {
                 return Ok(());
             };
             // Lookups by column id over a BORROW of the row's cells. The previous
@@ -322,9 +327,6 @@ impl SystemTableLoader {
         let mut grants = Vec::new();
 
         self.walk_all_partitions(&tid, |partition| {
-            if !partition.deletion.is_live() {
-                return Ok(());
-            }
             let role = String::from_utf8(partition.key.key.as_bytes().to_vec()).map_err(|e| {
                 FerrosaError::InvalidData(format!("invalid role_permissions role key utf8: {e}"))
             })?;
@@ -344,7 +346,12 @@ impl SystemTableLoader {
                 };
                 // A newer grant can resurrect this permission cell above an
                 // older row tombstone. Older/equal cells remain deleted.
-                if cell.timestamp <= row.deletion.marked_for_delete_at {
+                if cell.timestamp
+                    <= partition
+                        .deletion
+                        .marked_for_delete_at
+                        .max(row.deletion.marked_for_delete_at)
+                {
                     continue;
                 }
                 let Some(bytes) = cell.value.as_deref() else {
@@ -702,13 +709,157 @@ mod tests {
         test_engine_with_flush_threshold(dir, 4096)
     }
 
+    #[tokio::test]
+    async fn canonical_role_update_survives_earlier_future_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let role = RoleMetadata {
+            name: "clock_regressed_role".into(),
+            is_superuser: false,
+            can_login: true,
+            salted_hash: None,
+            member_of: Default::default(),
+            scram: None,
+        };
+        // A committed projection from before a wall-clock correction. Seed its
+        // actual stored timestamps rather than changing the process clock.
+        let (key, mut row, _) = ferrosa_schema::system::persistence::role_to_row(&role);
+        let earlier_timestamp = i64::MAX - 1024;
+        row.primary_key_liveness.timestamp = earlier_timestamp;
+        for (_, cell) in &mut row.cells {
+            cell.timestamp = earlier_timestamp;
+        }
+        engine
+            .write(
+                &TableId::new("system_auth", "roles"),
+                &key,
+                row,
+                earlier_timestamp,
+            )
+            .unwrap();
+        let loader = SystemTableLoader::new(Arc::clone(&engine));
+        assert!(loader
+            .load_roles()
+            .unwrap()
+            .iter()
+            .any(|r| r.name == role.name && r.can_login));
+        SystemTableWriter::new(Arc::clone(&engine))
+            .apply(
+                ferrosa_schema::system::persistence::SystemTableMutation::RoleCreated(
+                    RoleMetadata {
+                        can_login: false,
+                        ..role.clone()
+                    },
+                ),
+            )
+            .unwrap();
+        let restored = loader.load_roles().unwrap();
+        assert!(
+            restored.iter().any(|r| r.name == role.name && !r.can_login),
+            "later ordered login disable must replace an earlier future-dated cell"
+        );
+        engine.flush(&TableId::new("system_auth", "roles")).unwrap();
+        engine.force_commit_log_sync().unwrap();
+        drop(loader);
+        drop(engine);
+        let reopened = reopen_test_engine(dir.path());
+        assert!(
+            SystemTableLoader::new(reopened)
+                .load_roles()
+                .unwrap()
+                .iter()
+                .any(|r| r.name == role.name && !r.can_login),
+            "login disable must survive cold reopen"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_regrant_survives_role_partition_tombstone() {
+        use ferrosa_schema::system::persistence::SystemTableMutation;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let mut writer = SystemTableWriter::new(Arc::clone(&engine));
+        writer.set_permission_timestamp_for_test(1);
+        let grant = GrantEntry {
+            role: "recreated_role".into(),
+            resource: Resource::Keyspace("ks".into()),
+            permissions: [Permission::Select].into_iter().collect(),
+        };
+        writer
+            .apply(SystemTableMutation::GrantUpdated(grant.clone()))
+            .unwrap();
+        writer
+            .apply(SystemTableMutation::RoleDropped(grant.role.clone()))
+            .unwrap();
+        let loader = SystemTableLoader::new(Arc::clone(&engine));
+        assert!(
+            loader.load_role_permissions().unwrap().is_empty(),
+            "drop must hide the old grant"
+        );
+        let tid = TableId::new("system_auth", "role_permissions");
+        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            grant.role.as_bytes().to_vec(),
+        ));
+        let deleted = engine.read_limited_rows(&tid, &key, 1).unwrap().unwrap();
+        assert!(
+            !deleted.deletion.is_live(),
+            "actual partition deletion must remain"
+        );
+        assert!(
+            engine
+                .read_clustering_row(&tid, &key, grant.resource.to_string().as_bytes())
+                .unwrap()
+                .is_none(),
+            "logical exact-row lookup omits deleted partition metadata"
+        );
+        writer
+            .apply(SystemTableMutation::GrantUpdated(GrantEntry {
+                permissions: [Permission::Modify].into_iter().collect(),
+                ..grant.clone()
+            }))
+            .unwrap();
+        assert!(
+            loader
+                .load_role_permissions()
+                .unwrap()
+                .iter()
+                .any(|g| g.role == grant.role
+                    && g.permissions == [Permission::Modify].into_iter().collect()),
+            "a newer grant must survive an older role partition tombstone"
+        );
+        engine.flush(&tid).unwrap();
+        engine.force_commit_log_sync().unwrap();
+        drop(loader);
+        drop(writer);
+        drop(engine);
+        let reopened = reopen_test_engine(dir.path());
+        assert!(
+            SystemTableLoader::new(reopened)
+                .load_role_permissions()
+                .unwrap()
+                .iter()
+                .any(|g| g.role == grant.role
+                    && g.permissions == [Permission::Modify].into_iter().collect()),
+            "regrant must survive cold reopen above the old partition deletion"
+        );
+    }
+
     /// A test engine whose memtable auto-flush threshold is a parameter, so a
     /// test can hold many small partitions resident without flush churn.
     fn test_engine_with_flush_threshold(
         dir: &std::path::Path,
         flush_threshold_bytes: u64,
     ) -> Arc<StorageEngine> {
-        let config = StorageEngineConfig {
+        Arc::new(StorageEngine::new(test_storage_config(dir, flush_threshold_bytes), None).unwrap())
+    }
+
+    fn test_storage_config(
+        dir: &std::path::Path,
+        flush_threshold_bytes: u64,
+    ) -> StorageEngineConfig {
+        StorageEngineConfig {
             commit_log: CommitLogConfig {
                 log_dir: dir.to_path_buf(),
                 checkpoint_dir: dir.to_path_buf(),
@@ -730,8 +881,14 @@ mod tests {
             max_pending_replay_mutations_without_schema: 1024,
             memtable_num_shards: 64,
             cache_hot_window_secs: 900,
-        };
-        Arc::new(StorageEngine::new(config, None).unwrap())
+        }
+    }
+
+    fn reopen_test_engine(dir: &std::path::Path) -> Arc<StorageEngine> {
+        let (engine, pending) = StorageEngine::open(test_storage_config(dir, 4096), None).unwrap();
+        engine.register_system_tables().unwrap();
+        engine.replay_mutations(pending).unwrap();
+        Arc::new(engine)
     }
 
     fn test_schema() -> Schema {
