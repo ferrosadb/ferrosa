@@ -147,3 +147,8 @@ Storage schemas now persist the authoritative UUID in the reserved `ferrosa.tabl
 ## Immutable scalar scan values
 
 System-schema metadata uses the immutable shared text/blob variants of the common CQL runtime value type. Schema statement formatting still explicitly produces owned textual CQL literals. Schema metadata contents, encoding and persistence contracts remain unchanged.
+
+
+### Canonical permission JSON
+
+System-table grant projection sorts permission names before JSON encoding. The array representation remains compatible with older rows, while its bytes depend on the permission set rather than hash iteration order. This canonical encoding does not replace projection ordering or conflict resolution.
