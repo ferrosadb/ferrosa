@@ -55,8 +55,8 @@ pub struct Manifest {
     pub sstables: HashMap<String, Vec<ManifestEntry>>,
     /// ISO 8601 timestamp of the last compaction.
     pub last_compacted_at: Option<String>,
-    /// Removals accumulated via [`remove_sstables`] — re-applied on CAS
-    /// retry in [`save_with_retry`] so compaction deletions are never lost.
+    /// Removals accumulated via [`Manifest::remove_sstables`] — re-applied on CAS
+    /// retry in [`Manifest::save_with_retry`] so compaction deletions are never lost.
     /// Not serialized (transient state only).
     #[serde(skip)]
     pub(crate) pending_removals: Vec<(String, Vec<String>)>,

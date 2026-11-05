@@ -14475,7 +14475,7 @@ impl StorageEngine {
     /// Select the compaction strategy for a table based on its extensions.
     ///
     /// An RRD-segmented table (`rrd.segment_window`) gets
-    /// [`NoCompactionStrategy`]: its segments are immutable, one per time
+    /// [`crate::compaction::NoCompactionStrategy`]: its segments are immutable, one per time
     /// window, and never overlap in time, so there is nothing to merge.
     ///
     /// Tables with `compaction.class` containing "Unified" or "UCS" use the

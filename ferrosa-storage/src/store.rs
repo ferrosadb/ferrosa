@@ -796,7 +796,7 @@ pub struct TableStore<F: FlushTarget> {
     /// `IndexResult` cannot be mapped back to a base-table row on its own. The
     /// scoped per-prefix sidecars written at flush time *are* keyed by scope,
     /// so remembering which scopes were flushed lets the index-consult path in
-    /// [`ann_search_partitions`] enumerate those scoped sidecars and recover the
+    /// [`TableStore::ann_search_partitions`] enumerate those scoped sidecars and recover the
     /// actual partition keys without a full table scan.
     vector_index_scopes: ArcSwap<VectorIndexScopes>,
     /// SSTable generations the read path has quarantined because a read
@@ -4653,7 +4653,7 @@ impl<F: FlushTarget> TableStore<F> {
         }
     }
 
-    /// One attempt of [`read_limited_rows`] against a fixed `view` snapshot.
+    /// One attempt of [`Self::read_limited_rows`] against a fixed `view` snapshot.
     /// Returns the merged partition (if any) plus the identity of any
     /// snapshotted SSTable that could not be consulted — the signal the caller
     /// uses to retry against a fresh view (transient compaction swap) and, on
@@ -4891,7 +4891,7 @@ impl<F: FlushTarget> TableStore<F> {
         })
     }
 
-    /// One attempt of [`read_clustering_row`] against a fixed `view` snapshot.
+    /// One attempt of [`Self::read_clustering_row`] against a fixed `view` snapshot.
     /// Returns the matching row (if any) plus the identity of any snapshotted
     /// SSTable that could not be consulted — the signal the caller uses to retry
     /// against a fresh view and, on exhaustion, to quarantine + repair.
@@ -9407,7 +9407,7 @@ impl<F: FlushTarget> TableStore<F> {
     /// matches its scoped sidecars on disk. Any other live generation (no
     /// manifest: compacted before compaction wrote vector sidecars, flushed
     /// before manifests existed, or a build that crashed) is left for
-    /// [`Self::plan_vector_sidecar_repair`]; ANN refuses over it until then.
+    /// [`Self::run_vector_repair`]; ANN refuses over it until then.
     ///
     /// # Errors
     ///
