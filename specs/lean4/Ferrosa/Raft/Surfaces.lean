@@ -464,7 +464,7 @@ def surfaceItems : List SpecItem := [
      "Raft.stale_builder_overwrites_the_durable_snapshot"⟩,
   ⟨"a snapshot is restored as a whole or the node does not boot on it",
    .failing
-     "apply_snapshot_data adopts the state and the published index (state_machine.rs:838-839) before sync_schema_and_engine_from_state (:841-844) can fail, and controller/cluster.rs:1459-1465 downgrades that failure to a warning, so the process runs with RaftState at the snapshot index and a shared Schema and StorageEngine that never saw it; nothing on the apply path closes the gap, and the retirement of superseded incarnations (:1001-1005) happens before the sync that can still fail"
+     "apply_snapshot_data adopts the state and the published index (state_machine.rs:838-839) before sync_schema_and_engine_from_state (:841-844) can fail, and controller/cluster.rs:1459-1465 downgrades that failure to a warning, so the process runs with RaftState at the snapshot index and a shared Schema and StorageEngine that never saw it; nothing on the apply path closes the gap, and the retirement of superseded incarnations (:1001-1005) happens before the sync that can still fail. The classifier cannot see it either: it is asked about last_applied, which the failed restore already advanced (:1485-1489), so it answers Usable. Ferrosa/Raft/Partial.lean classifies what the node then holds — corrupt for a destructive entry, divergent for an additive one"
      "Raft.a_failed_restore_boots_with_a_stale_schema"⟩,
   ⟨"a failed local side effect is repaired without a restart",
    .failing

@@ -1,22 +1,30 @@
 /-
-  The apply fence, settled: three obligations proved, two red
-  ===========================================================
+  The apply fence, settled: three obligations proved, one red, one fixed
+  ======================================================================
 
   A committed entry is either published as applied with its ordered system-table write behind it, or
   left unpublished and replayable, and the published index never moves backwards or skips an entry.
   Those three hold over every trace of the machine in `Ferrosa/Raft/StateMachine.lean`, for both
   publish policies and both stagings, so sharing the staged copy cannot break them.
 
-  Two obligations do not hold, and both are recorded red rather than argued away. Publication waits
-  for the ordered system-table write to be *attempted*, not to succeed, so a failed write publishes
-  an entry whose row is missing and replay never re-issues it. And the staged copy shares `schema`,
-  `engine` and `system_writer` with the live machine, so physical effects are visible before the
-  published index moves; only the metadata transition is genuinely isolated.
+  The fourth obligation used to be red: publication waited for the ordered system-table write to be
+  *attempted*, not to succeed, so a failed write published an entry whose row was missing. `6c270518`
+  made `flush_pending_system_writes` fallible and propagated into the latch, and the machine gained a
+  `.systemFailFatal` event for that shape; `sysfail_blocks_publication` is the same trace the old
+  disproof used, ending with nothing published. The pre-fix trace is kept as
+  `sysfail_publishes_without_row`, because a trace of a machine that no longer ships is the clearest
+  statement of what was wrong.
 
-  The area continues in `Ferrosa/Raft/Surfaces.lean`, which audits the rest of the surface — the
-  snapshot a builder produces, the file it is written to, the purge ceiling and the two restart paths
-  — for the same shape of failure. Three more obligations are red there and four are proved, and this
-  file's `ledger` appends them so one area still prints and counts as one list.
+  The fifth obligation does not hold, and the staged copy is why: it shares `schema`, `engine` and
+  `system_writer` with the live machine, so physical effects are visible before the published index
+  moves. Only the metadata transition is genuinely isolated.
+
+  The area continues in three siblings, and this file's ledger appends all of them so one area still
+  prints and counts as one list. `Ferrosa/Raft/Surfaces.lean` audits the snapshot, the purge ceiling
+  and the two restart paths. `Ferrosa/Raft/Startup.lean` asks what the node does on the next boot —
+  whether a failure state repairs, refuses, or resyncs — and finds that the apply latch is in-memory
+  and every restart replays the same failure. `Ferrosa/Raft/Partial.lean` enumerates what a partially
+  applied entry leaves behind and classifies it: safe, divergent, corrupt, or stalled.
 
   The proved statements quantify over every trace and are closed by induction on it. A disproof is a
   single trace whose fields reduce under `decide`, which is all a counterexample needs.
@@ -24,6 +32,8 @@
 import Ferrosa.Ledger
 import Ferrosa.Raft.StateMachine
 import Ferrosa.Raft.Surfaces
+import Ferrosa.Raft.Startup
+import Ferrosa.Raft.Partial
 
 namespace Ferrosa.Raft
 
@@ -302,11 +312,13 @@ theorem written_inv_initial : WrittenInv St.initial where
   writtenEqAttempted := by simp [St.initial]
 
 /-- **A successful ordered write raises the durable prefix and the attempt together.** A failing
-    write is the only event that separates them, which is why this lemma excludes it. -/
+    write is the only event that separates them, which is why this lemma excludes it — in both of its
+    shapes, since `6c270518` an error that is propagated leaves the attempt recorded and the prefix
+    behind, exactly as an error that is swallowed does. -/
 theorem written_inv_step (stg : Staging) (s : St) (e : Ev) (h : WrittenInv s)
     (hnext : ∀ k, s.pending = some k → k = s.applied + 1)
     (hge : s.applied ≤ s.attempted) (hb : s.attempted ≤ s.applied + 1)
-    (he : e ≠ .systemFail) : WrittenInv (step .late stg s e) where
+    (he : e ≠ .systemFail) (hef : e ≠ .systemFailFatal) : WrittenInv (step .late stg s e) where
   writtenEqAttempted := by
     have hw := h.writtenEqAttempted
     rcases hp : s.pending with _ | n
@@ -320,28 +332,31 @@ theorem written_inv_step (stg : Staging) (s : St) (e : Ev) (h : WrittenInv s)
     induction on the trace. -/
 theorem written_inv_run (stg : Staging) :
     ∀ (tr : List Ev) (s : St), Invariant s → WrittenInv s → (∀ e, e ∈ tr → e ≠ .systemFail)
-      → WrittenInv (run .late stg s tr)
-  | [], s, _, h, _ => h
-  | e :: es, s, hinv, h, hno =>
+      → (∀ e, e ∈ tr → e ≠ .systemFailFatal) → WrittenInv (run .late stg s tr)
+  | [], s, _, h, _, _ => h
+  | e :: es, s, hinv, h, hno, hnoF =>
     written_inv_run stg es (step .late stg s e) (inv_step stg s e hinv)
       (written_inv_step stg s e h hinv.pendingNext hinv.appliedLeAttempted
-        hinv.attemptedBound (hno e (by simp)))
-      (fun e' he' => hno e' (by simp [he']))
+        hinv.attemptedBound (hno e (by simp)) (hnoF e (by simp)))
+      (fun e' he' => hno e' (by simp [he'])) (fun e' he' => hnoF e' (by simp [he']))
 
 /-- **REPLAY SAFETY, durability half (proved, conditional).** If no ordered system-table write in
     the trace returned an error, the published index never runs past the durable system-table
     prefix: every published index has its row in the engine. -/
 theorem rows_present_when_writes_succeed (stg : Staging) (tr : List Ev)
-    (hno : ∀ e, e ∈ tr → e ≠ .systemFail) :
+    (hno : ∀ e, e ∈ tr → e ≠ .systemFail) (hnoF : ∀ e, e ∈ tr → e ≠ .systemFailFatal) :
     (run .late stg St.initial tr).applied ≤ (run .late stg St.initial tr).written := by
   have hinv := (inv_run stg tr St.initial inv_initial).appliedLeAttempted
-  have hw := (written_inv_run stg tr St.initial inv_initial written_inv_initial hno).writtenEqAttempted
+  have hwi := written_inv_run stg tr St.initial inv_initial written_inv_initial hno hnoF
+  have hw := hwi.writtenEqAttempted
   omega
 
-/-- **REPLAY SAFETY, durability half — DISPROVED.** A failed ordered system-table write is logged
-    and swallowed, so the job completes, publication advances, the durable prefix stays behind, and
-    a restart does not re-issue the write because replay starts at the next index. No cancellation is
-    involved. -/
+/-- **REPLAY SAFETY, durability half — DISPROVED (the pre-`6c270518` shape, kept as the regression
+    trace).** A failed ordered system-table write is logged and swallowed, so the job completes,
+    publication advances, the durable prefix stays behind, and a restart does not re-issue the write
+    because replay starts at the next index. No cancellation is involved. This is a trace of the
+    machine's `.systemFail` event, which is what the code did before `6c270518`; the shipped shape is
+    the `.systemFailFatal` trace below. -/
 theorem sysfail_publishes_without_row :
     (run .late .shared St.initial
         [.propose, .beginApply, .physical, .systemFail, .finish]).applied = 1
@@ -354,6 +369,44 @@ theorem sysfail_publishes_without_row :
     ∧ (run .late .shared St.initial
         [.propose, .beginApply, .physical, .systemFail, .finish, .restart]).written = 0 := by
   decide
+
+/-- **THE FIX, AT THE TRACE THE OLD DISPROOF USED: A FAILED PROJECTION PUBLISHES NOTHING
+    (PROVED).** With the job propagating the error (`state_machine.rs:2334-2342` → `:454-464`) the
+    entry does not advance `last_applied`, the durable prefix does not advance either, and the
+    machine latches — so the same four events that used to publish row-less now publish nothing, and
+    a restart replays the entry instead of starting after it. -/
+theorem sysfail_blocks_publication :
+    (run .late .shared St.initial
+        [.propose, .beginApply, .physical, .systemFailFatal]).applied = 0
+    ∧ (run .late .shared St.initial
+        [.propose, .beginApply, .physical, .systemFailFatal]).attempted = 1
+    ∧ (run .late .shared St.initial
+        [.propose, .beginApply, .physical, .systemFailFatal]).written = 0
+    ∧ (run .late .shared St.initial
+        [.propose, .beginApply, .physical, .systemFailFatal]).failed = true
+    ∧ (run .late .shared St.initial
+        [.propose, .beginApply, .physical, .systemFailFatal]).pending = none
+    ∧ (run .late .shared St.initial
+        [.propose, .beginApply, .physical, .systemFailFatal, .finish]).applied = 0
+    ∧ (run .late .shared St.initial
+        [.propose, .beginApply, .physical, .systemFailFatal, .restart, .beginApply, .physical,
+         .systemWrite, .finish]).applied = 1 := by
+  decide
+
+/-- **…and nothing republishes it before a restart.** The latch closes every entry point, so over any
+    trace that does not restart the process the published index is frozen where the failure left it.
+    The restart is the one event that clears the latch, which is `Ferrosa/Raft/Startup.lean`'s
+    finding, not a hole in this one. -/
+theorem a_latched_entry_is_not_republished (stg : Staging) (tr : List Ev)
+    (hne : ∀ e, e ∈ tr → e ≠ .restart) (s : St) (hf : s.failed = true) (hp : s.pending = none) :
+    (run .late stg s tr).applied = s.applied := by
+  induction tr generalizing s with
+  | nil => rfl
+  | cons e es ih =>
+    obtain ⟨h1, h2, h3, h4, h5, h6, h7⟩ := latch_closed .late stg s e hf hp (hne e (by simp))
+    rw [show run .late stg s (e :: es) = run .late stg (step .late stg s e) es from rfl]
+    rw [ih (fun e' he' => hne e' (by simp [he'])) (step .late stg s e) h7 (h6.trans hp)]
+    exact h1
 
 /-- **Cancellation is not a state change.** `finish_pending_apply` polls the retained handle, so
     dropping the awaiter leaves both the handle and the job in place. -/
@@ -444,11 +497,13 @@ theorem panic_after_physical_latches :
 
 /-! ## The ledger
 
-Twelve obligations, each with the theorem that settles it. Seven hold over every trace; five are red,
-each naming the single trace that refutes it. Reading this table answers what a client may assume
-about a schema change once raft reports the entry applied, and where that assumption stops — and,
-from `Ferrosa/Raft/Surfaces.lean`, what an operator may assume about the snapshot that is supposed to
-make the answer survive a restart.
+Twenty-two obligations, each with the theorem that settles it: twelve the fence and its snapshot
+surface, five on startup and replay, and five on what a partial apply leaves behind. Ten are red,
+each naming the single trace or table that refutes it.
+
+Reading this table answers what a client may assume about a schema change once raft reports the entry
+applied, where that assumption stops (`Surfaces.lean`), what a node does on the next boot when the
+assumption failed (`Startup.lean`), and what it holds when it comes back (`Partial.lean`).
 -/
 
 def ledger : List SpecItem := [
@@ -459,19 +514,18 @@ def ledger : List SpecItem := [
   ⟨"once an apply has failed, nothing that follows changes the state machine",
    .met "Raft.latch_closed"⟩,
   ⟨"an entry is published only when its ordered system-table write landed",
-   .failing
-     "publication waits for the ordered write to be attempted, not for it to succeed: a failed write is logged and swallowed, so the entry publishes with the durable prefix behind it and replay starts after it"
-     "Raft.sysfail_publishes_without_row"⟩,
+   .met "Raft.sysfail_blocks_publication"⟩,
   ⟨"the staged copy leaves no trace until it publishes",
    .failing
      "staged_apply clones the metadata but shares the schema, engine and system-writer handles, so the physical transition is visible on the blocking thread while the published index still points at the previous entry"
      "Raft.shared_exposes_effects_before_publication"⟩
-] ++ surfaceItems
+] ++ surfaceItems ++ startupItems ++ partialItems ++ grantItems
 
-/-- The area records twelve obligations of which five are unmet — the fence's two and the three the
-    snapshot, purge and restart surface adds — and both numbers are pinned here: closing one, or
-    adding a claim, forces this table to be updated in the same change. -/
-theorem raft_has_twelve_items_and_five_red : ledger.length = 12 ∧ redCount ledger = 5 := by
+/-- The area records twenty-two obligations of which ten are unmet — the fence's one, the snapshot
+    surface's three, startup's three, partial application's two and the grant projection's one — and
+    both numbers are pinned here: closing one, or adding a claim, forces this table to be updated in
+    the same change. -/
+theorem raft_has_twenty_two_items_and_ten_red : ledger.length = 22 ∧ redCount ledger = 10 := by
   decide
 
 def main : IO Unit :=

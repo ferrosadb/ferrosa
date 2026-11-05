@@ -95,8 +95,14 @@ inductive Ev where
   | physical
   /-- The job's ordered system-table writes all returned `Ok`. -/
   | systemWrite
-  /-- The job's ordered system-table writes returned an error, which is logged and dropped. -/
+  /-- The job's ordered system-table writes returned an error, which is logged and dropped. This is
+  the **pre-`6c270518` shape**, kept because the regression trace below is still a trace of this
+  machine. -/
   | systemFail
+  /-- The job's ordered system-table write returned an error and the job propagated it:
+  `flush_pending_system_writes` is fallible (`state_machine.rs:2171-2199`), so `finish_pending_apply`
+  latches and the entry does not publish (`:454-464`). This is the shipped shape. -/
+  | systemFailFatal
   /-- The awaiter is dropped. `pending_apply` (and so the job) is retained. -/
   | cancel
   /-- `finish_pending_apply`: poll the retained handle and publish, or latch on failure. -/
@@ -191,6 +197,13 @@ def step (pol : PublishPolicy) (stg : Staging) (s : St) (e : Ev) : St :=
     | some k =>
       if s.pendingPhysical = true ∧ s.pendingSystemWrites = false then
         { s with attempted := k, pendingSystemWrites := true }
+      else s
+  | .systemFailFatal =>
+    match s.pending with
+    | none => s
+    | some k =>
+      if s.pendingPhysical = true ∧ s.pendingSystemWrites = false then
+        { s with attempted := k, pending := none, failed := true }
       else s
   | .cancel => s
   | .finish =>

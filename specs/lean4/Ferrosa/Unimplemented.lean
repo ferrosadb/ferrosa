@@ -147,9 +147,10 @@ theorem ledgerTotal_is_the_registry_sum :
     ledgerTotal = (areas.map fun a => redCount a.ledger).sum := rfl
 
 /-- Pinned so that removing a ledger from the registry — the drift that has recurred here — is a
-    build failure rather than a silently smaller total. Sixty-five: the raft surface audit added
-    three reds without adding an area. -/
-theorem ledgerTotal_pinned : ledgerTotal = 65 := by decide
+    build failure rather than a silently smaller total. Seventy: the raft surface audit added three
+    reds without adding an area, the startup and replay audit added three, partial application two,
+    the grant projection one, and `6c270518` closed one. -/
+theorem ledgerTotal_pinned : ledgerTotal = 70 := by decide
 
 /-- Print every registered ledger, with the header its area module prints. -/
 def printAllLedgers : IO Unit := do
@@ -289,13 +290,16 @@ def nonDefects : List Other := [
 
 /-! ## Rows that are discharged now
 
-Three rows below classify items that have since been met: the ledger absorbed the claim. They are
-kept, not deleted — deleting a row is how the count stayed balanced while the bookkeeping went
-wrong — and each one is required to name a real ledger item whose status is `.met`. They are not
-part of the classification: `nothing_discharged_is_still_classified` keeps the two lists apart.
+Five rows classify items that are met now, either because the ledger absorbed the claim or because
+the code was fixed and the claim was written into the ledger afterwards. They are kept, not deleted —
+deleting a row is how the count stayed balanced while the bookkeeping went wrong — and each one is
+required to name a real ledger item whose status is `.met`. They are not part of the classification:
+`nothing_discharged_is_still_classified` keeps the two lists apart.
 -/
 
-/-- A row that was red when it was written and is discharged now. -/
+/-- A row that was red when it was written and is discharged now: either the ledger absorbed the
+claim, or the code was fixed and the claim was written into the ledger afterwards. `why` carries the
+regression witness's name in the second case. -/
 structure Discharged where
   area : String
   what : String
@@ -314,7 +318,13 @@ def discharged : List Discharged := [
    "Ferrosa.Sql.Index", "a range lookup on an indexed column costs one round trip per node, which is accepted"⟩,
   ⟨"Jepsen", "a multi-DC run with local reads treats a semantics consequence as a failure",
    "discharged: `ferrosa-jepsen/src/checker/profile.rs` classifies a run that declares a cross-datacenter read as not tested rather than failed (`cross_datacenter_read_defeats_the_overlap`), a report with any not-tested run is not all-passed, and a profile declaration that does not parse is refused before the run (`a_value_that_does_not_parse_is_refused`) instead of falling back to QUORUM/QUORUM",
-   "Ferrosa.Testing.Jepsen", "a multi-DC run under LOCAL_QUORUM or DC_QUORUM must expect strict-serializability violations after a failover"⟩
+   "Ferrosa.Testing.Jepsen", "a multi-DC run under LOCAL_QUORUM or DC_QUORUM must expect strict-serializability violations after a failover"⟩,
+  ⟨"Raft", "an entry is published only when its ordered system-table write landed",
+   "discharged by 6c270518: `flush_pending_system_writes` now returns its error (state_machine.rs:2171-2199) into the latch, so the entry does not publish, and `Raft.sysfail_blocks_publication` is the trace the old disproof used, ending with nothing published. The pre-fix shape is kept as `Raft.sysfail_publishes_without_row`; what the fix does not settle is the physical effects that land before the flush and replay idempotency, which are `Ferrosa.Raft.Partial`'s obligations",
+   "Ferrosa.Raft.Obligations", "an entry is published only when its ordered system-table write landed"⟩,
+  ⟨"Raft", "a published grant projection carries the complete permission set",
+   "regression witness for 1a89858a: `Raft.the_persisted_delta_contradicts_the_live_cell` records the shape the fix removed, where Grant persisted `entry.clone()` (the delta) and Revoke persisted a whole-resource tombstone while the state machine kept the union and the remainder, so a restart changed a role's authorization answers with nothing logged and nothing failing. The fix's own tests assert only the post-state, which is why the pre-fix shape is recorded here",
+   "Ferrosa.Raft.Obligations", "a published grant projection carries the complete permission set"⟩
 ]
 
 /-! ## The checks

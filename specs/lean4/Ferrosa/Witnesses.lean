@@ -339,3 +339,15 @@ import Ferrosa.Raft.Obligations
 #check Ferrosa.Raft.late_cancel_still_publishes
 #check Ferrosa.Raft.early_cancel_publishes_before_write
 #check Ferrosa.Raft.panic_after_physical_latches
+#check Ferrosa.Raft.sysfail_blocks_publication
+#check Ferrosa.Raft.a_latched_entry_is_not_republished
+#check Ferrosa.Raft.restart_clears_the_latch
+#check Ferrosa.Raft.restart_cycle_never_passes_a_poisoned_entry
+#check Ferrosa.Raft.an_unreadable_snapshot_skips_the_purged_log
+#check Ferrosa.Raft.failed_restore_boots_a_healthy_node
+#check Ferrosa.Raft.replay_reaches_the_log_end
+#check Ferrosa.Raft.the_class_is_decided_by_whether_the_cause_clears
+#check Ferrosa.Raft.no_failure_is_merely_stalled
+#check Ferrosa.Raft.a_drop_that_never_publishes_is_read_as_an_empty_table
+#check Ferrosa.Raft.the_persisted_delta_contradicts_the_live_cell
+#check Ferrosa.Raft.a_tie_goes_to_the_tombstone

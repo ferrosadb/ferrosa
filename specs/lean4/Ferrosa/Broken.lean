@@ -101,10 +101,30 @@ def broken : List Item := [
    "Model only: this row is stale. The socket setting it says is missing, TCP_NODELAY, is set on every client and internode socket. Whether replies still go out as several small writes, and what that costs, has not been measured.",
    "unverified: stale as written. The premise that NODELAY exists only on unmerged c38add89 is false — `git merge-base --is-ancestor c38add89 HEAD` exits 0, and ferrosa-cql/src/server.rs:303-311 sets `stream.set_nodelay(true)` on every accepted CQL socket (same at ferrosa-postgres/src/server.rs:2237-2245, ferrosa-graph/src/bolt/server.rs:136-142, ferrosa-net/src/rpc/server.rs:267-273). Whether replies are still several small writes, and what that costs per statement, has not been re-measured. Do not re-site this row before measuring",
    "Ferrosa.Storage.Streaming", "acks are coalesced so a high-latency pipe is not ack-starved"⟩,
-  ⟨"Raft", "an entry is published only when its ordered system-table write landed",
-   "A schema change is reported as applied even when the write that makes it durable failed. The failure is logged and dropped, the applied index advances, and a restart replays from after that entry, so the system-table row can stay missing.",
-   "ferrosa-cluster/src/raft/state_machine.rs:2166-2174 logs a failed ordered write and returns (the Error level at :2171 is a log line, not a latch), so the job completes and :466-467 adopt the completed metadata and advance last_applied; replay then starts at the next index, so the write is never re-issued",
-   "Ferrosa.Raft.Obligations", "an entry is published only when its ordered system-table write landed"⟩,
+  ⟨"Raft", "a startup failure either serves, refuses naming the cause, or names a resync path",
+   "When the saved Raft snapshot cannot be restored, or cannot be read at all, the node logs a warning and starts anyway, reporting an applied index it cannot back with real schema or table state. It looks healthy, answers questions from state that is not there, and nothing retries or repairs it.",
+   "ferrosa-cluster/src/raft/state_machine.rs:848-854 adopt state and last_applied before the sync that can fail, and controller/cluster.rs:1459-1465 logs that error and boots; the classifier at :1485-1489 is asked about the already-adopted index, so it answers Usable. When the file does not decode at all, last_applied stays None and recover_from_purge_point (state_machine.rs:621-632) sets it to the purge point without restoring state",
+   "Ferrosa.Raft.Obligations", "a startup failure either serves, refuses naming the cause, or names a resync path"⟩,
+  ⟨"Raft", "the apply latch survives a restart",
+   "The flag that stops a node applying changes lives only in memory, so a restart always clears it, and nothing at startup asks whether the reason for the failure is still true.",
+   "ferrosa-cluster/src/raft/state_machine.rs:375 is a plain field, absent from SnapshotData (state, last_applied, last_membership), and the constructor at :580 sets it to None; controller/cluster.rs:1449-1453 builds a fresh machine on every boot",
+   "Ferrosa.Raft.Obligations", "the apply latch survives a restart"⟩,
+  ⟨"Raft", "a restart cannot repeat a persistent projection failure without progress",
+   "If the cause of a failed schema write does not clear - a disk below its reserve, a table that cannot be created - the node restarts clean, fails the same entry, and stops again. Repeatedly, with no progress, and with nothing on the node able to tell that apart from a transient fault.",
+   "6c270518 made every WarnReplay system-write site fatal (ferrosa-cluster/src/raft/state_machine.rs:2171-2199 returning into :454-464), widening the set of inputs that latch; the precondition is check_write_admission (ferrosa-storage/src/engine.rs:3354-3372, reached from engine.write at :10109) or the fsync at state_machine.rs:2196. Ferrosa/Raft/Startup.lean:restart_cycle_never_passes_a_poisoned_entry is the trace",
+   "Ferrosa.Raft.Obligations", "a restart cannot repeat a persistent projection failure without progress"⟩,
+  ⟨"Raft", "no durable effect belongs to an entry the published index does not cover",
+   "A row can reach the disk before the index it belongs to is published. Playback normally reissues it, but the window is unbounded when the cause of a later failure persists, and it is the raft directory that holds the only record the row could be explained by.",
+   "ferrosa-cluster/src/raft/state_machine.rs:2193-2197 forces the commit log to disk inside the job, and finish_pending_apply advances last_applied only when the job's result is polled at :476-477; a death between the two leaves the row durable and unpublished. controller/cluster.rs:1526 then moves the whole raft directory aside, taking the entry with it",
+   "Ferrosa.Raft.Obligations", "no durable effect belongs to an entry the published index does not cover"⟩,
+  ⟨"Raft", "a restart or a resync repairs an entry whose destructive effect already landed",
+   "Dropping a table deletes its rows before the bookkeeping row is written. If that row then fails, the drop is never recorded as applied, and after a restart the node advertises the table again: empty, with every component agreeing, and nothing left that could put the rows back.",
+   "apply_command calls engine.unregister_table inside the staged job (ferrosa-cluster/src/raft/state_machine.rs:2334-2342 -> ferrosa-storage/src/engine.rs:5865-5899, :6020-6059), which records a durable drop in dropped-tables.json and deletes the SSTable directory, before flush_pending_system_writes at :2171 can fail; the snapshot restored on the next boot still describes the table and apply_snapshot merges additively (ferrosa-schema/src/registry.rs:346-364)",
+   "Ferrosa.Raft.Obligations", "a restart or a resync repairs an entry whose destructive effect already landed"⟩,
+  ⟨"Raft", "the projection orders two writes by the log, not by the wall clock",
+   "Rows written to the permission and catalog tables are ordered by the wall clock rather than by the log. Two writes inside the same microsecond resolve to a delete, so a grant that follows a revoke can be masked and a role can lose permissions that it, and every peer, still holds.",
+   "1a89858a removed the tombstone-then-rewrite pair within one entry (ferrosa-cluster/src/raft/state_machine.rs:1892-1939), but grant_to_row still stamps rows with now_micros() (ferrosa-schema/src/system/persistence.rs:417-432) and PermissionRevoked stamps its tombstone the same way (ferrosa-cluster/src/system_table_writer.rs:164-181); reconcile_ref gives an equal-timestamp tie to the tombstone (ferrosa-common/src/complex_cell.rs:65-75) and SystemTime is not monotone",
+   "Ferrosa.Raft.Obligations", "the projection orders two writes by the log, not by the wall clock"⟩,
   ⟨"Raft", "the durable snapshot on disk never moves backwards",
    "A node that finishes building an old snapshot after it has installed a newer one writes the old one over the newer one on disk. The two durable facts then disagree, so the node refuses to start, throws away its raft log and has to be rebuilt from a peer.",
    "ferrosa-cluster/src/raft/state_machine.rs:2218 discards the boolean publish_snapshot returns when it refuses to replace a newer snapshot, and :2225 then persists snapshot_path unconditionally, so a builder taken at index 5 that finishes after install_snapshot at 10 writes 5 over 10 while mark_durably_applied (:2229) stays at 10 because it is a fetch_max; the guard is only tested with snapshot_path None (the test at :4501 builds on FerrosStateMachine::new())",
@@ -119,26 +139,27 @@ def broken : List Item := [
    "Ferrosa.Raft.Obligations", "a failed local side effect is repaired without a restart"⟩
 ]
 
-/-- Nineteen built-and-wrong items, pinned so a defect cannot be dropped from the list without the
-corpus classification breaking. -/
-theorem broken_has_nineteen_items : broken.length = 19 := by native_decide
+/-- Twenty-four built-and-wrong items, pinned so a defect cannot be dropped from the list without the
+corpus classification breaking. The sysfail row left for `Unimplemented.discharged` when `6c270518`
+closed it; six rows joined when startup, replay and the grant projection were audited. -/
+theorem broken_has_twenty_four_items : broken.length = 24 := by native_decide
 
-/-- The surfaces are where the damage concentrates: five of the nineteen are SQL or SPARQL, which are
-    the two places where a client is most likely to be told something confidently wrong. -/
+/-- The surfaces are where the damage concentrates: five of the twenty-four are SQL or SPARQL, which
+    are the two places where a client is most likely to be told something confidently wrong. -/
 theorem the_surfaces_carry_five : (broken.filter fun i => i.area == "SQL").length
     + (broken.filter fun i => i.area == "SPARQL").length = 5 := by native_decide
 
-/-- Five of the nineteen could not be anchored to the shipping code: four describe an implementation
-    that does the correct thing at this revision (with tests pinning it) and one is stale because the
-    fix it says is unmerged has been merged since. Counted, so a later edit cannot quietly turn a
-    model-only hazard back into an assertion about code. -/
+/-- Five of the twenty-four could not be anchored to the shipping code: four describe an
+    implementation that does the correct thing at this revision (with tests pinning it) and one is
+    stale because the fix it says is unmerged has been merged since. Counted, so a later edit cannot
+    quietly turn a model-only hazard back into an assertion about code. -/
 theorem five_rows_have_no_verified_site :
     (broken.filter fun i => i.site.startsWith "unverified:").length = 5 := by native_decide
 
 /-- The remainder — the rows that name a real location — are what the list's opening claim is about:
     code that was read, not inferred. -/
-theorem fourteen_rows_name_a_site :
-    (broken.filter fun i => !i.site.startsWith "unverified:").length = 14 := by native_decide
+theorem nineteen_rows_name_a_site :
+    (broken.filter fun i => !i.site.startsWith "unverified:").length = 19 := by native_decide
 
 /-- What a reader of the specification is shown for a row: the sentence that says what is wrong. -/
 def readerText (i : Item) : String := i.plain
