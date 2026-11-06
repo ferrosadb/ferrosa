@@ -24,16 +24,17 @@ type ReplicaWriteTarget = (u64, Option<(uuid::Uuid, String)>, String);
 type ReplicaWriteJoin = JoinHandle<ReplicaResult>;
 type NtsReplicaWriteJoin = JoinHandle<(ReplicaResult, String)>;
 
-/// Spawns `work` under the `coordinator-local-write` blocking-pool capacity. The
-/// pool admits it against the shared bound inside the spawned task, so the caller
-/// neither waits here nor queues the row in tokio's unbounded queue; awaiting the
-/// returned handle yields the job's `Result`.
-fn spawn_storage_blocking<T, F>(work: F) -> JoinHandle<Result<T, ferrosa_common::Error>>
+/// Admits `work` against the `coordinator-local-write` blocking-pool capacity,
+/// then spawns it. Awaiting yields the job's handle; a full pool makes the
+/// caller wait here instead of queueing the row in tokio's unbounded queue.
+async fn spawn_storage_blocking<T, F>(work: F) -> JoinHandle<Result<T, ferrosa_common::Error>>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, ferrosa_common::Error> + Send + 'static,
 {
-    ferrosa_common::task_pool::TaskPool::current("coordinator-local-write").spawn_blocking(work)
+    ferrosa_common::task_pool::TaskPool::current("coordinator-local-write")
+        .spawn_blocking(work)
+        .await
 }
 
 struct TrackedWritePermit {
@@ -381,6 +382,7 @@ impl ClusterCoordinator {
                             storage.write(&table_id, &key, row, timestamp)
                         })
                         .await
+                        .await
                         {
                             Ok(Ok(())) => {
                                 metrics::inc_replica_write_ack(true);
@@ -676,6 +678,7 @@ impl ClusterCoordinator {
                             storage.write(&table_id, &key, row, timestamp)
                         })
                         .await
+                        .await
                         {
                             Ok(Ok(())) => {
                                 metrics::inc_replica_write_ack(true);
@@ -899,6 +902,7 @@ impl ClusterCoordinator {
                         let result = match spawn_storage_blocking(move || {
                             storage.write(&table_id, &key, row, timestamp)
                         })
+                        .await
                         .await
                         {
                             Ok(Ok(())) => {
@@ -2736,7 +2740,8 @@ mod blocking_storage_tests {
             work_started.store(true, Ordering::Release);
             std::thread::sleep(Duration::from_millis(300));
             Ok::<(), ferrosa_common::Error>(())
-        });
+        })
+        .await;
 
         while !started.load(Ordering::Acquire) {
             tokio::task::yield_now().await;
