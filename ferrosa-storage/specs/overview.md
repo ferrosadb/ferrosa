@@ -610,9 +610,19 @@ A segment is a chain of sections, each opened by an 8-byte head marker
 `HEADER_SIZE` is the first head. `Segment::flush_to_disk` is the only path to
 disk, and every call closes the current section under `marker_link`: it
 reserves the next head slot `S` (counted as an in-flight writer), writes the
-current head with `next = S`, then writes `[last_flushed, S)` at its own offset
-and syncs. `last_flushed` becomes `S`. A flush with nothing allocated since the
-head reserves nothing. When no slot fits, or the segment is sealed for
+current head with `next = S`, then writes `[last_flushed, min(S, written))` at
+its own offset and syncs. `last_flushed` becomes that end. A flush with nothing
+allocated since the head reserves nothing.
+
+`min` with the published length is what keeps a flush from publishing a range a
+writer has reserved but not yet filled: `allocate`'s CAS names the bytes, and
+`SegmentBuffer::publish` is what makes them exist. A writer therefore writes its
+own range through `range_mut` and publishes it, and a flusher reads
+`SegmentBuffer::prefix(end)` under `file_handle` after `wait_for_writers`, so two
+writers' views never overlap and a flush never carries bytes that were only
+reserved. That costs a slow writer one extra incremental flush; taking `S` alone
+would write zeros over its range and move the watermark past it, so the entry
+would never reach disk while the index said it was there. When no slot fits, or the segment is sealed for
 rotation, the final head is written with `next = 0`, the chain is closed and
 the segment takes no more appends.
 
