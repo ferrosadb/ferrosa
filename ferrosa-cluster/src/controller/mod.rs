@@ -202,6 +202,13 @@ pub struct ModeController {
     /// Monotonic process-wide consensus health, read synchronously by CQL and
     /// readiness so neither path waits on a failed Raft runtime.
     pub(super) consensus_health: Arc<ConsensusHealth>,
+    pub(super) recovery_admission: Arc<crate::raft::quarantine::RecoveryAdmission>,
+    pub(super) repair_preparations: Arc<
+        parking_lot::Mutex<
+            HashMap<RaftGroupId, crate::raft::recovery_session::RepairPreparationState>,
+        >,
+    >,
+    pub(super) repair_preparation_changed: Arc<tokio::sync::Notify>,
     /// Per-follower replication progress, fed by the leader's snapshot pusher
     /// and Raft network; read by readiness and the metrics endpoint.
     pub(super) replication_health: Arc<crate::raft::replication_health::ReplicationHealth>,
@@ -254,6 +261,8 @@ pub struct ModeController {
     /// [`RaftGroupId::default_dc`]. Replaces the prior single
     /// `raft_instance` field — see ADR-015.
     pub(super) raft_groups: Arc<ArcSwap<HashMap<RaftGroupId, Arc<FerrosRaft>>>>,
+    pub(super) physical_raft_workers: Arc<crate::raft::physical_apply::PhysicalRaftWorkers>,
+    pub(super) raft_retirement_operation: tokio::sync::Mutex<()>,
     /// Known DC for each connected peer. Populated by
     /// [`Self::record_peer_dc`] when a peer announces its DC during the
     /// connection handshake. Used by `transition_to_cluster` to filter
@@ -521,6 +530,15 @@ impl ModeController {
         let initial_mode = match super::controller::cluster::configured_raft_dir(&config) {
             // A dissolved cluster outranks the cluster-member marker: the node
             // is half of a pair now, never a returning member (t_47bbeb66).
+            Some(_)
+                if matches!(
+                    dissolution_state,
+                    dissolution::DissolutionState::Unreadable(_)
+                ) =>
+            {
+                tracing::error!(reason = ?dissolution_state.raft_refusal(), "dissolution retirement is incomplete; refusing local write ownership");
+                DeploymentMode::DegradedCluster
+            }
             Some(_) if dissolution_state != dissolution::DissolutionState::None => {
                 tracing::warn!(
                     reason = ?dissolution_state.raft_refusal(),
@@ -551,9 +569,22 @@ impl ModeController {
         // jsonb DDL gate reads it at every entry and apply, so it can never
         // lag a transition the controller has made.
         schema.set_deployment_mode(initial_mode);
+        let consensus_health = Arc::new(ConsensusHealth::new());
+        if matches!(
+            dissolution_state,
+            dissolution::DissolutionState::Unreadable(_)
+        ) {
+            consensus_health.fail(
+                "raft_retirement_incomplete",
+                format_args!("{:?}", dissolution_state.raft_refusal()),
+            );
+        }
         let controller = Arc::new(Self {
             self_weak: std::sync::OnceLock::new(),
-            consensus_health: Arc::new(ConsensusHealth::new()),
+            consensus_health,
+            recovery_admission: Arc::new(crate::raft::quarantine::RecoveryAdmission::new()),
+            repair_preparations: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            repair_preparation_changed: Arc::new(tokio::sync::Notify::new()),
             replication_health: Arc::new(crate::raft::replication_health::ReplicationHealth::new()),
             leader_contact: Arc::new(crate::raft::leader_contact::LeaderContact::new()),
             mode: schema.deployment_mode_handle(),
@@ -574,6 +605,10 @@ impl ModeController {
             dissolution: ArcSwap::from_pointee(dissolution_state),
             pair_dissolve_transport: ArcSwap::from_pointee(None),
             raft_groups: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            physical_raft_workers: Arc::new(
+                crate::raft::physical_apply::PhysicalRaftWorkers::default(),
+            ),
+            raft_retirement_operation: tokio::sync::Mutex::new(()),
             peer_dcs: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             peer_racks: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             hint_store,
@@ -727,6 +762,9 @@ impl ModeController {
         Arc::new(Self {
             self_weak: std::sync::OnceLock::new(),
             consensus_health: Arc::new(ConsensusHealth::new()),
+            recovery_admission: Arc::new(crate::raft::quarantine::RecoveryAdmission::new()),
+            repair_preparations: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            repair_preparation_changed: Arc::new(tokio::sync::Notify::new()),
             replication_health: Arc::new(crate::raft::replication_health::ReplicationHealth::new()),
             leader_contact: Arc::new(crate::raft::leader_contact::LeaderContact::new()),
             mode: {
@@ -750,6 +788,10 @@ impl ModeController {
             dissolution: ArcSwap::from_pointee(dissolution::DissolutionState::None),
             pair_dissolve_transport: ArcSwap::from_pointee(None),
             raft_groups: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            physical_raft_workers: Arc::new(
+                crate::raft::physical_apply::PhysicalRaftWorkers::default(),
+            ),
+            raft_retirement_operation: tokio::sync::Mutex::new(()),
             peer_dcs: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             peer_racks: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             hint_store,
@@ -808,6 +850,9 @@ impl ModeController {
         Arc::new(Self {
             self_weak: std::sync::OnceLock::new(),
             consensus_health: Arc::new(ConsensusHealth::new()),
+            recovery_admission: Arc::new(crate::raft::quarantine::RecoveryAdmission::new()),
+            repair_preparations: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            repair_preparation_changed: Arc::new(tokio::sync::Notify::new()),
             replication_health: Arc::new(crate::raft::replication_health::ReplicationHealth::new()),
             leader_contact: Arc::new(crate::raft::leader_contact::LeaderContact::new()),
             mode: {
@@ -831,6 +876,10 @@ impl ModeController {
             dissolution: ArcSwap::from_pointee(dissolution::DissolutionState::None),
             pair_dissolve_transport: ArcSwap::from_pointee(None),
             raft_groups: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            physical_raft_workers: Arc::new(
+                crate::raft::physical_apply::PhysicalRaftWorkers::default(),
+            ),
+            raft_retirement_operation: tokio::sync::Mutex::new(()),
             peer_dcs: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             peer_racks: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             hint_store,
@@ -959,7 +1008,7 @@ impl ModeController {
     /// Pair replicas accept read traffic. Mutation and DDL dispatch enforce
     /// primary authority rather than rejecting a connection before its opcode.
     pub fn is_cql_ready(&self) -> bool {
-        if !self.consensus_health.is_healthy() {
+        if !self.consensus_is_healthy() {
             return false;
         }
         self.accepts_cql_connections()
@@ -1035,6 +1084,11 @@ impl ModeController {
     }
 
     /// Shared, monotonic health gate for the process's consensus lane.
+    /// Shared online-recovery admission fence for client, snapshot and Raft RPC surfaces.
+    pub fn recovery_admission(&self) -> Arc<crate::raft::quarantine::RecoveryAdmission> {
+        Arc::clone(&self.recovery_admission)
+    }
+
     pub fn consensus_health(&self) -> Arc<ConsensusHealth> {
         self.consensus_health.clone()
     }
@@ -1078,8 +1132,34 @@ impl ModeController {
     }
 
     /// Synchronous fast path used by readiness and CQL dispatch.
+    #[cfg(test)]
+    pub(crate) async fn wait_for_raft_repair_preparation(
+        &self,
+        dc: &str,
+    ) -> Result<Arc<crate::raft::recovery_session::ActiveRaftRepair>, String> {
+        loop {
+            let notified = self.repair_preparation_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self
+                .repair_preparations
+                .lock()
+                .get(&RaftGroupId::for_dc(dc))
+            {
+                Some(crate::raft::recovery_session::RepairPreparationState::Prepared(value)) => {
+                    return Ok(Arc::clone(value))
+                }
+                Some(crate::raft::recovery_session::RepairPreparationState::Failed(error)) => {
+                    return Err(error.clone())
+                }
+                _ => {}
+            }
+            notified.await;
+        }
+    }
+
     pub fn consensus_is_healthy(&self) -> bool {
-        self.consensus_health.is_healthy()
+        self.consensus_health.is_healthy() && self.recovery_admission.admits().is_ok()
     }
 
     /// Get local host_id.
@@ -1215,6 +1295,79 @@ impl ModeController {
     /// the `RaftGroupId` from a DC name.
     pub fn set_raft_for_dc(&self, dc_name: &str, raft: Arc<FerrosRaft>) {
         self.set_raft_for_group(RaftGroupId::for_dc(dc_name), raft);
+    }
+
+    /// Publish an externally constructed group with its actual physical owner.
+    ///
+    /// The supplied state machine must be the one owned by this Raft worker,
+    /// and the log store must be the store used to create that worker. This
+    /// adapter preserves the normal retirement and committed-coverage checks.
+    pub fn set_tracked_raft_for_dc(
+        self: &Arc<Self>,
+        dc_name: &str,
+        raft: Arc<FerrosRaft>,
+        state_machine: &crate::raft::state_machine::FerrosStateMachine,
+        log_store: &crate::raft::log_store::SledLogStore,
+    ) -> impl std::future::Future<Output = crate::error::Result<()>> + Send + 'static {
+        // Capture actual ownership synchronously. The returned future borrows
+        // neither the machine nor its observer lock while shutdown is awaited.
+        let group = RaftGroupId::for_dc(dc_name);
+        let lifecycle = state_machine.physical_lifecycle();
+        let committed = log_store.committed_reader();
+        let controller = Arc::clone(self);
+        async move {
+            // An unpolled publication must not reserve a live worker. Once
+            // polled, reserve/install/publish complete without an intervening
+            // await, so cancellation cannot abandon a half-installed owner.
+            let registration = controller
+                .physical_raft_workers
+                .reserve(group, lifecycle)
+                .inspect(|registration| registration.bind_log(committed));
+            let publication = registration.and_then(|registration| {
+                if registration.install_raft(Arc::clone(&raft))
+                    && registration.publish(|| {
+                        controller.set_raft_for_group(group, Arc::clone(&raft));
+                    })
+                {
+                    Ok(())
+                } else {
+                    Err("physical Raft registration sealed before publication".into())
+                }
+            });
+            if let Err(reason) = publication {
+                raft.shutdown().await.map_err(|error| {
+                    crate::error::ClusterError::RaftError(format!(
+                        "stop unpublished tracked Raft worker: {error}"
+                    ))
+                })?;
+                return Err(crate::error::ClusterError::RaftError(reason));
+            }
+            Ok(())
+        }
+    }
+
+    /// Fence and drain one quarantined Raft group without sealing other groups.
+    /// The returned scope is quiescence evidence only; it never clears a fault,
+    /// authorizes storage activation or reopens admission.
+    pub async fn retire_raft_group_for_recovery(
+        &self,
+        dc_name: &str,
+        recovery_epoch: u64,
+    ) -> crate::error::Result<Arc<crate::raft::RetiredRaftGroup>> {
+        self.recovery_admission
+            .drain_publications_async(recovery_epoch)
+            .await
+            .map_err(|error| crate::error::ClusterError::RaftError(error.to_string()))?;
+        let retired = self
+            .physical_raft_workers
+            .stop_group_for_recovery(RaftGroupId::for_dc(dc_name), &self.raft_groups.load_full())
+            .await
+            .map_err(crate::error::ClusterError::RaftError)?;
+        self.recovery_admission
+            .drain_publications_async(recovery_epoch)
+            .await
+            .map_err(|error| crate::error::ClusterError::RaftError(error.to_string()))?;
+        Ok(retired)
     }
 
     /// Record a connected peer's DC. Called by the peer handshake (or

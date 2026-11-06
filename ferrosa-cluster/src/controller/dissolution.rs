@@ -49,6 +49,10 @@ pub struct PairDissolution {
     pub former_voters: Vec<u64>,
     /// Wall-clock milliseconds when this node recorded it.
     pub dissolved_at_ms: u64,
+    /// True only after Core, the committed SM queue and detached physical jobs
+    /// have retired. Legacy markers carry no such proof and fail closed.
+    #[serde(default)]
+    pub retirement_complete: bool,
 }
 
 impl PairDissolution {
@@ -88,7 +92,7 @@ impl DissolutionState {
             )),
             Self::Unreadable(e) => Some(format!(
                 "{DISSOLUTION_MARKER} exists but cannot be read ({e}); refusing Raft and \
-                 every peer until an operator repairs or removes it"
+                 every peer until an operator repairs the committed state and confirms retirement"
             )),
         }
     }
@@ -113,7 +117,10 @@ pub fn read_dissolution(raft_dir: &Path) -> DissolutionState {
     let path = marker_path(raft_dir);
     match std::fs::read(&path) {
         Ok(bytes) => match serde_json::from_slice::<PairDissolution>(&bytes) {
-            Ok(d) => DissolutionState::Dissolved(d),
+            Ok(d) if d.retirement_complete => DissolutionState::Dissolved(d),
+            Ok(_) => DissolutionState::Unreadable(format!(
+                "{}: physical retirement is unconfirmed; preserve the marker and repair the committed Raft prefix before completing dissolution", path.display()
+            )),
             Err(e) => DissolutionState::Unreadable(format!("{}: {e}", path.display())),
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => DissolutionState::None,
@@ -264,6 +271,7 @@ mod tests {
             pair: [Uuid::from_u128(1), Uuid::from_u128(2)],
             former_voters: vec![1, 2, 3],
             dissolved_at_ms: 7,
+            retirement_complete: true,
         }
     }
 

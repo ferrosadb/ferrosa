@@ -7,6 +7,9 @@
 //! Snapshots are serialized with bincode because `serde_json` does not support
 //! non-string map keys (our `BTreeMap<(String, String), _>` tuple keys).
 
+//! Last revised: 2026-11-05.
+//! Last changed: Serialize durable snapshot promotion and reject stale builders on disk.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -46,41 +49,120 @@ use crate::ring::TokenRing;
 // ApplyError — typed sub-errors that can occur inside `apply_command`.
 // ---------------------------------------------------------------------------
 
-/// Typed sub-error from a single side-effect during `apply_command` (W1.7).
+/// A failed committed local Schema or Engine effect during `apply_command`.
 ///
-/// Today the apply path logs and swallows every Schema / Engine /
-/// SystemTableWriter failure (`tracing::error!(%e, ...)` with no
-/// further propagation), which has produced two known
-/// silent-data-loss bugs:
+/// A *storage failure* propagates through the retained worker, latches the
+/// machine, and refuses further apply/snapshot progress. A *refusal* — a DROP
+/// whose only failing step was directory cleanup, a CREATE whose
+/// `engine.register_table` was refused, an ALTER of a table this node's engine
+/// does not hold — is returned to the caller as a `RaftResponse::Error` and the
+/// machine keeps applying (see `fences_replica` and the response decision at the
+/// end of `apply_command`). Ordinary domain rejection is a separate
+/// `RaftResponse::Error` and does not poison the machine either.
 ///
-/// 1. `engine.register_table` failure — writes to the new table go
-///    nowhere yet `RaftResponse::Ok` is returned to the client.
-/// 2. `schema.create_table_internal` failure — schema diverges from
-///    the Raft log; queries blow up with "unknown table" hours later.
-///
-/// `ApplyError` accumulates these so `apply_command` can return
-/// `RaftResponse::Error(_)` and callers (`MembershipChanger`,
-/// `client_write` users, the schema-coherence audit) can act.  The
-/// migration is staged: Sprint 1 introduces the type and wires the
-/// engine path; subsequent sprints migrate the remaining sites.
+/// Shared physical effects may already be visible; this is not transactional
+/// rollback, a persistent failure journal, or automatic recovery.
 #[derive(Debug, Clone)]
 pub enum ApplyError {
-    /// `engine.register_table` failed — writes to the table will not
-    /// land in storage.  The most dangerous class of error.
+    /// `engine.register_table` refused — this node could not take ownership of
+    /// the table's directory (an unremovable same-name directory left by a DROP
+    /// that could not sweep it, `EACCES`, a mount point, a path that is not a
+    /// directory).
+    ///
+    /// Refusal, not storage failure: the entry is committed and canonical
+    /// metadata agrees on every replica, so applying it is what keeps replicas
+    /// in agreement. The table is unusable on this node only, loudly, and a
+    /// re-issued CREATE after the directory is usable again registers it.
     EngineRegisterTable {
         keyspace: String,
         table: String,
         reason: String,
     },
-    /// `engine.unregister_table` failed — stale data may persist
-    /// after a DropTable / DropKeyspace.
+    /// `engine.unregister_table` failed before the durable drop intent or before
+    /// the table's writers were retired.
+    ///
+    /// Storage failure, not a refusal: the original table is still registered and
+    /// its rows are still readable, so the DROP did not take effect.
     EngineUnregisterTable {
         keyspace: String,
         table: String,
         reason: String,
     },
-    /// Catch-all for sites not yet migrated to a typed variant.
+    /// Registry retirement and durable intents succeeded; only directory cleanup refused.
+    ///
+    /// Refusal, not storage failure: the table is gone from canonical metadata on
+    /// every replica, the surviving bytes are unreachable and swept by the next
+    /// same-name CREATE.
+    EngineDropCleanupRefused {
+        keyspace: String,
+        table: String,
+        reason: String,
+    },
+    /// This node's engine holds no registration for a table the committed log
+    /// says exists, so a per-table effect (`update_table_schema`) had nothing to
+    /// act on.
+    ///
+    /// Refusal, not storage failure: with no registration no write can reach a
+    /// memtable, so no flush can be built from a wrong header. The table is
+    /// unusable on this node, loudly, and a re-issued CREATE registers it with
+    /// the metadata the log has accumulated since.
+    EngineTableNotRegistered {
+        keyspace: String,
+        table: String,
+        reason: String,
+    },
+    /// A local effect whose failure leaves the bytes this node will *persist*
+    /// wrong, or whose durable effect is not established. Latching.
+    ///
+    /// Three classes live here today, all local storage failures rather than
+    /// command refusals: a stale per-table schema handed to the engine
+    /// (`update_table_schema` — subsequent flushes would build SSTables from a
+    /// wrong `SerializationHeader`), and failures while building/rotating index
+    /// state (`build_replicated_index`, `engine.drop_index`) that can leave the
+    /// on-disk index disagreeing with committed metadata and silently
+    /// under-answer reads. Also the shared-registry reconciliation sites
+    /// (`schema.*_internal`): those are deterministic across replicas and have
+    /// no demonstrated safe serving state after divergence, so they stay
+    /// latched pending evidence rather than being downgraded on assumption.
     Other(String),
+}
+
+impl ApplyError {
+    fn unregister(
+        keyspace: String,
+        table: String,
+        error: ferrosa_storage::engine::TableUnregistrationFailure,
+    ) -> Self {
+        let reason = error.to_string();
+        if error.is_cleanup_refusal() {
+            Self::EngineDropCleanupRefused {
+                keyspace,
+                table,
+                reason,
+            }
+        } else {
+            Self::EngineUnregisterTable {
+                keyspace,
+                table,
+                reason,
+            }
+        }
+    }
+
+    /// Whether this failure means the replica's *durable* state can no longer
+    /// be trusted with the committed log, so the state machine must latch and
+    /// stop serving.
+    ///
+    /// Exhaustive on purpose: adding a variant forces a classification decision
+    /// here instead of silently inheriting the latch (or silently escaping it).
+    fn fences_replica(&self) -> bool {
+        match self {
+            Self::EngineRegisterTable { .. }
+            | Self::EngineDropCleanupRefused { .. }
+            | Self::EngineTableNotRegistered { .. } => false,
+            Self::EngineUnregisterTable { .. } | Self::Other(_) => true,
+        }
+    }
 }
 
 impl std::fmt::Display for ApplyError {
@@ -98,9 +180,23 @@ impl std::fmt::Display for ApplyError {
                 keyspace,
                 table,
                 reason,
+            }
+            | Self::EngineDropCleanupRefused {
+                keyspace,
+                table,
+                reason,
             } => write!(
                 f,
                 "engine.unregister_table({keyspace}.{table}) failed: {reason}"
+            ),
+            Self::EngineTableNotRegistered {
+                keyspace,
+                table,
+                reason,
+            } => write!(
+                f,
+                "engine.update_table_schema({keyspace}.{table}) failed: this node's engine \
+                 has no registration for a table the committed log says exists: {reason}"
             ),
             Self::Other(msg) => f.write_str(msg),
         }
@@ -280,6 +376,61 @@ struct PersistedSnapshot {
     bytes: Vec<u8>,
 }
 
+/// The metadata prefix orders both replication and durable snapshot publication.
+fn snapshot_precedes(
+    incoming: &SnapshotMeta<u64, BasicNode>,
+    current: &SnapshotMeta<u64, BasicNode>,
+) -> bool {
+    (incoming.last_log_id, incoming.last_membership.log_id())
+        < (current.last_log_id, current.last_membership.log_id())
+}
+
+/// Validate the complete outer record without allocating its byte-vector payload.
+/// This establishes framing, not a checksum or semantic bit-rot guarantee.
+fn validate_snapshot_record(
+    reader: &mut std::io::BufReader<&std::fs::File>,
+    file_len: u64,
+) -> std::io::Result<()> {
+    let payload_len: u64 = bincode::deserialize_from(&mut *reader)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let prefix_len = std::io::Seek::stream_position(reader)?;
+    if prefix_len.checked_add(payload_len) != Some(file_len) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "persisted snapshot payload length does not match the complete record",
+        ));
+    }
+    let copied = std::io::copy(
+        &mut std::io::Read::take(&mut *reader, payload_len),
+        &mut std::io::sink(),
+    )?;
+    if copied != payload_len || !std::io::BufRead::fill_buf(reader)?.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "persisted snapshot record is incomplete or has trailing bytes",
+        ));
+    }
+    Ok(())
+}
+
+/// Keep the coordination inode after unlocking: another process may hold it.
+struct SnapshotWriterLock(std::fs::File);
+
+impl Drop for SnapshotWriterLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+/// Remove only this attempt's uniquely owned staging file on failure or unwind.
+struct SnapshotStagingFile(PathBuf);
+
+impl Drop for SnapshotStagingFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // FerrosStateMachine
 // ---------------------------------------------------------------------------
@@ -345,8 +496,29 @@ impl std::fmt::Display for RecoveryError {
 
 impl std::error::Error for RecoveryError {}
 
+/// A local file supplies a durable metadata cut, not the ordering of an
+/// already-registered physical incarnation against retained committed entries.
+#[derive(Clone, Copy)]
+enum SnapshotSource {
+    Persisted,
+    Installed,
+}
+
 /// The current-snapshot slot one live state machine shares with its builders.
 type SharedSnapshotSlot = Arc<parking_lot::RwLock<Option<(SnapshotMeta<u64, BasicNode>, Vec<u8>)>>>;
+
+struct CompletedApply {
+    state: RaftState,
+    responses: Vec<RaftResponse>,
+}
+
+struct PendingApply {
+    log_id: LogId<u64>,
+    job: tokio::task::JoinHandle<Result<CompletedApply, ferrosa_common::Error>>,
+    // Both the queued worker and its owner retain these until physical work
+    // and the existing ordered system-table writes have completed.
+    pauses: Arc<Vec<ferrosa_storage::compaction::TableCompactionPause>>,
+}
 
 /// Openraft state machine for Ferrosa.
 ///
@@ -355,6 +527,19 @@ type SharedSnapshotSlot = Arc<parking_lot::RwLock<Option<(SnapshotMeta<u64, Basi
 /// (table registration).
 pub struct FerrosStateMachine {
     state: RaftState,
+    physical_lifecycle: Arc<super::physical_apply::PhysicalApplyLifecycle>,
+    recovery_admission: Arc<super::quarantine::RecoveryAdmission>,
+    recovery_session: Option<Arc<super::recovery_session::RecoverySession>>,
+    recovery_required: bool,
+    // RAII owner token is absent from staged copies and snapshot builders.
+    _physical_owner: Option<super::physical_apply::PhysicalApplyOwner>,
+    pending_apply: Option<PendingApply>,
+    /// First caller-owned committed index not yet transferred to a retained job.
+    /// Cancellation must not allow a later apply to silently skip this suffix.
+    unconsumed_input: Option<u64>,
+    apply_failure: Option<String>,
+    #[cfg(test)]
+    projection_syncs: Arc<std::sync::atomic::AtomicU64>,
     last_applied: Option<LogId<u64>>,
     last_membership: StoredMembership<u64, BasicNode>,
     /// Current snapshot data + metadata, served by `get_current_snapshot`.
@@ -391,6 +576,124 @@ pub struct FerrosStateMachine {
 }
 
 impl FerrosStateMachine {
+    /// Use the controller's shared recovery gate for this group and its builders.
+    pub(crate) fn recovery_requires_repair(&self) -> bool {
+        self.recovery_required
+    }
+    pub(crate) fn recovery_session_handle(
+        &self,
+    ) -> Option<Arc<super::recovery_session::RecoverySession>> {
+        self.recovery_session.clone()
+    }
+
+    pub fn set_recovery_admission(&mut self, admission: Arc<super::quarantine::RecoveryAdmission>) {
+        self.recovery_admission = admission;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_recovery_admission(
+        &self,
+        expected: &Arc<super::quarantine::RecoveryAdmission>,
+    ) -> bool {
+        std::sync::Arc::ptr_eq(&self.recovery_admission, expected)
+    }
+
+    pub(crate) fn physical_lifecycle(&self) -> Arc<super::physical_apply::PhysicalApplyLifecycle> {
+        Arc::clone(&self.physical_lifecycle)
+    }
+
+    fn physical_admission(
+        &self,
+    ) -> Result<Arc<super::physical_apply::PhysicalApplyLease>, Box<StorageIOError<u64>>> {
+        self.physical_lifecycle.admit().map_err(|error| {
+            Box::new(StorageIOError::write_state_machine(to_any_error(
+                std::io::Error::other(error),
+            )))
+        })
+    }
+
+    /// The synchronous transition runs against a staged metadata copy. A
+    /// detached waiter leaves the owned handle here, so the next trait call
+    /// reaps it before exposing an applied index or constructing a snapshot.
+    fn staged_apply(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+            last_applied: self.last_applied,
+            last_membership: self.last_membership.clone(),
+            current_snapshot: self.current_snapshot.clone(),
+            schema: self.schema.clone(),
+            engine: self.engine.clone(),
+            ring: self.ring.clone(),
+            ring_observer: self.ring_observer.clone(),
+            system_writer: self.system_writer.clone(),
+            snapshot_path: self.snapshot_path.clone(),
+            durable_applied: self.durable_applied.clone(),
+            pending_apply: None,
+            unconsumed_input: None,
+            physical_lifecycle: Arc::clone(&self.physical_lifecycle),
+            recovery_admission: Arc::clone(&self.recovery_admission),
+            recovery_session: self.recovery_session.clone(),
+            recovery_required: self.recovery_required,
+            _physical_owner: None,
+            apply_failure: self.apply_failure.clone(),
+            #[cfg(test)]
+            projection_syncs: Arc::clone(&self.projection_syncs),
+        }
+    }
+
+    async fn finish_pending_apply(
+        &mut self,
+    ) -> Result<Option<Vec<RaftResponse>>, Box<StorageError<u64>>> {
+        if let Some(reason) = &self.apply_failure {
+            return Err(Box::new(
+                StorageIOError::write_state_machine(to_any_error(std::io::Error::other(
+                    reason.clone(),
+                )))
+                .into(),
+            ));
+        }
+        let Some(pending) = self.pending_apply.as_mut() else {
+            return Ok(None);
+        };
+        // Poll the retained handle, not a temporary that cancellation can lose.
+        let result = (&mut pending.job).await;
+        let pending = self
+            .pending_apply
+            .take()
+            .expect("pending handle was retained");
+        let completed = match result {
+            Ok(Ok(completed)) => completed,
+            Ok(Err(error)) => {
+                let reason =
+                    format!("Raft local apply or system projection persistence failed: {error}");
+                self.apply_failure = Some(reason.clone());
+                self.physical_lifecycle.fail(&reason);
+                return Err(Box::new(
+                    StorageIOError::write_state_machine(to_any_error(std::io::Error::other(
+                        reason,
+                    )))
+                    .into(),
+                ));
+            }
+            Err(error) => {
+                let reason = format!("Raft physical apply job failed: {error}");
+                self.apply_failure = Some(reason.clone());
+                self.physical_lifecycle.fail(&reason);
+                return Err(Box::new(
+                    StorageIOError::write_state_machine(to_any_error(std::io::Error::other(
+                        reason,
+                    )))
+                    .into(),
+                ));
+            }
+        };
+        self.state = completed.state;
+        self.last_applied = Some(pending.log_id);
+        self.physical_lifecycle.applied(self.last_applied);
+        drop(pending.pauses);
+        Ok(Some(completed.responses))
+    }
+
     /// Publish `meta`/`bytes` as the snapshot replication serves, unless the
     /// slot already holds a newer one. Returns whether the slot changed.
     ///
@@ -402,7 +705,7 @@ impl FerrosStateMachine {
     fn publish_snapshot(&self, meta: SnapshotMeta<u64, BasicNode>, bytes: Vec<u8>) -> bool {
         let mut slot = self.current_snapshot.write();
         if let Some((current, _)) = slot.as_ref() {
-            if meta.last_log_id < current.last_log_id {
+            if snapshot_precedes(&meta, current) {
                 tracing::info!(
                     stale = ?meta.last_log_id,
                     current = ?current.last_log_id,
@@ -472,6 +775,8 @@ impl FerrosStateMachine {
 
     /// Create a new state machine with empty state and no side-effect targets.
     pub fn new() -> Self {
+        let (physical_lifecycle, physical_owner) =
+            super::physical_apply::PhysicalApplyLifecycle::new_owner();
         // Default auto_join=true so initial cluster formation works without
         // explicit approval. Production clusters override via UpdateConfig.
         let mut state = RaftState::default();
@@ -488,6 +793,16 @@ impl FerrosStateMachine {
             system_writer: None,
             snapshot_path: None,
             durable_applied: None,
+            physical_lifecycle,
+            recovery_admission: Arc::new(super::quarantine::RecoveryAdmission::new()),
+            recovery_session: None,
+            recovery_required: false,
+            _physical_owner: Some(physical_owner),
+            pending_apply: None,
+            unconsumed_input: None,
+            apply_failure: None,
+            #[cfg(test)]
+            projection_syncs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -659,6 +974,8 @@ impl FerrosStateMachine {
     /// Create a new state machine wired to local `Schema` and `StorageEngine`
     /// for side-effect propagation.
     pub fn with_side_effects(schema: Arc<Schema>, engine: Arc<StorageEngine>) -> Self {
+        let (physical_lifecycle, physical_owner) =
+            super::physical_apply::PhysicalApplyLifecycle::new_owner();
         let system_writer = Some(SystemTableWriter::new(Arc::clone(&engine)));
         Self {
             state: RaftState::default(),
@@ -672,6 +989,16 @@ impl FerrosStateMachine {
             system_writer,
             snapshot_path: None,
             durable_applied: None,
+            physical_lifecycle,
+            recovery_admission: Arc::new(super::quarantine::RecoveryAdmission::new()),
+            recovery_session: None,
+            recovery_required: false,
+            _physical_owner: Some(physical_owner),
+            pending_apply: None,
+            unconsumed_input: None,
+            apply_failure: None,
+            #[cfg(test)]
+            projection_syncs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -682,6 +1009,9 @@ impl FerrosStateMachine {
         snapshot_path: PathBuf,
     ) -> Self {
         let mut sm = Self::with_side_effects(schema, engine);
+        sm.recovery_session = Some(Arc::new(
+            super::recovery_session::RecoverySession::for_snapshot(&snapshot_path),
+        ));
         sm.snapshot_path = Some(snapshot_path);
         sm
     }
@@ -739,30 +1069,58 @@ impl FerrosStateMachine {
     #[allow(clippy::result_large_err)]
     fn apply_snapshot_data(
         &mut self,
-        meta: SnapshotMeta<u64, BasicNode>,
-        bytes: Vec<u8>,
+        meta: &SnapshotMeta<u64, BasicNode>,
+        bytes: &[u8],
     ) -> Result<(), StorageIOError<u64>> {
+        self.apply_snapshot_data_from(meta, bytes, SnapshotSource::Installed)
+            .map_err(|error| *error)
+    }
+
+    fn apply_snapshot_data_from(
+        &mut self,
+        meta: &SnapshotMeta<u64, BasicNode>,
+        bytes: &[u8],
+        source: SnapshotSource,
+    ) -> Result<(), Box<StorageIOError<u64>>> {
+        let _physical = self.physical_admission()?;
         let lifecycle_schema = self.schema.clone();
         let _lifecycle = lifecycle_schema
             .as_ref()
             .map(|schema| schema.lifecycle_write());
-        let data: SnapshotData = decode_snapshot(&bytes)
+        let data: SnapshotData = decode_snapshot(bytes)
             .map_err(|e| StorageIOError::read_state_machine(to_any_error(e)))?;
 
         let absent = tables_absent_from_snapshot(&self.state.tables, &data.state.tables);
         self.refuse_ambiguous_snapshot_drops(&absent, meta.last_log_id)
             .map_err(|e| *e)?;
         let dropped = tables_dropped_by_snapshot(&self.state.tables, &data.state.tables);
-        self.state = data.state;
+        let previous_state = std::mem::replace(&mut self.state, data.state);
+        let previous_applied = self.last_applied;
+        let previous_membership = self.last_membership.clone();
         self.last_applied = meta.last_log_id;
         self.last_membership = meta.last_membership.clone();
-        self.sync_schema_and_engine_from_state("Raft snapshot")
-            .map_err(|e| {
-                StorageIOError::read_state_machine(to_any_error(std::io::Error::other(e)))
-            })?;
-        self.publish_snapshot(meta, bytes);
+        if let Err(error) = self.sync_schema_and_engine_from_state("Raft snapshot", source) {
+            self.state = previous_state;
+            self.last_applied = previous_applied;
+            self.last_membership = previous_membership;
+            let reason = format!("Raft snapshot local restoration failed: {error}");
+            self.apply_failure = Some(reason.clone());
+            self.physical_lifecycle.fail(&reason);
+            return Err(Box::new(StorageIOError::read_state_machine(to_any_error(
+                std::io::Error::other(reason),
+            ))));
+        }
         self.sync_ring();
         self.unregister_tables_dropped_by_snapshot(&dropped);
+        if let Some((_, applied)) = self
+            .unconsumed_input
+            .zip(self.last_applied)
+            .filter(|(required, applied)| applied.index >= *required)
+        {
+            // An authoritative snapshot can supersede the abandoned prefix,
+            // but it cannot authorize skipping its own next committed index.
+            self.unconsumed_input = applied.index.checked_add(1);
+        }
         Ok(())
     }
 
@@ -878,7 +1236,11 @@ impl FerrosStateMachine {
         }
     }
 
-    fn sync_schema_and_engine_from_state(&self, context: &'static str) -> Result<(), String> {
+    fn sync_schema_and_engine_from_state(
+        &self,
+        context: &'static str,
+        source: SnapshotSource,
+    ) -> Result<(), String> {
         let _lifecycle = self.schema.as_ref().map(|schema| schema.lifecycle_write());
         // A same-name table with a different UUID owns none of the local old
         // incarnation's rows. Retire physical state before publishing its identity.
@@ -908,10 +1270,21 @@ impl FerrosStateMachine {
                             format!("{context}: inspect unbound table {tid}: {e}")
                         })? =>
                     {
-                        return Err(format!("{context}: table {tid} has data but no authoritative local incarnation; restore schema provenance before retrying"));
+                        return Err(format!(
+                            "{context}: table {tid} has data but no authoritative local incarnation; restore schema provenance before retrying"
+                        ));
                     }
                     _ => {}
                 }
+            }
+            // Startup must not roll physical data backwards to a lagging
+            // snapshot before retained committed DROP/CREATE entries replay.
+            // Without that chronology, even a valid local UUID cannot prove
+            // which incarnation may be erased. Preserve and refuse instead.
+            if let (SnapshotSource::Persisted, Some(table)) = (source, retired.first()) {
+                return Err(format!(
+                    "{context}: persisted snapshot cannot establish replacement order for {table}; local physical data preserved, verified committed-log recovery required"
+                ));
             }
             // Validate every table before retiring any data.
             for tid in retired {
@@ -1015,15 +1388,56 @@ impl FerrosStateMachine {
         meta: &SnapshotMeta<u64, BasicNode>,
         bytes: &[u8],
     ) -> Result<(), StorageIOError<u64>> {
-        let persisted = PersistedSnapshot {
-            meta: meta.clone(),
-            bytes: bytes.to_vec(),
-        };
-        let encoded = bincode::serialize(&persisted)
-            .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
+        }
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".writer.lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(PathBuf::from(lock_path))
+            .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
+        lock_file
+            .lock()
+            .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
+        let _lock = SnapshotWriterLock(lock_file);
+
+        // Compare leading metadata without allocating another snapshot payload.
+        // The comparison and promotion share the same per-path lock, including
+        // independent state-machine instances and cancelled async waiters.
+        match std::fs::File::open(path) {
+            Ok(file) => {
+                let mut reader = std::io::BufReader::new(&file);
+                let current: SnapshotMeta<u64, BasicNode> = bincode::deserialize_from(&mut reader)
+                    .map_err(|e| StorageIOError::read_state_machine(to_any_error(e)))?;
+                if snapshot_precedes(meta, &current) {
+                    let file_len = file
+                        .metadata()
+                        .map_err(|e| StorageIOError::read_state_machine(to_any_error(e)))?
+                        .len();
+                    validate_snapshot_record(&mut reader, file_len)
+                        .map_err(|e| StorageIOError::read_state_machine(to_any_error(e)))?;
+                    // A prior rename may have returned a directory-sync error.
+                    // Establish durability before allowing any caller to advance
+                    // its watermark, even when its older candidate is skipped.
+                    file.sync_all()
+                        .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
+                    if let Some(parent) = path.parent() {
+                        std::fs::File::open(parent)
+                            .and_then(|dir| dir.sync_all())
+                            .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
+                    }
+                    return Ok(());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(StorageIOError::read_state_machine(to_any_error(error)));
+            }
         }
         // Durable, not merely written.
         //
@@ -1038,50 +1452,93 @@ impl FerrosStateMachine {
         //
         // Returning Ok for a write that may not survive a crash is the "never
         // fake success" failure, and the caller cannot tell the difference.
-        let tmp = path.with_extension("tmp");
+        let mut staging_name = path.file_name().unwrap_or_default().to_os_string();
+        staging_name.push(format!(".{}.tmp", Uuid::new_v4()));
+        let tmp = path.with_file_name(staging_name);
         {
-            let file = std::fs::File::create(&tmp)
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
                 .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
+            let _staging = SnapshotStagingFile(tmp.clone());
             {
+                // Borrowed fields serialize identically to PersistedSnapshot;
+                // stream directly to the file instead of copying its payload.
+                #[derive(Serialize)]
+                struct SnapshotOnDisk<'a> {
+                    meta: &'a SnapshotMeta<u64, BasicNode>,
+                    bytes: &'a [u8],
+                }
                 let mut writer = std::io::BufWriter::new(&file);
-                std::io::Write::write_all(&mut writer, &encoded)
+                bincode::serialize_into(&mut writer, &SnapshotOnDisk { meta, bytes })
                     .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
                 std::io::Write::flush(&mut writer)
                     .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
             }
             file.sync_all()
                 .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
+            std::fs::rename(&tmp, path)
+                .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
         }
-        std::fs::rename(&tmp, path)
-            .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
 
         // fsync the directory too, or the rename itself can be lost while the
         // file contents survive -- leaving the snapshot under its temp name
         // and the node with no snapshot at all.
         if let Some(parent) = path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                dir.sync_all()
-                    .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
-            }
+            std::fs::File::open(parent)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
         }
         Ok(())
     }
 
     #[allow(clippy::result_large_err)]
     pub fn recover_from_persisted_snapshot(&mut self) -> Result<bool, StorageIOError<u64>> {
-        let Some(path) = self.snapshot_path.clone() else {
-            return Ok(false);
-        };
-        if !path.exists() {
-            return Ok(false);
-        }
+        let result = (|| {
+            if let Some(session) = &self.recovery_session {
+                match session.startup_reason() {
+                    Ok(None) => {}
+                    Ok(Some(reason)) => {
+                        self.recovery_required = true;
+                        self.recovery_admission.quarantine("local-raft", &reason);
+                        return Ok(false);
+                    }
+                    Err(error) => {
+                        self.recovery_required = true;
+                        self.recovery_admission.quarantine(
+                            "local-raft",
+                            format!("cannot validate recovery session: {error}"),
+                        );
+                        return Ok(false);
+                    }
+                }
+            }
+            let Some(path) = self.snapshot_path.clone() else {
+                return Ok(false);
+            };
+            if !path.exists() {
+                return Ok(false);
+            }
 
-        let bytes = std::fs::read(&path)
-            .map_err(|e| StorageIOError::read_state_machine(to_any_error(e)))?;
-        let persisted: PersistedSnapshot = bincode::deserialize(&bytes)
-            .map_err(|e| StorageIOError::read_state_machine(to_any_error(e)))?;
-        self.apply_snapshot_data(persisted.meta, persisted.bytes)?;
-        Ok(true)
+            let bytes = std::fs::read(&path)
+                .map_err(|e| StorageIOError::read_state_machine(to_any_error(e)))?;
+            let persisted: PersistedSnapshot = bincode::deserialize(&bytes)
+                .map_err(|e| StorageIOError::read_state_machine(to_any_error(e)))?;
+            self.apply_snapshot_data_from(
+                &persisted.meta,
+                &persisted.bytes,
+                SnapshotSource::Persisted,
+            )
+            .map_err(|error| *error)?;
+            self.publish_snapshot(persisted.meta, persisted.bytes);
+            self.physical_lifecycle.applied(self.last_applied);
+            Ok(true)
+        })();
+        if let Err(error) = &result {
+            self.physical_lifecycle.fail(error);
+        }
+        result
     }
 
     /// Rebuild the live `TokenRing` from current `RaftState` and store it.
@@ -1197,10 +1654,14 @@ impl FerrosStateMachine {
     ///
     /// Returns the `RaftResponse` plus the deferred `system_schema.*`/
     /// `system_auth.*` writes; the caller drains them via `spawn_blocking`.
-    fn apply_command(&mut self, cmd: RaftCommand) -> (RaftResponse, Vec<PendingSystemWrite>) {
+    fn apply_command(
+        &mut self,
+        cmd: RaftCommand,
+    ) -> ferrosa_common::Result<(RaftResponse, Vec<PendingSystemWrite>)> {
         let RaftCommand { op, schema_version } = cmd;
         let mut schema_changed = true;
         let mut apply_errors: Vec<ApplyError> = Vec::new();
+        let mut command_rejection = None;
         let mut pending_system_writes: Vec<PendingSystemWrite> = Vec::new();
         match op {
             // ---- DDL: Keyspaces ----------------------------------------
@@ -1267,18 +1728,17 @@ impl FerrosStateMachine {
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.drop_keyspace_internal(&name) {
                         tracing::error!(%e, "Raft apply: drop_keyspace_internal failed — schema diverged from Raft state");
+                        apply_errors.push(ApplyError::Other(format!(
+                            "drop_keyspace_internal failed — schema diverged from Raft state: {e}"
+                        )));
                     }
                 }
                 if let Some(engine) = &self.engine {
                     for (ks, tbl) in dropped_tables {
                         let tid = TableId::new(&ks, &tbl);
-                        if let Err(e) = engine.unregister_table(&tid) {
+                        if let Err(e) = engine.unregister_table_classified(&tid) {
                             tracing::error!(%e, "Raft apply: unregister_table failed");
-                            apply_errors.push(ApplyError::EngineUnregisterTable {
-                                keyspace: ks,
-                                table: tbl,
-                                reason: e.to_string(),
-                            });
+                            apply_errors.push(ApplyError::unregister(ks, tbl, e));
                         }
                     }
                 }
@@ -1302,6 +1762,9 @@ impl FerrosStateMachine {
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.alter_keyspace_internal(&name, updates) {
                         tracing::error!(%e, "Raft apply: alter_keyspace_internal failed");
+                        apply_errors.push(ApplyError::Other(format!(
+                            "alter_keyspace_internal failed: {e}"
+                        )));
                     }
                 }
                 if self.system_writer.is_some() {
@@ -1350,7 +1813,12 @@ impl FerrosStateMachine {
                 }
                 if let Some(engine) = &self.engine {
                     if let Err(e) = engine.register_table(table.to_storage_schema()) {
-                        tracing::error!(%e, "Raft apply: register_table failed — writes to this table will silently fail");
+                        // A refusal, not a storage failure: this node could not
+                        // take ownership of the table's directory. The caller
+                        // sees `RaftResponse::Error`; writes here fail loudly
+                        // until the directory is usable and the CREATE is
+                        // re-issued. See `ApplyError::fences_replica`.
+                        tracing::error!(%e, "Raft apply: register_table refused — this node serves no writes to the table");
                         apply_errors.push(ApplyError::EngineRegisterTable {
                             keyspace: table.keyspace.clone(),
                             table: table.name.clone(),
@@ -1385,17 +1853,20 @@ impl FerrosStateMachine {
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.drop_table_internal(&keyspace, &table) {
                         tracing::error!(%e, "Raft apply: drop_table_internal failed");
+                        apply_errors.push(ApplyError::Other(format!(
+                            "drop_table_internal failed: {e}"
+                        )));
                     }
                 }
                 if let Some(engine) = &self.engine {
                     let tid = TableId::new(&keyspace, &table);
-                    if let Err(e) = engine.unregister_table(&tid) {
+                    if let Err(e) = engine.unregister_table_classified(&tid) {
                         tracing::error!(%e, "Raft apply: unregister_table failed — stale table data may remain");
-                        apply_errors.push(ApplyError::EngineUnregisterTable {
-                            keyspace: keyspace.clone(),
-                            table: table.clone(),
-                            reason: e.to_string(),
-                        });
+                        apply_errors.push(ApplyError::unregister(
+                            keyspace.clone(),
+                            table.clone(),
+                            e,
+                        ));
                     }
                 }
                 if self.system_writer.is_some() {
@@ -1440,8 +1911,24 @@ impl FerrosStateMachine {
                     }
                 };
                 if let Some(schema) = &self.schema {
+                    // The registry's internal ALTER is an idempotent no-op for
+                    // a missing table. That is not success when committed Raft
+                    // metadata still requires this table to exist locally.
+                    if new_storage_schema.is_some()
+                        && !schema
+                            .snapshot()
+                            .tables
+                            .contains_key(&(keyspace.clone(), table.clone()))
+                    {
+                        return Err(ferrosa_common::Error::Io(std::io::Error::other(format!(
+                            "committed table {keyspace}.{table} is missing from the shared schema during ALTER"
+                        ))));
+                    }
                     if let Err(e) = schema.alter_table_internal(&keyspace, &table, *updates) {
                         tracing::error!(%e, "Raft apply: schema.alter_table_internal failed");
+                        apply_errors.push(ApplyError::Other(format!(
+                            "schema.alter_table_internal failed: {e}"
+                        )));
                     }
                 }
                 // Propagate the post-ALTER column set into the storage engine
@@ -1453,8 +1940,31 @@ impl FerrosStateMachine {
                 // (bug-sstable-writer-produces-zero-byte-rows-db.md).
                 if let (Some(engine), Some(new_schema)) = (&self.engine, new_storage_schema) {
                     let tid = TableId::new(&keyspace, &table);
-                    if let Err(e) = engine.update_table_schema(&tid, new_schema) {
+                    if engine.table_schema(&tid).is_none() {
+                        // Refusal, not a storage failure: this node's engine has
+                        // no registration for a table the committed log says
+                        // exists (typically a CREATE whose registration was
+                        // refused above). There is no schema to rotate and no
+                        // memtable a flush could build from a wrong header, so
+                        // refusing the ALTER keeps the node serving — latching
+                        // here would resurrect the refused-CREATE fence one
+                        // statement later.
+                        tracing::error!(
+                            keyspace = %keyspace,
+                            table = %table,
+                            "Raft apply: update_table_schema refused — the engine has no \
+                             registration for this table"
+                        );
+                        apply_errors.push(ApplyError::EngineTableNotRegistered {
+                            keyspace: keyspace.clone(),
+                            table: table.clone(),
+                            reason: "engine has no registration for the table".to_string(),
+                        });
+                    } else if let Err(e) = engine.update_table_schema(&tid, new_schema) {
                         tracing::error!(%e, "Raft apply: update_table_schema failed — future flushes may be corrupt");
+                        apply_errors.push(ApplyError::Other(format!(
+                            "update_table_schema failed — future flushes may be corrupt: {e}"
+                        )));
                     }
                 }
             }
@@ -1529,6 +2039,9 @@ impl FerrosStateMachine {
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.create_index_internal(index.clone()) {
                         tracing::error!(%e, "Raft apply: schema.create_index_internal failed");
+                        apply_errors.push(ApplyError::Other(format!(
+                            "schema.create_index_internal failed: {e}"
+                        )));
                     }
                 }
             }
@@ -1560,6 +2073,9 @@ impl FerrosStateMachine {
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.drop_index_internal(&keyspace, &table, &index) {
                         tracing::error!(%e, "Raft apply: schema.drop_index_internal failed");
+                        apply_errors.push(ApplyError::Other(format!(
+                            "schema.drop_index_internal failed: {e}"
+                        )));
                     }
                 }
                 if let Some(engine) = &self.engine {
@@ -1601,6 +2117,9 @@ impl FerrosStateMachine {
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.create_type_internal(&udt) {
                         tracing::error!(%e, "Raft apply: schema.create_type_internal failed");
+                        apply_errors.push(ApplyError::Other(format!(
+                            "schema.create_type_internal failed: {e}"
+                        )));
                     }
                 }
             }
@@ -1619,6 +2138,9 @@ impl FerrosStateMachine {
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.drop_type_internal(&keyspace, &name) {
                         tracing::error!(%e, "Raft apply: schema.drop_type_internal failed");
+                        apply_errors.push(ApplyError::Other(format!(
+                            "schema.drop_type_internal failed: {e}"
+                        )));
                     }
                 }
             }
@@ -1644,6 +2166,9 @@ impl FerrosStateMachine {
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.create_function_internal(&func) {
                         tracing::error!(%e, "Raft apply: schema.create_function_internal failed");
+                        apply_errors.push(ApplyError::Other(format!(
+                            "schema.create_function_internal failed: {e}"
+                        )));
                     }
                 }
             }
@@ -1668,6 +2193,9 @@ impl FerrosStateMachine {
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.drop_function_internal(&keyspace, &name, &arg_types) {
                         tracing::error!(%e, "Raft apply: schema.drop_function_internal failed");
+                        apply_errors.push(ApplyError::Other(format!(
+                            "schema.drop_function_internal failed: {e}"
+                        )));
                     }
                 }
             }
@@ -1686,6 +2214,9 @@ impl FerrosStateMachine {
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.create_aggregate_internal(&agg) {
                         tracing::error!(%e, "Raft apply: schema.create_aggregate_internal failed");
+                        apply_errors.push(ApplyError::Other(format!(
+                            "schema.create_aggregate_internal failed: {e}"
+                        )));
                     }
                 }
             }
@@ -1699,6 +2230,9 @@ impl FerrosStateMachine {
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.drop_aggregate_internal(&keyspace, &name, &arg_types) {
                         tracing::error!(%e, "Raft apply: schema.drop_aggregate_internal failed");
+                        apply_errors.push(ApplyError::Other(format!(
+                            "schema.drop_aggregate_internal failed: {e}"
+                        )));
                     }
                 }
             }
@@ -1718,6 +2252,9 @@ impl FerrosStateMachine {
                         Ok(inserted) => inserted,
                         Err(e) => {
                             tracing::error!(%e, role = %name, "Raft apply: schema.insert_role_if_absent failed");
+                            apply_errors.push(ApplyError::Other(format!(
+                                "schema.insert_role_if_absent failed: {e}"
+                            )));
                             false
                         }
                     },
@@ -1759,6 +2296,9 @@ impl FerrosStateMachine {
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.alter_role_internal(&name, updates) {
                         tracing::error!(%e, "Raft apply: schema.alter_role_internal failed");
+                        apply_errors.push(ApplyError::Other(format!(
+                            "schema.alter_role_internal failed: {e}"
+                        )));
                     }
                 }
                 // After the registry update, so the row is the altered stored role.
@@ -1776,6 +2316,9 @@ impl FerrosStateMachine {
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.drop_role_internal(&name) {
                         tracing::error!(%e, "Raft apply: schema.drop_role_internal failed");
+                        apply_errors.push(ApplyError::Other(format!(
+                            "schema.drop_role_internal failed: {e}"
+                        )));
                     }
                 }
                 if self.system_writer.is_some() {
@@ -1796,8 +2339,18 @@ impl FerrosStateMachine {
                     grants.push(entry.clone());
                 }
                 if self.system_writer.is_some() {
+                    let stored = grants
+                        .iter()
+                        .find(|g| g.resource == entry.resource)
+                        .cloned()
+                        .ok_or_else(|| {
+                            ferrosa_common::Error::InvalidData(
+                                "Raft grant post-state is missing its resource binding".into(),
+                            )
+                        })?;
                     pending_system_writes.push(PendingSystemWrite {
-                        mutation: SystemTableMutation::GrantUpdated(entry.clone()),
+                        // The row contains the entire permission set, not a delta.
+                        mutation: SystemTableMutation::GrantUpdated(stored),
                         level: SystemWriteLogLevel::Error,
                         context: "Raft apply: system table write failed",
                     });
@@ -1805,6 +2358,9 @@ impl FerrosStateMachine {
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.grant_internal(entry) {
                         tracing::error!(%e, "Raft apply: schema.grant_internal failed");
+                        apply_errors.push(ApplyError::Other(format!(
+                            "schema.grant_internal failed: {e}"
+                        )));
                     }
                 }
             }
@@ -1823,12 +2379,22 @@ impl FerrosStateMachine {
                     }
                 }
                 if self.system_writer.is_some() {
-                    pending_system_writes.push(PendingSystemWrite {
-                        mutation: SystemTableMutation::PermissionRevoked {
+                    let remaining =
+                        self.state.grants.get(&role).and_then(|grants| {
+                            grants.iter().find(|g| g.resource == resource).cloned()
+                        });
+                    // A partial revoke must replace the full permission cell.
+                    // Do not tombstone and rewrite: equal timestamps can mask it.
+                    let mutation = match remaining {
+                        Some(grant) => SystemTableMutation::GrantUpdated(grant),
+                        None => SystemTableMutation::PermissionRevoked {
                             role: role.clone(),
                             resource: resource.clone(),
                             permission,
                         },
+                    };
+                    pending_system_writes.push(PendingSystemWrite {
+                        mutation,
                         level: SystemWriteLogLevel::Error,
                         context: "Raft apply: system table write failed for PermissionRevoked",
                     });
@@ -1836,6 +2402,9 @@ impl FerrosStateMachine {
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.revoke_internal(&role, &resource, &permission) {
                         tracing::error!(%e, "Raft apply: schema.revoke_internal failed");
+                        apply_errors.push(ApplyError::Other(format!(
+                            "schema.revoke_internal failed: {e}"
+                        )));
                     }
                 }
             }
@@ -1862,6 +2431,9 @@ impl FerrosStateMachine {
                     if let Some(schema) = &self.schema {
                         if let Err(e) = schema.grant_role_internal(&member, &granted_role) {
                             tracing::error!(%e, "Raft apply: schema.grant_role_internal failed");
+                            apply_errors.push(ApplyError::Other(format!(
+                                "schema.grant_role_internal failed: {e}"
+                            )));
                         }
                     }
                     if self.system_writer.is_some() {
@@ -1883,6 +2455,9 @@ impl FerrosStateMachine {
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.revoke_role_internal(&member, &granted_role) {
                         tracing::error!(%e, "Raft apply: schema.revoke_role_internal failed");
+                        apply_errors.push(ApplyError::Other(format!(
+                            "schema.revoke_role_internal failed: {e}"
+                        )));
                     }
                 }
                 if self.system_writer.is_some() {
@@ -2037,9 +2612,9 @@ impl FerrosStateMachine {
                         node_id,
                         "refusing RecordBootstrapComplete: node is not a member"
                     );
-                    apply_errors.push(ApplyError::Other(format!(
+                    command_rejection = Some(format!(
                         "RecordBootstrapComplete for node {node_id}: not a member"
-                    )));
+                    ));
                 }
             }
         }
@@ -2055,71 +2630,96 @@ impl FerrosStateMachine {
             }
         }
 
-        // W1.7 — surface accumulated sub-errors instead of silently
-        // returning Ok.  Callers can detect engine/schema/system_writer
-        // failures and decide whether to retry, alert, or escalate.
-        let response = if apply_errors.is_empty() {
-            RaftResponse::Ok
-        } else {
-            let summary = apply_errors
+        // A committed local effect failure is a storage failure, not a
+        // publishable command response. The retained worker propagates it to
+        // the sticky apply fence before adopting staged metadata or log ID.
+        //
+        // Two classes are not storage failures — they are *refusals*:
+        //
+        //  - `engine.unregister_table` could not remove a dropped table's bytes
+        //    (permission denied on the table directory, a locked file).
+        //  - `engine.register_table` could not take ownership of a created
+        //    table's directory (an unremovable same-name directory left by such
+        //    a DROP, `EACCES`, a mount point).
+        //
+        // In both cases the entry is already committed and canonical metadata
+        // agrees on every replica, so applying it is what keeps replicas in
+        // agreement. Latching the machine for either made one undroppable
+        // directory return `Fatal` to every later proposal and stop RaftCore —
+        // a DDL the node refused, not a log it could not apply — with no online
+        // repair path. They stay loud to the caller as `RaftResponse::Error`
+        // instead: the DDL never reports success, and the node keeps serving.
+        // Everything else still latches; see `ApplyError::fences_replica` for
+        // which variant is which and why.
+        let (refusals, fatal): (Vec<ApplyError>, Vec<ApplyError>) = apply_errors
+            .into_iter()
+            .partition(|error| !error.fences_replica());
+        if !fatal.is_empty() {
+            let summary = fatal
                 .iter()
-                .map(|e| e.to_string())
+                .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join("; ");
-            RaftResponse::Error(summary)
-        };
-        (response, pending_system_writes)
+            return Err(ferrosa_common::Error::Io(std::io::Error::other(summary)));
+        }
+        let rejection = command_rejection.or_else(|| {
+            (!refusals.is_empty()).then(|| {
+                refusals
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+        });
+        let response = rejection
+            .map(RaftResponse::Error)
+            .unwrap_or(RaftResponse::Ok);
+        Ok((response, pending_system_writes))
     }
 
-    /// Execute the system-table writes collected by `apply_command` on a
-    /// blocking thread, then emit the per-mutation log lines on the worker.
-    ///
-    /// The `engine.write` calls inside `SystemTableWriter::apply` are
-    /// synchronous and would otherwise park the raft apply worker, delaying
-    /// heartbeat responses (1s lane deadline). Running them under
-    /// `spawn_blocking` isolates that work; awaiting the handle here preserves
-    /// openraft's sequential apply ordering. A `JoinError` is surfaced loudly
-    /// rather than swallowed.
-    async fn flush_pending_system_writes(&self, pending: Vec<PendingSystemWrite>) {
-        if pending.is_empty() {
-            return;
-        }
-        let Some(writer) = self.system_writer.clone() else {
-            return;
+    /// Persist the collected system-table writes inside the same owned worker
+    /// as physical apply. Cancellation cannot let a subsequent entry overtake
+    /// this stage or release compaction pauses before it finishes.
+    fn flush_pending_system_writes(
+        &self,
+        pending: Vec<PendingSystemWrite>,
+    ) -> ferrosa_common::Result<bool> {
+        let Some(writer) = &self.system_writer else {
+            // Explicit metadata-only state machines have no configured projection.
+            return Ok(false);
         };
 
-        let outcomes = ferrosa_net::task_pool::TaskPool::current("raft-system-table-apply")
-            .spawn_blocking(move || {
-                pending
-                    .into_iter()
-                    .map(|p| {
-                        let result = writer.apply(p.mutation);
-                        (p.level, p.context, result.err())
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .await
-            .await;
-
-        let outcomes = match outcomes {
-            Ok(outcomes) => outcomes,
-            Err(e) => {
-                tracing::error!(
-                    %e,
-                    "Raft apply: system-table write task panicked or was cancelled"
-                );
-                return;
-            }
-        };
-
-        for (level, context, err) in outcomes {
-            if let Some(e) = err {
-                match level {
-                    SystemWriteLogLevel::WarnReplay => tracing::warn!(%e, "{context}"),
-                    SystemWriteLogLevel::Error => tracing::error!(%e, "{context}"),
+        let dirty = !pending.is_empty();
+        for pending in pending {
+            if let Err(error) = writer.apply(pending.mutation) {
+                match pending.level {
+                    SystemWriteLogLevel::WarnReplay => {
+                        tracing::warn!(%error, "{}", pending.context)
+                    }
+                    SystemWriteLogLevel::Error => tracing::error!(%error, "{}", pending.context),
                 }
+                // Severity is not permission to lose a canonical row. Current
+                // startup registers system tables before replay; real storage
+                // failures, including WarnReplay sites, must remain replayable.
+                return Err(error);
             }
         }
+        Ok(dirty)
+    }
+
+    /// One fence covers all canonical writes in this owned command group.
+    fn sync_projection(&self, dirty: bool) -> ferrosa_common::Result<()> {
+        if !dirty {
+            return Ok(());
+        }
+        // Periodic acknowledgement alone does not permit snapshot/purge.
+        if let Some(engine) = &self.engine {
+            #[cfg(test)]
+            self.projection_syncs
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            engine.force_commit_log_sync()?;
+        }
+        Ok(())
     }
 }
 
@@ -2135,6 +2735,8 @@ impl Default for FerrosStateMachine {
 
 impl RaftSnapshotBuilder<FerrosRaftConfig> for FerrosStateMachine {
     async fn build_snapshot(&mut self) -> Result<Snapshot<FerrosRaftConfig>, StorageError<u64>> {
+        let physical = self.physical_admission().map_err(|error| *error)?;
+        self.finish_pending_apply().await.map_err(|error| *error)?;
         let data = SnapshotData {
             state: self.state.clone(),
             last_applied: self.last_applied,
@@ -2165,11 +2767,31 @@ impl RaftSnapshotBuilder<FerrosRaftConfig> for FerrosStateMachine {
         self.publish_snapshot(meta.clone(), bytes.clone());
         if let Some(path) = self.snapshot_path.clone() {
             let meta_for_disk = meta.clone();
+            let disk_lifecycle = Arc::clone(&self.physical_lifecycle);
             let bytes_for_disk = bytes.clone();
+            let disk_session = self.recovery_session.clone();
             #[allow(clippy::result_large_err)]
             ferrosa_net::task_pool::TaskPool::current("raft-log-store")
                 .spawn_blocking(move || {
-                    Self::persist_snapshot_to_disk(&path, &meta_for_disk, &bytes_for_disk)
+                    let _physical = physical.into_job();
+                    let result =
+                        Self::persist_snapshot_to_disk(&path, &meta_for_disk, &bytes_for_disk)
+                            .and_then(|()| {
+                                if let Some(session) = &disk_session {
+                                    session
+                                        .snapshot_synced(
+                                            meta_for_disk.last_log_id.map_or(0, |id| id.index),
+                                        )
+                                        .map_err(|error| {
+                                            StorageIOError::write_state_machine(to_any_error(error))
+                                        })?;
+                                }
+                                Ok(())
+                            });
+                    if let Err(error) = &result {
+                        disk_lifecycle.fail(error);
+                    }
+                    result
                 })
                 .await
                 .await
@@ -2194,6 +2816,8 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
     async fn applied_state(
         &mut self,
     ) -> Result<(Option<LogId<u64>>, StoredMembership<u64, BasicNode>), StorageError<u64>> {
+        self.finish_pending_apply().await.map_err(|error| *error)?;
+        self.physical_lifecycle.applied(self.last_applied);
         Ok((self.last_applied, self.last_membership.clone()))
     }
 
@@ -2202,13 +2826,38 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
         I: IntoIterator<Item = Entry<FerrosRaftConfig>> + Send,
         I::IntoIter: Send,
     {
+        let physical = self.physical_admission().map_err(|error| *error)?;
+        let mut entries = entries.into_iter().peekable();
+        let first = entries.peek().map(|entry| entry.log_id.index);
+        let required = self.unconsumed_input;
+        // Capture ownership before even awaiting a preceding job. A cancelled
+        // new caller may otherwise lose its input while that job is reaped.
+        if required.is_none() {
+            self.unconsumed_input = first;
+        }
+        self.finish_pending_apply().await.map_err(|error| *error)?;
+        if let Some((required, first)) = required
+            .zip(first)
+            .filter(|(required, first)| first != required)
+        {
+            return Err(
+                StorageIOError::write_state_machine(to_any_error(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "cancelled Raft input requires committed index {required} before {first}"
+                    ),
+                )))
+                .into(),
+            );
+        }
         let mut responses = Vec::new();
-
-        for entry in entries {
-            self.last_applied = Some(entry.log_id);
-
+        while let Some(entry) = entries.next() {
+            self.unconsumed_input = Some(entry.log_id.index);
             match entry.payload {
                 EntryPayload::Blank => {
+                    self.last_applied = Some(entry.log_id);
+                    self.physical_lifecycle.applied(self.last_applied);
+                    self.unconsumed_input = entries.peek().map(|next| next.log_id.index);
                     responses.push(RaftResponse::Ok);
                 }
                 EntryPayload::Normal(cmd) => {
@@ -2250,16 +2899,100 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
                             _ => {}
                         }
                     }
-                    let (resp, pending) = self.apply_command(cmd);
-                    // Drain the collected system-table writes off the raft
-                    // worker. Awaiting here (before the next entry) preserves
-                    // openraft's sequential apply ordering while keeping the
-                    // blocking `engine.write` calls off the worker thread.
-                    self.flush_pending_system_writes(pending).await;
-                    responses.push(resp);
+                    // Coalesce only this existing apply input. A subsequent
+                    // destructive operation gets its own group so its async
+                    // compaction drain resolves against committed prior state.
+                    // Accord data operations also retain their existing boundary.
+                    let groupable = !matches!(
+                        &cmd.op,
+                        RaftOp::DropTable { .. }
+                            | RaftOp::DropKeyspace(_)
+                            | RaftOp::AccordApply { .. }
+                    );
+                    let mut commands = vec![cmd];
+                    let mut last_log_id = entry.log_id;
+                    while groupable
+                        && matches!(
+                            entries.peek().map(|next| &next.payload),
+                            Some(EntryPayload::Normal(next))
+                                if !matches!(&next.op, RaftOp::DropTable { .. } | RaftOp::DropKeyspace(_) | RaftOp::AccordApply { .. })
+                        )
+                    {
+                        let Some(next) = entries.next() else {
+                            break;
+                        };
+                        if let EntryPayload::Normal(command) = next.payload {
+                            commands.push(command);
+                            last_log_id = next.log_id;
+                        }
+                    }
+                    let pauses = Arc::new(pauses);
+                    let worker_pauses = Arc::clone(&pauses);
+                    let mut staged = self.staged_apply();
+                    let physical_job = Arc::clone(&physical).into_job();
+                    let job_lifecycle = Arc::clone(&self.physical_lifecycle);
+                    let recovery_session = self.recovery_session.clone();
+                    let recovery_admission = Arc::clone(&self.recovery_admission);
+                    let previous_index = self.last_applied.map_or(0, |id| id.index);
+                    let job = ferrosa_net::task_pool::TaskPool::current("raft-physical-apply")
+                        .spawn_blocking(move || {
+                            let _physical = physical_job;
+                            let _pauses = worker_pauses;
+                            let transition = || {
+                                let mut responses = Vec::with_capacity(commands.len());
+                                let mut dirty = false;
+                                for command in commands {
+                                    let (response, system_writes) =
+                                        staged.apply_command(command)?;
+                                    dirty |= staged.flush_pending_system_writes(system_writes)?;
+                                    responses.push(response);
+                                }
+                                staged.sync_projection(dirty)?;
+                                Ok(CompletedApply {
+                                    state: staged.state,
+                                    responses,
+                                })
+                            };
+                            let result: ferrosa_common::Result<CompletedApply> =
+                                match &recovery_session {
+                                    Some(session) => session.execute(
+                                        last_log_id.index,
+                                        previous_index,
+                                        |reason| {
+                                            recovery_admission.quarantine("local-raft", reason);
+                                            job_lifecycle.fail(reason);
+                                        },
+                                        transition,
+                                    ),
+                                    None => transition(),
+                                };
+                            if let Err(error) = &result {
+                                if recovery_session.is_none() {
+                                    recovery_admission.quarantine("local-raft", error.to_string());
+                                }
+                                job_lifecycle.fail(error);
+                            }
+                            result
+                        })
+                        .await;
+                    self.pending_apply = Some(PendingApply {
+                        log_id: last_log_id,
+                        job,
+                        pauses,
+                    });
+                    // The worker now owns the group, but not the caller's suffix.
+                    self.unconsumed_input = entries.peek().map(|next| next.log_id.index);
+                    if let Some(group_responses) =
+                        self.finish_pending_apply().await.map_err(|error| *error)?
+                    {
+                        responses.extend(group_responses);
+                    }
                 }
                 EntryPayload::Membership(membership) => {
+                    self.last_applied = Some(entry.log_id);
+                    self.physical_lifecycle.applied(self.last_applied);
                     self.last_membership = StoredMembership::new(Some(entry.log_id), membership);
+                    self.unconsumed_input = entries.peek().map(|next| next.log_id.index);
                     responses.push(RaftResponse::Ok);
                 }
             }
@@ -2269,6 +3002,11 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+        if let Err(error) = self.finish_pending_apply().await {
+            // This trait method cannot return an error; the returned builder
+            // retains the sticky failure and build_snapshot reports it.
+            tracing::error!(%error, "Raft snapshot builder refused failed apply");
+        }
         // The builder is a point-in-time copy of the state (openraft runs it in
         // a detached task while apply continues), but it SHARES the
         // current-snapshot slot: what it builds is what the live machine's
@@ -2285,12 +3023,23 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
             system_writer: None, // snapshot builder doesn't need system writer
             snapshot_path: self.snapshot_path.clone(),
             durable_applied: self.durable_applied.clone(),
+            pending_apply: None,
+            unconsumed_input: None,
+            physical_lifecycle: Arc::clone(&self.physical_lifecycle),
+            recovery_admission: Arc::clone(&self.recovery_admission),
+            recovery_session: self.recovery_session.clone(),
+            recovery_required: self.recovery_required,
+            _physical_owner: None,
+            apply_failure: self.apply_failure.clone(),
+            #[cfg(test)]
+            projection_syncs: Arc::clone(&self.projection_syncs),
         }
     }
 
     async fn begin_receiving_snapshot(
         &mut self,
     ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<u64>> {
+        self.finish_pending_apply().await.map_err(|error| *error)?;
         Ok(Box::new(Cursor::new(Vec::new())))
     }
 
@@ -2299,27 +3048,45 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
         meta: &SnapshotMeta<u64, BasicNode>,
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<u64>> {
-        let bytes = snapshot.into_inner();
-        self.apply_snapshot_data(meta.clone(), bytes.clone())?;
-        if let Some(path) = self.snapshot_path.clone() {
-            let meta_for_disk = meta.clone();
-            #[allow(clippy::result_large_err)]
-            ferrosa_net::task_pool::TaskPool::current("raft-log-store")
-                .spawn_blocking(move || {
-                    Self::persist_snapshot_to_disk(&path, &meta_for_disk, &bytes)
-                })
-                .await
-                .await
-                .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))??;
-            self.mark_durably_applied(meta.last_log_id);
-        }
+        let result = async {
+            let physical = self.physical_admission().map_err(|error| *error)?;
+            self.finish_pending_apply().await.map_err(|error| *error)?;
+            let bytes = snapshot.into_inner();
+            self.apply_snapshot_data(meta, &bytes)?;
+            self.publish_snapshot(meta.clone(), bytes.clone());
+            if let Some(path) = self.snapshot_path.clone() {
+                let meta_for_disk = meta.clone();
+                let disk_lifecycle = Arc::clone(&self.physical_lifecycle);
+                #[allow(clippy::result_large_err)]
+                ferrosa_net::task_pool::TaskPool::current("raft-log-store")
+                    .spawn_blocking(move || {
+                        let _physical = physical.into_job();
+                        let result = Self::persist_snapshot_to_disk(&path, &meta_for_disk, &bytes);
+                        if let Err(error) = &result {
+                            disk_lifecycle.fail(error);
+                        }
+                        result
+                    })
+                    .await
+                    .await
+                    .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))??;
+                self.mark_durably_applied(meta.last_log_id);
+            }
+            self.physical_lifecycle.applied(self.last_applied);
 
-        Ok(())
+            Ok(())
+        }
+        .await;
+        if let Err(error) = &result {
+            self.physical_lifecycle.fail(error);
+        }
+        result
     }
 
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<FerrosRaftConfig>>, StorageError<u64>> {
+        self.finish_pending_apply().await.map_err(|error| *error)?;
         Ok(self
             .current_snapshot_cloned()
             .map(|(meta, bytes)| Snapshot {
@@ -3622,8 +4389,11 @@ mod tests {
             (incoming.keyspace.clone(), incoming.name.clone()),
             incoming.clone(),
         );
-        sm.sync_schema_and_engine_from_state("known incarnation regression")
-            .unwrap();
+        sm.sync_schema_and_engine_from_state(
+            "known incarnation regression",
+            SnapshotSource::Installed,
+        )
+        .unwrap();
         assert!(engine.read(&tid, &key).unwrap().is_some());
         assert_eq!(
             schema.snapshot().tables[&(incoming.keyspace, incoming.name)].id,
@@ -3663,8 +4433,11 @@ mod tests {
             incoming.clone(),
         );
         assert!(
-            sm.sync_schema_and_engine_from_state("unbound incarnation regression")
-                .is_err(),
+            sm.sync_schema_and_engine_from_state(
+                "unbound incarnation regression",
+                SnapshotSource::Installed
+            )
+            .is_err(),
             "data without an authoritative local UUID must not be assigned an incoming UUID"
         );
         assert!(
@@ -3675,6 +4448,166 @@ mod tests {
             .snapshot()
             .tables
             .contains_key(&(incoming.keyspace, incoming.name)));
+    }
+
+    /// Every apply group that finished is complete on disk, so a restart whose
+    /// snapshot lags those groups replays them from the log as before. Only a
+    /// group interrupted mid-effect leaves the node quarantined. Before the
+    /// guard settled on completion, every restart that came after an
+    /// un-snapshotted apply quarantined the group. The repair path had no
+    /// installer, so the node never rebuilt Raft and never became ready.
+    #[tokio::test]
+    async fn a_restart_after_completed_applies_is_not_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let path = dir.path().join("restart.snapshot.bin");
+        let mut sm = FerrosStateMachine::with_side_effects_and_snapshot_path(
+            Arc::clone(&schema),
+            Arc::clone(&engine),
+            path.clone(),
+        );
+        sm.apply(vec![make_entry(
+            1,
+            1,
+            RaftOp::CreateKeyspace(simple_keyspace("restart_ks")),
+        )])
+        .await
+        .unwrap();
+        sm.build_snapshot().await.unwrap();
+        sm.apply(vec![make_entry(
+            1,
+            2,
+            RaftOp::CreateTable(Box::new(simple_table("restart_ks", "after_snapshot"))),
+        )])
+        .await
+        .unwrap();
+        drop(sm);
+
+        let mut restarted = FerrosStateMachine::with_side_effects_and_snapshot_path(
+            Arc::clone(&schema),
+            Arc::clone(&engine),
+            path,
+        );
+        let recovered = restarted.recover_from_persisted_snapshot();
+        assert!(
+            !restarted.recovery_requires_repair(),
+            "a completed apply group is not an unclean session: {:?}",
+            restarted.recovery_admission.admits().err()
+        );
+        assert!(restarted.recovery_admission.admits().is_ok());
+        assert!(
+            matches!(recovered, Ok(true)),
+            "the lagging snapshot restores and the log replays the rest: {recovered:?}"
+        );
+        assert_eq!(restarted.last_applied.map(|id| id.index), Some(1));
+    }
+
+    /// The durable snapshot may lag a successfully applied DROP/CREATE and
+    /// durable user writes in the new UUID. Startup has no authority to erase
+    /// that UUID merely to install the older metadata before log replay.
+    #[tokio::test]
+    async fn startup_snapshot_preserves_newer_durable_incarnation_before_replay() {
+        use ferrosa_common::{DecoratedKey, PartitionKey};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let path = dir.path().join("startup.snapshot.bin");
+        let old = simple_table("startup_ks", "survivor");
+        let mut current = old.clone();
+        current.id = Uuid::new_v4();
+        let mut sm = FerrosStateMachine::with_side_effects_and_snapshot_path(
+            Arc::clone(&schema),
+            Arc::clone(&engine),
+            path.clone(),
+        );
+        sm.apply(vec![
+            make_entry(1, 1, RaftOp::CreateKeyspace(simple_keyspace("startup_ks"))),
+            make_entry(1, 2, RaftOp::CreateTable(Box::new(old.clone()))),
+        ])
+        .await
+        .unwrap();
+        sm.build_snapshot().await.unwrap();
+        let original_snapshot = std::fs::read(&path).unwrap();
+        sm.apply(vec![
+            make_entry(
+                1,
+                3,
+                RaftOp::DropTable {
+                    keyspace: "startup_ks".into(),
+                    table: "survivor".into(),
+                },
+            ),
+            make_entry(1, 4, RaftOp::CreateTable(Box::new(current.clone()))),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(sm.last_applied.unwrap().index, 4);
+        let tid = TableId::new("startup_ks", "survivor");
+        let key = DecoratedKey::new(PartitionKey::new(b"new-incarnation-row".to_vec()));
+        engine
+            .write(
+                &tid,
+                &key,
+                ferrosa_sstable::types::Row {
+                    clustering: vec![],
+                    cells: vec![],
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
+                },
+                1,
+            )
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        assert!(engine.read(&tid, &key).unwrap().is_some());
+        assert_eq!(
+            schema.snapshot().tables[&("startup_ks".into(), "survivor".into())].id,
+            current.id
+        );
+        drop(sm);
+        drop(engine);
+        drop(schema);
+
+        let (cold, pending) = StorageEngine::open(
+            test_storage_config(dir.path(), ferrosa_storage::SyncStrategyConfig::Batch, 0),
+            None,
+        )
+        .unwrap();
+        cold.register_system_tables().unwrap();
+        cold.register_table(current.to_storage_schema()).unwrap();
+        cold.replay_mutations(pending).unwrap();
+        let cold = Arc::new(cold);
+        let local_schema = Arc::new(test_schema_instance());
+        local_schema
+            .create_keyspace_internal(simple_keyspace("startup_ks"))
+            .unwrap();
+        local_schema.create_table_internal(current.clone()).unwrap();
+        assert!(
+            cold.read(&tid, &key).unwrap().is_some(),
+            "cold positive control must load durable new-UUID SSTable rows"
+        );
+        let mut restarted = FerrosStateMachine::with_side_effects_and_snapshot_path(
+            Arc::clone(&local_schema),
+            Arc::clone(&cold),
+            path.clone(),
+        );
+        let result = restarted.recover_from_persisted_snapshot();
+        assert!(cold.read(&tid, &key).unwrap().is_some(), "startup must not delete newer durable rows while restoring a lagging snapshot before committed replay");
+        // Both apply groups completed, so this is not an unclean session: the
+        // refusal comes from chronology, not from the recovery guard.
+        assert!(
+            !restarted.recovery_required,
+            "completed applies must not quarantine"
+        );
+        assert!(result.is_err(), "without committed chronology authority startup must preserve and refuse, not guess that the incoming UUID is newer");
+        assert!(restarted.last_applied.is_none());
+        assert_eq!(
+            local_schema.snapshot().tables[&("startup_ks".into(), "survivor".into())].id,
+            current.id
+        );
+        assert_eq!(std::fs::read(path).unwrap(), original_snapshot);
     }
 
     #[test]
@@ -3703,7 +4636,7 @@ mod tests {
             (old.keyspace.clone(), old.name.clone()),
             replacement.clone(),
         );
-        sm.sync_schema_and_engine_from_state("incarnation regression")
+        sm.sync_schema_and_engine_from_state("incarnation regression", SnapshotSource::Installed)
             .unwrap();
         assert!(
             engine.read(&tid, &key).unwrap().is_none(),
@@ -3735,6 +4668,7 @@ mod tests {
             },
         );
         let extended_columns = extended.to_storage_schema().regular_columns.len();
+        let incarnation = extended.id;
         source
             .apply(vec![make_entry(
                 1,
@@ -3748,7 +4682,10 @@ mod tests {
         // Recovering node: engine ALREADY holds the table, with the stale
         // (pre-ALTER) column set — the situation node3 was stuck in.
         let engine = test_engine(dir.path());
-        let stale = simple_table("agent_memory", "entity_store").to_storage_schema();
+        let mut stale = simple_table("agent_memory", "entity_store");
+        // ALTER changes columns, not the table incarnation.
+        stale.id = incarnation;
+        let stale = stale.to_storage_schema();
         let stale_columns = stale.regular_columns.len();
         engine.register_table(stale).unwrap();
         assert!(
@@ -4346,6 +5283,310 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canonical_projection_sync_once_for_two_entry_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            test_engine_with_strategy(dir.path(), ferrosa_storage::SyncStrategyConfig::default());
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let mut sm = FerrosStateMachine::with_side_effects(schema, engine);
+        let responses = sm
+            .apply(vec![
+                make_entry(1, 1, RaftOp::CreateKeyspace(simple_keyspace("batch_one"))),
+                make_entry(1, 2, RaftOp::CreateKeyspace(simple_keyspace("batch_two"))),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(sm.last_applied.unwrap().index, 2);
+        assert_eq!(
+            sm.projection_syncs
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one canonical durability fence must cover the owned apply group"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_projection_sync_skips_empty_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            test_engine_with_strategy(dir.path(), ferrosa_storage::SyncStrategyConfig::default());
+        engine.register_system_tables().unwrap();
+        let mut sm =
+            FerrosStateMachine::with_side_effects(Arc::new(test_schema_instance()), engine);
+        let config = sm.state.config.clone();
+        sm.apply(vec![make_entry(1, 1, RaftOp::UpdateConfig(config))])
+            .await
+            .unwrap();
+        assert_eq!(
+            sm.projection_syncs
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a metadata-only entry must not force the data commit log"
+        );
+    }
+
+    async fn permission_regrant_with_clock(later_clock: i64) {
+        use crate::system_table_loader::SystemTableLoader;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let mut sm = FerrosStateMachine::with_side_effects(
+            Arc::new(test_schema_instance()),
+            Arc::clone(&engine),
+        );
+        sm.system_writer
+            .as_mut()
+            .unwrap()
+            .set_permission_timestamp_for_test(1_000_000);
+        let grant = GrantEntry {
+            role: "same_clock".into(),
+            resource: Resource::Keyspace("ks".into()),
+            permissions: [Permission::Select].into_iter().collect(),
+        };
+        let entries = vec![
+            make_entry(1, 1, RaftOp::Grant(grant.clone())),
+            make_entry(
+                1,
+                2,
+                RaftOp::Revoke {
+                    role: grant.role.clone(),
+                    resource: grant.resource.clone(),
+                    permission: Permission::Select,
+                },
+            ),
+            make_entry(
+                1,
+                3,
+                RaftOp::Grant(GrantEntry {
+                    permissions: [Permission::Modify].into_iter().collect(),
+                    ..grant.clone()
+                }),
+            ),
+        ];
+        sm.apply(entries[..2].to_vec()).await.unwrap();
+        let tid = ferrosa_storage::TableId::new("system_auth", "role_permissions");
+        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            grant.role.as_bytes().to_vec(),
+        ));
+        let partition = engine.read(&tid, &key).unwrap().unwrap();
+        let tombstone = partition
+            .rows
+            .iter()
+            .find(|r| r.clustering == grant.resource.to_string().as_bytes())
+            .unwrap()
+            .deletion;
+        assert!(
+            !tombstone.is_live(),
+            "the actual old revoke tombstone must exist"
+        );
+        sm.system_writer
+            .as_mut()
+            .unwrap()
+            .set_permission_timestamp_for_test(later_clock);
+        sm.apply(vec![entries[2].clone()]).await.unwrap();
+        let rows = SystemTableLoader::new(Arc::clone(&engine))
+            .load_role_permissions()
+            .unwrap();
+        let expected = [Permission::Modify].into_iter().collect();
+        assert!(
+            rows.iter().any(|g| g.role == grant.role
+                && g.resource == grant.resource
+                && g.permissions == expected),
+            "later grant must supersede the actual persisted revoke tombstone"
+        );
+        engine.flush(&tid).unwrap();
+        drop(sm);
+        drop(engine);
+        let (reopened, pending) = StorageEngine::open(
+            test_storage_config(dir.path(), ferrosa_storage::SyncStrategyConfig::Batch, 0),
+            None,
+        )
+        .unwrap();
+        reopened.register_system_tables().unwrap();
+        reopened.replay_mutations(pending).unwrap();
+        let reopened = Arc::new(reopened);
+        let mut replay = FerrosStateMachine::with_side_effects(
+            Arc::new(test_schema_instance()),
+            Arc::clone(&reopened),
+        );
+        replay
+            .system_writer
+            .as_mut()
+            .unwrap()
+            .set_permission_timestamp_for_test(0);
+        replay.apply(entries.clone()).await.unwrap();
+        replay.apply(entries).await.unwrap();
+        let rows = SystemTableLoader::new(reopened)
+            .load_role_permissions()
+            .unwrap();
+        assert!(
+            rows.iter().any(|g| g.role == grant.role
+                && g.resource == grant.resource
+                && g.permissions == expected),
+            "backward-clock cold replay and repeated replay must converge"
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_regrant_survives_equal_clock_tombstone() {
+        permission_regrant_with_clock(1_000_000).await;
+    }
+
+    #[tokio::test]
+    async fn permission_regrant_survives_backward_clock_and_restart() {
+        permission_regrant_with_clock(42).await;
+    }
+
+    #[tokio::test]
+    async fn permission_timestamp_exhaustion_refuses_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let mut sm =
+            FerrosStateMachine::with_side_effects(Arc::new(test_schema_instance()), engine);
+        sm.system_writer
+            .as_mut()
+            .unwrap()
+            .set_permission_timestamp_for_test(i64::MAX);
+        let grant = GrantEntry {
+            role: "exhausted".into(),
+            resource: Resource::Keyspace("ks".into()),
+            permissions: [Permission::Select].into_iter().collect(),
+        };
+        sm.apply(vec![make_entry(1, 1, RaftOp::Grant(grant.clone()))])
+            .await
+            .unwrap();
+        let result = sm
+            .apply(vec![make_entry(
+                1,
+                2,
+                RaftOp::Revoke {
+                    role: grant.role,
+                    resource: grant.resource,
+                    permission: Permission::Select,
+                },
+            )])
+            .await;
+        assert!(result.is_err());
+        assert_eq!(sm.last_applied.unwrap().index, 1);
+        assert!(sm.apply_failure.is_some());
+    }
+
+    async fn grant_projection_matches_full_state(revoke: bool) {
+        use crate::system_table_loader::SystemTableLoader;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let mut sm = FerrosStateMachine::with_side_effects(schema, Arc::clone(&engine));
+        let original = GrantEntry {
+            role: "projection_analyst".into(),
+            resource: Resource::Keyspace("projection_ks".into()),
+            permissions: [Permission::Select, Permission::Modify]
+                .into_iter()
+                .collect(),
+        };
+        let unrelated = GrantEntry {
+            role: "unrelated_analyst".into(),
+            resource: Resource::Keyspace("other_ks".into()),
+            permissions: [Permission::Select].into_iter().collect(),
+        };
+        let same_role_other_resource = GrantEntry {
+            role: original.role.clone(),
+            resource: Resource::Keyspace("first_other_resource".into()),
+            permissions: [Permission::Select].into_iter().collect(),
+        };
+        let initial = if revoke {
+            original.clone()
+        } else {
+            GrantEntry {
+                permissions: [Permission::Select].into_iter().collect(),
+                ..original.clone()
+            }
+        };
+        sm.apply(vec![
+            make_entry(1, 1, RaftOp::Grant(same_role_other_resource.clone())),
+            make_entry(1, 2, RaftOp::Grant(initial)),
+            make_entry(1, 3, RaftOp::Grant(unrelated.clone())),
+        ])
+        .await
+        .unwrap();
+        let op = if revoke {
+            RaftOp::Revoke {
+                role: original.role.clone(),
+                resource: original.resource.clone(),
+                permission: Permission::Modify,
+            }
+        } else {
+            RaftOp::Grant(GrantEntry {
+                permissions: [Permission::Modify].into_iter().collect(),
+                ..original.clone()
+            })
+        };
+        sm.apply(vec![make_entry(1, 4, op)]).await.unwrap();
+        let grants = SystemTableLoader::new(Arc::clone(&engine))
+            .load_role_permissions()
+            .unwrap();
+        let persisted = grants
+            .iter()
+            .find(|g| g.role == original.role && g.resource == original.resource)
+            .expect("remaining grant must exist physically");
+        assert_eq!(persisted.permissions, sm.state.grants[&original.role].iter().find(|g| g.resource == original.resource).unwrap().permissions,
+            "canonical row must contain the complete post-state, not the delta or a whole-row tombstone");
+        assert!(grants.iter().any(|g| g.role == unrelated.role
+            && g.resource == unrelated.resource
+            && g.permissions == unrelated.permissions));
+        assert!(grants
+            .iter()
+            .any(|g| g.role == same_role_other_resource.role
+                && g.resource == same_role_other_resource.resource
+                && g.permissions == same_role_other_resource.permissions));
+        let expected = persisted.permissions.clone();
+        engine
+            .flush(&ferrosa_storage::TableId::new(
+                "system_auth",
+                "role_permissions",
+            ))
+            .unwrap();
+        drop(sm);
+        drop(engine);
+        let (reopened, pending) = StorageEngine::open(
+            test_storage_config(dir.path(), ferrosa_storage::SyncStrategyConfig::Batch, 0),
+            None,
+        )
+        .unwrap();
+        reopened.register_system_tables().unwrap();
+        reopened.replay_mutations(pending).unwrap();
+        let rows = SystemTableLoader::new(Arc::new(reopened))
+            .load_role_permissions()
+            .unwrap();
+        assert!(
+            rows.iter().any(|g| g.role == original.role
+                && g.resource == original.resource
+                && g.permissions == expected),
+            "cold engine recovery must preserve the complete permission set"
+        );
+        assert!(rows.iter().any(|g| g.role == unrelated.role
+            && g.resource == unrelated.resource
+            && g.permissions == unrelated.permissions));
+        assert!(rows.iter().any(|g| g.role == same_role_other_resource.role
+            && g.resource == same_role_other_resource.resource
+            && g.permissions == same_role_other_resource.permissions));
+    }
+
+    #[tokio::test]
+    async fn grant_projection_persists_accumulated_permissions() {
+        grant_projection_matches_full_state(false).await;
+    }
+
+    #[tokio::test]
+    async fn revoke_projection_preserves_remaining_permissions() {
+        grant_projection_matches_full_state(true).await;
+    }
+
+    #[tokio::test]
     async fn get_current_snapshot_returns_none_initially() {
         let mut sm = FerrosStateMachine::new();
         let snap = sm.get_current_snapshot().await.unwrap();
@@ -4445,6 +5686,195 @@ mod tests {
             meta10.snapshot_id,
             "the installed snapshot itself must still be the one served"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_builder_cannot_replace_newer_durable_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state-machine.snapshot.bin");
+        let durable = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut live = FerrosStateMachine::with_snapshot_path(path.clone());
+        live.set_durable_applied_handle(Arc::clone(&durable));
+        live.apply(vec![make_entry(
+            1,
+            1,
+            RaftOp::CreateKeyspace(simple_keyspace("before")),
+        )])
+        .await
+        .unwrap();
+        let mut stale = live.get_snapshot_builder().await;
+        let mut newer = FerrosStateMachine::new();
+        newer
+            .apply(vec![
+                make_entry(1, 1, RaftOp::CreateKeyspace(simple_keyspace("before"))),
+                make_entry(1, 2, RaftOp::CreateKeyspace(simple_keyspace("after"))),
+            ])
+            .await
+            .unwrap();
+        let installed = newer.build_snapshot().await.unwrap();
+        live.install_snapshot(&installed.meta, installed.snapshot)
+            .await
+            .unwrap();
+        stale.build_snapshot().await.unwrap();
+
+        assert_eq!(
+            current_snapshot_index(&live.get_current_snapshot().await.unwrap()),
+            Some(2)
+        );
+        assert_eq!(durable.load(std::sync::atomic::Ordering::Acquire), 2);
+        let mut restarted = FerrosStateMachine::with_snapshot_path(path);
+        assert!(restarted.recover_from_persisted_snapshot().unwrap());
+        assert_eq!(
+            restarted.last_applied_index(),
+            Some(2),
+            "the durable file must cover the advertised purge watermark"
+        );
+        assert!(restarted.state().keyspaces.contains_key("after"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_file_survives_cancelled_waiter_and_concurrent_promotion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.bin");
+        let legacy_staging = path.with_extension("tmp");
+        std::fs::write(&legacy_staging, b"another attempt owns this file").unwrap();
+        let lock_path = dir.path().join("snapshot.bin.writer.lock");
+        let coordinator = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        coordinator.lock().unwrap();
+        let (meta1, bytes1) = snapshot_at(1).await;
+        let (meta2, bytes2) = snapshot_at(2).await;
+        let expected = bytes2.clone();
+        let first_path = path.clone();
+        let (started, running) = tokio::sync::oneshot::channel();
+        let (finished, completion) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            ferrosa_net::task_pool::TaskPool::current("raft-log-store")
+                .spawn_blocking(move || {
+                    let _ = started.send(());
+                    let result =
+                        FerrosStateMachine::persist_snapshot_to_disk(&first_path, &meta1, &bytes1);
+                    let _ = finished.send(result);
+                })
+                .await
+                .await
+                .unwrap();
+        });
+        running.await.unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        let second_path = path.clone();
+        let log_store_pool = ferrosa_net::task_pool::TaskPool::current("raft-log-store");
+        let second = log_store_pool.spawn_blocking(move || {
+                FerrosStateMachine::persist_snapshot_to_disk(&second_path, &meta2, &bytes2)
+                    .map_err(Box::new)
+            });
+        coordinator.unlock().unwrap();
+        completion.await.unwrap().unwrap();
+        second.await.await.unwrap().unwrap();
+
+        let stored: PersistedSnapshot =
+            bincode::deserialize(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored.meta.last_log_id.map(|id| id.index), Some(2));
+        assert_eq!(stored.bytes, expected);
+        assert_eq!(
+            std::fs::read(&legacy_staging).unwrap(),
+            b"another attempt owns this file"
+        );
+        assert!(lock_path.is_file(), "the coordination inode must persist");
+        let staging: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with("snapshot.bin."))
+            .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(
+            staging.is_empty(),
+            "completed attempts must leave no staging files"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_file_preserves_legacy_bincode_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.bin");
+        let (meta, bytes) = snapshot_at(3).await;
+        let expected = bincode::serialize(&PersistedSnapshot {
+            meta: meta.clone(),
+            bytes: bytes.clone(),
+        })
+        .unwrap();
+        FerrosStateMachine::persist_snapshot_to_disk(&path, &meta, &bytes).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn snapshot_file_keeps_newer_membership_at_the_same_applied_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.bin");
+        let (older, older_bytes) = snapshot_at(5).await;
+        let mut source = FerrosStateMachine::new();
+        source
+            .apply(vec![
+                Entry {
+                    log_id: LogId::new(CommittedLeaderId::new(1, 1), 3),
+                    payload: EntryPayload::Membership(openraft::Membership::new(
+                        vec![BTreeSet::from([1_u64])],
+                        BTreeMap::from([(1_u64, BasicNode::new("node1"))]),
+                    )),
+                },
+                blank_entry(5),
+            ])
+            .await
+            .unwrap();
+        let newer = source.build_snapshot().await.unwrap();
+        let newer_bytes = newer.snapshot.into_inner();
+        FerrosStateMachine::persist_snapshot_to_disk(&path, &newer.meta, &newer_bytes).unwrap();
+        FerrosStateMachine::persist_snapshot_to_disk(&path, &older, &older_bytes).unwrap();
+        assert!(!source.publish_snapshot(older, older_bytes));
+        let stored: PersistedSnapshot =
+            bincode::deserialize(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(stored.meta.last_membership, newer.meta.last_membership);
+        assert_eq!(stored.bytes, newer_bytes);
+    }
+
+    async fn reject_incomplete_newer_snapshot_record(metadata_only: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.bin");
+        let (meta, bytes) = snapshot_at(2).await;
+        let malformed = if metadata_only {
+            bincode::serialize(&meta).unwrap()
+        } else {
+            let mut encoded = bincode::serialize(&PersistedSnapshot { meta, bytes }).unwrap();
+            encoded.pop();
+            encoded
+        };
+        std::fs::write(&path, &malformed).unwrap();
+        let durable = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut builder = FerrosStateMachine::with_snapshot_path(path.clone());
+        builder.set_durable_applied_handle(Arc::clone(&durable));
+        builder.apply(vec![blank_entry(1)]).await.unwrap();
+        assert!(
+            builder.build_snapshot().await.is_err(),
+            "a newer metadata prefix is not proof of a complete durable snapshot"
+        );
+        assert_eq!(durable.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert_eq!(std::fs::read(path).unwrap(), malformed);
+    }
+
+    #[tokio::test]
+    async fn stale_snapshot_rejects_metadata_only_file() {
+        reject_incomplete_newer_snapshot_record(true).await;
+    }
+
+    #[tokio::test]
+    async fn stale_snapshot_rejects_truncated_payload() {
+        reject_incomplete_newer_snapshot_record(false).await;
     }
 
     /// Steps for T-F1-3's interleavings.
@@ -4917,19 +6347,43 @@ mod tests {
     }
 
     fn test_engine(dir: &std::path::Path) -> Arc<StorageEngine> {
-        use ferrosa_storage::engine::StorageEngineConfig;
+        test_engine_with_strategy(dir, Default::default())
+    }
+
+    fn test_engine_with_strategy(
+        dir: &std::path::Path,
+        sync_strategy: ferrosa_storage::SyncStrategyConfig,
+    ) -> Arc<StorageEngine> {
+        test_engine_with_reserve(dir, sync_strategy, 0)
+    }
+
+    fn test_engine_with_reserve(
+        dir: &std::path::Path,
+        sync_strategy: ferrosa_storage::SyncStrategyConfig,
+        reserve_bytes: u64,
+    ) -> Arc<StorageEngine> {
+        let config = test_storage_config(dir, sync_strategy, reserve_bytes);
+        Arc::new(StorageEngine::new(config, None).unwrap())
+    }
+
+    fn test_storage_config(
+        dir: &std::path::Path,
+        sync_strategy: ferrosa_storage::SyncStrategyConfig,
+        reserve_bytes: u64,
+    ) -> ferrosa_storage::engine::StorageEngineConfig {
         use ferrosa_storage::{CommitLogConfig, CompactionConfig};
-        let config = StorageEngineConfig {
+        ferrosa_storage::engine::StorageEngineConfig {
             commit_log: CommitLogConfig {
                 log_dir: dir.to_path_buf(),
                 checkpoint_dir: dir.to_path_buf(),
                 archive: None,
+                sync_strategy,
                 ..CommitLogConfig::default()
             },
             compaction: CompactionConfig::from_env(dir.join("compaction")),
             object_store: None,
             local_cache_max_bytes: 1024 * 1024,
-            local_disk_free_reserve_bytes: 0,
+            local_disk_free_reserve_bytes: reserve_bytes,
             flush_threshold_bytes: 4096,
             memtable_backpressure_bytes: u64::MAX,
             flush_max_age_secs: 5,
@@ -4941,8 +6395,94 @@ mod tests {
             max_pending_replay_mutations_without_schema: 1024,
             memtable_num_shards: 64,
             cache_hot_window_secs: 900,
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_projection_group_does_not_publish_earlier_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine_with_reserve(
+            dir.path(),
+            ferrosa_storage::SyncStrategyConfig::Batch,
+            u64::MAX,
+        );
+        engine.register_system_tables().unwrap();
+        let mut sm =
+            FerrosStateMachine::with_side_effects(Arc::new(test_schema_instance()), engine);
+        let before = sm.state.config.auto_join;
+        let mut config = sm.state.config.clone();
+        config.auto_join = !before;
+        let result = sm
+            .apply(vec![
+                make_entry(1, 1, RaftOp::UpdateConfig(config)),
+                make_entry(
+                    1,
+                    2,
+                    RaftOp::CreateKeyspace(simple_keyspace("failed_group")),
+                ),
+            ])
+            .await;
+        assert!(result.is_err());
+        assert!(sm.last_applied.is_none());
+        assert_eq!(
+            sm.state.config.auto_join, before,
+            "the group prefix must not publish before its durability fence"
+        );
+        assert!(sm.apply_failure.is_some());
+    }
+
+    async fn hard_projection_failure_must_not_publish(drop_keyspace: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine_with_reserve(
+            dir.path(),
+            ferrosa_storage::SyncStrategyConfig::Batch,
+            u64::MAX,
+        );
+        engine.register_system_tables().unwrap();
+        assert!(matches!(
+            engine.check_write_admission(),
+            Err(ferrosa_common::Error::InvalidData(_))
+        ));
+        let schema = Arc::new(test_schema_instance());
+        let mut sm = FerrosStateMachine::with_side_effects(Arc::clone(&schema), engine);
+        let keyspace = simple_keyspace("projection_failure");
+        let op = if drop_keyspace {
+            schema.create_keyspace_internal(keyspace.clone()).unwrap();
+            sm.state
+                .keyspaces
+                .insert(keyspace.name.clone(), keyspace.clone());
+            RaftOp::DropKeyspace(keyspace.name)
+        } else {
+            RaftOp::CreateKeyspace(keyspace)
         };
-        Arc::new(StorageEngine::new(config, None).unwrap())
+        let result = sm.apply(vec![make_entry(1, 1, op)]).await;
+        assert!(
+            result.is_err(),
+            "real canonical projection write refusal must reach storage failure, got {result:?}"
+        );
+        assert!(
+            sm.last_applied.is_none(),
+            "failed canonical projection must remain replayable"
+        );
+        assert!(
+            sm.apply_failure.is_some(),
+            "a true persistence failure must latch"
+        );
+        let mut builder = sm.get_snapshot_builder().await;
+        assert!(
+            builder.build_snapshot().await.is_err(),
+            "failed projection cannot be snapshotted and purged"
+        );
+    }
+
+    #[tokio::test]
+    async fn warn_replay_does_not_hide_real_projection_storage_failure() {
+        hard_projection_failure_must_not_publish(false).await;
+    }
+
+    #[tokio::test]
+    async fn critical_projection_storage_failure_does_not_publish_applied_index() {
+        hard_projection_failure_must_not_publish(true).await;
     }
 
     /// A node that receives a snapshot missing a local data-bearing table must
@@ -5048,17 +6588,113 @@ mod tests {
         }
     }
 
-    /// W1.7 — `apply_command` returns `RaftResponse::Error` instead of
-    /// silently swallowing engine.register_table failures.
+    /// W1.7 — physical failure is a storage error, not a successful
+    /// application carrying an ordinary command-error response.
     ///
     /// The engine's `register_table` calls `std::fs::create_dir_all` on
     /// `<data_dir>/sstables/<keyspace>:<table>`.  If that path already
     /// exists as a regular file, the call fails with "Not a directory".
     /// We pre-create the file, then issue `RaftOp::CreateTable` and
-    /// confirm the apply returns `RaftResponse::Error` carrying the
-    /// `engine.register_table` reason.
+    /// confirm apply refuses publication with the original registration reason,
+    /// retains the preceding index, and prevents a successor from applying.
     #[tokio::test]
-    async fn apply_command_propagates_engine_register_failure() {
+    async fn physical_retirement_tracks_successful_snapshot_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut source = FerrosStateMachine::new();
+        source
+            .apply(vec![make_entry(
+                1,
+                7,
+                RaftOp::CreateKeyspace(simple_keyspace("installed_ks")),
+            )])
+            .await
+            .unwrap();
+        let snapshot = source.build_snapshot().await.unwrap();
+        let expected = snapshot.meta.last_log_id;
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let path = dir.path().join("installed.snapshot.bin");
+        let mut target = FerrosStateMachine::with_side_effects_and_snapshot_path(
+            Arc::clone(&schema),
+            engine,
+            path.clone(),
+        );
+        let lifecycle = target.physical_lifecycle();
+        target
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        assert!(schema.snapshot().keyspaces.contains_key("installed_ks"));
+        assert_eq!(target.last_applied, expected);
+        assert!(path.is_file());
+        drop(target);
+        assert_eq!(
+            lifecycle.drain().await.unwrap(),
+            expected,
+            "completed snapshot must cover the persisted committed retirement target"
+        );
+    }
+
+    #[tokio::test]
+    async fn physical_retirement_refuses_failed_snapshot_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut source = FerrosStateMachine::new();
+        source
+            .apply(vec![
+                make_entry(
+                    1,
+                    1,
+                    RaftOp::CreateKeyspace(simple_keyspace("failed_install")),
+                ),
+                make_entry(
+                    1,
+                    2,
+                    RaftOp::CreateTable(Box::new(simple_table("failed_install", "victim"))),
+                ),
+            ])
+            .await
+            .unwrap();
+        let snapshot = source.build_snapshot().await.unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let blocker = dir.path().join("sstables/failed_install.victim");
+        std::fs::create_dir_all(blocker.parent().unwrap()).unwrap();
+        std::fs::write(&blocker, b"owned physical refusal").unwrap();
+        let mut target = FerrosStateMachine::with_side_effects_and_snapshot_path(
+            Arc::new(test_schema_instance()),
+            engine,
+            dir.path().join("failed.snapshot.bin"),
+        );
+        let lifecycle = target.physical_lifecycle();
+        assert!(target
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .is_err());
+        assert!(target.last_applied.is_none());
+        drop(target);
+        assert!(
+            lifecycle.drain().await.is_err(),
+            "failed restore must not authorize Pair retirement"
+        );
+        assert_eq!(std::fs::read(blocker).unwrap(), b"owned physical refusal");
+    }
+
+    /// A CREATE whose local registration is refused is a command this node
+    /// refused, not a log it could not apply.
+    ///
+    /// `engine.register_table` refuses when it cannot take ownership of the
+    /// table's directory — an unremovable same-name directory left by a DROP
+    /// that could not sweep it, a permission error, a mount point. The entry is
+    /// already committed, canonical metadata agrees on every replica, and every
+    /// other node registers the table normally; latching this machine would take
+    /// a healthy replica out of service for one directory, with no online
+    /// repair. The caller must still see the refusal, the node must keep
+    /// applying, and the refusal must be recoverable online: once the directory
+    /// is usable again a re-issued CREATE registers the table and a DROP clears
+    /// it.
+    #[tokio::test]
+    async fn refused_engine_register_surfaces_and_keeps_applying() {
         let dir = tempfile::tempdir().unwrap();
         let engine = test_engine(dir.path());
         engine.register_system_tables().unwrap();
@@ -5080,31 +6716,192 @@ mod tests {
         let create_ks_entry = make_entry(1, 1, RaftOp::CreateKeyspace(ks));
         let create_tbl_entry = make_entry(1, 2, RaftOp::CreateTable(Box::new(table)));
 
+        sm.apply(vec![create_ks_entry]).await.unwrap();
         let responses = sm
-            .apply(vec![create_ks_entry, create_tbl_entry])
+            .apply(vec![create_tbl_entry])
             .await
-            .unwrap();
-
-        // Two responses: CreateKeyspace -> Ok, CreateTable -> Error.
-        assert_eq!(responses.len(), 2);
+            .expect("a refused registration must surface to the caller, not fail the apply");
+        let refusal = match responses.first() {
+            Some(RaftResponse::Error(reason)) => reason.clone(),
+            other => panic!("a refused CREATE must be an error response, got {other:?}"),
+        };
+        assert!(refusal.contains("engine.register_table"), "{refusal}");
         assert!(
-            matches!(&responses[0], RaftResponse::Ok),
-            "CreateKeyspace should succeed: {:?}",
-            responses[0]
+            refusal.contains("regress_ks") && refusal.contains("victim_tbl"),
+            "{refusal}"
         );
-        match &responses[1] {
-            RaftResponse::Error(msg) => {
-                assert!(
-                    msg.contains("engine.register_table"),
-                    "expected register_table failure, got: {msg}"
-                );
-                assert!(
-                    msg.contains("regress_ks") && msg.contains("victim_tbl"),
-                    "error should name the failing keyspace/table: {msg}"
-                );
-            }
-            other => panic!("expected RaftResponse::Error, got {other:?}"),
-        }
+        assert!(
+            sm.apply_failure.is_none(),
+            "a refused CREATE must not close the apply fence: {refusal}"
+        );
+        assert_eq!(
+            sm.last_applied.unwrap().index,
+            2,
+            "the committed entry must be published so the next one can apply"
+        );
+
+        // A later command applies on the same node.
+        let next = sm
+            .apply(vec![make_entry(
+                1,
+                3,
+                RaftOp::CreateTable(Box::new(simple_table("regress_ks", "valid_tbl"))),
+            )])
+            .await
+            .expect("the node must still apply after a refused CREATE");
+        assert!(matches!(next[0], RaftResponse::Ok), "{next:?}");
+        assert!(engine
+            .table_schema(&TableId::new("regress_ks", "valid_tbl"))
+            .is_some());
+
+        // Repair online: clear the blocker and re-issue the CREATE. The table
+        // the node refused is registered without restarting it.
+        std::fs::remove_file(&target).unwrap();
+        let retried = sm
+            .apply(vec![make_entry(
+                1,
+                4,
+                RaftOp::CreateTable(Box::new(simple_table("regress_ks", "victim_tbl"))),
+            )])
+            .await
+            .expect("the re-issued CREATE must apply");
+        assert!(matches!(retried[0], RaftResponse::Ok), "{retried:?}");
+        assert!(engine
+            .table_schema(&TableId::new("regress_ks", "victim_tbl"))
+            .is_some());
+
+        // ... and a DROP of it still works.
+        let dropped = sm
+            .apply(vec![make_entry(
+                1,
+                5,
+                RaftOp::DropTable {
+                    keyspace: "regress_ks".into(),
+                    table: "victim_tbl".into(),
+                },
+            )])
+            .await
+            .expect("a DROP after the refused CREATE must apply");
+        assert!(matches!(dropped[0], RaftResponse::Ok), "{dropped:?}");
+        assert!(engine
+            .table_schema(&TableId::new("regress_ks", "victim_tbl"))
+            .is_none());
+    }
+
+    /// An ALTER of a table this node's engine does not hold is a refusal, not a
+    /// storage failure.
+    ///
+    /// Nothing can be rotated and no memtable can be flushed from a stale
+    /// header when there is no registration to begin with, so latching here
+    /// would only re-fence a node that is already correctly refusing writes to
+    /// that table — exactly what a refused CREATE leaves behind. The ALTER must
+    /// reach the caller, the node must keep applying, and re-registering the
+    /// table (what a re-issued CREATE does) must make the next ALTER work.
+    #[tokio::test]
+    async fn refused_alter_without_engine_registration_surfaces_and_keeps_applying() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = test_schema_instance();
+        let mut sm = FerrosStateMachine::with_side_effects(Arc::new(schema), Arc::clone(&engine));
+
+        sm.apply(vec![
+            make_entry(
+                1,
+                1,
+                RaftOp::CreateKeyspace(simple_keyspace("unregistered_ks")),
+            ),
+            make_entry(
+                1,
+                2,
+                RaftOp::CreateTable(Box::new(simple_table("unregistered_ks", "victim"))),
+            ),
+        ])
+        .await
+        .unwrap();
+
+        // The engine loses the registration while committed metadata keeps the
+        // table — the state a refused CREATE leaves behind.
+        let tid = TableId::new("unregistered_ks", "victim");
+        engine.unregister_table(&tid).unwrap();
+        assert!(engine.table_schema(&tid).is_none());
+
+        let add_column = |name: &str| ferrosa_schema::metadata::table::TableUpdates {
+            params: None,
+            drop_columns: vec![],
+            extensions: None,
+            add_columns: vec![ColumnMetadata {
+                name: name.into(),
+                kind: ColumnKind::Regular,
+                position: 1,
+                column_type: "text".into(),
+                clustering_order: ClusteringOrder::None,
+                mask: None,
+            }],
+        };
+
+        let responses = sm
+            .apply(vec![make_entry(
+                1,
+                3,
+                RaftOp::AlterTable {
+                    keyspace: "unregistered_ks".into(),
+                    table: "victim".into(),
+                    updates: Box::new(add_column("added")),
+                },
+            )])
+            .await
+            .expect("a refused ALTER must surface to the caller, not fail the apply");
+        let refusal = match responses.first() {
+            Some(RaftResponse::Error(reason)) => reason.clone(),
+            other => panic!("a refused ALTER must be an error response, got {other:?}"),
+        };
+        assert!(refusal.contains("no registration"), "{refusal}");
+        assert!(
+            sm.apply_failure.is_none(),
+            "a refused ALTER must not close the apply fence: {refusal}"
+        );
+        assert_eq!(sm.last_applied.unwrap().index, 3);
+
+        // The node still applies after the refusal.
+        let next = sm
+            .apply(vec![make_entry(
+                1,
+                4,
+                RaftOp::CreateTable(Box::new(simple_table("unregistered_ks", "later"))),
+            )])
+            .await
+            .expect("the node must still apply after a refused ALTER");
+        assert!(matches!(next[0], RaftResponse::Ok), "{next:?}");
+
+        // The repair is a DDL: re-registering the table with the metadata the
+        // log has accumulated makes the same ALTER apply.
+        let current = sm
+            .state
+            .tables
+            .get(&("unregistered_ks".into(), "victim".into()))
+            .expect("committed metadata keeps the table")
+            .to_storage_schema();
+        engine.register_table(current).unwrap();
+        let repaired = sm
+            .apply(vec![make_entry(
+                1,
+                5,
+                RaftOp::AlterTable {
+                    keyspace: "unregistered_ks".into(),
+                    table: "victim".into(),
+                    updates: Box::new(add_column("added_after_repair")),
+                },
+            )])
+            .await
+            .expect("an ALTER after re-registration must apply");
+        assert!(matches!(repaired[0], RaftResponse::Ok), "{repaired:?}");
+        assert!(engine
+            .table_schema(&tid)
+            .expect("registered")
+            .regular_columns
+            .iter()
+            .any(|c| c.name == "added_after_repair"));
     }
 
     /// Repro for forge t_86f9259d: a keyspace created through the Raft
@@ -5188,6 +6985,458 @@ mod tests {
             "CreateKeyspace apply must reconcile the shared Schema so fresh \
              connections see the keyspace, even when self.state already had it"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn held_schema_lease_allows_async_observer_control() {
+        let schema = Arc::new(test_schema_instance());
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _lease = schema.lifecycle_read();
+            ready_tx.send(()).unwrap();
+            progress_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok()
+        });
+        ready_rx.recv().unwrap();
+        tokio::task::yield_now().await;
+        progress_tx.send(()).unwrap();
+        assert!(
+            holder.join().unwrap(),
+            "observer must run while the fixture lease is held"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn raft_create_table_keeps_async_progress_while_schema_lease_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let mut sm = FerrosStateMachine::with_side_effects(Arc::clone(&schema), engine);
+        sm.apply(vec![make_entry(
+            1,
+            1,
+            RaftOp::CreateKeyspace(simple_keyspace("async_apply")),
+        )])
+        .await
+        .unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let held_schema = Arc::clone(&schema);
+        let holder = std::thread::spawn(move || {
+            let _lease = held_schema.lifecycle_read();
+            ready_tx.send(()).unwrap();
+            // Cleanup bound, not a scheduling deadline: a broken apply must
+            // eventually release so the test reports its assertion failure.
+            progress_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok()
+        });
+        ready_rx.recv().unwrap();
+        let apply = sm.apply(vec![make_entry(
+            1,
+            2,
+            RaftOp::CreateTable(Box::new(simple_table("async_apply", "t"))),
+        )]);
+        tokio::pin!(apply);
+        tokio::select! {
+            biased;
+            result = &mut apply => { result.unwrap(); }
+            () = async { let _released_after_cleanup = progress_tx.send(()); } => { apply.await.unwrap(); }
+        }
+        assert!(
+            holder.join().unwrap(),
+            "Raft apply blocked the only async worker while waiting for the schema lease"
+        );
+        assert!(schema
+            .snapshot()
+            .tables
+            .contains_key(&("async_apply".into(), "t".into())));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_raft_schema_lease_apply_is_reaped_before_snapshot_and_next_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let mut sm = FerrosStateMachine::with_side_effects(Arc::clone(&schema), engine);
+        sm.apply(vec![make_entry(
+            1,
+            1,
+            RaftOp::CreateKeyspace(simple_keyspace("cancel_apply")),
+        )])
+        .await
+        .unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let held_schema = Arc::clone(&schema);
+        let holder = std::thread::spawn(move || {
+            let _lease = held_schema.lifecycle_read();
+            ready_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok()
+        });
+        ready_rx.recv().unwrap();
+        {
+            let apply = sm.apply(vec![make_entry(
+                1,
+                2,
+                RaftOp::CreateTable(Box::new(simple_table("cancel_apply", "first"))),
+            )]);
+            tokio::pin!(apply);
+            std::future::poll_fn(|cx| match std::future::Future::poll(apply.as_mut(), cx) {
+                std::task::Poll::Pending => std::task::Poll::Ready(()),
+                std::task::Poll::Ready(result) => {
+                    panic!("held lease must leave apply pending: {result:?}")
+                }
+            })
+            .await;
+            // Drop only the waiter. The admitted operation must remain owned.
+        }
+        let _released_after_cleanup = release_tx.send(());
+        assert!(
+            holder.join().unwrap(),
+            "cancelling apply must not wait for the fixture cleanup deadline"
+        );
+        let mut builder = sm.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let data = decode_snapshot(snapshot.snapshot.get_ref()).unwrap();
+        assert_eq!(data.last_applied.unwrap().index, 2);
+        assert!(data
+            .state
+            .tables
+            .contains_key(&("cancel_apply".into(), "first".into())));
+        sm.apply(vec![make_entry(
+            1,
+            3,
+            RaftOp::CreateTable(Box::new(simple_table("cancel_apply", "second"))),
+        )])
+        .await
+        .unwrap();
+        assert_eq!(sm.applied_state().await.unwrap().0.unwrap().index, 3);
+        assert!(sm
+            .state
+            .tables
+            .contains_key(&("cancel_apply".into(), "first".into())));
+        assert!(sm
+            .state
+            .tables
+            .contains_key(&("cancel_apply".into(), "second".into())));
+    }
+
+    async fn cancelled_mixed_input_requires_reissue(membership: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let mut sm = FerrosStateMachine::with_side_effects(Arc::clone(&schema), engine);
+        sm.apply(vec![make_entry(
+            1,
+            1,
+            RaftOp::CreateKeyspace(simple_keyspace("mixed_cancel")),
+        )])
+        .await
+        .unwrap();
+        let boundary = if membership {
+            Entry {
+                log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 3),
+                payload: EntryPayload::Membership(openraft::Membership::new(
+                    vec![BTreeSet::from([1_u64])],
+                    BTreeMap::from([(1_u64, BasicNode::new("node1"))]),
+                )),
+            }
+        } else {
+            blank_entry(3)
+        };
+        let suffix = make_entry(
+            1,
+            4,
+            RaftOp::CreateTable(Box::new(simple_table("mixed_cancel", "suffix"))),
+        );
+        let later = make_entry(
+            1,
+            5,
+            RaftOp::CreateTable(Box::new(simple_table("mixed_cancel", "later"))),
+        );
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let held = Arc::clone(&schema);
+        let holder = std::thread::spawn(move || {
+            let _lease = held.lifecycle_read();
+            ready_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok()
+        });
+        ready_rx.recv().unwrap();
+        {
+            let apply = sm.apply(vec![
+                make_entry(
+                    1,
+                    2,
+                    RaftOp::CreateTable(Box::new(simple_table("mixed_cancel", "first"))),
+                ),
+                boundary.clone(),
+                suffix.clone(),
+            ]);
+            tokio::pin!(apply);
+            std::future::poll_fn(|cx| match std::future::Future::poll(apply.as_mut(), cx) {
+                std::task::Poll::Pending => std::task::Poll::Ready(()),
+                std::task::Poll::Ready(result) => {
+                    panic!("held first group must remain pending: {result:?}")
+                }
+            })
+            .await;
+        }
+        release_tx.send(()).unwrap();
+        assert!(holder.join().unwrap());
+        assert_eq!(sm.applied_state().await.unwrap().0.unwrap().index, 2);
+        let skipped = sm.apply(vec![later.clone()]).await;
+        assert!(skipped.is_err(), "must not acknowledge index5 while the cancelled input's committed indexes3/4 are unconsumed: {skipped:?}");
+        assert_eq!(sm.last_applied.unwrap().index, 2);
+        assert!(!schema
+            .snapshot()
+            .tables
+            .contains_key(&("mixed_cancel".into(), "later".into())));
+        sm.apply(vec![boundary, suffix]).await.unwrap();
+        assert_eq!(sm.last_applied.unwrap().index, 4);
+        assert!(schema
+            .snapshot()
+            .tables
+            .contains_key(&("mixed_cancel".into(), "suffix".into())));
+        sm.apply(vec![later]).await.unwrap();
+        assert_eq!(sm.last_applied.unwrap().index, 5);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_mixed_blank_input_refuses_skipping_unconsumed_suffix() {
+        cancelled_mixed_input_requires_reissue(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_mixed_membership_input_refuses_skipping_unconsumed_suffix() {
+        cancelled_mixed_input_requires_reissue(true).await;
+    }
+
+    async fn snapshot_supersedes_abandoned_prefix(snapshot_index: u64) {
+        let mut source = FerrosStateMachine::new();
+        source
+            .apply(vec![blank_entry(snapshot_index)])
+            .await
+            .unwrap();
+        let snapshot = source.build_snapshot().await.unwrap();
+        let mut target = FerrosStateMachine::new();
+        // The two held-worker cancellation cases establish this runtime fence.
+        target.unconsumed_input = Some(3);
+        target
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        assert!(
+            target
+                .apply(vec![blank_entry(snapshot_index + 2)])
+                .await
+                .is_err(),
+            "an authoritative snapshot must not permit skipping its next index"
+        );
+        target
+            .apply(vec![blank_entry(snapshot_index + 1)])
+            .await
+            .unwrap();
+        assert_eq!(target.last_applied.unwrap().index, snapshot_index + 1);
+    }
+
+    #[tokio::test]
+    async fn snapshot_covering_part_of_cancelled_suffix_requires_its_next_index() {
+        snapshot_supersedes_abandoned_prefix(3).await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_covering_cancelled_suffix_allows_ordered_progress() {
+        snapshot_supersedes_abandoned_prefix(4).await;
+    }
+
+    async fn cancelled_projection_waiter_retains_fence(
+        strategy: ferrosa_storage::SyncStrategyConfig,
+        batched: bool,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine_with_strategy(dir.path(), strategy);
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let mut sm = FerrosStateMachine::with_side_effects(schema, Arc::clone(&engine));
+        sm.apply(vec![make_entry(
+            1,
+            1,
+            RaftOp::CreateKeyspace(simple_keyspace("system_wait")),
+        )])
+        .await
+        .unwrap();
+        let recorder = sm
+            .system_writer
+            .as_ref()
+            .unwrap()
+            .last_apply_thread_handle();
+        *recorder.lock().unwrap() = None;
+        let syncs = Arc::clone(&sm.projection_syncs);
+        let before = syncs.load(std::sync::atomic::Ordering::SeqCst);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let held_engine = Arc::clone(&engine);
+        let holder = std::thread::spawn(move || {
+            let mut progressed = false;
+            held_engine.with_commit_log_flush_held_for_test(|| {
+                ready_tx.send(()).unwrap();
+                progressed = release_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .is_ok();
+            });
+            progressed
+        });
+        ready_rx.recv().unwrap();
+        {
+            let mut entries = vec![make_entry(
+                1,
+                2,
+                RaftOp::CreateTable(Box::new(simple_table("system_wait", "t"))),
+            )];
+            if batched {
+                entries.push(make_entry(
+                    1,
+                    3,
+                    RaftOp::CreateTable(Box::new(simple_table("system_wait", "t2"))),
+                ));
+            }
+            let apply = sm.apply(entries);
+            tokio::pin!(apply);
+            std::future::poll_fn(|cx| match std::future::Future::poll(apply.as_mut(), cx) {
+                std::task::Poll::Pending => std::task::Poll::Ready(()),
+                std::task::Poll::Ready(result) => {
+                    panic!("held flush must leave apply pending: {result:?}")
+                }
+            })
+            .await;
+            if batched {
+                // Both physical projection writes completed and the owned job
+                // reached its one real explicit sync, blocked by the held file.
+                while syncs.load(std::sync::atomic::Ordering::SeqCst) == before {
+                    tokio::task::yield_now().await;
+                }
+            } else {
+                while recorder.lock().unwrap().is_none() {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+        assert_eq!(
+            sm.last_applied.unwrap().index,
+            1,
+            "system writes must finish before publication"
+        );
+        let applied = sm.applied_state();
+        tokio::pin!(applied);
+        let waited = tokio::select! {
+            biased;
+            result = &mut applied => { result.unwrap(); false }
+            () = async { let _after_cleanup = release_tx.send(()); } => { applied.await.unwrap(); true }
+        };
+        assert!(
+            holder.join().unwrap(),
+            "fixture must release on observer progress"
+        );
+        assert!(
+            waited,
+            "applied_state must await the retained system-table write"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_raft_system_write_is_reaped_before_applied_state() {
+        cancelled_projection_waiter_retains_fence(
+            ferrosa_storage::SyncStrategyConfig::Batch,
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_periodic_projection_batch_retains_durability_fence() {
+        cancelled_projection_waiter_retains_fence(
+            ferrosa_storage::SyncStrategyConfig::default(),
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn panicked_raft_apply_poison_refuses_every_trait_barrier() {
+        let mut sm = FerrosStateMachine {
+            pending_apply: Some(PendingApply {
+                log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 1),
+                job: ferrosa_net::task_pool::TaskPool::current("raft-poison-test")
+                    .spawn_blocking(|| -> ferrosa_common::Result<CompletedApply> {
+                        panic!("intentional apply panic");
+                    })
+                    .await,
+                pauses: Arc::new(Vec::new()),
+            }),
+            ..Default::default()
+        };
+        let error = sm.applied_state().await.unwrap_err().to_string();
+        assert!(error.contains("Raft physical apply job failed"));
+        assert!(sm.last_applied.is_none());
+        assert!(sm.state.tables.is_empty());
+        assert!(sm
+            .apply(vec![make_entry(
+                1,
+                2,
+                RaftOp::CreateKeyspace(simple_keyspace("not_applied"))
+            )])
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Raft physical apply job failed"));
+        assert!(sm
+            .begin_receiving_snapshot()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Raft physical apply job failed"));
+        assert!(sm
+            .get_current_snapshot()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Raft physical apply job failed"));
+        assert!(sm
+            .build_snapshot()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Raft physical apply job failed"));
+        let meta = SnapshotMeta {
+            last_log_id: None,
+            last_membership: StoredMembership::default(),
+            snapshot_id: "poison".into(),
+        };
+        assert!(sm
+            .install_snapshot(&meta, Box::new(Cursor::new(Vec::new())))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Raft physical apply job failed"));
+        let mut builder = sm.get_snapshot_builder().await;
+        assert!(builder
+            .build_snapshot()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Raft physical apply job failed"));
+        assert!(sm.last_applied.is_none());
     }
 
     /// Companion to the keyspace reconciliation repro: a `CreateTable` apply
@@ -5943,7 +8192,7 @@ mod tests {
             }),
             schema_version: Uuid::new_v4(),
         };
-        sm.apply_command(create_cmd);
+        sm.apply_command(create_cmd).unwrap();
 
         // Now report node 1 as Building.
         let status_cmd = RaftCommand {
@@ -5956,7 +8205,7 @@ mod tests {
             },
             schema_version: Uuid::new_v4(),
         };
-        sm.apply_command(status_cmd);
+        sm.apply_command(status_cmd).unwrap();
 
         let entry = sm
             .state()
@@ -5976,7 +8225,7 @@ mod tests {
             },
             schema_version: Uuid::new_v4(),
         };
-        sm.apply_command(ready_cmd);
+        sm.apply_command(ready_cmd).unwrap();
 
         let entry = sm
             .state()
@@ -6002,7 +8251,7 @@ mod tests {
             }),
             schema_version: Uuid::new_v4(),
         };
-        sm.apply_command(create_cmd);
+        sm.apply_command(create_cmd).unwrap();
 
         // Node 1: Ready, Node 2: Building, Node 3: Failed
         for (node_id, status) in [
@@ -6020,7 +8269,7 @@ mod tests {
                 },
                 schema_version: Uuid::new_v4(),
             };
-            sm.apply_command(cmd);
+            sm.apply_command(cmd).unwrap();
         }
 
         let entry = sm
@@ -6052,7 +8301,8 @@ mod tests {
                 options: std::collections::HashMap::new(),
             }),
             schema_version: Uuid::new_v4(),
-        });
+        })
+        .unwrap();
         sm.apply_command(RaftCommand {
             op: RaftOp::IndexStatus {
                 node_id: 1,
@@ -6062,7 +8312,8 @@ mod tests {
                 status: IndexNodeStatus::Ready,
             },
             schema_version: Uuid::new_v4(),
-        });
+        })
+        .unwrap();
 
         assert!(!sm.state().index_state_map.is_empty());
 
@@ -6073,7 +8324,8 @@ mod tests {
                 index: "idx".into(),
             },
             schema_version: Uuid::new_v4(),
-        });
+        })
+        .unwrap();
 
         assert!(
             !sm.state()
@@ -6097,7 +8349,8 @@ mod tests {
                 },
             }),
             schema_version: Uuid::new_v4(),
-        });
+        })
+        .unwrap();
         sm.apply_command(RaftCommand {
             op: RaftOp::CreateIndex(IndexMetadata {
                 keyspace: "ks".into(),
@@ -6109,7 +8362,8 @@ mod tests {
                 options: std::collections::HashMap::new(),
             }),
             schema_version: Uuid::new_v4(),
-        });
+        })
+        .unwrap();
         sm.apply_command(RaftCommand {
             op: RaftOp::IndexStatus {
                 node_id: 1,
@@ -6119,14 +8373,16 @@ mod tests {
                 status: IndexNodeStatus::Ready,
             },
             schema_version: Uuid::new_v4(),
-        });
+        })
+        .unwrap();
 
         assert!(!sm.state().index_state_map.is_empty());
 
         sm.apply_command(RaftCommand {
             op: RaftOp::DropKeyspace("ks".into()),
             schema_version: Uuid::new_v4(),
-        });
+        })
+        .unwrap();
 
         assert!(
             sm.state().index_state_map.is_empty(),
@@ -6149,7 +8405,8 @@ mod tests {
                 options: std::collections::HashMap::new(),
             }),
             schema_version: Uuid::new_v4(),
-        });
+        })
+        .unwrap();
         sm.apply_command(RaftCommand {
             op: RaftOp::IndexStatus {
                 node_id: 1,
@@ -6159,7 +8416,8 @@ mod tests {
                 status: IndexNodeStatus::Ready,
             },
             schema_version: Uuid::new_v4(),
-        });
+        })
+        .unwrap();
 
         // Also create an index on a different table to ensure it survives.
         sm.apply_command(RaftCommand {
@@ -6173,7 +8431,8 @@ mod tests {
                 options: std::collections::HashMap::new(),
             }),
             schema_version: Uuid::new_v4(),
-        });
+        })
+        .unwrap();
         sm.apply_command(RaftCommand {
             op: RaftOp::IndexStatus {
                 node_id: 1,
@@ -6183,7 +8442,8 @@ mod tests {
                 status: IndexNodeStatus::Ready,
             },
             schema_version: Uuid::new_v4(),
-        });
+        })
+        .unwrap();
 
         assert_eq!(sm.state().index_state_map.len(), 2);
 
@@ -6193,7 +8453,8 @@ mod tests {
                 table: "tbl".into(),
             },
             schema_version: Uuid::new_v4(),
-        });
+        })
+        .unwrap();
 
         assert_eq!(sm.state().index_state_map.len(), 1);
         assert!(sm.state().index_state_map.contains_key(&(
@@ -6323,7 +8584,8 @@ mod tests {
                 options: std::collections::HashMap::new(),
             }),
             schema_version: Uuid::new_v4(),
-        });
+        })
+        .unwrap();
 
         // Two nodes report Ready.
         for node_id in [1u64, 2] {
@@ -6336,7 +8598,8 @@ mod tests {
                     status: IndexNodeStatus::Ready,
                 },
                 schema_version: Uuid::new_v4(),
-            });
+            })
+            .unwrap();
         }
 
         let entry = sm
@@ -6350,7 +8613,8 @@ mod tests {
         sm.apply_command(RaftCommand {
             op: RaftOp::LeaveNode { node_id: 1 },
             schema_version: Uuid::new_v4(),
-        });
+        })
+        .unwrap();
 
         let entry = sm
             .state()
@@ -6377,7 +8641,8 @@ mod tests {
                 options: std::collections::HashMap::new(),
             }),
             schema_version: Uuid::new_v4(),
-        });
+        })
+        .unwrap();
 
         // index_state_map should have an entry (empty since no members).
         let entry = sm
@@ -6407,7 +8672,8 @@ mod tests {
                 options: std::collections::HashMap::new(),
             }),
             schema_version: Uuid::new_v4(),
-        });
+        })
+        .unwrap();
 
         // Node 1 is already Ready.
         sm.apply_command(RaftCommand {
@@ -6419,7 +8685,8 @@ mod tests {
                 status: IndexNodeStatus::Ready,
             },
             schema_version: Uuid::new_v4(),
-        });
+        })
+        .unwrap();
 
         // New node joins.
         let host_id = Uuid::new_v4();
@@ -6434,7 +8701,8 @@ mod tests {
                 cql_broadcast: None,
             }),
             schema_version: Uuid::new_v4(),
-        });
+        })
+        .unwrap();
 
         // New node should be marked Building for the existing index.
         let entry = sm
@@ -6464,7 +8732,8 @@ mod tests {
         sm.apply_command(RaftCommand {
             op: RaftOp::UpdateConfig(cfg),
             schema_version: Uuid::new_v4(),
-        });
+        })
+        .unwrap();
 
         sm.apply_command(RaftCommand {
             op: RaftOp::JoinNode(NodeInfo {
@@ -6476,14 +8745,16 @@ mod tests {
                 cql_broadcast: None,
             }),
             schema_version: Uuid::new_v4(),
-        });
+        })
+        .unwrap();
         sm.apply_command(RaftCommand {
             op: RaftOp::AssignTokens {
                 node_id,
                 tokens: vec![-10, 0, 10],
             },
             schema_version: Uuid::new_v4(),
-        });
+        })
+        .unwrap();
 
         sm.apply_command(RaftCommand {
             op: RaftOp::UpdateNodeInfo(NodeInfo {
@@ -6495,7 +8766,8 @@ mod tests {
                 cql_broadcast: Some("127.0.0.1:19043".into()),
             }),
             schema_version: Uuid::new_v4(),
-        });
+        })
+        .unwrap();
 
         let member = sm
             .state()
@@ -6535,7 +8807,8 @@ mod tests {
                     cql_broadcast: None,
                 }),
                 schema_version: Uuid::new_v4(),
-            });
+            })
+            .unwrap();
         }
 
         assert_eq!(sm.state().members.len(), 2);
@@ -6552,7 +8825,8 @@ mod tests {
                 options: std::collections::HashMap::new(),
             }),
             schema_version: Uuid::new_v4(),
-        });
+        })
+        .unwrap();
 
         let entry = sm
             .state()
@@ -6578,7 +8852,7 @@ mod tests {
         // Helper: apply same command to all machines.
         fn apply_all(machines: &mut [&mut FerrosStateMachine], cmd: RaftCommand) {
             for sm in machines.iter_mut() {
-                sm.apply_command(cmd.clone());
+                sm.apply_command(cmd.clone()).unwrap();
             }
         }
 
@@ -6699,7 +8973,8 @@ mod tests {
                     cql_broadcast: None,
                 }),
                 schema_version: Uuid::new_v4(),
-            });
+            })
+            .unwrap();
         }
 
         // Create index.
@@ -6714,7 +8989,8 @@ mod tests {
                 options: std::collections::HashMap::new(),
             }),
             schema_version: Uuid::new_v4(),
-        });
+        })
+        .unwrap();
 
         let node1_id = crate::raft::uuid_to_node_id(Uuid::from_u128(1));
         let node2_id = crate::raft::uuid_to_node_id(Uuid::from_u128(2));
@@ -6729,7 +9005,8 @@ mod tests {
                 status: IndexNodeStatus::Ready,
             },
             schema_version: Uuid::new_v4(),
-        });
+        })
+        .unwrap();
         sm.apply_command(RaftCommand {
             op: RaftOp::IndexStatus {
                 node_id: node2_id,
@@ -6739,7 +9016,8 @@ mod tests {
                 status: IndexNodeStatus::Failed("disk full".into()),
             },
             schema_version: Uuid::new_v4(),
-        });
+        })
+        .unwrap();
 
         let entry = sm
             .state()
@@ -7161,6 +9439,212 @@ mod tests {
             }
         }
     }
+    #[tokio::test]
+    async fn committed_schema_effect_failure_does_not_publish_or_apply_later_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let mut sm = FerrosStateMachine::with_side_effects(schema.clone(), engine.clone());
+        sm.apply(vec![
+            make_entry(
+                1,
+                1,
+                RaftOp::CreateKeyspace(simple_keyspace("schema_failure")),
+            ),
+            make_entry(
+                1,
+                2,
+                RaftOp::CreateTable(Box::new(simple_table("schema_failure", "victim"))),
+            ),
+        ])
+        .await
+        .unwrap();
+        // A valid committed ALTER must not silently succeed when this node's
+        // shared registry has drifted from the committed table it still holds.
+        schema
+            .drop_table_internal("schema_failure", "victim")
+            .unwrap();
+        assert!(sm
+            .state
+            .tables
+            .contains_key(&("schema_failure".into(), "victim".into())));
+        assert!(engine
+            .table_schema(&TableId::new("schema_failure", "victim"))
+            .is_some());
+        let update = ferrosa_schema::metadata::table::TableUpdates {
+            params: None,
+            drop_columns: vec![],
+            extensions: None,
+            add_columns: vec![ColumnMetadata {
+                name: "added".into(),
+                kind: ColumnKind::Regular,
+                position: 1,
+                column_type: "text".into(),
+                clustering_order: ClusteringOrder::None,
+                mask: None,
+            }],
+        };
+        let outcome = sm
+            .apply(vec![make_entry(
+                1,
+                3,
+                RaftOp::AlterTable {
+                    keyspace: "schema_failure".into(),
+                    table: "victim".into(),
+                    updates: Box::new(update),
+                },
+            )])
+            .await;
+        assert!(
+            outcome.is_err(),
+            "A missing local Schema effect must not publish committed success: {outcome:?}"
+        );
+        assert_eq!(sm.last_applied.unwrap().index, 2);
+        assert!(
+            !sm.state.tables[&("schema_failure".into(), "victim".into())]
+                .columns
+                .contains_key("added")
+        );
+        assert!(sm.apply_failure.is_some());
+        assert!(sm
+            .apply(vec![make_entry(
+                1,
+                4,
+                RaftOp::CreateTable(Box::new(simple_table("schema_failure", "later")))
+            )])
+            .await
+            .is_err());
+        assert!(engine
+            .table_schema(&TableId::new("schema_failure", "later"))
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn drop_intent_write_failure_is_not_a_safe_statement_refusal() {
+        use ferrosa_common::{DecoratedKey, PartitionKey};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let mut sm = FerrosStateMachine::with_side_effects(schema, engine.clone());
+        sm.apply(vec![
+            make_entry(
+                1,
+                1,
+                RaftOp::CreateKeyspace(simple_keyspace("intent_fault")),
+            ),
+            make_entry(
+                1,
+                2,
+                RaftOp::CreateTable(Box::new(simple_table("intent_fault", "victim"))),
+            ),
+        ])
+        .await
+        .unwrap();
+        let table = TableId::new("intent_fault", "victim");
+        let key = DecoratedKey::new(PartitionKey::new(b"acknowledged".to_vec()));
+        engine
+            .write(
+                &table,
+                &key,
+                ferrosa_sstable::types::Row {
+                    clustering: vec![],
+                    cells: vec![],
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
+                },
+                1,
+            )
+            .unwrap();
+        engine.flush(&table).unwrap();
+        assert!(
+            engine.read(&table, &key).unwrap().is_some(),
+            "real ACKed row positive control"
+        );
+        // A directory at the exact ledger filename deterministically refuses
+        // the durable intent before engine retirement, regardless of test UID.
+        let ledger = dir
+            .path()
+            .join(ferrosa_storage::table_drops::DROPPED_TABLES_FILE);
+        assert!(!ledger.exists());
+        std::fs::create_dir(&ledger).unwrap();
+        let result = sm
+            .apply(vec![make_entry(
+                1,
+                3,
+                RaftOp::DropTable {
+                    keyspace: "intent_fault".into(),
+                    table: "victim".into(),
+                },
+            )])
+            .await;
+        assert!(
+            engine.table_schema(&table).is_some(),
+            "failed intent never retired physical table"
+        );
+        assert!(
+            engine.read(&table, &key).unwrap().is_some(),
+            "physical row remains visible without a successful retirement"
+        );
+        assert!(result.is_err(), "failure before durable intent/retirement is a hard apply fault, not a committed statement refusal: {result:?}");
+        assert_eq!(sm.last_applied.unwrap().index, 2);
+        assert!(sm.applied_state().await.is_err());
+        assert!(sm.build_snapshot().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_persisted_restore_keeps_prior_metadata_and_refuses_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_path = dir.path().join("raft.snapshot");
+        let mut source = FerrosStateMachine::with_snapshot_path(snapshot_path.clone());
+        source
+            .apply(vec![
+                make_entry(
+                    1,
+                    1,
+                    RaftOp::CreateKeyspace(simple_keyspace("restore_failure")),
+                ),
+                make_entry(
+                    1,
+                    2,
+                    RaftOp::CreateTable(Box::new(simple_table("restore_failure", "victim"))),
+                ),
+            ])
+            .await
+            .unwrap();
+        source.build_snapshot().await.unwrap();
+        let snapshot_bytes = std::fs::read(&snapshot_path).unwrap();
+        let engine_root = dir.path().join("engine");
+        let engine = test_engine(&engine_root);
+        let schema = Arc::new(test_schema_instance());
+        let mut restored = FerrosStateMachine::with_side_effects_and_snapshot_path(
+            schema,
+            engine,
+            snapshot_path.clone(),
+        );
+        let previous = restored.state.clone();
+        std::fs::create_dir_all(engine_root.join("sstables")).unwrap();
+        std::fs::write(
+            engine_root.join("sstables/restore_failure.victim"),
+            b"owned refusal",
+        )
+        .unwrap();
+        assert!(restored.recover_from_persisted_snapshot().is_err());
+        assert!(
+            restored.last_applied.is_none(),
+            "Failed restoration must not adopt the snapshot's applied index."
+        );
+        assert_eq!(restored.state.schema_version, previous.schema_version);
+        assert_eq!(restored.state.tables.len(), previous.tables.len());
+        assert!(
+            restored.apply_failure.is_some(),
+            "Partial shared effects must prevent this instance from serving progress."
+        );
+        assert!(restored.applied_state().await.is_err());
+        assert!(restored.build_snapshot().await.is_err());
+        assert_eq!(std::fs::read(snapshot_path).unwrap(), snapshot_bytes);
+    }
 }
 
 /// P0-4: the replicated "bootstrap complete" record.
@@ -7255,6 +9739,16 @@ mod bootstrap_record_tests {
             "a record for a non-member must be an error response, got {responses:?}"
         );
         assert!(sm.state().bootstrap_complete.is_empty());
+        assert!(
+            sm.apply_failure.is_none(),
+            "A domain refusal is not a physical failure."
+        );
+        let next = sm
+            .apply(vec![entry(2, joining(Uuid::new_v4()))])
+            .await
+            .unwrap();
+        assert!(matches!(next[0], RaftResponse::Ok));
+        assert_eq!(sm.applied_state().await.unwrap().0.unwrap().index, 2);
     }
 
     /// Leaving the cluster drops the record, and a fresh `Joining` JoinNode

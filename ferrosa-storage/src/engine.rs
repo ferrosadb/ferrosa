@@ -1,8 +1,8 @@
 //! Module: Compose commit log, memtable, flush, compaction, object storage, and cache.
 //! Correctness: Correct when admitted writes are durable before visibility and reads,
 //! replay, flush, and maintenance preserve table and cursor invariants.
-//! Last revised: 2026-10-24
-//! Last changed: Share immutable observer payloads across bounded lossless queues.
+//! Last revised: 2026-11-05
+//! Last changed: retain bounded physical metadata for canonical projection ordering.
 //!
 //! [`StorageEngine`] is the entry point for all storage operations. It owns:
 //! - A [`CommitLog`] for write-ahead durability.
@@ -1570,6 +1570,48 @@ impl Drop for DigestFailurePause {
 thread_local! {
     static RECOVERY_RETAINED_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static RECOVERY_FLUSH_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Phase information for a failed table unregister. This is not a snapshot,
+/// reader-drain, or installed-content receipt.
+#[derive(Debug)]
+pub struct TableUnregistrationFailure {
+    error: ferrosa_common::Error,
+    cleanup_refusal: bool,
+}
+
+impl TableUnregistrationFailure {
+    /// Only directory cleanup failed after durable intents and registry removal.
+    pub fn is_cleanup_refusal(&self) -> bool {
+        self.cleanup_refusal
+    }
+    fn cleanup(error: ferrosa_common::Error) -> Self {
+        Self {
+            error,
+            cleanup_refusal: true,
+        }
+    }
+    fn into_error(self) -> ferrosa_common::Error {
+        self.error
+    }
+}
+impl From<ferrosa_common::Error> for TableUnregistrationFailure {
+    fn from(error: ferrosa_common::Error) -> Self {
+        Self {
+            error,
+            cleanup_refusal: false,
+        }
+    }
+}
+impl std::fmt::Display for TableUnregistrationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, f)
+    }
+}
+impl std::error::Error for TableUnregistrationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
 }
 
 pub struct StorageEngine {
@@ -5863,6 +5905,16 @@ impl StorageEngine {
     /// from this path). Local deletion is sufficient to prevent stale data
     /// from being loaded on re-creation.
     pub fn unregister_table(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
+        self.unregister_table_classified(table_id)
+            .map_err(TableUnregistrationFailure::into_error)
+    }
+
+    /// Classify only post-retirement directory cleanup as a statement refusal.
+    /// Intent creation, registry retirement and other persistence failures stay hard.
+    pub fn unregister_table_classified(
+        &self,
+        table_id: &TableId,
+    ) -> Result<(), TableUnregistrationFailure> {
         // A DROP that is about to happen must be recorded durably BEFORE any
         // step that can refuse or abort it. The in-memory schema is dropped
         // first on every DDL route (cluster `apply_command`, `apply_direct`,
@@ -5893,9 +5945,10 @@ impl StorageEngine {
         if !pause.is_drained() {
             return Err(ferrosa_common::Error::InvalidFormat(format!(
                 "table {table_id} has active compaction; use unregister_table_and_wait"
-            )));
+            ))
+            .into());
         }
-        self.unregister_table_quiesced(table_id)
+        self.unregister_table_quiesced_classified(table_id)
     }
 
     /// Cancel compactions, await their complete finalization, then change table storage.
@@ -5951,14 +6004,18 @@ impl StorageEngine {
 
     fn retire_table_state(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
         self.clear_compaction_retry_state(table_id);
+        if let Some(state) = self.table_state(table_id) {
+            state
+                .store
+                .retire_checked(crate::store::MEMTABLE_SEAL_DEADLINE)?;
+        }
         if let Some(state) = remove_table(&self.tables, table_id)? {
             if state.in_write_soft_zone.swap(false, Ordering::Relaxed) {
                 self.soft_pressure_table_count
                     .fetch_sub(1, Ordering::Relaxed);
             }
-            // No flush of the dropped store may write into the directory
-            // deleted below; see `TableStore::retire`.
-            state.store.retire();
+            // Checked writer/rotation retirement completed before registry removal.
+            // A failed barrier cannot be downgraded to a cleanup-only refusal.
         }
         self.remove_time_series_consolidator(table_id);
 
@@ -6018,6 +6075,14 @@ impl StorageEngine {
     }
 
     fn unregister_table_quiesced(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
+        self.unregister_table_quiesced_classified(table_id)
+            .map_err(TableUnregistrationFailure::into_error)
+    }
+
+    fn unregister_table_quiesced_classified(
+        &self,
+        table_id: &TableId,
+    ) -> Result<(), TableUnregistrationFailure> {
         // Recorded BEFORE anything is removed, and a failure refuses the drop:
         // without the record, set-aside frames of this table would later be
         // applied to a re-created table of the same name. Only a registered
@@ -6052,7 +6117,8 @@ impl StorageEngine {
                 table_id.keyspace(),
                 table_id.table(),
             )?;
-            self.delete_table_directory(table_id)?;
+            self.delete_table_directory(table_id)
+                .map_err(TableUnregistrationFailure::cleanup)?;
             crate::table_drops::clear_pending_sweep(
                 &self.config.data_dir,
                 table_id.keyspace(),
@@ -10640,6 +10706,33 @@ impl StorageEngine {
             .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Read bounded physical metadata for serialized canonical projections.
+    /// Retains tombstones and their covered rows/cells; never use this as a
+    /// logical query result. `start_clustering` is an exclusive cursor and
+    /// `row_limit` must be nonzero, including when the table is absent.
+    pub fn read_projection_rows(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        start_clustering: Option<&[u8]>,
+        row_limit: usize,
+    ) -> ferrosa_common::Result<Option<Partition>> {
+        if row_limit == 0 {
+            return Err(ferrosa_common::Error::InvalidData(
+                "projection metadata reads require a nonzero row limit".into(),
+            ));
+        }
+        match self.table_state(table_id) {
+            Some(state) => {
+                state.note_foreground_read();
+                state
+                    .store
+                    .read_projection_rows(key, start_clustering, row_limit)
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Read at most `row_limit` rows strictly after `start_clustering` from one
     /// partition without retaining the already-delivered prefix or the tail.
     ///
@@ -14449,7 +14542,7 @@ impl StorageEngine {
     /// Select the compaction strategy for a table based on its extensions.
     ///
     /// An RRD-segmented table (`rrd.segment_window`) gets
-    /// [`NoCompactionStrategy`]: its segments are immutable, one per time
+    /// [`crate::compaction::NoCompactionStrategy`]: its segments are immutable, one per time
     /// window, and never overlap in time, so there is nothing to merge.
     ///
     /// Tables with `compaction.class` containing "Unified" or "UCS" use the

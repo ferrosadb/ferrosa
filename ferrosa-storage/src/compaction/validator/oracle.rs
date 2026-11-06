@@ -125,9 +125,9 @@ fn liveness_wins(x: LivenessInfo, y: LivenessInfo) -> bool {
 /// True when cell `cand` supersedes `cur` under deterministic last-write-wins.
 ///
 /// Higher timestamp wins. On an equal timestamp the result must not depend on
-/// merge order: a write (a cell with a value) beats a tombstone so equal-
-/// timestamp data is preserved; among writes the lexicographically greater value
-/// wins; two tombstones are broken by local deletion time.
+/// merge order: a tombstone beats a write. Same-kind ties use payload, TTL,
+/// local deletion time and path, matching full CellValue ordering while keeping
+/// this test oracle independent of the production comparison function.
 fn cell_wins(cand: &CellValue, cur: &CellValue) -> bool {
     if cand.timestamp != cur.timestamp {
         return cand.timestamp > cur.timestamp;
@@ -135,11 +135,15 @@ fn cell_wins(cand: &CellValue, cur: &CellValue) -> bool {
     tie_rank(cand) > tie_rank(cur)
 }
 
-fn tie_rank(c: &CellValue) -> (bool, &[u8], i32) {
+type CellTieRank<'a> = (bool, Option<&'a [u8]>, i32, i32, Option<&'a [u8]>);
+
+fn tie_rank(c: &CellValue) -> CellTieRank<'_> {
     (
-        c.value.is_some(),
-        c.value.as_deref().unwrap_or(&[]),
+        c.value.is_none(),
+        c.value.as_deref(),
+        c.ttl,
         c.local_deletion_time,
+        c.path.as_deref(),
     )
 }
 

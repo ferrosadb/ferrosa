@@ -1,7 +1,7 @@
 /-!
 # Register II: Consistency, replication and topology
 
-What you are allowed to assume once the cluster is more than one node. The escalation ladder, one rung per module: a single node, a pair, three at RF=2, five at RF=quorum, two datacenters over one WAN link, three in a ring. Each rung is a concrete `Topo`, so its quorum properties are finite and checked by enumeration rather than argued. The Accord modules sit above them and specify the apply order and the recovery path a client actually observes.
+What you are allowed to assume once the cluster is more than one node. The escalation ladder, one rung per module: a single node, a pair, three at RF=2, five at RF=quorum, two datacenters over one WAN link, three in a ring. Each rung is a concrete `Topo`, so its quorum properties are finite and checked by enumeration rather than argued. The Accord modules sit above them and specify the apply order and the recovery path a client actually observes. The last two modules come back down to a single node's apply path: what a client may assume once raft reports a schema change applied, and the two places that assumption stops.
 
 Tick a theorem once you have reviewed its statement and docstring on its module page. Ticks are kept in this browser only.
 
@@ -219,4 +219,41 @@ Tick a theorem once you have reviewed its statement and docstring on its module 
 - [`applied_implies_committed`](Ferrosa/Accord/AccordMultiDcLean/#Ferrosa___Accord___AccordMultiDcLean___applied_implies_committed): I-28 holds by construction: `appliedAccord` is a set that only ever gains committed transactions, so "applied an aborted transaction" is unreachable without any idempotence argument.
 - [`per_dc_commit_index_never_advances`](Ferrosa/Accord/AccordMultiDcLean/#Ferrosa___Accord___AccordMultiDcLean___per_dc_commit_index_never_advances): The per-DC Raft layer is a stub: nothing in the module advances a commit index, so no Raft property of the multi-DC composition is checked.
 - [`watermark_monotone_by_guard`](Ferrosa/Accord/AccordMultiDcLean/#Ferrosa___Accord___AccordMultiDcLean___watermark_monotone_by_guard): Watermark monotonicity is a guard, not a theorem: `AdvanceWatermark` requires `w ≥ hlcWatermark[d]`, so `[][watermark'[d] ≥ watermark[d]]` is true because the step is only enabled when it is.
+
+## `Ferrosa.Raft.Obligations`
+
+[The module page](Ferrosa/Raft/Obligations/)
+
+- [`inv_initial`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___inv_initial): The initial state satisfies the invariant.
+- [`inv_pendingNext_step`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___inv_pendingNext_step): The pending slot still names the next index after any step.
+- [`inv_pendingAttempted_step`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___inv_pendingAttempted_step): A returned ordered write is recorded against the pending index, whether it succeeded or failed: both stages set `attempted`, so the record never names an entry whose write did not return.
+- [`inv_appliedLeAttempted_step`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___inv_appliedLeAttempted_step): Publication never leads the write attempt.
+- [`inv_attemptedBound_step`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___inv_attemptedBound_step): The write attempt never runs more than one entry ahead of publication, because the pending slot holds the next index and nothing else can raise it.
+- [`inv_latchClean_step`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___inv_latchClean_step): A latched machine holds no job.
+- [`inv_step`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___inv_step): Every event preserves the invariant, including `cancel` (a no-op), `panic`, `crash` and `restart`.
+- [`inv_run`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___inv_run): The invariant holds of every state a trace can reach from a state that satisfies it, by induction on the trace.
+- [`applied_monotone_step`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___applied_monotone_step): One step never lowers the published index, provided the pending entry is not behind it — which the invariant gives, and which also holds for the pre-PR policy, where the pending index is the already-published one.
+- [`pending_ge_step`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___pending_ge_step): The pending-entry condition survives a step, so monotonicity can be chained along a trace.
+- [`applied_monotone`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___applied_monotone): MONOTONICITY (proved).
+- [`applied_monotone_late`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___applied_monotone_late): Monotonicity from an empty machine, for the fenced publish policy: no trace of events can move the published index backwards.
+- [`applied_advances_by_one`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___applied_advances_by_one): No event advances the published index by more than one, so a trace cannot skip an entry.
+- [`late_publish_only_at_finish`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___late_publish_only_at_finish): GAPLESSNESS, part 1 (proved).
+- [`publish_requires_completed_job`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___publish_requires_completed_job): GAPLESSNESS, part 2 (proved).
+- [`publish_advances_to_pending_index`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___publish_advances_to_pending_index): GAPLESSNESS, part 3 (proved).
+- [`latch_closed`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___latch_closed): LATCH-CLOSEDNESS (proved).
+- [`latch_clears_pending`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___latch_clears_pending): The latch is never set while a job is retained, so a latched machine has no work left that could move state behind the error.
+- [`publish_after_write_attempt`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___publish_after_write_attempt): Every published index has had its ordered system-table write return, so publication can never run ahead of the attempt.
+- [`written_inv_initial`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___written_inv_initial): Nothing has been written and nothing attempted, so the durable prefix and the attempt agree on the empty machine.
+- [`written_inv_step`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___written_inv_step): A successful ordered write raises the durable prefix and the attempt together.
+- [`written_inv_run`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___written_inv_run): A trace in which no ordered write fails keeps the durable prefix level with the attempt, by induction on the trace.
+- [`rows_present_when_writes_succeed`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___rows_present_when_writes_succeed): REPLAY SAFETY, durability half (proved, conditional).
+- [`sysfail_publishes_without_row`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___sysfail_publishes_without_row): **Red.** REPLAY SAFETY, durability half — DISPROVED.
+- [`cancel_is_noop`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___cancel_is_noop): Cancellation is not a state change.
+- [`late_cancel_still_publishes`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___late_cancel_still_publishes): A cancelled apply is reaped and publishes with its ordered write.
+- [`early_cancel_publishes_before_write`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___early_cancel_publishes_before_write): The pre-PR shape (DISPROVED).
+- [`shared_exposes_effects_before_publication`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___shared_exposes_effects_before_publication): **Red.** ALIASING (disproved for the code as written).
+- [`isolated_hides_effects_until_publication`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___isolated_hides_effects_until_publication): The same trace with owned handles touches nothing until publication, which is what sharing gives up.
+- [`metadata_published_with_index`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___metadata_published_with_index): What sharing does not cost.
+- [`panic_after_physical_latches`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___panic_after_physical_latches): ALIASING under a panicking job.
+- [`raft_has_five_items_and_two_red`](Ferrosa/Raft/Obligations/#Ferrosa___Raft___raft_has_five_items_and_two_red): The area records five obligations of which two are unmet, and both numbers are pinned here: closing one, or adding a claim, forces this table to be updated in the same change.
 -/

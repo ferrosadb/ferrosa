@@ -64,7 +64,9 @@ def parts : List Part := [
    "one rung per module: a single node, a pair, three at RF=2, five at RF=quorum, two datacenters " ++
    "over one WAN link, three in a ring. Each rung is a concrete `Topo`, so its quorum properties are " ++
    "finite and checked by enumeration rather than argued. The Accord modules sit above them and " ++
-   "specify the apply order and the recovery path a client actually observes.", [
+   "specify the apply order and the recovery path a client actually observes. The last two modules " ++
+   "come back down to a single node's apply path: what a client may assume once raft reports a schema " ++
+   "change applied, and the two places that assumption stops.", [
     "Ferrosa.Topology.Single",
     "Ferrosa.Topology.Pair",
     "Ferrosa.Topology.ThreeNode",
@@ -80,7 +82,13 @@ def parts : List Part := [
     "Ferrosa.Accord.History",
     "Ferrosa.Accord.Recovery",
     "Ferrosa.Accord.Edn",
-    "Ferrosa.Accord.AccordMultiDcLean"
+    "Ferrosa.Accord.AccordMultiDcLean",
+    "Ferrosa.Raft.StateMachine",
+    "Ferrosa.Raft.Surfaces",
+    "Ferrosa.Raft.Startup",
+    "Ferrosa.Raft.Partial",
+    "Ferrosa.Raft.Obligations",
+    "Ferrosa.SystemTables.Projection"
   ]⟩,
 
   ⟨"III", "What leaves the cluster",
@@ -101,14 +109,30 @@ def parts : List Part := [
    "target, applied to the memtable, acknowledged, and only then flushed to an SSTable. Each arrow " ++
    "in that sentence is a constructor of `Step` in `WritePath`, which is why the trace can be " ++
    "checked rather than described. The storage modules then take the path apart: the cell format, " ++
-   "the visibility rule, what survives a crash, and what a delete leaves behind.", [
+   "the visibility rule, what survives a crash, and what a delete leaves behind. The three last " ++
+   "modules turn the same questions on the memory a path needs: what a read may hold, what a " ++
+   "transform may rewrite, and which sites in the tree meet either rule. The three before them ask " ++
+   "what the pipeline is allowed to assume about a value before any of these modules sees it: one " ++
+   "canonical in-memory form, the codec interface a format swap has to fit inside, and what the " ++
+   "code still does to a value on the way in. The ownership modules sit beside them: one payload with " ++
+   "N refcounted handles instead of N copies, the moves that make a use after a move unrepresentable, " ++
+   "and the sites where the tree still duplicates a payload a handle would have shared.", [
     "Ferrosa.WritePath",
     "Ferrosa.Storage.Format",
     "Ferrosa.Storage.Mvcc",
     "Ferrosa.Storage.Recovery",
     "Ferrosa.Storage.Tombstone",
-    "Ferrosa.Storage.Streaming"
-  ]⟩,
+    "Ferrosa.Storage.Streaming",
+    "Ferrosa.Ownership.Machine",
+    "Ferrosa.Ownership.Audit",
+    "Ferrosa.Ownership.Obligations",
+    "Ferrosa.Codec.Canonical",
+    "Ferrosa.Codec.Seam",
+    "Ferrosa.Codec.Audit",
+    "Ferrosa.Streaming.Machine",
+    "Ferrosa.Streaming.Obligations",
+    "Ferrosa.Streaming.Audit"
+   ]⟩,
 
   ⟨"V", "Foundations",
    "Reference, not an introduction, kept near the back deliberately: the counting lemma every " ++
@@ -160,7 +184,7 @@ theorem every_ledger_is_placed :
 
 /-- The book covers a fixed number of modules. A module added to the corpus without a home here is
     a build failure rather than a silent omission from the document. -/
-theorem placed_module_count : (parts.map (fun p => p.modules.length)).sum = 61 := by decide
+theorem placed_module_count : (parts.map (fun p => p.modules.length)).sum = 76 := by decide
 
 /-- Part numerals are distinct, so `\ref` cannot collide. -/
 theorem part_numerals_distinct : (parts.map (fun p => p.numeral)).Nodup := by decide

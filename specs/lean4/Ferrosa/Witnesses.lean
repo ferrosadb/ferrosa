@@ -21,6 +21,8 @@ import Ferrosa.Commons.Flow
 import Ferrosa.Commons.Stream
 import Ferrosa.Cql.Subscribe
 import Ferrosa.Flight.Subscribe
+import Ferrosa.Raft.Obligations
+import Ferrosa.Codec.Audit
 
 #check Ferrosa.Topology.DcQuorum.dc_quorum_writes_share_a_replica
 #check Ferrosa.Topology.DcQuorum.no_partition_admits_two_dc_quorum_writes
@@ -323,3 +325,47 @@ import Ferrosa.Flight.Subscribe
 #check Ferrosa.Unsafe.a_failed_syscall_has_no_out_parameter
 #check Ferrosa.Unsafe.overlapping_writers_are_the_race
 #check Ferrosa.Unsafe.a_handle_after_its_context_is_dropped_is_dangling
+
+#check Ferrosa.Raft.applied_monotone
+#check Ferrosa.Raft.applied_monotone_late
+#check Ferrosa.Raft.publish_advances_to_pending_index
+#check Ferrosa.Raft.latch_closed
+#check Ferrosa.Raft.latch_clears_pending
+#check Ferrosa.Raft.sysfail_publishes_without_row
+#check Ferrosa.Raft.rows_present_when_writes_succeed
+#check Ferrosa.Raft.publish_after_write_attempt
+#check Ferrosa.Raft.shared_exposes_effects_before_publication
+#check Ferrosa.Raft.isolated_hides_effects_until_publication
+#check Ferrosa.Raft.metadata_published_with_index
+#check Ferrosa.Raft.late_cancel_still_publishes
+#check Ferrosa.Raft.early_cancel_publishes_before_write
+#check Ferrosa.Raft.panic_after_physical_latches
+#check Ferrosa.Raft.sysfail_blocks_publication
+#check Ferrosa.Raft.a_latched_entry_is_not_republished
+#check Ferrosa.Raft.restart_clears_the_latch
+#check Ferrosa.Raft.restart_cycle_never_passes_a_poisoned_entry
+#check Ferrosa.Raft.an_unreadable_snapshot_skips_the_purged_log
+#check Ferrosa.Raft.failed_restore_boots_a_healthy_node
+#check Ferrosa.Raft.replay_reaches_the_log_end
+#check Ferrosa.Raft.the_class_is_decided_by_whether_the_cause_clears
+#check Ferrosa.Raft.no_failure_is_merely_stalled
+#check Ferrosa.Raft.a_drop_that_never_publishes_is_read_as_an_empty_table
+#check Ferrosa.Raft.the_persisted_delta_contradicts_the_live_cell
+#check Ferrosa.Raft.a_tie_goes_to_the_tombstone
+
+-- The canonical form, its awkward cases, and the codec seam (`Ferrosa/Codec/`).
+#check Ferrosa.Codec.tombstone_is_not_empty_string
+#check Ferrosa.Codec.expired_is_still_a_value
+#check Ferrosa.Codec.timestamp_extremes_are_representable
+#check Ferrosa.Codec.sortEntries_mem
+#check Ferrosa.Codec.map_canon_ignores_entry_order
+#check Ferrosa.Codec.obsEq_iff_eq
+#check Ferrosa.Codec.codecA_roundtrip
+#check Ferrosa.Codec.codecB_roundtrip
+#check Ferrosa.Codec.codecA_accepts_only_encodings
+#check Ferrosa.Codec.store_roundtrip
+#check Ferrosa.Codec.store_fidelity
+#check Ferrosa.Codec.short_record_is_refused
+#check Ferrosa.Codec.verified_record_consumes_exactly
+#check Ferrosa.Codec.another_formats_artifact_is_refused
+#check Ferrosa.Codec.canonicalise_is_per_record
