@@ -607,3 +607,23 @@ Single-table unregister APIs retain their existing behavior and recovery format.
 The `test-support` feature exposes a callback that holds the active commit-log
 segment's existing file mutex. Sibling-crate progress tests use it to exercise
 real flush/fsync contention with deterministic release and ordinary storage I/O.
+
+
+### Bounded physical projection metadata
+
+`StorageEngine::read_projection_rows` is a nonzero-bounded, exclusive-cursor
+metadata read for serialized canonical projection writers. It merges source
+metadata without deletion suppression, preserving hidden row tombstones and
+physical clustering cursors; table/partition deletion watermarks remain attached.
+It is not a logical query result. Existing read APIs retain their deletion
+visibility rules and retry/corruption policy. Memory remains bounded by source
+count times the requested page size.
+
+
+### Consistent cell ties across storage paths
+
+Read, compaction and repair cell comparison delegates to the same common ordering as the memtable. An equal-timestamp cell deletion therefore remains a deletion across a flush and cold reopen. This changes reconciliation of previously conflicting ties, not the SSTable or commit-log format.
+
+Reader compatibility: future WAL header versions are refused before entry decoding. Version emission is unchanged; generation-aware WAL/Pair payloads require a reader-first rollout.
+
+Deferred compaction and resident read merges share the same total cell order. The independent validation oracle states that order separately, including tombstone and TTL tie-breakers.

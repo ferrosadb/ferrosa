@@ -2036,6 +2036,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         self.reader.read_exact_at(&mut cell_flags_buf, self.pos)?;
         self.pos += 1;
         let cell_flags = cell_flags_buf[0];
+        validate_cell_flags(cell_flags)?;
 
         let is_deleted = cell_flags & CELL_IS_DELETED != 0;
         let is_expiring = cell_flags & CELL_IS_EXPIRING != 0;
@@ -2223,6 +2224,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         self.reader.read_exact_at(&mut cell_flags_buf, self.pos)?;
         self.pos += 1;
         let cell_flags = cell_flags_buf[0];
+        validate_cell_flags(cell_flags)?;
 
         let is_deleted = cell_flags & CELL_IS_DELETED != 0;
         let is_expiring = cell_flags & CELL_IS_EXPIRING != 0;
@@ -2338,6 +2340,22 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
     }
 }
 
+/// Reject unknown framing before either materializing or skipping a cell.
+/// Writers retain the existing format; new payload fields require reader rollout.
+fn validate_cell_flags(flags: u8) -> Result<()> {
+    const KNOWN: u8 = CELL_IS_DELETED
+        | CELL_IS_EXPIRING
+        | CELL_HAS_EMPTY_VALUE
+        | CELL_USE_ROW_TIMESTAMP
+        | CELL_USE_ROW_TTL;
+    if flags & !KNOWN != 0 {
+        return Err(Error::UnsupportedVersion(format!(
+            "unsupported SSTable cell flags {flags:#04x}"
+        )));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2421,6 +2439,43 @@ mod tests {
         data.push(END_OF_PARTITION);
 
         data
+    }
+
+    #[test]
+    fn future_cell_flags_are_refused_by_value_and_skip_readers() {
+        let header = test_header();
+        let liveness = LivenessInfo::with_timestamp(1_000_042);
+        for future in [false, true] {
+            let bytes =
+                vec![CELL_USE_ROW_TIMESTAMP | CELL_HAS_EMPTY_VALUE | if future { 0x20 } else { 0 }];
+            let mut value_reader = DataReader::new(&bytes, &header, 0);
+            let mut skip_reader = DataReader::new(&bytes, &header, 0);
+            let value = value_reader.read_cell(
+                &liveness,
+                "org.apache.cassandra.db.marshal.UTF8Type",
+                false,
+            );
+            let skip = skip_reader.read_cell_skip(
+                &liveness,
+                "org.apache.cassandra.db.marshal.UTF8Type",
+                false,
+            );
+            if future {
+                assert!(
+                    matches!(value, Err(Error::UnsupportedVersion(_))),
+                    "future value flags must fail closed"
+                );
+                assert!(
+                    matches!(skip, Err(Error::UnsupportedVersion(_))),
+                    "projection must not skip unknown framing"
+                );
+            } else {
+                assert!(value.unwrap().value.is_some());
+                skip.unwrap();
+                assert_eq!(value_reader.pos, 1);
+                assert_eq!(skip_reader.pos, 1);
+            }
+        }
     }
 
     /// A corrupt clustering-value length must be rejected *before* it drives a

@@ -14,6 +14,8 @@ pub mod local_state;
 pub mod log_store;
 pub mod multi_dc_apply;
 pub mod network;
+pub(crate) mod physical_apply;
+pub mod quarantine;
 pub mod replication_health;
 pub mod snapshot_pusher;
 pub mod snapshot_transport;
@@ -402,6 +404,8 @@ pub fn uuid_to_node_id(id: Uuid) -> u64 {
 // Tests
 // ---------------------------------------------------------------------------
 
+pub use physical_apply::{RetiredRaftGroup, RetiredRaftOwner};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -685,3 +689,6 @@ mod tests {
         );
     }
 }
+
+pub(crate) mod recovery_journal;
+pub(crate) mod recovery_session;

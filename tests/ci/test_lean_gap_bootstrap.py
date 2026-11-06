@@ -1,4 +1,9 @@
-"""Execute the pinned Charon build graph through the bootstrap adapter."""
+"""Exercise the pinned build graph and fresh-runner package prerequisites.
+
+Correctness: required builds and local opam provisioning complete or fail once.
+Last revised: 2026-11-05.
+Last changed: Execute pinned opam discovery with an isolated dependency PATH.
+"""
 from __future__ import annotations
 
 import hashlib
@@ -120,6 +125,111 @@ class BootstrapBuildGraph(unittest.TestCase):
         self.assertEqual(calls.count('dune build'), 1)
         self.assertNotIn('dune build @doc', calls)
         self.assertNotIn('dune fmt', calls)
+
+
+class OpamBootstrapPrerequisite(unittest.TestCase):
+    """Run the real package step and pinned discovery fragment, without apt/network builds."""
+
+    def package_and_probe(self, *, existing=False, fail_install=False):
+        from tests.ci.test_lean_gap_ratchet_workflow import load_yaml
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        tools = root / "bin"
+        tools.mkdir()
+        fixture = json.loads(
+            (ROOT / "tests/ci/fixtures/aeneas-80b690a9/bootstrap.json").read_text()
+        )
+        source = fixture["content"].encode()
+        self.assertEqual(
+            hashlib.sha1(f"blob {len(source)}\0".encode() + source).hexdigest(),
+            fixture["gitBlob"],
+        )
+        start = fixture["content"].index('say "opam"')
+        end = fixture["content"].index(
+            "# ---------------------------------------------------------------- opam root", start
+        )
+        discovery = fixture["content"][start:end]
+        workflow = load_yaml(ROOT / ".github/workflows/lean-specs.yml")
+        package = next(
+            step["run"] for step in workflow["jobs"]["ratchet"]["steps"]
+            if step.get("name") == "System packages the toolchain links against"
+        )
+        opam_program = f"#!{sys.executable}\nprint('fixture opam')\n"
+        programs = {
+            "sudo": f'''#!{sys.executable}
+import json, os, pathlib, sys
+root = pathlib.Path(os.environ["FIXTURE_ROOT"])
+args = sys.argv[1:]
+with (root / "packages.log").open("a") as out:
+    out.write(json.dumps(args) + "\\n")
+if args[:2] == ["apt-get", "update"]:
+    raise SystemExit(0)
+if args[:2] != ["apt-get", "install"]:
+    raise SystemExit(97)
+if "opam" in args and os.environ["FAIL_OPAM_INSTALL"] == "1":
+    raise SystemExit(17)
+if "capnproto" in args:
+    (root / "schema-installed").touch()
+if "opam" in args:
+    opam = root / "bin/opam"
+    opam.write_text({opam_program!r})
+    opam.chmod(0o755)
+''',
+            "capnp": f'''#!{sys.executable}
+import os, pathlib
+assert (pathlib.Path(os.environ["FIXTURE_ROOT"]) / "schema-installed").exists()
+print("fixture capnp")
+''',
+            "curl": f'''#!{sys.executable}
+import os, pathlib, sys
+(pathlib.Path(os.environ["FIXTURE_ROOT"]) / "curl.log").write_text(" ".join(sys.argv[1:]))
+print("curl: (22) The requested URL returned error: 403", file=sys.stderr)
+raise SystemExit(22)
+''',
+            "uname": f'''#!{sys.executable}
+import sys
+print("Linux" if sys.argv[1:] == ["-s"] else "x86_64")
+''',
+        }
+        for name, content in programs.items():
+            program = tools / name
+            program.write_text(content)
+            program.chmod(0o755)
+        for name, target in [("python3", sys.executable), ("mkdir", "/bin/mkdir"),
+                             ("chmod", "/bin/chmod")]:
+            (tools / name).symlink_to(target)
+        if existing:
+            (tools / "opam").write_text(opam_program)
+            (tools / "opam").chmod(0o755)
+        env = {
+            "PATH": str(tools), "HOME": str(root / "home"),
+            "PREFIX": str(root / "prefix"), "FIXTURE_ROOT": str(root),
+            "FAIL_OPAM_INSTALL": str(int(fail_install)),
+        }
+        script = ("set -euo pipefail\nDRY_RUN=0\nsay() { :; }\nnote() { :; }\n"
+                  + package + "\n" + discovery + "\nopam --version\n")
+        result = subprocess.run(["/bin/bash", "-c", script], cwd=root, env=env,
+                                capture_output=True, text=True)
+        return root, result
+
+    def test_fresh_runner_provides_opam_without_release_api_discovery(self):
+        root, result = self.package_and_probe()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((root / "curl.log").exists())
+        self.assertTrue((root / "bin/opam").is_file())
+
+    def test_package_failure_stops_before_release_discovery(self):
+        root, result = self.package_and_probe(fail_install=True)
+        self.assertEqual(result.returncode, 17, result.stdout + result.stderr)
+        self.assertFalse((root / "curl.log").exists())
+        self.assertEqual(len((root / "packages.log").read_text().splitlines()), 2)
+
+    def test_existing_opam_is_a_positive_control_for_the_pinned_fragment(self):
+        root, result = self.package_and_probe(existing=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((root / "curl.log").exists())
 
 
 if __name__ == '__main__':

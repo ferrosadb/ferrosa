@@ -227,9 +227,11 @@ jobs:
       - name: System packages the toolchain links against
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq libgmp-dev m4 python3-yaml capnproto
+          sudo apt-get install -y -qq libgmp-dev m4 python3-yaml capnproto opam
           # Extracted crates build ferrosa-net's generated protocol schemas.
           capnp --version
+          # Avoid bootstrap's unauthenticated latest-release discovery on fresh runners.
+          opam --version
 
       - name: Ratchet and bootstrap contracts
         run: /usr/bin/python3 -m unittest -q tests.ci.test_lean_gap_ratchet tests.ci.test_lean_gap_ratchet_workflow tests.ci.test_lean_gap_bootstrap tests.ci.test_lean_gap_diagnostics

@@ -40,8 +40,8 @@ class Unexpected(Exception):
 
 
 # ---------------------------------------------------------------------------------------------------
-# The header essay: a setext title, then paragraphs with `code`, **bold** and *italic*. Nothing else
-# occurs in the corpus today, and anything else is refused rather than guessed at.
+# The header essay: a setext title, paragraphs, h2-h6 headings, flat lists and fenced code,
+# with `code`, **bold** and *italic*. Other Markdown is refused rather than guessed at.
 
 UNSUPPORTED = re.compile(r"^\s*([-*+] |\d+[.)] |\||```|#|>|    \S)")
 
@@ -63,7 +63,8 @@ def render_inline(text: str) -> str:
 
 def render_essay(key: str, text: str) -> tuple[str, str]:
     """The essay's title, and its body as HTML."""
-    lines = [ln.strip() for ln in text.strip("\n").split("\n")]
+    raw_lines = text.strip("\n").split("\n")
+    lines = [ln.strip() for ln in raw_lines]
     # A setext title may wrap: it is every line above the first underline, which must come before
     # the first blank line.
     under = next((i for i, ln in enumerate(lines) if re.fullmatch(r"=+|-+", ln) or not ln), None)
@@ -74,19 +75,90 @@ def render_essay(key: str, text: str) -> tuple[str, str]:
     # prefix says nothing, so the heading drops it.
     title = re.sub(r"^Ferrosa formal specification\s*[—-]\s*", "", title)
     title = title[:1].upper() + title[1:]
-    paragraphs, current = [], []
-    for ln in lines[under + 1:]:
-        if UNSUPPORTED.match(ln) and not ln.startswith("**"):
-            raise Unexpected(f"{key}: header essay uses Markdown the renderer does not handle: {ln!r}")
-        if ln:
-            current.append(ln)
-        elif current:
-            paragraphs.append(" ".join(current))
-            current = []
-    if current:
-        paragraphs.append(" ".join(current))
-    body = "\n".join(f"<p>{render_inline(p)}</p>" for p in paragraphs)
+    body = render_blocks(key, raw_lines[under + 1:])
     return title, body
+
+
+def render_blocks(key: str, lines: list[str]) -> str:
+    """Render supported blocks; preserve fenced bytes rather than interpreting them."""
+    blocks: list[tuple[str, str]] = []
+    current: list[str] = []
+    kind = "p"
+    margin = min((len(ln) - len(ln.lstrip()) for ln in lines if ln.strip()), default=0)
+    fence: tuple[int, str, int] | None = None
+    code: list[str] = []
+
+    def flush() -> None:
+        if current:
+            blocks.append((kind, " ".join(current)))
+            current.clear()
+
+    for raw in lines:
+        ln = raw.strip()
+        indent = len(raw) - len(raw.lstrip())
+        if fence is not None:
+            if re.fullmatch(r"`{3,}", ln) and len(ln) >= fence[0]:
+                blocks.append(("code:" + fence[1], "\n".join(code) + ("\n" if code else "")))
+                fence = None
+                code = []
+            else:
+                code.append(raw[min(indent, fence[2]):])
+            continue
+        opening = re.fullmatch(r"(`{3,})[ \t]*([A-Za-z0-9_+-]*)[ \t]*", ln)
+        heading = re.fullmatch(r"(#{2,6})[ \t]+(.+)", ln)
+        bullet = re.fullmatch(r"[-*+][ \t]+(\S.*)", ln)
+        numbered = re.fullmatch(r"([0-9]{1,9})[.)][ \t]+(\S.*)", ln)
+        if opening and indent == margin:
+            flush()
+            kind = "p"
+            fence = (len(opening[1]), opening[2], indent)
+        elif heading:
+            flush()
+            blocks.append((f"h{len(heading[1])}", heading[2]))
+            kind = "p"
+        elif (bullet or numbered) and indent == margin:
+            flush()
+            kind = "li" if bullet else "ol:" + numbered[1]
+            current.append(bullet[1] if bullet else numbered[2])
+        elif UNSUPPORTED.match(ln) and not ln.startswith("**"):
+            raise Unexpected(f"{key}: header essay uses Markdown the renderer does not handle: {ln!r}")
+        elif ln:
+            current.append(ln)
+        else:
+            flush()
+            kind = "p"
+    if fence is not None:
+        raise Unexpected(f"{key}: unclosed fenced code block")
+    flush()
+
+    rendered: list[str] = []
+    active_list: str | None = None
+    expected_number = 1
+    for tag, content in blocks:
+        number = int(tag[3:]) if tag.startswith("ol:") else None
+        list_kind = "ol" if number is not None else "ul" if tag == "li" else None
+        if list_kind != active_list:
+            if active_list:
+                rendered.append(f"</{active_list}>")
+            if list_kind:
+                start = f' start="{number}"' if number is not None and number != 1 else ""
+                rendered.append(f"<{list_kind}{start}>")
+                expected_number = number if number is not None else 1
+            active_list = list_kind
+        if tag.startswith("code:"):
+            language = tag[5:]
+            attr = f' class="language-{html.escape(language, quote=True)}"' if language else ""
+            rendered.append(f"<pre><code{attr}>{html.escape(content, quote=False)}</code></pre>")
+        elif list_kind:
+            value = f' value="{number}"' if number is not None and number != expected_number else ""
+            rendered.append(f"<li{value}>{render_inline(content)}</li>")
+            if number is not None:
+                expected_number = number + 1
+        else:
+            rendered.append(f"<{tag}>{render_inline(content)}</{tag}>")
+    if active_list:
+        rendered.append(f"</{active_list}>")
+    return "\n".join(rendered)
 
 
 def essays(specs: Path) -> dict[str, tuple[str, str]]:

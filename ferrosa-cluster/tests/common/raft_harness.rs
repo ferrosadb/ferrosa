@@ -38,7 +38,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
 use openraft::error::{ClientWriteError, NetworkError, RPCError, RaftError, Unreachable};
@@ -47,7 +47,7 @@ use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, ClientWriteResponse, InstallSnapshotRequest,
     InstallSnapshotResponse, TimeoutNowRequest, TimeoutNowResponse, VoteRequest, VoteResponse,
 };
-use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine, Snapshot};
+use openraft::storage::{RaftLogStorage, RaftSnapshotBuilder, RaftStateMachine, Snapshot};
 use openraft::{
     BasicNode, Config as RaftLibConfig, LogId, RaftMetrics, RaftNetwork, RaftNetworkFactory,
     SnapshotMeta, StorageError, StoredMembership,
@@ -376,35 +376,59 @@ impl std::error::Error for ChannelClosed {}
 /// can hold the lock across the inner `.await`s on the snapshot path.
 ///
 /// Production code uses `FerrosStateMachine` directly; this wrapper
-/// is strictly a test affordance.  It serialises `apply` and snapshot
-/// operations the same way openraft already does, so semantics match.
+/// is strictly a test affordance. It serialises `apply` and snapshot
+/// operations the same way openraft already does. Read-only observations are
+/// weak handles so they do not keep the physical worker owner alive.
 #[derive(Clone)]
 pub struct SharedStateMachine {
-    inner: Arc<AsyncMutex<FerrosStateMachine>>,
+    inner: Weak<AsyncMutex<FerrosStateMachine>>,
+    // Only the worker and an in-flight snapshot builder own the real machine.
+    // Observation handles must not keep its physical owner alive after shutdown.
+    owner: Option<Arc<AsyncMutex<FerrosStateMachine>>>,
 }
 
 impl SharedStateMachine {
     fn new(sm: FerrosStateMachine) -> Self {
+        let owner = Arc::new(AsyncMutex::new(sm));
         Self {
-            inner: Arc::new(AsyncMutex::new(sm)),
+            inner: Arc::downgrade(&owner),
+            owner: Some(owner),
         }
+    }
+
+    fn observer(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            owner: None,
+        }
+    }
+
+    fn retained_inner(&self) -> Arc<AsyncMutex<FerrosStateMachine>> {
+        self.owner
+            .clone()
+            .or_else(|| self.inner.upgrade())
+            .expect("state-machine worker has ended")
     }
 
     /// Clone the application-level `RaftState` (members, token_map,
     /// approved_nodes, …) so callers can assert on it without holding
     /// the lock across other awaits.
     pub async fn snapshot_state(&self) -> RaftState {
-        self.inner.lock().await.state().clone()
+        let inner = self.retained_inner();
+        let state = inner.lock().await.state().clone();
+        state
     }
 
     /// Synchronous variant of [`Self::snapshot_state`] for use from non-
     /// async test contexts.  Uses `try_lock` and panics if the state
     /// machine is currently being mutated by an apply call.
     pub fn snapshot_state_blocking(&self) -> RaftState {
-        self.inner
+        let inner = self.retained_inner();
+        let state = inner
             .try_lock()
             .map(|sm| sm.state().clone())
-            .expect("state machine busy — call from async context with snapshot_state()")
+            .expect("state machine busy — call from async context with snapshot_state()");
+        state
     }
 }
 
@@ -414,7 +438,8 @@ impl RaftStateMachine<FerrosRaftConfig> for SharedStateMachine {
     async fn applied_state(
         &mut self,
     ) -> Result<(Option<LogId<u64>>, StoredMembership<u64, BasicNode>), StorageError<u64>> {
-        let mut sm = self.inner.lock().await;
+        let inner = self.retained_inner();
+        let mut sm = inner.lock().await;
         sm.applied_state().await
     }
 
@@ -424,7 +449,8 @@ impl RaftStateMachine<FerrosRaftConfig> for SharedStateMachine {
         I::IntoIter: Send,
     {
         let entries: Vec<_> = entries.into_iter().collect();
-        let mut sm = self.inner.lock().await;
+        let inner = self.retained_inner();
+        let mut sm = inner.lock().await;
         sm.apply(entries).await
     }
 
@@ -432,7 +458,11 @@ impl RaftStateMachine<FerrosRaftConfig> for SharedStateMachine {
         // Reuse the same Arc — the SnapshotBuilder impl below also
         // takes the lock.  This means snapshot building briefly
         // contends with apply, which is fine for the harness.
-        self.clone()
+        let owner = self.retained_inner();
+        Self {
+            inner: Arc::downgrade(&owner),
+            owner: Some(owner),
+        }
     }
 
     async fn begin_receiving_snapshot(
@@ -446,21 +476,24 @@ impl RaftStateMachine<FerrosRaftConfig> for SharedStateMachine {
         meta: &SnapshotMeta<u64, BasicNode>,
         snapshot: Box<std::io::Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<u64>> {
-        let mut sm = self.inner.lock().await;
+        let inner = self.retained_inner();
+        let mut sm = inner.lock().await;
         sm.install_snapshot(meta, snapshot).await
     }
 
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<FerrosRaftConfig>>, StorageError<u64>> {
-        let mut sm = self.inner.lock().await;
+        let inner = self.retained_inner();
+        let mut sm = inner.lock().await;
         sm.get_current_snapshot().await
     }
 }
 
 impl RaftSnapshotBuilder<FerrosRaftConfig> for SharedStateMachine {
     async fn build_snapshot(&mut self) -> Result<Snapshot<FerrosRaftConfig>, StorageError<u64>> {
-        let mut sm = self.inner.lock().await;
+        let inner = self.retained_inner();
+        let mut sm = inner.lock().await;
         let mut builder = sm.get_snapshot_builder().await;
         builder.build_snapshot().await
     }
@@ -476,6 +509,8 @@ pub struct TestNode {
     /// Lock-shared handle to the underlying state machine. Use
     /// `state_machine.snapshot_state()` to read application state.
     pub state_machine: SharedStateMachine,
+    /// Reader of the exact log store supplied to this worker.
+    log_store: Arc<SledLogStore>,
     /// This node's own storage engine. `Some` only for clusters built with
     /// [`TestCluster::with_voters_and_engines`]; the state machine then applies
     /// replicated DDL to it exactly as a production node does.
@@ -949,6 +984,33 @@ impl TestCluster {
             })
     }
 
+    /// Register the actual worker, machine lifetime and committed log reader.
+    pub async fn publish_controller_group(
+        &self,
+        node_id: u64,
+        controller: &Arc<ferrosa_cluster::controller::ModeController>,
+        dc_name: &str,
+    ) {
+        let (raft, observer, log_store) = {
+            let nodes = self.nodes();
+            let node = nodes
+                .iter()
+                .find(|node| node.node_id == node_id)
+                .expect("harness voter");
+            (
+                Arc::clone(&node.raft),
+                node.state_machine.clone(),
+                Arc::clone(&node.log_store),
+            )
+        };
+        let inner = observer.retained_inner();
+        let publication = {
+            let state_machine = inner.lock().await;
+            controller.set_tracked_raft_for_dc(dc_name, raft, &state_machine, &log_store)
+        };
+        publication.await.expect("track physical harness worker");
+    }
+
     /// Get the `Arc<FerrosRaft>` for an arbitrary node_id, searching
     /// both bootstrap and extra nodes. Useful when leadership has
     /// moved to a newly-added voter (W8.3).
@@ -1089,7 +1151,8 @@ async fn build_test_node(
     let tempdir = tempfile::tempdir().expect("tempdir");
     let log_path: PathBuf = tempdir.path().join(format!("raft-{node_id}"));
     std::fs::create_dir_all(&log_path).expect("create raft log dir");
-    let log_store = SledLogStore::new(&log_path).expect("open sled log store");
+    let mut log_store = SledLogStore::new(&log_path).expect("open sled log store");
+    let log_store_for_node = Arc::new(log_store.get_log_reader().await);
 
     let (sm, engine) = if with_engine {
         let engine = open_node_engine(&tempdir.path().join(format!("engine-{node_id}")));
@@ -1102,7 +1165,7 @@ async fn build_test_node(
         (FerrosStateMachine::new(), None)
     };
     let state_machine = SharedStateMachine::new(sm);
-    let state_machine_for_node = state_machine.clone();
+    let state_machine_for_node = state_machine.observer();
 
     // Bound the inbound channel so a stalled node back-pressures
     // its peers rather than buffering unbounded RPC traffic.
@@ -1170,6 +1233,7 @@ async fn build_test_node(
         node_id,
         raft,
         state_machine: state_machine_for_node,
+        log_store: log_store_for_node,
         engine,
         dispatcher,
         _tempdir: tempdir,

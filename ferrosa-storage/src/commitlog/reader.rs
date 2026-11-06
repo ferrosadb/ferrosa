@@ -23,7 +23,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use super::config::CommitLogPosition;
-use super::descriptor::{SegmentDescriptor, HEADER_SIZE};
+use super::descriptor::{SegmentDescriptor, FORMAT_VERSION, HEADER_SIZE};
 use super::mutation::Mutation;
 
 pub(crate) enum SegmentEntryRead {
@@ -66,7 +66,7 @@ impl SegmentReader {
     /// Opens a segment file and validates its fixed-size header.
     ///
     /// Returns an error if the file cannot be read, is too short for a header,
-    /// or the header CRC is invalid.
+    /// the header CRC is invalid, or its format version is newer than this reader.
     pub fn open(path: &Path) -> ferrosa_common::Result<Self> {
         let mut file = File::open(path)?;
         let file_len = file.metadata()?.len();
@@ -79,6 +79,12 @@ impl SegmentReader {
         let mut header = [0_u8; HEADER_SIZE];
         file.read_exact(&mut header)?;
         let descriptor = SegmentDescriptor::read_from(&header)?;
+        if descriptor.version > FORMAT_VERSION {
+            return Err(ferrosa_common::Error::UnsupportedVersion(format!(
+                "WAL format {} exceeds supported version {FORMAT_VERSION}",
+                descriptor.version
+            )));
+        }
 
         Ok(Self {
             rejected_records: false,
@@ -435,6 +441,43 @@ mod tests {
             }],
             timestamp: 99_000,
         }
+    }
+
+    #[test]
+    fn future_segment_version_is_refused_without_changing_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let segment = Segment::new(1, 4096, dir.path());
+        let mutation = simple_mutation();
+        let offset = segment
+            .allocate(Segment::entry_total_size(&mutation))
+            .unwrap();
+        segment.write_entry(offset, &mutation);
+        segment.flush_to_disk().unwrap();
+        let path = segment.path().to_path_buf();
+        drop(segment);
+
+        let mut current = SegmentReader::open(&path).unwrap();
+        assert_eq!(current.read_all().unwrap().len(), 1);
+        drop(current);
+        let mut bytes = fs::read(&path).unwrap();
+        let mut descriptor = SegmentDescriptor::read_from(&bytes[..HEADER_SIZE]).unwrap();
+        descriptor.version = super::super::descriptor::FORMAT_VERSION + 1;
+        descriptor.write_to(&mut bytes[..HEADER_SIZE]);
+        assert_eq!(
+            SegmentDescriptor::read_from(&bytes[..HEADER_SIZE])
+                .unwrap()
+                .version,
+            descriptor.version
+        );
+        fs::write(&path, &bytes).unwrap();
+        assert!(
+            matches!(
+                SegmentReader::open(&path),
+                Err(ferrosa_common::Error::UnsupportedVersion(_))
+            ),
+            "a CRC-valid future WAL must not be interpreted as the current mutation format"
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
     }
 
     #[test]

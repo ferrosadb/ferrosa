@@ -1380,7 +1380,7 @@ impl Segment {
     /// Returns the current heap size of the buffer in bytes.
     ///
     /// Returns the segment capacity before [`release_buffer()`](Self::release_buffer)
-    /// is called, and 0 after.  Used by [`CommitLog::closed_segments_total_bytes()`]
+    /// is called, and 0 after.  Used by [`crate::commitlog::CommitLog::closed_segments_total_bytes`]
     /// to confirm that closed segments are not holding memory.
     pub fn buffer_bytes(&self) -> usize {
         // An atomic, not the `Vec`'s length field: writers hold `&mut` into this
@@ -1391,7 +1391,7 @@ impl Segment {
 
     /// Drops the in-memory write buffer, retaining only segment metadata.
     ///
-    /// Called by [`CommitLog::force_rotate()`] immediately after the segment
+    /// Called by [`crate::commitlog::CommitLog::force_rotate`] immediately after the segment
     /// has been fsynced to disk and moved to `closed_segments`.  Replacing
     /// the 32 MB buffer with an empty `Vec` caps closed-segment memory at
     /// ~200 bytes of metadata per segment regardless of GC lag.

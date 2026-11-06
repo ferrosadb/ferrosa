@@ -34,6 +34,56 @@ token ring and a Raft-replicated metadata state machine:
    ferrosa fork with a CheckQuorum extension; a PreVote gate also exists in the
    fork but is **disabled by default** — its network transport is unimplemented,
    see below). The state machine is in-memory `RaftState`; the log is sled-backed.
+Raft command application owns its blocking schema/storage transition and ordered
+system-table writes in one worker job. Dropping an async waiter retains that job;
+subsequent apply/status/snapshot entry points await it before exposing the applied
+index or constructing a snapshot. A worker panic, failed committed local Schema/Engine effect, or configured
+system-table persistence failure poisons the state machine and returns a storage
+error rather than publishing staged metadata or advancing the applied index.
+The retained worker forces the commit log to disk before publication, including
+with Periodic acknowledgement. Log severity does not exempt failed projections.
+Shared schema/storage effects can already be visible; this is not rollback or
+transactional isolation. Ordinary domain rejection remains a command error
+response and does not poison the machine. Only directory-cleanup refusal after durable drop/sweep intents and checked
+writer retirement plus registry removal is an ordinary DROP rejection. It stays
+loud to the caller, leaves the Core usable, and a later same-name CREATE sweeps
+the orphaned bytes. Creating those intents, retiring the store, or other
+persistence failures remain hard storage errors: they may leave the original
+physical table readable and cannot advertise a completed DROP. The typed storage
+result records this phase without matching error text. This is not reader-drain
+or installed-checkpoint authority. A CREATE whose registration the node refuses
+(`register_table`: the same unremovable directory, `EACCES`, a mount point) is
+the same class — committed metadata plus a refused statement — so the CREATE is
+reported as an error while the node keeps serving; a re-issued CREATE after the
+directory is usable registers the table without a restart. An ALTER of a table
+this node's engine holds no registration for is refused the same way, for the
+same reason: with no registration no write reaches a memtable, so no flush can
+be built from a stale header. The refusals live in `ApplyError::fences_replica`,
+which classifies every variant explicitly; a latch means the durable bytes are
+untrustworthy (a stale per-table engine schema, an index built from a failed
+rotation), never that a statement was refused. A failed persisted snapshot restore
+keeps the prior Raft metadata and closes startup readiness instead of continuing
+with a partially restored shared schema; the snapshot and log files are retained
+for recovery. Persisted startup also refuses a different physical table UUID before
+retirement: the file can lag committed DROP/CREATE and durable rows in the newer
+incarnation. Installed snapshots use a separate source path. This preservation
+check does not reconstruct the retained committed target or repair a failed
+projection. The apply latch is currently process-local, not an automatic repair
+mechanism. Snapshot-file publication has a separate per-path writer fence. A
+file cannot regress behind its stored log or membership position when an older
+builder finishes. Each attempt owns a unique staging file; it flushes the file,
+renames it, and flushes the directory before reporting success. Cancelled async
+waiters cannot make concurrent writers truncate or rename one another's staging
+files.
+
+Controller retirement separately tracks the actual state-machine owner and its
+queued/running physical jobs. Core shutdown alone is not a drain. Before replacing
+Raft authority with Pair, the controller seals new group starts, waits for the SM
+queue and retained jobs, and checks applied coverage against persisted commitment.
+Failed jobs and unresolved committed suffixes refuse the handoff. Snapshot install
+progress is reported only after successful completion. These in-memory leases add
+no per-entry disk I/O; they do not implement a durable failed-apply repair journal.
+
 2. **Read/write coordination** (`coordinator/`) — fans writes and reads out to
    replicas with tunable CQL consistency-level (CL) enforcement, write
    backpressure, read repair, batchlog, and range/streaming reads.
@@ -833,11 +883,16 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   i.e. every ring member other than this node and the named, connected peer is
   down, and only if those downed members are a Raft-voter MINORITY. Two-phase
   and fenced (t_47bbeb66, `controller/dissolution.rs`): the peer durably
-  records `dissolved-into-pair.json` and stops its Raft group first
-  (`PairDissolve`), then this node does the same and installs the pair path.
-  A node holding the marker never starts Raft, restarts `Standalone` rather
-  than as a returning member, and admits only its partner as a peer, so the
-  members taken down can never re-form the old cluster (CL-42, CL-45).
+  records retirement intent in `dissolved-into-pair.json`, drains its Core,
+  state-machine queue and physical jobs, then confirms `retirement_complete`
+  before installing Pair (`PairDissolve`). This node follows the same sequence.
+  A confirmed marker disables Raft and retains the existing partner-only
+  `Standalone` restart path. An incomplete or legacy unconfirmed marker instead
+  keeps the node degraded, unhealthy and closed to peers; its bytes remain for
+  verified recovery. Concurrent public retirement operations refuse rather than
+  retiring different peers, and stale checks cannot rewrite partner authority.
+  The legacy unversioned peer `Done` reply is not cross-version retirement proof;
+  mixed-version dissolution and lost phase-one reply recovery remain unqualified.
 
 ### Accord transactions (`accord/`)
 - **A PostgreSQL snapshot's staleness is judged on the transaction's OWN keys, never on a
@@ -1348,3 +1403,75 @@ live caller retains its share through peer ACK and the strict archive barrier.
 Inbound handlers retain their existing primary apply/replicate-back and secondary
 apply-only behavior; they acquire no nested handoff read lease. Cancellation
 produces no successful ACK and can leave an unacknowledged local write.
+
+
+### Raft canonical projection ordering
+
+Canonical system-table persistence is a node-local projection of the ordered Raft
+log. Normal apply entries share one retained durability group until a destructive
+operation needs its next asynchronous compaction drain. Ordered projection writes
+finish before one explicit commit-log fence and group publication; groups with no
+projection writes add no fence. This does not change ordinary data-write sync policy
+or isolate shared physical effects before publication.
+
+Permission projections replace the complete resource permission set. Their local
+timestamps advance beyond the stored resource cell and row tombstone, including
+when the wall clock ties or moves backwards; exhaustion is a storage failure. This
+requires the existing single Raft projection writer and retained-job ordering. It
+is not a deterministic cross-node cell timestamp or an authorization for concurrent
+direct mutations of canonical rows. Normal repair and rebalance exclude system
+keyspaces; arbitrary cross-node reconciliation of these local projection files is
+not covered by this contract.
+
+
+An owned apply group survives waiter cancellation; a not-yet-transferred input
+suffix is still caller-owned. The runtime preserves its first required committed
+index and requires a later input to begin there. The Raft caller supplies the
+original contiguous committed entries. Reissuing that missing prefix
+restores normal progress without a poison latch. A successful authoritative
+snapshot advances the requirement to its next index instead of permitting a gap.
+The pinned OpenRaft worker owns and awaits complete input batches; this runtime
+fence also makes direct trait cancellation refuse silent loss of a mixed suffix.
+It is not a persistent incomplete-effect journal.
+
+
+### Role projection clock and reload visibility
+
+Role-row updates advance beyond the stored role cells and row/partition deletion
+clock before writing, including after wall-clock regression. Checked exhaustion
+fails the projection. The role lookup retains at most one target row and one
+metadata row. Role and permission reload accepts newer cells above older partition
+tombstones. This is a node-local serialized-writer rule; other schema projection
+families and role-membership partition reconciliation have separate ordering rules.
+
+
+### Physical projection timestamp inspection
+
+Role deletion and permission regrant inspect physical metadata through bounded
+32-row pages, including rows hidden by an older partition tombstone. The
+node-local serialized writer chooses a checked successor beyond stored cells,
+row deletions and partition deletions; clock ties/regression cannot resurrect a
+removed role or suppress a later grant. Role deletion preflights role, grant
+and owned-membership clocks before its first write. Role updates replace the
+owned membership partition, then write exactly the stored parents above that
+delete; a revoked parent is not retained. Keyspace, table/column, index, type and
+function rows use the same checked successor and restamp all their cells and
+liveness/deletion metadata. This is serialized node-local ordering, not
+concurrent or cross-node timestamp arbitration. Membership reload and cleanup of
+other roles that reference a dropped parent are separate concerns.
+
+
+### Direct permission projection poststate
+
+The Direct DDL path persists the complete resource permission set after both grants and partial revokes. A revoke writes the existing deletion projection only when the remaining set is empty. The existing schema lifecycle fence covers mutation and poststate lookup; no transaction rollback or new acknowledgment durability guarantee is implied.
+
+Group recovery has a separate retirement operation from the global Pair handoff.
+It fences one group, stops its actual Core, drains its state-machine owner and
+owned jobs, and reports observed applied/committed/purged positions and failures.
+Other groups are not physically stopped. The opaque retirement scope does not
+clear a fault, authorize storage adoption, or reopen traffic; no release exists
+without verified live-storage activation. Normal and rebuilt state machines and
+log readers share the controller's recovery admission.
+
+
+Recovery sessions retain a durable pre-effect guard beside each Raft group directory. The guard is armed before an apply group's physical effects and settles once they all complete, so a restart after completed applies replays the un-snapshotted log tail as normal. Only a group interrupted mid-effect, or one whose apply failed or panicked, is an unsafe restart. After an unsafe restart, native startup keeps admission closed, drains that group’s actual state-machine owner, and records the retirement scope plus committed and purged bounds for repair preparation. Repeated peer discovery retains that session rather than reopening its files. Preparation does not authorize data installation, Core replacement, or healthy admission; verified physical-data installation and the corresponding release path remain unfinished.

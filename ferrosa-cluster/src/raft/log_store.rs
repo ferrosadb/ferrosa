@@ -292,6 +292,28 @@ pub struct SledLogStore {
     /// index exist nowhere else on this node, so deleting them is
     /// unrecoverable. See `crate::raft::local_state::purge_ceiling`.
     durable_applied: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    recovery_admission: std::sync::Arc<super::quarantine::RecoveryAdmission>,
+}
+
+/// A read-only view retained for verifying retirement after Core has stopped.
+/// It introduces no new persistence or acknowledgement boundary.
+#[derive(Clone)]
+pub(crate) struct CommittedLogReader {
+    meta: sled::Tree,
+}
+
+impl CommittedLogReader {
+    pub(crate) fn read(&self) -> Result<Option<LogId<u64>>, Box<StorageIOError<u64>>> {
+        Ok(
+            SledLogStore::load_meta::<Option<LogId<u64>>>(&self.meta, META_COMMITTED)
+                .map_err(Box::new)?
+                .unwrap_or(None),
+        )
+    }
+
+    pub(crate) fn read_purged(&self) -> Result<Option<LogId<u64>>, String> {
+        SledLogStore::load_meta(&self.meta, META_LAST_PURGED).map_err(|error| error.to_string())
+    }
 }
 
 /// Counts of entries cleared by [`SledLogStore::reset`].
@@ -507,7 +529,24 @@ impl SledLogStore {
             log,
             meta,
             durable_applied: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            recovery_admission: std::sync::Arc::new(super::quarantine::RecoveryAdmission::new()),
         })
+    }
+
+    /// Share the controller's online recovery fence with log-purge publication.
+    pub fn set_recovery_admission(
+        &mut self,
+        admission: std::sync::Arc<super::quarantine::RecoveryAdmission>,
+    ) {
+        self.recovery_admission = admission;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_recovery_admission(
+        &self,
+        expected: &std::sync::Arc<super::quarantine::RecoveryAdmission>,
+    ) -> bool {
+        std::sync::Arc::ptr_eq(&self.recovery_admission, expected)
     }
 
     /// Share this store's durable-applied watermark with the state machine.
@@ -516,6 +555,13 @@ impl SledLogStore {
     /// reads it to bound `purge`. They must be the same cell, which is why it
     /// is handed over at construction rather than passed per call -- openraft
     /// owns the two halves separately once Raft is running.
+    pub(crate) fn committed_reader(&self) -> CommittedLogReader {
+        CommittedLogReader {
+            meta: self.meta.clone(),
+        }
+    }
+
+    /// Shared durable-snapshot watermark used to bound log purging.
     pub fn durable_applied_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
         self.durable_applied.clone()
     }
@@ -644,6 +690,14 @@ impl SledLogStore {
     /// also exercise the error path here directly without needing to
     /// construct a `LogFlushed` callback (which has a `pub(crate)`
     /// constructor inside openraft).
+    #[cfg(test)]
+    pub(crate) async fn append_recovery_fixture(
+        &mut self,
+        entries: Vec<Entry<FerrosRaftConfig>>,
+    ) -> Result<(), StorageError<u64>> {
+        self.append_inner(entries).await
+    }
+
     async fn append_inner<I>(&mut self, entries: I) -> Result<(), StorageError<u64>>
     where
         I: IntoIterator<Item = Entry<FerrosRaftConfig>> + Send,
@@ -1204,6 +1258,7 @@ impl openraft::storage::RaftLogStorage<FerrosRaftConfig> for SledLogStore {
             // Same cell, not a copy: a reader that purges must see the same
             // durable watermark the writer does.
             durable_applied: self.durable_applied.clone(),
+            recovery_admission: std::sync::Arc::clone(&self.recovery_admission),
         }
     }
 
@@ -1306,6 +1361,14 @@ impl openraft::storage::RaftLogStorage<FerrosRaftConfig> for SledLogStore {
     }
 
     async fn purge(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
+        // A deferred optional purge retains repair material without terminating
+        // the Raft worker. Quarantine must not advance its persisted authority.
+        let recovery_epoch = self.recovery_admission.epoch();
+        if let Err(refusal) = self.recovery_admission.admits_epoch(recovery_epoch) {
+            tracing::warn!(%refusal, "deferring Raft log purge during recovery");
+            return Ok(());
+        }
+
         // Never delete past what the state machine has durably applied.
         //
         // openraft only asks to purge up to a snapshot it believes exists, so
@@ -1362,9 +1425,6 @@ impl openraft::storage::RaftLogStorage<FerrosRaftConfig> for SledLogStore {
             }
         };
 
-        // Persist the purge point first so recovery can reconstruct state.
-        Self::save_meta(&self.meta, META_LAST_PURGED, &log_id)?;
-
         // Remove all entries with index <= log_id.index.
         // Big-endian keys: 0x0000..0000 through index_key(log_id.index) inclusive.
         // Run sled disk IO on a blocking thread so the async Raft runtime
@@ -1372,20 +1432,39 @@ impl openraft::storage::RaftLogStorage<FerrosRaftConfig> for SledLogStore {
         // AppendEntries traffic, a synchronous purge of a large segment
         // would stall the lane and miss heartbeat deadlines (W1.20 / I-25).
         let log = self.log.clone();
+        let meta = self.meta.clone();
+        let admission = std::sync::Arc::clone(&self.recovery_admission);
         let end_inclusive = Self::index_key(log_id.index);
         ferrosa_net::task_pool::TaskPool::current("raft-log-store")
             .spawn_blocking(move || -> Result<(), Box<StorageIOError<u64>>> {
-                let keys_to_remove: Vec<sled::IVec> = log
-                    .range(..=end_inclusive)
-                    .filter_map(|r| r.ok().map(|(k, _v)| k))
-                    .collect();
+                let mut io_result = None;
+                let publication = admission.with_admission_epoch(recovery_epoch, || {
+                    io_result = Some((|| {
+                        // The authority update belongs to the same admitted job as
+                        // deletion, not the caller that may only have queued it.
+                        Self::save_meta(&meta, META_LAST_PURGED, &log_id).map_err(Box::new)?;
+                        let keys_to_remove: Vec<sled::IVec> = log
+                            .range(..=end_inclusive)
+                            .filter_map(|r| r.ok().map(|(k, _v)| k))
+                            .collect();
 
-                let mut batch = sled::Batch::default();
-                for key in keys_to_remove {
-                    batch.remove(key);
+                        let mut batch = sled::Batch::default();
+                        for key in keys_to_remove {
+                            batch.remove(key);
+                        }
+                        log.apply_batch(batch)
+                            .map_err(|e| Box::new(StorageIOError::write_logs(to_any_error(e))))?;
+                        Ok(())
+                    })());
+                });
+                // Detection can overlap already-admitted I/O. Its actual result
+                // must survive a post-publication epoch refusal, especially Err.
+                if let Some(result) = io_result {
+                    return result;
                 }
-                log.apply_batch(batch)
-                    .map_err(|e| Box::new(StorageIOError::write_logs(to_any_error(e))))?;
+                if let Err(refusal) = publication {
+                    tracing::warn!(%refusal, "deferring Raft log purge at publication boundary");
+                }
                 Ok(())
             })
             .await
@@ -1508,6 +1587,108 @@ mod tests {
     /// Entries 1..=5 exist and the snapshot covers 3. openraft asks to purge
     /// through 5. Deleting 4 and 5 would remove this node's only copy of them,
     /// which is what stranded node3 on 2026-08-20, so the purge must stop at 3.
+    #[tokio::test]
+    async fn quarantined_purge_defers_without_deleting_repair_logs() {
+        use openraft::storage::RaftLogStorage;
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SledLogStore::new(dir.path()).unwrap();
+        let admission = std::sync::Arc::new(super::super::quarantine::RecoveryAdmission::new());
+        store.set_recovery_admission(std::sync::Arc::clone(&admission));
+        store
+            .append_inner(vec![
+                blank_entry(1, 1),
+                blank_entry(1, 2),
+                blank_entry(1, 3),
+            ])
+            .await
+            .unwrap();
+        store.db.flush().unwrap();
+        store
+            .durable_applied
+            .store(3, std::sync::atomic::Ordering::Release);
+        assert_eq!(store.try_get_log_entries(1..4).await.unwrap().len(), 3);
+        let mut reader = store.get_log_reader().await;
+        assert!(std::sync::Arc::ptr_eq(
+            &reader.recovery_admission,
+            &admission
+        ));
+        admission.quarantine(
+            "owned-raft-group",
+            "repair still needs retained log material",
+        );
+        assert!(
+            reader
+                .purge(LogId::new(CommittedLeaderId::new(1, 0), 3))
+                .await
+                .is_ok(),
+            "an optional deferred purge must not fatally close the repair Core"
+        );
+        assert_eq!(store.last_purged_log_id().unwrap(), None);
+        assert_eq!(store.try_get_log_entries(1..4).await.unwrap().len(), 3);
+        drop(reader);
+        drop(store);
+        let mut reopened = SledLogStore::new(dir.path()).unwrap();
+        assert_eq!(reopened.last_purged_log_id().unwrap(), None);
+        assert_eq!(
+            reopened.try_get_log_entries(1..4).await.unwrap().len(),
+            3,
+            "a deferred purge must retain committed repair material after cold reopen"
+        );
+    }
+
+    #[tokio::test]
+    async fn busy_publication_defers_purge_without_mutating_disk_authority() {
+        use openraft::storage::RaftLogStorage;
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SledLogStore::new(dir.path()).unwrap();
+        let admission = std::sync::Arc::new(super::super::quarantine::RecoveryAdmission::new());
+        store.set_recovery_admission(std::sync::Arc::clone(&admission));
+        store
+            .append_inner(vec![
+                blank_entry(1, 1),
+                blank_entry(1, 2),
+                blank_entry(1, 3),
+            ])
+            .await
+            .unwrap();
+        store.db.flush().unwrap();
+        store
+            .durable_applied
+            .store(3, std::sync::atomic::Ordering::Release);
+        let epoch = admission.epoch();
+        let held = std::sync::Arc::clone(&admission);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let publisher = std::thread::spawn(move || {
+            held.with_admission_epoch(epoch, || {
+                ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+            .unwrap();
+        });
+        ready_rx.await.unwrap();
+        let result = store
+            .purge(LogId::new(CommittedLeaderId::new(1, 0), 3))
+            .await;
+        let point = store.last_purged_log_id().unwrap();
+        let entries = store.try_get_log_entries(1..4).await.unwrap();
+        release_tx.send(()).unwrap();
+        publisher.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "busy optional purge must defer, not kill the Core"
+        );
+        assert_eq!(
+            point, None,
+            "publication contention must not advance purge authority"
+        );
+        assert_eq!(entries.len(), 3);
+        drop(store);
+        let mut reopened = SledLogStore::new(dir.path()).unwrap();
+        assert_eq!(reopened.last_purged_log_id().unwrap(), None);
+        assert_eq!(reopened.try_get_log_entries(1..4).await.unwrap().len(), 3);
+    }
+
     #[tokio::test]
     async fn purge_stops_at_the_durably_applied_index() {
         use openraft::storage::RaftLogStorage;

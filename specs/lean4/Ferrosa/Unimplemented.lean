@@ -37,7 +37,12 @@ import Ferrosa.Sql.Index
 import Ferrosa.Sql.Txn
 import Ferrosa.Storage.Mvcc
 import Ferrosa.Storage.Streaming
+import Ferrosa.Ownership.Obligations
+import Ferrosa.Streaming.Audit
 import Ferrosa.Sql.Consistency
+import Ferrosa.Raft.Obligations
+import Ferrosa.SystemTables.Projection
+import Ferrosa.Codec.Audit
 
 namespace Ferrosa.Unimplemented
 
@@ -87,6 +92,8 @@ def areas : List Area := [
   ⟨"Ferrosa.Sql.Txn", Ferrosa.Sql.Txn.ledger, Ferrosa.Sql.Txn.main⟩,
   ⟨"Ferrosa.Storage.Mvcc", Ferrosa.Storage.Mvcc.ledger, Ferrosa.Storage.Mvcc.main⟩,
   ⟨"Ferrosa.Storage.Streaming", Ferrosa.Storage.Streaming.ledger, Ferrosa.Storage.Streaming.main⟩,
+  ⟨"Ferrosa.Ownership.Obligations", Ferrosa.Ownership.ledger, Ferrosa.Ownership.main⟩,
+  ⟨"Ferrosa.Streaming.Audit", Ferrosa.Streaming.ledger, Ferrosa.Streaming.main⟩,
   ⟨"Ferrosa.Sql.Consistency", Ferrosa.Sql.Consistency.ledger, Ferrosa.Sql.Consistency.main⟩,
   ⟨"Ferrosa.Cdc.Subscribe", Ferrosa.Cdc.ledger, Ferrosa.Cdc.main⟩,
   ⟨"Ferrosa.Cql.Subscribe", Ferrosa.Cql.Subscribe.ledger, Ferrosa.Cql.Subscribe.main⟩,
@@ -96,7 +103,10 @@ def areas : List Area := [
   ⟨"Ferrosa.Testing.JepsenModels", Ferrosa.Testing.Models.ledger, Ferrosa.Testing.Models.main⟩,
   ⟨"Ferrosa.Testing.Histories", Ferrosa.Testing.Histories.ledger, Ferrosa.Testing.Histories.main⟩,
   ⟨"Ferrosa.Testing.Guarantees", Ferrosa.Testing.Guarantees.ledger, Ferrosa.Testing.Guarantees.main⟩,
-  ⟨"Ferrosa.Unsafe.Invariants", Ferrosa.Unsafe.ledger, Ferrosa.Unsafe.main⟩
+  ⟨"Ferrosa.Unsafe.Invariants", Ferrosa.Unsafe.ledger, Ferrosa.Unsafe.main⟩,
+  ⟨"Ferrosa.Raft.Obligations", Ferrosa.Raft.ledger, Ferrosa.Raft.main⟩,
+  ⟨"Ferrosa.SystemTables.Projection", Ferrosa.SystemTables.ledger, Ferrosa.SystemTables.main⟩,
+  ⟨"Ferrosa.Codec.Audit", Ferrosa.Codec.ledger, Ferrosa.Codec.main⟩
 ]
 
 /-- Look up an area ledger by module key. -/
@@ -128,11 +138,11 @@ theorem area_keys_are_distinct : (areas.map (·.key)).Nodup := by decide
 
 /-- Pinned so that dropping a ledger with no reds — which the total cannot see — is still a build
     failure rather than a quietly smaller registry. -/
-theorem registered_ledger_count : areas.length = 21 := by decide
+theorem registered_ledger_count : areas.length = 26 := by decide
 
 /-! ## The total, derived
 
-`ledgerTotal` is the sum of the registered ledgers' red counts and contains no literal term, so there is nothing for it to fall out of step with and `ledgerTotal_is_the_registry_sum` records only its definition. The pin at sixty guards the opposite failure: dropping a whole ledger from `areas` shrinks the total without changing any local count. `ledgerTotal_pinned` makes that a build failure rather than a quieter number.
+`ledgerTotal` is the sum of the registered ledgers' red counts and contains no literal term, so there is nothing for it to fall out of step with and `ledgerTotal_is_the_registry_sum` records only its definition. The pin at sixty-two guards the opposite failure: dropping a whole ledger from `areas` shrinks the total without changing any local count. `ledgerTotal_pinned` makes that a build failure rather than a quieter number.
 -/
 
 /-- The number of red items across the corpus: the sum of the registered ledgers' `redCount`.
@@ -145,8 +155,12 @@ theorem ledgerTotal_is_the_registry_sum :
     ledgerTotal = (areas.map fun a => redCount a.ledger).sum := rfl
 
 /-- Pinned so that removing a ledger from the registry — the drift that has recurred here — is a
-    build failure rather than a silently smaller total. -/
-theorem ledgerTotal_pinned : ledgerTotal = 60 := by decide
+    build failure rather than a silently smaller total. Ninety-seven: the raft surface audit added
+    three reds without adding an area, the startup and replay audit added three, partial application
+    two, the grant projection one, `6c270518` closed one, the projection layer added seven, the
+    quarantine design added six, and the memory-discipline audit added an area of thirty-six items
+    with fourteen reds. -/
+theorem ledgerTotal_pinned : ledgerTotal = 108 := by decide
 
 /-- Print every registered ledger, with the header its area module prints. -/
 def printAllLedgers : IO Unit := do
@@ -244,7 +258,17 @@ def unimplemented : List Item := [
   ⟨"MVCC", "an asynchronous vacuum decrements reference counts after each commit",
    "Ferrosa.Storage.Mvcc", "vacuum runs asynchronously after the committing transaction completes, off the write path"⟩,
   ⟨"Tombstone", "the purge path cannot resurrect a deleted row",
-   "Ferrosa.Storage.Tombstone", "deleted data cannot be resurrected"⟩
+   "Ferrosa.Storage.Tombstone", "deleted data cannot be resurrected"⟩,
+  ⟨"Streaming", "a spill reserves disk space before it writes, instead of discovering ENOSPC inside the merge",
+   "Ferrosa.Streaming.Audit", "a spill reserves disk space before it writes"⟩,
+  ⟨"Streaming", "a node admits memory-bearing work through one permit rather than one per surface",
+   "Ferrosa.Streaming.Audit", "a node admits memory-bearing work through one permit"⟩,
+  ⟨"Streaming", "spill directories an earlier process left behind are reconciled at startup",
+   "Ferrosa.Streaming.Audit", "orphaned spill directories are reconciled at startup"⟩,
+  ⟨"Streaming", "spill files are written to a filesystem the node knows is not memory-backed",
+   "Ferrosa.Streaming.Audit", "spill files land on a filesystem that is not memory"⟩,
+  ⟨"Streaming", "a PITR rewrap exists as a transform that publishes a new version atomically",
+   "Ferrosa.Streaming.Audit", "a PITR rewrap publishes a new version atomically"⟩
 ]
 
 /-- Everything the ledgers list that is neither broken nor absent. -/
@@ -278,18 +302,24 @@ def nonDefects : List Other := [
    "Ferrosa.Cql.AggregateObligations", "COUNT(DISTINCT) is O(1) in memory"⟩,
   ⟨"MVCC", "a snapshot lookup stops at the first file holding the key",
    "requirement: refuted — the newest file's version may be invisible to the snapshot, so every file holding a version must be consulted; one probe per SSTable in the view is the real bound, and that is what is proved",
-   "Ferrosa.Storage.Mvcc", "a snapshot lookup can stop at the first file holding the key"⟩
+   "Ferrosa.Storage.Mvcc", "a snapshot lookup can stop at the first file holding the key"⟩,
+  ⟨"Raft", "the staged copy leaves no trace until it publishes",
+   "requirement: the staged copy clones the metadata but shares the schema, engine and system-writer handles, so the physical transition is visible before publication; what sharing keeps is that the metadata and the published index move together (`Raft.metadata_published_with_index`)",
+   "Ferrosa.Raft.Obligations", "the staged copy leaves no trace until it publishes"⟩
 ]
 
 /-! ## Rows that are discharged now
 
-Three rows below classify items that have since been met: the ledger absorbed the claim. They are
-kept, not deleted — deleting a row is how the count stayed balanced while the bookkeeping went
-wrong — and each one is required to name a real ledger item whose status is `.met`. They are not
-part of the classification: `nothing_discharged_is_still_classified` keeps the two lists apart.
+Five rows classify items that are met now, either because the ledger absorbed the claim or because
+the code was fixed and the claim was written into the ledger afterwards. They are kept, not deleted —
+deleting a row is how the count stayed balanced while the bookkeeping went wrong — and each one is
+required to name a real ledger item whose status is `.met`. They are not part of the classification:
+`nothing_discharged_is_still_classified` keeps the two lists apart.
 -/
 
-/-- A row that was red when it was written and is discharged now. -/
+/-- A row that was red when it was written and is discharged now: either the ledger absorbed the
+claim, or the code was fixed and the claim was written into the ledger afterwards. `why` carries the
+regression witness's name in the second case. -/
 structure Discharged where
   area : String
   what : String
@@ -308,7 +338,13 @@ def discharged : List Discharged := [
    "Ferrosa.Sql.Index", "a range lookup on an indexed column costs one round trip per node, which is accepted"⟩,
   ⟨"Jepsen", "a multi-DC run with local reads treats a semantics consequence as a failure",
    "discharged: `ferrosa-jepsen/src/checker/profile.rs` classifies a run that declares a cross-datacenter read as not tested rather than failed (`cross_datacenter_read_defeats_the_overlap`), a report with any not-tested run is not all-passed, and a profile declaration that does not parse is refused before the run (`a_value_that_does_not_parse_is_refused`) instead of falling back to QUORUM/QUORUM",
-   "Ferrosa.Testing.Jepsen", "a multi-DC run under LOCAL_QUORUM or DC_QUORUM must expect strict-serializability violations after a failover"⟩
+   "Ferrosa.Testing.Jepsen", "a multi-DC run under LOCAL_QUORUM or DC_QUORUM must expect strict-serializability violations after a failover"⟩,
+  ⟨"Raft", "an entry is published only when its ordered system-table write landed",
+   "discharged by 6c270518: `flush_pending_system_writes` now returns its error (state_machine.rs:2171-2199) into the latch, so the entry does not publish, and `Raft.sysfail_blocks_publication` is the trace the old disproof used, ending with nothing published. The pre-fix shape is kept as `Raft.sysfail_publishes_without_row`; what the fix does not settle is the physical effects that land before the flush and replay idempotency, which are `Ferrosa.Raft.Partial`'s obligations",
+   "Ferrosa.Raft.Obligations", "an entry is published only when its ordered system-table write landed"⟩,
+  ⟨"Raft", "a published grant projection carries the complete permission set",
+   "regression witness for 1a89858a: `Raft.the_persisted_delta_contradicts_the_live_cell` records the shape the fix removed, where Grant persisted `entry.clone()` (the delta) and Revoke persisted a whole-resource tombstone while the state machine kept the union and the remainder, so a restart changed a role's authorization answers with nothing logged and nothing failing. The fix's own tests assert only the post-state, which is why the pre-fix shape is recorded here",
+   "Ferrosa.Raft.Obligations", "a published grant projection carries the complete permission set"⟩
 ]
 
 /-! ## The checks
@@ -360,7 +396,7 @@ theorem every_red_is_classified_exactly_once (a : Area) (ha : a ∈ areas) :
     (a.ledger.filter isRed).all (fun i => rows.count (a.key, i.name) == 1) = true := by
   obtain ⟨k, l, p⟩ := a
   simp only [areas, List.mem_cons, List.not_mem_nil, or_false] at ha
-  rcases ha with ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩
+  rcases ha with ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩
   all_goals decide
 
 /-- **(c)** Each area's rows number exactly that area's reds. -/
@@ -368,7 +404,7 @@ theorem per_area_counts (a : Area) (ha : a ∈ areas) :
     (rows.filter fun r => r.1 == a.key).length = redCount a.ledger := by
   obtain ⟨k, l, p⟩ := a
   simp only [areas, List.mem_cons, List.not_mem_nil, or_false] at ha
-  rcases ha with ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩
+  rcases ha with ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩
   all_goals decide
 
 /-- The pairs the discharged rows name: not part of the classification, but still checked. -/
@@ -400,20 +436,25 @@ theorem every_ledger_item_is_classified :
     Ferrosa.Broken.broken.length + unimplemented.length + nonDefects.length = ledgerTotal := by
   native_decide
 
-/-- Thirty-eight items have no code path yet, and the count is pinned so a row cannot disappear
+/-- Forty-three items have no code path yet, and the count is pinned so a row cannot disappear
     between commits without this failing. The local-read Jepsen row left for `discharged`; the
     Jepsen-evidence spec added three (the indeterminate split, the final read, and Elle's exit
-    code), and packet JE-2 closed the exit-code row. -/
-theorem unimplemented_has_the_right_length : unimplemented.length = 38 := by native_decide
+    code), packet JE-2 closed the exit-code row, and the memory-discipline audit added five:
+    no spill admission, no node-wide permit, no orphan reconciliation for the engine roots, no
+    check that the spill medium is not memory, and no PITR rewrap to hold to the transform rule. -/
+theorem unimplemented_has_the_right_length : unimplemented.length = 43 := by native_decide
 
-/-- Seven, not eight: two rows were discharged into the ledger itself (see `discharged`), and one
-    new row records the refuted constant-probe claim in the MVCC ledger. -/
-theorem twelve_are_not_defects : nonDefects.length = 7 := by native_decide
+/-- Eight, not seven: two rows were discharged into the ledger itself (see `discharged`), one new
+    row records the refuted constant-probe claim in the MVCC ledger, and one records the staging
+    requirement the staged apply does not meet. -/
+theorem eight_are_not_defects : nonDefects.length = 8 := by native_decide
 
-/-- **Live defects now outnumber everything else.**  Fifteen reds against seven requirements,
+/-- **Live defects now outnumber everything else.**  Forty-six reds against eight requirements,
     proofs, measurements, inherited protocol behaviour and closures. This theorem had the opposite
     direction until the memory specs found three more: the closer the specs get to the code, the
-    more of it turns out to be shipping something that is not true. -/
+    more of it turns out to be shipping something that is not true. The raft surface audit added
+    three, all of them a durable effect that did not happen while publication advanced, the
+    system-table projection layer added seven, and the memory-discipline audit added nine. -/
 theorem live_defects_outnumber_the_rest : nonDefects.length < Ferrosa.Broken.broken.length := by
   native_decide
 

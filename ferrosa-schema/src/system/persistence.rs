@@ -419,7 +419,8 @@ pub fn grant_to_row(grant: &GrantEntry) -> (DecoratedKey, Row, i64) {
     let key = DecoratedKey::new(PartitionKey::new(grant.role.as_bytes().to_vec()));
 
     let resource_str = grant.resource.to_string();
-    let perms: Vec<String> = grant.permissions.iter().map(|p| p.to_string()).collect();
+    let mut perms: Vec<String> = grant.permissions.iter().map(|p| p.to_string()).collect();
+    perms.sort_unstable();
     let perms_json = serde_json::to_vec(&perms).unwrap_or_default();
 
     let row = Row {
@@ -886,6 +887,31 @@ pub fn all_system_table_schemas() -> Vec<TableSchema> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grant_permission_json_has_canonical_set_order() {
+        let grant = GrantEntry {
+            role: "canonical_json".into(),
+            resource: Resource::Keyspace("ks".into()),
+            permissions: [
+                Permission::Create,
+                Permission::Alter,
+                Permission::Drop,
+                Permission::Select,
+                Permission::Modify,
+                Permission::Authorize,
+                Permission::Describe,
+                Permission::Execute,
+                Permission::Backup,
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let (_, row, _) = grant_to_row(&grant);
+        assert_eq!(row.cells[0].1.value.as_deref(),
+            Some(&br#"["ALTER","AUTHORIZE","BACKUP","CREATE","DESCRIBE","DROP","EXECUTE","MODIFY","SELECT"]"#[..]),
+            "permission JSON bytes must depend on set membership, not HashSet iteration order");
+    }
 
     #[test]
     fn keyspaces_column_indices_are_sequential() {

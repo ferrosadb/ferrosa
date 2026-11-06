@@ -105,13 +105,18 @@ impl SystemTableLoader {
         let mut roles = Vec::new();
 
         self.walk_all_partitions(&tid, |partition| {
-            if !partition.deletion.is_live() {
-                return Ok(());
-            }
             let name = String::from_utf8(partition.key.key.as_bytes().to_vec()).map_err(|e| {
                 FerrosaError::InvalidData(format!("invalid roles role key utf8: {e}"))
             })?;
-            let Some(row) = partition.rows.iter().find(|row| row.deletion.is_live()) else {
+            let Some(row) = partition.rows.iter().find(|row| {
+                row.cells.iter().any(|(_, cell)| {
+                    cell.timestamp
+                        > partition
+                            .deletion
+                            .marked_for_delete_at
+                            .max(row.deletion.marked_for_delete_at)
+                })
+            }) else {
                 return Ok(());
             };
             // Lookups by column id over a BORROW of the row's cells. The previous
@@ -322,17 +327,11 @@ impl SystemTableLoader {
         let mut grants = Vec::new();
 
         self.walk_all_partitions(&tid, |partition| {
-            if !partition.deletion.is_live() {
-                return Ok(());
-            }
             let role = String::from_utf8(partition.key.key.as_bytes().to_vec()).map_err(|e| {
                 FerrosaError::InvalidData(format!("invalid role_permissions role key utf8: {e}"))
             })?;
 
             for row in &partition.rows {
-                if !row.deletion.is_live() {
-                    continue;
-                }
                 let resource_text = String::from_utf8(row.clustering.clone()).map_err(|e| {
                     FerrosaError::InvalidData(format!(
                         "invalid role_permissions resource utf8: {e}"
@@ -345,6 +344,16 @@ impl SystemTableLoader {
                 else {
                     continue;
                 };
+                // A newer grant can resurrect this permission cell above an
+                // older row tombstone. Older/equal cells remain deleted.
+                if cell.timestamp
+                    <= partition
+                        .deletion
+                        .marked_for_delete_at
+                        .max(row.deletion.marked_for_delete_at)
+                {
+                    continue;
+                }
                 let Some(bytes) = cell.value.as_deref() else {
                     continue;
                 };
@@ -700,13 +709,835 @@ mod tests {
         test_engine_with_flush_threshold(dir, 4096)
     }
 
+    fn visible_projection_cells(partition: &ferrosa_sstable::types::Partition) -> usize {
+        partition
+            .rows
+            .iter()
+            .map(|row| {
+                let deleted_at = partition
+                    .deletion
+                    .marked_for_delete_at
+                    .max(row.deletion.marked_for_delete_at);
+                row.cells
+                    .iter()
+                    .filter(|(_, cell)| cell.value.is_some() && cell.timestamp > deleted_at)
+                    .count()
+            })
+            .sum()
+    }
+
+    async fn canonical_family_after_future_cells(case: usize) {
+        use ferrosa_common::CqlType;
+        use ferrosa_schema::metadata::{
+            function::UserFunctionMetadata, index::IndexMetadata, table::TableMetadata,
+            user_type::UserTypeMetadata,
+        };
+        use ferrosa_schema::system::persistence::SystemTableMutation as Mutation;
+        let cases = vec![
+            (
+                Mutation::KeyspaceCreated(KeyspaceMetadata {
+                    name: "ordered".into(),
+                    durable_writes: true,
+                    replication: ReplicationParams {
+                        strategy: "SimpleStrategy".into(),
+                        options: [("replication_factor".into(), "1".into())]
+                            .into_iter()
+                            .collect(),
+                    },
+                }),
+                Mutation::KeyspaceDropped("ordered".into()),
+                TableId::new("system_schema", "keyspaces"),
+                "ordered",
+            ),
+            (
+                Mutation::TableCreated(Box::new(TableMetadata {
+                    keyspace: "ordered".into(),
+                    name: "t".into(),
+                    id: uuid::Uuid::new_v4(),
+                    columns: Default::default(),
+                    partition_key: vec![],
+                    clustering_key: vec![],
+                    params: Default::default(),
+                    flags: Default::default(),
+                    extensions: Default::default(),
+                    is_system: false,
+                })),
+                Mutation::TableDropped {
+                    keyspace: "ordered".into(),
+                    table: "t".into(),
+                },
+                TableId::new("system_schema", "tables"),
+                "ordered",
+            ),
+            (
+                Mutation::RoleCreated(RoleMetadata {
+                    name: "ordered".into(),
+                    is_superuser: false,
+                    can_login: true,
+                    salted_hash: None,
+                    member_of: Default::default(),
+                    scram: None,
+                }),
+                Mutation::RoleDropped("ordered".into()),
+                TableId::new("system_auth", "roles"),
+                "ordered",
+            ),
+            (
+                Mutation::IndexCreated(IndexMetadata {
+                    keyspace: "ordered".into(),
+                    table: "t".into(),
+                    name: "i".into(),
+                    index_type: ferrosa_index::IndexType::BTree,
+                    target_columns: vec!["c".into()],
+                    filter_predicate: None,
+                    options: Default::default(),
+                }),
+                Mutation::IndexDropped {
+                    keyspace: "ordered".into(),
+                    table: "t".into(),
+                    name: "i".into(),
+                },
+                TableId::new("system_schema", "indexes"),
+                "ordered",
+            ),
+            (
+                Mutation::TypeCreated(UserTypeMetadata {
+                    keyspace: "ordered".into(),
+                    name: "u".into(),
+                    fields: vec![("c".into(), CqlType::Int)],
+                }),
+                Mutation::TypeDropped {
+                    keyspace: "ordered".into(),
+                    name: "u".into(),
+                },
+                TableId::new("system_schema", "types"),
+                "ordered",
+            ),
+            (
+                Mutation::FunctionCreated(UserFunctionMetadata {
+                    keyspace: "ordered".into(),
+                    name: "f".into(),
+                    arg_names: vec!["c".into()],
+                    arg_types: vec![CqlType::Int],
+                    return_type: CqlType::Int,
+                    called_on_null: true,
+                    language: "wasm".into(),
+                    body: "deadbeef".into(),
+                }),
+                Mutation::FunctionDropped {
+                    keyspace: "ordered".into(),
+                    name: "f".into(),
+                    arg_types: vec![CqlType::Int],
+                },
+                TableId::new("system_schema", "functions"),
+                "ordered",
+            ),
+        ];
+        let (create, drop_mutation, tid, name) = cases.into_iter().nth(case).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let writer = SystemTableWriter::new(Arc::clone(&engine));
+        writer.apply(create.clone()).unwrap();
+        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            name.as_bytes().to_vec(),
+        ));
+        let initial = engine.read(&tid, &key).unwrap().unwrap();
+        assert!(
+            visible_projection_cells(&initial) > 0,
+            "positive create control: {tid}"
+        );
+        let future = i64::MAX - 4096;
+        for mut row in initial.rows {
+            row.primary_key_liveness.timestamp = future;
+            for (_, cell) in &mut row.cells {
+                cell.timestamp = future;
+            }
+            engine.write(&tid, &key, row, future).unwrap();
+        }
+        writer.apply(drop_mutation).unwrap();
+        let deleted = engine.read(&tid, &key).unwrap().unwrap();
+        assert_eq!(
+            visible_projection_cells(&deleted),
+            0,
+            "later drop must beat prior future cells: {tid}"
+        );
+        writer.apply(create).unwrap();
+        assert!(
+            visible_projection_cells(&engine.read(&tid, &key).unwrap().unwrap()) > 0,
+            "later recreate must beat prior deletion: {tid}"
+        );
+        engine.flush(&tid).unwrap();
+        engine.force_commit_log_sync().unwrap();
+        drop(writer);
+        drop(engine);
+        let reopened = reopen_test_engine(dir.path());
+        assert!(
+            visible_projection_cells(&reopened.read(&tid, &key).unwrap().unwrap()) > 0,
+            "ordered recreation must survive cold reopen: {tid}"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_family_keyspace_after_clock_regression() {
+        canonical_family_after_future_cells(0).await;
+    }
+
+    #[tokio::test]
+    async fn canonical_family_table_after_clock_regression() {
+        canonical_family_after_future_cells(1).await;
+    }
+
+    #[tokio::test]
+    async fn canonical_family_role_after_clock_regression() {
+        canonical_family_after_future_cells(2).await;
+    }
+
+    #[tokio::test]
+    async fn canonical_family_index_after_clock_regression() {
+        canonical_family_after_future_cells(3).await;
+    }
+
+    #[tokio::test]
+    async fn canonical_family_type_after_clock_regression() {
+        canonical_family_after_future_cells(4).await;
+    }
+
+    #[tokio::test]
+    async fn canonical_family_function_after_clock_regression() {
+        canonical_family_after_future_cells(5).await;
+    }
+
+    #[tokio::test]
+    async fn canonical_table_column_recreation_dominates_stored_future_cells() {
+        use ferrosa_schema::metadata::{
+            column::{ClusteringOrder, ColumnKind, ColumnMetadata},
+            table::TableMetadata,
+        };
+        use ferrosa_schema::system::persistence::{SystemTableMutation, COLUMNS_COL_TYPE};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let writer = SystemTableWriter::new(Arc::clone(&engine));
+        let mut table = TableMetadata {
+            keyspace: "column_clock".into(),
+            name: "items".into(),
+            id: uuid::Uuid::new_v4(),
+            columns: Default::default(),
+            partition_key: vec!["id".into()],
+            clustering_key: vec![],
+            params: Default::default(),
+            flags: Default::default(),
+            extensions: Default::default(),
+            is_system: false,
+        };
+        table.columns.insert(
+            "id".into(),
+            ColumnMetadata {
+                name: "id".into(),
+                kind: ColumnKind::PartitionKey,
+                position: 0,
+                column_type: "uuid".into(),
+                clustering_order: ClusteringOrder::None,
+                mask: None,
+            },
+        );
+        writer
+            .apply(SystemTableMutation::TableCreated(Box::new(table.clone())))
+            .unwrap();
+        let columns = TableId::new("system_schema", "columns");
+        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            table.keyspace.as_bytes().to_vec(),
+        ));
+        let initial = engine.read(&columns, &key).unwrap().unwrap();
+        assert!(!initial.rows.is_empty());
+        let future = i64::MAX - 4096;
+        for mut row in initial.rows {
+            row.primary_key_liveness.timestamp = future;
+            for (_, cell) in &mut row.cells {
+                cell.timestamp = future;
+            }
+            engine.write(&columns, &key, row, future).unwrap();
+        }
+        writer
+            .apply(SystemTableMutation::TableDropped {
+                keyspace: table.keyspace.clone(),
+                table: table.name.clone(),
+            })
+            .unwrap();
+        table.id = uuid::Uuid::new_v4();
+        table.columns.get_mut("id").unwrap().column_type = "text".into();
+        writer
+            .apply(SystemTableMutation::TableCreated(Box::new(table)))
+            .unwrap();
+        engine.flush(&columns).unwrap();
+        engine.force_commit_log_sync().unwrap();
+        drop(writer);
+        drop(engine);
+        let reopened = reopen_test_engine(dir.path());
+        let actual = reopened.read(&columns, &key).unwrap().unwrap();
+        assert!(
+            actual.rows.iter().any(|row| row
+                .cells
+                .iter()
+                .any(|(id, cell)| *id == COLUMNS_COL_TYPE
+                    && cell.value.as_deref() == Some(b"text".as_slice()))),
+            "new incarnation column type must dominate prior future-dated column row"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_membership_clock_exhaustion_preserves_prior_role() {
+        use ferrosa_schema::system::persistence::SystemTableMutation;
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let writer = SystemTableWriter::new(Arc::clone(&engine));
+        let role = RoleMetadata {
+            name: "exhausted_members".into(),
+            is_superuser: false,
+            can_login: true,
+            salted_hash: None,
+            member_of: Default::default(),
+            scram: None,
+        };
+        writer
+            .apply(SystemTableMutation::RoleCreated(role.clone()))
+            .unwrap();
+        let members = TableId::new("system_auth", "role_members");
+        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            role.name.as_bytes().to_vec(),
+        ));
+        engine
+            .write(
+                &members,
+                &key,
+                Row {
+                    clustering: b"old_parent".to_vec(),
+                    cells: vec![],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(i64::MAX),
+                },
+                i64::MAX,
+            )
+            .unwrap();
+        let result = writer.apply(SystemTableMutation::RoleCreated(RoleMetadata {
+            can_login: false,
+            member_of: ["replacement_parent".into()].into_iter().collect(),
+            ..role.clone()
+        }));
+        assert!(
+            result.is_err(),
+            "exhausted physical membership clock must refuse"
+        );
+        assert!(
+            SystemTableLoader::new(Arc::clone(&engine))
+                .load_roles()
+                .unwrap()
+                .iter()
+                .any(|r| r.name == role.name && r.can_login),
+            "membership preflight must finish before changing login authority"
+        );
+        assert_eq!(
+            projected_members(&engine, &role.name),
+            ["old_parent".into()].into_iter().collect()
+        );
+    }
+
+    fn projected_members(engine: &StorageEngine, role: &str) -> std::collections::BTreeSet<String> {
+        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            role.as_bytes().to_vec(),
+        ));
+        let Some(partition) = engine
+            .read(&TableId::new("system_auth", "role_members"), &key)
+            .unwrap()
+        else {
+            return Default::default();
+        };
+        partition
+            .rows
+            .iter()
+            .filter(|row| {
+                row.primary_key_liveness.timestamp
+                    > partition
+                        .deletion
+                        .marked_for_delete_at
+                        .max(row.deletion.marked_for_delete_at)
+            })
+            .map(|row| String::from_utf8(row.clustering.clone()).unwrap())
+            .collect()
+    }
+
+    async fn canonical_membership_projection(replace: bool) {
+        use ferrosa_schema::system::persistence::SystemTableMutation;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let writer = SystemTableWriter::new(Arc::clone(&engine));
+        let child = RoleMetadata {
+            name: "membership_child".into(),
+            is_superuser: false,
+            can_login: false,
+            salted_hash: None,
+            member_of: ["parent_a".into(), "parent_b".into()].into_iter().collect(),
+            scram: None,
+        };
+        writer
+            .apply(SystemTableMutation::RoleCreated(child.clone()))
+            .unwrap();
+        let unrelated = RoleMetadata {
+            name: "unrelated_child".into(),
+            ..child.clone()
+        };
+        writer
+            .apply(SystemTableMutation::RoleCreated(unrelated.clone()))
+            .unwrap();
+        let original = ["parent_a".into(), "parent_b".into()].into_iter().collect();
+        assert_eq!(projected_members(&engine, &child.name), original);
+        let expected = if replace {
+            writer
+                .apply(SystemTableMutation::RoleCreated(RoleMetadata {
+                    member_of: ["parent_b".into()].into_iter().collect(),
+                    ..child.clone()
+                }))
+                .unwrap();
+            ["parent_b".into()].into_iter().collect()
+        } else {
+            writer
+                .apply(SystemTableMutation::RoleDropped(child.name.clone()))
+                .unwrap();
+            Default::default()
+        };
+        let actual = projected_members(&engine, &child.name);
+        let members = TableId::new("system_auth", "role_members");
+        engine.flush(&members).unwrap();
+        engine.force_commit_log_sync().unwrap();
+        drop(writer);
+        drop(engine);
+        let reopened = reopen_test_engine(dir.path());
+        assert_eq!(
+            projected_members(&reopened, &unrelated.name),
+            original,
+            "other principal membership must survive"
+        );
+        assert_eq!(
+            actual, expected,
+            "canonical full stored role must replace its membership projection"
+        );
+        assert_eq!(
+            projected_members(&reopened, &child.name),
+            expected,
+            "membership poststate must survive cold reopen"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_membership_replace_removes_revoked_edge() {
+        canonical_membership_projection(true).await;
+    }
+
+    #[tokio::test]
+    async fn canonical_membership_drop_removes_owned_edges() {
+        canonical_membership_projection(false).await;
+    }
+
+    #[tokio::test]
+    async fn canonical_role_update_survives_earlier_future_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let role = RoleMetadata {
+            name: "clock_regressed_role".into(),
+            is_superuser: false,
+            can_login: true,
+            salted_hash: None,
+            member_of: Default::default(),
+            scram: None,
+        };
+        // A committed projection from before a wall-clock correction. Seed its
+        // actual stored timestamps rather than changing the process clock.
+        let (key, mut row, _) = ferrosa_schema::system::persistence::role_to_row(&role);
+        let earlier_timestamp = i64::MAX - 1024;
+        row.primary_key_liveness.timestamp = earlier_timestamp;
+        for (_, cell) in &mut row.cells {
+            cell.timestamp = earlier_timestamp;
+        }
+        engine
+            .write(
+                &TableId::new("system_auth", "roles"),
+                &key,
+                row,
+                earlier_timestamp,
+            )
+            .unwrap();
+        let loader = SystemTableLoader::new(Arc::clone(&engine));
+        assert!(loader
+            .load_roles()
+            .unwrap()
+            .iter()
+            .any(|r| r.name == role.name && r.can_login));
+        SystemTableWriter::new(Arc::clone(&engine))
+            .apply(
+                ferrosa_schema::system::persistence::SystemTableMutation::RoleCreated(
+                    RoleMetadata {
+                        can_login: false,
+                        ..role.clone()
+                    },
+                ),
+            )
+            .unwrap();
+        let restored = loader.load_roles().unwrap();
+        assert!(
+            restored.iter().any(|r| r.name == role.name && !r.can_login),
+            "later ordered login disable must replace an earlier future-dated cell"
+        );
+        engine.flush(&TableId::new("system_auth", "roles")).unwrap();
+        engine.force_commit_log_sync().unwrap();
+        drop(loader);
+        drop(engine);
+        let reopened = reopen_test_engine(dir.path());
+        assert!(
+            SystemTableLoader::new(reopened)
+                .load_roles()
+                .unwrap()
+                .iter()
+                .any(|r| r.name == role.name && !r.can_login),
+            "login disable must survive cold reopen"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_role_drop_dominates_stored_future_rows_after_reopen() {
+        use ferrosa_schema::system::persistence::{role_to_row, SystemTableMutation};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let role = RoleMetadata {
+            name: "drop_future_role".into(),
+            is_superuser: false,
+            can_login: true,
+            salted_hash: None,
+            member_of: Default::default(),
+            scram: None,
+        };
+        let future = i64::MAX - 2048;
+        let (key, mut row, _) = role_to_row(&role);
+        row.primary_key_liveness.timestamp = future;
+        for (_, cell) in &mut row.cells {
+            cell.timestamp = future;
+        }
+        let roles = TableId::new("system_auth", "roles");
+        let permissions = TableId::new("system_auth", "role_permissions");
+        engine.write(&roles, &key, row, future).unwrap();
+        let mut writer = SystemTableWriter::new(Arc::clone(&engine));
+        writer.set_permission_timestamp_for_test(future);
+        writer
+            .apply(SystemTableMutation::GrantUpdated(GrantEntry {
+                role: role.name.clone(),
+                resource: Resource::Keyspace("ks".into()),
+                permissions: [Permission::Select].into_iter().collect(),
+            }))
+            .unwrap();
+        writer
+            .apply(SystemTableMutation::RoleDropped(role.name.clone()))
+            .unwrap();
+        let loader = SystemTableLoader::new(Arc::clone(&engine));
+        let live_roles = loader.load_roles().unwrap();
+        let live_grants = loader.load_role_permissions().unwrap();
+        engine.flush(&roles).unwrap();
+        engine.flush(&permissions).unwrap();
+        engine.force_commit_log_sync().unwrap();
+        drop(loader);
+        drop(writer);
+        drop(engine);
+        let reopened = SystemTableLoader::new(reopen_test_engine(dir.path()));
+        assert!(
+            !live_roles.iter().any(|r| r.name == role.name)
+                && !live_grants.iter().any(|g| g.role == role.name)
+                && !reopened.load_roles().unwrap().iter().any(|r| r.name == role.name)
+                && !reopened.load_role_permissions().unwrap().iter().any(|g| g.role == role.name),
+            "committed role deletion must dominate stored future role/grants in memory and after cold reopen; roles={live_roles:?}, grants={live_grants:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_regrant_dominates_row_tombstone_hidden_by_partition_delete() {
+        use ferrosa_schema::system::persistence::SystemTableMutation;
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let mut writer = SystemTableWriter::new(Arc::clone(&engine));
+        writer.set_permission_timestamp_for_test(1_000_000);
+        let grant = GrantEntry {
+            role: "hidden_tombstone_role".into(),
+            resource: Resource::Keyspace("ks".into()),
+            permissions: [Permission::Select].into_iter().collect(),
+        };
+        writer
+            .apply(SystemTableMutation::GrantUpdated(grant.clone()))
+            .unwrap();
+        let tid = TableId::new("system_auth", "role_permissions");
+        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            grant.role.as_bytes().to_vec(),
+        ));
+        // Legacy revocation followed by a backward-clock role deletion. Both
+        // are real persisted records, not clock mocks or synthetic read results.
+        engine
+            .write(
+                &tid,
+                &key,
+                Row {
+                    clustering: grant.resource.to_string().into_bytes(),
+                    cells: vec![],
+                    deletion: DeletionTime::new(8_000_000, 8),
+                    primary_key_liveness: LivenessInfo::NONE,
+                },
+                8_000_000,
+            )
+            .unwrap();
+        engine
+            .write(
+                &tid,
+                &key,
+                Row {
+                    clustering: vec![],
+                    cells: vec![],
+                    deletion: DeletionTime::new(3_000_000, 3),
+                    primary_key_liveness: LivenessInfo::NONE,
+                },
+                3_000_000,
+            )
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        engine.force_commit_log_sync().unwrap();
+        assert!(
+            engine
+                .read_clustering_row(&tid, &key, grant.resource.to_string().as_bytes())
+                .unwrap()
+                .is_none(),
+            "logical lookup hides the older PK even though its row tombstone is newer"
+        );
+        writer
+            .apply(SystemTableMutation::GrantUpdated(GrantEntry {
+                permissions: [Permission::Modify].into_iter().collect(),
+                ..grant.clone()
+            }))
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        engine.force_commit_log_sync().unwrap();
+        drop(writer);
+        drop(engine);
+        let grants = SystemTableLoader::new(reopen_test_engine(dir.path()))
+            .load_role_permissions()
+            .unwrap();
+        assert!(grants.iter().any(|g| g.role == grant.role
+            && g.permissions == [Permission::Modify].into_iter().collect()),
+            "later canonical regrant must dominate hidden stored row tombstone after reopen: {grants:?}");
+    }
+
+    #[tokio::test]
+    async fn canonical_role_drop_crosses_hidden_prefix_in_bounded_metadata_pages() {
+        use ferrosa_schema::system::persistence::SystemTableMutation;
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine_with_flush_threshold(dir.path(), 1 << 20);
+        engine.register_system_tables().unwrap();
+        let tid = TableId::new("system_auth", "role_permissions");
+        let role = "paged_role";
+        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            role.as_bytes().to_vec(),
+        ));
+        let mut writer = SystemTableWriter::new(Arc::clone(&engine));
+        for i in 0..65 {
+            writer.set_permission_timestamp_for_test(if i == 64 {
+                i64::MAX - 2048
+            } else {
+                1_000_000
+            });
+            writer
+                .apply(SystemTableMutation::GrantUpdated(GrantEntry {
+                    role: role.into(),
+                    resource: Resource::Keyspace(format!("ks{i:03}")),
+                    permissions: [Permission::Select].into_iter().collect(),
+                }))
+                .unwrap();
+        }
+        // Compare against the real persisted clock: legacy nanosecond-shaped
+        // inputs are normalized by StorageEngine before reaching the store.
+        let late_resource = Resource::Keyspace("ks064".into()).to_string();
+        let late = engine
+            .read_clustering_row(&tid, &key, late_resource.as_bytes())
+            .unwrap()
+            .unwrap();
+        let late_clock = late
+            .rows
+            .iter()
+            .flat_map(|row| row.cells.iter().map(|(_, cell)| cell.timestamp))
+            .max()
+            .unwrap();
+        assert!(
+            late_clock
+                > std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_micros() as i64
+        );
+        engine
+            .write(
+                &tid,
+                &key,
+                Row {
+                    clustering: vec![],
+                    cells: vec![],
+                    deletion: DeletionTime::new(3_000_000, 3),
+                    primary_key_liveness: LivenessInfo::NONE,
+                },
+                3_000_000,
+            )
+            .unwrap();
+        assert!(
+            engine
+                .read_limited_rows(&tid, &key, 32)
+                .unwrap()
+                .unwrap()
+                .rows
+                .is_empty(),
+            "ordinary logical page must still suppress the partition-deleted prefix"
+        );
+        let mut cursor = None;
+        let mut rows = 0;
+        let mut greatest = i64::MIN;
+        loop {
+            let page = engine
+                .read_projection_rows(&tid, &key, cursor.as_deref(), 32)
+                .unwrap()
+                .unwrap();
+            assert!(page.rows.len() <= 32);
+            assert_eq!(page.deletion.marked_for_delete_at, 3_000_000);
+            for row in &page.rows {
+                rows += 1;
+                for (_, cell) in &row.cells {
+                    greatest = greatest.max(cell.timestamp);
+                }
+            }
+            let Some(last) = page.rows.last() else { break };
+            cursor = Some(last.clustering.clone());
+        }
+        assert_eq!(rows, 65, "physical cursor must cross both hidden pages");
+        assert_eq!(greatest, late_clock, "late future grant must be inspected");
+        assert!(engine.read_projection_rows(&tid, &key, None, 0).is_err());
+        assert!(engine
+            .read_projection_rows(&TableId::new("missing", "missing"), &key, None, 0)
+            .is_err());
+        writer
+            .apply(SystemTableMutation::GrantUpdated(GrantEntry {
+                role: "unrelated_role".into(),
+                resource: Resource::Keyspace("safe".into()),
+                permissions: [Permission::Select].into_iter().collect(),
+            }))
+            .unwrap();
+        writer
+            .apply(SystemTableMutation::RoleDropped(role.into()))
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        engine.force_commit_log_sync().unwrap();
+        drop(writer);
+        drop(engine);
+        let grants = SystemTableLoader::new(reopen_test_engine(dir.path()))
+            .load_role_permissions()
+            .unwrap();
+        assert!(!grants.iter().any(|g| g.role == role));
+        assert!(grants.iter().any(|g| g.role == "unrelated_role"));
+    }
+
+    #[tokio::test]
+    async fn canonical_regrant_survives_role_partition_tombstone() {
+        use ferrosa_schema::system::persistence::SystemTableMutation;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let mut writer = SystemTableWriter::new(Arc::clone(&engine));
+        writer.set_permission_timestamp_for_test(1);
+        let grant = GrantEntry {
+            role: "recreated_role".into(),
+            resource: Resource::Keyspace("ks".into()),
+            permissions: [Permission::Select].into_iter().collect(),
+        };
+        writer
+            .apply(SystemTableMutation::GrantUpdated(grant.clone()))
+            .unwrap();
+        writer
+            .apply(SystemTableMutation::RoleDropped(grant.role.clone()))
+            .unwrap();
+        let loader = SystemTableLoader::new(Arc::clone(&engine));
+        assert!(
+            loader.load_role_permissions().unwrap().is_empty(),
+            "drop must hide the old grant"
+        );
+        let tid = TableId::new("system_auth", "role_permissions");
+        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            grant.role.as_bytes().to_vec(),
+        ));
+        let deleted = engine.read_limited_rows(&tid, &key, 1).unwrap().unwrap();
+        assert!(
+            !deleted.deletion.is_live(),
+            "actual partition deletion must remain"
+        );
+        assert!(
+            engine
+                .read_clustering_row(&tid, &key, grant.resource.to_string().as_bytes())
+                .unwrap()
+                .is_none(),
+            "logical exact-row lookup omits deleted partition metadata"
+        );
+        writer
+            .apply(SystemTableMutation::GrantUpdated(GrantEntry {
+                permissions: [Permission::Modify].into_iter().collect(),
+                ..grant.clone()
+            }))
+            .unwrap();
+        assert!(
+            loader
+                .load_role_permissions()
+                .unwrap()
+                .iter()
+                .any(|g| g.role == grant.role
+                    && g.permissions == [Permission::Modify].into_iter().collect()),
+            "a newer grant must survive an older role partition tombstone"
+        );
+        engine.flush(&tid).unwrap();
+        engine.force_commit_log_sync().unwrap();
+        drop(loader);
+        drop(writer);
+        drop(engine);
+        let reopened = reopen_test_engine(dir.path());
+        assert!(
+            SystemTableLoader::new(reopened)
+                .load_role_permissions()
+                .unwrap()
+                .iter()
+                .any(|g| g.role == grant.role
+                    && g.permissions == [Permission::Modify].into_iter().collect()),
+            "regrant must survive cold reopen above the old partition deletion"
+        );
+    }
+
     /// A test engine whose memtable auto-flush threshold is a parameter, so a
     /// test can hold many small partitions resident without flush churn.
     fn test_engine_with_flush_threshold(
         dir: &std::path::Path,
         flush_threshold_bytes: u64,
     ) -> Arc<StorageEngine> {
-        let config = StorageEngineConfig {
+        Arc::new(StorageEngine::new(test_storage_config(dir, flush_threshold_bytes), None).unwrap())
+    }
+
+    fn test_storage_config(
+        dir: &std::path::Path,
+        flush_threshold_bytes: u64,
+    ) -> StorageEngineConfig {
+        StorageEngineConfig {
             commit_log: CommitLogConfig {
                 log_dir: dir.to_path_buf(),
                 checkpoint_dir: dir.to_path_buf(),
@@ -728,8 +1559,14 @@ mod tests {
             max_pending_replay_mutations_without_schema: 1024,
             memtable_num_shards: 64,
             cache_hot_window_secs: 900,
-        };
-        Arc::new(StorageEngine::new(config, None).unwrap())
+        }
+    }
+
+    fn reopen_test_engine(dir: &std::path::Path) -> Arc<StorageEngine> {
+        let (engine, pending) = StorageEngine::open(test_storage_config(dir, 4096), None).unwrap();
+        engine.register_system_tables().unwrap();
+        engine.replay_mutations(pending).unwrap();
+        Arc::new(engine)
     }
 
     fn test_schema() -> Schema {
