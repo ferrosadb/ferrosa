@@ -40,7 +40,10 @@ fn test_storage(dir: &std::path::Path) -> Arc<StorageEngine> {
         memtable_num_shards: 64,
         cache_hot_window_secs: 900,
     };
-    Arc::new(StorageEngine::new(config, None).unwrap())
+    let storage = Arc::new(StorageEngine::new(config, None).unwrap());
+    // Exercise the same canonical projection authority as real node startup.
+    storage.register_system_tables().unwrap();
+    storage
 }
 
 /// Create a test Schema instance.

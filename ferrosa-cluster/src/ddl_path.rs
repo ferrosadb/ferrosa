@@ -338,6 +338,21 @@ pub(crate) async fn pause_ddl_compactions(
     Ok(pauses)
 }
 
+/// Read the complete resource permission set after an authorized mutation.
+fn permission_poststate(
+    schema: &Schema,
+    role: &str,
+    resource: &ferrosa_schema::Resource,
+) -> Option<ferrosa_schema::GrantEntry> {
+    schema
+        .snapshot()
+        .grants
+        .get(role)?
+        .iter()
+        .find(|grant| grant.resource == *resource)
+        .cloned()
+}
+
 /// Apply an authorized direct operation synchronously under the schema lifecycle fence.
 ///
 /// Call from a blocking worker. The caller owns any required compaction pauses;
@@ -440,10 +455,14 @@ pub fn apply_direct(op: &DdlOperation, schema: &Schema, engine: &Arc<StorageEngi
             schema
                 .grant_internal(entry.clone())
                 .map_err(|e| ClusterError::Internal(format!("grant: {e}")))?;
+            let poststate =
+                permission_poststate(schema, &entry.role, &entry.resource).ok_or_else(|| {
+                    ClusterError::Internal("grant poststate missing after mutation".into())
+                })?;
             SystemTableWriter::new(Arc::clone(engine))
                 .apply(
                     ferrosa_schema::system::persistence::SystemTableMutation::GrantUpdated(
-                        entry.clone(),
+                        poststate,
                     ),
                 )
                 .map_err(ClusterError::Storage)?;
@@ -456,14 +475,19 @@ pub fn apply_direct(op: &DdlOperation, schema: &Schema, engine: &Arc<StorageEngi
             schema
                 .revoke_internal(role, resource, permission)
                 .map_err(|e| ClusterError::Internal(format!("revoke: {e}")))?;
+            use ferrosa_schema::system::persistence::SystemTableMutation;
+            let projection = match permission_poststate(schema, role, resource)
+                .filter(|grant| !grant.permissions.is_empty())
+            {
+                Some(poststate) => SystemTableMutation::GrantUpdated(poststate),
+                None => SystemTableMutation::PermissionRevoked {
+                    role: role.clone(),
+                    resource: resource.clone(),
+                    permission: *permission,
+                },
+            };
             SystemTableWriter::new(Arc::clone(engine))
-                .apply(
-                    ferrosa_schema::system::persistence::SystemTableMutation::PermissionRevoked {
-                        role: role.clone(),
-                        resource: resource.clone(),
-                        permission: *permission,
-                    },
-                )
+                .apply(projection)
                 .map_err(ClusterError::Storage)?;
         }
         DdlOperation::GrantRole {
@@ -1456,7 +1480,11 @@ mod tests {
     }
 
     fn test_storage(dir: &std::path::Path) -> Arc<StorageEngine> {
-        let config = StorageEngineConfig {
+        Arc::new(StorageEngine::new(test_storage_config(dir), None).unwrap())
+    }
+
+    fn test_storage_config(dir: &std::path::Path) -> StorageEngineConfig {
+        StorageEngineConfig {
             commit_log: CommitLogConfig {
                 log_dir: dir.to_path_buf(),
                 checkpoint_dir: dir.to_path_buf(),
@@ -1478,8 +1506,133 @@ mod tests {
             max_pending_replay_mutations_without_schema: 1024,
             memtable_num_shards: 64,
             cache_hot_window_secs: 900,
+        }
+    }
+
+    async fn direct_permission_poststate_roundtrip(partial_revoke: bool) {
+        use crate::system_table_loader::SystemTableLoader;
+        use ferrosa_schema::{GrantEntry, Permission, Resource, RoleMetadata};
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let engine = test_storage(dir.path());
+        engine.register_system_tables().unwrap();
+        let ddl = DdlPath::Direct {
+            schema: Arc::clone(&schema),
+            engine: Arc::clone(&engine),
         };
-        Arc::new(StorageEngine::new(config, None).unwrap())
+        ddl.execute(DdlOperation::CreateKeyspace(simple_keyspace("poststate")))
+            .await
+            .unwrap();
+        let role = RoleMetadata {
+            name: "direct_principal".into(),
+            is_superuser: false,
+            can_login: false,
+            salted_hash: None,
+            member_of: Default::default(),
+            scram: None,
+        };
+        ddl.execute(DdlOperation::CreateRole(role.clone()))
+            .await
+            .unwrap();
+        let resource = Resource::Keyspace("poststate".into());
+        let initial: HashSet<_> = if partial_revoke {
+            [Permission::Select, Permission::Modify]
+                .into_iter()
+                .collect()
+        } else {
+            [Permission::Select].into_iter().collect()
+        };
+        ddl.execute(DdlOperation::Grant(GrantEntry {
+            role: role.name.clone(),
+            resource: resource.clone(),
+            permissions: initial.clone(),
+        }))
+        .await
+        .unwrap();
+        let permissions = |grants: Vec<GrantEntry>| {
+            grants
+                .into_iter()
+                .find(|g| g.role == role.name && g.resource == resource)
+                .map(|g| g.permissions)
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            permissions(
+                SystemTableLoader::new(Arc::clone(&engine))
+                    .load_role_permissions()
+                    .unwrap()
+            ),
+            initial,
+            "initial persisted grant positive control"
+        );
+        let expected: HashSet<_> = if partial_revoke {
+            ddl.execute(DdlOperation::Revoke {
+                role: role.name.clone(),
+                resource: resource.clone(),
+                permission: Permission::Select,
+            })
+            .await
+            .unwrap();
+            [Permission::Modify].into_iter().collect()
+        } else {
+            ddl.execute(DdlOperation::Grant(GrantEntry {
+                role: role.name.clone(),
+                resource: resource.clone(),
+                permissions: [Permission::Modify].into_iter().collect(),
+            }))
+            .await
+            .unwrap();
+            [Permission::Select, Permission::Modify]
+                .into_iter()
+                .collect()
+        };
+        let snapshot = schema.snapshot();
+        let memory = snapshot
+            .grants
+            .get(&role.name)
+            .unwrap()
+            .iter()
+            .find(|g| g.resource == resource)
+            .unwrap()
+            .permissions
+            .clone();
+        assert_eq!(
+            memory, expected,
+            "actual Direct schema mutation must retain its poststate"
+        );
+        let stored = permissions(
+            SystemTableLoader::new(Arc::clone(&engine))
+                .load_role_permissions()
+                .unwrap(),
+        );
+        let tid = ferrosa_storage::TableId::new("system_auth", "role_permissions");
+        engine.flush(&tid).unwrap();
+        engine.force_commit_log_sync().unwrap();
+        drop(snapshot);
+        drop(ddl);
+        drop(schema);
+        drop(engine);
+        let (reopened, pending) =
+            StorageEngine::open(test_storage_config(dir.path()), None).unwrap();
+        reopened.register_system_tables().unwrap();
+        reopened.replay_mutations(pending).unwrap();
+        let cold = permissions(
+            SystemTableLoader::new(Arc::new(reopened))
+                .load_role_permissions()
+                .unwrap(),
+        );
+        assert!(stored == expected && cold == expected,
+            "Direct permission projection must persist full poststate: memory={memory:?}, stored={stored:?}, cold={cold:?}, expected={expected:?}");
+    }
+
+    #[tokio::test]
+    async fn direct_permission_poststate_keeps_grant_union() {
+        direct_permission_poststate_roundtrip(false).await;
+    }
+
+    #[tokio::test]
+    async fn direct_permission_poststate_keeps_partial_revoke_remainder() {
+        direct_permission_poststate_roundtrip(true).await;
     }
 
     fn simple_keyspace(name: &str) -> KeyspaceMetadata {

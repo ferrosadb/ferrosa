@@ -53,10 +53,10 @@ mod tests {
         assert_eq!(ab, oracle, "merge_partitions must match the oracle");
     }
 
-    /// When a write and a delete carry the same timestamp, the write is favored
-    /// and the data is preserved (Ferrosa's chosen equal-timestamp reconciliation).
+    /// An equal-timestamp delete dominates a write in both source orders and
+    /// the independently stated oracle, so compaction cannot resurrect data.
     #[test]
-    fn write_wins_over_tombstone_on_equal_timestamp() {
+    fn tombstone_wins_over_write_on_equal_timestamp() {
         let write = partition(vec![(0, CellValue::live(b"v".to_vec(), 7))], 7);
         let del = partition(vec![(0, CellValue::tombstone(7, 100))], 7);
 
@@ -67,9 +67,28 @@ mod tests {
         assert_eq!(ab, ba, "merge must be order-independent");
         assert_eq!(ab, oracle, "merge must match the oracle");
         assert!(
-            ab.rows[0].cells[0].1.value.is_some(),
-            "the write must survive the equal-timestamp tie, got a tombstone"
+            ab.rows[0].cells[0].1.value.is_none(),
+            "an equal-timestamp tombstone must survive compaction"
         );
+    }
+    #[test]
+    fn oracle_same_value_ttl_ties_match_total_order() {
+        let lower = partition(
+            vec![(0, CellValue::expiring(b"same".to_vec(), 2000, 60, 200))],
+            2000,
+        );
+        let higher = partition(
+            vec![(0, CellValue::expiring(b"same".to_vec(), 2000, 90, 200))],
+            2000,
+        );
+        let expected = oracle_merge(&[lower.clone(), higher.clone()]);
+        assert_eq!(expected.rows[0].cells[0].1.ttl, 90);
+        assert_eq!(
+            merge_partitions(vec![lower.clone(), higher.clone()]),
+            expected
+        );
+        assert_eq!(oracle_merge(&[higher.clone(), lower.clone()]), expected);
+        assert_eq!(merge_partitions(vec![higher, lower]), expected);
     }
 }
 

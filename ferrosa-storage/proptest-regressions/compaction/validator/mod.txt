@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f0099306ba41834bd640799730b7832b7e53eb7211cef5a0fd3bd60a04ea7a39 # shrinks to sources = [Partition { key: DecoratedKey { token: Token(5303797501861836210), key: PartitionKey([107]) }, deletion: DeletionTime { marked_for_delete_at: -9223372036854775808, local_deletion_time: 4294967295 }, static_row: None, rows: [Row { clustering: [99, 0], cells: [(1, CellValue { value: None, timestamp: 3, ttl: 0, local_deletion_time: 50, path: None })], deletion: DeletionTime { marked_for_delete_at: -9223372036854775808, local_deletion_time: 4294967295 }, primary_key_liveness: LivenessInfo { timestamp: 1, ttl: 0, local_deletion_time: 2147483647 } }] }, Partition { key: DecoratedKey { token: Token(5303797501861836210), key: PartitionKey([107]) }, deletion: DeletionTime { marked_for_delete_at: -9223372036854775808, local_deletion_time: 4294967295 }, static_row: None, rows: [Row { clustering: [99, 0], cells: [(1, CellValue { value: Some([0]), timestamp: 3, ttl: 0, local_deletion_time: 2147483647, path: None })], deletion: DeletionTime { marked_for_delete_at: -9223372036854775808, local_deletion_time: 4294967295 }, primary_key_liveness: LivenessInfo { timestamp: 1, ttl: 0, local_deletion_time: 2147483647 } }] }]

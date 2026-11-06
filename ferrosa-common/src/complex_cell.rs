@@ -61,19 +61,39 @@ pub fn reconcile(a: &CellValue, b: &CellValue) -> CellValue {
 
 /// [`reconcile`] by reference: the winner of the two, without copying it.
 pub fn reconcile_ref<'a>(a: &'a CellValue, b: &'a CellValue) -> &'a CellValue {
-    use std::cmp::Ordering;
-    match a.timestamp.cmp(&b.timestamp) {
-        Ordering::Greater => a,
-        Ordering::Less => b,
-        Ordering::Equal => match (a.is_tombstone(), b.is_tombstone()) {
-            // Equal timestamp: a deletion wins the tie (Cassandra semantics).
-            (true, false) => a,
-            (false, true) => b,
-            // Same kind: deterministic total-order tiebreak (larger value / cell wins),
-            // symmetric so `reconcile(a,b) == reconcile(b,a)`.
-            _ => a.max(b),
-        },
+    if reconcile_cmp(a, b).is_gt() {
+        a
+    } else {
+        b
     }
+}
+
+/// The cell ordering shared by memtable, read/compaction, and repair merges.
+/// Timestamp wins first; at equal timestamps deletion wins, then the existing
+/// full-cell ordering breaks same-kind ties. Equal cells do not supersede one
+/// another. This compares borrowed bytes and allocates no payload buffers.
+pub fn reconcile_cmp(a: &CellValue, b: &CellValue) -> std::cmp::Ordering {
+    reconcile_cmp_with_values(a, a.value.as_deref(), b, b.value.as_deref())
+}
+
+/// Compare cells using borrowed payload views supplied by a deferred reader.
+/// Each view must have the same presence as its cell's value. Metadata and
+/// payload ordering are identical to [`reconcile_cmp`], without owning bytes.
+pub fn reconcile_cmp_with_values(
+    a: &CellValue,
+    a_value: Option<&[u8]>,
+    b: &CellValue,
+    b_value: Option<&[u8]>,
+) -> std::cmp::Ordering {
+    debug_assert_eq!(a.value.is_some(), a_value.is_some());
+    debug_assert_eq!(b.value.is_some(), b_value.is_some());
+    a.timestamp
+        .cmp(&b.timestamp)
+        .then_with(|| a.is_tombstone().cmp(&b.is_tombstone()))
+        .then_with(|| a_value.cmp(&b_value))
+        .then_with(|| a.ttl.cmp(&b.ttl))
+        .then_with(|| a.local_deletion_time.cmp(&b.local_deletion_time))
+        .then_with(|| a.path.cmp(&b.path))
 }
 
 /// A complex (collection) column as a set of per-element cells reconciled by

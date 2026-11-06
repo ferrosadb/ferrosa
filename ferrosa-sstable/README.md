@@ -640,3 +640,5 @@ and byte/corruption assertions are retained.
 ## Single-row COUNT pushdown
 
 `PartitionIter` exposes its current partition position, source serialization header and an independent read at that position. The liveness-count consumer uses these pinned-source bookmarks before iterator refill when cell values are necessary to resolve TTL/deletion visibility. `Row::is_visible_at` supplies the shared primary-key/cell TTL and row-deletion predicate used by the row bridge and exact single-row counter.
+
+Both cell materialization and projection skipping reject unknown cell-flag bits before interpreting payloads. Writers retain the existing cell encoding; this reader gate does not add sequence-first reconciliation or a new generation field.

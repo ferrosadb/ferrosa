@@ -98,7 +98,7 @@ fn member(host_id: Uuid) -> NodeInfo {
 /// a peer manager, the committed ring of all `voters`, and `up` as the
 /// connected peers. Its Raft directory is `dir/raft`, where the dissolution
 /// marker lives.
-fn controller_for(
+async fn controller_for(
     cluster: &TestCluster,
     node_id: u64,
     voters: u64,
@@ -119,10 +119,9 @@ fn controller_for(
         Arc::new(HandlerRegistry::new()),
     );
     controller.set_mode_for_test(DeploymentMode::Cluster);
-    controller.set_raft_for_dc(
-        "dc1",
-        cluster.raft_for_node_id(node_id).expect("harness voter"),
-    );
+    cluster
+        .publish_controller_group(node_id, &controller, "dc1")
+        .await;
     controller.set_peer_manager(Arc::new(ferrosa_net::peer::PeerManager::new(
         Arc::new(NetConfig::default()),
         controller.host_id(),
@@ -233,8 +232,8 @@ async fn a_returning_member_cannot_form_a_majority_beside_the_pair() {
     let cluster = formed(3).await;
     cluster.isolate_by_node_id(3);
     let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let a = controller_for(&cluster, 1, 3, &[2], dir_a.path());
-    let b = controller_for(&cluster, 2, 3, &[1], dir_b.path());
+    let a = controller_for(&cluster, 1, 3, &[2], dir_a.path()).await;
+    let b = controller_for(&cluster, 2, 3, &[1], dir_b.path()).await;
     a.set_pair_dissolve_transport_for_test(Arc::new(InProcess { peer: b.clone() }));
 
     a.downgrade_to_pair(Some(host_for(2)))
@@ -296,8 +295,8 @@ async fn a_restarted_pair_node_stays_out_of_raft_and_refuses_former_members() {
     let cluster = formed(3).await;
     cluster.isolate_by_node_id(3);
     let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let a = controller_for(&cluster, 1, 3, &[2], dir_a.path());
-    let b = controller_for(&cluster, 2, 3, &[1], dir_b.path());
+    let a = controller_for(&cluster, 1, 3, &[2], dir_a.path()).await;
+    let b = controller_for(&cluster, 2, 3, &[1], dir_b.path()).await;
     a.set_pair_dissolve_transport_for_test(Arc::new(InProcess { peer: b.clone() }));
     a.downgrade_to_pair(Some(host_for(2)))
         .await
@@ -357,8 +356,8 @@ async fn a_restarted_pair_node_stays_out_of_raft_and_refuses_former_members() {
 async fn a_downgrade_whose_downed_members_hold_a_majority_is_refused() {
     let cluster = formed(5).await;
     let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let a = controller_for(&cluster, 1, 5, &[2], dir_a.path());
-    let b = controller_for(&cluster, 2, 5, &[1], dir_b.path());
+    let a = controller_for(&cluster, 1, 5, &[2], dir_a.path()).await;
+    let b = controller_for(&cluster, 2, 5, &[1], dir_b.path()).await;
     a.set_pair_dissolve_transport_for_test(Arc::new(InProcess { peer: b.clone() }));
 
     let err = a
@@ -379,7 +378,7 @@ async fn a_downgrade_whose_downed_members_hold_a_majority_is_refused() {
 async fn a_downgrade_the_peer_does_not_confirm_changes_nothing() {
     let cluster = formed(3).await;
     let dir_a = tempfile::tempdir().unwrap();
-    let a = controller_for(&cluster, 1, 3, &[2], dir_a.path());
+    let a = controller_for(&cluster, 1, 3, &[2], dir_a.path()).await;
     a.set_pair_dissolve_transport_for_test(Arc::new(Unreachable));
 
     let err = a

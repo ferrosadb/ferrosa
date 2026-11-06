@@ -1842,6 +1842,44 @@ The `test-support` feature exposes a callback that holds the active commit-log
 segment's existing file mutex. Sibling-crate progress tests use it to exercise
 real flush/fsync contention with deterministic release and ordinary storage I/O.
 
+
+### Bounded physical projection metadata
+
+`StorageEngine::read_projection_rows` is a nonzero-bounded, exclusive-cursor
+metadata read for serialized canonical projection writers. It merges source
+metadata without deletion suppression, preserving hidden row tombstones and
+physical clustering cursors; table/partition deletion watermarks remain attached.
+It is not a logical query result. Existing read APIs retain their deletion
+visibility rules and retry/corruption policy. Memory remains bounded by source
+count times the requested page size.
+
+
+### Consistent cell ties across storage paths
+
+Read, compaction and repair cell comparison delegates to the same common ordering as the memtable. An equal-timestamp cell deletion therefore remains a deletion across a flush and cold reopen. This changes reconciliation of previously conflicting ties, not the SSTable or commit-log format.
+
+WAL readers reject future header versions before interpreting entries. The writer still emits the existing version; a future mutation generation requires a compatible reader rollout across WAL and Pair transport.
+
+Deferred compaction uses canonical cell reconciliation for both current heads and duplicate-row batches, including equal-timestamp tombstones and TTL ties. Payload comparison retains the existing reusable buffers; metadata-determined losers do not fetch values.
+
+### Checked store writer retirement
+
+`TableStore::retire_checked(writer_deadline)` closes new row writes, propagates
+rotation-barrier errors, then seals and drains admitted writers in the current
+memtable. Late truncates are refused. A drain failure remains closed and returns
+an error; a later retry can confirm completion after the existing writers leave.
+Rows already held in the memtable remain readable. This does not flush those rows,
+drain readers or compaction, or authorize replacing physical files. Recovery callers
+must establish those separate boundaries before issuing an installed-content receipt.
+
+### Unregister failure phases
+
+`unregister_table_classified` distinguishes failed directory cleanup from failures
+creating durable drop/sweep intents or retiring the writer. Only the cleanup
+phase follows checked writer retirement and registry removal. The legacy
+`unregister_table` surface still returns the original error. This phase result
+does not certify reader drain, physical checkpoint adoption or recovery admission.
+
 ### Isolated physical checkpoint staging
 
 `recovery_checkpoint::{stage_checkpoint, resume_checkpoint_stage}` copy an explicitly

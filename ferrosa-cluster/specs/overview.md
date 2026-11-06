@@ -39,6 +39,39 @@ machine but are otherwise loosely coupled:
 4. **Anti-entropy** — Merkle repair + hinted handoff to converge replicas.
 5. **Transactions** — Accord for strict-serializable multi-key / LWT operations.
 
+Raft command apply stages metadata in an owned blocking job together with physical
+schema effects and system-table writes. A retained handle fences later trait
+calls across cancellation; completed state and applied indexes publish in order.
+Committed local Schema/Engine effect failures and projection failures propagate
+through that job and prevent publishing its metadata/index. Ordinary command
+rejection remains non-fatal. For DROP, only directory cleanup after durable
+intents and checked writer/registry retirement is a typed statement refusal.
+Pre-retirement intent or persistence failures remain hard faults; the original
+physical table can still be live, so its index must not advance. A CREATE whose
+registration the node refuses (`register_table`: an unremovable same-name
+directory, `EACCES`, a mount point) and an ALTER of a table its engine holds no
+registration for are the same class — committed metadata plus a refused
+statement, not a log this node could not apply. `ApplyError::fences_replica`
+classifies every variant explicitly; a latch means the durable bytes are
+untrustworthy, never that a statement was refused. The process-local failure latch
+prevents later snapshots or successful apply results. A failed persisted restore
+retains the previous Raft metadata and refuses consensus startup/readiness,
+preserving its files rather than adopting a purge point on a failed restore.
+This is not a rollback of already visible physical effects or automatic recovery.
+Snapshot file publication and network agreement deadlines are separate
+boundaries.
+
+Physical retirement also owns the actual OpenRaft SM loop lifetime, independently
+of Core's shutdown join. A sealed start/publication registry waits for that owner
+and every retained blocking job, then verifies applied coverage of durable
+commitment before Pair takes authority. Snapshot completion advances that coverage;
+orphaned job panics retain failure even if an async lease share survives unwind.
+Public retirement operations use a nonblocking operation permit before phase one.
+Intent-only/legacy dissolution records refuse standalone/Pair restart authority;
+`retirement_complete` is persisted only after the drain and final mode check.
+These guards add no per-entry fsync and do not implement automatic failed-apply
+repair or prove legacy/mixed-version peer receipts.
+
 ## Module map
 
 | Module | Responsibility |
@@ -261,9 +294,16 @@ identities and digest ordering are unchanged.
 
 PostgreSQL replica apply acquires each MVCC observer's lifecycle lease before preparing row images and retains the leases through the complete atomic storage batch and publication. Stale table UUIDs reject the whole batch before any storage effect; a fresh applier also rejects replay into a replacement incarnation. Schema/storage reconciliation uses synchronous lifecycle write fences with the lifecycle fence acquired before registry/storage locks; no guard spans an await. PostgreSQL metadata without incarnation UUIDs requires explicit upgrade handling and is refused by the new observer.
 
-Raft restore retires physical rows when authoritative incoming schema names a different UUID, then installs the replacement; storage/schema reconciliation errors propagate instead of reporting a successful snapshot. Direct DDL and pair catch-up retain one write fence across registry and storage transitions. The all-serving TRUNCATE fan-out is a separate raw-marker path and is not covered by the MVCC observer lease.
+Installed Raft snapshots retire physical rows when authoritative incoming schema names a different UUID, then install the replacement; storage/schema reconciliation errors propagate instead of reporting a successful snapshot. Direct DDL and pair catch-up retain one write fence across registry and storage transitions. The all-serving TRUNCATE fan-out is a separate raw-marker path and is not covered by the MVCC observer lease.
 
-Storage schemas now persist the authoritative UUID in the reserved `ferrosa.table_id` extension (overwriting caller-supplied values). Restore prefers that provenance, with the local schema registry supplying legacy provenance when available. Unidentified data or malformed UUID metadata is refused before any table is retired; recoverable data is preserved for explicit repair. Empty registrations can adopt the incoming schema.
+Storage schemas now persist the authoritative UUID in the reserved `ferrosa.table_id` extension (overwriting caller-supplied values). Restore prefers that provenance, with the local schema registry supplying legacy provenance when available. Unidentified data or malformed UUID metadata is refused before any table is retired; recoverable data is preserved for explicit repair. Empty registrations without UUID metadata can adopt the incoming schema.
+
+Persisted startup snapshots do not establish ordering against a different local
+physical UUID. The startup path validates all incoming table bindings and refuses
+replacement before any retirement, preserving newer durable rows and the original
+snapshot for verified committed-log recovery. It reuses the existing validation
+pass without another decode, state copy or per-apply fsync. This guard is distinct
+from reconstructing the committed target and from automatic failure repair.
 
 ## Single-row COUNT pushdown
 
@@ -346,3 +386,65 @@ live caller retains its share through peer ACK and the strict archive barrier.
 Inbound handlers retain their existing primary apply/replicate-back and secondary
 apply-only behavior; they acquire no nested handoff read lease. Cancellation
 produces no successful ACK and can leave an unacknowledged local write.
+
+
+### Durable snapshot file promotion
+
+Snapshot writers coordinate through a persistent per-path writer lock. The
+comparison with the stored log and membership positions and the durable rename
+run under that same lock, so a delayed builder cannot overwrite a newer file.
+A stale candidate synchronizes the accepted file and directory before reporting
+success. Before accepting a stale candidate, complete outer-record framing is
+validated with bounded read scratch rather than another payload allocation.
+This framing check is not a checksum or semantic bit-rot guarantee.
+
+Each attempt creates its own staging file and streams the existing bincode
+format into it. File and parent-directory synchronization failures propagate;
+failed or unwound attempts remove only their own staging file. Cancellation of
+an async waiter does not cancel an already-running blocking file operation.
+This file-ownership rule is separate from state-machine restore publication.
+
+
+### Role projection clock and reload visibility
+
+Role-row updates advance beyond the stored role cells and row/partition deletion
+clock before writing, including after wall-clock regression. Checked exhaustion
+fails the projection. The role lookup retains at most one target row and one
+metadata row. Role and permission reload accepts newer cells above older partition
+tombstones. This is a node-local serialized-writer rule; other schema projection
+families and role-membership partition reconciliation have separate ordering rules.
+
+
+### Physical projection timestamp inspection
+
+Role deletion and permission regrant inspect physical metadata through bounded
+32-row pages, including rows hidden by an older partition tombstone. The
+node-local serialized writer chooses a checked successor beyond stored cells,
+row deletions and partition deletions; clock ties/regression cannot resurrect a
+removed role or suppress a later grant. Role deletion preflights role, grant
+and owned-membership clocks before its first write. Role updates replace the
+owned membership partition, then write exactly the stored parents above that
+delete; a revoked parent is not retained. Keyspace, table/column, index, type and
+function rows use the same checked successor and restamp all their cells and
+liveness/deletion metadata. This is serialized node-local ordering, not
+concurrent or cross-node timestamp arbitration. Membership reload and cleanup of
+other roles that reference a dropped parent are separate concerns.
+
+
+### Direct permission projection poststate
+
+The Direct DDL path persists the complete resource permission set after both grants and partial revokes. A revoke writes the existing deletion projection only when the remaining set is empty. The existing schema lifecycle fence covers mutation and poststate lookup; no transaction rollback or new acknowledgment durability guarantee is implied.
+
+### Group-scoped retirement
+
+`ModeController::retire_raft_group_for_recovery` requires the exact quarantined
+admission epoch and completed publication drain. The physical-worker registry
+then fences only the selected group before awaiting its Core and physical owner.
+Retries retain the same scope and failed-owner history. While it is fenced,
+ordinary group starts/publication and global Pair retirement refuse; unrelated
+group registration remains available. The returned observations are quiescence
+and log-position evidence, not a storage-adoption or healthy-state receipt.
+There is no fault-clear or replacement-release operation in this prerequisite.
+
+
+Recovery sessions retain a durable pre-effect guard beside each Raft group directory. The guard is armed before an apply group's physical effects and settles once they all complete, so a restart after completed applies replays the un-snapshotted log tail as normal. Only a group interrupted mid-effect, or one whose apply failed or panicked, is an unsafe restart. After an unsafe restart, native startup keeps admission closed, drains that group’s actual state-machine owner, and records the retirement scope plus committed and purged bounds for repair preparation. Repeated peer discovery retains that session rather than reopening its files. Preparation does not authorize data installation, Core replacement, or healthy admission; verified physical-data installation and the corresponding release path remain unfinished.
