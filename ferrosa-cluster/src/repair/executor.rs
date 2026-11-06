@@ -206,7 +206,6 @@ impl RepairStore for StorageEngineRepairStore {
                 .map_err(|e| format!("read_token_range_bounded: {e}"))
             })
             .await
-            .await
             .map_err(|e| format!("read_range_chunked join: {e}"))?
             .map(|(chunk, next)| {
                 (
@@ -240,7 +239,6 @@ impl RepairStore for StorageEngineRepairStore {
                 Ok(())
             })
             .await
-            .await
             .map_err(|e| format!("apply_partitions join: {e}"))?
     }
 
@@ -268,7 +266,6 @@ impl RepairStore for StorageEngineRepairStore {
                 super::build_tree_for_range(&engine, &table, range_start, range_end)
                     .map_err(|e| format!("build_tree_for_range: {e}"))
             })
-            .await
             .await
             .map_err(|e| format!("build_merkle join: {e}"))?
     }

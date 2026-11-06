@@ -1550,7 +1550,6 @@ impl ModeController {
                             ))
                         })
                         .await
-                        .await
                         .map_err(|e| e.to_string())?
                         .map_err(|e| e.to_string())?;
                     admission

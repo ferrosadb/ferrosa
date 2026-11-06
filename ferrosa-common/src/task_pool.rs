@@ -155,23 +155,40 @@ impl TaskPool {
     /// If the pool's semaphore has been closed. It never is: that would be a
     /// programming error in this module, and running unbounded instead would
     /// hide it.
-    pub async fn spawn_blocking<F, R>(&self, f: F) -> tokio::task::JoinHandle<R>
+    pub fn spawn_blocking<F, R>(&self, f: F) -> tokio::task::JoinHandle<R>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
         refuse_reentry(self.name);
-        let permit = admission_for(self.name).acquire().await;
         let name = self.name;
-        let job = move || {
-            let _permit = permit;
-            let _held = HeldPermit::enter(name);
-            f()
+        let admission = admission_for(name);
+        // Admission is awaited inside the spawned task, not by the caller. Returning the
+        // handle immediately keeps the two properties callers already rely on: the job
+        // starts without being polled, and dropping the handle detaches it rather than
+        // cancelling work that may already be running. A job still waiting for a permit
+        // waits as a task, not on a blocking thread, which is the bound this pool exists
+        // to enforce.
+        let runner = async move {
+            let permit = admission.acquire().await;
+            let job = move || {
+                let _permit = permit;
+                let _held = HeldPermit::enter(name);
+                f()
+            };
+            // The handle this returns must have the same shape the caller had before:
+            // a panic in the job surfaces as the caller's own `JoinError`, not as a
+            // nested one it has no arm for.
+            match tokio::task::spawn_blocking(job).await {
+                Ok(value) => value,
+                Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                Err(error) => std::panic::resume_unwind(Box::new(error)),
+            }
         };
         if let Some(runtime) = &self.runtime {
-            runtime.spawn_blocking(job)
+            runtime.spawn(runner)
         } else {
-            tokio::task::spawn_blocking(job)
+            tokio::spawn(runner)
         }
     }
 
@@ -540,12 +557,10 @@ mod tests {
                 let entered = Arc::clone(&entered);
                 let release_rx = release_rx.clone();
                 tokio::spawn(async move {
-                    let handle = pool
-                        .spawn_blocking(move || {
-                            entered.fetch_add(1, Ordering::AcqRel);
-                            release_rx.recv().expect("release sender alive");
-                        })
-                        .await;
+                    let handle = pool.spawn_blocking(move || {
+                        entered.fetch_add(1, Ordering::AcqRel);
+                        release_rx.recv().expect("release sender alive");
+                    });
                     handle.await.expect("blocking job must not panic");
                 })
             })
@@ -589,9 +604,7 @@ mod tests {
         let second = TaskPool::current(POOL);
         let (release_tx, release_rx) = crossbeam_channel::bounded::<()>(1);
 
-        let holder = first
-            .spawn_blocking(move || release_rx.recv().expect("release sender alive"))
-            .await;
+        let holder = first.spawn_blocking(move || release_rx.recv().expect("release sender alive"));
         let blocked = tokio::time::timeout(
             Duration::from_millis(200),
             second.spawn_blocking(|| "second"),
@@ -602,8 +615,7 @@ mod tests {
             "a second TaskPool of the same name was admitted past the shared bound"
         );
 
-        let second_job =
-            tokio::spawn(async move { second.spawn_blocking(|| "second").await.await });
+        let second_job = tokio::spawn(async move { second.spawn_blocking(|| "second").await });
         wait_for("the second instance to wait", || {
             first.blocking_stats().waiting == 1
         })
@@ -626,10 +638,7 @@ mod tests {
         let runtime = tokio::runtime::Handle::current();
         let inner = pool.clone();
         let outcome = pool
-            .spawn_blocking(move || {
-                runtime.block_on(async { inner.spawn_blocking(|| 1).await.await })
-            })
-            .await
+            .spawn_blocking(move || runtime.block_on(async { inner.spawn_blocking(|| 1).await }))
             .await;
         let err = outcome.expect_err("re-entering the same pool must panic");
         let message = err
@@ -648,10 +657,7 @@ mod tests {
         let other = TaskPool::current("test-reentry-other");
         let runtime = tokio::runtime::Handle::current();
         let nested = pool
-            .spawn_blocking(move || {
-                runtime.block_on(async { other.spawn_blocking(|| 2).await.await })
-            })
-            .await
+            .spawn_blocking(move || runtime.block_on(async { other.spawn_blocking(|| 2).await }))
             .await
             .expect("calling another pool from a job is allowed");
         assert_eq!(nested.expect("inner job"), 2);
@@ -665,7 +671,6 @@ mod tests {
 
         let panicked = pool
             .spawn_blocking(|| panic!("deliberate test panic"))
-            .await
             .await;
         assert!(
             panicked.expect_err("the job panicked").is_panic(),
@@ -676,7 +681,7 @@ mod tests {
         let later = tokio::time::timeout(Duration::from_secs(5), pool.spawn_blocking(|| 7))
             .await
             .expect("a later job must be admitted after a panic released the permit");
-        assert_eq!(later.await.expect("later job"), 7);
+        assert_eq!(later.expect("later job"), 7);
     }
 
     #[test]

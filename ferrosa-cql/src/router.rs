@@ -117,7 +117,6 @@ async fn run_direct_schema_change<T: Send + 'static>(
             change(&core, &auth)
         })
         .await
-        .await
         .map_err(|error| CqlError::ServerError(format!("schema change task failed: {error}")))?
 }
 
@@ -16820,7 +16819,6 @@ async fn compile_assemblyscript_body(
         .spawn_blocking(move || {
             ferrosa_udf::component::compile_to_component(&nm, &source, &at, &rt)
         })
-        .await
         .await
         .map_err(|e| CqlError::Invalid(format!("AssemblyScript compile task panicked: {e}")))?
         .map_err(|e| CqlError::Invalid(format!("{e}")))?;

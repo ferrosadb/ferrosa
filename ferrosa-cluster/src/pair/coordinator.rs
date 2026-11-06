@@ -174,7 +174,6 @@ impl PairCoordinator {
                 coordinator.apply_locally(&mutation)
             })
             .await
-            .await
             .map_err(|error| ClusterError::Internal(format!("pair storage task failed: {error}")))?
     }
 
@@ -302,7 +301,6 @@ impl PairCoordinator {
                     .map_err(ClusterError::Storage)?;
                 Ok::<_, ClusterError>(mutations)
             })
-            .await
             .await
             .map_err(|error| {
                 ClusterError::Internal(format!("pair batch storage task failed: {error}"))
@@ -679,7 +677,6 @@ mod tests {
                     let _admitted = coordinator.handoff_gate().blocking_read();
                     coordinator.apply_locally(&mutation)
                 })
-                .await
                 .await
                 .expect("control storage job")
         } else {

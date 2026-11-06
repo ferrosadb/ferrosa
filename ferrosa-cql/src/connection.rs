@@ -278,7 +278,6 @@ where
             schema.authenticate(&username, &password)
         })
         .await
-        .await
         .unwrap_or(Err(ferrosa_schema::SchemaError::AuthenticationFailed))
 }
 

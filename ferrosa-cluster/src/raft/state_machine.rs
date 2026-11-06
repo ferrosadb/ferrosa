@@ -2794,7 +2794,6 @@ impl RaftSnapshotBuilder<FerrosRaftConfig> for FerrosStateMachine {
                     result
                 })
                 .await
-                .await
                 .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))??;
             self.mark_durably_applied(meta.last_log_id);
         }
@@ -2973,8 +2972,7 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
                                 job_lifecycle.fail(error);
                             }
                             result
-                        })
-                        .await;
+                        });
                     self.pending_apply = Some(PendingApply {
                         log_id: last_log_id,
                         job,
@@ -3067,7 +3065,6 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
                         }
                         result
                     })
-                    .await
                     .await
                     .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))??;
                 self.mark_durably_applied(meta.last_log_id);
@@ -5762,7 +5759,6 @@ mod tests {
                     let _ = finished.send(result);
                 })
                 .await
-                .await
                 .unwrap();
         });
         running.await.unwrap();
@@ -5771,12 +5767,12 @@ mod tests {
         let second_path = path.clone();
         let log_store_pool = ferrosa_net::task_pool::TaskPool::current("raft-log-store");
         let second = log_store_pool.spawn_blocking(move || {
-                FerrosStateMachine::persist_snapshot_to_disk(&second_path, &meta2, &bytes2)
-                    .map_err(Box::new)
-            });
+            FerrosStateMachine::persist_snapshot_to_disk(&second_path, &meta2, &bytes2)
+                .map_err(Box::new)
+        });
         coordinator.unlock().unwrap();
         completion.await.unwrap().unwrap();
-        second.await.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
 
         let stored: PersistedSnapshot =
             bincode::deserialize(&std::fs::read(&path).unwrap()).unwrap();
@@ -7377,11 +7373,11 @@ mod tests {
         let mut sm = FerrosStateMachine {
             pending_apply: Some(PendingApply {
                 log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 1),
-                job: ferrosa_net::task_pool::TaskPool::current("raft-poison-test")
-                    .spawn_blocking(|| -> ferrosa_common::Result<CompletedApply> {
+                job: ferrosa_net::task_pool::TaskPool::current("raft-poison-test").spawn_blocking(
+                    || -> ferrosa_common::Result<CompletedApply> {
                         panic!("intentional apply panic");
-                    })
-                    .await,
+                    },
+                ),
                 pauses: Arc::new(Vec::new()),
             }),
             ..Default::default()
