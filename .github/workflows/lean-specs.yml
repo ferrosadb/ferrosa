@@ -233,6 +233,12 @@ jobs:
           # Avoid bootstrap's unauthenticated latest-release discovery on fresh runners.
           opam --version
 
+      # The cached opam root carries the version of the opam that created it, and opam
+      # refuses to write a root newer than itself. Key the toolchain cache on the version
+      # too, so a toolchain change cannot restore a root it will never write.
+      - name: Record the opam version for the toolchain cache key
+        run: echo "OPAM_VERSION=$(opam --version)" >> "$GITHUB_ENV"
+
       - name: Ratchet and bootstrap contracts
         run: /usr/bin/python3 -m unittest -q tests.ci.test_lean_gap_ratchet tests.ci.test_lean_gap_ratchet_workflow tests.ci.test_lean_gap_bootstrap tests.ci.test_lean_gap_diagnostics
 
@@ -268,7 +274,31 @@ jobs:
           path: |
             ~/.local/opam
             aeneas/charon/charon/target
-          key: lean-gap-${{ env.AENEAS_COMMIT }}-${{ env.CHARON_COMMIT }}
+          key: lean-gap-${{ env.AENEAS_COMMIT }}-${{ env.CHARON_COMMIT }}-opam${{ env.OPAM_VERSION }}
+
+      # Belt and braces for a root restored from an older key: opam decides whether it may
+      # write a root by major.minor, so a root written by a newer opam is unusable even
+      # though the pins match. Discard a mismatched root and rebuild the switch: minutes,
+      # against a failure that reads as a code red on every PR touching a gated crate.
+      - name: Discard an opam root this opam cannot write
+        run: |
+          root="$HOME/.local/opam"
+          if [ ! -f "$root/config" ]; then
+            echo "no cached opam root"
+            exit 0
+          fi
+          recorded=$(sed -n 's/^opam-version: *"\([^"]*\)"$/\1/p' "$root/config" | head -1)
+          current=$(opam --version)
+          echo "opam root records ${recorded:-unknown}; opam in PATH is $current"
+          if [ -z "$recorded" ]; then
+            echo "::warning::cached opam root has no recorded version; discarding it"
+            rm -rf "$root"
+            exit 0
+          fi
+          if [ "$(echo "$recorded" | cut -d. -f1-2)" != "$(echo "$current" | cut -d. -f1-2)" ]; then
+            echo "::warning::discarding cached opam root ($recorded) because this opam is $current"
+            rm -rf "$root"
+          fi
 
       - name: Build the pinned toolchain
         run: |
