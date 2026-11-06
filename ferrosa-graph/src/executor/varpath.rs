@@ -4,8 +4,10 @@
 //! from an anchor through repeated hops within the specified min/max range.
 //! Uses a visited set for cycle detection (FMEA F2) and a total vertex
 //! budget for DoS protection (threat T13, FMEA F3).
-//! Last revised: 2026-11-03
-//! Last changed: Reject ambiguous logical anchor identity instead of using a physical partition key.
+//! Last revised: 2026-11-04
+//! Last changed: ORDER BY rows go straight into the spilling sink with hidden
+//!   sort keys, and the result is returned as a stream
+//!   (`execute_var_length_streaming`) that the dispatch hands to the transport.
 
 use crate::executor::io::GraphWrite;
 
@@ -25,10 +27,11 @@ use crate::error::{GraphError, Result};
 use crate::executor::eval;
 use crate::executor::expand::{
     build_columns, check_timeout, expected_adjacency_direction, extract_column_bytes_from_row,
-    graph_vertex_lookup_key, row_to_json, sort_rows, table_metadata_for, traversable_neighbor_id,
+    graph_vertex_lookup_key, row_to_json, table_metadata_for, traversable_neighbor_id,
     GraphEngineConfig,
 };
 use crate::executor::result::{GraphResult, QueryStats};
+use crate::executor::spill::{OrderSemantics, RowAcc};
 use crate::parser::Direction;
 use crate::parser::ReturnClause;
 use crate::planner::physical::{Anchor, Hop};
@@ -62,11 +65,11 @@ fn admit_neighbor(
     Ok(())
 }
 
-/// Execute a variable-length path expansion using BFS.
+/// Execute a variable-length path expansion using BFS, buffering the result.
 ///
-/// Traverses from anchor vertices through `min_hops..=max_hops` repetitions
-/// of the given hop. Uses a visited set for cycle detection and a total
-/// vertex budget for DoS protection (threat T13, FMEA F3).
+/// One implementation: this collects [`execute_var_length_streaming`] at the
+/// buffered `GraphResult` boundary — the caller asked for a whole result —
+/// rather than keeping a second tail that could drift from it.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_var_length(
     write_path: &dyn GraphWrite,
@@ -81,6 +84,51 @@ pub async fn execute_var_length(
     virtual_tables: Option<&VirtualTableRegistry>,
     schema: Option<&ferrosa_schema::Schema>,
 ) -> Result<GraphResult> {
+    let (columns, rows, stats) = execute_var_length_streaming(
+        write_path,
+        keyspace,
+        anchor,
+        hop,
+        min_hops,
+        max_hops,
+        return_clause,
+        config,
+        start,
+        virtual_tables,
+        schema,
+    )
+    .await?;
+    // `usize::MAX`, deliberately NOT `config.max_result_rows`: a cap here
+    // would be a silently truncated answer.
+    crate::executor::collect_to_graph_result(columns, rows, stats, usize::MAX).await
+}
+
+/// Execute a variable-length path expansion using BFS, returning the rows as
+/// a stream.
+///
+/// Traverses from anchor vertices through `min_hops..=max_hops` repetitions
+/// of the given hop. Uses a visited set for cycle detection and a total
+/// vertex budget for DoS protection (threat T13, FMEA F3).
+///
+/// Each projected row is pushed into a spilling sink as it is produced (no
+/// interim `Vec`). With an ORDER BY every order term is carried as a hidden
+/// key — so ordering by an expression that is not a projected column works,
+/// and spills, instead of being skipped; without one, the hidden key is the
+/// arrival number. The returned stream reads the merge on pull.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_var_length_streaming(
+    write_path: &dyn GraphWrite,
+    keyspace: &str,
+    anchor: &Anchor,
+    hop: &Hop,
+    min_hops: u32,
+    max_hops: u32,
+    return_clause: &ReturnClause,
+    config: &GraphEngineConfig,
+    start: Instant,
+    virtual_tables: Option<&VirtualTableRegistry>,
+    schema: Option<&ferrosa_schema::Schema>,
+) -> Result<(Vec<String>, crate::executor::RowStream<'static>, QueryStats)> {
     let mut stats = QueryStats::default();
 
     // Step 1: Anchor lookup — same as execute_expand.
@@ -392,7 +440,18 @@ pub async fn execute_var_length(
     // (t_4ce82a3e): an unbounded ORDER BY spills below instead of being capped.
     // Traversal is still bounded by `max_var_path_visited`, which limits WORK
     // (a DoS control), not the result buffer.
-    let mut rows = Vec::new();
+    //
+    // Every row goes straight into a spilling sink: with an ORDER BY, keyed by
+    // its order terms evaluated from the row's bindings; without one, keyed by
+    // arrival number so the stream keeps production order. Only the BFS result
+    // keys stay resident (bounded by `max_var_path_visited`), never the rows.
+    let mut acc = RowAcc::new(
+        &columns,
+        return_clause,
+        config,
+        "graph_varpath_order_by",
+        OrderSemantics::ProjectedColumns,
+    )?;
     for key in &result_keys {
         let partition = write_path.read(&proj_table_id, key).await?;
         let hex_id = hex::encode(key.key.as_bytes());
@@ -429,50 +488,20 @@ pub async fn execute_var_length(
             bindings.insert(anchor_var.to_string(), row_json);
         }
 
-        let row: Vec<serde_json::Value> = return_clause
-            .items
-            .iter()
-            .map(|item| eval::eval_expr(&item.expr, &bindings).unwrap_or(serde_json::Value::Null))
-            .collect();
-        rows.push(row);
+        let row = super::expand::eval_return_items(&return_clause.items, &bindings)?;
+        acc.push(row, &bindings)?;
     }
 
-    // Apply ORDER BY. An unbounded one spills through the storage engine's
-    // bounded external merge sort; `spill_order_by` returns false (leaving the
-    // in-memory sort) when it cannot apply — no backend, a LIMIT is present, or
-    // an order term is not a projected column.
-    if !return_clause.order_by.is_empty() {
-        let spilled =
-            crate::executor::spill::spill_order_by(&mut rows, &columns, return_clause, config)
-                .await?;
-        if !spilled {
-            sort_rows(&mut rows, &columns, &return_clause.order_by);
-        }
-    }
-
-    // Apply DISTINCT.
+    // ORDER BY, then DISTINCT, then LIMIT — on the stream.
     //
-    // Same bug the expand tail had: `Vec::dedup` only removes consecutive
-    // duplicates, so this sorted by debug representation to make them adjacent
-    // — AFTER the ORDER BY sort immediately above, silently replacing the order
-    // the query asked for. Deduplicating on a hash leaves the order alone.
-    if return_clause.distinct {
-        super::expand::dedup_preserving_order(&mut rows);
-    }
-
-    // Apply LIMIT.
-    if let Some(limit) = return_clause.limit {
-        let limit = limit.max(0) as usize;
-        rows.truncate(limit);
-    }
+    // DISTINCT dedups on a hash in first-seen order. It used to sort by debug
+    // representation to make duplicates adjacent for `Vec::dedup`, AFTER the
+    // ORDER BY sort, silently replacing the order the query asked for.
+    let rows = acc.into_stream(return_clause)?;
 
     stats.execution_ms = start.elapsed().as_millis() as u64;
 
-    Ok(GraphResult {
-        columns,
-        rows,
-        stats,
-    })
+    Ok((columns, rows, stats))
 }
 
 #[cfg(test)]
@@ -674,6 +703,44 @@ mod tests {
         }
     }
 
+    /// `RETURN 1 IN 2` over a var-length path: an evaluation error must fail
+    /// the query. The projection used `eval_expr(..).unwrap_or(Null)`, so it
+    /// came back as `Ok` with a Null cell.
+    #[tokio::test]
+    async fn varpath_projection_error_fails_the_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = setup_storage(tmp.path());
+        write_vertex(&storage, "test_ks", "person_v", b"A");
+        write_adjacency(&storage, "test_ks", b"A", "KNOWS", b"B");
+        let wp = WritePath::direct(storage);
+        let mut return_clause = simple_return("b");
+        return_clause.items[0].expr = Expr::In {
+            value: Box::new(Expr::Literal(crate::parser::Literal::Integer(1))),
+            list: Box::new(Expr::Literal(crate::parser::Literal::Integer(2))),
+        };
+        let result = execute_var_length(
+            &wp,
+            "test_ks",
+            &make_anchor("a"),
+            &make_hop("b"),
+            1,
+            1,
+            &return_clause,
+            &test_config(),
+            Instant::now(),
+            None,
+            None,
+        )
+        .await;
+        match result {
+            Err(err) => assert!(err.to_string().contains("IN expects a list"), "{err}"),
+            Ok(ok) => panic!(
+                "an evaluation error must fail the query, but it returned Ok({:?})",
+                ok.rows
+            ),
+        }
+    }
+
     #[tokio::test]
     async fn varpath_single_hop() {
         // Graph: A -> B (only A is written to person_v; B is discovered via adjacency)
@@ -823,6 +890,87 @@ mod tests {
         // A->B at depth 1, B->C at depth 2, C->A at depth 3 is cycle (A visited).
         // Result should have B and C (2 vertices).
         assert_eq!(result.rows.len(), 2);
+    }
+
+    /// `RETURN b AS who ORDER BY b DESC` over a var-length path.
+    ///
+    /// Two defects this pins. The rows were pushed into an interim `Vec` and
+    /// then drained into the sorter by `spill_order_by`, which collected the
+    /// merge back into a `Vec` (`finish_rows`) before the dispatch's buffered
+    /// fallback handed it on — so the spill bounded the sort buffer and nothing
+    /// else, and no run file outlived the call. And because `b` is not a
+    /// projected column name (the column is `who`), the sink refused the query
+    /// and `sort_rows` silently skipped the term: the rows came back in BFS
+    /// order, not the order asked for.
+    ///
+    /// Now each row is pushed into the sink as it is produced, with `b` as a
+    /// hidden key, and `ExpandVarLength` has a streaming dispatch entry, so the
+    /// run files are still on disk while the transport pulls — and the sorter,
+    /// spilling on every push, never held more than one row.
+    #[tokio::test]
+    async fn varpath_order_by_spills_incrementally_and_streams_in_order() {
+        use crate::executor::spill::test_support::{spilling_config, TempDirReserver};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = setup_storage(tmp.path());
+        write_vertex(&storage, "test_ks", "person_v", b"A");
+        // Inserted out of order so BFS order is not the sorted order.
+        let targets: [&[u8]; 5] = [b"B3", b"B1", b"B4", b"B0", b"B2"];
+        for target in targets {
+            write_adjacency(&storage, "test_ks", b"A", "KNOWS", target);
+        }
+        let wp = WritePath::direct(storage);
+
+        let spill_dir = tempfile::tempdir().unwrap();
+        let reserver = TempDirReserver::new(spill_dir.path());
+        let config = spilling_config(reserver.clone(), test_config());
+
+        let return_clause = ReturnClause {
+            distinct: false,
+            items: vec![ReturnItem {
+                expr: Expr::Var("b".to_string()),
+                alias: Some("who".to_string()),
+            }],
+            order_by: vec![crate::parser::OrderItem {
+                expr: Expr::Var("b".to_string()),
+                direction: crate::parser::SortDir::Desc,
+            }],
+            limit: None,
+        };
+        let plan = crate::planner::physical::PhysicalPlan::ExpandVarLength {
+            anchor: make_anchor("a"),
+            hop: make_hop("b"),
+            min_hops: 1,
+            max_hops: 1,
+            return_clause,
+        };
+
+        let (columns, mut rows, _stats) =
+            crate::executor::expand::execute_streaming(plan, &wp, "test_ks", &config, None, None)
+                .await
+                .unwrap();
+        assert_eq!(columns, vec!["who".to_string()]);
+        assert_eq!(
+            reserver.reserved_paths().len(),
+            1,
+            "the var-length ORDER BY must sort through the spill backend"
+        );
+        assert!(
+            reserver.live_run_files() > 1,
+            "the sorted runs must still be on disk while the stream is pulled; \
+             a collected result would already have removed them"
+        );
+
+        let mut got = Vec::new();
+        while let Some(row) = rows.next().await {
+            let row = row.unwrap();
+            assert_eq!(row.len(), 1, "a hidden sort key leaked into {row:?}");
+            got.push(row[0].as_str().unwrap().to_string());
+        }
+        let mut expected: Vec<String> = targets.iter().map(hex::encode).collect();
+        expected.sort();
+        expected.reverse();
+        assert_eq!(got, expected, "rows must arrive in ORDER BY b DESC order");
     }
 
     #[tokio::test]

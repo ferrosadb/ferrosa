@@ -478,7 +478,10 @@ async fn healed(engine: &GraphEngine) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     loop {
         match engine.ensure_adjacency_ready_for_test(KEYSPACE).await {
-            Ok(()) => return,
+            Ok(()) => {
+                heal_record_settled(engine).await;
+                return;
+            }
             Err(ferrosa_graph::error::GraphError::Unavailable(reason)) => {
                 assert!(
                     std::time::Instant::now() < deadline,
@@ -500,7 +503,13 @@ async fn first_heal_completes(engine: &GraphEngine) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     loop {
         match engine.ensure_adjacency_ready_for_test(KEYSPACE).await {
-            Ok(()) => return,
+            Ok(()) => {
+                assert!(
+                    heal_record_settled(engine).await,
+                    "the first heal completed but was not recorded"
+                );
+                return;
+            }
             Err(ferrosa_graph::error::GraphError::Unavailable(reason))
                 if reason.contains("the heal is still running") =>
             {
@@ -513,6 +522,17 @@ async fn first_heal_completes(engine: &GraphEngine) {
             Err(other) => panic!("the first heal did not complete: {other}"),
         }
     }
+}
+
+/// Wait for `engine`'s heal record to settle; returns whether it says the heal
+/// completed. The record is written after the traversal gate opens, so a test
+/// that restarts on the data dir or edits the record waits on this explicit
+/// signal first.
+async fn heal_record_settled(engine: &GraphEngine) -> bool {
+    engine
+        .adjacency_heal_recorded_for_test(KEYSPACE)
+        .await
+        .unwrap_or_else(|e| panic!("the adjacency heal record did not settle: {e}"))
 }
 
 /// Every traversal ferrosa-memory issues, for every vertex, all issued at once
@@ -1023,6 +1043,7 @@ async fn damage(
             live.remove(*e);
         }
     }
+    heal_record_settled(&old).await;
     drop(old);
     as_left_by_prefix_build(&node);
     (node, all, live)
@@ -1434,12 +1455,65 @@ async fn deleting_one_edge_type_keeps_its_sibling_traversable() {
     );
 }
 
+/// A traversal waits for the heal, never for the heal's durable record.
+///
+/// t_9930eb20: the gate awaited `heal_record::record_healed` (two fsyncs),
+/// which was the whole of a first-use heal's time. On the HTTP suite the
+/// reconcile took 0 ms and the record p50 190-405 ms, max 1.8 s, so loaded
+/// runs refused setup queries with "the heal is still running" (HTTP 503).
+/// Here the record write is held in flight; the gate must open anyway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readiness_does_not_wait_for_the_heal_record() {
+    let node = Node::new();
+    let data_dir = node.storage.data_dir().to_path_buf();
+    // A plain thread holds the record writer (a sync lock, never held across
+    // this test's awaits) until told to let go.
+    let writer =
+        ferrosa_graph::adjacency::heal_record::record_writer_lock_for_test(&data_dir).unwrap();
+    let (holding, held) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _guard = writer.lock();
+        holding
+            .send(())
+            .expect("the test waits for the writer to be held");
+        // Err means the test failed and dropped its sender: let go anyway.
+        if released.recv().is_err() {
+            eprintln!("record writer released because the test ended early");
+        }
+    });
+    held.recv()
+        .expect("the holder thread holds the record writer");
+    let engine = node.start_engine();
+    let ready = engine.ensure_adjacency_ready_for_test(KEYSPACE).await;
+    assert!(
+        ready.is_ok(),
+        "a completed heal must serve while its record is still being written, got {ready:?}"
+    );
+    assert!(
+        !ferrosa_graph::adjacency::heal_record::healed(&data_dir, KEYSPACE).unwrap(),
+        "the record write is held, so nothing can be recorded yet"
+    );
+    release
+        .send(())
+        .expect("the holder thread is waiting to let go");
+    holder.join().expect("the holder thread exits");
+    assert!(
+        engine
+            .adjacency_heal_recorded_for_test(KEYSPACE)
+            .await
+            .unwrap(),
+        "the completed heal is recorded once the writer is free"
+    );
+    assert!(ferrosa_graph::adjacency::heal_record::healed(&data_dir, KEYSPACE).unwrap());
+}
+
 /// A fully keyed but absent start vertex must terminate before reading any
 /// adjacency partition, even when the table already contains unrelated edges.
 #[tokio::test]
 async fn absent_keyed_start_does_not_scan_adjacency_partitions() {
     let node = Node::new();
-    let engine = node.start_engine();
+    let engine = node.healed_engine().await;
     let tenant = tenant_id(0);
     let session = session_id(0, 0);
 
@@ -2143,6 +2217,7 @@ mod at_scale {
                     live.remove(e);
                 }
             }
+            heal_record_settled(&old).await;
             drop(old);
             as_left_by_prefix_build(&node);
 

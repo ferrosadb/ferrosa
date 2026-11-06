@@ -659,8 +659,35 @@ impl crate::executor::spill::SpillReserver for StorageEngineSpill {
 /// waiting — a client timeout drops the request's future — leaves the heal
 /// running to completion instead of cancelling it half done. The error is the
 /// retryable reason the heal did not complete.
-type HealGate =
-    futures::future::Shared<futures::future::BoxFuture<'static, std::result::Result<(), String>>>;
+///
+/// `ready` resolves when the index is whole, which is all a traversal needs.
+/// `recorded` reports the durable heal record separately: the record only
+/// lets the NEXT start skip the heal, so it is written after `ready` resolves,
+/// never in front of it. It used to be awaited inside the gate, and its
+/// fsyncs (two `sync_all`s, behind a process-wide lock) were the whole of a
+/// first-use heal's time: on the HTTP suite the reconcile took 0 ms and the
+/// record p50 190-405 ms, max 1.8 s with the lock made per data dir, which
+/// put the gate past [`HEAL_WAIT_BUDGET`] and refused queries (t_9930eb20).
+#[derive(Clone)]
+struct HealGate {
+    ready: futures::future::Shared<
+        futures::future::BoxFuture<'static, std::result::Result<(), String>>,
+    >,
+    recorded: tokio::sync::watch::Receiver<HealRecordState>,
+}
+
+/// Where this process's heal of a keyspace stands in the durable record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HealRecordState {
+    /// The heal is running, or completed and its record is being written.
+    Pending,
+    /// The record says the heal completed: written by this heal, or found at
+    /// start (only the local catch-up ran).
+    Recorded,
+    /// Not recorded: the heal failed, or the record write failed (logged at
+    /// ERROR). The next start heals again.
+    NotRecorded,
+}
 
 /// The longest an adjacency query waits on a running heal before it is
 /// refused retryably. The heal is not tied to the query and goes on in its own
@@ -678,12 +705,14 @@ fn spawn_on_first_poll_heal(
     keyspace: String,
 ) -> HealGate {
     use futures::FutureExt;
-    async move {
+    let (record_tx, recorded) = tokio::sync::watch::channel(HealRecordState::Pending);
+    let ready = async move {
         let heal = tokio::spawn(heal_adjacency_unless_recorded(
             schema,
             write_path.load_full(),
             storage,
             keyspace,
+            record_tx,
         ));
         match heal.await {
             Ok(outcome) => outcome,
@@ -699,7 +728,52 @@ fn spawn_on_first_poll_heal(
         }
     }
     .boxed()
-    .shared()
+    .shared();
+    HealGate { ready, recorded }
+}
+
+/// Publish where the heal record stands. The receiver lives in the engine's
+/// gate map; once the gate is dropped (a failed heal forgotten, the engine
+/// dropped) nobody is waiting, and the record itself is unaffected.
+fn publish_record_state(tx: &tokio::sync::watch::Sender<HealRecordState>, state: HealRecordState) {
+    if tx.send(state).is_err() {
+        tracing::debug!(
+            ?state,
+            "graph engine: no one is waiting on the adjacency heal record"
+        );
+    }
+}
+
+/// Durably record a completed heal of `keyspace`, off the traversal path.
+async fn record_completed_heal(
+    data_dir: std::path::PathBuf,
+    keyspace: String,
+    record_tx: tokio::sync::watch::Sender<HealRecordState>,
+) {
+    let ks = keyspace.clone();
+    let state =
+        match tokio::task::spawn_blocking(move || heal_record::record_healed(&data_dir, &ks)).await
+        {
+            Ok(Ok(())) => HealRecordState::Recorded,
+            Ok(Err(e)) => {
+                tracing::error!(
+                    keyspace = %keyspace,
+                    error = %e,
+                    "graph engine: adjacency heal completed but was not recorded; the next start \
+                     heals again"
+                );
+                HealRecordState::NotRecorded
+            }
+            Err(join_error) => {
+                tracing::error!(
+                    keyspace = %keyspace,
+                    error = %join_error,
+                    "graph engine: recording the adjacency heal died; the next start heals again"
+                );
+                HealRecordState::NotRecorded
+            }
+        };
+    publish_record_state(&record_tx, state);
 }
 
 /// The heal of `keyspace`, unless this node already completed one
@@ -715,16 +789,24 @@ fn spawn_on_first_poll_heal(
 /// Fallbacks, both logged at ERROR: a record that cannot be read means heal
 /// (slow but correct); a completed heal that cannot be recorded still serves,
 /// and the next start heals again.
+///
+/// Returns as soon as the index is whole. The record of a completed heal is
+/// written by its own task afterwards ([`record_completed_heal`]) and reported
+/// on `record_tx`; the traversal gate never waits for it (see [`HealGate`]).
 async fn heal_adjacency_unless_recorded(
     schema: Arc<Schema>,
     wp: Arc<WritePath>,
     storage: Arc<StorageEngine>,
     keyspace: String,
+    record_tx: tokio::sync::watch::Sender<HealRecordState>,
 ) -> std::result::Result<(), String> {
     let data_dir = storage.data_dir().to_path_buf();
     let (dir, ks) = (data_dir.clone(), keyspace.clone());
     match tokio::task::spawn_blocking(move || heal_record::healed(&dir, &ks)).await {
-        Ok(Ok(true)) => return catch_up_adjacency(schema, storage, keyspace).await,
+        Ok(Ok(true)) => {
+            publish_record_state(&record_tx, HealRecordState::Recorded);
+            return catch_up_adjacency(schema, storage, keyspace).await;
+        }
         Ok(Ok(false)) => {}
         Ok(Err(e)) => tracing::error!(
             keyspace = %keyspace,
@@ -743,21 +825,16 @@ async fn heal_adjacency_unless_recorded(
         "graph engine: adjacency heal started; adjacency queries that outlast the wait \
          budget are refused retryably until it completes"
     );
-    heal_adjacency(schema, wp, keyspace.clone()).await?;
-    let ks = keyspace.clone();
-    match tokio::task::spawn_blocking(move || heal_record::record_healed(&data_dir, &ks)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::error!(
-            keyspace = %keyspace,
-            error = %e,
-            "graph engine: adjacency heal completed but was not recorded; the next start heals again"
-        ),
-        Err(join_error) => tracing::error!(
-            keyspace = %keyspace,
-            error = %join_error,
-            "graph engine: recording the adjacency heal died; the next start heals again"
-        ),
+    if let Err(reason) = heal_adjacency(schema, wp, keyspace.clone()).await {
+        publish_record_state(&record_tx, HealRecordState::NotRecorded);
+        return Err(reason);
     }
+    // Detached on purpose: the record outlives the gate, and a record that
+    // never lands is logged by `record_completed_heal` and costs only a
+    // repeated heal on the next start.
+    drop(tokio::spawn(record_completed_heal(
+        data_dir, keyspace, record_tx,
+    )));
     Ok(())
 }
 
@@ -1078,8 +1155,37 @@ impl GraphEngine {
             // Poll once: `peek` only sees an outcome some caller has already
             // polled out of the heal task, and none may have since it ended.
             .is_some_and(|gate| {
-                matches!(futures::FutureExt::now_or_never(gate.clone()), Some(Ok(())))
+                matches!(
+                    futures::FutureExt::now_or_never(gate.ready.clone()),
+                    Some(Ok(()))
+                )
             })
+    }
+
+    /// Wait for the durable record of `keyspace`'s heal in this process to
+    /// settle, and return whether the record says the heal completed. The
+    /// readiness signal for a test that restarts on the same data dir or
+    /// edits the record: the record is written after the gate opens.
+    ///
+    /// Errors if no heal of `keyspace` has started in this engine, or if the
+    /// heal task ended without reporting (it died).
+    #[doc(hidden)]
+    pub async fn adjacency_heal_recorded_for_test(&self, keyspace: &str) -> Result<bool> {
+        let Some(gate) = self.adjacency_heals.load().get(keyspace).cloned() else {
+            return Err(GraphError::Internal(format!(
+                "no adjacency heal of keyspace {keyspace} has started in this engine"
+            )));
+        };
+        let mut recorded = gate.recorded;
+        let state = recorded
+            .wait_for(|state| *state != HealRecordState::Pending)
+            .await
+            .map_err(|_| {
+                GraphError::Internal(format!(
+                    "the adjacency heal of keyspace {keyspace} ended without reporting its record"
+                ))
+            })?;
+        Ok(*state == HealRecordState::Recorded)
     }
 
     async fn ensure_adjacency_storage_for_keyspace(&self, keyspace: &str) -> Result<bool> {
@@ -1225,10 +1331,10 @@ impl GraphEngine {
         // the traversal after it see the adjacency table.
         self.ensure_adjacency_storage_for_keyspace(keyspace).await?;
         let gate = self.adjacency_heal_gate(keyspace);
-        if let Some(Ok(())) = gate.peek() {
+        if let Some(Ok(())) = gate.ready.peek() {
             return Ok(());
         }
-        match tokio::time::timeout(HEAL_WAIT_BUDGET, gate.clone()).await {
+        match tokio::time::timeout(HEAL_WAIT_BUDGET, gate.ready.clone()).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(reason)) => {
                 self.forget_failed_heal(keyspace, &gate);
@@ -1276,7 +1382,10 @@ impl GraphEngine {
     fn forget_failed_heal(&self, keyspace: &str, failed: &HealGate) {
         self.adjacency_heals.rcu(|gates| {
             let mut next = HashMap::clone(gates);
-            if next.get(keyspace).is_some_and(|g| g.ptr_eq(failed)) {
+            if next
+                .get(keyspace)
+                .is_some_and(|g| g.ready.ptr_eq(&failed.ready))
+            {
                 next.remove(keyspace);
             }
             next

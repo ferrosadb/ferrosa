@@ -9,10 +9,11 @@
 //! This module replaces that cap with a classic **external merge sort**:
 //!
 //! 1. Rows are pushed into an in-memory buffer.
-//! 2. When the buffer's estimated size crosses the **spill threshold**
-//!    (see [`crate::spill_budget`]), the buffer is sorted and written to a
-//!    **run file** on disk, then cleared. Peak in-memory rows are thus bounded
-//!    by the threshold, independent of the total result size.
+//! 2. When the buffer's retained bytes ([`SpillRow::retained_bytes`]) cross
+//!    the **spill threshold** (see [`crate::spill_budget`]), or the node-wide
+//!    [`crate::spill_pool`] asks this sorter to yield, the buffer is sorted and
+//!    written to a **run file** on disk, then cleared. Peak in-memory rows are
+//!    thus bounded by the threshold, independent of the total result size.
 //! 3. [`ExternalSorter::finish`] performs a **bounded k-way merge** of all run
 //!    files (plus the final in-memory buffer, spilled if any runs exist) using a
 //!    min-heap that holds at most one row per run. The merge streams rows in
@@ -38,8 +39,11 @@ use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use ferrosa_common::{CqlValue, Error, Result};
+
+use crate::spill_pool::{Admission, SpillCharge, SpillPool, DEFAULT_FLOOR_BYTES};
 
 /// A single result row: one optional value per output column.
 pub type Row = Vec<Option<CqlValue>>;
@@ -82,45 +86,46 @@ impl RowOrder {
     }
 }
 
-/// Estimate the in-memory footprint of a row for threshold accounting.
-///
-/// This need not be exact — it only has to grow monotonically with real memory
-/// use so the accumulator spills before the process is starved. We count the
-/// `Option<CqlValue>` slots plus the payload bytes of variable-length values.
-fn estimate_row_bytes(row: &Row) -> usize {
-    // Per-slot overhead: the Vec slot + Option/enum discriminant.
-    let mut bytes = row.len() * std::mem::size_of::<Option<CqlValue>>();
-    for cell in row.iter().flatten() {
-        bytes += cql_value_payload_bytes(cell);
-    }
-    bytes
+/// Retained bytes of a CQL row: the row's `Vec` header, its slot capacity, and
+/// each value's heap buffers (see [`SpillRow::retained_bytes`]).
+fn row_retained_bytes(row: &Row) -> usize {
+    std::mem::size_of::<Row>()
+        + row.capacity() * std::mem::size_of::<Option<CqlValue>>()
+        + row
+            .iter()
+            .flatten()
+            .map(cql_value_heap_bytes)
+            .sum::<usize>()
 }
 
-/// Payload bytes of a `CqlValue` beyond its fixed enum size (variable-length
-/// heap allocations: strings, blobs, collections).
-fn cql_value_payload_bytes(v: &CqlValue) -> usize {
+/// Heap bytes a `CqlValue` keeps alive beyond its fixed enum size: the
+/// CAPACITY of each vector and collection buffer (spare capacity is resident
+/// too), the whole backing buffer a text or blob slice retains (a short value
+/// sliced from a large storage page keeps that page alive), and recursively the
+/// same for nested values.
+fn cql_value_heap_bytes(v: &CqlValue) -> usize {
     match v {
-        CqlValue::Text(s) | CqlValue::Ascii(s) => s.len(),
-        CqlValue::Blob(b) => b.len(),
-        CqlValue::Vector(items) => items.len() * std::mem::size_of::<u32>(),
+        CqlValue::Text(s) | CqlValue::Ascii(s) => s.retained_capacity().max(s.len()),
+        CqlValue::Blob(b) => b.retained_heap_bytes().max(b.len()),
+        CqlValue::Vector(items) => items.capacity() * std::mem::size_of::<u32>(),
         CqlValue::List(items) | CqlValue::Set(items) => {
-            items.iter().map(cql_value_payload_bytes).sum::<usize>()
-                + items.len() * std::mem::size_of::<CqlValue>()
+            items.iter().map(cql_value_heap_bytes).sum::<usize>()
+                + items.capacity() * std::mem::size_of::<CqlValue>()
         }
         CqlValue::Map(entries) => {
             entries
                 .iter()
-                .map(|(k, val)| cql_value_payload_bytes(k) + cql_value_payload_bytes(val))
+                .map(|(k, val)| cql_value_heap_bytes(k) + cql_value_heap_bytes(val))
                 .sum::<usize>()
-                + entries.len() * 2 * std::mem::size_of::<CqlValue>()
+                + entries.capacity() * 2 * std::mem::size_of::<CqlValue>()
         }
         CqlValue::Tuple(items) => {
             items
                 .iter()
                 .flatten()
-                .map(cql_value_payload_bytes)
+                .map(cql_value_heap_bytes)
                 .sum::<usize>()
-                + items.len() * std::mem::size_of::<Option<CqlValue>>()
+                + items.capacity() * std::mem::size_of::<Option<CqlValue>>()
         }
         // Fixed-size variants own no heap payload beyond the enum itself.
         CqlValue::Null
@@ -144,14 +149,15 @@ fn cql_value_payload_bytes(v: &CqlValue) -> usize {
         CqlValue::Jsonb(j) => j.as_bytes().len(),
         // A UDT owns its field names and values; counting it as 0 let rows of
         // large UDTs accumulate past the spill threshold unaccounted.
-        CqlValue::Udt(fields) => fields
-            .iter()
-            .map(|(name, value)| {
-                name.len()
-                    + std::mem::size_of::<(String, Option<CqlValue>)>()
-                    + value.as_ref().map_or(0, cql_value_payload_bytes)
-            })
-            .sum(),
+        CqlValue::Udt(fields) => {
+            fields.capacity() * std::mem::size_of::<(String, Option<CqlValue>)>()
+                + fields
+                    .iter()
+                    .map(|(name, value)| {
+                        name.capacity() + value.as_ref().map_or(0, cql_value_heap_bytes)
+                    })
+                    .sum::<usize>()
+        }
         // Arbitrary precision: the digit buffer grows with the magnitude.
         CqlValue::Varint(n) | CqlValue::Decimal { unscaled: n, .. } => {
             usize::try_from(n.bits().div_ceil(8)).unwrap_or(usize::MAX)
@@ -160,20 +166,27 @@ fn cql_value_payload_bytes(v: &CqlValue) -> usize {
 }
 
 /// A row this sorter can spill: serializable (runs are length-prefixed JSON) and
-/// able to estimate its own footprint for threshold accounting.
+/// able to report the memory it retains while buffered.
 ///
 /// Implemented for the CQL result [`Row`]; other engines (e.g. the graph
 /// executor's `Vec<serde_json::Value>` rows, t_4ce82a3e) implement it to reuse
 /// this spill/merge machinery with their own row type.
 pub trait SpillRow: serde::Serialize + serde::de::DeserializeOwned {
-    /// Approximate in-memory bytes. Need not be exact — only monotonic in real
-    /// memory use, so the buffer spills before the process is starved.
-    fn estimated_bytes(&self) -> usize;
+    /// Bytes this row keeps allocated while it sits in a spill buffer: its own
+    /// fixed size and value slots, plus the CAPACITY of every heap buffer it
+    /// owns or retains (spare capacity, and the whole backing of a shared
+    /// slice, are resident too).
+    ///
+    /// Computed from the row, not measured from the allocator: it leaves out
+    /// allocator size-class rounding and per-node overhead of tree maps, so
+    /// real resident memory is somewhat higher. This is the unit of every
+    /// [`crate::SpillPool`] charge and every spill threshold.
+    fn retained_bytes(&self) -> usize;
 }
 
 impl SpillRow for Row {
-    fn estimated_bytes(&self) -> usize {
-        estimate_row_bytes(self)
+    fn retained_bytes(&self) -> usize {
+        row_retained_bytes(self)
     }
 }
 
@@ -249,22 +262,53 @@ pub struct ExternalSorter<T = Row, C = RowOrder> {
     runs: Vec<PathBuf>,
     /// Whether at least one spill to disk occurred (observability + tests).
     spilled: bool,
+    /// This sorter's share of the node-wide spill pool: always equal to
+    /// `buffer_bytes`. The pool, not `threshold_bytes`, is what bounds the
+    /// process — `threshold_bytes` only caps one operator.
+    charge: SpillCharge,
 }
 
 impl<T: SpillRow, C: SpillOrder<T>> ExternalSorter<T, C> {
     /// Create a sorter that spills into `dir` once the in-memory buffer's
-    /// estimated size reaches `threshold_bytes`.
+    /// retained bytes reach `threshold_bytes`, or earlier when the node-wide
+    /// [`SpillPool::global`] is exhausted (see [`ExternalSorter::push`]).
     pub fn new(dir: impl Into<PathBuf>, order: C, threshold_bytes: u64) -> Self {
+        Self::with_pool(dir, order, threshold_bytes, Arc::clone(SpillPool::global()))
+    }
+
+    /// [`ExternalSorter::new`] charging `pool` instead of the global pool.
+    pub fn with_pool(
+        dir: impl Into<PathBuf>,
+        order: C,
+        threshold_bytes: u64,
+        pool: Arc<SpillPool>,
+    ) -> Self {
+        // At least 1 so a zero/absurd threshold still makes progress.
+        let threshold_bytes = threshold_bytes.max(1);
         Self {
             dir: dir.into(),
             order,
-            // At least 1 so a zero/absurd threshold still makes progress.
-            threshold_bytes: (threshold_bytes as usize).max(1),
+            threshold_bytes: usize::try_from(threshold_bytes).unwrap_or(usize::MAX),
             buffer: Vec::new(),
             buffer_bytes: 0,
             runs: Vec::new(),
             spilled: false,
+            // The floor never exceeds the sorter's own threshold: a sorter
+            // spills there anyway.
+            charge: pool.charge_with_floor(DEFAULT_FLOOR_BYTES.min(threshold_bytes)),
         }
+    }
+
+    /// Replace the pool floor (default `min(1 MiB, threshold)`).
+    pub fn with_floor(mut self, floor_bytes: u64) -> Self {
+        let pool = Arc::clone(self.charge.pool());
+        self.charge = pool.charge_with_floor(floor_bytes);
+        self
+    }
+
+    /// Retained bytes currently buffered in memory (not yet in a run).
+    pub fn buffered_bytes(&self) -> u64 {
+        self.buffer_bytes as u64
     }
 
     /// Whether any run has been spilled to disk. Used by tests/metrics to
@@ -278,12 +322,27 @@ impl<T: SpillRow, C: SpillOrder<T>> ExternalSorter<T, C> {
         self.runs.len()
     }
 
-    /// Push one row (moved, never cloned). Spills the buffer to a run file if it
-    /// crosses the threshold.
+    /// Push one row (moved, never cloned).
+    ///
+    /// Before buffering, the row's retained bytes are admitted by the pool
+    /// (see [`crate::spill_pool`]). A refused sorter keeps buffering up to its
+    /// floor; at its floor it spills what it holds and is admitted again. After
+    /// buffering it spills when it reaches its own threshold, or when the pool
+    /// is exhausted and it holds more than its fair share.
     pub fn push(&mut self, row: T) -> Result<()> {
-        self.buffer_bytes += row.estimated_bytes();
+        let bytes = row.retained_bytes();
+        if self.charge.admit(bytes as u64) == Admission::SpillFirst {
+            self.spill_buffer()?;
+            let again = self.charge.admit(bytes as u64);
+            assert_ne!(
+                again,
+                Admission::SpillFirst,
+                "an empty charge is always admitted within its floor"
+            );
+        }
+        self.buffer_bytes += bytes;
         self.buffer.push(row);
-        if self.buffer_bytes >= self.threshold_bytes {
+        if self.buffer_bytes >= self.threshold_bytes || self.charge.over_fair_share() {
             self.spill_buffer()?;
         }
         Ok(())
@@ -306,6 +365,7 @@ impl<T: SpillRow, C: SpillOrder<T>> ExternalSorter<T, C> {
         w.flush()
             .map_err(|e| io_error(format!("external sort: flush run {}: {e}", path.display())))?;
         self.buffer_bytes = 0;
+        self.charge.release_all();
         self.runs.push(path);
         self.spilled = true;
         Ok(())
@@ -324,7 +384,14 @@ impl<T: SpillRow, C: SpillOrder<T>> ExternalSorter<T, C> {
         if self.runs.is_empty() {
             self.buffer.sort_by(|a, b| self.order.compare(a, b));
             let rows = std::mem::take(&mut self.buffer);
-            return Ok(SortedRows::InMemory(rows.into_iter()));
+            // The rows stay resident while a consumer reads them, so the
+            // charge travels with them.
+            let empty = self.charge.pool().charge();
+            let charge = std::mem::replace(&mut self.charge, empty);
+            return Ok(SortedRows::InMemory {
+                rows: rows.into_iter(),
+                _charge: charge,
+            });
         }
         // Spill whatever remains so the merge reads uniformly from run files.
         self.spill_buffer()?;
@@ -406,8 +473,13 @@ fn merge_runs_into<T: SpillRow, C: SpillOrder<T>>(
 /// Each item is a `Result<Row>`: the merge does real I/O, so a read error on a
 /// spilled run surfaces here rather than being swallowed.
 pub enum SortedRows<T = Row, C = RowOrder> {
-    /// Fast path: everything fit in memory; already-sorted rows.
-    InMemory(std::vec::IntoIter<T>),
+    /// Fast path: everything fit in memory; already-sorted rows. The charge
+    /// holds their bytes against the spill pool until the result is parked on
+    /// disk or dropped (conservatively, including rows already yielded).
+    InMemory {
+        rows: std::vec::IntoIter<T>,
+        _charge: SpillCharge,
+    },
     /// Spilled path: a bounded k-way merge over run files.
     Merged(KWayMerge<T, C>),
 }
@@ -433,9 +505,11 @@ impl<T: SpillRow, C: SpillOrder<T>> SortedRows<T, C> {
     /// with them); the run is created with `create_new`, so a second call into
     /// the same directory fails loud rather than overwriting rows.
     pub fn into_disk_backed(self, dir: &std::path::Path, order: C) -> Result<Self> {
-        let rows = match self {
+        // `_charge` drops at the end of this function, once the rows it
+        // accounts for are on disk.
+        let (rows, _charge) = match self {
             SortedRows::Merged(merger) => return Ok(SortedRows::Merged(merger)),
-            SortedRows::InMemory(rows) => rows,
+            SortedRows::InMemory { rows, _charge } => (rows, _charge),
         };
         let path = dir.join("parked-run.bin");
         let file = std::fs::OpenOptions::new()
@@ -458,7 +532,7 @@ impl<T: SpillRow, C: SpillOrder<T>> Iterator for SortedRows<T, C> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            SortedRows::InMemory(iter) => iter.next().map(Ok),
+            SortedRows::InMemory { rows, .. } => rows.next().map(Ok),
             SortedRows::Merged(merger) => merger.next_row().transpose(),
         }
     }
@@ -573,9 +647,9 @@ mod tests {
         let len = j.as_bytes().len();
         let v = CqlValue::Jsonb(j);
         assert!(len > 1000);
-        assert_eq!(cql_value_payload_bytes(&v), len);
+        assert_eq!(cql_value_heap_bytes(&v), len);
         let row: Row = vec![Some(v)];
-        assert!(estimate_row_bytes(&row) > 1000);
+        assert!(row_retained_bytes(&row) > 1000);
     }
 
     /// A UDT owns its fields' payloads. Counting it as 0 let an ORDER BY over
@@ -592,14 +666,14 @@ mod tests {
             ),
             ("gone".to_string(), None),
         ]);
-        let bytes = cql_value_payload_bytes(&udt);
+        let bytes = cql_value_heap_bytes(&udt);
         assert!(
             bytes >= 15_000,
             "a UDT holding 15,000 payload bytes accounted as {bytes}"
         );
         // Nested: a list of UDTs accounts each element's fields.
         let list = CqlValue::List(vec![udt.clone(), udt]);
-        assert!(cql_value_payload_bytes(&list) >= 30_000);
+        assert!(cql_value_heap_bytes(&list) >= 30_000);
     }
 
     /// Arbitrary-precision numbers own a heap buffer proportional to their
@@ -607,12 +681,12 @@ mod tests {
     #[test]
     fn varint_and_decimal_payload_counts_their_magnitude() {
         let huge: num_bigint::BigInt = "9".repeat(10_000).parse().expect("decimal digits");
-        let varint = cql_value_payload_bytes(&CqlValue::Varint(huge.clone()));
+        let varint = cql_value_heap_bytes(&CqlValue::Varint(huge.clone()));
         assert!(
             varint >= 4_000,
             "a 10,000-digit varint accounted as {varint}"
         );
-        let decimal = cql_value_payload_bytes(&CqlValue::Decimal {
+        let decimal = cql_value_heap_bytes(&CqlValue::Decimal {
             scale: 2,
             unscaled: huge,
         });
@@ -622,26 +696,40 @@ mod tests {
         );
     }
 
+    /// `retained_bytes` counts what a buffered row keeps allocated, not its
+    /// logical length: spare collection capacity and the slot capacity of the
+    /// row itself are resident while the row waits in a spill buffer.
+    #[test]
+    fn retained_bytes_counts_spare_capacity_not_just_length() {
+        let mut items = Vec::with_capacity(1_000);
+        items.push(CqlValue::Int(1));
+        let list = CqlValue::List(items);
+        assert!(
+            cql_value_heap_bytes(&list) >= 1_000 * std::mem::size_of::<CqlValue>(),
+            "a one-element list with room for 1,000 retains 1,000 slots"
+        );
+        let mut row: Row = Vec::with_capacity(64);
+        row.push(Some(CqlValue::Int(1)));
+        assert!(row_retained_bytes(&row) >= 64 * std::mem::size_of::<Option<CqlValue>>());
+    }
+
     #[test]
     fn no_wildcard_default_for_new_variant() {
         // Variable-length payloads are counted; a large document-like value
         // must never account as 0 bytes (jsonb hazard H3, FM-18).
-        assert_eq!(cql_value_payload_bytes(&CqlValue::Text("abcd".into())), 4);
-        assert_eq!(cql_value_payload_bytes(&CqlValue::Ascii("ab".into())), 2);
-        assert_eq!(
-            cql_value_payload_bytes(&CqlValue::Blob(vec![0; 9].into())),
-            9
-        );
-        assert_eq!(cql_value_payload_bytes(&CqlValue::Vector(vec![0; 3])), 12);
-        assert!(cql_value_payload_bytes(&CqlValue::List(vec![CqlValue::Text("x".into())])) > 1);
-        assert!(cql_value_payload_bytes(&CqlValue::Set(vec![CqlValue::Int(1)])) > 0);
+        assert_eq!(cql_value_heap_bytes(&CqlValue::Text("abcd".into())), 4);
+        assert_eq!(cql_value_heap_bytes(&CqlValue::Ascii("ab".into())), 2);
+        assert!(cql_value_heap_bytes(&CqlValue::Blob(vec![0; 9].into())) >= 9);
+        assert_eq!(cql_value_heap_bytes(&CqlValue::Vector(vec![0; 3])), 12);
+        assert!(cql_value_heap_bytes(&CqlValue::List(vec![CqlValue::Text("x".into())])) > 1);
+        assert!(cql_value_heap_bytes(&CqlValue::Set(vec![CqlValue::Int(1)])) > 0);
         assert!(
-            cql_value_payload_bytes(&CqlValue::Map(vec![(CqlValue::Int(1), CqlValue::Int(2))])) > 0
+            cql_value_heap_bytes(&CqlValue::Map(vec![(CqlValue::Int(1), CqlValue::Int(2))])) > 0
         );
-        assert!(cql_value_payload_bytes(&CqlValue::Tuple(vec![Some(CqlValue::Int(1))])) > 0);
+        assert!(cql_value_heap_bytes(&CqlValue::Tuple(vec![Some(CqlValue::Int(1))])) > 0);
         // Fixed-size variants own no heap payload.
-        assert_eq!(cql_value_payload_bytes(&CqlValue::Int(1)), 0);
-        assert_eq!(cql_value_payload_bytes(&CqlValue::Null), 0);
+        assert_eq!(cql_value_heap_bytes(&CqlValue::Int(1)), 0);
+        assert_eq!(cql_value_heap_bytes(&CqlValue::Null), 0);
     }
 
     fn irow(v: i64) -> Row {
@@ -667,6 +755,116 @@ mod tests {
         assert!(!s.spilled());
         let out: Vec<i64> = s.finish().unwrap().map(|r| ival(&r.unwrap())).collect();
         assert_eq!(out, vec![1, 2, 3, 4, 5]);
+    }
+
+    /// PR #651 review: with a one-row floor, a sorter starved by another that
+    /// holds the pool spilled a one-row run on EVERY push. It now buffers up to
+    /// its floor first.
+    #[test]
+    fn a_sorter_starved_by_another_does_not_write_a_run_per_row() {
+        let row_bytes = row_retained_bytes(&irow(0)) as u64;
+        let pool = SpillPool::new("test", row_bytes * 10);
+        let order = RowOrder::new(vec![(0, true)]);
+        let (hog_dir, starved_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mut hog =
+            ExternalSorter::with_pool(hog_dir.path(), order.clone(), 1 << 30, Arc::clone(&pool));
+        let mut v = 0;
+        while pool.used() < pool.limit() {
+            hog.push(irow(v)).unwrap();
+            v += 1;
+        }
+        let mut starved =
+            ExternalSorter::with_pool(starved_dir.path(), order, 1 << 30, Arc::clone(&pool));
+        for v in (0..100).rev() {
+            starved.push(irow(v)).unwrap();
+        }
+        assert_eq!(
+            starved.run_count(),
+            0,
+            "100 small rows fit the starved sorter's floor; it wrote {} runs",
+            starved.run_count()
+        );
+        let out: Vec<i64> = starved
+            .finish()
+            .unwrap()
+            .map(|r| ival(&r.unwrap()))
+            .collect();
+        assert_eq!(out, (0..100).collect::<Vec<_>>());
+    }
+
+    /// Streaming audit, `Streaming.per_operator_thresholds_multiply`: every
+    /// operator used to receive the whole process threshold, so three of them
+    /// held three thresholds. Each sorter here is handed the full pool size as
+    /// its OWN threshold — exactly the shipped shape — and together they must
+    /// still stay within one pool plus each operator's floor and one row.
+    #[test]
+    fn concurrent_sorters_share_one_pool_instead_of_one_threshold_each() {
+        let row_bytes = row_retained_bytes(&irow(0)) as u64;
+        let limit = row_bytes * 10;
+        let pool = SpillPool::new("test", limit);
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let order = RowOrder::new(vec![(0, true)]);
+        let mut sorters: Vec<_> = dirs
+            .iter()
+            .map(|d| {
+                ExternalSorter::with_pool(d.path(), order.clone(), limit, Arc::clone(&pool))
+                    .with_floor(row_bytes)
+            })
+            .collect();
+        let mut peak = 0;
+        for v in 0..30i64 {
+            for i in 0..sorters.len() {
+                sorters[i].push(irow(29 - v)).unwrap();
+                // What the sorters really hold, not what they claim to the pool.
+                let resident: u64 = sorters.iter().map(|s| s.buffered_bytes()).sum();
+                peak = peak.max(resident);
+                assert_eq!(pool.used(), resident, "the pool charge is the resident set");
+            }
+        }
+        // The documented bound: limit + live operators × (floor + one row).
+        assert!(
+            peak <= limit + 3 * (row_bytes + row_bytes),
+            "three sorters held {peak} bytes against a {limit}-byte pool"
+        );
+        assert!(
+            sorters.iter().any(|s| s.spilled()),
+            "the shared pool must force a spill before any single threshold is reached"
+        );
+        for s in sorters {
+            let out: Vec<i64> = s.finish().unwrap().map(|r| ival(&r.unwrap())).collect();
+            assert_eq!(out, (0..30).collect::<Vec<_>>());
+        }
+        assert_eq!(
+            pool.used(),
+            0,
+            "every charge is returned once the results drop"
+        );
+    }
+
+    /// An un-spilled result still holds its rows while a consumer reads it, so
+    /// its charge must live as long as the rows do — and parking it on disk
+    /// returns the charge.
+    #[test]
+    fn an_in_memory_result_keeps_its_charge_until_parked_or_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = SpillPool::new("test", u64::MAX / 2);
+        let order = RowOrder::new(vec![(0, true)]);
+        let mut s =
+            ExternalSorter::with_pool(dir.path(), order.clone(), u64::MAX, Arc::clone(&pool));
+        for v in [3i64, 1, 2] {
+            s.push(irow(v)).unwrap();
+        }
+        let held = pool.used();
+        assert!(held > 0);
+        let rows = s.finish().unwrap();
+        assert_eq!(
+            pool.used(),
+            held,
+            "finishing in memory must not return the charge early"
+        );
+        let rows = rows.into_disk_backed(dir.path(), order).unwrap();
+        assert_eq!(pool.used(), 0, "a parked result holds no pool bytes");
+        drop(rows);
     }
 
     /// Parking an in-memory result moves its REMAINING rows to disk, in order,
@@ -735,8 +933,8 @@ mod tests {
         type JsonRow = Vec<serde_json::Value>;
 
         impl SpillRow for JsonRow {
-            fn estimated_bytes(&self) -> usize {
-                self.len() * 32
+            fn retained_bytes(&self) -> usize {
+                self.capacity() * std::mem::size_of::<serde_json::Value>()
             }
         }
 

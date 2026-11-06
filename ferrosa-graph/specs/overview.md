@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-graph
 status: implemented
-last_updated: 2026-10-15
+last_updated: 2026-11-04
 executive_summary: >
   The property-graph query engine for ferrosa. Parses Cypher, authorizes it
   against the schema, plans and executes traversals over data stored in ordinary
@@ -72,7 +72,7 @@ resolved Bolt port.
 | `planner::physical` (~2.7k LoC) | anchor selection; `plan` entry (physical.rs:282) and `plan_match` (physical.rs:1349); `Expand` / `ExpandVarLength` / `Aggregate` (physical.rs:179) / `WcoJoin` / `MergeUpsert` / `Create` / `Subscribe` / `Union` plans |
 | `executor::expand` (~9.8k LoC) | streaming dispatch hub: `execute_streaming` (expand.rs:207) / `execute_streaming_owned` (expand.rs:280) → `execute_streaming_inner` (expand.rs:371); anchor lookup, per-hop adjacency reads, eval, aggregation, write clauses, DoS limits |
 | `executor::aggregate` | incremental `Accumulator` framework (aggregate.rs:11) for `count`/`sum`/`avg`/`min`/`max`/`collect` — folds row by row, no materialization of the input |
-| `executor::spill` | external-sort spill for `ORDER BY` (+ `LIMIT`): streams the smallest rows in order, bounds sort memory (spill.rs:303) |
+| `executor::spill` | `OrderBySink` for every `ORDER BY` (Expand, `WcoJoin`, `ExpandVarLength`): rows are pushed as produced with each order term as a hidden trailing sort-key column (so non-projected terms spill too), spilled past `spill_threshold_bytes`, and consumed only as a stream (`finish_stream`) with the keys stripped; DISTINCT/LIMIT apply on that stream. No backend → counted, warned in-memory fallback |
 | `executor::varpath` + `leapfrog` | variable-length `[*min..max]` BFS with visited-set + vertex budget |
 | `executor::eval` | expression evaluation, WHERE filtering, partition→JSON |
 | `executor::subscribe` | per-connection `SubscriptionRegistry` (cap enforcement) |
@@ -107,7 +107,9 @@ An inner expansion can still materialize its frontier. Eligible unfiltered
 vertex counts bypass that expansion and call `WritePath::count_range_with` at
 CL ONE with the keyspace replication strategy. `ORDER BY` (with
 optional `LIMIT`) spills to disk through `executor::spill` when the sort would
-exceed the memory budget.
+exceed the memory budget — whether or not its terms are projected, since each
+term rides along as a hidden sort-key column — and the merged output streams to
+the transport rather than being collected.
 
 **Write path:** a `CREATE`/`MERGE`/`SET`/`DELETE` plan writes the edge/vertex row
 through `WritePath`. Because the `AdjacencyIndexObserver` is registered on the

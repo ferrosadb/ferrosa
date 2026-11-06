@@ -69,7 +69,9 @@ its input: `execute_aggregate` (executor/expand.rs:6046) folds each row into
 per-group `Accumulator`s, so `RETURN count(n)` keeps state proportional to the
 number of groups (bounded by `config.max_groups`), not the input row count.
 `ORDER BY` (with optional `LIMIT`) spills to disk via `executor::spill`
-(spill.rs:303). Because traversal reads the index rather than the edge table, an
+(`OrderBySink`): each row is pushed as it is produced with its order terms as
+hidden trailing key columns (so `RETURN n.name ORDER BY n.age` spills too), and
+the merge streams to the transport with the keys stripped. Because traversal reads the index rather than the edge table, an
 adjacency-index desync (FMEA G-1/G-2) shows up here as **missing rows, not an
 error** — which is exactly why the consistency invariant below matters.
 

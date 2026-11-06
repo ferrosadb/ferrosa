@@ -21,39 +21,14 @@ use ferrosa_storage::TableId;
 
 use crate::adjacency::schema::adjacency_keyspace_name;
 use crate::error::{GraphError, Result};
+use crate::executor::eval;
 use crate::executor::expand::{
     build_columns, check_timeout, extract_neighbor_id, GraphEngineConfig,
 };
 use crate::executor::result::{GraphResult, QueryStats};
-use crate::executor::spill::SpillSortSink;
-use crate::executor::stream::RowVals;
-use crate::executor::{eval, sort_rows};
+use crate::executor::spill::{OrderSemantics, RowAcc};
 use crate::parser::ReturnClause;
 use crate::planner::physical::WcoJoinPlan;
-
-/// Where enumerated result rows go.
-///
-/// `Spilling` pushes each row into the external merge sort AS IT IS PRODUCED,
-/// so an unbounded ORDER BY result never sits fully in memory (t_3f2f961a).
-/// `Buffered` is the fallback when the sink cannot apply (no backend, LIMIT
-/// present, no ORDER BY, or an order term that is not a projected column) —
-/// identical to the old accumulation.
-enum RowAcc {
-    Buffered(Vec<RowVals>),
-    Spilling(SpillSortSink),
-}
-
-impl RowAcc {
-    fn push(&mut self, row: RowVals) -> Result<()> {
-        match self {
-            Self::Buffered(rows) => {
-                rows.push(row);
-                Ok(())
-            }
-            Self::Spilling(sink) => sink.push(row),
-        }
-    }
-}
 
 /// A sorted iterator over neighbor IDs from the adjacency index.
 /// Supports seek (advance to a position >= target) and next.
@@ -66,17 +41,16 @@ struct AdjacencyIterator {
 
 impl AdjacencyIterator {
     /// Create from a vertex's adjacency partition, filtering by optional label.
+    ///
+    /// A failed read is an error, not an empty neighbour list: treating it as
+    /// "no neighbours" made the join return a silently short answer.
     async fn from_partition(
         write_path: &dyn GraphWrite,
         adj_table_id: &TableId,
         vertex_key: &DecoratedKey,
         edge_label: Option<&str>,
-    ) -> Self {
-        let partition = write_path
-            .read(adj_table_id, vertex_key)
-            .await
-            .ok()
-            .flatten();
+    ) -> Result<Self> {
+        let partition = write_path.read(adj_table_id, vertex_key).await?;
         let mut neighbors = Vec::new();
         if let Some(p) = partition {
             for row in &p.rows {
@@ -87,7 +61,7 @@ impl AdjacencyIterator {
         }
         neighbors.sort();
         neighbors.dedup();
-        Self { neighbors, pos: 0 }
+        Ok(Self { neighbors, pos: 0 })
     }
 
     /// Create from an already-known list of neighbor IDs (pre-sorted, pre-deduped).
@@ -273,17 +247,20 @@ pub async fn execute_wco_join_streaming<'a>(
 
     let columns = build_columns(return_clause);
 
-    // Result accumulation is spill-backed when the sorter applies, so an
-    // unbounded ORDER BY never holds the full result in memory. The silent
-    // `max_result_rows` truncation that used to stop enumeration is REMOVED
-    // (result caps are bugs: a client could not tell a partial answer from a
-    // complete one). Work stays bounded by `check_timeout`, which every
-    // enumeration step already consults.
-    let mut acc =
-        match SpillSortSink::try_new(&columns, return_clause, config, "graph_wco_order_by")? {
-            Some(sink) => RowAcc::Spilling(sink),
-            None => RowAcc::Buffered(Vec::new()),
-        };
+    // With an ORDER BY, result accumulation goes into the ORDER BY sink —
+    // spill-backed whenever a backend is configured, with every order term a
+    // hidden key — so an unbounded ORDER BY never holds the full result in
+    // memory, projected terms or not. The silent `max_result_rows` truncation
+    // that used to stop enumeration is REMOVED (result caps are bugs: a client
+    // could not tell a partial answer from a complete one). Work stays bounded
+    // by `check_timeout`, which every enumeration step already consults.
+    let mut acc = RowAcc::new(
+        &columns,
+        return_clause,
+        config,
+        "graph_wco_order_by",
+        OrderSemantics::ProjectedColumns,
+    )?;
 
     let mut candidates = write_path.range_read_stream_all(&first_table_id, 0).await?;
     while let Some(candidate) = candidates.next().await {
@@ -316,36 +293,17 @@ pub async fn execute_wco_join_streaming<'a>(
         .await?;
     }
 
-    // Terminal ORDER BY: the spilling accumulator already sorted while
-    // accumulating and hands back a stream that reads its spilled runs on pull;
-    // the buffered fallback sorts in memory, which is bounded by the threshold
-    // that would have made it spill.
-    let mut rows: crate::executor::RowStream<'static> = match acc {
-        RowAcc::Spilling(sink) => sink.finish_stream()?,
-        RowAcc::Buffered(mut buffered) => {
-            if !return_clause.order_by.is_empty() {
-                sort_rows(&mut buffered, &columns, &return_clause.order_by);
-            }
-            crate::executor::stream::stream_from_rows(buffered)
-        }
-    };
-
-    // DISTINCT on the stream. The buffered form sorted the whole result by its
-    // debug representation and then deduped, which needed every row present at
-    // once — and incidentally returned RETURN DISTINCT in string-repr sorted
-    // order. `dedup_stream` is first-seen order, matching the streaming paths
-    // that already made that change deliberately (t_4ce82a3e).
-    if return_clause.distinct {
-        rows = crate::executor::stream::dedup_stream(rows);
-    }
-
-    // LIMIT on the stream. `Vec::truncate` had to build the whole result before
-    // discarding most of it; `take` stops pulling.
-    if let Some(limit) = return_clause.limit {
-        use futures::StreamExt as _;
-        let limit = limit.max(0) as usize;
-        rows = Box::pin(rows.take(limit));
-    }
+    // Terminal ORDER BY, then DISTINCT, then LIMIT, all on the stream. The
+    // sink already sorted while accumulating and hands back a stream that
+    // reads its spilled runs on pull, hidden keys stripped.
+    //
+    // DISTINCT: the buffered form sorted the whole result by its debug
+    // representation and then deduped, which needed every row present at once
+    // — and incidentally returned RETURN DISTINCT in string-repr sorted order.
+    // `dedup_stream` is first-seen order, matching the streaming paths that
+    // already made that change deliberately (t_4ce82a3e). LIMIT: `take` stops
+    // pulling where `Vec::truncate` had to build the whole result first.
+    let rows = acc.into_stream(return_clause)?;
 
     stats.execution_ms = start.elapsed().as_millis() as u64;
 
@@ -380,11 +338,12 @@ async fn enumerate_bindings(
     if var_idx >= variables.len() {
         // Check that every relation is satisfied with current bindings.
         if verify_all_relations(write_path, adj_table_id, plan, var_bindings, stats).await? {
-            // Build a result row from the bindings.
-            let row =
+            // Build a result row from the bindings; the ORDER BY sink takes
+            // the JSON bindings too, to evaluate the hidden sort keys.
+            let (row, json_bindings) =
                 project_bindings(write_path, plan, var_bindings, return_clause, stats, schema)
                     .await?;
-            acc.push(row)?;
+            acc.push(row, &json_bindings)?;
         }
         return Ok(());
     }
@@ -404,7 +363,7 @@ async fn enumerate_bindings(
                     &src_key,
                     rel.edge_label.as_deref(),
                 )
-                .await;
+                .await?;
                 stats.edges_read += it.neighbors.len();
                 iterators.push(it);
             }
@@ -421,7 +380,7 @@ async fn enumerate_bindings(
                 // For leapfrog, we need the set of source vertices that
                 // have an edge TO dst. We read dst's IN-adjacency.
                 let dst_key = DecoratedKey::new(PartitionKey::new(dst_bytes.clone()));
-                let partition = write_path.read(adj_table_id, &dst_key).await.ok().flatten();
+                let partition = write_path.read(adj_table_id, &dst_key).await?;
                 let mut neighbors = Vec::new();
                 if let Some(p) = partition {
                     for row in &p.rows {
@@ -536,7 +495,9 @@ async fn verify_all_relations(
 
         // Check that src has an OUT edge to dst with the given label.
         let src_key = DecoratedKey::new(PartitionKey::new(src_bytes.clone()));
-        let partition = write_path.read(adj_table_id, &src_key).await.ok().flatten();
+        // A failed read must fail the join: as "edge absent" it silently
+        // dropped a valid match.
+        let partition = write_path.read(adj_table_id, &src_key).await?;
         let found = if let Some(p) = partition {
             stats.edges_read += 1;
             p.rows.iter().any(|row| {
@@ -559,6 +520,7 @@ async fn verify_all_relations(
 }
 
 /// Project variable bindings into a result row according to the return clause.
+/// Returns the JSON bindings the row was evaluated against alongside it.
 async fn project_bindings(
     write_path: &dyn GraphWrite,
     plan: &WcoJoinPlan,
@@ -566,7 +528,7 @@ async fn project_bindings(
     return_clause: &ReturnClause,
     stats: &mut QueryStats,
     schema: Option<&ferrosa_schema::Schema>,
-) -> Result<Vec<serde_json::Value>> {
+) -> Result<(Vec<serde_json::Value>, HashMap<String, serde_json::Value>)> {
     // Build JSON bindings for eval_expr by reading each variable's partition.
     let mut json_bindings: HashMap<String, serde_json::Value> = HashMap::new();
 
@@ -591,13 +553,9 @@ async fn project_bindings(
         }
     }
 
-    let row: Vec<serde_json::Value> = return_clause
-        .items
-        .iter()
-        .map(|item| eval::eval_expr(&item.expr, &json_bindings).unwrap_or(serde_json::Value::Null))
-        .collect();
+    let row = super::expand::eval_return_items(&return_clause.items, &json_bindings)?;
 
-    Ok(row)
+    Ok((row, json_bindings))
 }
 
 #[cfg(test)]
@@ -623,6 +581,269 @@ mod tests {
     /// at a time and never holds the intersection in memory.
     fn drain_intersection(iterators: &mut [AdjacencyIterator]) -> Vec<Vec<u8>> {
         std::iter::from_fn(|| next_common_value(iterators)).collect()
+    }
+
+    // --- storage errors must fail the join, not shorten it ----------------
+
+    /// Delegates to a real `WritePath`, except that every point read of the
+    /// adjacency table fails — the shape of a storage I/O error mid-join.
+    struct FailingAdjacencyReads {
+        inner: ferrosa_cluster::write_path::WritePath,
+        adjacency: TableId,
+    }
+
+    #[async_trait::async_trait]
+    impl GraphWrite for FailingAdjacencyReads {
+        async fn read(
+            &self,
+            table_id: &TableId,
+            key: &DecoratedKey,
+        ) -> ferrosa_common::Result<Option<ferrosa_sstable::types::Partition>> {
+            if table_id == &self.adjacency {
+                return Err(ferrosa_common::Error::InvalidFormat(
+                    "injected adjacency read failure".to_string(),
+                ));
+            }
+            self.inner.read(table_id, key).await
+        }
+        async fn pk_read(
+            &self,
+            table_id: &TableId,
+            key: &DecoratedKey,
+            cl: ferrosa_cluster::consistency::ConsistencyLevel,
+            strategy: &ferrosa_cluster::ring::strategy::ReplicationStrategy,
+        ) -> ferrosa_common::Result<Option<ferrosa_sstable::types::Partition>> {
+            GraphWrite::pk_read(&self.inner, table_id, key, cl, strategy).await
+        }
+        async fn range_read_stream_all(
+            &self,
+            table_id: &TableId,
+            row_limit: usize,
+        ) -> ferrosa_cluster::error::Result<ferrosa_cluster::write_path::PartitionResultStream>
+        {
+            GraphWrite::range_read_stream_all(&self.inner, table_id, row_limit).await
+        }
+        async fn count_range_with(
+            &self,
+            table_id: &TableId,
+            cl: ferrosa_cluster::consistency::ConsistencyLevel,
+            strategy: &ferrosa_cluster::ring::strategy::ReplicationStrategy,
+        ) -> ferrosa_cluster::error::Result<u64> {
+            GraphWrite::count_range_with(&self.inner, table_id, cl, strategy).await
+        }
+        fn declares_index_locally(&self, table_id: &TableId, index_name: &str) -> bool {
+            GraphWrite::declares_index_locally(&self.inner, table_id, index_name)
+        }
+        fn index_is_current(&self, table_id: &TableId, index_name: &str) -> bool {
+            GraphWrite::index_is_current(&self.inner, table_id, index_name)
+        }
+        async fn index_read_stream(
+            &self,
+            table_id: &TableId,
+            index_name: &str,
+            index_key: &ferrosa_index::IndexKey,
+            after: Option<&ferrosa_index::RowPosition>,
+        ) -> ferrosa_cluster::error::Result<ferrosa_cluster::write_path::PartitionResultStream>
+        {
+            GraphWrite::index_read_stream(&self.inner, table_id, index_name, index_key, after).await
+        }
+        async fn write(
+            &self,
+            table_id: &TableId,
+            key: &DecoratedKey,
+            row: ferrosa_sstable::types::Row,
+            timestamp: i64,
+            cl: ferrosa_cluster::consistency::ConsistencyLevel,
+            strategy: &ferrosa_cluster::ring::strategy::ReplicationStrategy,
+        ) -> ferrosa_common::Result<()> {
+            GraphWrite::write(&self.inner, table_id, key, row, timestamp, cl, strategy).await
+        }
+        async fn write_batch(
+            &self,
+            mutations: Vec<ferrosa_storage::Mutation>,
+            cl: ferrosa_cluster::consistency::ConsistencyLevel,
+            rf: usize,
+        ) -> ferrosa_common::Result<()> {
+            GraphWrite::write_batch(&self.inner, mutations, cl, rf).await
+        }
+    }
+
+    /// One vertex `A` in `test_ks.person_v`, behind a write path whose
+    /// adjacency reads all fail.
+    fn failing_adjacency_fixture() -> (tempfile::TempDir, FailingAdjacencyReads) {
+        use ferrosa_common::schema::TableSchema;
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(
+            ferrosa_storage::StorageEngine::new(
+                ferrosa_storage::StorageEngineConfig::test_config(dir.path()),
+                None,
+            )
+            .unwrap(),
+        );
+        storage
+            .register_table(TableSchema {
+                keyspace: "test_ks".to_string(),
+                table: "person_v".to_string(),
+                key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                clustering_columns: vec![],
+                static_columns: vec![],
+                regular_columns: vec![],
+                extensions: Default::default(),
+            })
+            .unwrap();
+        storage
+            .write(
+                &TableId::new("test_ks", "person_v"),
+                &DecoratedKey::new(PartitionKey::new(b"A".to_vec())),
+                Row {
+                    clustering: vec![],
+                    cells: vec![],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(1),
+                },
+                1,
+            )
+            .unwrap();
+        let adjacency = TableId::new(adjacency_keyspace_name("test_ks"), "adjacency");
+        let wp = FailingAdjacencyReads {
+            inner: ferrosa_cluster::write_path::WritePath::direct(storage),
+            adjacency,
+        };
+        (dir, wp)
+    }
+
+    fn person() -> crate::planner::logical::ResolvedTable {
+        crate::planner::logical::ResolvedTable {
+            keyspace: "test_ks".to_string(),
+            table: "person_v".to_string(),
+            graph_type: "vertex".to_string(),
+            label: "Person".to_string(),
+        }
+    }
+
+    fn relation(src: &str, dst: &str) -> crate::planner::physical::JoinRelation {
+        crate::planner::physical::JoinRelation {
+            src_var: src.to_string(),
+            dst_var: dst.to_string(),
+            direction: crate::parser::Direction::Out,
+            edge_label: Some("KNOWS".to_string()),
+            edge_table: None,
+        }
+    }
+
+    /// Each WCO adjacency read site used `.ok().flatten()`, so a storage error
+    /// read as "this vertex has no neighbours" and the join returned a
+    /// silently SHORT answer — `Ok` with fewer rows than exist. One plan per
+    /// site, each shaped so that site performs the first adjacency read:
+    /// - `a->b`: the OUT iterator for `b` (`AdjacencyIterator::from_partition`);
+    /// - `b->a`: the IN-adjacency read for `b` in `enumerate_bindings`;
+    /// - `a->a`: the closing-edge check (`verify_all_relations`).
+    #[tokio::test]
+    async fn a_failed_adjacency_read_fails_the_join_instead_of_shortening_it() {
+        let cases: [(
+            &str,
+            Vec<String>,
+            Vec<crate::planner::physical::JoinRelation>,
+        ); 3] = [
+            (
+                "from_partition",
+                vec!["a".to_string(), "b".to_string()],
+                vec![relation("a", "b")],
+            ),
+            (
+                "IN-adjacency read",
+                vec!["a".to_string(), "b".to_string()],
+                vec![relation("b", "a")],
+            ),
+            (
+                "verify_all_relations",
+                vec!["a".to_string()],
+                vec![relation("a", "a")],
+            ),
+        ];
+        for (site, variables, relations) in cases {
+            let (_dir, wp) = failing_adjacency_fixture();
+            let var_tables = variables.iter().map(|v| (v.clone(), person())).collect();
+            let plan = WcoJoinPlan {
+                variables,
+                relations,
+                var_tables,
+            };
+            let return_clause = ReturnClause {
+                distinct: false,
+                items: vec![crate::parser::ReturnItem {
+                    expr: crate::parser::Expr::Var("a".to_string()),
+                    alias: None,
+                }],
+                order_by: vec![],
+                limit: None,
+            };
+            let result = execute_wco_join(
+                &wp,
+                "test_ks",
+                &plan,
+                &return_clause,
+                &GraphEngineConfig::default(),
+                Instant::now(),
+                None,
+                None,
+            )
+            .await;
+            match result {
+                Err(err) => assert!(
+                    err.to_string().contains("injected adjacency read failure"),
+                    "{site}: the storage error must surface, got {err}"
+                ),
+                Ok(ok) => panic!(
+                    "{site}: a failed adjacency read must fail the join, but it \
+                     returned Ok with {} rows",
+                    ok.rows.len()
+                ),
+            }
+        }
+    }
+
+    /// A WCO join's projection: an evaluation error (`1 IN 2`) fails the row,
+    /// while a missing property is still a Null cell.
+    #[tokio::test]
+    async fn wco_projection_error_fails_the_row_but_a_missing_property_is_null() {
+        let (_dir, wp) = failing_adjacency_fixture();
+        let plan = WcoJoinPlan {
+            variables: vec!["a".to_string()],
+            relations: vec![],
+            var_tables: HashMap::from([("a".to_string(), person())]),
+        };
+        let bindings = HashMap::from([("a".to_string(), b"A".to_vec())]);
+        let clause = |expr| ReturnClause {
+            distinct: false,
+            items: vec![crate::parser::ReturnItem { expr, alias: None }],
+            order_by: vec![],
+            limit: None,
+        };
+        let bad_in = crate::parser::Expr::In {
+            value: Box::new(crate::parser::Expr::Literal(
+                crate::parser::Literal::Integer(1),
+            )),
+            list: Box::new(crate::parser::Expr::Literal(
+                crate::parser::Literal::Integer(2),
+            )),
+        };
+        let mut stats = QueryStats::default();
+        match project_bindings(&wp, &plan, &bindings, &clause(bad_in), &mut stats, None).await {
+            Err(err) => assert!(err.to_string().contains("IN expects a list"), "{err}"),
+            Ok((row, _)) => {
+                panic!("an evaluation error must fail the row, but it projected Ok({row:?})")
+            }
+        }
+        let missing = crate::parser::Expr::Property {
+            var: "a".to_string(),
+            name: "no_such_property".to_string(),
+        };
+        let (row, _) = project_bindings(&wp, &plan, &bindings, &clause(missing), &mut stats, None)
+            .await
+            .unwrap();
+        assert_eq!(row, vec![serde_json::Value::Null]);
     }
 
     #[test]

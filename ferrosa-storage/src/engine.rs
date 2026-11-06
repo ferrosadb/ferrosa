@@ -9416,6 +9416,7 @@ impl StorageEngine {
                         worker_engine.process_pending_time_series_materializations(batch_limit)
                     })
                     .await
+                    .await
                 {
                     Ok(Ok(processed)) if processed > 0 => {
                         tracing::debug!(
@@ -24157,7 +24158,8 @@ mod tests {
             bad.rows[0].cells[0].1 = CellValue::live(payload, 0);
         }
         let offset = put(&bad);
-        segment.allocate_and_link_sync_marker().unwrap();
+        // Close the section so `last` sits behind its own sync marker.
+        segment.flush_to_disk().unwrap();
         let mut last = first.clone();
         last.mutation_id = [93; 16];
         last.key = make_key("after-rejected-frame");

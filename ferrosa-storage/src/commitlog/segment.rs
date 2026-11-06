@@ -33,6 +33,46 @@
 //! marker_crc:         u32 — CRC32 of (segment_id as u64 || next_marker_offset as u32)
 //! ```
 //!
+//! # Sync Marker Chain: reserve-ahead, write-once
+//!
+//! A segment is a chain of sections. Each section starts with a head marker
+//! whose `next_marker_offset` names the start of the following section (the
+//! next head), or is 0 when the section runs to end of file.
+//!
+//! Every flush closes the current section, Cassandra-style:
+//!
+//! 1. Under `marker_link`, reserve the NEXT head slot `S` at the current
+//!    allocation position.
+//! 2. Write the CURRENT head (reserved by the previous flush, or the initial
+//!    slot at `HEADER_SIZE`, and never yet on disk) with `next = S`.
+//! 3. Write `[last_flushed, S)` to the file and sync it. `S` itself is not
+//!    written; it becomes the new `last_flushed`.
+//!
+//! So each head marker is written exactly once, at or above the flush
+//! watermark, and **no durable byte is ever rewritten**. A reader tailing the
+//! open segment never sees a marker it already read change. The file of an
+//! open segment always ends at an unwritten head slot; a reader stops there
+//! (the marker lies beyond EOF) and resumes once a later flush writes it.
+//!
+//! When the segment cannot hold another marker (full) or is sealed for
+//! rotation, the final head is written with `next = 0` (to EOF), the chain is
+//! closed, and the segment accepts no more appends.
+//!
+//! The on-disk encoding did not change: segments written by older binaries,
+//! which patched the previous marker in place and ended in a `next = 0`
+//! marker, are read by the same [`SegmentReader`](super::reader::SegmentReader),
+//! and an older binary reads this writer's segments.
+//!
+//! Compatibility is only ever a READ question, because no binary — old or new
+//! — appends to a segment it did not create in the same process: segment files
+//! are always created fresh (`truncate(true)`), and startup replays existing
+//! segments, re-logs what it keeps into new ones, and deletes the old files. So
+//! an older binary can never patch a marker in a segment this writer made.
+//!
+//! A torn head (bad CRC) ends the chain: the sections before it replay, and
+//! the bytes after it are reported as rejected so the segment is retained
+//! (`a_torn_section_head_is_rejected_not_followed`).
+//!
 //! # Safety
 //!
 //! The segment buffer is wrapped in [`UnsafeCell`] because concurrent writers
@@ -222,29 +262,6 @@ fn sync_file(file: &fs::File, mode: CommitLogSyncMode) -> ferrosa_common::Result
     file.sync_data()?;
     SYNCS_BY_MODE[mode_index(mode)].fetch_add(1, Ordering::Relaxed);
     Ok(())
-}
-
-/// Rewrites, in place, the sync marker that a forward flush skipped.
-///
-/// `write_all_at` is pwrite: it does not move the file cursor, so the
-/// appending `write_all` that ran just before it keeps its place and the next
-/// incremental flush still lands at the tail.
-fn repair_marker_in_place(
-    file: &fs::File,
-    buf: &[u8],
-    patch: &std::ops::Range<u64>,
-) -> ferrosa_common::Result<usize> {
-    use std::os::unix::fs::FileExt;
-    let start = patch.start as usize;
-    let end = patch.end as usize;
-    if end > buf.len() {
-        return Err(ferrosa_common::Error::InvalidData(format!(
-            "commit-log marker repair {start}..{end} lies outside the {}-byte segment buffer",
-            buf.len()
-        )));
-    }
-    file.write_all_at(&buf[start..end], patch.start)?;
-    Ok(end - start)
 }
 
 /// Makes a new segment's directory entry durable in `mode`.
@@ -459,33 +476,36 @@ pub struct Segment {
     /// reused for subsequent appends.
     file_handle: Mutex<Option<std::fs::File>>,
 
-    /// Byte position up to which data has been flushed to disk. Used by
-    /// incremental flush to write only new bytes.
+    /// Byte position up to which data has been flushed AND synced. Every byte
+    /// below it is durable and is never written again. Only advanced under
+    /// `file_handle`, after the sync succeeds. While the chain is open it is
+    /// always the offset of a reserved head slot that is not yet on disk.
     last_flushed: AtomicU64,
 
-    /// Absolute byte offset of the most recently written sync marker.
-    /// Used to build the forward-linked marker chain: when a new marker is
-    /// written, the previous marker's `next_marker_offset` is patched to
-    /// point to the new one.
+    /// Offset of the CURRENT section's head marker slot: reserved, not yet
+    /// written to the buffer with its final value, never yet on disk. The
+    /// next flush writes it with `next` = the slot it reserves.
     ///
     /// Only ever read or written under `marker_link`. It stays an atomic so
     /// the field carries no interior-mutability ceremony of its own; the lock
     /// is what makes the read-modify-write a single step.
-    last_sync_marker_offset: AtomicU64,
+    head_marker_offset: AtomicU64,
 
-    /// Serializes marker allocation together with marker linking.
+    /// Set (under `marker_link`) once the final head has been written with
+    /// `next = 0`. After that no marker is ever written again and flushes
+    /// carry the segment up to its allocation position.
+    chain_closed: std::sync::atomic::AtomicBool,
+
+    /// Serializes slot reservation together with writing the head that points
+    /// at the reserved slot.
     ///
-    /// The chain must come out in ALLOCATION order, and nothing weaker than
-    /// one lock over both steps gets that. A swap on
-    /// `last_sync_marker_offset` stops two callers from claiming the same
-    /// predecessor, but it does not stop the caller who allocated the LATER
-    /// offset from claiming first — and a marker whose `next` points
-    /// backwards ends the chain as far as `SegmentReader` is concerned, which
-    /// is silent loss of everything after it. Allocating under the same lock
-    /// makes "claimed earlier" and "sits earlier in the file" the same fact.
+    /// The chain must come out in ALLOCATION order. Reserving the slot and
+    /// linking the head to it under one lock makes "reserved earlier" and
+    /// "sits earlier in the file" the same fact, so every `next` points
+    /// forward to the very next head.
     ///
-    /// It guards the eight-byte buffer writes only, not the flush, so
-    /// concurrent `force_sync` callers still fsync in parallel.
+    /// It guards the eight-byte buffer writes only, not the file I/O, so
+    /// concurrent flushers still sync in parallel.
     marker_link: Mutex<()>,
 
     /// The system call every sync of this segment issues.
@@ -549,8 +569,10 @@ impl Segment {
     /// Creates a new segment with the given ID and capacity.
     ///
     /// The buffer is pre-allocated and zeroed. The 17-byte header is written
-    /// immediately, followed by an 8-byte sync marker (all zeros = EOF marker).
-    /// Syncs use the default, power-loss durable [`CommitLogSyncMode::Full`].
+    /// immediately and the 8-byte slot at `HEADER_SIZE` is reserved as the
+    /// first section's head; that marker is written by the first flush that
+    /// closes a non-empty section. Syncs use the default, power-loss durable
+    /// [`CommitLogSyncMode::Full`].
     pub fn new(id: u64, size: usize, dir: &Path) -> Self {
         Self::with_sync_mode(id, size, dir, CommitLogSyncMode::default())
     }
@@ -568,15 +590,8 @@ impl Segment {
         // Write the segment header (17 bytes).
         let descriptor = SegmentDescriptor::new(id);
         descriptor.write_to(&mut buffer[..HEADER_SIZE]);
-
-        // Write the first sync marker at offset HEADER_SIZE (17).
-        // All zeros = EOF marker (next_marker_offset = 0, marker_crc = CRC of
-        // segment_id || 0).
-        Self::write_sync_marker_into(
-            &mut buffer[HEADER_SIZE..HEADER_SIZE + SYNC_MARKER_SIZE],
-            id,
-            0,
-        );
+        // The slot at HEADER_SIZE stays zero: it is the first section's head,
+        // written once by the flush that closes that section.
 
         let path = dir.join(format!("commitlog-{id}.log"));
 
@@ -597,8 +612,9 @@ impl Segment {
             in_flight_writers: AtomicU64::new(0),
             sealed: std::sync::atomic::AtomicBool::new(false),
             file_handle: Mutex::new(None),
-            last_flushed: AtomicU64::new(INITIAL_POSITION),
-            last_sync_marker_offset: AtomicU64::new(HEADER_SIZE as u64),
+            last_flushed: AtomicU64::new(0),
+            head_marker_offset: AtomicU64::new(HEADER_SIZE as u64),
+            chain_closed: std::sync::atomic::AtomicBool::new(false),
             marker_link: Mutex::new(()),
             sync_mode,
         }
@@ -806,136 +822,102 @@ impl Segment {
         }
     }
 
-    /// Writes a sync marker at the current sync position.
+    /// Closes the current section and returns the offset the flush must write
+    /// up to (exclusive). Every byte below the returned offset is either
+    /// already complete or belongs to a writer counted in `in_flight_writers`,
+    /// so the caller must still `wait_for_writers` before reading the buffer.
     ///
-    /// The sync marker contains `next_offset` (the absolute byte offset of
-    /// the next sync marker, or 0 for EOF) and a CRC of the segment ID
-    /// concatenated with the offset.
-    pub fn write_sync_marker(&self, next_offset: u32) {
-        // Reserve the eight bytes rather than reading `position` and writing at
-        // it: two callers that both read the same position would otherwise write
-        // the same bytes, and a flusher could snapshot past a marker that has no
-        // contents. Counting it in flight gives the marker the same ordering
-        // guarantee an entry gets.
-        let Some(offset) = self.allocate_and_begin_write(SYNC_MARKER_SIZE) else {
-            // The segment cannot hold another marker; the chain ends where it
-            // ends, exactly as `allocate_and_link_sync_marker` decides.
-            return;
-        };
-
-        // SAFETY: because `allocate_and_begin_write` claimed exactly these eight
-        // bytes for this call, no other writer's view can overlap them — the
-        // reservation is what makes the range ours.
-        let marker = unsafe { self.buffer.range_mut(offset as usize, SYNC_MARKER_SIZE) };
-        Self::write_sync_marker_into(marker, self.id, next_offset);
-        self.buffer.publish(offset as usize + SYNC_MARKER_SIZE);
-
-        self.writer_done();
-    }
-
-    /// Which already-flushed bytes a backwards marker patch dirtied, if any.
+    /// Three cases, all decided under `marker_link`:
     ///
-    /// `write_sync_marker_at` patches the PREVIOUS marker so it points at the
-    /// new one. That write goes backwards, and `flush_to_disk` only ever writes
-    /// forward from `last_flushed` -- so a patch below that watermark would
-    /// never reach disk.
+    /// * **Chain closed** (final head already written with `next = 0`): the
+    ///   last section runs to EOF, so the flush covers the whole allocation
+    ///   position. No marker is written.
+    /// * **Empty section** (nothing allocated since the head slot): there is
+    ///   nothing to close. The flush end is the head slot itself, which leaves
+    ///   any earlier, not yet durable section (a failed flush) to be written.
+    ///   Without this, every idle periodic tick would burn eight bytes and a
+    ///   sync.
+    /// * **Otherwise** reserve the next slot `S` and write the current head
+    ///   with `next = S`. The flush end is `S`: up to, not including, the new
+    ///   slot, whose bytes are only written by the flush that closes ITS
+    ///   section. If no slot fits, or the segment is sealed for rotation, the
+    ///   head is written with `next = 0`, the chain is closed and the segment
+    ///   is sealed so it never takes another append.
     ///
-    /// `force_sync` used to answer this by rewriting the whole segment:
-    /// `open(O_TRUNC)` plus every byte accumulated so far plus a hardware cache
-    /// flush, on every call. Inside one 32 MB segment that is quadratic in the
-    /// number of batches, and it ran on every Accord apply. The region actually
-    /// dirtied is SYNC_MARKER_SIZE bytes -- eight.
-    ///
-    /// `None` means the patch sits at or above the watermark and the ordinary
-    /// incremental flush already covers it.
-    pub(crate) fn marker_patch_to_rewrite(
-        prev_offset: u64,
-        already_flushed: u64,
-    ) -> Option<std::ops::Range<u64>> {
-        let end = prev_offset.saturating_add(SYNC_MARKER_SIZE as u64);
-        // Any overlap at all with what is already on disk, not just full
-        // containment: a marker straddling the watermark has its leading bytes
-        // below it, and those are exactly the bytes a forward flush skips.
-        (prev_offset < already_flushed).then_some(prev_offset..end)
-    }
-
-    /// Reserves an EOF sync marker and links it onto the end of the forward
-    /// chain, as one step.
-    ///
-    /// Returns the offset of the PREVIOUS marker — the one this call patched,
-    /// and the one the caller hands to
-    /// [`flush_to_disk_repairing_marker`](Self::flush_to_disk_repairing_marker),
-    /// because that backwards patch is the write an incremental flush would
-    /// otherwise skip. Reading the tracker separately would name a different
-    /// marker once a second writer has moved it. `None` means the segment
-    /// cannot hold another marker and the chain ends where it ends.
-    ///
-    /// Reserving and linking are inseparable. Each is individually
-    /// atomic already; doing them apart is what corrupts the chain, because a
-    /// caller can win the allocation and lose the race to link, leaving a
-    /// marker pointing backwards at one allocated before it. The
-    /// `marker_link` field documents why nothing lock-free covers this.
-    ///
-    /// The marker counts as an in-flight writer for the whole window, exactly
-    /// as `append` counts an entry: a flusher that snapshots a position past
-    /// this allocation must wait for the eight bytes to exist, or it writes
-    /// the hole and leaves an uncrossable marker on disk.
-    pub fn allocate_and_link_sync_marker(&self) -> Option<u64> {
+    /// Ordering. The head being written lies below `S`, and any flusher whose
+    /// end exceeds the head obtained that end from this function after we
+    /// release `marker_link`, so it observes the finished head bytes. Flushers
+    /// holding an earlier end stop at or before the head and never read it.
+    /// The new slot is never pointed at before this same flush writes it as
+    /// the end of its range. The slot reservation itself goes through
+    /// `allocate_and_begin_write`, so it counts as an in-flight writer while
+    /// the head is written and also respects `sealed`.
+    fn close_section(&self) -> ferrosa_common::Result<u64> {
         let _linking = self.marker_link.lock();
-        let offset = self.allocate_and_begin_write(SYNC_MARKER_SIZE)?;
-        let prev_offset = self.write_sync_marker_at(offset, 0);
-        self.writer_done();
-        Some(prev_offset)
+        if self.chain_closed.load(Ordering::Acquire) {
+            return Ok(self.position.load(Ordering::Acquire));
+        }
+        let head = self.head_marker_offset.load(Ordering::Acquire);
+        let head_end = head + SYNC_MARKER_SIZE as u64;
+        let position = self.position.load(Ordering::Acquire);
+        debug_assert!(
+            position >= head_end,
+            "allocation position {position} below the head slot end {head_end}"
+        );
+        if position == head_end {
+            return Ok(head);
+        }
+        match self.allocate_and_begin_write(SYNC_MARKER_SIZE) {
+            Some(slot) => {
+                let linked = self.write_head_marker(head, slot);
+                if linked.is_ok() {
+                    self.head_marker_offset.store(slot, Ordering::Release);
+                }
+                self.writer_done();
+                linked.map(|()| slot)
+            }
+            None => {
+                // Full or sealed. A full segment cannot take an entry either
+                // (every entry is larger than a marker); sealing says so
+                // explicitly so no later append can land past the final head.
+                self.sealed.store(true, Ordering::SeqCst);
+                self.write_head_marker(head, 0)?;
+                self.chain_closed.store(true, Ordering::Release);
+                Ok(self.position.load(Ordering::Acquire))
+            }
+        }
     }
 
-    /// Writes a sync marker at an explicitly allocated offset, linking it
-    /// into the forward chain.
-    ///
-    /// Unlike `write_sync_marker()`, this does not advance the position — the
-    /// offset was already reserved via `allocate()`.
-    ///
-    /// The previous sync marker's `next_marker_offset` is patched to point to
-    /// this new marker, creating the forward-linked chain for crash recovery.
-    ///
-    /// The caller must hold `marker_link`; see
-    /// [`allocate_and_link_sync_marker`](Self::allocate_and_link_sync_marker).
-    fn write_sync_marker_at(&self, offset: u64, next_marker_offset: u32) -> u64 {
-        // The link write below goes backwards, into bytes a flush in progress may
-        // be reading. `file_handle` is the lock a flusher takes before it forms
-        // its view of the prefix, so holding it here is what keeps this
-        // eight-byte patch out of that view. It does not serialise the fsyncs of
-        // concurrent `force_sync` callers: this guard is released before their
-        // repair flush re-acquires it.
-        let _file = self.file_handle.lock();
-
-        // SAFETY: because `offset` was reserved for this call by
-        // `allocate_and_link_sync_marker`, and `marker_link` excludes every other
-        // marker writer, this range is ours alone.
-        let marker = unsafe { self.buffer.range_mut(offset as usize, SYNC_MARKER_SIZE) };
-
-        // The new marker's own bytes go down BEFORE anything points at them.
-        // A flusher racing us reads the prefix under this same file lock, so
-        // the order these two writes land in is the order it can observe. A
-        // predecessor pointing at eight bytes that are still zero is a marker
-        // with a zero CRC, which a reader treats as the end of the log.
-        Self::write_sync_marker_into(marker, self.id, next_marker_offset);
-        self.buffer.publish(offset as usize + SYNC_MARKER_SIZE);
-
-        let prev_offset = self.last_sync_marker_offset.load(Ordering::Acquire);
-        // SAFETY: the previous marker is ours to patch because `marker_link` is
-        // held, so no other writer is touching a marker, and because
-        // `file_handle` keeps a flusher from holding a view over these eight
-        // bytes while we write them.
-        let prev = unsafe {
-            self.buffer
-                .range_mut(prev_offset as usize, SYNC_MARKER_SIZE)
-        };
-        Self::write_sync_marker_into(prev, self.id, offset as u32);
-
-        self.last_sync_marker_offset
-            .store(offset, Ordering::Release);
-
-        prev_offset
+    /// Writes the head marker at `head` into the buffer, linking it to `next`
+    /// (0 = runs to EOF). The caller holds `marker_link`.
+    fn write_head_marker(&self, head: u64, next: u64) -> ferrosa_common::Result<()> {
+        let next = u32::try_from(next).map_err(|_| {
+            ferrosa_common::Error::InvalidData(format!(
+                "commit-log segment {}: next marker offset {next} exceeds u32",
+                self.id
+            ))
+        })?;
+        let end = head as usize + SYNC_MARKER_SIZE;
+        // Checked against the allocation, not the view: a released buffer must
+        // fail loudly here rather than hand back a slice of freed memory.
+        if end > self.buffer.allocated() {
+            return Err(ferrosa_common::Error::InvalidData(format!(
+                "commit-log segment {}: head marker {head}..{end} lies outside the \
+                 {}-byte buffer (released before its chain was closed?)",
+                self.id,
+                self.buffer.allocated()
+            )));
+        }
+        // SAFETY: `marker_link` is held for the duration, so no other marker writer
+        // can claim these eight bytes; `range_mut`'s bound check then confirms the
+        // reservation is still within the allocation rather than trusting the caller.
+        let marker = unsafe { self.buffer.range_mut(head as usize, SYNC_MARKER_SIZE) };
+        Self::write_sync_marker_into(marker, self.id, next);
+        // The slot's bytes now exist, so a later flush may include them in its
+        // prefix; without this the final section of a sealed segment would carry
+        // an unpublished head below the watermark.
+        self.buffer.publish(end);
+        Ok(())
     }
 
     /// Internal helper to write a sync marker into its own eight bytes.
@@ -958,48 +940,34 @@ impl Segment {
         hold();
     }
 
-    /// Flushes the written portion of the buffer to disk and fsyncs.
+    /// Closes the current section and makes everything before the next head
+    /// slot durable. This is the ONLY way bytes reach the segment file.
     ///
-    /// Uses incremental flush: only writes bytes since the last flush.
-    /// Waits for all in-flight writers to complete before reading the buffer.
+    /// Writes `[last_flushed, end)` at its own offset and syncs it, where
+    /// `end` comes from [`close_section`](Self::close_section). Bytes below
+    /// `last_flushed` are never written again. Waits for all in-flight
+    /// writers before reading the buffer.
     pub fn flush_to_disk(&self) -> ferrosa_common::Result<()> {
-        self.flush_inner(None)
+        let end = self.close_section()?;
+        self.write_through(end as usize)
     }
 
-    /// Flushes, and repairs the sync marker at `prev_marker_offset` if the
-    /// backwards patch [`write_sync_marker_at`](Self::write_sync_marker_at)
-    /// made to it now sits behind the flush watermark.
-    ///
-    /// The repair is decided inside the flush, under the file lock, against
-    /// the watermark the flush itself uses. Deciding it in the caller would be
-    /// a race: between the caller's marker write and this call a concurrent
-    /// flusher can carry those bytes to disk, or run past them with their
-    /// pre-patch contents, and only the lock holder can tell which happened.
-    pub fn flush_to_disk_repairing_marker(
-        &self,
-        prev_marker_offset: u64,
-    ) -> ferrosa_common::Result<()> {
-        self.flush_inner(Some(prev_marker_offset))
-    }
-
-    fn flush_inner(&self, repair_marker_at: Option<u64>) -> ferrosa_common::Result<()> {
+    fn write_through(&self, end: usize) -> ferrosa_common::Result<()> {
         let sync_start = Instant::now();
         let _span = tracing::info_span!("commitlog.sync", segment_id = self.id,).entered();
-        let mut phases = SyncPhaseDurations::default();
-        // Snapshot position BEFORE waiting. This captures only data from
-        // writers who have already allocated. New allocations after this
-        // point will be flushed on the next call.
-        let snapshot_pos = self.position.load(Ordering::Acquire) as usize;
-
-        // Wait for all in-flight writers to complete their entries.
-        phases.wait_writers = self.wait_for_writers();
+        // Every byte below `end` was allocated before `end` was chosen, so
+        // its writer already counts in `in_flight_writers`. After this,
+        // buffer[..end] is fully written.
+        let mut phases = SyncPhaseDurations {
+            wait_writers: self.wait_for_writers(),
+            ..SyncPhaseDurations::default()
+        };
         observe_wait_writers(phases.wait_writers);
 
-        // File I/O happens under the file_handle mutex to prevent concurrent
-        // flushers from writing duplicate bytes. `release_buffer()` and the
-        // marker patch take this lock too, so once we hold it the buffer's
-        // (ptr, len, cap) is stable for the duration of this flush and no
-        // eight-byte marker write can land inside the prefix about to be read.
+        // File I/O happens under the file_handle mutex so concurrent flushers
+        // never write the same range twice. `release_buffer()` also takes
+        // this lock, so once we hold it the buffer's (ptr, len, cap) is
+        // stable for the duration of this flush.
         let lock_start = Instant::now();
         let mut handle = self.file_handle.lock();
         phases.file_lock_wait = lock_start.elapsed();
@@ -1008,213 +976,60 @@ impl Segment {
             &SYNC_FILE_LOCK_WAIT_MICROS_MAX,
             phases.file_lock_wait,
         );
-
-        // If `release_buffer()` ran before us, the data is already on disk
-        // (force_rotate calls flush_to_disk first) and the buffer is empty.
-        // Don't try to slice into a freed allocation — short-circuit. Without
-        // this guard the test
-        // `concurrent_writers_with_flushes_preserve_lww` flakes with
-        // `range end index N out of range for slice of length 0`.
-        if self.buffer.allocated() == 0 {
+        let start = self.last_flushed.load(Ordering::Acquire) as usize;
+        // Publish only bytes that exist. `end` comes from the allocation, and a
+        // writer can hold a reservation for a while before it has written a byte
+        // of it; taking the smaller of the two costs a slow writer one extra
+        // incremental flush, while taking `end` alone would write zeros over its
+        // range and then move the watermark past it, so the entry would never
+        // reach disk while the index said it was there.
+        let end = end.min(self.buffer.written());
+        if end <= start {
+            // Already durable: a flusher with a later end wrote AND synced
+            // this range under this lock before advancing the watermark (or
+            // the segment was closed and released after its final flush).
+            // `end` is never 0 (the header precedes the first head slot), so
+            // a never-flushed segment (`start == 0`) always gets here with
+            // something to write.
             return Ok(());
         }
 
-        // Publish only the bytes that exist. `snapshot_pos` is what was
-        // *reserved*, and `allocate()` is public: a writer can hold a
-        // reservation for a while before it has written a byte of it. The
-        // flushable end is therefore the published prefix as well as the
-        // snapshot. Taking the smaller of the two costs a slow writer one extra
-        // incremental flush; taking the snapshot alone would write zeros over
-        // its range and then move the watermark past it, so the entry would
-        // never reach disk while the index said it was there.
-        let current_pos = snapshot_pos.min(self.buffer.written());
-        let last_flushed = self.last_flushed.load(Ordering::Acquire) as usize;
-        let marker_patch = repair_marker_at
-            .and_then(|prev| Self::marker_patch_to_rewrite(prev, last_flushed as u64));
-
-        // SAFETY: because `current_pos <= written`, every byte below it has
-        // been written and published; `wait_for_writers` drained the counted
-        // writers, so nothing below `snapshot_pos` is mid-write, and entry
-        // writers only touch ranges reserved at or above it. The file lock
-        // excludes the marker patch — the one writer that reaches backwards
-        // into this prefix — and `release_buffer`.
-        let buf = unsafe { self.buffer.prefix(current_pos) };
-
-        match handle.as_mut() {
-            None => {
-                // First flush: create file, write from beginning (header + sync marker + entries).
-                // Nothing is on disk yet, so a marker patch anywhere in
-                // `buf[..current_pos]` goes out with this write.
-                if let Some(parent) = self.path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                let created = !self.path.exists();
-                let f = fs::OpenOptions::new()
-                    .create(true)
-                    .truncate(true)
-                    .write(true)
-                    .open(&self.path)?;
-                *handle = Some(f);
-                let file = handle.as_mut().unwrap();
-                use std::io::Write;
-                let written = current_pos;
-                let write_start = Instant::now();
-                file.write_all(&buf[..current_pos])?;
-                phases.write = write_start.elapsed();
-                observe_phase(
-                    &SYNC_WRITE_MICROS_TOTAL,
-                    &SYNC_WRITE_MICROS_MAX,
-                    phases.write,
-                );
-                let sync_data_start = Instant::now();
-                sync_file(file, self.sync_mode)?;
-                phases.sync_data = sync_data_start.elapsed();
-                observe_phase(
-                    &SYNC_DATA_MICROS_TOTAL,
-                    &SYNC_DATA_MICROS_MAX,
-                    phases.sync_data,
-                );
-                if created {
-                    let parent_sync_start = Instant::now();
-                    sync_parent_dir(&self.path, self.sync_mode)?;
-                    phases.parent_dir_sync = parent_sync_start.elapsed();
-                    observe_phase(
-                        &SYNC_PARENT_DIR_MICROS_TOTAL,
-                        &SYNC_PARENT_DIR_MICROS_MAX,
-                        phases.parent_dir_sync,
-                    );
-                }
-                INCREMENTAL_FLUSHES_TOTAL.fetch_add(1, Ordering::Relaxed);
-                INCREMENTAL_FLUSH_BYTES_TOTAL.fetch_add(written as u64, Ordering::Relaxed);
-                SYNCS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                let total = sync_start.elapsed();
-                observe_sync(total);
-                maybe_warn_slow_sync(self.id, written, total, &phases);
-                self.last_flushed
-                    .store(current_pos as u64, Ordering::Release);
-            }
-            Some(file) if current_pos > last_flushed => {
-                // Incremental: append only new bytes, plus the eight bytes of
-                // any marker the forward write would have skipped. Both land
-                // before the single fsync below, so durability is unchanged.
-                use std::io::Write;
-                let mut written = current_pos - last_flushed;
-                let write_start = Instant::now();
-                file.write_all(&buf[last_flushed..current_pos])?;
-                if let Some(patch) = marker_patch.as_ref() {
-                    written += repair_marker_in_place(file, buf, patch)?;
-                }
-                phases.write = write_start.elapsed();
-                observe_phase(
-                    &SYNC_WRITE_MICROS_TOTAL,
-                    &SYNC_WRITE_MICROS_MAX,
-                    phases.write,
-                );
-                let sync_data_start = Instant::now();
-                sync_file(file, self.sync_mode)?;
-                phases.sync_data = sync_data_start.elapsed();
-                observe_phase(
-                    &SYNC_DATA_MICROS_TOTAL,
-                    &SYNC_DATA_MICROS_MAX,
-                    phases.sync_data,
-                );
-                INCREMENTAL_FLUSHES_TOTAL.fetch_add(1, Ordering::Relaxed);
-                INCREMENTAL_FLUSH_BYTES_TOTAL.fetch_add(written as u64, Ordering::Relaxed);
-                SYNCS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                let total = sync_start.elapsed();
-                observe_sync(total);
-                maybe_warn_slow_sync(self.id, written, total, &phases);
-                self.last_flushed
-                    .store(current_pos as u64, Ordering::Release);
-            }
-            Some(file) => {
-                // Nothing new to append. A marker repair can still be owed:
-                // a concurrent flusher can have carried this segment past the
-                // patched marker already, writing its pre-patch bytes.
-                let Some(patch) = marker_patch else {
-                    return Ok(());
-                };
-                let write_start = Instant::now();
-                let written = repair_marker_in_place(file, buf, &patch)?;
-                phases.write = write_start.elapsed();
-                observe_phase(
-                    &SYNC_WRITE_MICROS_TOTAL,
-                    &SYNC_WRITE_MICROS_MAX,
-                    phases.write,
-                );
-                let sync_data_start = Instant::now();
-                sync_file(file, self.sync_mode)?;
-                phases.sync_data = sync_data_start.elapsed();
-                observe_phase(
-                    &SYNC_DATA_MICROS_TOTAL,
-                    &SYNC_DATA_MICROS_MAX,
-                    phases.sync_data,
-                );
-                INCREMENTAL_FLUSHES_TOTAL.fetch_add(1, Ordering::Relaxed);
-                INCREMENTAL_FLUSH_BYTES_TOTAL.fetch_add(written as u64, Ordering::Relaxed);
-                SYNCS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                let total = sync_start.elapsed();
-                observe_sync(total);
-                maybe_warn_slow_sync(self.id, written, total, &phases);
-            }
+        if self.buffer.allocated() < end {
+            return Err(ferrosa_common::Error::InvalidData(format!(
+                "commit-log segment {}: flush to {end} past the {}-byte buffer with only \
+                 {start} bytes durable",
+                self.id,
+                self.buffer.allocated()
+            )));
         }
 
-        Ok(())
-    }
-
-    /// Rewrites the entire segment file from scratch.
-    ///
-    /// Unlike `flush_to_disk` which only appends new bytes, this writes
-    /// `buf[0..position]` to the file.
-    ///
-    /// Nothing calls this any more. `force_sync` did, to carry the eight-byte
-    /// backwards marker patch that a forward flush skips, which cost a whole
-    /// `open(O_TRUNC)` plus every accumulated byte plus a hardware cache flush
-    /// per call — quadratic within one segment. That is now
-    /// [`flush_to_disk_repairing_marker`](Self::flush_to_disk_repairing_marker).
-    /// A new caller wanting a full rewrite should say why the incremental path
-    /// cannot express it.
-    pub fn force_full_flush(&self) -> ferrosa_common::Result<()> {
-        let sync_start = Instant::now();
-        let mut phases = SyncPhaseDurations::default();
-        let snapshot_pos = self.position.load(Ordering::Acquire) as usize;
-        phases.wait_writers = self.wait_for_writers();
-        observe_wait_writers(phases.wait_writers);
-
-        let lock_start = Instant::now();
-        let mut handle = self.file_handle.lock();
-        phases.file_lock_wait = lock_start.elapsed();
-        observe_phase(
-            &SYNC_FILE_LOCK_WAIT_MICROS_TOTAL,
-            &SYNC_FILE_LOCK_WAIT_MICROS_MAX,
-            phases.file_lock_wait,
-        );
-
-        if self.buffer.allocated() == 0 {
-            return Ok(());
-        }
-        // The same published-prefix bound as `flush_inner`: rewrite the bytes
-        // that exist, not the range that was reserved.
-        let end = snapshot_pos.min(self.buffer.written());
-        // SAFETY: because `end <= written`, the prefix is written and published,
-        // the counted writers below it are drained, and the file lock excludes
-        // the marker patch and `release_buffer` from touching the same bytes.
+        // SAFETY: `wait_for_writers()` above drained every writer of the bytes
+        // below `end`; `prefix` additionally asserts they were published, so the
+        // view cannot cover a reservation whose writer has not written yet.
         let buf = unsafe { self.buffer.prefix(end) };
 
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
+        let created = handle.is_none() && !self.path.exists();
+        if handle.is_none() {
+            if let Some(parent) = self.path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            // Truncate only a file this segment has never made durable.
+            let f = fs::OpenOptions::new()
+                .create(true)
+                .truncate(start == 0)
+                .write(true)
+                .open(&self.path)?;
+            *handle = Some(f);
         }
-        let created = !self.path.exists();
-        let f = fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&self.path)?;
-        *handle = Some(f);
-        let file = handle.as_mut().unwrap();
-        use std::io::Write;
+        let Some(file) = handle.as_mut() else {
+            unreachable!("file handle opened above");
+        };
+
+        // Positional write: the range lands at its own offset even if an
+        // earlier attempt failed partway, so a retry can never misplace it.
+        use std::os::unix::fs::FileExt;
         let write_start = Instant::now();
-        file.write_all(&buf[..end])?;
+        file.write_all_at(&buf[start..end], start as u64)?;
         phases.write = write_start.elapsed();
         observe_phase(
             &SYNC_WRITE_MICROS_TOTAL,
@@ -1239,14 +1054,15 @@ impl Segment {
                 phases.parent_dir_sync,
             );
         }
-        FULL_FLUSHES_TOTAL.fetch_add(1, Ordering::Relaxed);
-        FULL_FLUSH_BYTES_TOTAL.fetch_add(end as u64, Ordering::Relaxed);
+        let written = end - start;
+        INCREMENTAL_FLUSHES_TOTAL.fetch_add(1, Ordering::Relaxed);
+        INCREMENTAL_FLUSH_BYTES_TOTAL.fetch_add(written as u64, Ordering::Relaxed);
         SYNCS_TOTAL.fetch_add(1, Ordering::Relaxed);
         let total = sync_start.elapsed();
         observe_sync(total);
-        maybe_warn_slow_sync(self.id, end, total, &phases);
+        maybe_warn_slow_sync(self.id, written, total, &phases);
+        // Only now is [start, end) durable.
         self.last_flushed.store(end as u64, Ordering::Release);
-
         Ok(())
     }
 
@@ -1358,10 +1174,13 @@ impl Segment {
     /// The largest single entry (payload + overhead) that can ever fit in a
     /// fresh segment of `capacity` bytes.
     ///
-    /// A fresh segment starts at [`INITIAL_POSITION`] (header + first sync
-    /// marker); a closing sync marker is also reserved so `force_sync` can
-    /// always append its EOF marker. Returns 0 when the capacity cannot hold
-    /// even an empty entry — callers must treat that as "no entry fits".
+    /// A fresh segment starts at [`INITIAL_POSITION`] (header + first head
+    /// slot). One more marker slot is reserved on top. Reserve-ahead does not
+    /// need it for correctness (a segment that cannot fit the next head closes
+    /// its final section with `next = 0`), but it keeps the limit unchanged
+    /// for callers that pre-flight batches against it. Returns 0 when the
+    /// capacity cannot hold even an empty entry — callers must treat that as
+    /// "no entry fits".
     pub fn max_entry_size(capacity: usize) -> usize {
         let reserved = INITIAL_POSITION as usize + SYNC_MARKER_SIZE;
         capacity.saturating_sub(reserved)
@@ -1411,29 +1230,34 @@ impl Segment {
         // lock, so holding it here means no flusher is inside its view when the
         // allocation below is freed.
         //
-        // Writers cannot reach this segment via `ArcSwap` once `force_rotate()`
-        // has swapped in the new active segment, so no append path can hold a
-        // range either; the assertion states that precondition rather than
-        // assuming it silently.
+        // SAFETY: With the lock held, no other thread is inside
+        // `flush_to_disk()` (which also acquires `file_handle`). Writers
+        // cannot reach this segment via `ArcSwap` once `force_rotate()` has
+        // swapped in the new active segment, so no append path will read
+        // the buffer either.
+        //
+        // `marker_link` is taken too, because `close_section` writes head
+        // markers into the buffer under it. Lock order is marker_link then
+        // file_handle; flushers never hold both at once.
+        //
+        // `last_flushed` is left alone: it must never claim bytes durable
+        // that are not. After the final flush the watermark already covers
+        // everything a later flush could ask for (the chain is closed, or the
+        // last section is empty), so a post-release flush is a no-op; one that
+        // is not finds the buffer gone and fails loudly.
+        let _linking = self.marker_link.lock();
         let _handle = self.file_handle.lock();
-        debug_assert_eq!(
-            self.in_flight_writers.load(Ordering::Acquire),
-            0,
-            "release_buffer: a writer is still in flight"
-        );
-        // SAFETY: `file_handle` excludes every flusher (they form their view
-        // under it), the segment has been rotated out of the active slot, and
-        // the assertion above holds on the one counter that tracks an append
-        // between reservation and write. Every view into the allocation is
-        // therefore gone.
+        // SAFETY: `marker_link` and `file_handle` are held for the duration, so no
+        // flusher can be inside a prefix view and no marker writer inside a range
+        // view; `release` is atomic (it zeroes the published length `Release` before
+        // it drops the allocation), so a stale reservation fails its bound check
+        // rather than dereferencing freed memory.
         unsafe { self.buffer.release() };
-        // Make any post-release flush a no-op: by setting last_flushed to
-        // the current position, the `Some(_)` "nothing new" arm of
-        // `flush_to_disk` is taken even if the file handle gets re-opened
-        // somehow. The `None` arm is additionally guarded by the published
-        // length check in `flush_inner`.
-        let pos = self.position.load(Ordering::Acquire);
-        self.last_flushed.store(pos, Ordering::Release);
+    }
+
+    /// Offset up to which this segment's bytes are durable on disk.
+    pub(crate) fn durable_watermark(&self) -> u64 {
+        self.last_flushed.load(Ordering::Acquire)
     }
 }
 
@@ -1487,8 +1311,12 @@ mod tests {
 
         assert!(syncs_issued(mode) > before, "{mode:?} sync was not counted");
         let on_disk = fs::read(segment.path()).unwrap();
-        let buf = written_prefix(&segment);
-        let end = segment.current_position() as usize;
+        // Everything up to the newly reserved (unwritten) head slot.
+        let end = segment.current_position() as usize - SYNC_MARKER_SIZE;
+        // SAFETY: single-threaded here, and `end` is at or below the published
+        // prefix because the only unpublished bytes are the reserved head slot.
+        let buf = unsafe { segment.buffer.prefix(end) };
+        assert_eq!(segment.durable_watermark() as usize, end);
         assert_eq!(&on_disk[..], &buf[..end]);
     }
 
@@ -1672,7 +1500,8 @@ mod tests {
         let path = segment.path();
         assert!(path.exists());
         let contents = fs::read(path).unwrap();
-        let expected_len = segment.current_position() as usize;
+        // The flush stops before the head slot it reserved for the next section.
+        let expected_len = segment.current_position() as usize - SYNC_MARKER_SIZE;
         assert_eq!(contents.len(), expected_len);
     }
 
@@ -1721,36 +1550,380 @@ mod tests {
         assert_eq!(descriptor.segment_id, 42);
     }
 
+    /// The marker bytes for `next` in segment `id`, as the reader checks them.
+    fn marker_bytes(id: u64, next: u32) -> [u8; SYNC_MARKER_SIZE] {
+        let mut out = [0u8; SYNC_MARKER_SIZE];
+        Segment::write_sync_marker_into(&mut out, id, next);
+        out
+    }
+
+    fn mutation_n(n: i64) -> Mutation {
+        Mutation {
+            timestamp: n,
+            ..simple_mutation()
+        }
+    }
+
+    fn append(segment: &Segment, m: &Mutation) {
+        let offset = segment
+            .allocate_and_begin_write(Segment::entry_total_size(m))
+            .expect("entry fits");
+        segment.write_entry(offset, m);
+        segment.writer_done();
+    }
+
+    fn replay(path: &Path) -> Vec<i64> {
+        let mut reader = super::super::reader::SegmentReader::open(path).unwrap();
+        let stamps = reader
+            .read_all()
+            .unwrap()
+            .into_iter()
+            .map(|(_, m)| m.timestamp)
+            .collect();
+        assert!(
+            !reader.rejected_records(),
+            "a cleanly written segment must not reject any bytes"
+        );
+        stamps
+    }
+
+    /// Two flushed sections, `[0, 1]` then `[2]`; returns the segment path and
+    /// the offset of the second section's head marker.
+    fn two_flushed_sections(dir: &Path) -> (std::path::PathBuf, u64) {
+        let segment = Segment::new(7, 4096, dir);
+        append(&segment, &mutation_n(0));
+        append(&segment, &mutation_n(1));
+        let second_head = segment.current_position();
+        segment.flush_to_disk().unwrap();
+        append(&segment, &mutation_n(2));
+        segment.flush_to_disk().unwrap();
+        assert_eq!(replay(segment.path()), vec![0, 1, 2]);
+        (segment.path().to_path_buf(), second_head)
+    }
+
+    fn replay_with_rejection(path: &Path) -> (Vec<i64>, bool) {
+        let mut reader = super::super::reader::SegmentReader::open(path).unwrap();
+        let stamps = reader
+            .read_all()
+            .unwrap()
+            .into_iter()
+            .map(|(_, m)| m.timestamp)
+            .collect();
+        (stamps, reader.rejected_records())
+    }
+
+    /// PR #651 review: a reserve-ahead head whose CRC is torn must not be
+    /// followed. The sections before it replay; the bytes after it are
+    /// REJECTED (reported, so replay keeps the segment), never read as entries.
     #[test]
-    fn sync_marker_crc_is_valid() {
+    fn a_torn_section_head_is_rejected_not_followed() {
+        use std::os::unix::fs::FileExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (path, second_head) = two_flushed_sections(dir.path());
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut crc_byte = [0u8; 1];
+        file.read_exact_at(&mut crc_byte, second_head + 5).unwrap();
+        file.write_all_at(&[crc_byte[0] ^ 0xFF], second_head + 5)
+            .unwrap();
+        drop(file);
+
+        let (stamps, rejected) = replay_with_rejection(&path);
+        assert_eq!(
+            stamps,
+            vec![0, 1],
+            "only the section before the torn head replays"
+        );
+        assert!(
+            rejected,
+            "the entries behind a torn head must be reported as rejected, not dropped silently"
+        );
+    }
+
+    /// A crash mid-way through writing a head (the 8-byte marker half on
+    /// disk) leaves the earlier sections intact and nothing to reject.
+    #[test]
+    fn a_half_written_section_head_ends_replay_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, second_head) = two_flushed_sections(dir.path());
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(second_head + (SYNC_MARKER_SIZE as u64) / 2)
+            .unwrap();
+        drop(file);
+
+        assert_eq!(replay_with_rejection(&path), (vec![0, 1], false));
+    }
+
+    #[test]
+    fn the_first_head_is_written_once_by_the_flush_that_closes_its_section() {
         let dir = tempfile::tempdir().unwrap();
         let segment = Segment::new(1, 4096, dir.path());
+        // Reserved, not yet written: nothing is on disk before the first flush.
+        assert!(
+            !segment.path().exists(),
+            "the first head must not reach disk before the flush that closes its section"
+        );
 
-        let buf = written_prefix(&segment);
-        let marker_offset = HEADER_SIZE;
+        append(&segment, &mutation_n(1));
+        let next_slot = segment.current_position();
+        segment.flush_to_disk().unwrap();
 
-        // Read next_marker_offset (should be 0 = EOF).
-        let next_offset = u32::from_be_bytes([
-            buf[marker_offset],
-            buf[marker_offset + 1],
-            buf[marker_offset + 2],
-            buf[marker_offset + 3],
-        ]);
-        assert_eq!(next_offset, 0);
+        let on_disk = fs::read(segment.path()).unwrap();
+        assert_eq!(
+            &on_disk[HEADER_SIZE..HEADER_SIZE + SYNC_MARKER_SIZE],
+            &marker_bytes(1, next_slot as u32),
+            "the first head must link forward to the slot this flush reserved"
+        );
+        assert_eq!(
+            on_disk.len() as u64,
+            next_slot,
+            "the flush stops before the newly reserved, still unwritten slot"
+        );
+        assert_eq!(segment.durable_watermark(), next_slot);
+    }
 
-        // Read and verify CRC.
-        let stored_crc = u32::from_be_bytes([
-            buf[marker_offset + 4],
-            buf[marker_offset + 5],
-            buf[marker_offset + 6],
-            buf[marker_offset + 7],
-        ]);
+    #[test]
+    fn an_idle_flush_reserves_no_marker_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let segment = Segment::new(1, 4096, dir.path());
+        append(&segment, &mutation_n(1));
+        segment.flush_to_disk().unwrap();
+        let position = segment.current_position();
+        let bytes = fs::read(segment.path()).unwrap();
+        for _ in 0..5 {
+            segment.flush_to_disk().unwrap();
+        }
+        assert_eq!(segment.current_position(), position);
+        assert_eq!(fs::read(segment.path()).unwrap(), bytes);
+    }
 
-        let mut crc_input = [0u8; 12];
-        crc_input[..8].copy_from_slice(&1u64.to_be_bytes());
-        crc_input[8..12].copy_from_slice(&0u32.to_be_bytes());
-        let expected_crc = crc32fast::hash(&crc_input);
-        assert_eq!(stored_crc, expected_crc);
+    /// A reader tailing the open segment sees every entry in order across
+    /// many flushes, and no byte it has seen on disk ever changes, in
+    /// particular no marker it already followed.
+    #[test]
+    fn a_tailing_reader_sees_every_entry_and_no_seen_byte_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let segment = Segment::new(9, 64 * 1024, dir.path());
+        append(&segment, &mutation_n(0));
+        segment.flush_to_disk().unwrap();
+
+        let mut reader = super::super::reader::SegmentReader::open(segment.path()).unwrap();
+        let mut seen: Vec<i64> = Vec::new();
+        let mut seen_bytes = fs::read(segment.path()).unwrap();
+        while let Some((_, m)) = reader.next_entry().unwrap() {
+            seen.push(m.timestamp);
+        }
+        let mut expected = vec![0];
+        assert_eq!(seen, expected);
+
+        let mut next = 1;
+        for round in 0..20 {
+            // A varying number of entries per section, including none.
+            for _ in 0..(round % 4) {
+                append(&segment, &mutation_n(next));
+                expected.push(next);
+                next += 1;
+            }
+            segment.flush_to_disk().unwrap();
+            reader.refresh().unwrap();
+            while let Some((_, m)) = reader.next_entry().unwrap() {
+                seen.push(m.timestamp);
+            }
+            assert_eq!(seen, expected, "round {round}");
+            let now = fs::read(segment.path()).unwrap();
+            assert_eq!(
+                &now[..seen_bytes.len()],
+                &seen_bytes[..],
+                "round {round}: bytes the reader already saw changed"
+            );
+            seen_bytes = now;
+        }
+        assert!(!reader.rejected_records());
+    }
+
+    /// Concurrent writers and flushers: every entry is replayable, and the
+    /// file only ever grows by appending.
+    #[test]
+    fn concurrent_writers_and_flushers_keep_every_entry_and_never_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let segment = Arc::new(Segment::new(3, 4 * 1024 * 1024, dir.path()));
+        const WRITERS: i64 = 4;
+        const PER_WRITER: i64 = 200;
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flushers: Vec<_> = (0..3)
+            .map(|_| {
+                let seg = Arc::clone(&segment);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut durable: Vec<u8> = Vec::new();
+                    while !stop.load(Ordering::Acquire) {
+                        seg.flush_to_disk().expect("flush");
+                        let now = fs::read(seg.path()).expect("read segment");
+                        assert!(now.len() >= durable.len(), "file shrank");
+                        assert!(
+                            now[..durable.len()] == durable[..],
+                            "a durable byte was rewritten"
+                        );
+                        durable = now;
+                    }
+                })
+            })
+            .collect();
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let seg = Arc::clone(&segment);
+                std::thread::spawn(move || {
+                    for i in 0..PER_WRITER {
+                        append(&seg, &mutation_n(w * PER_WRITER + i));
+                        if i % 7 == 0 {
+                            seg.flush_to_disk().expect("writer flush");
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in writers {
+            h.join().unwrap();
+        }
+        stop.store(true, Ordering::Release);
+        for h in flushers {
+            h.join().unwrap();
+        }
+        segment.flush_to_disk().unwrap();
+
+        let mut stamps = replay(segment.path());
+        stamps.sort_unstable();
+        assert_eq!(stamps, (0..WRITERS * PER_WRITER).collect::<Vec<_>>());
+    }
+
+    /// A segment written by the previous binary: the initial marker and every
+    /// force_sync marker were patched in place to point forward, and the last
+    /// one is an EOF marker (`next = 0`) followed by entries that a plain
+    /// flush appended after it. The current reader must replay all of it.
+    #[test]
+    fn a_segment_in_the_old_patched_layout_still_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = 77;
+        let path = dir.path().join(format!("commitlog-{id}.log"));
+        let mut file = vec![0u8; HEADER_SIZE];
+        SegmentDescriptor::new(id).write_to(&mut file[..HEADER_SIZE]);
+
+        let encode = |m: &Mutation| {
+            let payload_size = m.serialized_size();
+            let mut entry = vec![0u8; ENTRY_OVERHEAD + payload_size];
+            let size_bytes = (payload_size as u32).to_be_bytes();
+            entry[..4].copy_from_slice(&size_bytes);
+            entry[4..8].copy_from_slice(&crc32fast::hash(&size_bytes).to_be_bytes());
+            m.serialize_into(&mut entry[8..8 + payload_size]);
+            let crc = crc32fast::hash(&entry[8..8 + payload_size]);
+            entry[8 + payload_size..].copy_from_slice(&crc.to_be_bytes());
+            entry
+        };
+
+        // Old layout: [hdr][M0][e0 e1][M1][e2][M2 = EOF][e3 e4], where the
+        // old force_sync patched M0 -> M1 and M1 -> M2 after the fact.
+        let sections: [&[i64]; 3] = [&[0, 1], &[2], &[3, 4]];
+        let mut marker_offsets = Vec::new();
+        for stamps in sections {
+            marker_offsets.push(file.len());
+            file.extend_from_slice(&[0u8; SYNC_MARKER_SIZE]);
+            for &n in stamps {
+                file.extend(encode(&mutation_n(n)));
+            }
+        }
+        for pair in marker_offsets.windows(2) {
+            file[pair[0]..pair[0] + SYNC_MARKER_SIZE]
+                .copy_from_slice(&marker_bytes(id, pair[1] as u32));
+        }
+        let last = *marker_offsets.last().unwrap();
+        file[last..last + SYNC_MARKER_SIZE].copy_from_slice(&marker_bytes(id, 0));
+        fs::write(&path, &file).unwrap();
+
+        assert_eq!(replay(&path), vec![0, 1, 2, 3, 4]);
+    }
+
+    /// The old layout's single-section case: a plain flush with the initial
+    /// EOF marker and no force_sync at all.
+    #[test]
+    fn an_old_single_eof_section_segment_still_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = 78;
+        let path = dir.path().join(format!("commitlog-{id}.log"));
+        let segment = Segment::new(id, 4096, dir.path());
+        append(&segment, &mutation_n(5));
+        append(&segment, &mutation_n(6));
+        // Build exactly what the old Segment::new + plain flush produced. The
+        // reserved-but-unwritten head slot is zero in the buffer, so padding the
+        // published prefix reproduces the same bytes without reading a range this
+        // segment never published.
+        // SAFETY: single-threaded here; `written()` bounds the view to bytes that exist.
+        let published = unsafe { segment.buffer.prefix(segment.buffer.written()) };
+        let mut file = published.to_vec();
+        file.resize(segment.current_position() as usize, 0);
+        file[HEADER_SIZE..HEADER_SIZE + SYNC_MARKER_SIZE].copy_from_slice(&marker_bytes(id, 0));
+        fs::write(&path, &file).unwrap();
+        assert_eq!(replay(&path), vec![5, 6]);
+    }
+
+    /// A segment that fills up closes its final section with `next = 0`,
+    /// takes no further appends, and replays fully.
+    #[test]
+    fn a_full_segment_closes_its_final_section_to_eof_and_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = Segment::entry_total_size(&mutation_n(0));
+        // Room for the header, the first head, three entries, one more head
+        // and part of a third: the second flush cannot reserve a slot.
+        let capacity = INITIAL_POSITION as usize + 3 * entry + SYNC_MARKER_SIZE + 4;
+        let segment = Segment::new(5, capacity, dir.path());
+        append(&segment, &mutation_n(0));
+        segment.flush_to_disk().unwrap();
+        let second_head = segment.durable_watermark();
+        append(&segment, &mutation_n(1));
+        append(&segment, &mutation_n(2));
+        let before_close = fs::read(segment.path()).unwrap();
+        segment.flush_to_disk().unwrap();
+
+        let on_disk = fs::read(segment.path()).unwrap();
+        assert_eq!(&on_disk[..before_close.len()], &before_close[..]);
+        let h = second_head as usize;
+        assert_eq!(
+            &on_disk[h..h + SYNC_MARKER_SIZE],
+            &marker_bytes(5, 0),
+            "the final head runs to EOF"
+        );
+        assert_eq!(on_disk.len() as u64, segment.current_position());
+        assert!(
+            segment.allocate_and_begin_write(ENTRY_OVERHEAD).is_none(),
+            "a closed segment accepts no more appends"
+        );
+        // Later flushes are no-ops: nothing is ever rewritten.
+        segment.flush_to_disk().unwrap();
+        assert_eq!(fs::read(segment.path()).unwrap(), on_disk);
+        assert_eq!(replay(segment.path()), vec![0, 1, 2]);
+    }
+
+    /// Rotation seals a segment with room left; its final flush closes the
+    /// chain with `next = 0` too.
+    #[test]
+    fn a_sealed_segment_closes_its_final_section_to_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let segment = Segment::new(6, 64 * 1024, dir.path());
+        append(&segment, &mutation_n(0));
+        segment.flush_to_disk().unwrap();
+        let head = segment.durable_watermark() as usize;
+        append(&segment, &mutation_n(1));
+        segment.seal_writes();
+        segment.flush_to_disk().unwrap();
+        segment.close_file_handle();
+        segment.release_buffer();
+        segment.flush_to_disk().unwrap();
+
+        let on_disk = fs::read(segment.path()).unwrap();
+        assert_eq!(&on_disk[head..head + SYNC_MARKER_SIZE], &marker_bytes(6, 0));
+        assert_eq!(replay(segment.path()), vec![0, 1]);
     }
 
     #[test]
@@ -1967,7 +2140,25 @@ mod tests {
             if !cfg!(miri) {
                 segment.flush_to_disk().unwrap();
                 let on_disk = fs::read(segment.path()).unwrap();
-                assert_eq!(on_disk, concatenated, "the flush published different bytes");
+                // `concatenated` was built from a segment nothing ever flushed, so
+                // its head slot is still the zero placeholder. The flush closes the
+                // first section, which writes that slot's real marker (pointing at
+                // the slot it reserved for the next one) and carries the file up to
+                // the watermark. Substitute the marker the flush was responsible for
+                // and the rest of the bytes must match block for block.
+                let end = segment.durable_watermark() as usize;
+                assert_eq!(
+                    on_disk.len(),
+                    end,
+                    "the flush wrote past the durable watermark"
+                );
+                let mut expected_on_disk = concatenated;
+                expected_on_disk[HEADER_SIZE..HEADER_SIZE + SYNC_MARKER_SIZE]
+                    .copy_from_slice(&marker_bytes(1, end as u32));
+                assert_eq!(
+                    on_disk, expected_on_disk,
+                    "the flush published different bytes"
+                );
             }
         }
     }
@@ -2027,7 +2218,8 @@ mod tests {
                 let s = Arc::clone(&segment);
                 handles.push(std::thread::spawn(move || {
                     for _ in 0..200 {
-                        let _ = s.flush_to_disk();
+                        s.flush_to_disk()
+                            .expect("a flush racing release must not fail");
                     }
                 }));
             }
@@ -2042,50 +2234,5 @@ mod tests {
                 h.join().expect("flush thread must not panic");
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod marker_patch_tests {
-    use super::*;
-
-    #[test]
-    fn a_patch_below_the_watermark_must_be_rewritten() {
-        // The bytes are already on disk and the forward flush will not revisit
-        // them, so eight bytes have to be written back.
-        assert_eq!(
-            Segment::marker_patch_to_rewrite(1_000, 5_000),
-            Some(1_000..1_008)
-        );
-    }
-
-    #[test]
-    fn a_patch_at_or_above_the_watermark_needs_nothing_extra() {
-        // Not yet flushed: the ordinary incremental flush carries it.
-        assert_eq!(Segment::marker_patch_to_rewrite(5_000, 5_000), None);
-        assert_eq!(Segment::marker_patch_to_rewrite(6_000, 5_000), None);
-    }
-
-    #[test]
-    fn a_patch_straddling_the_watermark_is_still_rewritten() {
-        // Its leading bytes are below the watermark, and those are precisely
-        // the ones a forward flush skips.
-        assert_eq!(
-            Segment::marker_patch_to_rewrite(4_996, 5_000),
-            Some(4_996..5_004)
-        );
-    }
-
-    #[test]
-    fn nothing_flushed_yet_means_nothing_to_rewrite() {
-        assert_eq!(Segment::marker_patch_to_rewrite(0, 0), None);
-    }
-
-    #[test]
-    fn the_rewrite_is_one_marker_wide_and_never_the_segment() {
-        // The whole point: bounded at eight bytes regardless of how much the
-        // segment has accumulated.
-        let patch = Segment::marker_patch_to_rewrite(10, 32 * 1024 * 1024).expect("below mark");
-        assert_eq!(patch.end - patch.start, SYNC_MARKER_SIZE as u64);
     }
 }

@@ -21,7 +21,11 @@ ferrosa-jsonb = { path = "../ferrosa-jsonb" }
 num-bigint = "0.4"
 proptest = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["rt"] }
+# "sync": `TaskPool::spawn_blocking` admits work through a per-pool semaphore.
+tokio = { version = "1", features = ["rt", "sync"] }
+# `TaskPool` logs blocking-pool saturation/recovery edges and rejected
+# capacity overrides.
+tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [features]
@@ -39,3 +43,5 @@ proptest = "1"
 serde_json = "1"
 # The cluster-membership marker tests write real files.
 tempfile = "3"
+# The `TaskPool` admission tests drive blocking jobs from a multi-thread runtime.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }

@@ -11,7 +11,7 @@ use ferrosa_jsonb::{parse_text, JsonbValue, Limits, LimitsConfig};
 use ferrosa_sql::exec::{
     dedup, hash_aggregate, hash_join, sort, AggFunc, AggSpec, SortDir, SortKey, TryRowStream,
 };
-use ferrosa_sql::spill::{row_bytes, DirReserver, SpillCtx};
+use ferrosa_sql::spill::{row_retained_bytes, DirReserver, SpillCtx};
 use ferrosa_sql::types::{ColumnType, Row, Value};
 
 const TINY_THRESHOLD: u64 = 256;
@@ -237,16 +237,16 @@ fn row_serde_round_trips_and_validates_on_read() {
 }
 
 #[test]
-fn row_bytes_counts_the_real_jsonb_bytes() {
+fn row_retained_bytes_counts_the_real_jsonb_bytes() {
     let doc = jsonb(&bigdecimal_doc(3));
     let n = doc.as_bytes().len();
     let row = Row::new(vec![Value::Jsonb(doc)]);
     assert!(
-        row_bytes(&row) >= n + std::mem::size_of::<Value>(),
+        row_retained_bytes(&row) >= n + std::mem::size_of::<Value>(),
         "jsonb payload {n} must be counted"
     );
     let arr = Row::new(vec![Value::TextArray(vec![Some("abcd".into()), None])]);
-    assert!(row_bytes(&arr) >= std::mem::size_of::<Value>() + 4);
+    assert!(row_retained_bytes(&arr) >= std::mem::size_of::<Value>() + 4);
 }
 
 #[test]

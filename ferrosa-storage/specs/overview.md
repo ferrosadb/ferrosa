@@ -65,6 +65,7 @@ without changing the process environment. Digest verification is unconditional.
 | `timeseries/` | Ring aggregation, late-data, WASM aggregates, materialization |
 | `data_store` | `DataStore` trait + `LocalDataStore` |
 | `spill_budget` | Process RAM-budget detection (cgroup v2/v1 → `/proc/meminfo` → floor, injectable + cached) and the ORDER BY spill threshold (50% default; `FERROSA_RANGE_SPILL_THRESHOLD_{PCT,BYTES}`) |
+| `spill_pool` | The node-wide spill memory pool sized from the spill threshold: every `ExternalSorter` and SQL `ReplayBuffer` charges it in `retained_bytes`; a refused operator buffers up to its floor (default `min(1 MiB, threshold)`, counted) before spilling, and one over its fair share of an exhausted pool spills; bound `limit + operators × (floor + one row)`; edge-logged exhaustion/recovery |
 | `external_sort` | Bounded-memory spilling external merge sort of CQL rows (`ExternalSorter`, cascade k-way merge, `MERGE_FANIN`) for unbounded `ORDER BY`; `SortedRows::into_disk_backed` parks a remainder on disk for CQL result cursors; fail-loud on spill/merge I/O |
 | `write_set_spill` | Local temp staging for a large transaction's write-set mutation payloads (`WriteSetSpill`): `stage` drains the payloads to a temp file (reusing `TempSortTableReservation` cleanup) once they cross `WRITE_SET_SPILL_FLOOR_BYTES` (8 MiB), then MMAPS the region read-only (`memmap2`) so `entry(i)` is a borrowed slice — no seek, no read, no per-read lock — and `mutation(i)` its owned twin. The region-REFERENCE Apply wire (`ferrosa_net::protocol::encode_accord_apply_v2_region`) consumes the borrowed `entry(i)` slices directly, writing them into ONE contiguous region on the frame with no per-entry capnp struct. Keeps the coordinator's resident write-set at the KEYS + a small index instead of the payload bulk; below the floor nothing is staged. The file + mapping are released on the last drop of the `Arc<WriteSetSpill>` the driver holds |
 | `write_set_stage` | A **streaming**, threshold-bounded staging area for a transaction's write-set payloads (`WriteSetStage`). Where `write_set_spill` stages payloads that are already materialized, this is driven AS THE ROWS ARRIVE: `append(payload)` holds a bounded resident prefix and spills the rest to a private temp file, so the front end that BUILDS a write-set (a `COPY` inside `BEGIN`) never holds the bulk. `finish()` mmaps the spilled region and `entry(i)` returns a borrowed slice (resident prefix or mapping) in APPEND order; an un-staged index fails loud. The resident limit is a streaming BUFFER SIZE, externalized as `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES` (default 8 MiB) — never a cap; a larger write-set spills, it is not refused. Cleanup reuses `TempSortTableReservation` |
@@ -601,6 +602,40 @@ updates retain the maximum existing value. A physical failure returns an error
 and retains the group's recovery intents; it does not acknowledge an unfinished
 drop. The caller serializes schema recreation with the shared lifecycle writer.
 Single-table unregister APIs retain their existing behavior and recovery format.
+
+### Commit-log sync markers: reserve-ahead, write-once
+
+A segment is a chain of sections, each opened by an 8-byte head marker
+(`next` u32 BE + CRC32(segment_id || next); encoding unchanged). The slot at
+`HEADER_SIZE` is the first head. `Segment::flush_to_disk` is the only path to
+disk, and every call closes the current section under `marker_link`: it
+reserves the next head slot `S` (counted as an in-flight writer), writes the
+current head with `next = S`, then writes `[last_flushed, min(S, written))` at
+its own offset and syncs. `last_flushed` becomes that end. A flush with nothing
+allocated since the head reserves nothing.
+
+`min` with the published length is what keeps a flush from publishing a range a
+writer has reserved but not yet filled: `allocate`'s CAS names the bytes, and
+`SegmentBuffer::publish` is what makes them exist. A writer therefore writes its
+own range through `range_mut` and publishes it, and a flusher reads
+`SegmentBuffer::prefix(end)` under `file_handle` after `wait_for_writers`, so two
+writers' views never overlap and a flush never carries bytes that were only
+reserved. That costs a slow writer one extra incremental flush; taking `S` alone
+would write zeros over its range and move the watermark past it, so the entry
+would never reach disk while the index said it was there. When no slot fits, or the segment is sealed for
+rotation, the final head is written with `next = 0`, the chain is closed and
+the segment takes no more appends.
+
+Invariant: no byte below the durable watermark is ever written again. The
+previous writer patched the PREVIOUS marker in place (below the watermark), so
+a reader tailing the open segment could see one offset change from EOF to a
+link (PR 648's streaming audit). `SegmentReader` reads both layouts;
+`refresh()` still re-reads the current marker so old segments stay correct.
+Tests: `commitlog::tests::no_durable_byte_is_rewritten_by_a_later_flush`,
+`commitlog::segment::tests::{a_tailing_reader_sees_every_entry_and_no_seen_byte_changes,
+concurrent_writers_and_flushers_keep_every_entry_and_never_rewrite,
+a_segment_in_the_old_patched_layout_still_replays,
+a_full_segment_closes_its_final_section_to_eof_and_replays}`.
 
 ### Commit-log contention test support
 

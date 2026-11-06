@@ -839,8 +839,12 @@ struct SpillPosting {
 }
 
 impl crate::external_sort::SpillRow for SpillPosting {
-    fn estimated_bytes(&self) -> usize {
-        72 + self.key.len() + self.partition_key.len() + self.clustering_key.len()
+    /// The struct (three `Vec` headers) plus each key buffer's capacity.
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.key.capacity()
+            + self.partition_key.capacity()
+            + self.clustering_key.capacity()
     }
 }
 

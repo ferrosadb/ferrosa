@@ -64,7 +64,25 @@ here — it lives in `ferrosa-cql` / `ferrosa-row-bridge`.
   bytes, antimeridian crossing).
 - **Task spawning** — `TaskPool`: an explicit spawn target wrapping an optional
   dedicated `tokio::runtime::Runtime`, with a documented `current()` fallback to
-  ambient `tokio::spawn`.
+  ambient `tokio::spawn`. `spawn_blocking` is `async` and **bounded**: it
+  awaits an owned permit from the pool's semaphore before the closure reaches
+  tokio (whose blocking queue has no capacity), and the permit is released when
+  the closure returns or panics. The semaphore lives in a process-wide registry
+  keyed by pool name, so every ad-hoc `TaskPool::current("x")` shares one bound.
+  That budget is per NAME, process-wide, not per `TaskPool` value: two
+  subsystems that pick the same name share (and can exhaust) one budget, so
+  give each subsystem its own name. A job must not block on its own pool
+  (`Handle::block_on(pool.spawn_blocking(..))` from inside a job): that waits
+  for a permit while holding one and deadlocks at capacity, so it panics naming
+  the pool, every time. Calling a different pool from a job is allowed.
+  Capacity defaults to `4 × available_parallelism` clamped to `[8, 128]`;
+  override with `FERROSA_BLOCKING_POOL_CAPACITY` (all pools) or
+  `FERROSA_BLOCKING_POOL_CAPACITY_<NAME>` (one pool, `-` → `_`, upper-cased).
+  A non-positive or non-numeric override is rejected with an `error!` line and
+  resolution falls through to the next source. Saturation is logged on its
+  edges (one `warn!` when callers start waiting, one `info!` when the last
+  waiter is admitted); `TaskPool::blocking_stats()` / `blocking_pool_stats()`
+  expose capacity, in-flight, waiting and total-wait counters.
 - **Cancellation** — `CancelToken`: a cheap, cloneable cancellation flag
   (`is_cancelled`/`check`, one `Relaxed` atomic load) plus a `closed()`
   crossbeam `Receiver<()>` a blocking `select!` can wait on alongside a data
@@ -174,7 +192,9 @@ back:
   Ferrosa crate, by design: it sits at the bottom of the graph so the cycle-prone
   shared types (`CqlType`/`CqlValue`, `TableSchema`) can be reused without
   pulling in `ferrosa-cql`. External deps only: `num-bigint`, `serde`, `uuid`,
-  `tokio` (rt), `crossbeam-channel` (T-021, `CancelToken`'s `closed()` channel),
+  `tokio` (rt, sync — `TaskPool`'s blocking admission semaphore), `tracing`
+  (`TaskPool` saturation/recovery edges and rejected capacity overrides),
+  `crossbeam-channel` (T-021, `CancelToken`'s `closed()` channel),
   and `proptest` (optional, `test-generators`).
 
 **Called by** (crates that depend on this — essentially every crate):

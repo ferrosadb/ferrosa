@@ -170,6 +170,7 @@ async fn read_local_range_limited_rows_offloaded(
             read_local_range_limited_rows(storage.as_ref(), &table_id, limit, row_limit)
         })
         .await
+        .await
         .map_err(|e| {
             ferrosa_common::Error::Io(std::io::Error::other(format!(
                 "local range read task failed: {e}"
@@ -399,6 +400,7 @@ async fn read_local_partition(
             }
             (None, None) => storage.read_limited_rows(&table_id, &key, row_limit),
         })
+        .await
         .await
         .map_err(|e| {
             ferrosa_common::Error::Io(std::io::Error::other(format!(
@@ -6075,6 +6077,7 @@ mod tests {
                         4,
                     )
                 })
+                .await
                 .await
                 .expect("offloaded scan task must not panic")
                 .expect("offloaded scan must succeed");

@@ -85,7 +85,14 @@ controls already passed before the fix (`tests/count_payload_alloc.rs`).
   (FMEA ST-66).
 - **Commit log** (`commitlog/`) — segmented WAL with CAS-based lock-free
   allocation, forward-linked sync markers, crash-recovery replay, CDC reader,
-  S3 archiver for PITR, and per-table checkpoints. Three sync strategies
+  S3 archiver for PITR, and per-table checkpoints. Sync markers are
+  **reserve-ahead and write-once**: every flush reserves the next section's
+  head slot, writes the current head (linked to that slot) and syncs up to but
+  not including the slot, so no byte below the flush watermark is ever
+  rewritten and a reader tailing the open segment never sees a marker change.
+  A full or sealed segment closes its final head with `next = 0`. Segments
+  from older binaries (which patched the previous marker in place) still
+  replay unchanged. Three sync strategies
   (`Batch`, `Periodic`, `Group`); **default is `Periodic`** → a bounded
   durability window (see FMEA). Open-time replay re-logs every mutation it
   keeps only in memory into the new log generation (`ReplayRelog`) and fsyncs
@@ -1071,6 +1078,21 @@ controls already passed before the fix (`tests/count_payload_alloc.rs`).
   spill threshold defaults to 50% of the budget, tunable via
   `FERROSA_RANGE_SPILL_THRESHOLD_PCT` / `FERROSA_RANGE_SPILL_THRESHOLD_BYTES`
   (`process_spill_threshold_bytes`).
+- **Node-wide spill pool** (`spill_pool.rs`) — that threshold sizes ONE pool
+  (`SpillPool::global`) shared by every spilling operator in the process, not one
+  allowance per operator: each `ExternalSorter` (CQL ORDER BY, result cursors,
+  graph ORDER BY, SQL blocking operators, sidecar conversion) and SQL's
+  `ReplayBuffer` charges what it buffers. The unit is `SpillRow::retained_bytes`
+  (slots plus buffer capacity, including a shared slice's whole backing; it
+  omits allocator rounding and map-node overhead). An operator the pool refuses
+  keeps buffering up to its FLOOR (default `min(1 MiB, threshold)`, counted in
+  `forced_total`) and only then spills, so a starved operator never writes
+  one-row runs; while the pool is exhausted, an operator over its fair share
+  (`max(floor, limit / live operators)`) spills to make room. Total resident
+  spill memory is bounded by `limit + live operators × (floor + one row)`; the
+  pool logs the edges of exhaustion and recovery, and `/metrics` exports
+  `ferrosa_spill_pool_{limit_bytes,used_bytes,operators,refused_total,forced_total}`.
+  The per-call `threshold_bytes` still caps a single operator.
 - **External merge sort** (`external_sort.rs`) — bounded-memory spilling sort of
   CQL result rows (`Vec<Option<CqlValue>>`) for the unbounded `ORDER BY` (no
   `LIMIT`) shape. `ExternalSorter` moves rows into a buffer, spills sorted runs to

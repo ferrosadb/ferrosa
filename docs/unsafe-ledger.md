@@ -33,8 +33,8 @@ The rule itself, and the definition of evidence, is `docs/unsafe-policy.md`.
 
 | Scope | Sites |
 | --- | --- |
-| Production code (`src/`, outside `#[cfg(test)]`) | **64** |
-| `#[cfg(test)]` modules inside `src/` | 66 |
+| Production code (`src/`, outside `#[cfg(test)]`) | **61** |
+| `#[cfg(test)]` modules inside `src/` | 65 |
 | `tests/` and `examples/` | 299 |
 | WASM example bindings (`examples/**/src/`) | 58 |
 
@@ -42,7 +42,7 @@ Production sites by crate:
 
 | File | Sites | Category | Invariant this site relies on | Status |
 | --- | --- | --- | --- | --- |
-| `ferrosa-storage/src/commitlog/segment.rs` | 17 | `SegmentBuffer`: reservation-scoped slices, manual `Send`/`Sync` | writer w owns `[off, off+len)` because `allocate`'s CAS returned that offset to w alone, so no two writers' views overlap; the length is published `Release` and read `Acquire`; the marker patch and the flusher are serialised by `file_handle` | audited |
+| `ferrosa-storage/src/commitlog/segment.rs` | 14 | `SegmentBuffer`: reservation-scoped slices, manual `Send`/`Sync` | writer w owns `[off, off+len)` because `allocate`'s CAS returned that offset to w alone, so no two writers' views overlap; the length is published `Release` and read `Acquire`; each section's head slot is reserved by allocation and written only under `marker_link`, so no marker is ever patched backwards and the flusher reads a published prefix formed under `file_handle` | audited |
 | `ferrosa-udf/src/asc.rs` | 10 | FFI to the JS engine (`rquickjs`) | `CtxPtr`/`SendActive` outlive every use; raw handles come from a live context | queued |
 | `ferrosa-sstable/src/direct.rs` | 3 | `F_NOCACHE`, `posix_fadvise`, one `ioctl` | the fd is open for the duration of the call; each call is a hint the kernel may ignore | audited |
 | `ferrosa-sstable/src/pump.rs` | 5 | `preadv`/`pwritev` scatter-gather, raw slice | `iov_base`/`iov_len` describe the same allocation for the whole call | queued |

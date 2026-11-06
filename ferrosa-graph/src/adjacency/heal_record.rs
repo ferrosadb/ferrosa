@@ -17,8 +17,9 @@
 //! Healing an index that is already whole is slow but correct; skipping a heal
 //! the index needs is not.
 
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Weak};
 
 use ferrosa_common::{Error, Result};
 
@@ -29,7 +30,33 @@ pub const HEAL_RECORD_FILE: &str = "graph-adjacency-heals.json";
 /// count: raise this when a fix needs every node's index healed again.
 pub const HEAL_VERSION: u32 = 1;
 
-static WRITE_SERIAL: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+pub type WriterLock = Arc<parking_lot::Mutex<()>>;
+
+/// One writer lock per data dir that has a record write in flight. Weak, so
+/// an entry lives only while a writer holds its lock; dead entries are pruned
+/// on every lookup, which bounds the map by the concurrent writers.
+static WRITERS: LazyLock<parking_lot::Mutex<HashMap<PathBuf, Weak<parking_lot::Mutex<()>>>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+/// The lock that serializes this data dir's record read-modify-write.
+///
+/// Per data dir, not process-wide: the record of one dir never waits on
+/// another's fsyncs. It was one global lock, so every engine in a process
+/// (each test's, each with its own dir) queued its record behind all the
+/// others, and the first-use heal gate waits for the record. The key is the
+/// canonical path, so two spellings of one dir share a lock.
+fn writer_lock(data_dir: &Path) -> Result<WriterLock> {
+    std::fs::create_dir_all(data_dir)?;
+    let key = std::fs::canonicalize(data_dir)?;
+    let mut writers = WRITERS.lock();
+    writers.retain(|_, writer| writer.strong_count() > 0);
+    if let Some(live) = writers.get(&key).and_then(Weak::upgrade) {
+        return Ok(live);
+    }
+    let lock = Arc::new(parking_lot::Mutex::new(()));
+    writers.insert(key, Arc::downgrade(&lock));
+    Ok(lock)
+}
 
 /// Data keyspace to the version of the last heal that completed for it.
 type HealRecord = BTreeMap<String, u32>;
@@ -49,6 +76,13 @@ fn load(data_dir: &Path) -> Result<HealRecord> {
     })
 }
 
+/// The writer lock of `data_dir`'s record, for a test that must hold a
+/// record write in flight (see `writer_lock`).
+#[doc(hidden)]
+pub fn record_writer_lock_for_test(data_dir: &Path) -> Result<WriterLock> {
+    writer_lock(data_dir)
+}
+
 /// Whether this node completed a heal of `keyspace` at the current
 /// [`HEAL_VERSION`].
 pub fn healed(data_dir: &Path, keyspace: &str) -> Result<bool> {
@@ -58,7 +92,8 @@ pub fn healed(data_dir: &Path, keyspace: &str) -> Result<bool> {
 /// Durably records that a heal of `keyspace` completed at [`HEAL_VERSION`].
 /// Call only after the heal reported no errors.
 pub fn record_healed(data_dir: &Path, keyspace: &str) -> Result<()> {
-    let _serial = WRITE_SERIAL.lock();
+    let serial = writer_lock(data_dir)?;
+    let _serial = serial.lock();
     let mut record = load(data_dir)?;
     if record.insert(keyspace.to_string(), HEAL_VERSION) != Some(HEAL_VERSION) {
         ferrosa_storage::schema_snapshot::persist_bounded_json(
@@ -101,6 +136,46 @@ mod tests {
         assert!(!healed(dir.path(), "ks").unwrap());
         record_healed(dir.path(), "ks").unwrap();
         assert!(healed(dir.path(), "ks").unwrap());
+    }
+
+    /// Recording a heal is serialized per data dir, never process-wide. With
+    /// one global lock every engine in a process queued its record (two
+    /// fsyncs) behind every other engine's, whatever its data dir: measured
+    /// p50 312 ms of lock WAIT against 51 ms held, across the HTTP suite's
+    /// engines. The first-use heal gate waits for the record, so the wait
+    /// alone pushed heals past the 1 s budget and queries were refused.
+    #[test]
+    fn a_record_in_one_data_dir_does_not_wait_for_another() {
+        let busy = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let busy_lock = writer_lock(busy.path()).unwrap();
+        let _held = busy_lock.lock();
+        let (done, recorded) = std::sync::mpsc::channel();
+        let other_dir = other.path().to_path_buf();
+        std::thread::spawn(move || {
+            let outcome = record_healed(&other_dir, "ks").map_err(|e| e.to_string());
+            // The receiver outlives this thread unless the test already
+            // failed on its timeout; a failed send then changes nothing.
+            if done.send(outcome).is_err() {
+                eprintln!("record finished after the test gave up waiting");
+            }
+        });
+        let outcome = recorded
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a record in another data dir waited on this one's writer lock");
+        outcome.unwrap();
+        assert!(healed(other.path(), "ks").unwrap());
+    }
+
+    #[test]
+    fn one_data_dir_shares_one_writer_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = writer_lock(dir.path()).unwrap();
+        let b = writer_lock(&dir.path().join(".")).unwrap();
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "two spellings of one data dir must serialize on one lock"
+        );
     }
 
     #[test]

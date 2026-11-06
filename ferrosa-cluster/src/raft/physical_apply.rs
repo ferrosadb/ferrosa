@@ -285,6 +285,7 @@ impl PhysicalRaftWorkers {
                         ))
                     })
                     .await
+                    .await
                     .map_err(|error| error.to_string())??;
             reports.push(RetiredRaftOwner {
                 applied: drained.applied,
@@ -344,6 +345,7 @@ impl PhysicalRaftWorkers {
                 let target = ferrosa_net::task_pool::TaskPool::current("raft-physical-retirement")
                     .spawn_blocking(move || reader.read())
                     .await
+                    .await
                     .map_err(|error| error.to_string())?
                     .map_err(|error| error.to_string())?;
                 if let Some(target) = target {
@@ -399,6 +401,31 @@ impl PhysicalRaftRegistration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Start a pool job and hand back a handle that detaches on drop.
+    ///
+    /// `spawn_blocking` admits against the pool *before* it hands the closure to
+    /// tokio, so the job is only queued once its future is polled. Production code
+    /// polls and awaits it in place; the tests below drop the handle on purpose to
+    /// prove the work survives its waiter, which needs the future driven by a task.
+    fn start_job<T, F>(
+        pool: &ferrosa_net::task_pool::TaskPool,
+        work: F,
+    ) -> tokio::task::JoinHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        // Cloned so the returned task owns everything it needs; a `TaskPool` is a
+        // name plus an optional runtime handle, so this is cheap.
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            pool.spawn_blocking(work)
+                .await
+                .await
+                .expect("blocking job handle was dropped before it was dispatched")
+        })
+    }
 
     use crate::raft::log_store::SledLogStore;
     use crate::raft::state_machine::FerrosStateMachine;
@@ -568,13 +595,13 @@ mod tests {
         let (started, entered) = tokio::sync::oneshot::channel();
         let (release_tx, released) = std::sync::mpsc::channel();
         let release = Release(Some(release_tx));
-        let job = ferrosa_net::task_pool::TaskPool::current("retirement-cancel-test")
-            .spawn_blocking(move || {
-                let _owned = lease.into_job();
-                started.send(()).unwrap();
-                released.recv().unwrap();
-                std::fs::write(path, b"finished before replacement").unwrap();
-            });
+        let pool = ferrosa_net::task_pool::TaskPool::current("retirement-cancel-test");
+        let job = start_job(&pool, move || {
+            let _owned = lease.into_job();
+            started.send(()).unwrap();
+            released.recv().unwrap();
+            std::fs::write(path, b"finished before replacement").unwrap();
+        });
         entered.await.unwrap();
         let mut first = Box::pin(workers.stop_group_for_recovery(group, &published));
         assert!(futures::poll!(first.as_mut()).is_pending());
@@ -622,15 +649,14 @@ mod tests {
         let lease = lifecycle.admit().unwrap();
         let (entered, started) = tokio::sync::oneshot::channel();
         let (release, released) = std::sync::mpsc::channel();
-        let job = ferrosa_net::task_pool::TaskPool::current("physical-drain-test").spawn_blocking(
-            move || {
-                let _lease = lease.into_job();
-                entered.send(()).unwrap();
-                released
-                    .recv_timeout(std::time::Duration::from_secs(5))
-                    .unwrap();
-            },
-        );
+        let pool = ferrosa_net::task_pool::TaskPool::current("physical-drain-test");
+        let job = start_job(&pool, move || {
+            let _lease = lease.into_job();
+            entered.send(()).unwrap();
+            released
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        });
         started.await.unwrap();
         drop(job); // Tokio's blocking job is detached, not cancelled.
         drop(owner);
@@ -663,11 +689,11 @@ mod tests {
             let lease = lifecycle.admit().unwrap();
             let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let written = Arc::clone(&ran);
-            let job = ferrosa_net::task_pool::TaskPool::current("physical-queued-drain-test")
-                .spawn_blocking(move || {
-                    let _lease = lease.into_job();
-                    written.store(true, std::sync::atomic::Ordering::SeqCst);
-                });
+            let pool = ferrosa_net::task_pool::TaskPool::current("physical-queued-drain-test");
+            let job = start_job(&pool, move || {
+                let _lease = lease.into_job();
+                written.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
             drop(job);
             drop(owner);
             let mut drain = Box::pin(lifecycle.drain());
@@ -698,15 +724,15 @@ mod tests {
         let lease = lifecycle.admit().unwrap();
         let (entered, started) = tokio::sync::oneshot::channel();
         let (release, released) = std::sync::mpsc::channel();
-        let job = ferrosa_net::task_pool::TaskPool::current("physical-panic-drain-test")
-            .spawn_blocking(move || {
-                let _lease = lease.into_job();
-                entered.send(()).unwrap();
-                released
-                    .recv_timeout(std::time::Duration::from_secs(5))
-                    .unwrap();
-                panic!("owned orphaned physical job panic");
-            });
+        let pool = ferrosa_net::task_pool::TaskPool::current("physical-panic-drain-test");
+        let job = start_job(&pool, move || {
+            let _lease = lease.into_job();
+            entered.send(()).unwrap();
+            released
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            panic!("owned orphaned physical job panic");
+        });
         started.await.unwrap();
         drop(job);
         drop(owner);
@@ -722,11 +748,11 @@ mod tests {
         let (lifecycle, owner) = PhysicalApplyLifecycle::new_owner();
         let caller_share = lifecycle.admit().unwrap();
         let job_lease = Arc::clone(&caller_share).into_job();
-        let job = ferrosa_net::task_pool::TaskPool::current("physical-shared-panic-test")
-            .spawn_blocking(move || {
-                let _job = job_lease;
-                panic!("owned job panics while async share remains");
-            });
+        let pool = ferrosa_net::task_pool::TaskPool::current("physical-shared-panic-test");
+        let job = start_job(&pool, move || {
+            let _job = job_lease;
+            panic!("owned job panics while async share remains");
+        });
         assert!(job.await.unwrap_err().is_panic());
         drop(caller_share); // This final shared drop is not unwinding.
         drop(owner);
