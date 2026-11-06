@@ -48,7 +48,8 @@
 use std::cell::UnsafeCell;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -260,6 +261,155 @@ fn sync_parent_dir(path: &Path, mode: CommitLogSyncMode) -> ferrosa_common::Resu
     Ok(())
 }
 
+/// The segment's bytes, and the only place a view of them is formed.
+///
+/// Several threads write this buffer at once, each owning a disjoint byte
+/// range, and std has no primitive that expresses that: the only way into an
+/// `UnsafeCell<Vec<u8>>` is as a whole, `&mut Vec<u8>`, and two of those from
+/// two writers overlap as *references* even when the bytes they touch do not.
+/// That is undefined behaviour under Stacked and Tree Borrows — not a style
+/// problem — and it was the append path's shape before this type existed.
+///
+/// The invariant that replaces it: every reference this type hands out covers
+/// exactly one reservation, `[off, off + len)`, and reservation ownership — the
+/// CAS in [`Segment::allocate`] returns each offset to one caller — is what
+/// makes two of them disjoint. The base pointer is captured once, at
+/// construction, because re-deriving it means forming a reference to the `Vec`
+/// header that every writer would then have to coordinate on.
+///
+/// Deliberate follow-up, not smuggled in here: per-writer shards would let each
+/// writer own its buffer outright, which removes this raw pointer and both
+/// `unsafe impl`s below. That is a redesign of allocation, the flush watermark
+/// and the marker chain at once, so it is named here rather than done.
+struct SegmentBuffer {
+    /// Owns the allocation. Only [`release`](Self::release) replaces it.
+    storage: UnsafeCell<Vec<u8>>,
+    /// `storage`'s allocation, fixed for the buffer's life: `new` allocates the
+    /// whole capacity and nothing resizes it. `release` frees it and drops
+    /// `len` to zero, which every accessor checks before touching `base`.
+    base: NonNull<u8>,
+    /// Allocated bytes, 0 once released.
+    ///
+    /// Atomic because `buffer_bytes()` reads it while writers hold `&mut` into
+    /// the same allocation, where reading the `Vec`'s own length field is a data
+    /// race.
+    len: AtomicUsize,
+    /// One past the highest byte whose write has completed.
+    ///
+    /// Published `Release` by the writer that filled it and read `Acquire` by a
+    /// flusher, so a flusher that acts on this value is guaranteed to see the
+    /// bytes below it and can never publish a length whose contents do not exist
+    /// yet.
+    written: AtomicUsize,
+}
+
+impl SegmentBuffer {
+    fn new(bytes: Vec<u8>) -> Self {
+        let mut bytes = bytes;
+        // `as_mut_ptr`, not `as_ptr`: a pointer derived from a shared reference
+        // carries read-only permission, and every writer below writes through
+        // this one.
+        let base = NonNull::new(bytes.as_mut_ptr()).expect("segment buffer is non-empty");
+        let len = bytes.len();
+        Self {
+            storage: UnsafeCell::new(bytes),
+            base,
+            len: AtomicUsize::new(len),
+            written: AtomicUsize::new(0),
+        }
+    }
+
+    /// Allocated bytes; 0 once [`release`](Self::release) has run.
+    fn allocated(&self) -> usize {
+        self.len.load(Ordering::Acquire)
+    }
+
+    /// One past the highest byte that has been written.
+    fn written(&self) -> usize {
+        self.written.load(Ordering::Acquire)
+    }
+
+    /// Publishes "every byte below `end` is written".
+    fn publish(&self, end: usize) {
+        self.written.fetch_max(end, Ordering::Release);
+    }
+
+    /// A mutable view of exactly `[off, off + len)` — never of the whole buffer.
+    ///
+    /// # Safety
+    ///
+    /// `[off, off + len)` must be owned by the caller: a reservation from
+    /// [`Segment::allocate`], or marker bytes the caller reaches under
+    /// `marker_link`. No other live view may overlap it.
+    // The mutation is interior — that is the whole point of the `UnsafeCell` — and the caller's
+    // reservation is the safety condition, so the lint's objection is answered by `unsafe` here
+    // rather than by making the API hand out a raw pointer for every caller to dereference.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn range_mut(&self, off: usize, len: usize) -> &mut [u8] {
+        // Also the guard that a write after `release` panics instead of
+        // reaching a freed allocation. One load, and it is the atomic the
+        // release path has to update anyway.
+        assert!(
+            off + len <= self.allocated(),
+            "segment buffer range {off}..{} is outside the {}-byte buffer",
+            off + len,
+            self.allocated()
+        );
+        // SAFETY: the caller owns the range and `off + len` is inside the
+        // allocation, so the pointer arithmetic stays in bounds and the view
+        // does not overlap any other reservation's.
+        unsafe { std::slice::from_raw_parts_mut(self.base.as_ptr().add(off), len) }
+    }
+
+    /// A read-only view of `[0, end)`.
+    ///
+    /// # Safety
+    ///
+    /// `end` must not exceed [`written`](Self::written) or the allocated
+    /// length, and no writer may hold a mutable view of any part of `[0, end)`
+    /// while this one lives, because the flusher forms it under `file_handle`
+    /// after draining the append path.
+    unsafe fn prefix(&self, end: usize) -> &[u8] {
+        // `assert!`, not `debug_assert!`: the safety argument below is that `end`
+        // is inside the allocation, so the bound must hold in release builds
+        // too. It costs one load per flush and it is what turns "the caller
+        // promises" into a checked precondition.
+        assert!(
+            end <= self.allocated(),
+            "prefix {end} past the {}-byte allocation",
+            self.allocated()
+        );
+        assert!(
+            end <= self.written(),
+            "prefix {end} past the {} published bytes",
+            self.written()
+        );
+        // SAFETY: `end` is inside the allocation because the assertions above
+        // bound it, and no mutable view overlaps the prefix because the caller
+        // holds the lock that excludes the marker patch and the append path.
+        unsafe { std::slice::from_raw_parts(self.base.as_ptr(), end) }
+    }
+
+    /// Frees the allocation.
+    ///
+    /// # Safety
+    ///
+    /// No writer and no flusher may still be able to reach the segment: every
+    /// view is derived from `base`, which this frees. The caller holds
+    /// `file_handle` — the lock a flusher takes before it forms its view — and
+    /// the segment has been rotated out of the active slot.
+    unsafe fn release(&self) {
+        // Zero the length FIRST, then free. The other order leaves a window in
+        // which `allocated()` still reports the old size while `base` is already
+        // dangling, so a concurrent `range_mut` would pass its guard and write
+        // into freed memory. With this order the guard fails closed.
+        self.len.store(0, Ordering::Release);
+        // SAFETY: exclusive by the caller's precondition. Replacing the `Vec`
+        // drops the old allocation.
+        unsafe { *self.storage.get() = Vec::new() };
+    }
+}
+
 /// A fixed-size byte buffer with lock-free CAS allocation for commit log entries.
 ///
 /// The segment is `Send + Sync` because concurrent access to the buffer is
@@ -271,12 +421,10 @@ pub struct Segment {
 
     /// Pre-allocated buffer of `capacity` bytes, zeroed.
     ///
-    /// # Safety
-    ///
-    /// Wrapped in `UnsafeCell` because concurrent writers access non-overlapping
-    /// slices. The CAS allocation protocol guarantees exclusive ownership of
-    /// each byte range — see module-level documentation.
-    buffer: UnsafeCell<Vec<u8>>,
+    /// A [`SegmentBuffer`], so a writer can only ever get a view of its own
+    /// reserved range. See that type for why the bytes must not be reached as a
+    /// whole while other writers hold ranges.
+    buffer: SegmentBuffer,
 
     /// Next write offset. Atomically advanced by `allocate()`.
     position: AtomicU64,
@@ -386,10 +534,14 @@ fn maybe_warn_slow_sync(
     );
 }
 
-// SAFETY: The CAS allocation protocol guarantees that concurrent writers access
-// non-overlapping byte ranges. The buffer is only written to through exclusively-
-// owned offsets, and reads (flush_to_disk) only occur on the already-written
-// portion of the buffer.
+// SAFETY: `Segment`'s only field that is not `Send + Sync` on its own is its
+// `SegmentBuffer` — `UnsafeCell<Vec<u8>>` and `NonNull<u8>` are deliberately
+// neither. What discharges them is that buffer's invariant: every reference it
+// hands out covers one reservation, the CAS in `allocate` returns each offset to
+// exactly one writer so two writers' views cannot overlap, a reader only views
+// the published prefix whose bytes are complete, and the one writer that reaches
+// backwards (the marker patch) is synchronized against the flusher by
+// `file_handle`; std has no disjoint-mutable-ranges primitive to do it instead.
 unsafe impl Send for Segment {}
 unsafe impl Sync for Segment {}
 
@@ -420,13 +572,23 @@ impl Segment {
         // Write the first sync marker at offset HEADER_SIZE (17).
         // All zeros = EOF marker (next_marker_offset = 0, marker_crc = CRC of
         // segment_id || 0).
-        Self::write_sync_marker_to_buffer(&mut buffer, HEADER_SIZE, id, 0);
+        Self::write_sync_marker_into(
+            &mut buffer[HEADER_SIZE..HEADER_SIZE + SYNC_MARKER_SIZE],
+            id,
+            0,
+        );
 
         let path = dir.join(format!("commitlog-{id}.log"));
 
+        // Everything up to the first marker exists, so it is the buffer's first
+        // published length: a flusher that ran before any entry would write the
+        // header and marker and stop there.
+        let buffer = SegmentBuffer::new(buffer);
+        buffer.publish(INITIAL_POSITION as usize);
+
         Segment {
             id,
-            buffer: UnsafeCell::new(buffer),
+            buffer,
             position: AtomicU64::new(INITIAL_POSITION),
             capacity: size,
             created_at: Instant::now(),
@@ -540,12 +702,13 @@ impl Segment {
     ///
     /// # Safety Argument
     ///
-    /// This method uses `unsafe` to obtain a mutable reference to the buffer
-    /// slice at `offset`. This is safe because:
-    /// - The `offset` was obtained from [`allocate()`](Self::allocate), which
-    ///   guarantees exclusive ownership of the byte range `[offset, offset + total_size)`.
-    /// - No other thread can write to or read from this range until the segment
-    ///   is flushed (which requires all writers to have completed their entries).
+    /// The view taken below covers `[offset, offset + total_size)` and nothing
+    /// else. `offset` came from [`allocate()`](Self::allocate), whose CAS returns
+    /// each offset to exactly one caller, so writer w owns `[off, off + len)`
+    /// and no two writers' views overlap — the bytes are disjoint and so are the
+    /// references. The length is published `Release` after the last byte is
+    /// written, which pairs with the flusher's `Acquire` load, so a flush can
+    /// only ever include bytes that exist.
     pub fn write_entry(&self, offset: u64, mutation: &Mutation) -> CommitLogPosition {
         let payload_size = mutation.serialized_size();
         let total_size = ENTRY_OVERHEAD + payload_size;
@@ -557,26 +720,31 @@ impl Segment {
             self.capacity
         );
 
-        // SAFETY: offset range [off, off + total_size) is exclusively owned by
-        // this thread after CAS allocation. No other thread accesses this range.
-        let buf = unsafe { &mut *self.buffer.get() };
+        // SAFETY: this writer owns [off, off + total_size) — the reservation
+        // came from `allocate`, so no other writer holds an overlapping range,
+        // and the slice is scoped to those bytes rather than to the buffer.
+        let buf = unsafe { self.buffer.range_mut(off, total_size) };
 
         // 1. Write entry_size (payload size as u32, big-endian).
         let entry_size_bytes = (payload_size as u32).to_be_bytes();
-        buf[off..off + 4].copy_from_slice(&entry_size_bytes);
+        buf[..4].copy_from_slice(&entry_size_bytes);
 
         // 2. Write size_crc (CRC32 of the 4 entry_size bytes).
         let size_crc = crc32fast::hash(&entry_size_bytes);
-        buf[off + 4..off + 8].copy_from_slice(&size_crc.to_be_bytes());
+        buf[4..8].copy_from_slice(&size_crc.to_be_bytes());
 
         // 3. Write payload (serialized mutation).
-        let payload_start = off + 8;
+        let payload_start = 8;
         let payload_end = payload_start + payload_size;
         mutation.serialize_into(&mut buf[payload_start..payload_end]);
 
         // 4. Write payload_crc (CRC32 of payload bytes).
         let payload_crc = crc32fast::hash(&buf[payload_start..payload_end]);
         buf[payload_end..payload_end + 4].copy_from_slice(&payload_crc.to_be_bytes());
+
+        // The entry exists only once every byte above is down; `Release` is what
+        // stops a flusher from believing otherwise.
+        self.buffer.publish(off + total_size);
 
         CommitLogPosition {
             segment_id: self.id,
@@ -605,15 +773,17 @@ impl Segment {
             self.capacity
         );
 
-        let buf = unsafe { &mut *self.buffer.get() };
+        // SAFETY: as `write_entry` — `allocate` returned this offset to this
+        // writer alone, so the view covers exactly the bytes it owns.
+        let buf = unsafe { self.buffer.range_mut(off, total_size) };
 
         let entry_size_bytes = (payload_size as u32).to_be_bytes();
-        buf[off..off + 4].copy_from_slice(&entry_size_bytes);
+        buf[..4].copy_from_slice(&entry_size_bytes);
 
         let size_crc = crc32fast::hash(&entry_size_bytes);
-        buf[off + 4..off + 8].copy_from_slice(&size_crc.to_be_bytes());
+        buf[4..8].copy_from_slice(&size_crc.to_be_bytes());
 
-        let payload_start = off + 8;
+        let payload_start = 8;
         let payload_end = payload_start + payload_size;
         Mutation::serialize_single_row_into(
             mutation_id,
@@ -628,6 +798,8 @@ impl Segment {
         let payload_crc = crc32fast::hash(&buf[payload_start..payload_end]);
         buf[payload_end..payload_end + 4].copy_from_slice(&payload_crc.to_be_bytes());
 
+        self.buffer.publish(off + total_size);
+
         CommitLogPosition {
             segment_id: self.id,
             offset,
@@ -640,18 +812,25 @@ impl Segment {
     /// the next sync marker, or 0 for EOF) and a CRC of the segment ID
     /// concatenated with the offset.
     pub fn write_sync_marker(&self, next_offset: u32) {
-        let current_pos = self.position.load(Ordering::Acquire) as usize;
+        // Reserve the eight bytes rather than reading `position` and writing at
+        // it: two callers that both read the same position would otherwise write
+        // the same bytes, and a flusher could snapshot past a marker that has no
+        // contents. Counting it in flight gives the marker the same ordering
+        // guarantee an entry gets.
+        let Some(offset) = self.allocate_and_begin_write(SYNC_MARKER_SIZE) else {
+            // The segment cannot hold another marker; the chain ends where it
+            // ends, exactly as `allocate_and_link_sync_marker` decides.
+            return;
+        };
 
-        // SAFETY: sync markers are written by the sync strategy, which
-        // coordinates with writers. The marker is written at the current
-        // position after all preceding entries are complete.
-        let buf = unsafe { &mut *self.buffer.get() };
+        // SAFETY: because `allocate_and_begin_write` claimed exactly these eight
+        // bytes for this call, no other writer's view can overlap them — the
+        // reservation is what makes the range ours.
+        let marker = unsafe { self.buffer.range_mut(offset as usize, SYNC_MARKER_SIZE) };
+        Self::write_sync_marker_into(marker, self.id, next_offset);
+        self.buffer.publish(offset as usize + SYNC_MARKER_SIZE);
 
-        Self::write_sync_marker_to_buffer(buf, current_pos, self.id, next_offset);
-
-        // Advance position past the sync marker.
-        self.position
-            .fetch_add(SYNC_MARKER_SIZE as u64, Ordering::AcqRel);
+        self.writer_done();
     }
 
     /// Which already-flushed bytes a backwards marker patch dirtied, if any.
@@ -721,17 +900,37 @@ impl Segment {
     /// The caller must hold `marker_link`; see
     /// [`allocate_and_link_sync_marker`](Self::allocate_and_link_sync_marker).
     fn write_sync_marker_at(&self, offset: u64, next_marker_offset: u32) -> u64 {
-        let buf = unsafe { &mut *self.buffer.get() };
+        // The link write below goes backwards, into bytes a flush in progress may
+        // be reading. `file_handle` is the lock a flusher takes before it forms
+        // its view of the prefix, so holding it here is what keeps this
+        // eight-byte patch out of that view. It does not serialise the fsyncs of
+        // concurrent `force_sync` callers: this guard is released before their
+        // repair flush re-acquires it.
+        let _file = self.file_handle.lock();
+
+        // SAFETY: because `offset` was reserved for this call by
+        // `allocate_and_link_sync_marker`, and `marker_link` excludes every other
+        // marker writer, this range is ours alone.
+        let marker = unsafe { self.buffer.range_mut(offset as usize, SYNC_MARKER_SIZE) };
 
         // The new marker's own bytes go down BEFORE anything points at them.
-        // A flusher racing us reads the buffer without taking this lock, so
+        // A flusher racing us reads the prefix under this same file lock, so
         // the order these two writes land in is the order it can observe. A
         // predecessor pointing at eight bytes that are still zero is a marker
         // with a zero CRC, which a reader treats as the end of the log.
-        Self::write_sync_marker_to_buffer(buf, offset as usize, self.id, next_marker_offset);
+        Self::write_sync_marker_into(marker, self.id, next_marker_offset);
+        self.buffer.publish(offset as usize + SYNC_MARKER_SIZE);
 
         let prev_offset = self.last_sync_marker_offset.load(Ordering::Acquire);
-        Self::write_sync_marker_to_buffer(buf, prev_offset as usize, self.id, offset as u32);
+        // SAFETY: the previous marker is ours to patch because `marker_link` is
+        // held, so no other writer is touching a marker, and because
+        // `file_handle` keeps a flusher from holding a view over these eight
+        // bytes while we write them.
+        let prev = unsafe {
+            self.buffer
+                .range_mut(prev_offset as usize, SYNC_MARKER_SIZE)
+        };
+        Self::write_sync_marker_into(prev, self.id, offset as u32);
 
         self.last_sync_marker_offset
             .store(offset, Ordering::Release);
@@ -739,22 +938,17 @@ impl Segment {
         prev_offset
     }
 
-    /// Internal helper to write a sync marker into a buffer at a given offset.
-    fn write_sync_marker_to_buffer(
-        buf: &mut [u8],
-        offset: usize,
-        segment_id: u64,
-        next_marker_offset: u32,
-    ) {
+    /// Internal helper to write a sync marker into its own eight bytes.
+    fn write_sync_marker_into(marker: &mut [u8], segment_id: u64, next_marker_offset: u32) {
         // next_marker_offset: u32 (4 bytes)
-        buf[offset..offset + 4].copy_from_slice(&next_marker_offset.to_be_bytes());
+        marker[..4].copy_from_slice(&next_marker_offset.to_be_bytes());
 
         // marker_crc: CRC32 of (segment_id as u64 || next_marker_offset as u32)
         let mut crc_input = [0u8; 12];
         crc_input[..8].copy_from_slice(&segment_id.to_be_bytes());
         crc_input[8..12].copy_from_slice(&next_marker_offset.to_be_bytes());
         let crc = crc32fast::hash(&crc_input);
-        buf[offset + 4..offset + 8].copy_from_slice(&crc.to_be_bytes());
+        marker[4..8].copy_from_slice(&crc.to_be_bytes());
     }
 
     /// Hold the real flush/file mutex while a deterministic cross-crate test runs.
@@ -798,18 +992,14 @@ impl Segment {
         let snapshot_pos = self.position.load(Ordering::Acquire) as usize;
 
         // Wait for all in-flight writers to complete their entries.
-        // After this returns, buffer[0..snapshot_pos] is fully written.
         phases.wait_writers = self.wait_for_writers();
         observe_wait_writers(phases.wait_writers);
 
-        // SAFETY: We only read buffer[0..snapshot_pos]. All bytes in this range
-        // have been fully written — wait_for_writers() ensures no in-flight writes.
-        let buf = unsafe { &*self.buffer.get() };
-
         // File I/O happens under the file_handle mutex to prevent concurrent
-        // flushers from writing duplicate bytes. `release_buffer()` also
-        // takes this lock, so once we hold it the buffer's (ptr, len, cap)
-        // is stable for the duration of this flush.
+        // flushers from writing duplicate bytes. `release_buffer()` and the
+        // marker patch take this lock too, so once we hold it the buffer's
+        // (ptr, len, cap) is stable for the duration of this flush and no
+        // eight-byte marker write can land inside the prefix about to be read.
         let lock_start = Instant::now();
         let mut handle = self.file_handle.lock();
         phases.file_lock_wait = lock_start.elapsed();
@@ -818,20 +1008,37 @@ impl Segment {
             &SYNC_FILE_LOCK_WAIT_MICROS_MAX,
             phases.file_lock_wait,
         );
-        let last_flushed = self.last_flushed.load(Ordering::Acquire) as usize;
-        let current_pos = snapshot_pos;
-        let marker_patch = repair_marker_at
-            .and_then(|prev| Self::marker_patch_to_rewrite(prev, last_flushed as u64));
 
         // If `release_buffer()` ran before us, the data is already on disk
         // (force_rotate calls flush_to_disk first) and the buffer is empty.
-        // Don't try to slice into a zero-length Vec — short-circuit. Without
+        // Don't try to slice into a freed allocation — short-circuit. Without
         // this guard the test
         // `concurrent_writers_with_flushes_preserve_lww` flakes with
         // `range end index N out of range for slice of length 0`.
-        if buf.len() < current_pos {
+        if self.buffer.allocated() == 0 {
             return Ok(());
         }
+
+        // Publish only the bytes that exist. `snapshot_pos` is what was
+        // *reserved*, and `allocate()` is public: a writer can hold a
+        // reservation for a while before it has written a byte of it. The
+        // flushable end is therefore the published prefix as well as the
+        // snapshot. Taking the smaller of the two costs a slow writer one extra
+        // incremental flush; taking the snapshot alone would write zeros over
+        // its range and then move the watermark past it, so the entry would
+        // never reach disk while the index said it was there.
+        let current_pos = snapshot_pos.min(self.buffer.written());
+        let last_flushed = self.last_flushed.load(Ordering::Acquire) as usize;
+        let marker_patch = repair_marker_at
+            .and_then(|prev| Self::marker_patch_to_rewrite(prev, last_flushed as u64));
+
+        // SAFETY: because `current_pos <= written`, every byte below it has
+        // been written and published; `wait_for_writers` drained the counted
+        // writers, so nothing below `snapshot_pos` is mid-write, and entry
+        // writers only touch ranges reserved at or above it. The file lock
+        // excludes the marker patch — the one writer that reaches backwards
+        // into this prefix — and `release_buffer`.
+        let buf = unsafe { self.buffer.prefix(current_pos) };
 
         match handle.as_mut() {
             None => {
@@ -974,7 +1181,6 @@ impl Segment {
         phases.wait_writers = self.wait_for_writers();
         observe_wait_writers(phases.wait_writers);
 
-        let buf = unsafe { &*self.buffer.get() };
         let lock_start = Instant::now();
         let mut handle = self.file_handle.lock();
         phases.file_lock_wait = lock_start.elapsed();
@@ -983,6 +1189,17 @@ impl Segment {
             &SYNC_FILE_LOCK_WAIT_MICROS_MAX,
             phases.file_lock_wait,
         );
+
+        if self.buffer.allocated() == 0 {
+            return Ok(());
+        }
+        // The same published-prefix bound as `flush_inner`: rewrite the bytes
+        // that exist, not the range that was reserved.
+        let end = snapshot_pos.min(self.buffer.written());
+        // SAFETY: because `end <= written`, the prefix is written and published,
+        // the counted writers below it are drained, and the file lock excludes
+        // the marker patch and `release_buffer` from touching the same bytes.
+        let buf = unsafe { self.buffer.prefix(end) };
 
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
@@ -997,7 +1214,7 @@ impl Segment {
         let file = handle.as_mut().unwrap();
         use std::io::Write;
         let write_start = Instant::now();
-        file.write_all(&buf[..snapshot_pos])?;
+        file.write_all(&buf[..end])?;
         phases.write = write_start.elapsed();
         observe_phase(
             &SYNC_WRITE_MICROS_TOTAL,
@@ -1023,13 +1240,12 @@ impl Segment {
             );
         }
         FULL_FLUSHES_TOTAL.fetch_add(1, Ordering::Relaxed);
-        FULL_FLUSH_BYTES_TOTAL.fetch_add(snapshot_pos as u64, Ordering::Relaxed);
+        FULL_FLUSH_BYTES_TOTAL.fetch_add(end as u64, Ordering::Relaxed);
         SYNCS_TOTAL.fetch_add(1, Ordering::Relaxed);
         let total = sync_start.elapsed();
         observe_sync(total);
-        maybe_warn_slow_sync(self.id, snapshot_pos, total, &phases);
-        self.last_flushed
-            .store(snapshot_pos as u64, Ordering::Release);
+        maybe_warn_slow_sync(self.id, end, total, &phases);
+        self.last_flushed.store(end as u64, Ordering::Release);
 
         Ok(())
     }
@@ -1167,8 +1383,10 @@ impl Segment {
     /// is called, and 0 after.  Used by [`crate::commitlog::CommitLog::closed_segments_total_bytes`]
     /// to confirm that closed segments are not holding memory.
     pub fn buffer_bytes(&self) -> usize {
-        // SAFETY: We only read the Vec's length field — no slice access.
-        unsafe { &*self.buffer.get() }.len()
+        // An atomic, not the `Vec`'s length field: writers hold `&mut` into this
+        // allocation while this reads, and reading the header would be a data
+        // race against the append path.
+        self.buffer.allocated()
     }
 
     /// Drops the in-memory write buffer, retaining only segment metadata.
@@ -1188,27 +1406,32 @@ impl Segment {
     /// position has not advanced, so incremental flush finds nothing new to write.
     pub fn release_buffer(&self) {
         // Lock against concurrent `flush_to_disk()`. A periodic flush thread
-        // can have captured `snapshot_pos` and a `&Vec<u8>` reference
-        // BEFORE this method runs; if we replace the Vec without
-        // serialising on the same lock, that thread reads a torn (ptr, len,
-        // cap) tuple — observed in production as
-        // `range end index N out of range for slice of length 0` at the
-        // file.write_all(&buf[..current_pos]) site (see
-        // tests::concurrent_writers_with_flushes_preserve_lww flake).
+        // can have captured `snapshot_pos` and formed a view of the prefix
+        // BEFORE this method runs; the flush forms that view under this same
+        // lock, so holding it here means no flusher is inside its view when the
+        // allocation below is freed.
         //
-        // SAFETY: With the lock held, no other thread is inside
-        // `flush_to_disk()` (which also acquires `file_handle`). Writers
-        // cannot reach this segment via `ArcSwap` once `force_rotate()` has
-        // swapped in the new active segment, so no append path will read
-        // the buffer either.
+        // Writers cannot reach this segment via `ArcSwap` once `force_rotate()`
+        // has swapped in the new active segment, so no append path can hold a
+        // range either; the assertion states that precondition rather than
+        // assuming it silently.
         let _handle = self.file_handle.lock();
-        let buf = unsafe { &mut *self.buffer.get() };
-        *buf = Vec::new();
+        debug_assert_eq!(
+            self.in_flight_writers.load(Ordering::Acquire),
+            0,
+            "release_buffer: a writer is still in flight"
+        );
+        // SAFETY: `file_handle` excludes every flusher (they form their view
+        // under it), the segment has been rotated out of the active slot, and
+        // the assertion above holds on the one counter that tracks an append
+        // between reservation and write. Every view into the allocation is
+        // therefore gone.
+        unsafe { self.buffer.release() };
         // Make any post-release flush a no-op: by setting last_flushed to
         // the current position, the `Some(_)` "nothing new" arm of
         // `flush_to_disk` is taken even if the file handle gets re-opened
-        // somehow. The `None` arm is additionally guarded by a buffer
-        // bounds check below.
+        // somehow. The `None` arm is additionally guarded by the published
+        // length check in `flush_inner`.
         let pos = self.position.load(Ordering::Acquire);
         self.last_flushed.store(pos, Ordering::Release);
     }
@@ -1221,6 +1444,16 @@ mod tests {
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
     use std::collections::HashSet;
     use std::sync::Arc;
+
+    /// The segment's written prefix, for assertions.
+    ///
+    /// Test-only: nothing outside this module reads the buffer as a whole, which
+    /// is the point of `SegmentBuffer`.
+    fn written_prefix(segment: &Segment) -> &[u8] {
+        // SAFETY: the tests below are single-threaded at the point they read,
+        // and `written()` bounds the view to bytes that exist.
+        unsafe { segment.buffer.prefix(segment.buffer.written()) }
+    }
 
     /// Helper to create a simple mutation for testing.
     fn simple_mutation() -> Mutation {
@@ -1254,7 +1487,7 @@ mod tests {
 
         assert!(syncs_issued(mode) > before, "{mode:?} sync was not counted");
         let on_disk = fs::read(segment.path()).unwrap();
-        let buf = unsafe { &*segment.buffer.get() };
+        let buf = written_prefix(&segment);
         let end = segment.current_position() as usize;
         assert_eq!(&on_disk[..], &buf[..end]);
     }
@@ -1328,7 +1561,7 @@ mod tests {
         assert_eq!(pos.offset, offset);
 
         // Read back raw bytes and verify CRCs.
-        let buf = unsafe { &*segment.buffer.get() };
+        let buf = written_prefix(&segment);
         let off = offset as usize;
 
         // Read entry_size.
@@ -1483,7 +1716,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let segment = Segment::new(42, 4096, dir.path());
 
-        let buf = unsafe { &*segment.buffer.get() };
+        let buf = written_prefix(&segment);
         let descriptor = SegmentDescriptor::read_from(&buf[..HEADER_SIZE]).unwrap();
         assert_eq!(descriptor.segment_id, 42);
     }
@@ -1493,7 +1726,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let segment = Segment::new(1, 4096, dir.path());
 
-        let buf = unsafe { &*segment.buffer.get() };
+        let buf = written_prefix(&segment);
         let marker_offset = HEADER_SIZE;
 
         // Read next_marker_offset (should be 0 = EOF).
@@ -1584,6 +1817,159 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let segment = Segment::new(1, 8192, dir.path());
         assert_eq!(segment.buffer_bytes(), 8192);
+    }
+
+    /// A reservation is a claim on bytes, not a claim that they exist yet.
+    ///
+    /// A flush that runs between `allocate()` and `write_entry()` must publish
+    /// only the fully-written prefix. Publishing the whole reservation writes
+    /// zeros over the entry, and the incremental watermark then starts past
+    /// those bytes, so the entry is never written again: the index says the
+    /// entry is at that offset and the file holds zeros there.
+    ///
+    /// `allocate()` is public and `engine.rs` writes through it, so this is a
+    /// reachable window, not a synthetic one.
+    #[test]
+    fn a_flush_between_a_reservation_and_its_write_must_not_publish_unwritten_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let segment = Segment::new(1, 8192, dir.path());
+        let m = simple_mutation();
+        let total = Segment::entry_total_size(&m);
+
+        let first = segment.allocate(total).expect("room for one entry");
+        segment.write_entry(first, &m);
+        segment.flush_to_disk().unwrap();
+
+        // The window `allocate_and_begin_write()` covers with the in-flight
+        // counter: the range is reserved, and no byte of it has been written.
+        let second = segment.allocate(total).expect("room for a second entry");
+        segment.flush_to_disk().unwrap();
+
+        segment.write_entry(second, &m);
+        segment.flush_to_disk().unwrap();
+
+        let on_disk = fs::read(segment.path()).unwrap();
+        let first_entry = &on_disk[first as usize..first as usize + total];
+        let second_entry = &on_disk[second as usize..second as usize + total];
+        assert_eq!(
+            first_entry, second_entry,
+            "the entry written after the intermediate flush is not on disk at its own \
+             offset: that flush published a reserved range whose bytes did not exist yet"
+        );
+    }
+
+    /// Every writer may hold a `&mut` to its own reserved range, and two
+    /// writers' ranges are disjoint — but a `&mut` to the *whole* buffer on
+    /// each thread means the two references overlap, which is UB under Stacked
+    /// and Tree Borrows however disjoint the bytes they touch. This is the
+    /// commit log's durability path, so the test drives it the way `append`
+    /// does: one reservation per writer, all reservations taken before any
+    /// write begins.
+    ///
+    /// The bytes are checked against the same writes done one at a time, so
+    /// the assertion is "the concurrent result is byte-for-byte the serial
+    /// result", not merely "nothing panicked".
+    ///
+    /// The comparison is over the buffer's published prefix, which is what both
+    /// a flusher and this test read; the on-disk check is skipped under Miri,
+    /// which has no `fdatasync`.
+    #[test]
+    fn concurrent_writers_take_disjoint_ranges_and_lose_no_bytes() {
+        use std::sync::Barrier;
+
+        const WRITERS: usize = 8;
+        // Miri interprets one thread at a time and is orders of magnitude
+        // slower; the aliasing violation needs only one preemption.
+        let rounds = if cfg!(miri) { 4 } else { 16 };
+        let total = Segment::entry_total_size(&simple_mutation());
+        let capacity = 4096 + WRITERS * total;
+
+        for _ in 0..rounds {
+            // Reference: the same writes one at a time, so `expected` is the
+            // concatenation of what each writer wrote and nothing else.
+            let serial_dir = tempfile::tempdir().unwrap();
+            let serial = Segment::new(1, capacity, serial_dir.path());
+            let mut expected_offsets = Vec::new();
+            for i in 0..WRITERS {
+                let mut m = simple_mutation();
+                m.timestamp = 1_000 + i as i64;
+                let off = serial.allocate(total).expect("one block per writer");
+                serial.write_entry(off, &m);
+                expected_offsets.push(off);
+            }
+            let expected = written_prefix(&serial).to_vec();
+
+            let dir = tempfile::tempdir().unwrap();
+            let segment = Arc::new(Segment::new(1, capacity, dir.path()));
+            let barrier = Arc::new(Barrier::new(WRITERS));
+            let mut handles = Vec::new();
+            for i in 0..WRITERS {
+                let segment = Arc::clone(&segment);
+                let barrier = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    let mut m = simple_mutation();
+                    m.timestamp = 1_000 + i as i64;
+                    let off = segment.allocate(total).expect("one block per writer");
+                    // Everything is reserved before anything is written, so
+                    // every writer owns its range at the same time.
+                    barrier.wait();
+                    segment.write_entry(off, &m);
+                    (i, off)
+                }));
+            }
+            // Reservations complete in scheduler order, not writer order, so
+            // each block is checked against the offset its own writer took.
+            let mut assigned: Vec<(usize, u64)> =
+                handles.into_iter().map(|h| h.join().unwrap()).collect();
+            assigned.sort_unstable();
+            let mut offsets: Vec<u64> = assigned.iter().map(|(_, off)| *off).collect();
+            offsets.sort_unstable();
+            let mut expected_sorted = expected_offsets.clone();
+            expected_sorted.sort_unstable();
+            assert_eq!(offsets, expected_sorted, "reservations must stay disjoint");
+
+            let actual = written_prefix(&segment);
+
+            assert_eq!(
+                actual.len(),
+                expected.len(),
+                "the concurrent segment published a different number of bytes"
+            );
+            for (i, off) in &assigned {
+                let off = *off as usize;
+                let serial_off = expected_offsets[*i] as usize;
+                assert_eq!(
+                    &actual[off..off + total],
+                    &expected[serial_off..serial_off + total],
+                    "writer {i}'s block at offset {off} does not hold that writer's entry"
+                );
+            }
+
+            // And the buffer as a whole is the header followed by each writer's
+            // block, laid down in reservation order — the concatenation, with
+            // no interleaving and no gap.
+            let mut blocks: Vec<(u64, usize)> =
+                assigned.iter().map(|(i, off)| (*off, *i)).collect();
+            blocks.sort_unstable();
+            let mut concatenated = expected[..INITIAL_POSITION as usize].to_vec();
+            for (_, i) in blocks {
+                let serial_off = expected_offsets[i] as usize;
+                concatenated.extend_from_slice(&expected[serial_off..serial_off + total]);
+            }
+            assert_eq!(
+                actual, concatenated,
+                "the segment is not the concatenation of what each writer wrote"
+            );
+
+            // The same bytes must reach the file through the flush path. Miri
+            // stops at the sync syscall (`fdatasync` is unsupported there), so
+            // that half is checked on a real target only.
+            if !cfg!(miri) {
+                segment.flush_to_disk().unwrap();
+                let on_disk = fs::read(segment.path()).unwrap();
+                assert_eq!(on_disk, concatenated, "the flush published different bytes");
+            }
+        }
     }
 
     /// Regression: a `flush_to_disk()` racing with `release_buffer()`

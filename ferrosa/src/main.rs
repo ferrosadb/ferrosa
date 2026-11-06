@@ -42,7 +42,14 @@ mod counting_alloc {
 
     pub struct CountingJemalloc;
 
+    // SAFETY: `GlobalAlloc` is an `unsafe trait` whose methods are `unsafe fn` by definition, so
+    // this impl and its four methods are the allocator ABI itself rather than a choice. Each method
+    // forwards its `ptr` and `layout` unchanged to `tikv_jemallocator::Jemalloc`, the allocator that
+    // produced the pointer, so the layout freed is the layout allocated; the probe only reads
+    // `layout.size()` and never dereferences `ptr`.
     unsafe impl GlobalAlloc for CountingJemalloc {
+        // SAFETY: forwards `layout` unchanged to the allocator that owns the heap, and records the
+        // requested size only when `ptr` is non-null.
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             let ptr = tikv_jemallocator::Jemalloc.alloc(layout);
             if !ptr.is_null() {
@@ -51,11 +58,15 @@ mod counting_alloc {
             ptr
         }
 
+        // SAFETY: `ptr` came from the same jemalloc allocation with this `layout`, and the probe
+        // reads only `layout.size()` before forwarding both unchanged.
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
             ferrosa_common::mem_probe::record_dealloc(layout.size());
             tikv_jemallocator::Jemalloc.dealloc(ptr, layout);
         }
 
+        // SAFETY: forwarded unchanged; jemalloc's `alloc_zeroed` is the same contract as `alloc`
+        // plus zeroing, and the probe records only a non-null result.
         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
             let ptr = tikv_jemallocator::Jemalloc.alloc_zeroed(layout);
             if !ptr.is_null() {
@@ -64,6 +75,9 @@ mod counting_alloc {
             ptr
         }
 
+        // SAFETY: `ptr`/`layout` describe the live allocation being grown and are forwarded
+        // unchanged to jemalloc, which reallocates in place or moves; on success the probe moves
+        // the recorded bytes from `layout.size()` to `new_size`, and on failure nothing changes.
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
             let new_ptr = tikv_jemallocator::Jemalloc.realloc(ptr, layout, new_size);
             if !new_ptr.is_null() {

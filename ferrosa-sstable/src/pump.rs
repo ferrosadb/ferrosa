@@ -689,6 +689,9 @@ impl FileSink {
         }
         // Respect the host's pwritev vector limit while permitting larger
         // operator-configured queues. POSIX guarantees at least 16 vectors.
+        // SAFETY: `sysconf` takes a scalar argument and returns a scalar, so no memory crosses the
+        // boundary; `_SC_IOV_MAX` has no side effect. A non-positive return is replaced by the
+        // POSIX floor below, so it is never used as a zero or negative bound.
         let host_iov_max = unsafe { libc::sysconf(libc::_SC_IOV_MAX) };
         let iov_max = if host_iov_max > 0 {
             host_iov_max as usize

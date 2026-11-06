@@ -119,14 +119,57 @@ struct KernelStatx {
 
 #[cfg(target_os = "linux")]
 impl KernelStatx {
-    /// A zeroed buffer for the syscall to fill. Every field the kernel does
-    /// not touch (because it wasn't requested in the mask) stays zero, which
-    /// [`resolve_block`] already treats as "no usable alignment." Used only
-    /// by the Linux `probe`.
+    /// A zeroed buffer for the syscall to fill.
+    ///
+    /// Written as a field-by-field zero literal rather than
+    /// `std::mem::zeroed()`: every field is a plain integer, so the compiler
+    /// proves the value is valid instead of leaving an `unsafe` assertion that
+    /// it is. Every field the kernel does not touch (because it wasn't requested
+    /// in the mask) stays zero, which [`resolve_block`] already treats as "no
+    /// usable alignment".
     const fn zeroed() -> Self {
-        // SAFETY: an all-zero bit pattern is valid for every field here (all
-        // plain integers), so zeroing the bytes is a valid `KernelStatx`.
-        unsafe { std::mem::zeroed() }
+        Self {
+            stx_mask: 0,
+            stx_blksize: 0,
+            stx_attributes: 0,
+            stx_nlink: 0,
+            stx_uid: 0,
+            stx_gid: 0,
+            stx_mode: 0,
+            __spare0: [0],
+            stx_ino: 0,
+            stx_size: 0,
+            stx_blocks: 0,
+            stx_attributes_mask: 0,
+            stx_atime: KernelStatxTimestamp {
+                tv_sec: 0,
+                tv_nsec: 0,
+                __reserved: 0,
+            },
+            stx_btime: KernelStatxTimestamp {
+                tv_sec: 0,
+                tv_nsec: 0,
+                __reserved: 0,
+            },
+            stx_ctime: KernelStatxTimestamp {
+                tv_sec: 0,
+                tv_nsec: 0,
+                __reserved: 0,
+            },
+            stx_mtime: KernelStatxTimestamp {
+                tv_sec: 0,
+                tv_nsec: 0,
+                __reserved: 0,
+            },
+            stx_rdev_major: 0,
+            stx_rdev_minor: 0,
+            stx_dev_major: 0,
+            stx_dev_minor: 0,
+            stx_mnt_id: 0,
+            stx_dio_mem_align: 0,
+            stx_dio_offset_align: 0,
+            __spare3: [0; 12],
+        }
     }
 }
 
@@ -347,6 +390,27 @@ pub fn block_for(file: &File) -> Result<usize, TooLarge> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn dio_align_zero_buffer_trusts_nothing_before_the_kernel_fills_it() {
+        // The buffer handed to `statx` must be a real zero value, and its mask
+        // must be clear: a non-zero mask would have `probe` act on fields the
+        // kernel never wrote. This is the property `mem::zeroed()` asserted and
+        // the compiler now proves, so the test pins the behaviour rather than
+        // the mechanism.
+        let stx = KernelStatx::zeroed();
+        assert_eq!(
+            stx.stx_mask, 0,
+            "nothing may be advertised before the syscall"
+        );
+        assert_eq!(stx.stx_dio_mem_align, 0);
+        assert_eq!(stx.stx_dio_offset_align, 0);
+        assert_eq!(
+            resolve_block(false, stx.stx_dio_mem_align, stx.stx_dio_offset_align),
+            ProbeResult::Unsupported
+        );
+    }
 
     #[test]
     fn dio_align_kernel_statx_layout_matches_the_kernel_uapi() {

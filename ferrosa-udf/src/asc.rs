@@ -399,13 +399,23 @@ fn coerce_i64(v: &Value<'_>) -> i64 {
 }
 
 fn bigint_from_i64<'js>(ctx: &Ctx<'js>, n: i64) -> rquickjs::Result<Value<'js>> {
+    // SAFETY: `ctx.as_raw().as_ptr()` is the live `JSContext` behind this `Ctx<'js>` borrow, so
+    // `JS_NewBigInt64` allocates the value on the context that owns it and returns a reference into
+    // that context rather than a Rust allocation.
     let raw = unsafe { rquickjs::qjs::JS_NewBigInt64(ctx.as_raw().as_ptr(), n) };
+    // SAFETY: `raw` was produced by `JS_NewBigInt64` on this same context and is a value the C API
+    // created, so `from_raw` is the only way to adopt it. Passing `ctx` binds the result to `'js`,
+    // so the value cannot outlive the context that owns it.
     Ok(unsafe { Value::from_raw(ctx.clone(), raw) })
 }
 
 /// Build an ArrayBuffer that aliases `[ptr, len)` (the wasmtime linear memory),
 /// without copying or freeing it.
 fn external_array_buffer<'js>(ctx: &Ctx<'js>, ptr: *mut u8, len: usize) -> Value<'js> {
+    // SAFETY: `ptr`/`len` describe the wasmtime linear memory of a live `Store`, and the caller
+    // builds this buffer inside a host closure that borrows that store, so the memory outlives the
+    // `Value`. A null free callback means QuickJS takes no ownership and will never free memory it
+    // does not own, and `false` leaves the buffer non-shared.
     let raw = unsafe {
         rquickjs::qjs::JS_NewArrayBuffer(
             ctx.as_raw().as_ptr(),
@@ -416,6 +426,9 @@ fn external_array_buffer<'js>(ctx: &Ctx<'js>, ptr: *mut u8, len: usize) -> Value
             false,
         )
     };
+    // SAFETY: `raw` is the ArrayBuffer just created on this context and is still unowned by Rust;
+    // `from_raw` adopts it, and `ctx.clone()` binds the value to `'js` so it cannot outlive the
+    // context that owns it.
     unsafe { Value::from_raw(ctx.clone(), raw) }
 }
 
@@ -680,6 +693,10 @@ fn call_js_import(
     results: &mut [Val],
     res_tys: &[ValType],
 ) -> wasmtime::Result<()> {
+    // SAFETY: `cptr` is the `JSContext` that the JS entry point stored in `ShimData`, which the
+    // owning `Store` keeps alive for the whole wasm call, so it outlives every host invocation. The
+    // reconstructed `Ctx` is a borrowed handle used only inside this function; nothing here drops a
+    // context owner.
     let ctx = unsafe { Ctx::from_raw(cptr) };
     let a = imports_a.clone().restore(&ctx).map_err(wt_err)?;
     let f: Function = a.get(name).map_err(|e| {

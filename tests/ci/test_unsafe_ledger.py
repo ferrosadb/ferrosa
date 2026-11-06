@@ -4,124 +4,88 @@
 Aeneas refuses to translate `unsafe`, and Miri only sees executed paths. The defence is that the set
 is small, enumerated, and reviewed by hand, which only works if the enumeration cannot silently drift.
 
-This test is the ratchet: it rescans `*/src/**/*.rs`, ignores `#[cfg(test)]` modules (counted
-separately in the ledger), and fails when a file's production count differs from its ledger row, or
-when a file with `unsafe` has no row at all. Decreasing a count is a failure too — it means the ledger
-is stale in the other direction, and stale documentation is what this exists to prevent.
+This test is the ratchet for the *audit queue*: it fails when a file's production count differs from
+its ledger row, when a file with `unsafe` has no row at all, or when a count goes down without the
+ledger being updated — stale documentation in the other direction is still stale.
+
+`docs/unsafe-policy.md` and `scripts/ci-gates/guard-unsafe.py` are the admission rule: may a site
+exist at all, and under what kind. This file deliberately carries no second scanner — one scanner,
+one truth. It imports the gate's, so the ledger and the allowlist cannot disagree about what a
+production site is.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import re
+import sys
 import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 LEDGER = REPO / "docs" / "unsafe-ledger.md"
-
-# `unsafe {`, `unsafe fn`, `unsafe impl`, `unsafe trait`, `unsafe extern`. Deliberately narrower than
-# a bare `unsafe` search, which also matches SAFETY comments, doc prose and `forbid(unsafe_code)`.
-UNSAFE = re.compile(r"unsafe\s*(\{|fn|impl|trait|extern)")
-SAFETY = re.compile(r"//\s*SAFETY|///.*SAFETY")
-CFG_TEST = re.compile(r"#\[cfg\(test\)\]")
-MOD_OPEN = re.compile(r"\bmod\s+\w+\s*\{")
+GUARD = REPO / "scripts" / "ci-gates" / "guard-unsafe.py"
 
 
-def _strip_line_comment(line: str) -> str:
-    idx = line.find("//")
-    return line[:idx] if idx >= 0 else line
+def _load_guard():
+    """Import the hyphenated guard script.
 
-
-def cfg_test_ranges(lines: list[str]) -> list[tuple[int, int]]:
-    """Line ranges covered by `#[cfg(test)] mod ... { }` blocks, 1-indexed and inclusive."""
-    ranges: list[tuple[int, int]] = []
-    depth = 0
-    pending_cfg_test = False
-    for number, raw in enumerate(lines, start=1):
-        code = _strip_line_comment(raw)
-        if CFG_TEST.search(code):
-            pending_cfg_test = True
-        elif pending_cfg_test and MOD_OPEN.search(code):
-            pending_cfg_test = False
-            start_depth = depth
-            opener = number
-            scan_depth = depth
-            scan = number
-            while scan <= len(lines):
-                text = _strip_line_comment(lines[scan - 1])
-                scan_depth += text.count("{") - text.count("}")
-                if scan_depth <= start_depth and scan > opener:
-                    break
-                scan += 1
-            ranges.append((opener, scan))
-        depth += code.count("{") - code.count("}")
-    return ranges
-
-
-CFG_TEST_MOD = re.compile(r"\bmod\s+(\w+)\s*;")
-
-
-def test_only_module_files(root: Path) -> set[str]:
-    """Files reachable only through a `#[cfg(test)] mod name;` declaration.
-
-    The block scan above sees a module's body only when the body is in the same file. A test module
-    declared as `#[cfg(test)] mod allocation_test_support;` lives in another file, so its `unsafe`
-    sites were counted as production even though no non-test build compiles them. Resolve those
-    declarations, and follow them transitively.
+    `sys.modules` must be populated before `exec_module`: the guard declares a dataclass, and
+    dataclasses resolve string annotations through `sys.modules`.
     """
-    candidates = sorted(root.glob("*/src/**/*.rs"))
-    resolved: set[str] = set()
-    pending = list(candidates)
-    seen: set[Path] = set()
-    while pending:
-        path = pending.pop()
-        if path in seen:
-            continue
-        seen.add(path)
-        armed = False
-        for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
-            code = _strip_line_comment(raw)
-            if CFG_TEST.search(code):
-                armed = True
-                continue
-            declaration = CFG_TEST_MOD.search(code)
-            if armed and declaration:
-                armed = False
-                name = declaration.group(1)
-                for candidate in (path.parent / f"{name}.rs", path.parent / name / "mod.rs"):
-                    if candidate.is_file():
-                        resolved.add(candidate.relative_to(root).as_posix())
-                        pending.append(candidate)
-            elif code.strip() and not code.strip().startswith("#["):
-                armed = False
-    return resolved
+    spec = importlib.util.spec_from_file_location("guard_unsafe_ledger", GUARD)
+    assert spec is not None and spec.loader is not None, f"cannot load {GUARD}"
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["guard_unsafe_ledger"] = module
+    spec.loader.exec_module(module)
+    return module
 
 
-def scan(root: Path) -> tuple[dict[str, int], dict[str, int]]:
-    """(production, test-only) unsafe counts per crate-relative file path."""
-    whole_file_test_modules = test_only_module_files(root)
-    production: dict[str, int] = {}
-    test_only: dict[str, int] = {}
-    for path in sorted(root.glob("*/src/**/*.rs")):
-        rel = path.relative_to(root).as_posix()
-        if rel.startswith(("target/", ".")) or "/examples/" in rel or rel.startswith("examples/"):
+guard = _load_guard()
+
+# The scanner is the expensive part (59 sites over ~1200 files); setUp runs per test method.
+_CACHE: dict[str, dict[str, int]] = {}
+
+
+def production_counts() -> dict[str, int]:
+    """Sites the gate counts as production, per file."""
+    if "production" not in _CACHE:
+        counts: dict[str, int] = {}
+        for site in guard.collect(REPO):
+            counts[site.file] = counts.get(site.file, 0) + 1
+        _CACHE["production"] = counts
+    return _CACHE["production"]
+
+
+def all_counts() -> dict[str, int]:
+    """Every `unsafe` construct in `*/src/**`, `#[cfg(test)]` bodies included."""
+    if "all" in _CACHE:
+        return _CACHE["all"]
+    counts: dict[str, int] = {}
+    for path in sorted(REPO.glob("*/src/**/*.rs")):
+        rel = path.relative_to(REPO).as_posix()
+        if "target/" in rel:
             continue
-        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-        ranges = cfg_test_ranges(lines)
-        for number, line in enumerate(lines, start=1):
-            code = _strip_line_comment(line)
-            if not UNSAFE.search(code):
-                continue
-            if rel in whole_file_test_modules or any(a <= number <= b for a, b in ranges):
-                bucket = test_only
-            else:
-                bucket = production
-            bucket[rel] = bucket.get(rel, 0) + 1
-    return production, test_only
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        hits = sum(1 for line in text.splitlines() if guard.UNSAFE.search(guard.strip_literals(line)))
+        if hits:
+            counts[rel] = hits
+    _CACHE["all"] = counts
+    return counts
+
+
+def test_only_counts() -> dict[str, int]:
+    production = production_counts()
+    counts: dict[str, int] = {}
+    for rel, total in all_counts().items():
+        remaining = total - production.get(rel, 0)
+        if remaining:
+            counts[rel] = remaining
+    return counts
 
 
 def parse_ledger(text: str) -> dict[str, int]:
-    """Per-file counts from the inventory table, plus the declared total."""
+    """Per-file counts from the inventory table."""
     counts: dict[str, int] = {}
     for line in text.splitlines():
         if not line.startswith("| `"):
@@ -142,7 +106,8 @@ class UnsafeLedgerContract(unittest.TestCase):
     def setUp(self) -> None:
         self.assertTrue(LEDGER.exists(), f"missing {LEDGER}")
         self.text = LEDGER.read_text(encoding="utf-8")
-        self.production, self.test_only = scan(REPO)
+        self.production = production_counts()
+        self.test_only = test_only_counts()
         self.ledger = parse_ledger(self.text)
 
     def test_every_production_site_is_in_the_ledger(self) -> None:
@@ -179,33 +144,30 @@ class UnsafeLedgerContract(unittest.TestCase):
         section = self.text.split("## Sealed crates", 1)
         self.assertEqual(len(section), 2, "docs/unsafe-ledger.md lost its '## Sealed crates' section")
         body = section[1].split("Not sealed", 1)[0]
-        sealed = set(re.findall(r"`(ferrosa-[a-z0-9-]+)`", body))
-        self.assertGreater(len(sealed), 10, f"sealed-crate list looks empty or unparsed: {sorted(sealed)}")
-        offenders = sorted(
-            path for path in self.production if path.split("/src/")[0] in sealed
+        sealed = set(
+            re.findall(r"`((?:ferrosa-[a-z0-9-]+|red-ledger|xtask|tools/alloc-count))`", body)
         )
+        self.assertGreater(len(sealed), 10, f"sealed-crate list looks empty or unparsed: {sorted(sealed)}")
+        offenders = sorted(path for path in self.production if path.split("/src/")[0] in sealed)
         self.assertEqual(offenders, [], f"sealed crates must not contain unsafe: {offenders}")
+        # The ledger's list and the crates that actually carry the attribute must agree, or the list
+        # is describing a seal somebody removed.
+        self.assertEqual(
+            sorted(sealed),
+            sorted(guard.sealed_crates(REPO)),
+            "the ledger's sealed list and the #![forbid(unsafe_code)] attributes disagree",
+        )
 
     def test_safety_comment_coverage_is_reported(self) -> None:
-        total = covered = 0
-        for rel in self.production:
-            path = REPO / rel
-            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-            ranges = cfg_test_ranges(lines)
-            for number, line in enumerate(lines, start=1):
-                if not UNSAFE.search(_strip_line_comment(line)):
-                    continue
-                if any(a <= number <= b for a, b in ranges):
-                    continue
-                total += 1
-                window = lines[max(0, number - 5) : number]
-                if any(SAFETY.search(entry) for entry in window):
-                    covered += 1
-        # Recorded rather than enforced: the ledger's audit queue is how this number moves, and
-        # failing here would block every unrelated change. Print it so the debt stays visible.
+        sites = guard.collect(REPO)
+        total = len(sites)
+        covered = sum(1 for site in sites if site.safety)
+        mechanism = sum(1 for site in sites if site.safety and guard.safety_is_mechanism(site.safety))
+        # Recorded rather than enforced here: the gate enforces it for permitted sites, and this
+        # number is how the remaining debt stays visible. Print it so it does not go stale unseen.
         print(
-            f"\nunsafe SAFETY-comment coverage: {covered}/{total} production sites "
-            f"({100 * covered // max(total, 1)}%), test-only sites: {sum(self.test_only.values())}"
+            f"\nunsafe SAFETY-comment coverage: {covered}/{total} production sites carry a comment, "
+            f"{mechanism} name a mechanism; {sum(self.test_only.values())} test-only sites in src/"
         )
 
 
