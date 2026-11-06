@@ -12,6 +12,10 @@
 //! affect the exit code — they only make an approaching expiry visible before
 //! it turns the gate red.
 
+// A static-analysis tool over Rust syntax; it parses, it does not reach the platform, so the absence
+// of `unsafe` is enforced rather than merely true (docs/unsafe-policy.md §7).
+#![forbid(unsafe_code)]
+
 mod oom_audit;
 
 use std::path::PathBuf;

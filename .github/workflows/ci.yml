@@ -41,6 +41,14 @@ jobs:
       # enumerated and reviewed by hand. This fails when the enumeration and the source disagree.
       - name: Check the unsafe ledger matches the source
         run: python3 -m unittest -q tests.ci.test_unsafe_ledger
+      # The allowlist gate also runs as its own job (`unsafe is only where the platform forces it`),
+      # but that job is not a required status check on `main`, so on its own it cannot block a merge.
+      # Running it here — inside `Format`, which is required — is what makes the invariant enforced
+      # rather than advisory. The cost is about a second.
+      - name: Enforce the unsafe allowlist (required-check belt and braces)
+        run: |
+          python3 scripts/ci-gates/guard-unsafe.py
+          python3 -m unittest -q tests.ci.test_guard_unsafe
       - name: Check Cluster Data Loss workflow contract
         run: python3 -m unittest tests.ci.test_cluster_data_loss_workflow
       - name: Check Install Smoke workflow contract
@@ -124,6 +132,21 @@ jobs:
       # down until someone notices (node3, 35 h on 2026-10-06).
       - name: Check the LaunchAgent restarts a failed node
         run: python3 -m unittest tests.ci.test_launchd_template
+
+  # `unsafe` is the one part of the codebase no model or proof covers, so it is held to the operator's
+  # rule: permitted only where the platform forces it (ffi, syscall, ioctl, mmap, allocator, layout, a
+  # named sync primitive), never for performance. The guard fails on a site with no allowlist entry,
+  # on a `perf` or `unknown` kind, on an entry whose site is gone, and on a permitted site whose
+  # SAFETY comment names no mechanism. The rule is docs/unsafe-policy.md.
+  unsafe-allowlist:
+    name: unsafe is only where the platform forces it
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Every production unsafe site is allowlisted with a mechanism
+        run: python3 scripts/ci-gates/guard-unsafe.py
+      - name: Guard tests (each failure class must go red)
+        run: python3 -m unittest -q tests.ci.test_guard_unsafe
 
   no-memory-public:
     name: memory-public is NOT TO BE USED
