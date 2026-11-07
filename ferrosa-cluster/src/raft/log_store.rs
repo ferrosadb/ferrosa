@@ -942,7 +942,18 @@ impl SledLogStore {
         Ok(out)
     }
 
+    /// [`Self::deserialize_entry_layout`], also reading entries written in
+    /// the ferrosa 0.35.x `ClusterConfig` layout (see
+    /// [`crate::config::cluster_config_wire`]).
     fn deserialize_entry(bytes: &[u8]) -> Result<Entry<FerrosRaftConfig>, StorageIOError<u64>> {
+        crate::config::cluster_config_wire::decode_with_legacy_fallback("raft log entry", || {
+            Self::deserialize_entry_layout(bytes)
+        })
+    }
+
+    fn deserialize_entry_layout(
+        bytes: &[u8],
+    ) -> Result<Entry<FerrosRaftConfig>, StorageIOError<u64>> {
         // Tagged path: bytes start with FRE1 + version byte.
         if bytes.len() >= 5 && bytes[..4] == Self::ENTRY_MAGIC {
             let version = bytes[4];
@@ -963,19 +974,20 @@ impl SledLogStore {
                     ),
                 ))));
             }
-            return bincode::deserialize(&bytes[5..])
+            return crate::config::cluster_config_wire::deserialize_bounded(&bytes[5..])
                 .map_err(|e| StorageIOError::read_logs(to_any_error(e)));
         }
 
         // Legacy path: bare bincoded Entry, with a fall-through to the
         // pre-UpdateNodeInfo schema for entries written by older
         // ferrosa builds.
-        match bincode::deserialize(bytes) {
+        match crate::config::cluster_config_wire::deserialize_bounded(bytes) {
             Ok(entry) => Ok(entry),
             Err(current_err) => {
-                match bincode::deserialize::<openraft::Entry<LegacyFerrosRaftConfigPreUpdateNodeInfo>>(
-                    bytes,
-                ) {
+                match crate::config::cluster_config_wire::deserialize_bounded::<
+                    openraft::Entry<LegacyFerrosRaftConfigPreUpdateNodeInfo>,
+                >(bytes)
+                {
                     Ok(entry) => Ok(convert_legacy_entry_pre_update_node_info(entry)),
                     Err(_) => Err(StorageIOError::read_logs(to_any_error(current_err))),
                 }
@@ -3062,3 +3074,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "wire_compat/log_entry_tests.rs"]
+mod log_entry_wire_compat_tests;

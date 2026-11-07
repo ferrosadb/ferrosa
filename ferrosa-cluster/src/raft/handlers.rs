@@ -80,15 +80,19 @@ where
             format!("{handler}: Raft is not ready on this node (not initialised)"),
         );
     };
-    let req: Req = match bincode::deserialize(bytes) {
-        Ok(req) => req,
-        Err(e) => {
-            return HandlerOutcome::fail(
-                RemoteFailureKind::RequestDecodeFailed,
-                format!("{handler}: request failed to deserialize: {e}"),
-            )
-        }
-    };
+    // A 0.35.x peer encodes ClusterConfig with an extra byte; read either.
+    let req: Req =
+        match crate::config::cluster_config_wire::decode_with_legacy_fallback(handler, || {
+            crate::config::cluster_config_wire::deserialize_bounded(bytes)
+        }) {
+            Ok(req) => req,
+            Err(e) => {
+                return HandlerOutcome::fail(
+                    RemoteFailureKind::RequestDecodeFailed,
+                    format!("{handler}: request failed to deserialize: {e}"),
+                )
+            }
+        };
     let resp = match call(raft, req).await {
         Ok(resp) => resp,
         Err(e) => {
