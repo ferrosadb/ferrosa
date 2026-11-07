@@ -337,14 +337,18 @@ fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
 /// This function is called from `run_monitor` (async context). It enters
 /// crossterm raw mode and runs a synchronous event loop, using the tokio
 /// runtime handle for async CQL queries.
-pub async fn run(addr: SocketAddr, panel: Option<String>) -> io::Result<()> {
+pub async fn run(
+    addr: SocketAddr,
+    panel: Option<String>,
+    credentials: Option<&crate::credentials::Credentials>,
+) -> io::Result<()> {
     let initial_panel = panel
         .as_deref()
         .and_then(Panel::from_str)
         .unwrap_or(Panel::Connections);
 
     let handle = tokio::runtime::Handle::current();
-    let mut client = CqlClient::connect(addr)
+    let mut client = crate::credentials::connect_cql(addr, credentials)
         .await
         .map_err(|e| io::Error::other(e.to_string()))?;
 
