@@ -383,6 +383,18 @@ pub fn observe_eviction_audit_offload(uploaded: bool, failed: bool) {
     }
 }
 
+/// The evictor kept a generation because the object store lacks components of
+/// it although the manifest lists it. Non-zero means data exists only locally
+/// and needs re-uploading.
+pub fn inc_eviction_refused_not_in_store() {
+    EVICTION_AUDIT_REFUSED_NOT_IN_STORE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Current count of [`inc_eviction_refused_not_in_store`].
+pub fn eviction_refused_not_in_store_total() -> u64 {
+    EVICTION_AUDIT_REFUSED_NOT_IN_STORE_TOTAL.load(Ordering::Relaxed)
+}
+
 pub fn inc_write_admission_delayed() {
     WRITE_ADMISSION_DELAYED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
@@ -533,6 +545,7 @@ static EVICTION_AUDIT_PASSES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static EVICTION_AUDIT_WRITE_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static EVICTION_AUDIT_OFFLOAD_UPLOADED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static EVICTION_AUDIT_OFFLOAD_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static EVICTION_AUDIT_REFUSED_NOT_IN_STORE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static EVICTION_AUDIT_LAST_UNIX_MS: AtomicU64 = AtomicU64::new(0);
 static EVICTION_AUDIT_LAST_TRIGGER: AtomicU64 = AtomicU64::new(0);
 static EVICTION_AUDIT_LAST_EVICTED_GENERATIONS: AtomicU64 = AtomicU64::new(0);
@@ -1342,6 +1355,12 @@ pub fn render_prometheus() -> String {
             "counter",
             "Audit segment offload attempts that failed.",
             &EVICTION_AUDIT_OFFLOAD_FAILURES_TOTAL,
+        ),
+        (
+            "refused_not_in_store_total",
+            "counter",
+            "Evictions refused because the object store lacks the generation the manifest lists.",
+            &EVICTION_AUDIT_REFUSED_NOT_IN_STORE_TOTAL,
         ),
         (
             "last_unix_ms",

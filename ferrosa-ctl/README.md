@@ -20,6 +20,32 @@ recovery against a stopped node's files):
 3. **Offline filesystem / sled / S3** — SSTable corruption triage & salvage and
    Raft-log inspect/truncate/reset, run against a **stopped** node's data dir.
 
+## Authentication
+
+One set of credentials covers every command that talks to a node: the CQL
+commands authenticate with SASL PLAIN and the web admin API calls send HTTP
+basic auth. Resolved once per invocation (`src/credentials.rs`):
+
+| What | Source, highest precedence first |
+|------|----------------------------------|
+| User | `--username ROLE`, else `FERROSA_CTL_USERNAME`. Neither: anonymous (auth-disabled nodes). |
+| Password | `--password-stdin` (one line, max 4096 bytes), else `FERROSA_CTL_PASSWORD`, else a no-echo prompt. |
+
+`--username` and `--password-stdin` are global: they go before or after the
+subcommand. A password given with no user (`--password-stdin` or
+`FERROSA_CTL_PASSWORD` set, no `--username`/`FERROSA_CTL_USERNAME`) is refused,
+not ignored. `auth set-password` keeps its own `--admin-user` /
+`--admin-password-env`, and `sstable reingest` its `--user` / `--password-env`.
+
+```bash
+FERROSA_CTL_USERNAME=ferrosa_admin FERROSA_CTL_PASSWORD=... \
+  ferrosa-ctl --host 127.0.0.1:19042 --web-port 19090 repair --keyspace ks --table t
+```
+
+Before 2026-11-06 only `compaction stop` and `schema check` sent credentials;
+every other command failed against an auth-enabled node (`bad credentials` over
+CQL, `401 missing Authorization header` over HTTP).
+
 ## What's implemented
 
 ### Observability (CQL, read-only)
@@ -155,7 +181,7 @@ compaction on the selected node. Add `--keyspace KS --table TABLE` to target one
 table. Both scope flags are required together. `--host IP:CQL_PORT` selects the
 node and `--web-port` selects its admin port (default 9090).
 
-For authenticated nodes, add `--username ROLE`; the CLI prompts for its password.
+For authenticated nodes, add `--username ROLE` (see [Authentication](#authentication)); the CLI prompts for its password.
 Use `--password-stdin` to read one password line from stdin instead. The server
 requires its existing admin/operator grant (or superuser), unless auth is disabled.
 

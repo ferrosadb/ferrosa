@@ -616,6 +616,20 @@ impl RebuildOutcome {
 /// Default `FERROSA_CACHE_HOT_WINDOW_SECS`: 15 minutes.
 const DEFAULT_CACHE_HOT_WINDOW_SECS: u64 = 900;
 
+/// The fixed SSTable component files of one generation (index artifacts are
+/// named per index and listed separately).
+const SSTABLE_BASE_COMPONENTS: [&str; 9] = [
+    "Data.db",
+    "Partitions.db",
+    "Rows.db",
+    "Filter.db",
+    "Statistics.db",
+    "TOC.txt",
+    "CompressionInfo.db",
+    "Digest.crc32",
+    "CRC.db",
+];
+
 /// Composes sub-configurations for each component. Use `from_env()` for
 /// production (reads `FERROSA_*` env vars) or `test_config()` for tests.
 pub struct StorageEngineConfig {
@@ -14768,17 +14782,7 @@ impl StorageEngine {
     /// Deletes all on-disk component files for an SSTable generation, leaving
     /// any eviction marker in place.
     fn delete_sstable_components(table_dir: &std::path::Path, gen: &str) -> u64 {
-        let suffixes = [
-            "Data.db",
-            "Partitions.db",
-            "Rows.db",
-            "Filter.db",
-            "Statistics.db",
-            "TOC.txt",
-            "CompressionInfo.db",
-            "Digest.crc32",
-            "CRC.db",
-        ];
+        let suffixes = SSTABLE_BASE_COMPONENTS;
         let mut reclaimed = 0u64;
 
         // Resolve the component directory once before deleting anything. For
@@ -15277,9 +15281,60 @@ impl StorageEngine {
         }
     }
 
-    fn enforce_uploaded_sstable_cache_limit(
+    /// Components of generation `gen` the evictor would delete that the object
+    /// store does not hold at their local size: the base components on disk
+    /// plus the index artifacts its marker will list. Empty means every byte
+    /// the eviction removes can be fetched back. A store error other than
+    /// "not found" is returned, so the caller keeps the local copy.
+    async fn components_missing_from_store(
+        store: &dyn object_store::ObjectStore,
+        prefix: &str,
+        table_id: &str,
+        table_dir: &std::path::Path,
+        gen: &str,
+        index_artifacts: &[String],
+    ) -> ferrosa_common::Result<Vec<String>> {
+        let component_dir = if table_dir.join(gen).is_dir() {
+            table_dir.join(gen)
+        } else {
+            table_dir.to_path_buf()
+        };
+        let components = SSTABLE_BASE_COMPONENTS
+            .iter()
+            .map(|c| (*c).to_string())
+            .chain(index_artifacts.iter().cloned());
+        let hex = crate::upload::manager::hex_prefix_for(gen);
+        let mut missing = Vec::new();
+        for component in components {
+            let Ok(local) = std::fs::metadata(component_dir.join(format!("{gen}-{component}")))
+            else {
+                continue;
+            };
+            let key =
+                crate::upload::manager::sstable_object_key(prefix, &hex, table_id, gen, &component);
+            match store.head(&key).await {
+                Ok(meta) if meta.size as u64 == local.len() => {}
+                Ok(meta) => missing.push(format!(
+                    "{component} (store has {} bytes, disk has {})",
+                    meta.size,
+                    local.len()
+                )),
+                Err(object_store::Error::NotFound { .. }) => missing.push(component),
+                Err(e) => {
+                    return Err(ferrosa_common::Error::InvalidFormat(format!(
+                        "head {key} before eviction: {e}"
+                    )))
+                }
+            }
+        }
+        Ok(missing)
+    }
+
+    async fn enforce_uploaded_sstable_cache_limit(
         &self,
         manifest: &crate::manifest::Manifest,
+        store: &dyn object_store::ObjectStore,
+        prefix: &str,
     ) -> ferrosa_common::Result<usize> {
         let max_bytes = self.config.local_cache_max_bytes;
         let min_bytes = self.local_cache_min_bytes();
@@ -15361,6 +15416,45 @@ impl StorageEngine {
                     continue;
                 }
             };
+            // The manifest saying a generation was uploaded is not proof that
+            // its objects are in the store. On 2026-11-03 the free-space
+            // evictor deleted the only copy of two June-era
+            // `agent_memory.temporal_edges` generations whose base components
+            // had never been uploaded (only a sidecar had); every restart of
+            // those nodes then refused to start. Delete nothing the store
+            // cannot give back.
+            match Self::components_missing_from_store(
+                store,
+                prefix,
+                &table_id,
+                &table_dir,
+                &sstable_id,
+                &index_artifacts,
+            )
+            .await
+            {
+                Ok(missing) if missing.is_empty() => {}
+                Ok(missing) => {
+                    crate::metrics::inc_eviction_refused_not_in_store();
+                    tracing::error!(
+                        table = table_id,
+                        sstable = sstable_id,
+                        missing = ?missing,
+                        "s3-sync: manifest lists this generation but the object store lacks components of it; \
+                         NOT evicting the only copy. The generation needs re-uploading"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        table = table_id,
+                        sstable = sstable_id,
+                        error = %e,
+                        "s3-sync: cannot confirm the generation is in the object store; not evicting it (retried next sync)"
+                    );
+                    continue;
+                }
+            }
             let record = crate::eviction_marker::EvictionRecord {
                 trigger,
                 generation_bytes: Some(size),
@@ -15708,7 +15802,9 @@ impl StorageEngine {
             self.update_s3_manifest_stats(&manifest);
         }
 
-        let evicted = self.enforce_uploaded_sstable_cache_limit(&manifest)?;
+        let evicted = self
+            .enforce_uploaded_sstable_cache_limit(&manifest, store.as_ref(), &prefix)
+            .await?;
         // Optional, off by default, strictly after the eviction and bounded:
         // one segment, one attempt, a timeout, through the shared throttled store.
         self.eviction_audit.offload_rotated(&store, &prefix).await;
@@ -18831,8 +18927,140 @@ mod tests {
         );
     }
 
-    #[test]
-    fn uploaded_sstable_cache_eviction_deletes_only_manifest_confirmed_files() {
+    const STORE_PREFIX: &str = "evict-test";
+
+    /// An object store holding every local base component of every generation
+    /// `manifest` lists, as a completed upload leaves it.
+    async fn store_holding(
+        data_dir: &std::path::Path,
+        manifest: &crate::manifest::Manifest,
+    ) -> object_store::memory::InMemory {
+        use object_store::ObjectStore as _;
+        let store = object_store::memory::InMemory::new();
+        for (table_id, entries) in &manifest.sstables {
+            let table_dir = data_dir.join("sstables").join(table_id);
+            for entry in entries {
+                let hex = crate::upload::manager::hex_prefix_for(&entry.id);
+                for component in SSTABLE_BASE_COMPONENTS {
+                    let Ok(bytes) =
+                        std::fs::read(table_dir.join(format!("{}-{component}", entry.id)))
+                    else {
+                        continue;
+                    };
+                    let key = crate::upload::manager::sstable_object_key(
+                        STORE_PREFIX,
+                        &hex,
+                        table_id,
+                        &entry.id,
+                        component,
+                    );
+                    store.put(&key, bytes.into()).await.unwrap();
+                }
+            }
+        }
+        store
+    }
+
+    /// 2026-11-03: the free-space evictor deleted the only copy of a June-era
+    /// `agent_memory.temporal_edges` generation on two memory-cluster nodes.
+    /// The manifest listed it, but only a sidecar had ever reached the store;
+    /// each node then refused every restart ("evicted SSTable generation(s)
+    /// are neither local nor resolvable from the object store"). A generation
+    /// whose components the store lacks must stay local, and say so.
+    #[tokio::test]
+    async fn uploaded_cache_eviction_keeps_a_generation_the_store_does_not_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.local_cache_max_bytes = 1; // every generation is over the cap
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        let table_id = table_id().to_string();
+        let table_dir = dir.path().join("sstables").join(&table_id);
+        std::fs::create_dir_all(&table_dir).unwrap();
+        // Gen 1 is the oldest, so the first candidate; gen 2 is a control.
+        std::fs::write(table_dir.join("1-Data.db"), vec![1u8; 80]).unwrap();
+        std::fs::write(table_dir.join("1-Filter.db"), vec![1u8; 8]).unwrap();
+        std::fs::write(table_dir.join("2-Data.db"), vec![2u8; 80]).unwrap();
+        let mut manifest = crate::manifest::Manifest::new();
+        for id in ["1", "2"] {
+            manifest.add_sstable(&table_id, manifest_entry(id, 80));
+        }
+        let store = store_holding(dir.path(), &manifest).await;
+        // The store lost gen 1's Data.db (it was never uploaded).
+        {
+            use object_store::ObjectStore as _;
+            let hex = crate::upload::manager::hex_prefix_for("1");
+            let key = crate::upload::manager::sstable_object_key(
+                STORE_PREFIX,
+                &hex,
+                &table_id,
+                "1",
+                "Data.db",
+            );
+            store.delete(&key).await.unwrap();
+        }
+        let refused_before = crate::metrics::eviction_refused_not_in_store_total();
+
+        let evicted = engine
+            .enforce_uploaded_sstable_cache_limit(&manifest, &store, STORE_PREFIX)
+            .await
+            .unwrap();
+
+        assert!(
+            table_dir.join("1-Data.db").exists(),
+            "the only copy of a generation the store lacks must not be evicted"
+        );
+        assert!(
+            !StorageEngine::evicted_marker_path(&table_dir, "1").exists(),
+            "no eviction marker for a generation that was kept"
+        );
+        assert_eq!(
+            evicted, 1,
+            "the generation the store holds is still evicted"
+        );
+        assert!(!table_dir.join("2-Data.db").exists());
+        assert!(
+            crate::metrics::eviction_refused_not_in_store_total() > refused_before,
+            "the refusal is counted"
+        );
+    }
+
+    /// A store object shorter than the local file is not a copy of it.
+    #[tokio::test]
+    async fn uploaded_cache_eviction_keeps_a_generation_whose_stored_copy_is_truncated() {
+        use object_store::ObjectStore as _;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.local_cache_max_bytes = 1;
+        let engine = StorageEngine::new(config, None).unwrap();
+        let table_id = table_id().to_string();
+        let table_dir = dir.path().join("sstables").join(&table_id);
+        std::fs::create_dir_all(&table_dir).unwrap();
+        std::fs::write(table_dir.join("1-Data.db"), vec![1u8; 80]).unwrap();
+        let mut manifest = crate::manifest::Manifest::new();
+        manifest.add_sstable(&table_id, manifest_entry("1", 80));
+        let store = object_store::memory::InMemory::new();
+        let hex = crate::upload::manager::hex_prefix_for("1");
+        let key = crate::upload::manager::sstable_object_key(
+            STORE_PREFIX,
+            &hex,
+            &table_id,
+            "1",
+            "Data.db",
+        );
+        store.put(&key, vec![1u8; 40].into()).await.unwrap();
+
+        let evicted = engine
+            .enforce_uploaded_sstable_cache_limit(&manifest, &store, STORE_PREFIX)
+            .await
+            .unwrap();
+
+        assert_eq!(evicted, 0);
+        assert!(table_dir.join("1-Data.db").exists());
+    }
+
+    #[tokio::test]
+    async fn uploaded_sstable_cache_eviction_deletes_only_manifest_confirmed_files() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = StorageEngineConfig::test_config(dir.path());
         config.local_cache_max_bytes = 100;
@@ -18861,7 +19089,12 @@ mod tests {
         }
 
         let evicted = engine
-            .enforce_uploaded_sstable_cache_limit(&manifest)
+            .enforce_uploaded_sstable_cache_limit(
+                &manifest,
+                &store_holding(dir.path(), &manifest).await,
+                STORE_PREFIX,
+            )
+            .await
             .unwrap();
 
         assert_eq!(evicted, 1);
@@ -18883,8 +19116,8 @@ mod tests {
     /// `system_schema.indexes` read as empty, every secondary index went
     /// unregistered, and indexed reads were refused cluster-wide. System
     /// tables are tiny and needed before anything else — never evict them.
-    #[test]
-    fn uploaded_cache_eviction_never_evicts_system_keyspace_sstables() {
+    #[tokio::test]
+    async fn uploaded_cache_eviction_never_evicts_system_keyspace_sstables() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = StorageEngineConfig::test_config(dir.path());
         config.local_cache_max_bytes = 1;
@@ -18911,7 +19144,12 @@ mod tests {
         }
 
         engine
-            .enforce_uploaded_sstable_cache_limit(&manifest)
+            .enforce_uploaded_sstable_cache_limit(
+                &manifest,
+                &store_holding(dir.path(), &manifest).await,
+                STORE_PREFIX,
+            )
+            .await
             .unwrap();
 
         for table_dir in system_dirs {
@@ -18923,8 +19161,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn uploaded_cache_eviction_skips_generations_still_pending_upload() {
+    #[tokio::test]
+    async fn uploaded_cache_eviction_skips_generations_still_pending_upload() {
         // RED (#235): a generation still listed in the pending-upload log is
         // flushed locally but NOT yet confirmed durable in S3 (the log entry is
         // removed only after S3 confirms). Evicting its local copy deletes the
@@ -18962,7 +19200,12 @@ mod tests {
         }
 
         engine
-            .enforce_uploaded_sstable_cache_limit(&manifest)
+            .enforce_uploaded_sstable_cache_limit(
+                &manifest,
+                &store_holding(dir.path(), &manifest).await,
+                STORE_PREFIX,
+            )
+            .await
             .unwrap();
 
         assert!(
@@ -19256,8 +19499,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn uploaded_sstable_cache_eviction_responds_to_disk_pressure_before_cache_max() {
+    #[tokio::test]
+    async fn uploaded_sstable_cache_eviction_responds_to_disk_pressure_before_cache_max() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = StorageEngineConfig::test_config(dir.path());
         config.local_cache_max_bytes = 1024 * 1024;
@@ -19286,7 +19529,12 @@ mod tests {
         }
 
         let evicted = engine
-            .enforce_uploaded_sstable_cache_limit(&manifest)
+            .enforce_uploaded_sstable_cache_limit(
+                &manifest,
+                &store_holding(dir.path(), &manifest).await,
+                STORE_PREFIX,
+            )
+            .await
             .unwrap();
 
         assert!(
@@ -38149,14 +38397,19 @@ mod tests {
     /// 2026-09-29: ~1000 SSTables were evicted and nobody could say why,
     /// because the marker was empty and the reason lived in a rotated log. A
     /// cache-cap eviction must name that trigger and the byte figures.
-    #[test]
-    fn a_cache_cap_eviction_marker_names_its_trigger_and_figures() {
+    #[tokio::test]
+    async fn a_cache_cap_eviction_marker_names_its_trigger_and_figures() {
         use crate::eviction_marker::Trigger;
         let dir = tempfile::tempdir().unwrap();
         let (engine, table_dir, manifest) = engine_with_two_uploaded_sstables(dir.path(), 100, 0);
 
         let evicted = engine
-            .enforce_uploaded_sstable_cache_limit(&manifest)
+            .enforce_uploaded_sstable_cache_limit(
+                &manifest,
+                &store_holding(dir.path(), &manifest).await,
+                STORE_PREFIX,
+            )
+            .await
             .unwrap();
         assert!(evicted >= 1, "160 cached bytes over a 100 byte cap evicts");
 
@@ -38173,15 +38426,20 @@ mod tests {
 
     /// A free-space eviction (cache well under its cap, disk under its free
     /// target) names that trigger and carries the free-space figures.
-    #[test]
-    fn a_free_space_eviction_marker_names_its_trigger_and_figures() {
+    #[tokio::test]
+    async fn a_free_space_eviction_marker_names_its_trigger_and_figures() {
         use crate::eviction_marker::Trigger;
         let dir = tempfile::tempdir().unwrap();
         let (engine, table_dir, manifest) =
             engine_with_two_uploaded_sstables(dir.path(), 1024 * 1024, u64::MAX / 4);
 
         let evicted = engine
-            .enforce_uploaded_sstable_cache_limit(&manifest)
+            .enforce_uploaded_sstable_cache_limit(
+                &manifest,
+                &store_holding(dir.path(), &manifest).await,
+                STORE_PREFIX,
+            )
+            .await
             .unwrap();
         assert!(evicted >= 1);
 
@@ -38194,8 +38452,8 @@ mod tests {
 
     /// Every pass that finds pressure leaves a durable record naming what it
     /// saw (manifest claim AND real disk total), what it did, and who wrote it.
-    #[test]
-    fn an_eviction_pass_leaves_a_durable_audit_record() {
+    #[tokio::test]
+    async fn an_eviction_pass_leaves_a_durable_audit_record() {
         let dir = tempfile::tempdir().unwrap();
         let (engine, _table_dir, mut manifest) =
             engine_with_two_uploaded_sstables(dir.path(), 100, 0);
@@ -38204,7 +38462,12 @@ mod tests {
         listed.iter_mut().for_each(|entry| entry.size = 1000);
 
         let evicted = engine
-            .enforce_uploaded_sstable_cache_limit(&manifest)
+            .enforce_uploaded_sstable_cache_limit(
+                &manifest,
+                &store_holding(dir.path(), &manifest).await,
+                STORE_PREFIX,
+            )
+            .await
             .unwrap();
         assert_eq!(evicted, 1);
 
@@ -38227,15 +38490,20 @@ mod tests {
 
     /// An audit that cannot be written must not stop the eviction or its
     /// marker: durability of the marker outranks the audit record.
-    #[test]
-    fn an_unwritable_audit_does_not_prevent_an_eviction() {
+    #[tokio::test]
+    async fn an_unwritable_audit_does_not_prevent_an_eviction() {
         let dir = tempfile::tempdir().unwrap();
         let (engine, table_dir, manifest) = engine_with_two_uploaded_sstables(dir.path(), 100, 0);
         // A regular file where the audit directory must go.
         std::fs::write(dir.path().join("eviction-audit"), b"in the way").unwrap();
 
         let evicted = engine
-            .enforce_uploaded_sstable_cache_limit(&manifest)
+            .enforce_uploaded_sstable_cache_limit(
+                &manifest,
+                &store_holding(dir.path(), &manifest).await,
+                STORE_PREFIX,
+            )
+            .await
             .unwrap();
 
         assert_eq!(evicted, 1, "the eviction proceeded");
@@ -38279,8 +38547,8 @@ mod tests {
     /// second entry) must not double the evictor's byte count or evict the
     /// same files twice. The real bytes (160) are under the 170 byte cap; the
     /// duplicate makes the manifest-derived sum 240, which is over it.
-    #[test]
-    fn a_duplicate_manifest_entry_does_not_drive_an_eviction() {
+    #[tokio::test]
+    async fn a_duplicate_manifest_entry_does_not_drive_an_eviction() {
         let dir = tempfile::tempdir().unwrap();
         let (engine, table_dir, mut manifest) =
             engine_with_two_uploaded_sstables(dir.path(), 170, 0);
@@ -38291,7 +38559,12 @@ mod tests {
             .push(manifest_entry("1", 80));
 
         let evicted = engine
-            .enforce_uploaded_sstable_cache_limit(&manifest)
+            .enforce_uploaded_sstable_cache_limit(
+                &manifest,
+                &store_holding(dir.path(), &manifest).await,
+                STORE_PREFIX,
+            )
+            .await
             .unwrap();
 
         assert_eq!(evicted, 0, "160 real bytes under a 170 byte cap");
@@ -38307,8 +38580,8 @@ mod tests {
     /// compaction inputs not yet dropped, or evicted ones) claim bytes that
     /// are not there. They must not push the evictor over its cap when the
     /// real on-disk total is far under it.
-    #[test]
-    fn manifest_entries_that_are_not_on_disk_do_not_drive_an_eviction() {
+    #[tokio::test]
+    async fn manifest_entries_that_are_not_on_disk_do_not_drive_an_eviction() {
         let dir = tempfile::tempdir().unwrap();
         let (engine, table_dir, mut manifest) =
             engine_with_two_uploaded_sstables(dir.path(), 1024 * 1024, 0);
@@ -38318,7 +38591,12 @@ mod tests {
         }
 
         let evicted = engine
-            .enforce_uploaded_sstable_cache_limit(&manifest)
+            .enforce_uploaded_sstable_cache_limit(
+                &manifest,
+                &store_holding(dir.path(), &manifest).await,
+                STORE_PREFIX,
+            )
+            .await
             .unwrap();
 
         assert_eq!(evicted, 0, "160 real bytes under a 1 MiB cap");
