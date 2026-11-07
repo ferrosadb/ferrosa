@@ -261,3 +261,30 @@ blocks admission for every table and survives restart. Normal empty padding and
 torn creation headers do not create false rejection evidence. Persistence failure
 returns an error and keeps the source bytes. Replay/checkpoint locking prevents
 flush from crossing an unhandled replay frame.
+
+## ST-93 Evicting a generation the object store does not hold (2026-11-06)
+
+**Failure mode.** The uploaded-cache evictor treated "listed in the S3 manifest
+and not pending upload" as proof a generation was durable. Two June-era
+`agent_memory.temporal_edges` generations on the memory cluster were listed in
+the manifest although only a sidecar had ever been uploaded. A free-space pass
+on 2026-11-03 wrote their `.evicted` markers and deleted the only copy of
+`Data.db`; each node then refused every restart ("evicted SSTable
+generation(s) are neither local nor resolvable from the object store").
+
+**Control.** Before writing a marker, the evictor HEADs every base component it
+is about to delete plus every index artifact the marker will list, and requires
+each to exist at its local size. Missing or short objects keep the generation
+local, log an error naming them, and count
+`ferrosa_eviction_audit_refused_not_in_store_total`; a store error other than
+not-found also keeps it local (retried next pass).
+
+**Detection.** Non-zero `refused_not_in_store_total` means a manifest-listed
+generation exists only on local disk and needs re-uploading.
+
+**Tests.** `uploaded_cache_eviction_keeps_a_generation_the_store_does_not_hold`,
+`uploaded_cache_eviction_keeps_a_generation_whose_stored_copy_is_truncated`.
+
+**Open.** Why those generations entered the manifest without their base
+components was not established (June-era behaviour); no re-upload path exists
+for them yet.
