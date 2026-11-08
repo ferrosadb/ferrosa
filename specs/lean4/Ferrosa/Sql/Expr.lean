@@ -429,4 +429,43 @@ theorem uncorrelated_iff_no_outer_reference (level : Nat) (refs : List Nat) :
     correlated level refs = false ↔ ∀ l ∈ refs, level ≤ l := by
   simp [correlated, List.any_eq_false]
 
+/-! ## Mismatched types are errors, not UNKNOWN (found while building W1)
+
+  `veq` above folds a type mismatch into UNKNOWN. Used as the engine's
+  comparison that is a silent wrong answer: `WHERE ts > '2020-01-01'` compared a
+  timestamp with a string, got UNKNOWN on every row and returned nothing. The
+  engine now (1) reads a string literal as the type it faces, at plan time, and
+  (2) refuses two non-NULL values of different types (42883). `strictEq` is that
+  comparison; these theorems pin that it never invents UNKNOWN.
+-/
+
+/-- Same type family (the model's constructors). -/
+def sameType : V → V → Bool
+  | .int _, .int _ => true
+  | .bool _, .bool _ => true
+  | .str _, .str _ => true
+  | _, _ => false
+
+/-- The strict comparison: NULL is UNKNOWN, a mismatch is an error. -/
+def strictEq (a b : V) : Except Unit TV :=
+  match a, b with
+  | .null, _ => .ok none
+  | _, .null => .ok none
+  | a, b => if sameType a b then .ok (veq a b) else .error ()
+
+/-- UNKNOWN comes only from a NULL operand. -/
+theorem strict_unknown_only_from_null (a b : V) (h : strictEq a b = .ok none) :
+    a = .null ∨ b = .null := by
+  cases a <;> cases b <;> simp_all [strictEq, sameType, veq]
+
+/-- On values of one type the strict comparison is `veq`. -/
+theorem strict_agrees_on_same_type (a b : V) (h : sameType a b = true) :
+    strictEq a b = .ok (veq a b) := by
+  cases a <;> cases b <;> simp_all [strictEq, sameType]
+
+/-- Two non-NULL values of different types are refused. -/
+theorem strict_refuses_mismatch (a b : V) (ha : a ≠ .null) (hb : b ≠ .null)
+    (h : sameType a b = false) : strictEq a b = .error () := by
+  cases a <;> cases b <;> simp_all [strictEq, sameType]
+
 end Ferrosa.Sql.Expr

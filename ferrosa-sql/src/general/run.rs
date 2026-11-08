@@ -210,6 +210,7 @@ fn scan(source: &Source, rt: &Arc<Rt>) -> Result<TryRowStream<'static>, ExecErro
     match &source.table {
         SourceTable::Table(t) => Ok(fallible(seq_scan(&**t))),
         SourceTable::Cte(q) => open(q, rt, None),
+        SourceTable::OneRow => Ok(Box::new(std::iter::once(Ok(Row(Vec::new()))))),
     }
 }
 
