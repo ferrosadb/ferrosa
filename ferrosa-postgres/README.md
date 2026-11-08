@@ -790,6 +790,47 @@ a bad binary version byte answered `22P03` (Postgres: `XX000`; `08P01` for an
 empty value). There are no named divergences: `NAMED_DIVERGENCES` in the oracle is
 empty and fails if an entry stops differing.
 
+### Transactional DDL (`ddl_txn`, Lean `Ferrosa.Sql.Ddl`)
+
+Ecto runs every migration inside `BEGIN … COMMIT`, so DDL inside a transaction block is
+**buffered** and replayed at `COMMIT` rather than refused (`25001` is gone). The same
+holds for an extended-protocol pipeline's implicit transaction: its DDL applies at `Sync`.
+
+- **Visible inside the block.** Each DDL statement plans against the block's *view*: the
+  committed schema with the statements buffered so far applied (`DdlBatch::view`). So
+  `CREATE TABLE t …` followed by `ALTER TABLE t ADD COLUMN …` or `CREATE TABLE IF NOT
+  EXISTS t` works, and a second `CREATE TABLE t` is `42P07`. A statement the view refuses
+  is never buffered and aborts the block like any failed statement.
+- **Nothing before COMMIT.** The committed schema does not change until `COMMIT`.
+  `ROLLBACK` (and `COMMIT` of an aborted block) discards the batch with the rest of the
+  transaction.
+- **DML sees the committed schema.** Row statements inside the block run against the
+  committed schema, so an `INSERT` into a table created earlier in the same block is
+  `42P01`. (Ecto's migrations only write `schema_migrations`, which already exists.)
+- **COMMIT = preflight, then replay.** The batch is first re-applied in memory to the
+  schema as it is now (`ddl_txn::preflight`). If a concurrent session changed it so a
+  buffered step no longer applies (the table now exists, the altered table was dropped and
+  re-created), `COMMIT` fails with `40001` and **no** schema change is applied. Then the
+  steps are replayed in order through `DdlPath`, one replicated schema change each.
+- **Failure semantics (not atomic across steps).** Each step is an independent Raft entry,
+  so the replay is atomic only when every step succeeds. If step *k* of *n* fails at replay
+  (the schema-change path became unavailable, or a concurrent change landed between the
+  preflight and that step), steps 1…*k*-1 **stay applied** — compensating them would be a
+  second non-atomic sequence that could drop a table another session already writes into.
+  The client gets `58000` naming the applied steps, the failed step and its cause, and the
+  steps never run ("COMMIT applied 2 of 5 schema changes and then failed; the applied ones
+  are NOT rolled back …"); the same is logged at `error`. The block's row writes are then
+  not committed. Proved shape: `failed_commit_reports_the_exact_prefix`,
+  `third_of_five_fails_loudly`; tested by `ddl_txn::tests::third_of_five_reports_the_exact_prefix`.
+- **DDL before rows.** DDL replays before the row writes (they may target a new table). If
+  the row writes then fail to commit, the error message states that the schema changes
+  were applied and are not rolled back.
+- **Bound.** A block may buffer at most `MAX_BUFFERED_DDL` (4096) DDL statements.
+
+Tests: `tests/pg_oban_ddl.rs` (`ddl_inside_a_transaction_is_buffered_until_commit`,
+`rollback_discards_buffered_ddl`, `commit_refuses_a_batch_a_concurrent_change_invalidated`,
+…).
+
 ### Extended-protocol transaction boundary
 
 Extended-protocol pipelines stage DML until `Sync` and commit the group as one atomic batch. An error rolls back preceding writes in that group, disconnect discards staging, and an explicit `BEGIN` remains open across `Sync`. Commit failures are reported before `ReadyForQuery`. Tests: `server::txn_atomicity_tests::extended_pipeline_*`.

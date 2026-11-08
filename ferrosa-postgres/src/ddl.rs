@@ -25,7 +25,8 @@ use ferrosa_cluster::pair::ddl::DdlOperation;
 use ferrosa_common::cql_type::CqlType;
 use ferrosa_common::timeuuid::{is_reserved_column_name, SYNTHETIC_KEY_COLUMN};
 use ferrosa_schema::{
-    ClusteringOrder, ColumnKind, ColumnMetadata, Schema, TableMetadata, TableParams, TableUpdates,
+    ClusteringOrder, ColumnKind, ColumnMetadata, Schema, SchemaSnapshot, TableMetadata,
+    TableParams, TableUpdates,
 };
 use ferrosa_sql::{
     AlterOperation, AlterTableStmt, ColumnDef, CreateTableStmt, DropTableStatement, PgType,
@@ -66,6 +67,15 @@ pub trait DdlExecutor: Send + Sync {
         name: &str,
         columns: &[String],
     ) -> Result<(), String>;
+    /// Drop the secondary index `name` on `keyspace.table` through the same path.
+    ///
+    /// The default refuses by name, so an executor that cannot drop an index says so
+    /// rather than reporting a drop it did not perform.
+    async fn drop_index(&self, keyspace: &str, table: &str, name: &str) -> Result<(), String> {
+        Err(format!(
+            "this schema-change executor cannot drop index {keyspace}.{table}.{name}"
+        ))
+    }
 }
 
 /// [`DdlExecutor`] over the shared, atomically swappable [`DdlPath`] that the
@@ -173,6 +183,23 @@ impl DdlExecutor for ClusterDdl {
             )
         })?
     }
+
+    async fn drop_index(&self, keyspace: &str, table: &str, name: &str) -> Result<(), String> {
+        self.drop_index_now(keyspace, table, name).await
+    }
+}
+
+impl ClusterDdl {
+    async fn drop_index_now(&self, keyspace: &str, table: &str, name: &str) -> Result<(), String> {
+        let path = self.path.load_full();
+        path.execute(DdlOperation::DropIndex {
+            keyspace: keyspace.to_string(),
+            table: table.to_string(),
+            index: name.to_string(),
+        })
+        .await
+        .map_err(|e| e.to_string())
+    }
 }
 
 /// Observe current coverage, including compaction replacements, without
@@ -205,14 +232,66 @@ fn index_ready(
     Ok(engine.index_is_current(table, name))
 }
 
-/// What a `CREATE TABLE` runs against: the schema registry it checks for
-/// existing tables and the executor that applies the change.
-#[derive(Clone, Copy)]
+/// What a DDL statement runs against: the schema registry, the *view* it plans against,
+/// and the executor that applies (autocommit) or buffers (inside a transaction block,
+/// [`crate::ddl_txn::Recorder`]) the change.
+///
+/// `view` is the committed schema in autocommit, and the committed schema with the
+/// block's buffered DDL applied inside a transaction ([`crate::ddl_txn::DdlBatch::view`]),
+/// so a statement sees the tables and columns earlier statements in its block created.
+#[derive(Clone)]
 pub(crate) struct DdlEnv<'a> {
     pub(crate) executor: Option<&'a dyn DdlExecutor>,
     pub(crate) schema: &'a Schema,
+    pub(crate) view: Arc<SchemaSnapshot>,
     pub(crate) default_schema: &'a str,
-    pub(crate) in_txn: bool,
+}
+
+/// Execute one DDL statement. In autocommit (`txn` is `None`) the change is applied now,
+/// through the deployment's schema-change path; inside a transaction block it is buffered
+/// into the block's [`crate::ddl_txn::DdlBatch`] and planned against the block's view, to
+/// be replayed at `COMMIT` (see [`crate::ddl_txn`]). The statement is moved in.
+pub(crate) async fn execute_ddl_statement(
+    executor: Option<&dyn DdlExecutor>,
+    schema: &Schema,
+    default_schema: &str,
+    stmt: ferrosa_sql::Statement,
+    txn: Option<&mut crate::txn_write_set::TxnWriteSet>,
+) -> Vec<BackendMessage> {
+    let Some(set) = txn else {
+        let env = DdlEnv {
+            executor,
+            schema,
+            view: schema.snapshot(),
+            default_schema,
+        };
+        return dispatch_ddl(env, stmt).await;
+    };
+    let batch = set.ddl_batch_mut();
+    let view = batch.view(schema);
+    let recorder = crate::ddl_txn::Recorder::new(batch, schema);
+    // No schema-change path means no DDL at all, buffered or not: COMMIT could not apply it.
+    let executor = executor.map(|_| &recorder as &dyn DdlExecutor);
+    let env = DdlEnv {
+        executor,
+        schema,
+        view,
+        default_schema,
+    };
+    dispatch_ddl(env, stmt).await
+}
+
+async fn dispatch_ddl(env: DdlEnv<'_>, stmt: ferrosa_sql::Statement) -> Vec<BackendMessage> {
+    use ferrosa_sql::Statement;
+    match stmt {
+        Statement::CreateTable(create) => execute_create_table(env, &create).await,
+        Statement::DropTable(drop) => execute_drop_table(env, &drop).await,
+        Statement::AlterTable(alter) => execute_alter_table(env, &alter).await,
+        other => refuse(
+            "XX000",
+            &format!("internal: {other:?} is not a DDL statement"),
+        ),
+    }
 }
 
 fn refuse(code: &str, message: &str) -> Vec<BackendMessage> {
@@ -250,12 +329,6 @@ pub(crate) async fn execute_alter_table(
     env: DdlEnv<'_>,
     stmt: &AlterTableStmt,
 ) -> Vec<BackendMessage> {
-    if env.in_txn {
-        return refuse(
-            "25001",
-            "ALTER TABLE cannot run inside a transaction block: DDL is not transactional here",
-        );
-    }
     let Some(executor) = env.executor else {
         return refuse(
             "0A000",
@@ -264,7 +337,9 @@ pub(crate) async fn execute_alter_table(
     };
     let keyspace = stmt.table.schema.as_deref().unwrap_or(env.default_schema);
     let key = (keyspace.to_string(), stmt.table.table.clone());
-    let Some(meta) = env.schema.snapshot().tables.get(&key).cloned() else {
+    // Owned: the view is a shared snapshot, and the ALTER paths below read `meta` while the
+    // executor may replace that snapshot (a buffered step copies it on write).
+    let Some(meta) = env.view.tables.get(&key).cloned() else {
         return refuse(
             "42P01",
             &format!("relation \"{}\" does not exist", stmt.table.table),
@@ -276,7 +351,7 @@ pub(crate) async fn execute_alter_table(
             execute_add_primary_key(executor, keyspace, &meta, columns).await
         }
         AlterOperation::AddForeignKey(fk) => {
-            execute_add_foreign_key(executor, keyspace, &meta, fk, env.schema).await
+            execute_add_foreign_key(executor, keyspace, &meta, fk, &env.view).await
         }
         AlterOperation::AddColumn(def) => {
             if is_reserved_column_name(&def.name) {
@@ -451,7 +526,7 @@ async fn execute_add_foreign_key(
     keyspace: &str,
     child: &TableMetadata,
     fk: &ferrosa_sql::ForeignKeyConstraint,
-    schema: &Schema,
+    view: &SchemaSnapshot,
 ) -> Vec<BackendMessage> {
     // ferrosa secondary indexes cover a single column (`build_replicated_index` uses
     // `target_columns.first()`), so a multi-column constraint cannot be enforced as a lookup.
@@ -479,7 +554,7 @@ async fn execute_add_foreign_key(
     // The parent is resolved in the child's keyspace unless the statement qualified it.
     let parent_keyspace = fk.parent.schema.as_deref().unwrap_or(keyspace);
     let parent_key = (parent_keyspace.to_string(), fk.parent.table.clone());
-    let Some(parent) = schema.snapshot().tables.get(&parent_key).cloned() else {
+    let Some(parent) = view.tables.get(&parent_key) else {
         return refuse(
             "42P01",
             &format!("relation \"{}\" does not exist", fk.parent.table),
@@ -489,7 +564,7 @@ async fn execute_add_foreign_key(
     // No referenced-column list defaults to the parent's primary key, exactly as PostgreSQL does.
     let parent_columns = match &fk.parent_columns {
         Some(columns) => columns.clone(),
-        None => crate::pg_key::of(&parent),
+        None => crate::pg_key::of(parent),
     };
     if parent_columns.is_empty() {
         return refuse(
@@ -525,7 +600,7 @@ async fn execute_add_foreign_key(
     // The referenced column must be the parent's key: a point read when it is the storage key,
     // otherwise the `<parent>_pkey` secondary index. A non-key column would need a per-check
     // scan, which is not a lookup and is refused by name rather than recorded.
-    if crate::pg_key::of(&parent) != parent_columns {
+    if crate::pg_key::of(parent) != parent_columns {
         return refuse(
             "0A000",
             &format!(
@@ -592,12 +667,6 @@ pub(crate) async fn execute_create_table(
     env: DdlEnv<'_>,
     stmt: &CreateTableStmt,
 ) -> Vec<BackendMessage> {
-    if env.in_txn {
-        return refuse(
-            "25001",
-            "CREATE TABLE cannot run inside a transaction block: DDL is not transactional here",
-        );
-    }
     let Some(executor) = env.executor else {
         return refuse(
             "0A000",
@@ -607,10 +676,10 @@ pub(crate) async fn execute_create_table(
     // Authorization (CREATE on the keyspace) already ran at dispatch in
     // `authz::statement_permissions`, before this function is reached.
     let keyspace = stmt.name.schema.as_deref().unwrap_or(env.default_schema);
-    if !env.schema.snapshot().keyspaces.contains_key(keyspace) {
+    if !env.view.keyspaces.contains_key(keyspace) {
         return refuse("3F000", &format!("schema \"{keyspace}\" does not exist"));
     }
-    if let Some(reply) = existing_table_reply(env.schema, keyspace, stmt) {
+    if let Some(reply) = existing_table_reply(&env.view, keyspace, stmt) {
         return reply;
     }
     let table = match plan_create_table(stmt, keyspace) {
@@ -623,7 +692,7 @@ pub(crate) async fn execute_create_table(
     match executor.create_table(table).await {
         Ok(()) => complete(),
         // A concurrent CREATE can win between the check above and the apply.
-        Err(error) => existing_table_reply(env.schema, keyspace, stmt)
+        Err(error) => existing_table_reply(&env.schema.snapshot(), keyspace, stmt)
             .unwrap_or_else(|| refuse("58000", &format!("CREATE TABLE failed: {error}"))),
     }
 }
@@ -639,12 +708,6 @@ pub(crate) async fn execute_drop_table(
     env: DdlEnv<'_>,
     stmt: &DropTableStatement,
 ) -> Vec<BackendMessage> {
-    if env.in_txn {
-        return refuse(
-            "25001",
-            "DROP TABLE cannot run inside a transaction block: DDL is not transactional here",
-        );
-    }
     let Some(executor) = env.executor else {
         return refuse(
             "0A000",
@@ -656,7 +719,7 @@ pub(crate) async fn execute_drop_table(
     for target in &stmt.tables {
         let keyspace = target.schema.as_deref().unwrap_or(env.default_schema);
         let key = (keyspace.to_string(), target.table.clone());
-        if !env.schema.snapshot().tables.contains_key(&key) {
+        if !env.view.tables.contains_key(&key) {
             if stmt.if_exists {
                 continue; // PostgreSQL: missing table is a no-op under IF EXISTS.
             }
@@ -680,12 +743,12 @@ pub(crate) async fn execute_drop_table(
 /// `Some(reply)` when the table already exists: success under `IF NOT EXISTS`,
 /// `42P07` otherwise.
 fn existing_table_reply(
-    schema: &Schema,
+    view: &SchemaSnapshot,
     keyspace: &str,
     stmt: &CreateTableStmt,
 ) -> Option<Vec<BackendMessage>> {
     let key = (keyspace.to_string(), stmt.name.table.clone());
-    if !schema.snapshot().tables.contains_key(&key) {
+    if !view.tables.contains_key(&key) {
         return None;
     }
     Some(if stmt.if_not_exists {

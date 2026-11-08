@@ -20,6 +20,7 @@ pub mod connection;
 pub mod copy_decode;
 mod copy_stdin;
 pub mod ddl;
+mod ddl_txn;
 pub mod extended;
 pub mod handshake;
 pub mod jsonb_wire;

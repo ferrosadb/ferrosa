@@ -1666,31 +1666,10 @@ async fn execute_statement(
             "0A000",
             "SET/RESET session statements are not yet implemented",
         )],
-        // DDL (T-132a): through the same schema-change path CQL DDL uses.
-        Statement::CreateTable(create) => {
-            crate::ddl::execute_create_table(
-                crate::ddl::DdlEnv {
-                    executor: ddl,
-                    schema,
-                    default_schema,
-                    in_txn: txn.is_some(),
-                },
-                &create,
-            )
-            .await
-        }
-        // DROP TABLE: pgbench -i's reset step. Same schema-change path.
-        Statement::DropTable(drop) => {
-            crate::ddl::execute_drop_table(
-                crate::ddl::DdlEnv {
-                    executor: ddl,
-                    schema,
-                    default_schema,
-                    in_txn: txn.is_some(),
-                },
-                &drop,
-            )
-            .await
+        // DDL (T-132a): through the same schema-change path CQL DDL uses — applied now in
+        // autocommit, buffered until COMMIT inside a transaction block (`ddl_txn`).
+        stmt @ (Statement::CreateTable(_) | Statement::DropTable(_) | Statement::AlterTable(_)) => {
+            crate::ddl::execute_ddl_statement(ddl, schema, default_schema, stmt, txn).await
         }
         // `COPY ... FROM STDIN` cannot be answered in one step: the payload arrives AFTER the
         // acknowledgement, as `CopyData` frames, so the connection loop drives it. Reaching here
@@ -1700,20 +1679,6 @@ async fn execute_statement(
             "0A000",
             "COPY FROM STDIN must be driven by the connection loop, not answered directly",
         )],
-        // ALTER TABLE: the step pgbench -i runs right after creating its tables without a key.
-        // Same schema-change path.
-        Statement::AlterTable(alter) => {
-            crate::ddl::execute_alter_table(
-                crate::ddl::DdlEnv {
-                    executor: ddl,
-                    schema,
-                    default_schema,
-                    in_txn: txn.is_some(),
-                },
-                &alter,
-            )
-            .await
-        }
         // TRUNCATE [TABLE] t [, ...]: a normal replicated WRITE of a table-level
         // tombstone (ferrosa_storage::table_tombstone), through the SAME seam as an
         // INSERT/UPDATE/DELETE. That makes the statement transactional — it buffers
@@ -7517,8 +7482,8 @@ mod txn_buffer_tests {
             crate::ddl::DdlEnv {
                 executor: Some(ddl),
                 schema,
+                view: schema.snapshot(),
                 default_schema: "public",
-                in_txn: false,
             },
             &stmt,
         )

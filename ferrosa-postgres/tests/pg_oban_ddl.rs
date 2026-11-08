@@ -91,6 +91,7 @@ fn engine_config(dir: &Path) -> StorageEngineConfig {
 
 struct Fixture {
     client: Client,
+    port: u16,
     schema: Arc<Schema>,
     _dir: tempfile::TempDir,
 }
@@ -112,6 +113,11 @@ async fn connect(port: u16) -> Client {
         }
     });
     client
+}
+
+/// A second connection to the fixture's server.
+async fn connect_to(fx: &Fixture) -> Client {
+    connect(fx.port).await
 }
 
 fn public_keyspace() -> KeyspaceMetadata {
@@ -172,6 +178,7 @@ async fn start() -> Fixture {
     let client = connect(port).await;
     Fixture {
         client,
+        port,
         schema,
         _dir: dir,
     }
@@ -257,4 +264,143 @@ async fn extended_ddl_refuses_a_parameter() {
     let error = code(fx.client.prepare("DROP TABLE $1").await);
     assert_eq!(error, "42601");
     assert!(!table_exists(&fx, "schema_migrations"));
+}
+
+// ---------------------------------------------------------------------------
+// 2. Transactional DDL (census statements 4–7 and every migration)
+// ---------------------------------------------------------------------------
+
+fn columns_of(fx: &Fixture, table: &str) -> Vec<String> {
+    fx.schema
+        .snapshot()
+        .tables
+        .get(&("public".to_string(), table.to_string()))
+        .map(|meta| meta.columns.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// DDL inside BEGIN is buffered: later statements in the block see it, the committed
+/// schema does not change until COMMIT, and COMMIT applies the batch in order.
+#[tokio::test]
+async fn ddl_inside_a_transaction_is_buffered_until_commit() {
+    let fx = start().await;
+    let c = &fx.client;
+    c.batch_execute("BEGIN").await.expect("BEGIN");
+    c.batch_execute("CREATE TABLE jobs (id bigint PRIMARY KEY, queue text)")
+        .await
+        .expect("CREATE TABLE inside a transaction");
+    // The next statement sees the buffered table: IF NOT EXISTS is satisfied by it ...
+    c.batch_execute("CREATE TABLE IF NOT EXISTS jobs (id bigint PRIMARY KEY)")
+        .await
+        .expect("IF NOT EXISTS sees the buffered table");
+    // ... and an ALTER of it plans against the buffered definition (extended protocol).
+    c.execute("ALTER TABLE jobs ADD COLUMN worker text", &[])
+        .await
+        .expect("ALTER of a table created earlier in the block");
+    assert!(
+        !table_exists(&fx, "jobs"),
+        "nothing reaches the committed schema before COMMIT"
+    );
+    c.batch_execute("COMMIT").await.expect("COMMIT");
+    assert_eq!(columns_of(&fx, "jobs"), vec!["id", "queue", "worker"]);
+    // The applied table is usable after COMMIT.
+    c.batch_execute("INSERT INTO jobs (id, queue, worker) VALUES (1, 'default', 'W')")
+        .await
+        .expect("insert into the committed table");
+}
+
+/// A statement planned against the buffered schema is refused when the buffered schema
+/// refuses it: a second CREATE of the same table in one block is 42P07.
+#[tokio::test]
+async fn buffered_ddl_is_checked_against_the_buffered_schema() {
+    let fx = start().await;
+    let c = &fx.client;
+    c.batch_execute("BEGIN").await.unwrap();
+    c.batch_execute("CREATE TABLE twice (id int PRIMARY KEY)")
+        .await
+        .unwrap();
+    assert_eq!(
+        code(
+            c.batch_execute("CREATE TABLE twice (id int PRIMARY KEY)")
+                .await
+        ),
+        "42P07"
+    );
+    // The failure aborted the block: COMMIT is a ROLLBACK and applies nothing.
+    c.batch_execute("COMMIT").await.unwrap();
+    assert!(!table_exists(&fx, "twice"));
+}
+
+/// ROLLBACK applies none of the buffered DDL.
+#[tokio::test]
+async fn rollback_discards_buffered_ddl() {
+    let fx = start().await;
+    let c = &fx.client;
+    c.batch_execute("CREATE TABLE kept (id int PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.batch_execute("BEGIN").await.unwrap();
+    c.batch_execute("CREATE TABLE dropped_by_rollback (id int PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.execute("ALTER TABLE kept ADD COLUMN extra text", &[])
+        .await
+        .unwrap();
+    c.batch_execute("ROLLBACK").await.unwrap();
+    assert!(!table_exists(&fx, "dropped_by_rollback"));
+    assert_eq!(columns_of(&fx, "kept"), vec!["id"]);
+}
+
+/// The batch was planned against the schema as it stood when each statement ran. If a
+/// concurrent session changed that schema before COMMIT, the plan no longer holds: COMMIT
+/// is refused with 40001 and applies NONE of the batch.
+#[tokio::test]
+async fn commit_refuses_a_batch_a_concurrent_change_invalidated() {
+    let fx = start().await;
+    let other = connect_to(&fx).await;
+    let c = &fx.client;
+    c.batch_execute("BEGIN").await.unwrap();
+    c.batch_execute("CREATE TABLE first_in_batch (id int PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.batch_execute("CREATE TABLE contested (id int PRIMARY KEY)")
+        .await
+        .unwrap();
+    other
+        .batch_execute("CREATE TABLE contested (id int PRIMARY KEY, other text)")
+        .await
+        .expect("the concurrent session creates the same table first");
+    assert_eq!(code(c.batch_execute("COMMIT").await), "40001");
+    assert!(
+        !table_exists(&fx, "first_in_batch"),
+        "a refused batch applies nothing, not even the steps before the conflict"
+    );
+    assert_eq!(columns_of(&fx, "contested"), vec!["id", "other"]);
+}
+
+/// An extended-protocol pipeline is an implicit transaction: DDL in it is applied at Sync,
+/// together with the pipeline's other statements.
+#[tokio::test]
+async fn extended_pipeline_ddl_is_applied_at_sync() {
+    let fx = start().await;
+    fx.client
+        .execute("CREATE TABLE piped (id int PRIMARY KEY)", &[])
+        .await
+        .expect("pipeline DDL");
+    assert!(table_exists(&fx, "piped"));
+}
+
+/// DML inside the block runs against the COMMITTED schema: a table created earlier in the
+/// same block does not exist for it yet. That is refused loudly, never written somewhere.
+#[tokio::test]
+async fn dml_against_a_table_created_in_the_same_block_is_refused() {
+    let fx = start().await;
+    let c = &fx.client;
+    c.batch_execute("BEGIN").await.unwrap();
+    c.batch_execute("CREATE TABLE not_yet (id int PRIMARY KEY)")
+        .await
+        .unwrap();
+    let error = code(c.batch_execute("INSERT INTO not_yet (id) VALUES (1)").await);
+    assert_eq!(error, "42P01");
+    c.batch_execute("ROLLBACK").await.unwrap();
 }
