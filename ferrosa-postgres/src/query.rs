@@ -1339,26 +1339,10 @@ fn resolve_casts_in_scalar(
 ) -> Result<(), BackendMessage> {
     use ferrosa_sql::ScalarExpr;
     if let ScalarExpr::Cast { expr: inner, ty } = expr {
-        if is_regclass_type(ty) {
-            let value =
-                match &mut **inner {
-                    ScalarExpr::Literal(v) => v.clone(),
-                    ScalarExpr::Param(n) => {
-                        eval_cast_term(&Term::Param(*n), params, schema, default_schema)?
-                    }
-                    other => {
-                        resolve_casts_in_scalar(other, params, schema, default_schema)?;
-                        match other {
-                            ScalarExpr::Literal(v) => v.clone(),
-                            _ => return Err(error_response(
-                                "0A000",
-                                "a ::regclass cast of a non-constant expression is not supported",
-                            )),
-                        }
-                    }
-                };
-            let oid = apply_cast(&value, CastTarget::Regclass, schema, default_schema)?;
-            *expr = ScalarExpr::Literal(oid);
+        let kind = catalog_cast_kind(ty);
+        if let Some(kind) = kind {
+            let value = constant_operand(inner, kind.label(), params, schema, default_schema)?;
+            *expr = ScalarExpr::Literal(apply_catalog_cast(&value, kind, schema, default_schema)?);
             return Ok(());
         }
     }
@@ -1368,13 +1352,104 @@ fn resolve_casts_in_scalar(
     )
 }
 
-fn is_regclass_type(ty: &ferrosa_sql::TypeName) -> bool {
-    !ty.array
-        && ty.name.eq_ignore_ascii_case("regclass")
-        && ty
-            .schema
-            .as_deref()
-            .is_none_or(|s| s.eq_ignore_ascii_case("pg_catalog"))
+/// A cast whose meaning lives in the catalog, resolved here before planning.
+enum CatalogCast {
+    Regclass,
+    Regnamespace,
+    /// A user-defined type, `schema.name` (an enum, the only kind that exists).
+    UserType {
+        keyspace: String,
+        name: String,
+    },
+}
+
+impl CatalogCast {
+    fn label(&self) -> &str {
+        match self {
+            CatalogCast::Regclass => "regclass",
+            CatalogCast::Regnamespace => "regnamespace",
+            CatalogCast::UserType { name, .. } => name,
+        }
+    }
+}
+
+fn catalog_cast_kind(ty: &ferrosa_sql::TypeName) -> Option<CatalogCast> {
+    let pg_catalog = ty
+        .schema
+        .as_deref()
+        .is_none_or(|s| s.eq_ignore_ascii_case("pg_catalog"));
+    if ty.array {
+        return None;
+    }
+    if pg_catalog && ty.name.eq_ignore_ascii_case("regclass") {
+        return Some(CatalogCast::Regclass);
+    }
+    if pg_catalog && ty.name.eq_ignore_ascii_case("regnamespace") {
+        return Some(CatalogCast::Regnamespace);
+    }
+    match &ty.schema {
+        Some(ks) if !pg_catalog => Some(CatalogCast::UserType {
+            keyspace: ks.trim_matches('"').to_string(),
+            name: ty.name.trim_matches('"').to_string(),
+        }),
+        _ => None,
+    }
+}
+
+/// The constant a catalog cast applies to: a literal, a bound `$n`, or a nested
+/// cast that resolves to one. Anything per-row is refused (0A000).
+fn constant_operand(
+    inner: &mut ferrosa_sql::ScalarExpr,
+    label: &str,
+    params: &[SqlValue],
+    schema: &Schema,
+    default_schema: &str,
+) -> Result<SqlValue, BackendMessage> {
+    use ferrosa_sql::ScalarExpr;
+    match inner {
+        ScalarExpr::Literal(v) => Ok(v.clone()),
+        ScalarExpr::Param(n) => eval_cast_term(&Term::Param(*n), params, schema, default_schema),
+        other => {
+            resolve_casts_in_scalar(other, params, schema, default_schema)?;
+            match other {
+                ScalarExpr::Literal(v) => Ok(v.clone()),
+                _ => Err(error_response(
+                    "0A000",
+                    &format!("a ::{label} cast of a non-constant expression is not supported"),
+                )),
+            }
+        }
+    }
+}
+
+fn apply_catalog_cast(
+    value: &SqlValue,
+    kind: CatalogCast,
+    schema: &Schema,
+    default_schema: &str,
+) -> Result<SqlValue, BackendMessage> {
+    match (kind, value) {
+        (_, SqlValue::Null) => Ok(SqlValue::Null),
+        (CatalogCast::Regclass, _) => {
+            apply_cast(value, CastTarget::Regclass, schema, default_schema)
+        }
+        (CatalogCast::Regnamespace, SqlValue::Text(name)) => {
+            crate::catalog::resolve_regnamespace(schema, name)
+                .map(|oid| SqlValue::Int(i64::from(oid)))
+                .ok_or_else(|| {
+                    error_response("3F000", &format!("schema \"{name}\" does not exist"))
+                })
+        }
+        (CatalogCast::UserType { keyspace, name }, SqlValue::Text(text)) => {
+            // An enum value is stored and compared as its label text.
+            crate::pg_enum::cast_text_to_enum(&schema.snapshot(), &keyspace, &name, text)
+                .map(|label| SqlValue::Text(label.into()))
+        }
+        (kind, other) => Err(error_response(
+            "42846",
+            &format!("cannot cast {other:?} to {}", kind.label()),
+        )),
+    }
 }
 
 fn resolve_casts_in_expr(

@@ -597,29 +597,6 @@ async fn comment_refusals_are_named() {
     );
 }
 
-/// Census statement 8 reads the comment with `obj_description(oid, 'pg_class')`, a function
-/// call in a projection plus a LEFT JOIN: that needs W1's expression engine. Until W1
-/// merges it is refused loudly, never answered with an empty or wrong row. This test pins
-/// that refusal; W1's merge replaces it with the real answer ('12').
-#[tokio::test]
-async fn obj_description_awaits_the_expression_engine() {
-    let fx = start().await;
-    create_jobs(&fx.client).await;
-    fx.client
-        .batch_execute("COMMENT ON TABLE oban_jobs IS '12'")
-        .await
-        .unwrap();
-    let census_8 = "SELECT pg_catalog.obj_description(pg_class.oid, 'pg_class') FROM pg_class \
-         LEFT JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace \
-         WHERE pg_class.relname = 'oban_jobs' AND pg_namespace.nspname = 'public'";
-    let error = fx
-        .client
-        .simple_query(census_8)
-        .await
-        .expect_err("refused until W1 lands function calls in projections");
-    assert!(error.code().is_some(), "a typed SQLSTATE: {error:?}");
-}
-
 // ---------------------------------------------------------------------------
 // 10. pg_range (Postgrex's type bootstrap joins it; census statements 1, 53, 56)
 // ---------------------------------------------------------------------------
@@ -1323,5 +1300,84 @@ async fn array_columns_round_trip() {
                 .await
         ),
         "22P02"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Integration (W1 × W3): catalog casts the engine resolves through the front end
+// ---------------------------------------------------------------------------
+
+/// `'x'::"public".enum_type` validates the label; `'public'::regnamespace::oid` is
+/// the namespace OID pg_type reports; an unknown type is 42704; a non-label 22P02.
+#[tokio::test]
+async fn enum_and_regnamespace_casts_resolve_through_the_catalog() {
+    let fx = enum_fixture().await;
+    assert_eq!(
+        rows(&fx.client, "SELECT 'available'::\"public\".oban_job_state").await,
+        vec![vec![Some("available".to_string())]]
+    );
+    assert_eq!(
+        code(
+            fx.client
+                .batch_execute("SELECT 'bogus'::\"public\".oban_job_state")
+                .await
+        ),
+        "22P02"
+    );
+    assert_eq!(
+        code(
+            fx.client
+                .batch_execute("SELECT 'a'::\"public\".no_such_type")
+                .await
+        ),
+        "42704"
+    );
+    // The census DO block's existence check, verbatim.
+    assert_eq!(
+        rows(
+            &fx.client,
+            "SELECT 1 FROM pg_type WHERE typname = 'oban_job_state' \
+             AND typnamespace = 'public'::regnamespace::oid"
+        )
+        .await,
+        vec![vec![Some("1".to_string())]]
+    );
+    // An enum literal in a WHERE over the enum column.
+    fx.client
+        .batch_execute("INSERT INTO jobs (id, state) VALUES (1, 'scheduled')")
+        .await
+        .expect("insert");
+    assert_eq!(
+        rows(
+            &fx.client,
+            "SELECT id FROM jobs WHERE state IN ('available'::\"public\".oban_job_state, \
+             'scheduled'::\"public\".oban_job_state)"
+        )
+        .await,
+        vec![vec![Some("1".to_string())]]
+    );
+}
+
+/// Ecto's migration-version read: obj_description over pg_description, verbatim.
+#[tokio::test]
+async fn obj_description_reads_the_table_comment() {
+    let fx = start().await;
+    fx.client
+        .batch_execute("CREATE TABLE oban_jobs (id bigint PRIMARY KEY)")
+        .await
+        .expect("create");
+    fx.client
+        .batch_execute("COMMENT ON TABLE \"public\".oban_jobs IS '12'")
+        .await
+        .expect("comment");
+    assert_eq!(
+        rows(
+            &fx.client,
+            "SELECT pg_catalog.obj_description(pg_class.oid, 'pg_class') FROM pg_class \
+             LEFT JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace \
+             WHERE pg_class.relname = 'oban_jobs' AND pg_namespace.nspname = 'public'"
+        )
+        .await,
+        vec![vec![Some("12".to_string())]]
     );
 }
