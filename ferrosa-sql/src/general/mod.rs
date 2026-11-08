@@ -1044,6 +1044,17 @@ fn literal_type(v: &Value) -> Ty {
     }
 }
 
+/// Whether the engine implements a cast to `ty` (`::regclass` is the front end's).
+pub fn cast_type_supported(ty: &TypeName) -> bool {
+    let regclass = !ty.array
+        && ty.name.eq_ignore_ascii_case("regclass")
+        && ty
+            .schema
+            .as_deref()
+            .is_none_or(|s| s.eq_ignore_ascii_case("pg_catalog"));
+    regclass || cast_type(ty).is_ok()
+}
+
 /// The type a `::name` cast produces. A name outside this set is refused.
 fn cast_type(ty: &TypeName) -> Result<ColumnType, ExecError> {
     if let Some(schema) = &ty.schema {

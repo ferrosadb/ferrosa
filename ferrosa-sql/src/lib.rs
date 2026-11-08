@@ -35,6 +35,7 @@ pub use exec::{
     try_filter, try_project, AggFunc, AggSpec, AggregateError, CmpOp, Predicate, RowStream,
     SortDir, SortKey, TryRowStream,
 };
+pub use general::cast_type_supported;
 pub use parser::{parse, parse_statement, ParseError, MAX_EXPR_DEPTH};
 pub use plan::{
     describe, execute, execute_streaming, execute_with, infer_param_types, open_cursor, ExecError,

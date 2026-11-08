@@ -40,9 +40,9 @@ use ferrosa_common::timeuuid::is_synthetic_key_column;
 use ferrosa_common::{CqlType, CqlValue};
 use ferrosa_schema::{ColumnKind, Schema};
 use ferrosa_sql::{
-    parse_statement, ArithOp, CastTarget, Column, ColumnType, DeleteStmt, ExecError, Expr,
-    InsertStmt, MapCatalog, QueryResult, Returning, Row, ScalarItem, ScalarValue, SelectStmt,
-    SetExpr, Statement, Term, UpdateStmt, Value as SqlValue,
+    ArithOp, CastTarget, Column, ColumnType, DeleteStmt, ExecError, Expr, InsertStmt, MapCatalog,
+    QueryResult, Returning, Row, ScalarItem, ScalarValue, SelectStmt, SetExpr, Statement, Term,
+    UpdateStmt, Value as SqlValue,
 };
 use ferrosa_storage::{Mutation, StorageEngine};
 
@@ -1096,7 +1096,7 @@ pub(crate) async fn execute_query_streaming<O: ReplySink>(
     mut txn: Option<&mut TxnWriteSet>,
     out: &mut O,
 ) -> std::io::Result<Vec<BackendMessage>> {
-    let stmt = match parse_statement(sql) {
+    let stmt = match crate::catalog::parse_pg(sql) {
         Ok(stmt) => stmt,
         Err(e) => {
             return Ok(vec![error_response(
@@ -5399,7 +5399,8 @@ fn exact_point_lookup(
     limits: &ferrosa_jsonb::Limits,
 ) -> Option<crate::storage_provider::PointLookup> {
     use ferrosa_sql::{CmpOp, Expr, Operand, Term};
-    if select.join.is_some() {
+    // One relation only: a join, subquery or CTE reads others.
+    if select.tables().len() != 1 {
         return None;
     }
     let Expr::Compare {
@@ -5503,9 +5504,19 @@ pub(crate) async fn load_catalog_with_mvcc(
     // One slot per query: every provider records into it, and the query layer
     // takes it once after `execute` returns.
     let failure = ScanFailure::default();
-    let referenced: Vec<&ferrosa_sql::ast::TableRef> = std::iter::once(&stmt.from)
-        .chain(stmt.join.as_ref().map(|j| &j.table))
-        .collect();
+    // Every relation the statement reads, including joins, subqueries and CTE
+    // bodies, each once (a self-join names the same table twice).
+    let mut referenced: Vec<&ferrosa_sql::ast::TableRef> = Vec::new();
+    for t in stmt.tables() {
+        let same = |r: &&ferrosa_sql::ast::TableRef| {
+            r.table == t.table
+                && r.schema.as_deref().unwrap_or(default_schema)
+                    == t.schema.as_deref().unwrap_or(default_schema)
+        };
+        if !referenced.iter().any(same) {
+            referenced.push(t);
+        }
+    }
     // `pg_catalog.<relation>` is not stored: it is a projection built from the live
     // schema. Build the six catalog tables once when a referenced relation asks for
     // one, and serve each from that projection — an unresolvable column type is a
@@ -6782,7 +6793,7 @@ mod tests {
 
     /// Parse a no-`FROM` expression select the way the wire path does.
     fn parsed_scalar_items(sql: &str) -> Vec<ScalarItem> {
-        match parse_statement(sql) {
+        match ferrosa_sql::parse_statement(sql) {
             Ok(Statement::SelectExprs(items)) => items,
             other => panic!("`{sql}` must be an expression select, got {other:?}"),
         }
@@ -7539,7 +7550,7 @@ mod txn_buffer_tests {
     }
 
     fn alter(sql: &str) -> ferrosa_sql::AlterTableStmt {
-        match parse_statement(sql) {
+        match ferrosa_sql::parse_statement(sql) {
             Ok(Statement::AlterTable(a)) => *a,
             other => panic!("expected AlterTable, got {other:?}"),
         }
@@ -10324,6 +10335,108 @@ mod scalar_subquery_tests {
         })
     }
 
+    /// The DataRow cells of a reply, as text.
+    fn text_rows(messages: &[BackendMessage]) -> Vec<Vec<Option<String>>> {
+        messages
+            .iter()
+            .filter_map(|m| match m {
+                BackendMessage::DataRow { columns } => Some(
+                    columns
+                        .iter()
+                        .map(|c| c.as_ref().map(|b| String::from_utf8_lossy(b).into_owned()))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_general_select_runs_through_the_front_end() {
+        let (_dir, engine, schema) = new_engine();
+        seed(&engine, &schema, "pgbench_accounts", 3).await;
+        seed(&engine, &schema, "pgbench_tellers", 1).await;
+        let msgs = run(
+            &engine,
+            &schema,
+            "SELECT a.k, a.pad || '!', t.k FROM pgbench_accounts AS a \
+             LEFT JOIN pgbench_tellers AS t ON t.k = a.k \
+             WHERE a.k IN ('k0', 'k2') ORDER BY a.k",
+        )
+        .await;
+        assert_eq!(error_sqlstate(&msgs), None, "{msgs:?}");
+        let some = |s: &str| Some(s.to_string());
+        assert_eq!(
+            text_rows(&msgs),
+            vec![
+                vec![some("k0"), some("p!"), some("k0")],
+                vec![some("k2"), some("p!"), None],
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expression_error_reaches_the_client_with_its_sqlstate() {
+        let (_dir, engine, schema) = new_engine();
+        seed(&engine, &schema, "pgbench_accounts", 2).await;
+        let msgs = run(
+            &engine,
+            &schema,
+            "SELECT k FROM pgbench_accounts WHERE char_length(pad) / 0 > 1",
+        )
+        .await;
+        assert_eq!(error_sqlstate(&msgs).as_deref(), Some("22012"), "{msgs:?}");
+        let msgs = run(
+            &engine,
+            &schema,
+            "SELECT pad::nowhere FROM pgbench_accounts",
+        )
+        .await;
+        assert_eq!(error_sqlstate(&msgs).as_deref(), Some("0A000"), "{msgs:?}");
+    }
+
+    /// Postgrex's type bootstrap names `pg_type` and `pg_attribute` unqualified:
+    /// PostgreSQL searches `pg_catalog` first, and so must this front end.
+    #[tokio::test]
+    async fn unqualified_catalog_relations_resolve_in_pg_catalog() {
+        let (_dir, engine, schema) = new_engine();
+        let msgs = run(
+            &engine,
+            &schema,
+            "SELECT t.oid, t.typname, t.typsend, coalesce(d.typelem, t.typelem), ARRAY (
+               SELECT a.atttypid FROM pg_attribute AS a
+               WHERE a.attrelid = t.typrelid AND a.attnum > 0 AND NOT a.attisdropped
+               ORDER BY a.attnum)
+             FROM pg_type AS t LEFT JOIN pg_type AS d ON t.typbasetype = d.oid
+             WHERE (t.typrelid = 0)
+             AND (t.typelem = 0 OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_type s
+                  WHERE s.typrelid != 0 AND s.oid = t.typelem))
+             AND t.oid IN (23, 1007)",
+        )
+        .await;
+        assert_eq!(error_sqlstate(&msgs), None, "{msgs:?}");
+        let some = |s: &str| Some(s.to_string());
+        assert_eq!(
+            text_rows(&msgs),
+            vec![
+                vec![
+                    some("23"),
+                    some("int4"),
+                    some("int4send"),
+                    some("0"),
+                    some("{}")
+                ],
+                vec![
+                    some("1007"),
+                    some("_int4"),
+                    some("array_send"),
+                    some("23"),
+                    some("{}")
+                ],
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn pgbench_census_line_runs_end_to_end() {
         // The acceptance query: three `count(*)` scalar subqueries concatenated by
@@ -10375,7 +10488,7 @@ mod scalar_subquery_tests {
 
     /// Parse a single table `SELECT` for the agreement checks below.
     fn select_stmt(sql: &str) -> SelectStmt {
-        match parse_statement(sql).expect("parses") {
+        match ferrosa_sql::parse_statement(sql).expect("parses") {
             Statement::Select(stmt) => *stmt,
             other => panic!("expected a table SELECT, got {other:?}"),
         }

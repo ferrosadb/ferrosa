@@ -46,11 +46,12 @@ fn table(table: &TableRef, default_schema: &str) -> Resource {
 }
 
 fn select_reads(select: &SelectStmt, default_schema: &str) -> Vec<(Permission, Resource)> {
-    let mut required = vec![(Permission::Select, table(&select.from, default_schema))];
-    if let Some(join) = &select.join {
-        required.push((Permission::Select, table(&join.table, default_schema)));
-    }
-    required
+    // Every relation read: joins, subqueries and CTE bodies need SELECT too.
+    select
+        .tables()
+        .into_iter()
+        .map(|t| (Permission::Select, table(t, default_schema)))
+        .collect()
 }
 
 fn dml(target: &TableRef, returning: bool, default_schema: &str) -> Vec<(Permission, Resource)> {
