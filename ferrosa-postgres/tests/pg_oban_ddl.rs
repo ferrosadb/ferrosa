@@ -1392,4 +1392,3 @@ async fn enum_and_regnamespace_casts_resolve_through_the_catalog() {
         vec![vec![Some("1".to_string())]]
     );
 }
-
