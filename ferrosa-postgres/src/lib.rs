@@ -29,6 +29,7 @@ pub mod jsonb_wire;
 mod lock;
 pub mod messages;
 mod mvcc;
+mod pg_array;
 mod pg_constraint;
 mod pg_default;
 mod pg_enum;

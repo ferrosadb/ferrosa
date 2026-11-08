@@ -306,6 +306,8 @@ pub enum AlterOperation {
         column: String,
         ty: PgType,
         user_type: Option<TableRef>,
+        /// `T[]`.
+        array: bool,
     },
     /// `ALTER [COLUMN] c SET DEFAULT <expr>`, the expression as canonical SQL text.
     SetDefault { column: String, sql: String },
@@ -380,6 +382,8 @@ pub struct ColumnDef {
     /// with the general scalar grammar, so it is syntactically valid; never compare it
     /// byte-for-byte with what the client sent).
     pub default: Option<String>,
+    /// `T[]`: a one-dimensional array of `ty` (stored as a frozen CQL list).
+    pub array: bool,
     /// `bigserial` / `serial8`: `ty` is [`PgType::BigInt`] and the column's value, when an
     /// INSERT omits it, is a server-generated unique id (D15). `serial`/`smallserial` are
     /// refused at parse time (an id does not fit).

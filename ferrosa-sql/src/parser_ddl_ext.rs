@@ -495,6 +495,7 @@ impl Parser {
 
     fn parse_alter_column_type(&mut self, column: String) -> Result<AlterOperation, ParseError> {
         let (ty, user_type) = self.parse_column_type()?;
+        let array = self.parse_array_suffix()?;
         if self.peek_is_kw("USING") || self.peek_is_kw("COLLATE") {
             return Err(ParseError::UnsupportedAlter(
                 "ALTER COLUMN ... TYPE ... USING/COLLATE".into(),
@@ -504,6 +505,7 @@ impl Parser {
             column,
             ty,
             user_type,
+            array,
         })
     }
 

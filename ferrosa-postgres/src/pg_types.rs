@@ -235,6 +235,22 @@ pub fn for_column_type(ty: ColumnType) -> PgType {
 
 /// The engine column type a `CqlType` is carried as, and whether it is a text
 /// rendering of a composite.
+/// The array element type of a CQL list element, when the engine carries it.
+fn array_elem_of(t: &CqlType) -> Option<ArrayElem> {
+    Some(match t {
+        CqlType::Int | CqlType::Smallint | CqlType::Tinyint => ArrayElem::Int,
+        CqlType::Bigint => ArrayElem::BigInt,
+        CqlType::Varchar | CqlType::Ascii => ArrayElem::Text,
+        CqlType::Boolean => ArrayElem::Bool,
+        CqlType::Float | CqlType::Double => ArrayElem::Float,
+        CqlType::Uuid | CqlType::Timeuuid => ArrayElem::Uuid,
+        CqlType::Timestamp => ArrayElem::Timestamp,
+        CqlType::Decimal => ArrayElem::Numeric,
+        CqlType::Jsonb => ArrayElem::Jsonb,
+        _ => return None,
+    })
+}
+
 fn column_type_of(t: &CqlType) -> (ColumnType, bool) {
     match t {
         CqlType::Int | CqlType::Smallint | CqlType::Tinyint => (ColumnType::Int, false),
@@ -249,6 +265,11 @@ fn column_type_of(t: &CqlType) -> (ColumnType, bool) {
         CqlType::Inet => (ColumnType::Inet, false),
         CqlType::Decimal | CqlType::Varint => (ColumnType::Numeric, false),
         CqlType::Ascii | CqlType::Varchar => (ColumnType::Text, false),
+        // A frozen list is an array column (`pg_array`) when its element maps.
+        CqlType::List(inner) if array_elem_of(inner).is_some() => (
+            ColumnType::Array(array_elem_of(inner).unwrap_or(ArrayElem::Text)),
+            false,
+        ),
         CqlType::Duration
         | CqlType::List(_)
         | CqlType::Map(_, _)
@@ -318,6 +339,14 @@ pub fn cql_type_for_pg_name(name: &str) -> Result<CqlType, PgTypeError> {
         "numeric" | "decimal" => Ok(CqlType::Decimal),
         // D11: `json` has no verbatim text type; it is stored as jsonb.
         "jsonb" | "json" => Ok(CqlType::Jsonb),
+        // An array type (`_text`, `text[]`) is a list of its element (W3, `pg_array`).
+        _ if lower.starts_with('_') || lower.ends_with("[]") => {
+            let element = lower
+                .strip_prefix('_')
+                .or_else(|| lower.strip_suffix("[]"))
+                .unwrap_or_default();
+            cql_type_for_pg_name(element).map(|inner| CqlType::List(Box::new(inner)))
+        }
         _ => Err(PgTypeError::UnknownPgTypeName(name.to_string())),
     }
 }
@@ -410,6 +439,14 @@ mod tests {
                 assert!(!pg.text_rendered);
                 continue;
             }
+            // A list of a mappable element is an array column (W3, `pg_array`).
+            if let CqlType::List(inner) = &t {
+                if array_elem_of(inner).is_some() {
+                    assert!(!pg.text_rendered);
+                    assert!(matches!(pg.column_type, ColumnType::Array(_)), "{t:?}");
+                    continue;
+                }
+            }
             assert_eq!(pg.text_rendered, composite, "{t:?}");
             if composite {
                 assert_eq!((pg.oid, pg.column_type), (25, ColumnType::Text));
@@ -453,7 +490,10 @@ mod tests {
                 "{bad}: {err}"
             );
         }
+        // A frozen list of a mappable element is an array column (W3); a map stays rendered.
         let ok = pg_type_of_column("frozen<list<int>>", "ks", &schema).expect("resolves");
+        assert_eq!(ok.column_type, ColumnType::Array(ArrayElem::Int));
+        let ok = pg_type_of_column("frozen<map<text, int>>", "ks", &schema).expect("resolves");
         assert!(ok.text_rendered);
     }
 }

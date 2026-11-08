@@ -959,6 +959,7 @@ pub(crate) fn plan_create_table(
                 primary_key: true,
                 user_type: None,
                 default: None,
+                array: false,
                 serial: false,
             },
         );
@@ -1076,7 +1077,18 @@ fn schema_refusal(error: &ferrosa_schema::SchemaError) -> BackendMessage {
 }
 
 /// The CQL type string stored for `def`, through the one PG-name map (D10).
-pub(crate) fn cql_type_string(def: &ColumnDef) -> Result<&'static str, BackendMessage> {
+/// The CQL type of a column definition: its scalar type, or for `T[]` a frozen list of it
+/// (frozen, so the array is one cell and an empty array stays distinct from NULL).
+pub(crate) fn cql_type_string(def: &ColumnDef) -> Result<String, BackendMessage> {
+    let base = scalar_cql_type_string(def)?;
+    Ok(if def.array {
+        format!("frozen<list<{base}>>")
+    } else {
+        base.to_string()
+    })
+}
+
+fn scalar_cql_type_string(def: &ColumnDef) -> Result<&'static str, BackendMessage> {
     let cql = cql_type_for_pg_name(pg_type_name(def.ty)).map_err(|e| match e {
         PgTypeError::UnknownPgTypeName(name) => error_response(
             "42704",

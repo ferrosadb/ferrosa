@@ -1260,3 +1260,68 @@ async fn composite_partial_and_gin_indexes_are_recorded_not_built() {
         assert!(got == "0A000" || got == "42703", "{sql}: {got}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// 6. Array columns text[] / jsonb[] (census 10, 22, 28-29, 54)
+// ---------------------------------------------------------------------------
+
+/// `text[]`/`jsonb[]` columns store one-dimensional arrays: text literals (`'{a,b}'`,
+/// `'{}'`), binary array parameters, and an empty array that stays distinct from NULL.
+#[tokio::test]
+async fn array_columns_round_trip() {
+    let fx = start().await;
+    let c = &fx.client;
+    c.execute(
+        "CREATE TABLE arr (id int PRIMARY KEY, \"tags\" text[], \"errors\" jsonb[] NOT NULL)",
+        &[],
+    )
+    .await
+    .expect("array column types");
+    c.batch_execute(
+        "INSERT INTO arr (id, tags, errors) VALUES (1, '{a,\"b c\"}', '{}'), \
+         (2, NULL, '{\"{\\\"k\\\": 1}\"}')",
+    )
+    .await
+    .expect("array text literals");
+    assert_eq!(
+        rows(c, "SELECT tags, errors FROM arr WHERE id = 1").await,
+        vec![vec![
+            Some("{a,\"b c\"}".to_string()),
+            Some("{}".to_string())
+        ]]
+    );
+    assert_eq!(
+        rows(c, "SELECT tags FROM arr WHERE id = 2").await,
+        vec![vec![None]],
+        "NULL is not an empty array"
+    );
+    let tags = vec!["x", "y"];
+    c.execute(
+        "INSERT INTO arr (id, tags, errors) VALUES ($1, $2, '{}')",
+        &[&3_i32, &tags],
+    )
+    .await
+    .expect("a binary text[] parameter");
+    let row = c
+        .query_one("SELECT tags FROM arr WHERE id = 3", &[])
+        .await
+        .expect("binary text[] result");
+    assert_eq!(row.get::<_, Vec<String>>(0), vec!["x", "y"]);
+    // Census 22 and 29: ADD COLUMN ... text[], ALTER COLUMN ... TYPE text[] (same type).
+    c.execute(
+        "ALTER TABLE arr ADD COLUMN IF NOT EXISTS \"attempted_by\" text[]",
+        &[],
+    )
+    .await
+    .expect("ADD COLUMN text[]");
+    c.execute("ALTER TABLE arr ALTER COLUMN \"tags\" TYPE text[]", &[])
+        .await
+        .expect("same array type is a no-op");
+    assert_eq!(
+        code(
+            c.batch_execute("INSERT INTO arr (id, errors) VALUES (9, '{oops')")
+                .await
+        ),
+        "22P02"
+    );
+}
