@@ -45,6 +45,16 @@ in an `Arc<str>`, because a variable keeps its value while it is bound as a para
   slots; every fallible step returns the error result. Runtime errors share SQLSTATE and text
   with the interpreter (`messages`). `ferrosa-udf/tests/plpgsql_compiled.rs` runs both and
   compares results and host calls.
+- **Front-end statements** (`utility::parse_utility`): `DO [LANGUAGE plpgsql] 'body'`,
+  `CREATE [OR REPLACE] FUNCTION name([name] type, …) RETURNS type|trigger|void AS 'body'
+  LANGUAGE plpgsql [IMMUTABLE|STABLE|VOLATILE]`, `DROP FUNCTION [IF EXISTS] name[(types)]`,
+  `CREATE TRIGGER name AFTER INSERT|UPDATE [OF cols] [OR …] ON t FOR EACH ROW EXECUTE
+  PROCEDURE|FUNCTION f()`, `DROP TRIGGER [IF EXISTS] name ON t`, `LISTEN`, `UNLISTEN [*]`,
+  `NOTIFY ch [, 'payload']`, `SELECT pg_notify(a, b)` with literal or `$n` arguments. Any other
+  statement is `None` (the SQL engine's). Refused by name: other languages, `OUT`/`INOUT`/
+  `VARIADIC`, argument defaults, `SETOF`/`TABLE`, `STRICT`, `SECURITY`, `BEFORE`/`INSTEAD OF`,
+  `FOR EACH STATEMENT`, `DELETE`/`TRUNCATE` events, `WHEN`, trigger arguments, constraint
+  triggers, `CREATE OR REPLACE TRIGGER`, `CASCADE`.
 - **`testing::ScriptedHost`**: the recording host both runtimes are tested against.
 
 A compiled function allocates from a bump heap reclaimed after each call, so a `PERFORM`
