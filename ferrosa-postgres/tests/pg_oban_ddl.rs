@@ -619,3 +619,38 @@ async fn obj_description_awaits_the_expression_engine() {
         .expect_err("refused until W1 lands function calls in projections");
     assert!(error.code().is_some(), "a typed SQLSTATE: {error:?}");
 }
+
+// ---------------------------------------------------------------------------
+// 10. pg_range (Postgrex's type bootstrap joins it; census statements 1, 53, 56)
+// ---------------------------------------------------------------------------
+
+/// Ferrosa has no range types, so `pg_range` exists and is empty — the correct answer for
+/// Postgrex's `LEFT JOIN pg_range`, not a missing relation.
+#[tokio::test]
+async fn pg_range_exists_and_is_empty() {
+    let fx = start().await;
+    assert!(rows(
+        &fx.client,
+        "SELECT rngtypid, rngsubtype, rngmultitypid FROM pg_catalog.pg_range"
+    )
+    .await
+    .is_empty());
+    let prepared = fx
+        .client
+        .prepare("SELECT * FROM pg_catalog.pg_range")
+        .await
+        .expect("pg_range describes");
+    let names: Vec<&str> = prepared.columns().iter().map(|c| c.name()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "rngtypid",
+            "rngsubtype",
+            "rngmultitypid",
+            "rngcollation",
+            "rngsubopc",
+            "rngcanonical",
+            "rngsubdiff"
+        ]
+    );
+}

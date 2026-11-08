@@ -9,6 +9,8 @@
 //!   OID), `classoid` = 1259 (`pg_class`), `objsubid` = 0, `description`. A table's comment
 //!   is `COMMENT ON TABLE` ([`crate::ddl::COMMENT_EXTENSION`]); an empty comment is no
 //!   comment, as in PostgreSQL.
+//! * `pg_range` — always empty: Ferrosa has no range types. It exists because Postgrex's
+//!   type bootstrap `LEFT JOIN`s it, and a missing relation would fail every connect.
 //!
 //! Last revised: 2026-11-08
 
@@ -27,6 +29,7 @@ const PG_CLASS_OID: i64 = 1259;
 pub(crate) fn streamed_catalog_table(name: &str, schema: &Schema) -> Option<SharedTable> {
     match name {
         "pg_description" => Some(Arc::new(PgDescription::new(schema.snapshot()))),
+        "pg_range" => Some(Arc::new(PgRange::new())),
         _ => None,
     }
 }
@@ -109,5 +112,40 @@ impl Iterator for DescriptionRows {
             Value::Int(0),
             Value::Text(comment.to_string().into()),
         ]))
+    }
+}
+
+/// `pg_catalog.pg_range`: PostgreSQL's columns, and no rows (no range types exist).
+pub(crate) struct PgRange {
+    schema: RelSchema,
+}
+
+impl PgRange {
+    fn new() -> Self {
+        Self {
+            schema: RelSchema::new(vec![
+                Column::new("rngtypid", ColumnType::Int),
+                Column::new("rngsubtype", ColumnType::Int),
+                Column::new("rngmultitypid", ColumnType::Int),
+                Column::new("rngcollation", ColumnType::Int),
+                Column::new("rngsubopc", ColumnType::Int),
+                Column::new("rngcanonical", ColumnType::Text),
+                Column::new("rngsubdiff", ColumnType::Text),
+            ]),
+        }
+    }
+}
+
+impl TableProvider for PgRange {
+    fn schema(&self) -> &RelSchema {
+        &self.schema
+    }
+
+    fn count_all(&self) -> Option<Result<u64, String>> {
+        Some(Ok(0))
+    }
+
+    fn scan(&self) -> Box<dyn Iterator<Item = Row> + Send> {
+        Box::new(std::iter::empty())
     }
 }

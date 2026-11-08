@@ -29,7 +29,7 @@ executive_summary: >-
 
 | # | Statement shape | Needed by | Gap |
 |---|---|---|---|
-| 1 | Type bootstrap: `ARRAY(SELECT …)`, three-way `LEFT JOIN`, `coalesce`, `NOT EXISTS`, `OR` in a join condition, `pg_range` | Postgrex, every connect | Scalar subquery `ARRAY(…)`; more than one join; `NOT EXISTS`; `pg_range` projection |
+| 1 | Type bootstrap: `ARRAY(SELECT …)`, three-way `LEFT JOIN`, `coalesce`, `NOT EXISTS`, `OR` in a join condition, `pg_range` | Postgrex, every connect | Scalar subquery `ARRAY(…)`; more than one join; `NOT EXISTS` (W1); ~~`pg_range` projection~~ **Done (W3):** empty, streamed |
 | 2 | `CREATE TABLE IF NOT EXISTS … ` over the **extended** protocol | Ecto | ~~Extended-protocol `Parse` of DDL is refused~~ **Done (W3):** DDL prepares as `PreparedKind::Utility` |
 | 3 | DDL inside `BEGIN … COMMIT` | Ecto: every migration runs in a transaction | ~~`25001`~~ **Done (W3):** buffered, visible inside the block, replayed at `COMMIT` (`ddl_txn`; failure semantics in the crate README) |
 | 4 | `LOCK TABLE t IN SHARE UPDATE EXCLUSIVE MODE` | Ecto migration lock | ~~Not parsed~~ **Done (W3):** blocking on a standalone node, read-set conflict (`40001`) on a cluster (`lock`) |

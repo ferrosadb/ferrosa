@@ -865,6 +865,9 @@ needs the expression engine (W1) and is refused loudly until then
 (`obj_description_awaits_the_expression_engine` pins the refusal). Catalog relations are
 resolved only when qualified `pg_catalog.` today; unqualified resolution is W1's.
 
+`pg_catalog.pg_range` exists with PostgreSQL's columns and **no rows** — correct, since
+ferrosa has no range types — because Postgrex's type bootstrap `LEFT JOIN`s it.
+
 ### Extended-protocol transaction boundary
 
 Extended-protocol pipelines stage DML until `Sync` and commit the group as one atomic batch. An error rolls back preceding writes in that group, disconnect discards staging, and an explicit `BEGIN` remains open across `Sync`. Commit failures are reported before `ReadyForQuery`. Tests: `server::txn_atomicity_tests::extended_pipeline_*`.
