@@ -459,6 +459,30 @@ theorem omitted_without_default_is_null (cols : List Nat) (vals : Nat → V)
     fill cols vals dflt i = .null := by
   simp [fill, h, hd]
 
+/-! ## 5b. Assignment conversion never turns a value into NULL
+
+A `SET col = <text>` into a jsonb (or timestamp) column parses the text. Parsing either
+yields a value of the column's type or fails the statement (22P02). The bug this pins:
+the cast used to be refused outright; the rule is that it can never quietly yield NULL.
+-/
+
+/-- Convert a text value (`none` is SQL NULL) to a column type with `parse`. -/
+def assignText {J : Type} (parse : String → Option J) : Option String → Except Unit (Option J)
+  | none => .ok none
+  | some s => match parse s with
+    | some j => .ok (some j)
+    | none => .error ()
+
+theorem assign_null_is_null {J : Type} (parse : String → Option J) :
+    assignText parse none = .ok none := rfl
+
+theorem assign_never_nulls {J : Type} (parse : String → Option J) (s : String) :
+    assignText parse (some s) ≠ .ok none := by
+  simp only [assignText]
+  match h : parse s with
+  | none => simp
+  | some j => simp
+
 /-! ## 6. READ COMMITTED: re-check after ownership, fail on a concurrent change (D16) -/
 
 /-- Write `new` over a row read as `snap`, finding it now as `cur`: 40001 if it moved. -/

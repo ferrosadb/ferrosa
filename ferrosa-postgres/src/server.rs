@@ -743,6 +743,7 @@ async fn execute_simple_scoped<O: ReplySink>(
             | ferrosa_sql::Statement::Insert(_)
             | ferrosa_sql::Statement::Update(_)
             | ferrosa_sql::Statement::Delete(_)
+            | ferrosa_sql::Statement::Dml(_)
             // TRUNCATE is a replicated WRITE too. It MUST take this path, or an
             // autocommit TRUNCATE would bypass Accord entirely and write to LOCAL
             // storage only — a scope hole worse than the reserved key's RF subset.
@@ -1097,8 +1098,14 @@ async fn run_data_statement<O: ReplySink>(
         session.mark_txn_failed();
         return Ok(vec![error]);
     }
-    if let ferrosa_sql::Statement::Select(select) = stmt {
-        if let Err(error) = track_select_reads(ctx, session, select) {
+    let read = match stmt {
+        ferrosa_sql::Statement::Select(select) => Some(std::borrow::Cow::Borrowed(&**select)),
+        // A general UPDATE/DELETE reads every relation its read half reads.
+        ferrosa_sql::Statement::Dml(dml) => Some(std::borrow::Cow::Owned(dml.read_select())),
+        _ => None,
+    };
+    if let Some(read) = read {
+        if let Err(error) = track_select_reads(ctx, session, &read) {
             session.mark_txn_failed();
             return Ok(vec![error]);
         }
@@ -1538,7 +1545,7 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
 /// `RowDescription`/`NoData`; for a portal (`P`), reply a `RowDescription`/
 /// `NoData` under the portal's result formats. On any error, set the skip flag
 /// and reply a single `ErrorResponse`.
-async fn describe(
+pub(crate) async fn describe(
     ctx: &QueryContext,
     session: &mut Session,
     kind: u8,
@@ -1564,10 +1571,21 @@ async fn describe(
                 return vec![session.fail(denied)];
             }
             match parsed {
-                PreparedKind::Dml(_) => vec![session.fail(query::error_response(
-                    "0A000",
-                    "general UPDATE/DELETE is not executed yet",
-                ))],
+                PreparedKind::Dml(dml) => {
+                    match crate::dml_general::describe(ctx, &dml, &declared).await {
+                        Ok((param_oids, returning)) => {
+                            session.set_param_oids(name, param_oids.clone());
+                            vec![
+                                extended::parameter_description(&param_oids),
+                                match returning {
+                                    Some(columns) => extended::describe_statement_rows(&columns),
+                                    None => BackendMessage::NoData,
+                                },
+                            ]
+                        }
+                        Err(err) => vec![session.fail(err)],
+                    }
+                }
                 PreparedKind::Select(select) => {
                     // ParameterDescription: a driver (e.g. tokio-postgres) relies
                     // on this to serialize bound parameters. Use the
@@ -1694,10 +1712,15 @@ async fn describe(
                 return vec![session.fail(denied)];
             }
             match parsed {
-                PreparedKind::Dml(_) => vec![session.fail(query::error_response(
-                    "0A000",
-                    "general UPDATE/DELETE is not executed yet",
-                ))],
+                PreparedKind::Dml(dml) => {
+                    match crate::dml_general::describe(ctx, &dml, &[]).await {
+                        Ok((_, Some(columns))) => {
+                            vec![extended::describe_portal_rows(&columns, &result_formats)]
+                        }
+                        Ok((_, None)) => vec![BackendMessage::NoData],
+                        Err(err) => vec![session.fail(err)],
+                    }
+                }
                 PreparedKind::Select(select) => {
                     match describe_columns(ctx, session, &select).await {
                         Ok(columns) => {
@@ -1808,7 +1831,7 @@ async fn describe_columns(
 /// tail still to send (`CommandComplete`, `PortalSuspended`, or the
 /// `ErrorResponse` that ended a failed query). On any error, set the skip flag.
 /// (Does NOT emit `ReadyForQuery` — that follows `Sync`.)
-async fn execute_portal_to<O: ReplySink>(
+pub(crate) async fn execute_portal_to<O: ReplySink>(
     ctx: &QueryContext,
     session: &mut Session,
     portal_name: &str,
@@ -1846,6 +1869,7 @@ async fn execute_portal_scoped<O: ReplySink>(
                     | PreparedKind::Insert(_)
                     | PreparedKind::Update(_)
                     | PreparedKind::Delete(_)
+                    | PreparedKind::Dml(_)
             )
         });
     if session.in_txn() || ctx.accord.committer().is_none() || !is_data_statement {
@@ -1904,7 +1928,15 @@ async fn execute_portal_body<O: ReplySink>(
     if is_select {
         return execute_select_portal(ctx, session, portal_name, max_rows, out).await;
     }
-    let messages = execute_portal_inner(ctx, session, portal_name).await;
+    let general_dml = session
+        .portal(portal_name)
+        .and_then(|portal| session.statement(&portal.stmt_name))
+        .is_some_and(|stmt| matches!(&stmt.parsed, PreparedKind::Dml(_)));
+    let messages = if general_dml {
+        execute_dml_portal(ctx, session, portal_name, out).await?
+    } else {
+        execute_portal_inner(ctx, session, portal_name).await
+    };
     let succeeded = !messages
         .iter()
         .any(|m| matches!(m, BackendMessage::ErrorResponse { .. }));
@@ -1916,6 +1948,67 @@ async fn execute_portal_body<O: ReplySink>(
         session.finish(portal_name.to_string(), tag);
     }
     Ok(messages)
+}
+
+/// Execute a portal bound to a general `UPDATE`/`DELETE`: record its reads,
+/// then run it against the session's transaction. `RETURNING` rows stream to
+/// `out` after every write succeeded.
+async fn execute_dml_portal<O: ReplySink>(
+    ctx: &QueryContext,
+    session: &mut Session,
+    portal_name: &str,
+    out: &mut O,
+) -> std::io::Result<Vec<BackendMessage>> {
+    let Some(portal) = session.portal(portal_name) else {
+        return Ok(vec![session.fail(query::error_response(
+            "34000",
+            &format!("portal \"{portal_name}\" does not exist"),
+        ))]);
+    };
+    let (params, result_formats) = (portal.params.clone(), portal.result_formats.clone());
+    let parsed = session
+        .statement(&portal.stmt_name)
+        .map(|s| s.parsed.clone());
+    let Some(PreparedKind::Dml(dml)) = parsed else {
+        return Ok(vec![session.fail(query::error_response(
+            "26000",
+            "the portal's prepared statement is not a general UPDATE/DELETE",
+        ))]);
+    };
+    if let Err(denied) = authz::authorize(
+        &ctx.schema,
+        session.auth(),
+        &authz::prepared_permissions(&PreparedKind::Dml(dml.clone()), &ctx.default_schema),
+    ) {
+        session.mark_txn_failed();
+        return Ok(vec![session.fail(denied)]);
+    }
+    if let Some(error) = expired_transaction_error(ctx, session) {
+        session.mark_txn_failed();
+        return Ok(vec![session.fail(error)]);
+    }
+    if let Err(error) = track_select_reads(ctx, session, &dml.read_select()) {
+        session.mark_txn_failed();
+        return Ok(vec![session.fail(error)]);
+    }
+    let snapshot = read_snapshot(ctx, session);
+    let mut env = read_env(ctx, &snapshot);
+    env.timestamp_micros = session.timestamp_micros();
+    let run = crate::dml_general::DmlRun {
+        env,
+        params,
+        returning: query::ReturningOpts {
+            with_row_description: false,
+            result_formats: &result_formats,
+        },
+    };
+    let txn = if session.in_txn() {
+        Some(session.txn_writes_mut())
+    } else {
+        None
+    };
+    let msgs = crate::dml_general::execute_general_dml(run, &dml, txn, out).await?;
+    Ok(execute_dml(session, msgs))
 }
 
 /// The `SELECT` a portal is bound to, with its bound parameters.
@@ -2094,9 +2187,10 @@ async fn execute_portal_inner(
 
     let timestamp_micros = session.timestamp_micros();
     match parsed {
+        // Routed to `execute_dml_portal` before this point.
         PreparedKind::Dml(_) => vec![session.fail(query::error_response(
-            "0A000",
-            "general UPDATE/DELETE is not executed yet",
+            "XX000",
+            "internal error: a general UPDATE/DELETE portal reached the bounded path",
         ))],
         // Routed to `execute_select_portal` before this point.
         PreparedKind::Select(_) => vec![session.fail(query::error_response(

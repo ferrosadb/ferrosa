@@ -1121,6 +1121,14 @@ pub(crate) async fn execute_query_streaming<O: ReplySink>(
             )])
         }
     };
+    if let Statement::Dml(dml) = stmt {
+        let run = crate::dml_general::DmlRun {
+            env,
+            params: Vec::new(),
+            returning: ReturningOpts::simple(),
+        };
+        return crate::dml_general::execute_general_dml(run, &dml, txn, out).await;
+    }
     let Statement::Select(select) = stmt else {
         return Ok(execute_statement(env, stmt, txn).await);
     };
@@ -1676,9 +1684,10 @@ async fn execute_statement(
             "XX000",
             "internal error: a table SELECT reached the non-streaming path",
         )],
+        // Routed to `dml_general` by `execute_query_streaming`.
         Statement::Dml(_) => vec![error_response(
-            "0A000",
-            "general UPDATE/DELETE is not executed yet",
+            "XX000",
+            "internal error: a general UPDATE/DELETE reached the non-streaming path",
         )],
         // No-`FROM` expression query: `SELECT 1`, `SELECT version()`,
         // `SELECT (SELECT count(*) FROM t)`, etc.
@@ -1933,7 +1942,7 @@ async fn apply_or_buffer(
 /// per-transaction write-count refusal: the old `FERROSA_POSTGRES_MAX_TXN_WRITES`
 /// / SQLSTATE `53400` cap is gone (FMEA PG-12, PG-ACC-01). A write larger than
 /// the buffer SPILLS; it is never declined for being large.
-async fn apply_or_buffer_silent(
+pub(crate) async fn apply_or_buffer_silent(
     engine: &StorageEngine,
     schema: &Schema,
     mvcc: Option<&MvccManager>,
@@ -3841,7 +3850,7 @@ fn complete_tag(command: &str, rows: usize) -> Vec<BackendMessage> {
 }
 
 /// The current-micros timestamp a DML mutation is stamped with.
-fn dml_timestamp() -> i64 {
+pub(crate) fn dml_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
@@ -4187,7 +4196,7 @@ async fn delete_read_committed(
 
 /// Take local RC ownership before any property-dependent evaluation. Default
 /// lock waiting has no timeout; transaction lifetime is an independent bound.
-async fn own_row(
+pub(crate) async fn own_row(
     mvcc: Option<&MvccManager>,
     txn: Option<&mut TxnWriteSet>,
     id: uuid::Uuid,
@@ -4373,7 +4382,7 @@ async fn update_rows_by_predicate(
 }
 
 /// Build the storage mutation a resolved-row `DELETE` writes for ONE row.
-fn build_delete_mutation(
+pub(crate) fn build_delete_mutation(
     ks: &str,
     table: &str,
     pk_values: &[CqlValue],
@@ -4750,7 +4759,7 @@ pub(crate) async fn execute_update(
 /// The read is a normal point read of the row's storage, so the engine records it in
 /// the read set a serializable COMMIT validates — a concurrent writer of the same row
 /// fails that commit rather than silently losing this update.
-fn read_current_row_for_update(
+pub(crate) fn read_current_row_for_update(
     engine: &StorageEngine,
     schema: &Schema,
     ks: &str,

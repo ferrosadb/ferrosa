@@ -20,6 +20,9 @@ pub mod connection;
 pub mod copy_decode;
 mod copy_stdin;
 pub mod ddl;
+mod dml_general;
+#[cfg(test)]
+mod dml_general_tests;
 pub mod extended;
 pub mod handshake;
 pub mod jsonb_wire;

@@ -211,3 +211,14 @@ against ferrosa.
   scalar path cannot read is a general select over one empty row. Covers
   PL/pgSQL's `SELECT <expr>` with `$n` bindings (W4). Test:
   `plpgsql_expression_statements_evaluate`.
+
+## Found while building W2
+
+* **`'…'::jsonb` was refused as an impossible cast.** The general engine's cast had no
+  arm for text → jsonb, so `'{}'::jsonb` and a text literal assigned to a jsonb column
+  (`SET meta = '{}'`, Oban's `meta` DEFAULT) failed with 42846.
+  * Fixed (7e3ad2fa): the cast parses the text under the engine's jsonb limits, and
+    malformed JSON is 22P02, never NULL.
+  * Test: `general::eval::tests::text_casts_to_jsonb_by_parsing_it`, and
+    `dml_exec.rs` `a_text_literal_is_assigned_to_a_timestamp_or_jsonb_column`.
+  * Lean: `Dml.lean` `assign_never_nulls`.
