@@ -897,6 +897,17 @@ async fn execute_simple_inner<O: ReplySink>(
                 tag: "ROLLBACK".to_string(),
             }])
         }
+        // LOCK needs the session: it takes ownership held by the transaction.
+        ferrosa_sql::Statement::Lock(lock) => {
+            let msgs = crate::lock::lock_tables(ctx, session, &lock).await;
+            if msgs
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. }))
+            {
+                session.mark_txn_failed();
+            }
+            Ok(msgs)
+        }
         // Data + session statements: delegate to the stateless executor. (It
         // re-parses; cheap, and keeps the executor self-contained.) In an open
         // transaction, DML is BUFFERED into the session write-set instead of
@@ -1257,6 +1268,63 @@ async fn commit_txn_core(ctx: &QueryContext, session: &mut Session) -> Vec<Backe
         }];
     }
 
+    // Transactional DDL first: the row writes may target a table the batch creates. A
+    // refused or partially applied batch ends the transaction with its row writes unapplied.
+    let ddl_applied = match commit_ddl(ctx, session).await {
+        Ok(applied) => applied,
+        Err(error) => {
+            session.end_txn();
+            return vec![error];
+        }
+    };
+    let messages = commit_row_writes(ctx, session).await;
+    if ddl_applied > 0 {
+        return disclose_applied_ddl(messages, ddl_applied);
+    }
+    messages
+}
+
+/// Preflight and replay the block's buffered DDL (`ddl_txn::commit_batch`). Returns the
+/// number of schema changes applied.
+async fn commit_ddl(ctx: &QueryContext, session: &mut Session) -> Result<usize, BackendMessage> {
+    let batch = session.txn_writes_mut().take_ddl_batch();
+    if batch.is_empty() {
+        return Ok(0);
+    }
+    let Some(executor) = ctx.ddl.as_deref() else {
+        return Err(query::error_response(
+            "0A000",
+            "DDL is not available: this server has no schema-change path",
+        ));
+    };
+    crate::ddl_txn::commit_batch(executor, &ctx.schema, batch).await
+}
+
+/// The schema changes were applied before the row writes; if the row writes then failed,
+/// say that the schema changes stay applied rather than letting the error imply a full
+/// rollback.
+fn disclose_applied_ddl(mut messages: Vec<BackendMessage>, applied: usize) -> Vec<BackendMessage> {
+    for message in &mut messages {
+        if let BackendMessage::ErrorResponse { fields } = message {
+            for (kind, text) in fields.iter_mut() {
+                if *kind == b'M' {
+                    text.push_str(&format!(
+                        " (the transaction's {applied} schema change(s) WERE applied before its \
+                         row writes failed, and are not rolled back)"
+                    ));
+                }
+            }
+            tracing::error!(
+                applied,
+                "transaction row writes failed after its DDL was applied"
+            );
+        }
+    }
+    messages
+}
+
+/// Validate and commit the buffered row writes (the commit path before transactional DDL).
+async fn commit_row_writes(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMessage> {
     // The tables this transaction WROTE contribute a per-table WRITE WATERMARK to
     // the distributed commit, so a transaction that SCANNED one of them sees that
     // write even when the writer never read the table itself (FMEA CL-72). Read
@@ -1757,7 +1825,7 @@ async fn describe(
                         BackendMessage::NoData,
                     ]
                 }
-                PreparedKind::Utility(statement) => {
+                PreparedKind::Procedural(statement) => {
                     let param_oids = crate::procedural::param_oids(&statement, &declared);
                     // Stored on the statement and also described to the client.
                     session.set_param_oids(name, param_oids.clone());
@@ -1765,6 +1833,10 @@ async fn describe(
                         extended::parameter_description(&param_oids),
                         crate::procedural::describe(&statement),
                     ]
+                }
+                // DDL takes no parameters and returns no rows.
+                PreparedKind::Utility(_) => {
+                    vec![extended::parameter_description(&[]), BackendMessage::NoData]
                 }
             }
         }
@@ -1829,10 +1901,12 @@ async fn describe(
                         Err(err) => vec![session.fail(err)],
                     }
                 }
-                PreparedKind::Update(_) | PreparedKind::Delete(_) => {
+                PreparedKind::Update(_) | PreparedKind::Delete(_) | PreparedKind::Utility(_) => {
                     vec![BackendMessage::NoData]
                 }
-                PreparedKind::Utility(statement) => vec![crate::procedural::describe(&statement)],
+                PreparedKind::Procedural(statement) => {
+                    vec![crate::procedural::describe(&statement)]
+                }
             }
         }
         _ => vec![session.fail(query::error_response(
@@ -2026,7 +2100,8 @@ fn portal_select(
         | PreparedKind::Insert(_)
         | PreparedKind::Update(_)
         | PreparedKind::Delete(_)
-        | PreparedKind::Utility(_) => None,
+        | PreparedKind::Utility(_)
+        | PreparedKind::Procedural(_) => None,
     }
 }
 
@@ -2402,7 +2477,7 @@ async fn execute_portal_inner(
                 execute_dml_firing(ctx, session, &statement, &params, returning_opts, 0).await;
             execute_dml(session, msgs)
         }
-        PreparedKind::Utility(statement) => {
+        PreparedKind::Procedural(statement) => {
             let msgs = crate::procedural::execute(
                 ctx,
                 session,
@@ -2434,6 +2509,26 @@ async fn execute_portal_inner(
                 &params,
             )
             .await;
+            execute_dml(session, msgs)
+        }
+        // DDL over the extended protocol: the simple-query executor, inside the open
+        // transaction when there is one. A failure poisons the transaction like DML's.
+        PreparedKind::Utility(stmt) => {
+            if let ferrosa_sql::Statement::Lock(lock) = stmt.as_ref() {
+                let msgs = crate::lock::lock_tables(ctx, session, lock).await;
+                return execute_dml(session, msgs);
+            }
+            let snapshot = read_snapshot(ctx, session);
+            let mut env = read_env(ctx, &snapshot);
+            env.timestamp_micros = timestamp_micros;
+            // Inside any transaction — an explicit block or the pipeline's implicit one — the
+            // DDL is buffered and replayed at COMMIT / Sync (`ddl_txn`).
+            let txn = if session.in_txn() {
+                Some(session.txn_writes_mut())
+            } else {
+                None
+            };
+            let msgs = query::execute_utility(env, *stmt, txn).await;
             execute_dml(session, msgs)
         }
     }

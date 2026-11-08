@@ -529,40 +529,54 @@ impl Parser {
             self.next();
         }
         let table = self.parse_qualified_table()?;
-
-        let operation = if self.peek_is_kw("ADD") {
-            self.next(); // ADD
-            self.parse_alter_add()?
-        } else if self.peek_is_kw("DROP") {
-            self.next(); // DROP
-                         // `DROP COLUMN` and `DROP` are the same thing here; the keyword is optional in
-                         // Postgres. `DROP CONSTRAINT` is not implemented, and is caught by the ident check.
-            if self.peek_is_kw("COLUMN") {
-                self.next();
-            } else if !matches!(self.peek(), Some(Tok::Ident(_))) {
-                return Err(ParseError::UnsupportedAlter(
-                    "only DROP COLUMN is supported".into(),
-                ));
-            }
-            AlterOperation::DropColumn(self.ident()?)
-        } else if self.peek_is_kw("RENAME") {
-            return Err(ParseError::UnsupportedAlter(
-                "RENAME is not supported: ferrosa has no rename path".into(),
-            ));
-        } else if self.peek_is_kw("ALTER") {
-            return Err(ParseError::UnsupportedAlter(
-                "changing a column's type or default is not supported".into(),
-            ));
-        } else {
-            return Err(ParseError::UnsupportedAlter(
-                "expected ADD, DROP, RENAME or ALTER COLUMN".into(),
-            ));
-        };
-
+        let operation = self.parse_alter_action()?;
+        let mut rest = Vec::new();
+        while matches!(self.peek(), Some(Tok::Comma)) {
+            self.next();
+            rest.push(self.parse_alter_action()?);
+        }
+        self.expect_end()?;
         Ok(Statement::AlterTable(Box::new(AlterTableStmt {
             table,
             operation,
+            rest,
         })))
+    }
+
+    /// One action of `ALTER TABLE t …`.
+    fn parse_alter_action(&mut self) -> Result<AlterOperation, ParseError> {
+        if self.peek_is_kw("ADD") {
+            self.next(); // ADD
+            self.parse_alter_add()
+        } else if self.peek_is_kw("DROP") {
+            self.next(); // DROP
+            if self.peek_is_kw("CONSTRAINT") {
+                return self.parse_drop_constraint();
+            }
+            // `DROP COLUMN` and `DROP` are the same thing here; the keyword is optional.
+            if self.peek_is_kw("COLUMN") {
+                self.next();
+            } else if !matches!(self.peek(), Some(Tok::Ident(_) | Tok::QuotedIdent(_))) {
+                return Err(ParseError::UnsupportedAlter(
+                    "only DROP COLUMN and DROP CONSTRAINT are supported".into(),
+                ));
+            }
+            Ok(AlterOperation::DropColumn(self.ident()?))
+        } else if self.peek_is_kw("RENAME") {
+            Err(ParseError::UnsupportedAlter(
+                "RENAME is not supported: ferrosa has no rename path".into(),
+            ))
+        } else if self.peek_is_kw("ALTER") {
+            self.next(); // ALTER
+            self.parse_alter_column()
+        } else if self.peek_is_kw("SET") {
+            self.next(); // SET
+            self.parse_alter_set()
+        } else {
+            Err(ParseError::UnsupportedAlter(
+                "expected ADD, DROP, ALTER COLUMN or SET".into(),
+            ))
+        }
     }
 
     /// The clause after `ALTER TABLE t ADD`.
@@ -575,7 +589,13 @@ impl Parser {
             if self.peek_is_kw("FOREIGN") {
                 return self.parse_add_foreign_key(Some(name));
             }
+            if self.peek_is_kw("CHECK") {
+                return self.parse_add_check(Some(name));
+            }
             return self.parse_add_primary_key();
+        }
+        if self.peek_is_kw("CHECK") {
+            return self.parse_add_check(None);
         }
         if self.peek_is_kw("FOREIGN") {
             return self.parse_add_foreign_key(None);
@@ -587,12 +607,14 @@ impl Parser {
         // pgbench-style DDL and most ORMs emit.
         if self.peek_is_kw("COLUMN") {
             self.next();
-        } else if !matches!(self.peek(), Some(Tok::Ident(_))) {
+        } else if !matches!(self.peek(), Some(Tok::Ident(_) | Tok::QuotedIdent(_))) {
             return Err(ParseError::UnsupportedAlter(
-                "only ADD COLUMN, ADD PRIMARY KEY and ADD FOREIGN KEY are supported".into(),
+                "only ADD COLUMN, ADD PRIMARY KEY, ADD FOREIGN KEY and ADD CHECK are supported"
+                    .into(),
             ));
         }
-        let (def, reference) = self.parse_column_def()?;
+        let if_not_exists = self.parse_if_not_exists()?;
+        let (def, reference) = self.parse_add_column_def()?;
         // A column-level PRIMARY KEY would be a second way to say `ADD PRIMARY KEY`, and the two
         // would have to agree about order and about the storage key. Refuse it rather than pick.
         if def.primary_key {
@@ -610,7 +632,19 @@ impl Parser {
                     .into(),
             ));
         }
-        Ok(AlterOperation::AddColumn(def))
+        Ok(if if_not_exists {
+            AlterOperation::AddColumnIfNotExists(def)
+        } else {
+            AlterOperation::AddColumn(def)
+        })
+    }
+
+    /// A column definition inside `ALTER TABLE … ADD COLUMN`: it ends at a `,` that starts
+    /// the next action, as well as at the end of the statement.
+    fn parse_add_column_def(
+        &mut self,
+    ) -> Result<(ColumnDef, Option<ForeignKeyConstraint>), ParseError> {
+        self.parse_column_def()
     }
 
     /// `ADD [CONSTRAINT <name>] FOREIGN KEY (<cols>) REFERENCES <parent> [(<pcols>)]`.
@@ -653,12 +687,23 @@ impl Parser {
         &mut self,
     ) -> Result<(ColumnDef, Option<ForeignKeyConstraint>), ParseError> {
         let name = self.ident()?;
-        let ty = self.parse_pg_type()?;
+        let serial = self.parse_serial_type()?;
+        let (ty, user_type) = if serial {
+            (PgType::BigInt, None)
+        } else {
+            self.parse_column_type()?
+        };
+        let array = self.parse_array_suffix()?;
         let mut def = ColumnDef {
             name,
             ty,
-            not_null: false,
+            // A serial column is implicitly NOT NULL, as in PostgreSQL.
+            not_null: serial,
             primary_key: false,
+            user_type,
+            default: None,
+            array,
+            serial,
         };
         let mut reference = None;
         while let Some(tok) = self.peek() {
@@ -689,9 +734,16 @@ impl Parser {
                 def.primary_key = true;
                 Ok(())
             }
-            "DEFAULT" => Err(ParseError::UnsupportedClause(
-                UnsupportedClause::DefaultExpr,
-            )),
+            "DEFAULT" => {
+                if def.default.is_some() {
+                    return Err(ParseError::Unexpected {
+                        expected: "one DEFAULT per column",
+                        found: "DEFAULT".into(),
+                    });
+                }
+                def.default = Some(self.parse_default_expr()?);
+                Ok(())
+            }
             "REFERENCES" => {
                 if reference.is_some() {
                     return Err(ParseError::UnsupportedAlter(
@@ -722,7 +774,7 @@ impl Parser {
         }
     }
 
-    fn peek_is_kw(&self, kw: &str) -> bool {
+    pub(super) fn peek_is_kw(&self, kw: &str) -> bool {
         matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case(kw))
     }
 
@@ -885,6 +937,66 @@ impl Parser {
                 found: format!("{t:?}"),
             }),
             None => Err(ParseError::UnexpectedEnd),
+        }
+    }
+
+    /// An optional `[]` after a type: a one-dimensional array. `[n]` and multi-dimensional
+    /// arrays are refused (PostgreSQL ignores the bound; ferrosa will not pretend to).
+    pub(super) fn parse_array_suffix(&mut self) -> Result<bool, ParseError> {
+        if !matches!(self.peek(), Some(Tok::LBracket)) {
+            return Ok(false);
+        }
+        self.next();
+        if !matches!(self.next(), Some(Tok::RBracket)) {
+            return Err(ParseError::Unsupported(
+                "an array type with a size bound".into(),
+            ));
+        }
+        if matches!(self.peek(), Some(Tok::LBracket)) {
+            return Err(ParseError::Unsupported(
+                "a multi-dimensional array type".into(),
+            ));
+        }
+        Ok(true)
+    }
+
+    /// `bigserial`/`serial8` → `true` (consumed). `serial`, `serial4`, `smallserial` and
+    /// `serial2` are refused: a D15 id needs 63 bits. Anything else → `false` (untouched).
+    fn parse_serial_type(&mut self) -> Result<bool, ParseError> {
+        let word = match self.peek() {
+            Some(Tok::Ident(w)) => w.to_ascii_lowercase(),
+            _ => return Ok(false),
+        };
+        match word.as_str() {
+            "bigserial" | "serial8" => {
+                self.next();
+                Ok(true)
+            }
+            "serial" | "serial4" | "smallserial" | "serial2" => {
+                Err(ParseError::UnsupportedClause(UnsupportedClause::Serial))
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// A column's type: a built-in type, or else a (possibly schema-qualified) user-defined
+    /// type name, which the front end resolves. A built-in refusal (`SERIAL`, a bad
+    /// modifier) is not reinterpreted as a user type.
+    pub(super) fn parse_column_type(&mut self) -> Result<(PgType, Option<TableRef>), ParseError> {
+        let start = self.pos;
+        let first = match self.peek() {
+            Some(Tok::Ident(w) | Tok::QuotedIdent(w)) => w.to_ascii_lowercase(),
+            _ => String::new(),
+        };
+        match self.parse_pg_type() {
+            Ok(ty) => Ok((ty, None)),
+            // Only an unknown FIRST word is a user type name; `time with time zone` is a
+            // built-in spelling refused as such.
+            Err(ParseError::UnknownType(name)) if name == first => {
+                self.pos = start;
+                Ok((PgType::Text, Some(self.parse_qualified_table()?)))
+            }
+            Err(other) => Err(other),
         }
     }
 

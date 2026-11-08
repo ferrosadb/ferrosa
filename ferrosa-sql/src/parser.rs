@@ -13,6 +13,8 @@ use crate::types::Value;
 
 #[path = "parser_ddl.rs"]
 mod ddl;
+#[path = "parser_ddl_ext.rs"]
+mod ddl_ext;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
@@ -67,6 +69,8 @@ pub enum ParseError {
     MissingPrimaryKey,
     /// The primary key names a column the table does not define.
     UnknownPrimaryKeyColumn(String),
+    /// A statement form outside the supported subset, named by the caller (`0A000`).
+    Unsupported(String),
     /// An expression nests (parentheses, `NOT`) deeper than
     /// [`MAX_EXPR_DEPTH`]. The parser recurses per level, so without this
     /// bound a client-chosen depth overflows the parsing thread's stack and
@@ -122,6 +126,7 @@ impl fmt::Display for ParseError {
             ParseError::UnknownPrimaryKeyColumn(c) => {
                 write!(f, "primary key column `{c}` is not defined")
             }
+            ParseError::Unsupported(form) => write!(f, "{form} is not supported"),
             ParseError::TooDeep => {
                 write!(f, "expression nests deeper than {MAX_EXPR_DEPTH} levels")
             }
@@ -191,13 +196,15 @@ pub fn parse_statement(sql: &str) -> Result<Statement, ParseError> {
             "INSERT" => p.parse_insert(),
             "UPDATE" => p.parse_update(),
             "DELETE" => p.parse_delete(),
-            "CREATE" => p.parse_create(),
+            "CREATE" => p.parse_create_any(),
             "COPY" => p.parse_copy(),
-            "ALTER" => p.parse_alter_table(),
-            "DROP" => p.parse_drop(),
+            "ALTER" => p.parse_alter_any(),
+            "DROP" => p.parse_drop_any(),
             "TRUNCATE" => p.parse_truncate(),
             "VACUUM" => p.parse_vacuum(),
             "ANALYZE" | "ANALYSE" => p.parse_analyze(),
+            "LOCK" => p.parse_lock(),
+            "COMMENT" => p.parse_comment(),
             other => Err(ParseError::Unexpected {
                 expected: "a statement",
                 found: other.to_string(),
@@ -3130,7 +3137,9 @@ mod tests {
     fn other_alter_forms_are_refused_by_name() {
         for sql in [
             "ALTER TABLE t RENAME TO u",
-            "ALTER TABLE t ALTER COLUMN c TYPE bigint",
+            // `ALTER COLUMN c TYPE t` now parses; the front end applies a same-type no-op and
+            // refuses a real type change by name (0A000).
+            "ALTER TABLE t ALTER COLUMN c TYPE bigint USING c::bigint",
             "ALTER INDEX i RENAME TO j",
         ] {
             match parse_statement(sql) {
@@ -3259,10 +3268,6 @@ mod tests {
                 "CHECK",
             ),
             ("CREATE TABLE t (id serial PRIMARY KEY)", "SERIAL"),
-            (
-                "CREATE TABLE t (id int PRIMARY KEY, n int DEFAULT 1 + 1)",
-                "DEFAULT",
-            ),
             ("CREATE TABLE other.t (id int PRIMARY KEY)", "schema"),
         ];
         for (sql, clause) in cases {
@@ -3478,7 +3483,8 @@ mod tests {
 
     #[test]
     fn serial_types_are_refused_by_name() {
-        for ty in ["serial", "bigserial", "smallserial"] {
+        // `bigserial` is accepted (D15: a unique 64-bit id); the narrower forms cannot hold one.
+        for ty in ["serial", "smallserial", "serial4", "serial2"] {
             assert_eq!(
                 refused(&format!("CREATE TABLE t (id {ty} PRIMARY KEY)")),
                 UnsupportedClause::Serial,
@@ -3488,15 +3494,13 @@ mod tests {
     }
 
     #[test]
-    fn default_expression_is_refused_by_name() {
-        assert_eq!(
-            refused("CREATE TABLE t (id int PRIMARY KEY, at timestamp DEFAULT now())"),
-            UnsupportedClause::DefaultExpr
-        );
-        assert_eq!(
-            refused("CREATE TABLE t (id int PRIMARY KEY, n int DEFAULT 0)"),
-            UnsupportedClause::DefaultExpr
-        );
+    fn default_expression_is_recorded() {
+        // DEFAULT used to be refused (D10); it is now parsed with the general scalar grammar
+        // and recorded as canonical SQL for the INSERT path.
+        let c = create("CREATE TABLE t (id int PRIMARY KEY, at timestamp DEFAULT now())");
+        assert_eq!(c.columns[1].default.as_deref(), Some("now()"));
+        let c = create("CREATE TABLE t (id int PRIMARY KEY, n int DEFAULT 0)");
+        assert_eq!(c.columns[1].default.as_deref(), Some("0"));
     }
 
     #[test]
@@ -3521,7 +3525,9 @@ mod tests {
 
     #[test]
     fn create_table_structural_errors_are_typed() {
-        let cases: [(&str, ParseError); 6] = [
+        // An unknown simple type name (`a wibble`) now parses as a user-defined type name,
+        // which the front end resolves and refuses with the same SQLSTATE (42704).
+        let cases: [(&str, ParseError); 5] = [
             (
                 "CREATE TABLE t (a int PRIMARY KEY, b int PRIMARY KEY)",
                 ParseError::MultiplePrimaryKeys,
@@ -3537,10 +3543,6 @@ mod tests {
             (
                 "CREATE TABLE t (a int, PRIMARY KEY (z))",
                 ParseError::UnknownPrimaryKeyColumn("z".into()),
-            ),
-            (
-                "CREATE TABLE t (a wibble PRIMARY KEY)",
-                ParseError::UnknownType("wibble".into()),
             ),
             (
                 "CREATE TABLE t (a time with time zone PRIMARY KEY)",
@@ -3691,7 +3693,8 @@ mod tests {
             "CREATE TABLE t ()",
             "CREATE TABLE t (a int PRIMARY KEY",
             "CREATE TABLE t (a int PRIMARY KEY) extra",
-            "CREATE INDEX i ON t (a)",
+            // `CREATE INDEX i ON t (a)` is no longer malformed: it parses (W3, `pg_index`).
+            "CREATE INDEX i ON t",
             "CREATE TABLE t (a varchar(x) PRIMARY KEY)",
             "CREATE TABLE \"t (a int PRIMARY KEY)",
         ];

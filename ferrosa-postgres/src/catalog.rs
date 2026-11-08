@@ -42,7 +42,7 @@ const FIRST_USER_OID: u32 = 16_384;
 ///
 /// FNV-1a over `"{kind}:{name}"`, folded into `[FIRST_USER_OID, u32::MAX]`. The
 /// `kind` prefix keeps a namespace and a same-named relation from colliding.
-fn synthetic_oid(kind: &str, name: &str) -> u32 {
+pub(crate) fn synthetic_oid(kind: &str, name: &str) -> u32 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = FNV_OFFSET;
@@ -59,12 +59,12 @@ fn synthetic_oid(kind: &str, name: &str) -> u32 {
 }
 
 /// OID of the namespace (Postgres schema) for a keyspace name.
-fn namespace_oid(keyspace: &str) -> u32 {
+pub(crate) fn namespace_oid(keyspace: &str) -> u32 {
     synthetic_oid("namespace", keyspace)
 }
 
 /// OID of the relation (table) `keyspace.table`.
-fn relation_oid(keyspace: &str, table: &str) -> u32 {
+pub(crate) fn relation_oid(keyspace: &str, table: &str) -> u32 {
     synthetic_oid("relation", &format!("{keyspace}.{table}"))
 }
 
@@ -159,8 +159,17 @@ fn sorted_keyspaces(snapshot: &SchemaSnapshot) -> Vec<String> {
 }
 
 /// `(keyspace, table)` pairs from the snapshot, sorted for deterministic order.
+///
+/// Tables with ferrosa's reserved `_sys_` prefix (the enum metadata table,
+/// `pg_enum::META_TABLE`) are ferrosa's own storage, not relations a client created, so
+/// they are not projected.
 fn sorted_tables(snapshot: &SchemaSnapshot) -> Vec<(String, String)> {
-    let mut keys: Vec<(String, String)> = snapshot.tables.keys().cloned().collect();
+    let mut keys: Vec<(String, String)> = snapshot
+        .tables
+        .keys()
+        .filter(|(_, table)| !is_reserved_column_name(table))
+        .cloned() // the projection's sort key list; owned so it can be sorted
+        .collect();
     keys.sort();
     keys
 }
@@ -274,7 +283,11 @@ pub fn pg_attribute(schema: &Schema) -> Result<InMemoryTable, PgTypeError> {
         // `column_attnums`, the one place the number is decided (1-based for a table
         // column, negative for a reserved `_sys_` SYSTEM column — see that function).
         for (col, (_, attnum)) in meta.columns.values().zip(column_attnums(meta)) {
-            let pg = pg_type_of_column(&col.column_type, &ks, schema)?;
+            let mut pg = pg_type_of_column(&col.column_type, &ks, schema)?;
+            // An enum-typed column is stored as text but is typed by its enum.
+            if let Some((type_ks, type_name)) = crate::pg_enum::column_enum(meta, &col.name) {
+                pg.oid = crate::pg_enum::enum_oid(type_ks, type_name);
+            }
             rows.push(attribute_row(relid, col, attnum, pg));
         }
     }
@@ -329,7 +342,11 @@ pub fn pg_type(schema: &Schema) -> Result<InMemoryTable, PgTypeError> {
         .chain(crate::pg_types::ARRAY_PG_TYPES.iter())
         .map(|p| (p.oid, p.typname, p.typlen))
         .collect();
-    for ((ks, _), table) in &snapshot.tables {
+    for ((ks, name), table) in &snapshot.tables {
+        // ferrosa's own `_sys_` tables (the enum metadata table) are not projected.
+        if is_reserved_column_name(name) {
+            continue;
+        }
         for col in table.columns.values() {
             let p = pg_type_of_column(&col.column_type, ks, schema)?;
             types.push((p.oid, p.typname, p.typlen));
@@ -355,6 +372,25 @@ pub fn pg_type(schema: &Schema) -> Result<InMemoryTable, PgTypeError> {
         cells.push(oid_val(0));
         cells.push(oid_val(0));
         rows.push(Row::new(cells));
+    }
+    // User enum types and their array types (`pg_enum::enum_type_rows`), in the same
+    // columns; an enum has typlen 4 and its array -1, as in PostgreSQL.
+    for row in crate::pg_enum::enum_type_rows(&snapshot) {
+        let typlen = if row.typtype == "e" { 4 } else { -1 };
+        rows.push(Row::new(vec![
+            oid_val(row.oid),
+            Value::Text(row.typname.into()),
+            oid_val(row.typnamespace),
+            Value::Int(typlen),
+            Value::Text(row.typtype.into()),
+            Value::Text(row.typsend.into()),
+            Value::Text(row.typreceive.into()),
+            Value::Text(row.typoutput.into()),
+            Value::Text(row.typinput.into()),
+            oid_val(row.typelem),
+            oid_val(row.typrelid),
+            oid_val(row.typbasetype),
+        ]));
     }
 
     Ok(InMemoryTable::new(rel_schema, rows))
@@ -558,10 +594,124 @@ pub(crate) const CATALOG_RELATIONS: [&str; 9] = [
 pub(crate) fn parse_pg(sql: &str) -> Result<ferrosa_sql::Statement, ferrosa_sql::ParseError> {
     let mut stmt = ferrosa_sql::parse_statement(sql)?;
     if let ferrosa_sql::Statement::Select(select) = &mut stmt {
+        rewrite_obj_description(select)?;
         qualify_catalog_names(select, &[]);
         refuse_unknown_casts(select)?;
     }
     Ok(stmt)
+}
+
+/// `obj_description(oid, 'catalog')` is a lookup in `pg_description`; rewrite it
+/// to that scalar subquery so the engine needs no catalog function. Ecto checks
+/// Oban's migration version with it. A catalog other than the ones a comment
+/// can be on here is refused by name.
+fn rewrite_obj_description(
+    select: &mut ferrosa_sql::SelectStmt,
+) -> Result<(), ferrosa_sql::ParseError> {
+    walk_scalars(select, &mut |e| rewrite_obj_description_in(e))
+}
+
+fn rewrite_obj_description_in(
+    e: &mut ferrosa_sql::ScalarExpr,
+) -> Result<(), ferrosa_sql::ParseError> {
+    use ferrosa_sql::ScalarExpr;
+    e.try_for_each_child_mut(&mut rewrite_obj_description_in, &mut |q| {
+        rewrite_obj_description(q)
+    })?;
+    let ScalarExpr::Func { name, args } = e else {
+        return Ok(());
+    };
+    if name.strip_prefix("pg_catalog.").unwrap_or(name) != "obj_description" {
+        return Ok(());
+    }
+    let classoid = match args.get(1) {
+        None => None,
+        Some(ScalarExpr::Literal(Value::Text(c))) => Some(match c.as_str() {
+            "pg_class" => 1259,
+            "pg_type" => 1247,
+            "pg_namespace" => 2615,
+            _ => {
+                return Err(ferrosa_sql::ParseError::UnsupportedSelectExpr(
+                    "obj_description for that catalog",
+                ))
+            }
+        }),
+        Some(_) => {
+            return Err(ferrosa_sql::ParseError::UnsupportedSelectExpr(
+                "obj_description with a non-literal catalog name",
+            ))
+        }
+    };
+    if args.is_empty() || args.len() > 2 {
+        return Err(ferrosa_sql::ParseError::UnsupportedSelectExpr(
+            "obj_description takes one or two arguments",
+        ));
+    }
+    let object = args.swap_remove(0);
+    *e = ScalarExpr::Subquery(Box::new(description_lookup(object, classoid)));
+    Ok(())
+}
+
+/// `(SELECT d.description FROM pg_catalog.pg_description AS d WHERE d.objoid = <object>
+/// [AND d.classoid = <classoid>] AND d.objsubid = 0)`.
+fn description_lookup(
+    object: ferrosa_sql::ScalarExpr,
+    classoid: Option<i64>,
+) -> ferrosa_sql::SelectStmt {
+    use ferrosa_sql::{BinOp, CmpOp, ScalarExpr};
+    let col = |name: &str| {
+        ScalarExpr::Column(ferrosa_sql::ast::ColumnRef {
+            qualifier: Some("d".into()),
+            name: name.into(),
+        })
+    };
+    let eq = |l: ScalarExpr, r: ScalarExpr| ScalarExpr::Binary {
+        op: BinOp::Cmp(CmpOp::Eq),
+        left: Box::new(l),
+        right: Box::new(r),
+    };
+    let and = |l: ScalarExpr, r: ScalarExpr| ScalarExpr::Binary {
+        op: BinOp::And,
+        left: Box::new(l),
+        right: Box::new(r),
+    };
+    let mut cond = eq(col("objoid"), object);
+    if let Some(c) = classoid {
+        cond = and(
+            cond,
+            eq(col("classoid"), ScalarExpr::Literal(Value::Int(c))),
+        );
+    }
+    cond = and(
+        cond,
+        eq(col("objsubid"), ScalarExpr::Literal(Value::Int(0))),
+    );
+    ferrosa_sql::SelectStmt {
+        ctes: Vec::new(),
+        distinct: false,
+        projection: ferrosa_sql::Projection::Items(vec![ferrosa_sql::SelectItem::Column {
+            col: ferrosa_sql::ast::ColumnRef {
+                qualifier: Some("d".into()),
+                name: "description".into(),
+            },
+            alias: None,
+        }]),
+        from: ferrosa_sql::ast::TableRef {
+            schema: Some("pg_catalog".into()),
+            table: "pg_description".into(),
+            alias: Some("d".into()),
+        },
+        join: None,
+        joins: Vec::new(),
+        filter: Some(ferrosa_sql::Expr::Scalar(Box::new(cond))),
+        group_by: Vec::new(),
+        having: None,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        limit_param: None,
+        offset_param: None,
+    }
 }
 
 /// Refuse, at Parse time and by the name as written, a cast to a type nothing
@@ -727,6 +877,18 @@ pub fn catalog_tables(schema: &Schema) -> Result<Vec<(String, InMemoryTable)>, P
 /// `relkind = 'i'` — so it resolves to [`index_oid`]. Returns `None` when nothing
 /// by that name exists; the caller turns that into a `42P01` (undefined_table),
 /// never a zero OID that would silently match nothing.
+/// `'name'::regnamespace`: the namespace OID of the keyspace (or reserved schema) `name`,
+/// or `None` when no such schema exists (PostgreSQL's `3F000`). The integration point for the
+/// expression engine's `regnamespace` cast (census statement 9's `'public'::regnamespace::oid`).
+// Called by the W1 cast engine once it merges; until then only the tests call it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn resolve_regnamespace(schema: &Schema, name: &str) -> Option<u32> {
+    let name = name.trim_matches('"');
+    let known =
+        RESERVED_NAMESPACES.contains(&name) || schema.snapshot().keyspaces.contains_key(name);
+    known.then(|| namespace_oid(name))
+}
+
 pub(crate) fn resolve_regclass(schema: &Schema, default_schema: &str, name: &str) -> Option<u32> {
     let (keyspace, table) = match parse_relation_name(name)?.as_slice() {
         [table] => (default_schema.to_string(), table.clone()),
@@ -957,6 +1119,24 @@ mod tests {
     }
 
     /// Collect a provider's rows into a Vec for assertions.
+    /// `'public'::regnamespace` resolves to the same OID `pg_namespace` reports; an unknown
+    /// schema resolves to nothing (the caller's `3F000`).
+    #[test]
+    fn regnamespace_resolves_to_the_pg_namespace_oid() {
+        let schema = schema_with_ks_tbl();
+        let ns = pg_namespace(&schema);
+        let ks_row = rows_of(&ns)
+            .into_iter()
+            .find(|r| r.0[1] == Value::Text("ks".to_string().into()))
+            .expect("ks row");
+        assert_eq!(
+            resolve_regnamespace(&schema, "ks").map(|o| Value::Int(i64::from(o))),
+            Some(ks_row.0[0].clone())
+        );
+        assert!(resolve_regnamespace(&schema, "pg_catalog").is_some());
+        assert_eq!(resolve_regnamespace(&schema, "nope"), None);
+    }
+
     fn rows_of(table: &InMemoryTable) -> Vec<Row> {
         table.scan().collect()
     }
@@ -1205,6 +1385,20 @@ mod tests {
                 "{table}.{column}"
             );
         }
+    }
+
+    #[test]
+    fn obj_description_becomes_a_pg_description_lookup() {
+        let sql = "SELECT pg_catalog.obj_description(pg_class.oid, 'pg_class') FROM pg_class \
+                   LEFT JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace \
+                   WHERE pg_class.relname = 'oban_jobs' AND pg_namespace.nspname = 'public'";
+        let ferrosa_sql::Statement::Select(select) = parse_pg(sql).expect("parses") else {
+            panic!("a select");
+        };
+        assert_eq!(select.from.schema.as_deref(), Some("pg_catalog"));
+        let tables: Vec<&str> = select.tables().iter().map(|t| t.table.as_str()).collect();
+        assert!(tables.contains(&"pg_description"), "{tables:?}");
+        assert!(parse_pg("SELECT obj_description(1, 'pg_proc')").is_err());
     }
 
     #[test]

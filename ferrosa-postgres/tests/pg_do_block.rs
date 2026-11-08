@@ -158,34 +158,34 @@ async fn an_unsupported_construct_is_refused_and_runs_nothing() {
 }
 
 #[tokio::test]
-async fn ddl_in_a_do_block_is_routed_to_the_ddl_path() {
-    // DDL inside a transaction is refused today (25001) — W3 makes it transactional. The DO
-    // block is its own transaction, so the CREATE TABLE reaches the DDL path and is refused
-    // there with the DDL path's own SQLSTATE: the routing is real.
+async fn a_do_block_creates_a_table_through_the_ddl_path() {
     let server = pg_server::start_server_with_ddl().await;
     let client = pg_server::connect(server.port).await;
-    let error = client
+    client
         .batch_execute("DO $$ BEGIN CREATE TABLE made_by_do (id text PRIMARY KEY); END $$")
         .await
-        .expect_err("DDL in a transaction");
-    assert_eq!(code(&error), "25001", "{}", message(&error));
+        .expect("DDL inside the DO block's transaction");
+    client
+        .query("SELECT id FROM made_by_do", &[])
+        .await
+        .expect("the table exists after the DO block commits");
 }
 
-/// Awaits W3 (transactional DDL): a DO block creates a table. Built only with the
-/// `pending-workstreams` feature, so the default suite stays green while it is red.
-#[cfg(feature = "pending-workstreams")]
 #[tokio::test]
-async fn awaits_w3_a_do_block_creates_a_table() {
+async fn a_do_block_that_fails_after_its_ddl_leaves_no_table() {
     let server = pg_server::start_server_with_ddl().await;
     let client = pg_server::connect(server.port).await;
     client
-        .batch_execute("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'oban_job_state') THEN CREATE TABLE made_by_do (id text PRIMARY KEY); END IF; END $$")
+        .batch_execute(
+            "DO $$ BEGIN CREATE TABLE half_made (id text PRIMARY KEY); INSERT INTO ks.missing (id) VALUES ('x'); END $$",
+        )
         .await
-        .expect("DO creates a table");
-    client
-        .query("SELECT id FROM ks.made_by_do", &[])
+        .expect_err("the insert fails");
+    let error = client
+        .query("SELECT id FROM half_made", &[])
         .await
-        .expect("the table exists");
+        .expect_err("the CREATE TABLE rolled back with the block");
+    assert_eq!(code(&error), "42P01", "{}", message(&error));
 }
 
 #[tokio::test]

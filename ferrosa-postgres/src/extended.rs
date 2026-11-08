@@ -54,10 +54,15 @@ pub enum PreparedKind {
     Insert(Box<InsertStmt>),
     Update(Box<UpdateStmt>),
     Delete(Box<DeleteStmt>),
+    /// A parameterless utility statement (DDL): no `$N`, no result rows. Ecto sends every
+    /// migration statement as an unnamed prepared statement, so DDL has to be preparable;
+    /// executing it runs the same executor the simple-query path uses
+    /// (`query::execute_utility`). Which statements qualify is [`crate::query::is_utility`].
+    Utility(Box<Statement>),
     /// A statement of the procedural lane (D13): `DO`, PL/pgSQL function and trigger DDL,
     /// `LISTEN`/`UNLISTEN`/`NOTIFY`, `SELECT pg_notify(…)`. Ecto sends these through the
     /// extended protocol, so they must prepare like any other statement.
-    Utility(Box<ferrosa_plpgsql::utility::Utility>),
+    Procedural(Box<ferrosa_plpgsql::utility::Utility>),
 }
 
 /// A prepared statement: the parsed query plus the client-declared parameter
@@ -578,7 +583,7 @@ impl Session {
     ) -> BackendMessage {
         if let Some(utility) = ferrosa_plpgsql::utility::parse_utility(query) {
             let parsed = match utility {
-                Ok(statement) => PreparedKind::Utility(Box::new(statement)),
+                Ok(statement) => PreparedKind::Procedural(Box::new(statement)),
                 Err(error) => {
                     self.mark_error();
                     return error_response(error.sqlstate, &error.message);
@@ -618,13 +623,14 @@ impl Session {
             Ok(Statement::Insert(ins)) => PreparedKind::Insert(ins),
             Ok(Statement::Update(upd)) => PreparedKind::Update(upd),
             Ok(Statement::Delete(del)) => PreparedKind::Delete(del),
+            Ok(stmt) if crate::query::is_utility(&stmt) => PreparedKind::Utility(Box::new(stmt)),
             Ok(_) => {
                 // BEGIN/COMMIT/ROLLBACK/SET reach the backend via simple Query.
                 self.mark_error();
                 return error_response(
                     "0A000",
-                    "only SELECT and INSERT/UPDATE/DELETE statements can be prepared via the \
-                     extended-query protocol",
+                    "only SELECT, INSERT/UPDATE/DELETE and DDL statements can be prepared via \
+                     the extended-query protocol; transaction control goes through a simple Query",
                 );
             }
             Err(e) => {

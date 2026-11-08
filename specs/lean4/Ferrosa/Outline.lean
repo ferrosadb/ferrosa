@@ -54,6 +54,10 @@ def parts : List Part := [
     "Ferrosa.Sql.Semantics",
     "Ferrosa.Sql.Index",
     "Ferrosa.Sql.Txn",
+    "Ferrosa.Sql.Ddl",
+    "Ferrosa.Sql.Enum",
+    "Ferrosa.Sql.Serial",
+    "Ferrosa.Sql.Constraint",
     "Ferrosa.Sql.Consistency",
     "Ferrosa.Sql.Plpgsql",
     "Ferrosa.Sql.Notify",
@@ -187,7 +191,7 @@ theorem every_ledger_is_placed :
 
 /-- The book covers a fixed number of modules. A module added to the corpus without a home here is
     a build failure rather than a silent omission from the document. -/
-theorem placed_module_count : (parts.map (fun p => p.modules.length)).sum = 79 := by decide
+theorem placed_module_count : (parts.map (fun p => p.modules.length)).sum = 83 := by decide
 
 /-- Part numerals are distinct, so `\ref` cannot collide. -/
 theorem part_numerals_distinct : (parts.map (fun p => p.numeral)).Nodup := by decide
