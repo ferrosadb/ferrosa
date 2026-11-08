@@ -935,6 +935,11 @@ pub(crate) fn exec_error_response(err: &ExecError) -> BackendMessage {
         // directly with an unresolved cast; refused as an unsupported feature
         // rather than compared as if the cast did nothing.
         ExecError::UnresolvedCast(_) => ("0A000", err.to_string()),
+        // A row-level expression failure carries PostgreSQL's own SQLSTATE
+        // (22012 division_by_zero, 22003 out of range, 22P02 bad input, 21000 a
+        // subquery returning several rows, ...).
+        ExecError::Eval { sqlstate, .. } => (*sqlstate, err.to_string()),
+        ExecError::Unsupported(_) => ("0A000", err.to_string()),
     };
     error_response(sqlstate, &message)
 }
@@ -1206,6 +1211,20 @@ fn resolve_casts(
     schema: &Schema,
     default_schema: &str,
 ) -> Result<(), BackendMessage> {
+    let on_query = |q: &mut SelectStmt| resolve_casts(q, params, schema, default_schema);
+    for cte in &mut select.ctes {
+        on_query(&mut cte.query)?;
+    }
+    for join in &mut select.joins {
+        resolve_casts_in_scalar(&mut join.on, params, schema, default_schema)?;
+    }
+    if let ferrosa_sql::Projection::Items(items) = &mut select.projection {
+        for item in items {
+            if let ferrosa_sql::SelectItem::Expr { expr, .. } = item {
+                resolve_casts_in_scalar(expr, params, schema, default_schema)?;
+            }
+        }
+    }
     if let Some(filter) = select.filter.as_mut() {
         resolve_casts_in_expr(filter, params, schema, default_schema)?;
     }
@@ -1213,6 +1232,56 @@ fn resolve_casts(
         resolve_casts_in_expr(having, params, schema, default_schema)?;
     }
     Ok(())
+}
+
+/// Resolve every `::regclass` cast inside a general expression (and its
+/// subqueries) to the literal OID, exactly as a legacy comparison term is.
+/// A regclass cast of a non-constant (a column) is refused: its value would have
+/// to be resolved per row against the catalog, which the engine does not do.
+fn resolve_casts_in_scalar(
+    expr: &mut ferrosa_sql::ScalarExpr,
+    params: &[SqlValue],
+    schema: &Schema,
+    default_schema: &str,
+) -> Result<(), BackendMessage> {
+    use ferrosa_sql::ScalarExpr;
+    if let ScalarExpr::Cast { expr: inner, ty } = expr {
+        if is_regclass_type(ty) {
+            let value =
+                match &mut **inner {
+                    ScalarExpr::Literal(v) => v.clone(),
+                    ScalarExpr::Param(n) => {
+                        eval_cast_term(&Term::Param(*n), params, schema, default_schema)?
+                    }
+                    other => {
+                        resolve_casts_in_scalar(other, params, schema, default_schema)?;
+                        match other {
+                            ScalarExpr::Literal(v) => v.clone(),
+                            _ => return Err(error_response(
+                                "0A000",
+                                "a ::regclass cast of a non-constant expression is not supported",
+                            )),
+                        }
+                    }
+                };
+            let oid = apply_cast(&value, CastTarget::Regclass, schema, default_schema)?;
+            *expr = ScalarExpr::Literal(oid);
+            return Ok(());
+        }
+    }
+    expr.try_for_each_child_mut(
+        &mut |child| resolve_casts_in_scalar(child, params, schema, default_schema),
+        &mut |q| resolve_casts(q, params, schema, default_schema),
+    )
+}
+
+fn is_regclass_type(ty: &ferrosa_sql::TypeName) -> bool {
+    !ty.array
+        && ty.name.eq_ignore_ascii_case("regclass")
+        && ty
+            .schema
+            .as_deref()
+            .is_none_or(|s| s.eq_ignore_ascii_case("pg_catalog"))
 }
 
 fn resolve_casts_in_expr(
@@ -1229,6 +1298,7 @@ fn resolve_casts_in_expr(
             Ok(())
         }
         Expr::Compare { .. } => Ok(()),
+        Expr::Scalar(e) => resolve_casts_in_scalar(e, params, schema, default_schema),
         Expr::Not(inner) => resolve_casts_in_expr(inner, params, schema, default_schema),
         Expr::And(left, right) | Expr::Or(left, right) => {
             resolve_casts_in_expr(left, params, schema, default_schema)?;

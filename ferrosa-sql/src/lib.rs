@@ -12,7 +12,9 @@
 pub mod ast;
 pub mod catalog;
 pub mod exec;
+mod general;
 pub mod parser;
+mod parser_scalar;
 pub mod plan;
 pub mod provider;
 pub mod spill;
@@ -20,11 +22,12 @@ pub mod types;
 
 pub use ast::SelectStmt;
 pub use ast::{
-    AggArg, AlterOperation, AlterTableStmt, AnalyzeStmt, ArithOp, CastTarget, ColumnDef,
-    CopyFormatKind, CopyFromStdinStmt, CreateTableStmt, DeleteStmt, DropTableStatement, Expr,
-    ForeignKeyConstraint, InsertStmt, IsolationLevel, Operand, OrderItem, PgType, Projection,
-    Returning, ScalarItem, ScalarValue, SelectItem, SetExpr, Statement, Term, TruncateStatement,
-    UnsupportedClause, UpdateStmt, VacuumStmt,
+    AggArg, AlterOperation, AlterTableStmt, AnalyzeStmt, ArithOp, BinOp, CastTarget, ColumnDef,
+    CopyFormatKind, CopyFromStdinStmt, CreateTableStmt, Cte, DeleteStmt, DropTableStatement, Expr,
+    ForeignKeyConstraint, InsertStmt, IsolationLevel, JoinClause, JoinKind, Operand, OrderItem,
+    PgType, Projection, Returning, ScalarExpr, ScalarItem, ScalarValue, SelectItem, SetExpr,
+    Statement, Term, TruncateStatement, TypeName, UnaryOp, UnsupportedClause, UpdateStmt,
+    VacuumStmt,
 };
 pub use catalog::{Catalog, MapCatalog, SharedTable};
 pub use exec::{

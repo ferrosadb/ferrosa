@@ -145,3 +145,13 @@ Under `specs/lean4/Ferrosa/Sql/`, one model per feature, written before its code
 
 **Acceptance:** the Elixir probe (`Postgrex` → `Ecto.Migrator` → `Oban`) runs one job
 against ferrosa.
+
+## Found while building W1
+
+* **OID columns are `int4`.** The `pg_catalog` projections type every OID column as
+  `ColumnType::Int` (`int4`, OID 23), but synthetic OIDs lie in `[16384, u32::MAX]`.
+  * Text results are correct.
+  * In binary results an OID at or above 2³¹ fails to encode, because `int4` is signed.
+  * Fix: an `oid` column type (OID 26, unsigned 4-byte binary).
+  * Status: on W1's work list. Under the owner's rule, a found bug is fixed with a
+    test and a Lean spec before the work is done.
