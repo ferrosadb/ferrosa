@@ -696,10 +696,8 @@ async fn pg_ddl_create_table_named_refusals_survive_end_to_end() {
     let cases = [
         // (sql, expected sqlstate)
         ("CREATE TABLE t (id int PRIMARY KEY, v int UNIQUE)", "0A000"),
-        (
-            "CREATE TABLE t (id int PRIMARY KEY, v int DEFAULT 1)",
-            "0A000",
-        ),
+        // `DEFAULT` is no longer refused: it is recorded for the INSERT path
+        // (`pg_default`, Oban W3).
         (
             "CREATE TABLE t (id int PRIMARY KEY, v int CHECK (v > 0))",
             "0A000",

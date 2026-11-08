@@ -249,7 +249,11 @@ pub struct ForeignKeyConstraint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlterTableStmt {
     pub table: TableRef,
+    /// The first action.
     pub operation: AlterOperation,
+    /// Further comma-separated actions (`ADD COLUMN a …, ADD COLUMN b …`), in order. The
+    /// front end applies a statement's actions together or not at all.
+    pub rest: Vec<AlterOperation>,
 }
 
 /// What an `ALTER TABLE` changes.
@@ -268,6 +272,33 @@ pub enum AlterOperation {
     AddPrimaryKey(Vec<String>),
     /// `ADD [COLUMN] <name> <type> [NOT NULL]`.
     AddColumn(ColumnDef),
+    /// `ADD [COLUMN] IF NOT EXISTS <name> <type> …`: a no-op when the column exists.
+    AddColumnIfNotExists(ColumnDef),
+    /// `ALTER [COLUMN] c [SET DATA] TYPE <type>`. Only a change to the column's current type
+    /// (a no-op) can be applied; the front end refuses a real type change by name.
+    AlterColumnType {
+        column: String,
+        ty: PgType,
+        user_type: Option<TableRef>,
+    },
+    /// `ALTER [COLUMN] c SET DEFAULT <expr>`, the expression as canonical SQL text.
+    SetDefault { column: String, sql: String },
+    /// `ALTER [COLUMN] c DROP DEFAULT`.
+    DropDefault { column: String },
+    /// `ALTER [COLUMN] c SET NOT NULL` (validated against existing rows).
+    SetNotNull { column: String },
+    /// `ALTER [COLUMN] c DROP NOT NULL`.
+    DropNotNull { column: String },
+    /// `ADD [CONSTRAINT name] CHECK (<expr>) [NOT VALID]`, the expression as canonical SQL.
+    AddCheck {
+        name: Option<String>,
+        sql: String,
+        not_valid: bool,
+    },
+    /// `DROP CONSTRAINT [IF EXISTS] name`.
+    DropConstraint { name: String, if_exists: bool },
+    /// `SET UNLOGGED` (`true`) / `SET LOGGED` (`false`).
+    SetLogged(bool),
     /// `DROP [COLUMN] <name>`.
     DropColumn(String),
     /// `ADD [CONSTRAINT <name>] FOREIGN KEY (<cols>) REFERENCES <parent> [(<pcols>)]`.
@@ -319,6 +350,10 @@ pub struct ColumnDef {
     /// written. `ty` is then [`PgType::Text`], the storage of an enum; the front end
     /// resolves the name and refuses one that is not a known type.
     pub user_type: Option<TableRef>,
+    /// `DEFAULT <expr>`, as canonical SQL text rendered from the parsed tokens (parsed
+    /// with the general scalar grammar, so it is syntactically valid; never compare it
+    /// byte-for-byte with what the client sent).
+    pub default: Option<String>,
     /// `bigserial` / `serial8`: `ty` is [`PgType::BigInt`] and the column's value, when an
     /// INSERT omits it, is a server-generated unique id (D15). `serial`/`smallserial` are
     /// refused at parse time (an id does not fit).

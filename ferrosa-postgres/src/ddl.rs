@@ -250,6 +250,8 @@ pub(crate) struct DdlEnv<'a> {
     pub(crate) schema: &'a Schema,
     pub(crate) view: Arc<SchemaSnapshot>,
     pub(crate) default_schema: &'a str,
+    /// Reads existing rows for the validations some ALTERs need (`ddl_alter`).
+    pub(crate) probe: Option<&'a dyn crate::ddl_alter::RowProbe>,
 }
 
 /// Execute one DDL statement. In autocommit (`txn` is `None`) the change is applied now,
@@ -262,6 +264,7 @@ pub(crate) async fn execute_ddl_statement(
     default_schema: &str,
     stmt: ferrosa_sql::Statement,
     txn: Option<&mut crate::txn_write_set::TxnWriteSet>,
+    probe: Option<&dyn crate::ddl_alter::RowProbe>,
 ) -> Vec<BackendMessage> {
     let Some(set) = txn else {
         let env = DdlEnv {
@@ -269,6 +272,7 @@ pub(crate) async fn execute_ddl_statement(
             schema,
             view: schema.snapshot(),
             default_schema,
+            probe,
         };
         return dispatch_ddl(env, stmt).await;
     };
@@ -282,6 +286,7 @@ pub(crate) async fn execute_ddl_statement(
         schema,
         view,
         default_schema,
+        probe,
     };
     dispatch_ddl(env, stmt).await
 }
@@ -396,7 +401,7 @@ async fn store_enum(
 
 /// The enum-column extensions for the user-typed columns of `columns`, or `42704` naming a
 /// type `view` does not define. Only enum types exist as user types.
-fn user_type_extensions(
+pub(crate) fn user_type_extensions(
     view: &SchemaSnapshot,
     keyspace: &str,
     columns: &[ColumnDef],
@@ -514,107 +519,18 @@ pub(crate) async fn execute_alter_table(
         );
     };
 
-    match &stmt.operation {
-        AlterOperation::AddPrimaryKey(columns) => {
+    match (&stmt.operation, stmt.rest.is_empty()) {
+        (AlterOperation::AddPrimaryKey(columns), true) => {
             execute_add_primary_key(executor, keyspace, &meta, columns).await
         }
-        AlterOperation::AddForeignKey(fk) => {
+        (AlterOperation::AddForeignKey(fk), true) => {
             execute_add_foreign_key(executor, keyspace, &meta, fk, &env.view).await
         }
-        AlterOperation::AddColumn(def) => {
-            if is_reserved_column_name(&def.name) {
-                return refuse(
-                    "42P16",
-                    &format!(
-                        "column name \"{}\" is reserved: the `_sys_` prefix belongs to ferrosa",
-                        def.name
-                    ),
-                );
-            }
-            if meta.columns.contains_key(&def.name) {
-                return refuse(
-                    "42701",
-                    &format!(
-                        "column \"{}\" of relation \"{}\" already exists",
-                        def.name, meta.name
-                    ),
-                );
-            }
-            // The type must map before anything is written, so an unknown type is a refusal
-            // rather than a half-applied change.
-            let column_type = match cql_type_string(def) {
-                Ok(t) => t,
-                Err(msg) => return vec![msg],
-            };
-            let enum_column =
-                match user_type_extensions(&env.view, keyspace, std::slice::from_ref(def)) {
-                    Ok(extensions) => extensions,
-                    Err(refusal) => return vec![refusal],
-                };
-            let updates = TableUpdates {
-                params: None,
-                add_columns: vec![ColumnMetadata {
-                    name: def.name.clone(),
-                    // A column added by ALTER is a regular column: a key column is added by
-                    // re-creating the table, and `TableUpdates` cannot change the key anyway.
-                    kind: ColumnKind::Regular,
-                    position: 0,
-                    column_type: column_type.to_string(),
-                    clustering_order: ClusteringOrder::None,
-                    mask: None,
-                }],
-                drop_columns: Vec::new(),
-                extensions: (!enum_column.is_empty()).then_some(enum_column),
-            };
-            if let Err(error) = executor
-                .alter_table(keyspace, &stmt.table.table, updates)
-                .await
-            {
-                return refuse("58000", &format!("ALTER TABLE failed: {error}"));
-            }
-            complete_with("ALTER TABLE")
-        }
-        AlterOperation::DropColumn(name) => {
-            if is_reserved_column_name(name) {
-                return refuse(
-                    "42P16",
-                    &format!(
-                        "column name \"{name}\" is reserved: the `_sys_` prefix belongs to ferrosa"
-                    ),
-                );
-            }
-            if !meta.columns.contains_key(name) {
-                return refuse(
-                    "42703",
-                    &format!(
-                        "column \"{name}\" of relation \"{}\" does not exist",
-                        meta.name
-                    ),
-                );
-            }
-            // Dropping a key column would leave rows with no identity — and, for a declared key,
-            // an extension naming a column that no longer exists.
-            if crate::pg_key::storage_key_columns(&meta).contains(name)
-                || crate::pg_key::of(&meta).contains(name)
-            {
-                return refuse(
-                    "2BP01",
-                    &format!("cannot drop column \"{name}\" because the primary key depends on it"),
-                );
-            }
-            let updates = TableUpdates {
-                params: None,
-                add_columns: Vec::new(),
-                drop_columns: vec![name.clone()],
-                extensions: None,
-            };
-            if let Err(error) = executor
-                .alter_table(keyspace, &stmt.table.table, updates)
-                .await
-            {
-                return refuse("58000", &format!("ALTER TABLE failed: {error}"));
-            }
-            complete_with("ALTER TABLE")
+        _ => {
+            let ops: Vec<AlterOperation> = std::iter::once(stmt.operation.clone())
+                .chain(stmt.rest.iter().cloned())
+                .collect(); // the planner owns its actions; the statement is borrowed
+            crate::ddl_alter::execute_actions(&env, executor, keyspace, meta, ops).await
         }
     }
 }
@@ -879,6 +795,14 @@ pub(crate) async fn execute_create_table(
             .filter(|def| def.not_null && !def.primary_key)
             .map(|def| crate::pg_constraint::not_null_extension(&def.name)),
     );
+    for def in &stmt.columns {
+        let Some(sql) = &def.default else { continue };
+        if let Err(refusal) = crate::ddl_alter::check_enum_default(&env, &table, &def.name, sql) {
+            return vec![refusal];
+        }
+        let (key, value) = crate::pg_default::default_extension(&def.name, sql);
+        table.extensions.insert(key, value);
+    }
     table.extensions.extend(
         stmt.columns
             .iter()
@@ -1016,6 +940,7 @@ pub(crate) fn plan_create_table(
                 not_null: true,
                 primary_key: true,
                 user_type: None,
+                default: None,
                 serial: false,
             },
         );
@@ -1133,7 +1058,7 @@ fn schema_refusal(error: &ferrosa_schema::SchemaError) -> BackendMessage {
 }
 
 /// The CQL type string stored for `def`, through the one PG-name map (D10).
-fn cql_type_string(def: &ColumnDef) -> Result<&'static str, BackendMessage> {
+pub(crate) fn cql_type_string(def: &ColumnDef) -> Result<&'static str, BackendMessage> {
     let cql = cql_type_for_pg_name(pg_type_name(def.ty)).map_err(|e| match e {
         PgTypeError::UnknownPgTypeName(name) => error_response(
             "42704",

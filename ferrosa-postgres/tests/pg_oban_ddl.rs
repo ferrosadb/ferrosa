@@ -935,3 +935,241 @@ async fn not_null_on_a_regular_column_is_enforced() {
         vec![vec![Some("4".to_string()), Some("W".to_string())]]
     );
 }
+
+// ---------------------------------------------------------------------------
+// 8. ALTER TABLE variants, DEFAULTs and CHECK constraints (census 10, 19-20, 22, 28-29,
+//    35, 37-40, 47-49)
+// ---------------------------------------------------------------------------
+
+const OBAN_JOBS_V1: &str =
+    "CREATE TABLE IF NOT EXISTS \"public\".\"oban_jobs\" (\"id\" bigserial, \
+     \"state\" \"public\".oban_job_state DEFAULT 'available' NOT NULL, \
+     \"queue\" text DEFAULT 'default' NOT NULL, \"worker\" text NOT NULL, \"args\" jsonb NOT NULL, \
+     \"attempt\" integer DEFAULT 0 NOT NULL, \"max_attempts\" integer DEFAULT 20 NOT NULL, \
+     \"inserted_at\" timestamp DEFAULT timezone('UTC', now()) NOT NULL, \
+     \"attempted_at\" timestamp, PRIMARY KEY (\"id\"))";
+
+async fn oban_jobs() -> Fixture {
+    let fx = start().await;
+    fx.client.batch_execute(CREATE_STATE).await.unwrap();
+    fx.client
+        .execute(OBAN_JOBS_V1, &[])
+        .await
+        .expect("Oban's v1 CREATE TABLE with DEFAULTs");
+    fx
+}
+
+/// DEFAULT expressions are stored as canonical SQL text for the INSERT path (W2).
+#[tokio::test]
+async fn column_defaults_are_recorded() {
+    let fx = oban_jobs().await;
+    let get = |c: &str| extension(&fx, "oban_jobs", &format!("pg.column_default.{c}"));
+    assert_eq!(get("state").as_deref(), Some("'available'"));
+    assert_eq!(get("queue").as_deref(), Some("'default'"));
+    assert_eq!(get("attempt").as_deref(), Some("0"));
+    assert_eq!(
+        get("inserted_at").as_deref(),
+        Some("timezone('UTC', now())")
+    );
+    assert_eq!(get("worker"), None);
+    assert_eq!(
+        extension(&fx, "oban_jobs", "pg.not_null.state").as_deref(),
+        Some("true")
+    );
+}
+
+/// A literal DEFAULT outside the enum is refused at DDL time, as PostgreSQL does.
+#[tokio::test]
+async fn an_enum_default_must_be_a_label() {
+    let fx = start().await;
+    fx.client.batch_execute(CREATE_STATE).await.unwrap();
+    assert_eq!(
+        code(
+            fx.client
+                .batch_execute(
+                    "CREATE TABLE bad (id int PRIMARY KEY, s oban_job_state DEFAULT 'nope')"
+                )
+                .await
+        ),
+        "22P02"
+    );
+}
+
+/// Several actions in one ALTER: ADD COLUMN IF NOT EXISTS (census 28), ALTER COLUMN TYPE
+/// to the same type and SET DEFAULT (29), SET NOT NULL (37).
+#[tokio::test]
+async fn multi_action_alter_table() {
+    let fx = oban_jobs().await;
+    let c = &fx.client;
+    let add = "ALTER TABLE \"public\".\"oban_jobs\" ADD COLUMN IF NOT EXISTS \"discarded_at\" \
+               timestamp, ADD COLUMN IF NOT EXISTS \"priority\" integer, \
+               ADD COLUMN IF NOT EXISTS \"meta\" jsonb DEFAULT '{}'";
+    c.execute(add, &[])
+        .await
+        .expect("ADD COLUMN IF NOT EXISTS x3");
+    c.execute(add, &[]).await.expect("idempotent");
+    c.execute(
+        "ALTER TABLE \"public\".\"oban_jobs\" ALTER COLUMN \"priority\" TYPE integer, \
+         ALTER COLUMN \"priority\" SET DEFAULT 0, ALTER COLUMN \"args\" TYPE jsonb, \
+         ALTER COLUMN \"args\" SET DEFAULT '{}', ALTER COLUMN \"priority\" SET NOT NULL",
+        &[],
+    )
+    .await
+    .expect("same-type TYPE, SET DEFAULT, SET NOT NULL");
+    let cols = columns_of(&fx, "oban_jobs");
+    assert!(cols.contains(&"priority".to_string()) && cols.contains(&"meta".to_string()));
+    assert_eq!(
+        extension(&fx, "oban_jobs", "pg.column_default.priority").as_deref(),
+        Some("0")
+    );
+    assert_eq!(
+        extension(&fx, "oban_jobs", "pg.column_default.meta").as_deref(),
+        Some("'{}'")
+    );
+    assert_eq!(
+        extension(&fx, "oban_jobs", "pg.not_null.priority").as_deref(),
+        Some("true")
+    );
+    // A real type change cannot be done safely: refused by name, nothing applied.
+    assert_eq!(
+        code(
+            c.batch_execute(
+                "ALTER TABLE oban_jobs ALTER COLUMN priority TYPE text, \
+                             ALTER COLUMN worker SET DEFAULT 'x'"
+            )
+            .await
+        ),
+        "0A000"
+    );
+    assert_eq!(
+        extension(&fx, "oban_jobs", "pg.column_default.worker"),
+        None,
+        "a refused statement applies none of its actions"
+    );
+}
+
+/// SET NOT NULL validates existing rows.
+#[tokio::test]
+async fn set_not_null_refuses_existing_nulls() {
+    let fx = start().await;
+    let c = &fx.client;
+    c.batch_execute("CREATE TABLE sn (id int PRIMARY KEY, p int)")
+        .await
+        .unwrap();
+    c.batch_execute("INSERT INTO sn (id) VALUES (1)")
+        .await
+        .unwrap();
+    assert_eq!(
+        code(
+            c.batch_execute("ALTER TABLE sn ALTER COLUMN p SET NOT NULL")
+                .await
+        ),
+        "23502"
+    );
+    c.batch_execute("UPDATE sn SET p = 0 WHERE id = 1")
+        .await
+        .unwrap();
+    c.batch_execute("ALTER TABLE sn ALTER COLUMN p SET NOT NULL")
+        .await
+        .expect("no NULL left");
+}
+
+/// CHECK constraints (census 19, 38-40, 48-49): enforced on writes, validated against
+/// existing rows unless NOT VALID, and DROP CONSTRAINT removes one.
+#[tokio::test]
+async fn check_constraints_are_enforced() {
+    let fx = oban_jobs().await;
+    let c = &fx.client;
+    for sql in [
+        "ALTER TABLE \"public\".\"oban_jobs\" ADD CONSTRAINT \"worker_length\" CHECK \
+         (char_length(worker) > 0 AND char_length(worker) < 128)",
+        "ALTER TABLE \"public\".\"oban_jobs\" ADD CONSTRAINT \"positive_max_attempts\" CHECK \
+         (max_attempts > 0)",
+        "ALTER TABLE \"public\".\"oban_jobs\" ADD CONSTRAINT \"attempt_range\" CHECK \
+         (attempt between 0 and max_attempts)",
+    ] {
+        c.execute(sql, &[])
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    }
+    let insert = |worker: &str, attempt: i32, max: i32| {
+        format!(
+            "INSERT INTO oban_jobs (id, state, queue, worker, args, attempt, max_attempts, \
+             inserted_at) VALUES ({attempt}{max}, 'available', 'q', '{worker}', '{{}}', \
+             {attempt}, {max}, now())"
+        )
+    };
+    c.batch_execute(&insert("W", 0, 20))
+        .await
+        .expect("a valid row");
+    // UPDATE is checked on the complete new row: the stored max_attempts (20) bounds attempt.
+    assert_eq!(
+        code(
+            c.batch_execute("UPDATE oban_jobs SET attempt = 25 WHERE id = 20")
+                .await
+        ),
+        "23514"
+    );
+    c.batch_execute("UPDATE oban_jobs SET attempt = 3 WHERE id = 20")
+        .await
+        .expect("within the range");
+    for (worker, attempt, max) in [("", 0, 20), ("W", 0, 0), ("W", 21, 20)] {
+        assert_eq!(
+            code(c.batch_execute(&insert(worker, attempt, max)).await),
+            "23514",
+            "{worker:?} {attempt} {max}"
+        );
+    }
+    // A validated ADD fails on an existing violating row; NOT VALID is accepted and still
+    // checks new writes.
+    assert_eq!(
+        code(
+            c.batch_execute("ALTER TABLE oban_jobs ADD CONSTRAINT never CHECK (attempt > 100)")
+                .await
+        ),
+        "23514"
+    );
+    c.execute(
+        "ALTER TABLE \"public\".\"oban_jobs\" ADD CONSTRAINT \"non_negative_priority\" \
+         CHECK (attempt > 5) NOT VALID",
+        &[],
+    )
+    .await
+    .expect("NOT VALID skips existing rows");
+    assert_eq!(code(c.batch_execute(&insert("W", 1, 20)).await), "23514");
+    c.execute(
+        "ALTER TABLE \"public\".\"oban_jobs\" DROP CONSTRAINT \"non_negative_priority\"",
+        &[],
+    )
+    .await
+    .expect("DROP CONSTRAINT");
+    c.batch_execute(&insert("W", 1, 20))
+        .await
+        .expect("the dropped constraint no longer applies");
+    assert_eq!(
+        code(
+            c.batch_execute("ALTER TABLE oban_jobs DROP CONSTRAINT missing")
+                .await
+        ),
+        "42704"
+    );
+}
+
+/// SET UNLOGGED (census 47) is recorded, not applied: ferrosa keeps the table durable,
+/// which is stronger than what was asked.
+#[tokio::test]
+async fn set_unlogged_is_recorded() {
+    let fx = start().await;
+    fx.client
+        .batch_execute("CREATE TABLE peers (name text PRIMARY KEY)")
+        .await
+        .unwrap();
+    fx.client
+        .execute("ALTER TABLE \"public\".peers SET UNLOGGED", &[])
+        .await
+        .expect("SET UNLOGGED");
+    assert_eq!(
+        extension(&fx, "peers", "pg.unlogged").as_deref(),
+        Some("true")
+    );
+}

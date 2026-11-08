@@ -8,7 +8,9 @@
 //! A child module of `parser`, so it shares the private lexer and `Parser`. No recursion.
 
 use super::{ParseError, Parser, Tok};
-use crate::ast::{AlterTypeStmt, CommentStmt, CreateTypeStmt, LockMode, LockStmt, Statement};
+use crate::ast::{
+    AlterOperation, AlterTypeStmt, CommentStmt, CreateTypeStmt, LockMode, LockStmt, Statement,
+};
 
 impl Parser {
     /// The word after the statement's first keyword, upper-cased, without consuming it.
@@ -203,9 +205,269 @@ impl Parser {
     }
 }
 
+/// Words that end a column `DEFAULT` expression at nesting depth 0: the column constraints
+/// that may follow it.
+const DEFAULT_TERMINATORS: &[&str] = &[
+    "NULL",
+    "PRIMARY",
+    "CHECK",
+    "UNIQUE",
+    "REFERENCES",
+    "CONSTRAINT",
+    "DEFAULT",
+    "COLLATE",
+];
+
+impl Parser {
+    /// `DEFAULT <expr>` after the `DEFAULT` keyword: the expression ends at a depth-0 `,` or
+    /// `)` or at the next column constraint. It is parsed with the general scalar grammar
+    /// (so a malformed default is refused here) and returned as canonical SQL text.
+    pub(super) fn parse_default_expr(&mut self) -> Result<String, ParseError> {
+        let start = self.pos;
+        let mut depth = 0usize;
+        while let Some(tok) = self.toks.get(self.pos) {
+            let ends = depth == 0
+                && match tok {
+                    Tok::Comma | Tok::RParen | Tok::Not => true,
+                    Tok::Ident(w) => DEFAULT_TERMINATORS
+                        .iter()
+                        .any(|k| w.eq_ignore_ascii_case(k)),
+                    _ => false,
+                };
+            if ends {
+                break;
+            }
+            match tok {
+                Tok::LParen | Tok::LBracket => depth += 1,
+                Tok::RParen | Tok::RBracket => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            self.pos += 1;
+        }
+        self.parse_expression_slice(start, self.pos, "a DEFAULT expression")
+    }
+
+    /// Parse the tokens `start..end` as one scalar expression and render them. A sub-parser
+    /// owns its tokens, so the slice is copied once; the statement's tokens are untouched.
+    fn parse_expression_slice(
+        &self,
+        start: usize,
+        end: usize,
+        what: &'static str,
+    ) -> Result<String, ParseError> {
+        let slice = &self.toks[start..end];
+        if slice.is_empty() {
+            return Err(ParseError::Unexpected {
+                expected: what,
+                found: "nothing".into(),
+            });
+        }
+        let mut sub = Parser::new(slice.to_vec());
+        sub.parse_scalar_expr()?;
+        sub.expect_end()?;
+        Ok(render_tokens(slice))
+    }
+
+    /// `CHECK ( <expr> ) [NOT VALID]` after `ADD [CONSTRAINT name]`.
+    pub(super) fn parse_add_check(
+        &mut self,
+        name: Option<String>,
+    ) -> Result<AlterOperation, ParseError> {
+        self.expect_ident_kw("CHECK")?;
+        self.expect(&Tok::LParen, "(")?;
+        let start = self.pos;
+        let mut depth = 1usize;
+        while depth > 0 {
+            match self.next() {
+                Some(Tok::LParen) => depth += 1,
+                Some(Tok::RParen) => depth -= 1,
+                Some(_) => {}
+                None => return Err(ParseError::UnexpectedEnd),
+            }
+        }
+        let sql = self.parse_expression_slice(start, self.pos - 1, "a CHECK expression")?;
+        let not_valid = if matches!(self.peek(), Some(Tok::Not)) {
+            self.next();
+            self.expect_ident_kw("VALID")?;
+            true
+        } else {
+            false
+        };
+        Ok(AlterOperation::AddCheck {
+            name,
+            sql,
+            not_valid,
+        })
+    }
+
+    /// `CONSTRAINT [IF EXISTS] name` after `DROP`.
+    pub(super) fn parse_drop_constraint(&mut self) -> Result<AlterOperation, ParseError> {
+        self.expect_ident_kw("CONSTRAINT")?;
+        let if_exists = if self.peek_is_kw("IF") {
+            self.next();
+            self.expect_ident_kw("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.ident()?;
+        if self.peek_is_kw("CASCADE") || self.peek_is_kw("RESTRICT") {
+            return Err(ParseError::UnsupportedAlter(
+                "DROP CONSTRAINT ... CASCADE/RESTRICT".into(),
+            ));
+        }
+        Ok(AlterOperation::DropConstraint { name, if_exists })
+    }
+
+    /// `[COLUMN] c …` after `ALTER`: `[SET DATA] TYPE t`, `SET DEFAULT e`, `DROP DEFAULT`,
+    /// `SET NOT NULL`, `DROP NOT NULL`. Anything else is refused by name.
+    pub(super) fn parse_alter_column(&mut self) -> Result<AlterOperation, ParseError> {
+        if self.peek_is_kw("COLUMN") {
+            self.next();
+        }
+        let column = self.ident()?;
+        if self.peek_is_kw("TYPE") {
+            self.next();
+            return self.parse_alter_column_type(column);
+        }
+        let verb = self.ident()?.to_ascii_uppercase();
+        match (verb.as_str(), self.peek()) {
+            ("SET", Some(Tok::Ident(w))) if w.eq_ignore_ascii_case("DATA") => {
+                self.next();
+                self.expect_ident_kw("TYPE")?;
+                self.parse_alter_column_type(column)
+            }
+            ("SET", Some(Tok::Ident(w))) if w.eq_ignore_ascii_case("DEFAULT") => {
+                self.next();
+                let sql = self.parse_default_expr()?;
+                Ok(AlterOperation::SetDefault { column, sql })
+            }
+            ("DROP", Some(Tok::Ident(w))) if w.eq_ignore_ascii_case("DEFAULT") => {
+                self.next();
+                Ok(AlterOperation::DropDefault { column })
+            }
+            ("SET", Some(Tok::Not)) => {
+                self.next();
+                self.expect_ident_kw("NULL")?;
+                Ok(AlterOperation::SetNotNull { column })
+            }
+            ("DROP", Some(Tok::Not)) => {
+                self.next();
+                self.expect_ident_kw("NULL")?;
+                Ok(AlterOperation::DropNotNull { column })
+            }
+            _ => Err(ParseError::UnsupportedAlter(format!(
+                "ALTER COLUMN ... {verb} (only TYPE, SET/DROP DEFAULT and SET/DROP NOT NULL)"
+            ))),
+        }
+    }
+
+    fn parse_alter_column_type(&mut self, column: String) -> Result<AlterOperation, ParseError> {
+        let (ty, user_type) = self.parse_column_type()?;
+        if self.peek_is_kw("USING") || self.peek_is_kw("COLLATE") {
+            return Err(ParseError::UnsupportedAlter(
+                "ALTER COLUMN ... TYPE ... USING/COLLATE".into(),
+            ));
+        }
+        Ok(AlterOperation::AlterColumnType {
+            column,
+            ty,
+            user_type,
+        })
+    }
+
+    /// `UNLOGGED` / `LOGGED` after `ALTER TABLE t SET`.
+    pub(super) fn parse_alter_set(&mut self) -> Result<AlterOperation, ParseError> {
+        match self.ident()?.to_ascii_uppercase().as_str() {
+            "UNLOGGED" => Ok(AlterOperation::SetLogged(false)),
+            "LOGGED" => Ok(AlterOperation::SetLogged(true)),
+            other => Err(ParseError::UnsupportedAlter(format!(
+                "ALTER TABLE ... SET {other} (only SET LOGGED / SET UNLOGGED)"
+            ))),
+        }
+    }
+}
+
+/// Render tokens back to canonical SQL: keywords upper-cased, identifiers and literals
+/// re-quoted, a space between words, none inside calls, subscripts, casts or before commas.
+pub(super) fn render_tokens(toks: &[Tok]) -> String {
+    let mut out = String::new();
+    let mut prev: Option<&Tok> = None;
+    for tok in toks {
+        let glue = matches!(
+            tok,
+            Tok::Comma | Tok::RParen | Tok::RBracket | Tok::Dot | Tok::Cast
+        ) || matches!(
+            prev,
+            Some(Tok::LParen | Tok::LBracket | Tok::Dot | Tok::Cast)
+        ) || (matches!(tok, Tok::LParen | Tok::LBracket)
+            && matches!(
+                prev,
+                Some(Tok::Ident(_) | Tok::QuotedIdent(_) | Tok::RBracket)
+            ));
+        if prev.is_some() && !glue {
+            out.push(' ');
+        }
+        out.push_str(&token_text(tok));
+        prev = Some(tok);
+    }
+    out
+}
+
+fn token_text(tok: &Tok) -> String {
+    let keyword = match tok {
+        Tok::Select => "SELECT",
+        Tok::From => "FROM",
+        Tok::Join => "JOIN",
+        Tok::Inner => "INNER",
+        Tok::On => "ON",
+        Tok::Where => "WHERE",
+        Tok::As => "AS",
+        Tok::Group => "GROUP",
+        Tok::By => "BY",
+        Tok::Having => "HAVING",
+        Tok::Order => "ORDER",
+        Tok::Asc => "ASC",
+        Tok::Desc => "DESC",
+        Tok::Limit => "LIMIT",
+        Tok::Offset => "OFFSET",
+        Tok::And => "AND",
+        Tok::Or => "OR",
+        Tok::Not => "NOT",
+        Tok::Distinct => "DISTINCT",
+        Tok::Star => "*",
+        Tok::Comma => ",",
+        Tok::Dot => ".",
+        Tok::LParen => "(",
+        Tok::RParen => ")",
+        Tok::Concat => "||",
+        Tok::Cast => "::",
+        Tok::Eq => "=",
+        Tok::Ne => "<>",
+        Tok::Lt => "<",
+        Tok::Le => "<=",
+        Tok::Gt => ">",
+        Tok::Ge => ">=",
+        Tok::Plus => "+",
+        Tok::Minus => "-",
+        Tok::Slash => "/",
+        Tok::Percent => "%",
+        Tok::LBracket => "[",
+        Tok::RBracket => "]",
+        Tok::Ident(w) => return w.clone(), // the rendered text needs its own copy
+        Tok::QuotedIdent(w) => return format!("\"{}\"", w.replace('"', "\"\"")),
+        Tok::Str(s) => return format!("'{}'", s.replace('\'', "''")),
+        Tok::Int(n) => return n.to_string(),
+        Tok::Float(f) => return f.to_string(),
+        Tok::Param(n) => return format!("${n}"),
+        Tok::Other(c) => return c.to_string(),
+    };
+    keyword.to_string()
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::ast::{LockMode, Statement};
+    use crate::ast::{AlterOperation, LockMode, Statement};
     use crate::parser::{parse_statement, ParseError};
 
     #[test]
@@ -290,6 +552,64 @@ mod tests {
         assert!(state.not_null);
         // A built-in refusal is not reinterpreted as a user type.
         assert!(parse_statement("CREATE TABLE s (id serial PRIMARY KEY)").is_err());
+    }
+
+    #[test]
+    fn defaults_are_parsed_and_rendered_canonically() {
+        let Ok(Statement::CreateTable(t)) = parse_statement(
+            "CREATE TABLE j (id bigint PRIMARY KEY, \"state\" text DEFAULT 'available' NOT NULL, \
+             e jsonb DEFAULT ARRAY[]::jsonb[] NOT NULL, \
+             at timestamp DEFAULT timezone( 'UTC' , now()) NOT NULL, n int DEFAULT 0)",
+        ) else {
+            panic!("CREATE TABLE with defaults must parse");
+        };
+        let default = |i: usize| t.columns[i].default.as_deref();
+        assert_eq!(default(1), Some("'available'"));
+        assert!(t.columns[1].not_null);
+        assert_eq!(default(2), Some("ARRAY[]::jsonb[]"));
+        assert_eq!(default(3), Some("timezone('UTC', now())"));
+        assert_eq!(default(4), Some("0"));
+        assert!(
+            parse_statement("CREATE TABLE b (id int PRIMARY KEY, n int DEFAULT (1 +)").is_err()
+        );
+    }
+
+    #[test]
+    fn oban_alter_actions_parse() {
+        let Ok(Statement::AlterTable(a)) = parse_statement(
+            "ALTER TABLE \"public\".\"oban_jobs\" ALTER COLUMN \"priority\" TYPE integer, \
+             ALTER COLUMN \"priority\" SET DEFAULT 0, ALTER COLUMN \"priority\" SET NOT NULL",
+        ) else {
+            panic!("multi-action ALTER must parse");
+        };
+        assert!(matches!(
+            a.operation,
+            AlterOperation::AlterColumnType { .. }
+        ));
+        assert_eq!(a.rest.len(), 2);
+        let Ok(Statement::AlterTable(a)) = parse_statement(
+            "ALTER TABLE t ADD CONSTRAINT \"non_negative_priority\" CHECK (priority >= 0) NOT VALID",
+        ) else {
+            panic!("ADD CHECK must parse");
+        };
+        assert_eq!(
+            a.operation,
+            AlterOperation::AddCheck {
+                name: Some("non_negative_priority".into()),
+                sql: "priority >= 0".into(),
+                not_valid: true,
+            }
+        );
+        let Ok(Statement::AlterTable(a)) = parse_statement(
+            "ALTER TABLE t ADD COLUMN IF NOT EXISTS \"a\" timestamp, DROP CONSTRAINT x, SET UNLOGGED",
+        ) else {
+            panic!("ADD IF NOT EXISTS / DROP CONSTRAINT / SET UNLOGGED must parse");
+        };
+        assert!(matches!(
+            a.operation,
+            AlterOperation::AddColumnIfNotExists(_)
+        ));
+        assert_eq!(a.rest[1], AlterOperation::SetLogged(false));
     }
 
     #[test]

@@ -919,6 +919,36 @@ A non-key column declared `NOT NULL` is recorded (`pg.not_null.<col>`) and enfor
 with `23502` and write nothing. (It used to be parsed and dropped; see `oban-compat.md`.)
 Key columns are NOT NULL by construction.
 
+### `ALTER TABLE` actions, `DEFAULT`s and enforced `CHECK`s (`ddl_alter`, `pg_constraint`)
+
+- **DEFAULT.** A column `DEFAULT <expr>` (in `CREATE TABLE`, `ADD COLUMN`, `ALTER COLUMN …
+  SET DEFAULT`) is parsed with the general scalar grammar (a malformed one is refused) and
+  recorded as canonical SQL in `pg.column_default.<col>` for the INSERT path (W2 applies
+  it). A string-literal default on an enum column must be a label (`22P02`), as PostgreSQL
+  checks. `DROP DEFAULT` clears it.
+- **Multi-action ALTER.** A statement's actions (`ADD COLUMN [IF NOT EXISTS]`, `DROP
+  COLUMN`, `ALTER COLUMN … TYPE / SET|DROP DEFAULT / SET|DROP NOT NULL`, `ADD [CONSTRAINT n]
+  CHECK (…) [NOT VALID]`, `DROP CONSTRAINT [IF EXISTS]`, `SET [UN]LOGGED`) are planned in
+  order and applied as ONE schema change: all or nothing. `ADD PRIMARY KEY` / `ADD FOREIGN
+  KEY` must stand alone.
+- **Type changes.** `ALTER COLUMN c TYPE` to the column's current type is a no-op; any real
+  change is `0A000` naming the column and its type (stored values would need rewriting).
+- **Existing rows.** `SET NOT NULL` is refused (`23502`) if a row is NULL, and a validated
+  `ADD CHECK` (`23514`) if a row violates it — checked with a streamed `SELECT 1 … WHERE …
+  LIMIT 1` probe; `NOT VALID` skips that. `ADD COLUMN` with a `DEFAULT` or `NOT NULL` on a
+  table that already has rows is `0A000`: PostgreSQL backfills, ferrosa does not. Inside a
+  block, a table created earlier in it has no rows to check.
+- **CHECK enforcement.** Every `INSERT`/`UPDATE` evaluates every CHECK on the complete new
+  row (an UPDATE reads the current row first when the table has a CHECK); false is
+  `23514`, NULL passes (Lean `Ferrosa.Sql.Constraint`). Evaluation compiles
+  `SELECT (<check>) FROM <one-row relation>` and streams it through W1's engine
+  (`ferrosa_sql::execute_streaming`). `pg_constraint::check_row` is the single entry point
+  for a write path (enum labels, `NOT NULL`, CHECKs) on the complete, typed new row.
+- **SET UNLOGGED** is recorded (`pg.unlogged`), not applied: the table stays durable, which
+  is stronger than requested. `DROP CONSTRAINT` of a key or foreign key is `0A000`.
+- A `CHECK` written inside `CREATE TABLE` is still refused by name (`0A000`); Oban adds its
+  checks with `ALTER TABLE`.
+
 ### Extended-protocol transaction boundary
 
 Extended-protocol pipelines stage DML until `Sync` and commit the group as one atomic batch. An error rolls back preceding writes in that group, disconnect discards staging, and an explicit `BEGIN` remains open across `Sync`. Commit failures are reported before `ReadyForQuery`. Tests: `server::txn_atomicity_tests::extended_pipeline_*`.

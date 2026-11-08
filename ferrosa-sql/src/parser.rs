@@ -3131,7 +3131,9 @@ mod tests {
     fn other_alter_forms_are_refused_by_name() {
         for sql in [
             "ALTER TABLE t RENAME TO u",
-            "ALTER TABLE t ALTER COLUMN c TYPE bigint",
+            // `ALTER COLUMN c TYPE t` now parses; the front end applies a same-type no-op and
+            // refuses a real type change by name (0A000).
+            "ALTER TABLE t ALTER COLUMN c TYPE bigint USING c::bigint",
             "ALTER INDEX i RENAME TO j",
         ] {
             match parse_statement(sql) {
@@ -3260,10 +3262,6 @@ mod tests {
                 "CHECK",
             ),
             ("CREATE TABLE t (id serial PRIMARY KEY)", "SERIAL"),
-            (
-                "CREATE TABLE t (id int PRIMARY KEY, n int DEFAULT 1 + 1)",
-                "DEFAULT",
-            ),
             ("CREATE TABLE other.t (id int PRIMARY KEY)", "schema"),
         ];
         for (sql, clause) in cases {
@@ -3490,15 +3488,13 @@ mod tests {
     }
 
     #[test]
-    fn default_expression_is_refused_by_name() {
-        assert_eq!(
-            refused("CREATE TABLE t (id int PRIMARY KEY, at timestamp DEFAULT now())"),
-            UnsupportedClause::DefaultExpr
-        );
-        assert_eq!(
-            refused("CREATE TABLE t (id int PRIMARY KEY, n int DEFAULT 0)"),
-            UnsupportedClause::DefaultExpr
-        );
+    fn default_expression_is_recorded() {
+        // DEFAULT used to be refused (D10); it is now parsed with the general scalar grammar
+        // and recorded as canonical SQL for the INSERT path.
+        let c = create("CREATE TABLE t (id int PRIMARY KEY, at timestamp DEFAULT now())");
+        assert_eq!(c.columns[1].default.as_deref(), Some("now()"));
+        let c = create("CREATE TABLE t (id int PRIMARY KEY, n int DEFAULT 0)");
+        assert_eq!(c.columns[1].default.as_deref(), Some("0"));
     }
 
     #[test]

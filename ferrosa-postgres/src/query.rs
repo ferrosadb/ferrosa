@@ -1418,6 +1418,72 @@ fn value_type_name(value: &SqlValue) -> &'static str {
 /// Where a reply's messages go as they are produced. The server's sink writes
 /// them to the socket, so a streaming `SELECT` never accumulates its rows;
 /// `Vec<BackendMessage>` collects them for tests and tools.
+/// The [`crate::ddl_alter::RowProbe`] over a read environment: `SELECT 1 FROM t WHERE p
+/// LIMIT 1`, streamed into a sink that records only whether a row arrived.
+struct EnvProbe<'a> {
+    env: ReadEnv<'a>,
+}
+
+#[async_trait::async_trait]
+impl crate::ddl_alter::RowProbe for EnvProbe<'_> {
+    async fn any_row(
+        &self,
+        keyspace: &str,
+        table: &str,
+        predicate: &str,
+    ) -> Result<bool, BackendMessage> {
+        let sql = format!(
+            "SELECT 1 FROM \"{}\".\"{}\" WHERE {predicate} LIMIT 1",
+            keyspace.replace('"', "\"\""),
+            table.replace('"', "\"\"")
+        );
+        let mut sink = AnyRow::default();
+        let tail = execute_query_streaming(self.env, &sql, None, &mut sink)
+            .await
+            .map_err(|e| error_response("58000", &format!("validation read failed: {e}")))?;
+        if let Some(error) = sink.error.or_else(|| {
+            tail.into_iter()
+                .find(|m| matches!(m, BackendMessage::ErrorResponse { .. }))
+        }) {
+            return Err(error);
+        }
+        Ok(sink.found)
+    }
+}
+
+/// A sink that keeps nothing but whether a data row arrived (and the first error).
+#[derive(Default)]
+struct AnyRow {
+    found: bool,
+    error: Option<BackendMessage>,
+}
+
+impl ReplySink for AnyRow {
+    async fn send(&mut self, messages: Vec<BackendMessage>) -> std::io::Result<()> {
+        for message in messages {
+            match message {
+                BackendMessage::DataRow { .. } => self.found = true,
+                BackendMessage::ErrorResponse { .. } if self.error.is_none() => {
+                    self.error = Some(message)
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    async fn send_rows<I: Iterator<Item = Row>>(
+        &mut self,
+        mut rows: I,
+        _types: &[ColumnType],
+        _formats: &[i16],
+    ) -> std::io::Result<(usize, Option<BackendMessage>)> {
+        let found = rows.next().is_some();
+        self.found |= found;
+        Ok((usize::from(found), None))
+    }
+}
+
 pub(crate) trait ReplySink {
     /// Deliver `messages` in order. An error means the peer is gone.
     async fn send(&mut self, messages: Vec<BackendMessage>) -> std::io::Result<()>;
@@ -1768,7 +1834,9 @@ async fn execute_statement(
         | Statement::Comment(_)
         | Statement::CreateType(_)
         | Statement::AlterType(_)) => {
-            crate::ddl::execute_ddl_statement(ddl, schema, default_schema, stmt, txn).await
+            let probe = EnvProbe { env };
+            crate::ddl::execute_ddl_statement(ddl, schema, default_schema, stmt, txn, Some(&probe))
+                .await
         }
         // `COPY ... FROM STDIN` cannot be answered in one step: the payload arrives AFTER the
         // acknowledgement, as `CopyData` frames, so the connection loop drives it. Reaching here
@@ -2787,7 +2855,7 @@ fn decimal_from_numeric_text(text: &str) -> Result<CqlValue, BackendMessage> {
 /// rather than guessed at, because a silently misread value is worse than a refusal. A value that
 /// has a text form but does not parse is refused `22P02`, matching PostgreSQL's
 /// `invalid_text_representation` — never defaulted to zero, empty, or NULL.
-fn text_to_sql_value(ty: &CqlType, text: &str) -> Result<SqlValue, BackendMessage> {
+pub(crate) fn text_to_sql_value(ty: &CqlType, text: &str) -> Result<SqlValue, BackendMessage> {
     let trimmed = text.trim();
     let bad = |what: &str| {
         Err(error_response(
@@ -3136,7 +3204,17 @@ pub(crate) async fn execute_insert(
         }
         // Every NOT NULL column must have been given a non-NULL value (Lean
         // `Ferrosa.Sql.Constraint.admitted_writes_preserve_constraints`).
-        if let Err(violation) = crate::pg_constraint::check_inserted_row(meta, &sql_values) {
+        let typed: Result<HashMap<String, SqlValue>, BackendMessage> = col_values
+            .iter()
+            .map(|(name, value)| {
+                crate::storage_provider::cql_to_value(value)
+                    .map(|v| (name.clone(), v)) // the check row needs its own key
+                    .map_err(|e| error_response("XX000", &e))
+            })
+            .collect();
+        if let Err(violation) =
+            typed.and_then(|row| crate::pg_constraint::check_row(schema, meta, &row))
+        {
             return vec![violation];
         }
 
@@ -3884,10 +3962,15 @@ fn collect_set_columns(expr: &SetExpr, out: &mut Vec<String>) {
 fn current_image_for_set(
     row: &ResolvedRow,
     upd: &UpdateStmt,
+    meta: &ferrosa_schema::TableMetadata,
 ) -> Result<std::collections::HashMap<String, SqlValue>, BackendMessage> {
     let mut referenced = Vec::new();
     for (_, expr) in &upd.assignments {
         collect_set_columns(expr, &mut referenced);
+    }
+    // A CHECK spans columns the SET may not name: it is evaluated on the complete new row.
+    if !crate::pg_constraint::checks(meta).is_empty() {
+        referenced = meta.columns.keys().cloned().collect();
     }
     let mut image = std::collections::HashMap::new();
     for name in referenced {
@@ -3965,6 +4048,7 @@ fn build_update_mutation(
     {
         return Err(error_response(&code, &message));
     }
+    check_updated_row(ctx, current, &assigned)?;
     let timestamp = dml_timestamp();
     let key = ferrosa_row_bridge::build_decorated_key(pk_values, &[])
         .map_err(|error| error_response("22000", &error.to_string()))?;
@@ -3976,6 +4060,26 @@ fn build_update_mutation(
         vec![row],
         timestamp,
     ))
+}
+
+/// Evaluate the table's CHECKs on the complete new row: the current row image (which holds
+/// every column when the table has a CHECK) overlaid with the assigned values.
+fn check_updated_row(
+    ctx: &UpdateTarget<'_>,
+    current: Option<&std::collections::HashMap<String, SqlValue>>,
+    assigned: &std::collections::HashMap<String, CqlValue>,
+) -> Result<(), BackendMessage> {
+    if crate::pg_constraint::checks(ctx.meta).is_empty() {
+        return Ok(());
+    }
+    // The check needs its own row: the current image is still read by the caller.
+    let mut row = current.cloned().unwrap_or_default();
+    for (name, value) in assigned {
+        let value = crate::storage_provider::cql_to_value(value)
+            .map_err(|e| error_response("XX000", &e))?;
+        row.insert(name.clone(), value);
+    }
+    crate::pg_constraint::check_checks(ctx.schema, ctx.meta, &row)
 }
 
 /// Initial candidate selection is a statement snapshot plus own writes. The
@@ -4292,7 +4396,7 @@ async fn apply_update_row(
     } else {
         row
     };
-    let image = current_image_for_set(row, ctx.upd).map_err(|message| vec![message])?;
+    let image = current_image_for_set(row, ctx.upd, ctx.meta).map_err(|message| vec![message])?;
     let mutation = build_update_mutation(ctx, &row.pk_values, &row.ck_values, Some(&image))
         .map_err(|message| vec![message])?;
     apply_or_buffer_silent(
@@ -4709,10 +4813,14 @@ pub(crate) async fn execute_update(
 
     // Does any SET value read a column of the row being updated? Only then is the
     // row read (a read-modify-write); a constant SET never touches storage here.
-    let needs_read = upd
-        .assignments
-        .iter()
-        .any(|(_, expr)| expr.references_column());
+    // A table with a CHECK is read too: a check spans columns the SET may not name, so it is
+    // evaluated on the complete new row (`pg_constraint`).
+    let has_checks = !crate::pg_constraint::checks(meta).is_empty();
+    let needs_read = has_checks
+        || upd
+            .assignments
+            .iter()
+            .any(|(_, expr)| expr.references_column());
     let current: Option<HashMap<String, SqlValue>> = if needs_read {
         match read_current_row_for_update(
             engine,
@@ -7632,6 +7740,7 @@ mod txn_buffer_tests {
                 schema,
                 view: schema.snapshot(),
                 default_schema: "public",
+                probe: None,
             },
             &stmt,
         )

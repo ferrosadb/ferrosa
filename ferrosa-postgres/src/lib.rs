@@ -21,6 +21,7 @@ pub mod connection;
 pub mod copy_decode;
 mod copy_stdin;
 pub mod ddl;
+mod ddl_alter;
 mod ddl_txn;
 pub mod extended;
 pub mod handshake;
