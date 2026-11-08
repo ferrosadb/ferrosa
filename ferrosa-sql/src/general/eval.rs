@@ -154,6 +154,9 @@ fn eval_node(e: &CExpr, env: &Env<'_>) -> R<Value> {
             }
             Ok(Value::Array(ArrayValue::new(*elem, values)))
         }
+        CExpr::CatalogCast(name) => Err(internal(format!(
+            "a ::{name} cast reached evaluation unresolved; the front end resolves catalog casts"
+        ))),
         CExpr::AtUtc(inner) => match eval(inner, env)? {
             // Both directions keep the instant's microseconds: UTC has no offset.
             v @ (Value::Timestamp(_) | Value::Null) => Ok(v),

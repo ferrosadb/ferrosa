@@ -503,7 +503,7 @@ where
 
     match msg {
         FrontendMessage::Query(sql) => {
-            let msgs = execute_simple_to(
+            let msgs = execute_query_message(
                 ctx,
                 session,
                 &sql,
@@ -752,6 +752,74 @@ impl Drop for StatementScope<'_> {
 /// ownership on Direct nodes, and Accord ordering in cluster mode.
 ///
 /// A `SELECT`'s rows are written to `out` as they are produced; the returned
+/// A simple `Query` message: one statement, or several separated by `;`.
+///
+/// Several statements outside a transaction block run in ONE implicit transaction,
+/// as PostgreSQL runs them: an error rolls back the statements before it and the
+/// rest do not run. A message that itself holds transaction control (`BEGIN`,
+/// `COMMIT`, ...) runs its statements in order instead, stopping at the first error.
+async fn execute_query_message<O: ReplySink>(
+    ctx: &QueryContext,
+    session: &mut Session,
+    sql: &str,
+    out: &mut O,
+) -> std::io::Result<Vec<BackendMessage>> {
+    let pieces = crate::simple_split::split_statements(sql);
+    if pieces.len() <= 1 {
+        return execute_simple_to(ctx, session, sql, out).await;
+    }
+    let implicit = !session.in_txn()
+        && !session.in_failed_txn()
+        && !pieces.iter().any(|p| is_transaction_control(p));
+    if implicit {
+        if let Err(error) = begin_implicit_transaction(ctx, session).await {
+            return Ok(vec![error]);
+        }
+    }
+    let mut messages = Vec::new();
+    for piece in pieces {
+        let reply = execute_simple_to(ctx, session, piece, out).await?;
+        let failed = reply
+            .iter()
+            .any(|m| matches!(m, BackendMessage::ErrorResponse { .. }));
+        messages.extend(reply);
+        if failed {
+            if implicit {
+                session.end_txn();
+            }
+            return Ok(messages);
+        }
+    }
+    if implicit {
+        let commit = commit_txn(ctx, session).await;
+        if let Some(error @ BackendMessage::ErrorResponse { .. }) = commit.into_iter().next() {
+            messages.push(error);
+        }
+    }
+    Ok(messages)
+}
+
+/// Whether a statement starts or ends a transaction block.
+fn is_transaction_control(statement: &str) -> bool {
+    let word = statement
+        .split(|c: char| c.is_whitespace() || c == ';')
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    matches!(
+        word.as_str(),
+        "BEGIN"
+            | "START"
+            | "COMMIT"
+            | "END"
+            | "ROLLBACK"
+            | "ABORT"
+            | "SAVEPOINT"
+            | "RELEASE"
+            | "PREPARE"
+    )
+}
+
 /// messages are the tail still to send (its `CommandComplete`, or the
 /// `ErrorResponse` that ended it).
 ///

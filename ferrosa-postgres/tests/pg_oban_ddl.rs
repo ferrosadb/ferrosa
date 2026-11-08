@@ -1420,3 +1420,68 @@ async fn enum_and_regnamespace_casts_resolve_through_the_catalog() {
         vec![vec![Some("1".to_string())]]
     );
 }
+
+/// Catalog casts over the extended protocol: Parse/Describe must type them before
+/// the front end resolves them at Execute (found by W4).
+#[tokio::test]
+async fn catalog_casts_work_over_the_extended_protocol() {
+    let fx = enum_fixture().await;
+    let row = fx
+        .client
+        .query_one("SELECT ('public'::regnamespace::oid)::text", &[])
+        .await
+        .expect("regnamespace over the extended protocol");
+    assert!(!row.get::<_, String>(0).is_empty());
+    let row = fx
+        .client
+        .query_one("SELECT ('available'::\"public\".oban_job_state)::text", &[])
+        .await
+        .expect("an enum cast over the extended protocol");
+    assert_eq!(row.get::<_, String>(0), "available");
+}
+
+/// A simple query may hold several statements; each answers in order (found by W4).
+#[tokio::test]
+async fn a_simple_query_with_several_statements_runs_each() {
+    let fx = start().await;
+    let messages = fx
+        .client
+        .simple_query("SELECT 1; SELECT 'two'")
+        .await
+        .expect("multi-statement simple query");
+    let values: Vec<String> = messages
+        .iter()
+        .filter_map(|m| match m {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_string),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(values, ["1", "two"]);
+}
+
+/// The statements of one simple query share an implicit transaction: an error in a
+/// later one rolls back the earlier ones (PostgreSQL), never a partial commit.
+#[tokio::test]
+async fn a_multi_statement_query_is_one_implicit_transaction() {
+    let fx = start().await;
+    fx.client.batch_execute(SCHEMA_MIGRATIONS).await.unwrap();
+    let error = fx
+        .client
+        .simple_query("INSERT INTO schema_migrations (version) VALUES (1); SELECT 1 / 0")
+        .await
+        .expect_err("division by zero");
+    assert_eq!(error.code().map(|c| c.code()), Some("22012"));
+    assert_eq!(
+        rows(&fx.client, "SELECT version FROM schema_migrations").await,
+        Vec::<Vec<Option<String>>>::new(),
+        "the INSERT before the failure is rolled back"
+    );
+    fx.client
+        .simple_query("INSERT INTO schema_migrations (version) VALUES (2); SELECT 1")
+        .await
+        .expect("both succeed");
+    assert_eq!(
+        rows(&fx.client, "SELECT version FROM schema_migrations").await,
+        vec![vec![Some("2".to_string())]]
+    );
+}

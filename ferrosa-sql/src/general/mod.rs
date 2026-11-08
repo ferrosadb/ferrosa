@@ -166,6 +166,10 @@ pub(crate) enum CExpr {
     Subquery(Arc<Query>),
     ArraySubquery(Arc<Query>, ArrayElem),
     Array(Vec<CExpr>, ArrayElem),
+    /// A cast whose meaning lives in the catalog (`::regclass`, `::regnamespace`, an
+    /// enum type). The PostgreSQL front end rewrites it to a literal before
+    /// execution; evaluating one means it was not, and is refused.
+    CatalogCast(String),
     /// `x AT TIME ZONE 'UTC'` either way round: the instant's microseconds are
     /// unchanged, only the static type flips between timestamp and timestamptz.
     AtUtc(Box<CExpr>),
@@ -760,6 +764,14 @@ impl Compiler<'_> {
                 self.max_param.set(self.max_param.get().max(*n));
                 (CExpr::Param(*n), None)
             }
+            ScalarExpr::Cast { expr, ty } if catalog_cast_type(ty).is_some() => {
+                // Resolved by the front end before execution; typed here so Parse and
+                // Describe work. Reaching evaluation unresolved is an error.
+                let target = catalog_cast_type(ty).expect("guarded");
+                // The operand still compiles, so its own errors surface here.
+                let _operand = sub(expr, ctx)?;
+                (CExpr::CatalogCast(ty.name.clone()), Some(target))
+            }
             ScalarExpr::Cast { expr, ty } => {
                 let target = cast_type(ty)?;
                 let (inner, _) = sub(expr, ctx)?;
@@ -1188,6 +1200,24 @@ pub fn cast_type_supported(ty: &TypeName) -> bool {
             .as_deref()
             .is_none_or(|s| s.eq_ignore_ascii_case("pg_catalog"));
     regclass || cast_type(ty).is_ok()
+}
+
+/// The static type of a catalog cast: an OID for `regclass`/`regnamespace`, the
+/// label text for a schema-qualified user type (an enum).
+fn catalog_cast_type(ty: &TypeName) -> Option<ColumnType> {
+    if ty.array {
+        return None;
+    }
+    let pg_catalog = ty
+        .schema
+        .as_deref()
+        .is_none_or(|s| s.eq_ignore_ascii_case("pg_catalog"));
+    let name = ty.name.to_ascii_lowercase();
+    match (pg_catalog, name.as_str()) {
+        (true, "regclass" | "regnamespace") => Some(ColumnType::Oid),
+        (false, _) => Some(ColumnType::Text),
+        _ => None,
+    }
 }
 
 /// The type a `::name` cast produces. A name outside this set is refused.

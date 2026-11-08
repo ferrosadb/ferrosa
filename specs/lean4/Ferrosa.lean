@@ -50,6 +50,7 @@ import Ferrosa.Sql.Limit
 import Ferrosa.Sql.Dml
 import Ferrosa.Sql.Oid
 import Ferrosa.Sql.TableLock
+import Ferrosa.Sql.SimpleSplit
 import Ferrosa.Bolt.Session
 import Ferrosa.Sparql.Semantics
 import Ferrosa.Sql.Index

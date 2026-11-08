@@ -345,3 +345,18 @@ fixing commit.
         keeps its own waits acyclic.
   * Tests: `share_update_exclusive_admits_writers_from_another_connection`,
     `share_mode_holds_off_writers_of_the_table`.
+* **A simple query with several statements failed with `42601 bad token: ;`.**
+  Found by W4; fixed. `simple_split.rs` splits on top-level `;`, aware of
+  quotes, dollar quotes and comments.
+  * Several statements run in one implicit transaction, as in PostgreSQL: an
+    error rolls back the earlier ones.
+  * Lean: `Sql/SimpleSplit.lean` (`split_rejoins`,
+    `pieces_have_no_top_level_semicolon`).
+  * Tests: `a_simple_query_with_several_statements_runs_each`,
+    `a_multi_statement_query_is_one_implicit_transaction`.
+* **Catalog casts failed over the extended protocol.** Found by W4; fixed.
+  Parse/Describe could not type `::regnamespace` or `::schema.enum`.
+  * The compiler now types them (`oid`, or the label text) and the front end
+    resolves them at Execute.
+  * Evaluating an unresolved one is an internal error, never a pass-through.
+  * Test: `catalog_casts_work_over_the_extended_protocol`.

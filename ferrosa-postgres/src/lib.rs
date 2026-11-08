@@ -50,6 +50,7 @@ mod row_change_codec;
 pub mod scram;
 mod serial_id;
 pub mod server;
+mod simple_split;
 pub mod storage_provider;
 pub mod store;
 mod txn_write_set;
