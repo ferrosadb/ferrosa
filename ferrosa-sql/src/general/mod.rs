@@ -51,6 +51,9 @@ pub(crate) struct Query {
     distinct: bool,
     limit: Option<u64>,
     offset: Option<u64>,
+    /// `LIMIT $n` / `OFFSET $n`, resolved when the query opens (`Limit.lean`).
+    limit_param: Option<usize>,
+    offset_param: Option<usize>,
     /// Whether any expression evaluated over this query's rows holds a subquery,
     /// so each row must be lent to it as an outer frame.
     needs_frame: bool,
@@ -317,6 +320,10 @@ impl Compiler<'_> {
             });
         }
 
+        for n in stmt.limit_param.iter().chain(stmt.offset_param.iter()) {
+            self.max_param.set(self.max_param.get().max(*n));
+            self.record(&CExpr::Param(*n), Some(ColumnType::BigInt));
+        }
         let filter = match &stmt.filter {
             Some(f) => {
                 needs_frame |= condition_has_subquery(f);
@@ -342,6 +349,8 @@ impl Compiler<'_> {
             distinct: stmt.distinct,
             limit: stmt.limit,
             offset: stmt.offset,
+            limit_param: stmt.limit_param,
+            offset_param: stmt.offset_param,
             needs_frame,
             params_needed: 0,
         };

@@ -557,6 +557,8 @@ impl SelectStmt {
         };
         self.filter.as_ref().is_some_and(Expr::references_param)
             || self.having.as_ref().is_some_and(Expr::references_param)
+            || self.limit_param.is_some()
+            || self.offset_param.is_some()
             || self.ctes.iter().any(|c| c.query.references_param())
             || self.joins.iter().any(|j| j.on.references_param())
             || items.iter().any(|i| match i {
@@ -613,6 +615,11 @@ pub struct SelectStmt {
     pub order_by: Vec<OrderItem>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+    /// `LIMIT $n`: the count arrives as bound parameter `n` (Oban's `LIMIT $2`).
+    /// Resolved when the statement is opened (`Limit.lean`); `limit` is `None`.
+    pub limit_param: Option<usize>,
+    /// `OFFSET $n`, as `limit_param`.
+    pub offset_param: Option<usize>,
 }
 
 /// The right-hand side of a comparison: either an inline literal or a bound
@@ -908,6 +915,8 @@ impl SelectStmt {
                 if items.iter().any(|i| matches!(i, SelectItem::Expr { .. })))
             || self.filter.as_ref().is_some_and(Expr::has_scalar)
             || self.having.as_ref().is_some_and(Expr::has_scalar)
+            || self.limit_param.is_some()
+            || self.offset_param.is_some()
     }
 }
 

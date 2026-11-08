@@ -161,11 +161,38 @@ fn open(
             }));
         }
     }
-    let offset = q
-        .offset
-        .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX));
-    let limit = q.limit.map(|n| usize::try_from(n).unwrap_or(usize::MAX));
+    let offset = match q.offset_param {
+        Some(n) => bound_param(rt, n, "OFFSET", "2201X")?,
+        None => q.offset,
+    }
+    .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX));
+    let limit = match q.limit_param {
+        Some(n) => bound_param(rt, n, "LIMIT", "2201W")?,
+        None => q.limit,
+    }
+    .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
     Ok(limit_offset(rows, offset, limit))
+}
+
+/// Resolve a `LIMIT $n` / `OFFSET $n` value (`Limit.lean` `resolve`): NULL is no
+/// bound, a negative count is an error, never clamped.
+fn bound_param(
+    rt: &Rt,
+    n: usize,
+    clause: &str,
+    negative_state: &'static str,
+) -> Result<Option<u64>, ExecError> {
+    match rt.params.get(n - 1) {
+        None => Err(ExecError::MissingParameter(n)),
+        Some(Value::Null) => Ok(None),
+        Some(Value::Int(v)) => u64::try_from(*v)
+            .map(Some)
+            .map_err(|_| ExecError::eval(negative_state, format!("{clause} must not be negative"))),
+        Some(other) => Err(ExecError::eval(
+            "22023",
+            format!("{clause} must be an integer, not {other:?}"),
+        )),
+    }
 }
 
 fn scan(source: &Source, rt: &Arc<Rt>) -> Result<TryRowStream<'static>, ExecError> {

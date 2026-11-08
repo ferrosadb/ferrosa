@@ -170,7 +170,7 @@ against ferrosa.
     `typelem`, `typrelid` and `typbasetype`;
   * `pg_attribute` now has `attisdropped`.
   * Postgrex picks its codecs from these columns.
-* **`LIMIT $n` is not parsed.** Oban fetches jobs with `LIMIT $2`. Open, W1.
+* **`LIMIT $n` was not parsed.** Fixed: `LIMIT`/`OFFSET` take `$n` (and `LIMIT ALL`); NULL is no bound, a negative value is 2201W/2201X. Lean: `Limit.lean`.
 * **A no-`FROM` select uses the narrow scalar grammar.**
   * `SELECT coalesce($1, 0)` and `SELECT pg_notify(...)` fail to parse.
   * Route them to the general planner over a single empty row.

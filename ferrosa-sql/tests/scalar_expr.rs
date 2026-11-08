@@ -516,3 +516,44 @@ fn describe_and_param_inference_follow_the_expression_types() {
         vec![ColumnType::Array(ArrayElem::Text), ColumnType::Int]
     );
 }
+
+// -- LIMIT / OFFSET parameters (Limit.lean) ------------------------------------
+
+#[test]
+fn limit_and_offset_take_bound_parameters() {
+    assert_eq!(
+        select(
+            "SELECT id FROM t ORDER BY id LIMIT $1 OFFSET $2",
+            &[int(1), int(1)]
+        ),
+        vec![vec![int(2)]]
+    );
+    // LIMIT NULL is LIMIT ALL; OFFSET NULL is no offset.
+    assert_eq!(
+        select(
+            "SELECT id FROM t ORDER BY id LIMIT $1 OFFSET $2",
+            &[Value::Null, Value::Null]
+        )
+        .len(),
+        3
+    );
+}
+
+#[test]
+fn a_negative_limit_or_offset_parameter_is_an_error() {
+    let err = select_err("SELECT id FROM t LIMIT $1", &[int(-1)]);
+    assert_eq!(sqlstate(&err), "2201W", "{err}");
+    let err = select_err("SELECT id FROM t OFFSET $1", &[int(-1)]);
+    assert_eq!(sqlstate(&err), "2201X", "{err}");
+}
+
+#[test]
+fn limit_parameter_types_are_inferred_as_bigint() {
+    let Statement::Select(stmt) =
+        parse_statement("SELECT id FROM t WHERE a > $1 LIMIT $2").unwrap()
+    else {
+        panic!()
+    };
+    let params = ferrosa_sql::infer_param_types(&stmt, &catalog(), "public").unwrap();
+    assert_eq!(params, vec![ColumnType::Int, ColumnType::BigInt]);
+}

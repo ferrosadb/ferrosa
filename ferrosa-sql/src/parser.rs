@@ -766,17 +766,32 @@ impl Parser {
             Vec::new()
         };
         // LIMIT and OFFSET in either order, both optional.
-        let mut limit = None;
-        let mut offset = None;
+        // Each may be a literal count, a `$n` parameter, or (LIMIT) `ALL`.
+        let (mut limit, mut limit_param, mut seen_limit) = (None, None, false);
+        let (mut offset, mut offset_param, mut seen_offset) = (None, None, false);
         loop {
             match self.peek() {
-                Some(Tok::Limit) if limit.is_none() => {
+                Some(Tok::Limit) if !seen_limit => {
                     self.next();
-                    limit = Some(self.parse_u64()?);
+                    seen_limit = true;
+                    if self.peek_word("ALL") {
+                        self.next();
+                    } else if let Some(Tok::Param(n)) = self.peek() {
+                        limit_param = Some(*n);
+                        self.next();
+                    } else {
+                        limit = Some(self.parse_u64()?);
+                    }
                 }
-                Some(Tok::Offset) if offset.is_none() => {
+                Some(Tok::Offset) if !seen_offset => {
                     self.next();
-                    offset = Some(self.parse_u64()?);
+                    seen_offset = true;
+                    if let Some(Tok::Param(n)) = self.peek() {
+                        offset_param = Some(*n);
+                        self.next();
+                    } else {
+                        offset = Some(self.parse_u64()?);
+                    }
                 }
                 _ => break,
             }
@@ -794,6 +809,8 @@ impl Parser {
             order_by,
             limit,
             offset,
+            limit_param,
+            offset_param,
         })
     }
 
