@@ -40,9 +40,9 @@ use ferrosa_common::timeuuid::is_synthetic_key_column;
 use ferrosa_common::{CqlType, CqlValue};
 use ferrosa_schema::{ColumnKind, Schema};
 use ferrosa_sql::{
-    parse_statement, ArithOp, CastTarget, Column, ColumnType, DeleteStmt, ExecError, Expr,
-    InsertStmt, MapCatalog, QueryResult, Returning, Row, ScalarItem, ScalarValue, SelectStmt,
-    SetExpr, Statement, Term, UpdateStmt, Value as SqlValue,
+    ArithOp, CastTarget, Column, ColumnType, DeleteStmt, ExecError, Expr, InsertStmt, MapCatalog,
+    QueryResult, Returning, Row, ScalarItem, ScalarValue, SelectStmt, SetExpr, Statement, Term,
+    UpdateStmt, Value as SqlValue,
 };
 use ferrosa_storage::{Mutation, StorageEngine};
 
@@ -116,6 +116,7 @@ fn render_value(value: &SqlValue) -> Result<Option<Vec<u8>>, EncodeError> {
         SqlValue::Numeric { unscaled, scale } => render_numeric_text(unscaled, *scale).into_bytes(),
         // PostgreSQL jsonb text (D26), or a typed error for a corrupt cell.
         SqlValue::Jsonb(doc) => crate::jsonb_wire::render_text(doc)?,
+        SqlValue::Array(array) => render_array_text(array)?,
         SqlValue::JsonPath(_) | SqlValue::TextArray(_) => {
             return Err(EncodeError::unsupported(
                 "result format for jsonpath and text[] values is not supported yet (T-161b)",
@@ -123,6 +124,86 @@ fn render_value(value: &SqlValue) -> Result<Option<Vec<u8>>, EncodeError> {
         }
     };
     Ok(Some(text))
+}
+
+/// PostgreSQL `array_out`: `{a,b,NULL}`. An element is double-quoted when it is
+/// empty, spells `NULL` (any case), or contains a delimiter, brace, quote,
+/// backslash or whitespace; inside quotes `"` and `\` are backslash-escaped.
+fn render_array_text(array: &ferrosa_sql::ArrayValue) -> Result<Vec<u8>, EncodeError> {
+    let mut out = Vec::with_capacity(2 + array.items.len() * 4);
+    out.push(b'{');
+    for (index, item) in array.items.iter().enumerate() {
+        if index > 0 {
+            out.push(b',');
+        }
+        match render_value(item)? {
+            None => out.extend_from_slice(b"NULL"),
+            Some(text) if array_text_needs_quotes(&text) => {
+                out.push(b'"');
+                for byte in text {
+                    if byte == b'"' || byte == b'\\' {
+                        out.push(b'\\');
+                    }
+                    out.push(byte);
+                }
+                out.push(b'"');
+            }
+            Some(text) => out.extend_from_slice(&text),
+        }
+    }
+    out.push(b'}');
+    Ok(out)
+}
+
+fn array_text_needs_quotes(text: &[u8]) -> bool {
+    text.is_empty()
+        || text.eq_ignore_ascii_case(b"NULL")
+        || text
+            .iter()
+            .any(|b| matches!(b, b'{' | b'}' | b',' | b'"' | b'\\') || b.is_ascii_whitespace())
+}
+
+/// PostgreSQL `array_send` for a one-dimensional array: ndim, has-null flag,
+/// element OID, then (length, lower bound 1), then each element as a 4-byte
+/// length (`-1` for NULL) and its own binary encoding.
+fn encode_array_binary(array: &ferrosa_sql::ArrayValue) -> Result<Vec<u8>, EncodeError> {
+    let elem_type = crate::pg_types::for_array_elem(array.elem);
+    let mut out = Vec::with_capacity(20 + array.items.len() * 8);
+    let ndim: i32 = if array.items.is_empty() { 0 } else { 1 };
+    let has_null = array.items.iter().any(SqlValue::is_null);
+    out.extend_from_slice(&ndim.to_be_bytes());
+    out.extend_from_slice(&i32::from(has_null).to_be_bytes());
+    out.extend_from_slice(&elem_type.oid.to_be_bytes());
+    if ndim == 1 {
+        let len = i32::try_from(array.items.len()).map_err(|_| {
+            EncodeError::from("array is too long for the PostgreSQL wire format".to_string())
+        })?;
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(&1i32.to_be_bytes());
+    }
+    for item in array.items.iter() {
+        let bytes = match (array.elem, item) {
+            // `oid` is unsigned: a synthetic OID can exceed i32::MAX.
+            (ferrosa_sql::ArrayElem::Oid, SqlValue::Int(oid)) => Some(
+                u32::try_from(*oid)
+                    .map_err(|_| EncodeError::from(format!("{oid} is not a valid oid")))?
+                    .to_be_bytes()
+                    .to_vec(),
+            ),
+            _ => encode_value(1, elem_type.column_type, item)?,
+        };
+        match bytes {
+            None => out.extend_from_slice(&(-1i32).to_be_bytes()),
+            Some(bytes) => {
+                let len = i32::try_from(bytes.len()).map_err(|_| {
+                    EncodeError::from("array element is too long for the wire format".to_string())
+                })?;
+                out.extend_from_slice(&len.to_be_bytes());
+                out.extend_from_slice(&bytes);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Postgres text spelling of an `f64`: shortest round-trip form, with the
@@ -333,8 +414,9 @@ impl ParamError {
 
 /// Parameter type OIDs the decoder maps. Anything else (except `0`,
 /// unspecified) is refused rather than decoded as text.
-const SUPPORTED_PARAM_OIDS: [i32; 19] = [
-    16, 17, 19, 20, 21, 23, 25, 114, 700, 701, 869, 1043, 1082, 1083, 1114, 1184, 1700, 2950, 3802,
+const SUPPORTED_PARAM_OIDS: [i32; 20] = [
+    16, 17, 19, 20, 21, 23, 25, 26, 114, 700, 701, 869, 1043, 1082, 1083, 1114, 1184, 1700, 2950,
+    3802,
 ];
 
 /// `json` (D11: stored as jsonb) and `jsonb` parameter OIDs.
@@ -424,6 +506,12 @@ fn decode_param_text(type_oid: i32, raw: &[u8]) -> Result<SqlValue, ParamError> 
                 Err(bad("integer out of range"))
             }
         }
+        // oid: an unsigned decimal in [0, 2^32).
+        26 => s
+            .trim()
+            .parse::<u32>()
+            .map(|n| SqlValue::Int(i64::from(n)))
+            .map_err(|_| bad("not an oid")),
         // text / varchar / name; OID 0 (unspecified) is text too.
         0 | 25 | 1043 | 19 => Ok(SqlValue::Text(s.to_string().into())),
         16 => decode_bool_text(s).ok_or_else(|| bad("not a boolean")),
@@ -598,6 +686,10 @@ fn decode_param_binary(type_oid: i32, raw: &[u8]) -> Result<SqlValue, ParamError
     match type_oid {
         23 => int(4).map(SqlValue::Int),
         20 => int(8).map(SqlValue::Int),
+        // oid: an UNSIGNED big-endian u32.
+        26 => <[u8; 4]>::try_from(raw)
+            .map(|b| SqlValue::Int(i64::from(u32::from_be_bytes(b))))
+            .map_err(|_| bad("wrong length")),
         21 => int(2).map(SqlValue::Int),
         // text / varchar / name; OID 0 (unspecified) is text too.
         0 | 25 | 1043 | 19 => std::str::from_utf8(raw)
@@ -806,6 +898,7 @@ pub fn encode_value(
         }
         // jsonb_send: version byte 0x01 then the PostgreSQL text form (D11, D26).
         SqlValue::Jsonb(doc) => Some(crate::jsonb_wire::render_binary(doc)?),
+        SqlValue::Array(array) => Some(encode_array_binary(array)?),
         SqlValue::JsonPath(_) | SqlValue::TextArray(_) => {
             return Err(EncodeError::unsupported(&format!(
                 "no binary codec for {col_type:?} (T-161b)"
@@ -822,6 +915,10 @@ fn encode_int_binary(col_type: ColumnType, i: i64) -> Result<Vec<u8>, String> {
             .map(|value| value.to_be_bytes().to_vec())
             .map_err(|_| format!("integer {i} is outside the PostgreSQL int4 range")),
         ColumnType::BigInt => Ok(i.to_be_bytes().to_vec()),
+        // oid: UNSIGNED 4 bytes; outside [0, 2^32) is refused, never wrapped.
+        ColumnType::Oid => u32::try_from(i)
+            .map(|value| value.to_be_bytes().to_vec())
+            .map_err(|_| format!("{i} is outside the PostgreSQL oid range")),
         _ => Ok(i.to_be_bytes().to_vec()),
     }
 }
@@ -853,6 +950,11 @@ pub(crate) fn exec_error_response(err: &ExecError) -> BackendMessage {
         // directly with an unresolved cast; refused as an unsupported feature
         // rather than compared as if the cast did nothing.
         ExecError::UnresolvedCast(_) => ("0A000", err.to_string()),
+        // A row-level expression failure carries PostgreSQL's own SQLSTATE
+        // (22012 division_by_zero, 22003 out of range, 22P02 bad input, 21000 a
+        // subquery returning several rows, ...).
+        ExecError::Eval { sqlstate, .. } => (*sqlstate, err.to_string()),
+        ExecError::Unsupported(_) => ("0A000", err.to_string()),
     };
     error_response(sqlstate, &message)
 }
@@ -1009,7 +1111,7 @@ pub(crate) async fn execute_query_streaming<O: ReplySink>(
     mut txn: Option<&mut TxnWriteSet>,
     out: &mut O,
 ) -> std::io::Result<Vec<BackendMessage>> {
-    let stmt = match parse_statement(sql) {
+    let stmt = match crate::catalog::parse_pg(sql) {
         Ok(stmt) => stmt,
         Err(e) => {
             return Ok(vec![error_response(
@@ -1124,6 +1226,20 @@ fn resolve_casts(
     schema: &Schema,
     default_schema: &str,
 ) -> Result<(), BackendMessage> {
+    let on_query = |q: &mut SelectStmt| resolve_casts(q, params, schema, default_schema);
+    for cte in &mut select.ctes {
+        on_query(&mut cte.query)?;
+    }
+    for join in &mut select.joins {
+        resolve_casts_in_scalar(&mut join.on, params, schema, default_schema)?;
+    }
+    if let ferrosa_sql::Projection::Items(items) = &mut select.projection {
+        for item in items {
+            if let ferrosa_sql::SelectItem::Expr { expr, .. } = item {
+                resolve_casts_in_scalar(expr, params, schema, default_schema)?;
+            }
+        }
+    }
     if let Some(filter) = select.filter.as_mut() {
         resolve_casts_in_expr(filter, params, schema, default_schema)?;
     }
@@ -1131,6 +1247,56 @@ fn resolve_casts(
         resolve_casts_in_expr(having, params, schema, default_schema)?;
     }
     Ok(())
+}
+
+/// Resolve every `::regclass` cast inside a general expression (and its
+/// subqueries) to the literal OID, exactly as a legacy comparison term is.
+/// A regclass cast of a non-constant (a column) is refused: its value would have
+/// to be resolved per row against the catalog, which the engine does not do.
+fn resolve_casts_in_scalar(
+    expr: &mut ferrosa_sql::ScalarExpr,
+    params: &[SqlValue],
+    schema: &Schema,
+    default_schema: &str,
+) -> Result<(), BackendMessage> {
+    use ferrosa_sql::ScalarExpr;
+    if let ScalarExpr::Cast { expr: inner, ty } = expr {
+        if is_regclass_type(ty) {
+            let value =
+                match &mut **inner {
+                    ScalarExpr::Literal(v) => v.clone(),
+                    ScalarExpr::Param(n) => {
+                        eval_cast_term(&Term::Param(*n), params, schema, default_schema)?
+                    }
+                    other => {
+                        resolve_casts_in_scalar(other, params, schema, default_schema)?;
+                        match other {
+                            ScalarExpr::Literal(v) => v.clone(),
+                            _ => return Err(error_response(
+                                "0A000",
+                                "a ::regclass cast of a non-constant expression is not supported",
+                            )),
+                        }
+                    }
+                };
+            let oid = apply_cast(&value, CastTarget::Regclass, schema, default_schema)?;
+            *expr = ScalarExpr::Literal(oid);
+            return Ok(());
+        }
+    }
+    expr.try_for_each_child_mut(
+        &mut |child| resolve_casts_in_scalar(child, params, schema, default_schema),
+        &mut |q| resolve_casts(q, params, schema, default_schema),
+    )
+}
+
+fn is_regclass_type(ty: &ferrosa_sql::TypeName) -> bool {
+    !ty.array
+        && ty.name.eq_ignore_ascii_case("regclass")
+        && ty
+            .schema
+            .as_deref()
+            .is_none_or(|s| s.eq_ignore_ascii_case("pg_catalog"))
 }
 
 fn resolve_casts_in_expr(
@@ -1147,6 +1313,7 @@ fn resolve_casts_in_expr(
             Ok(())
         }
         Expr::Compare { .. } => Ok(()),
+        Expr::Scalar(e) => resolve_casts_in_scalar(e, params, schema, default_schema),
         Expr::Not(inner) => resolve_casts_in_expr(inner, params, schema, default_schema),
         Expr::And(left, right) | Expr::Or(left, right) => {
             resolve_casts_in_expr(left, params, schema, default_schema)?;
@@ -1232,6 +1399,18 @@ fn value_type_name(value: &SqlValue) -> &'static str {
         SqlValue::Jsonb(_) => "jsonb",
         SqlValue::JsonPath(_) => "jsonpath",
         SqlValue::TextArray(_) => "text[]",
+        SqlValue::Array(array) => match array.elem {
+            ferrosa_sql::ArrayElem::Int => "integer[]",
+            ferrosa_sql::ArrayElem::BigInt => "bigint[]",
+            ferrosa_sql::ArrayElem::Oid => "oid[]",
+            ferrosa_sql::ArrayElem::Text => "text[]",
+            ferrosa_sql::ArrayElem::Bool => "boolean[]",
+            ferrosa_sql::ArrayElem::Float => "double precision[]",
+            ferrosa_sql::ArrayElem::Uuid => "uuid[]",
+            ferrosa_sql::ArrayElem::Timestamp => "timestamp[]",
+            ferrosa_sql::ArrayElem::Numeric => "numeric[]",
+            ferrosa_sql::ArrayElem::Jsonb => "jsonb[]",
+        },
     }
 }
 
@@ -5172,6 +5351,7 @@ fn value_column_type(v: &SqlValue) -> ColumnType {
         SqlValue::Jsonb(_) => ColumnType::Jsonb,
         SqlValue::JsonPath(_) => ColumnType::JsonPath,
         SqlValue::TextArray(_) => ColumnType::TextArray,
+        SqlValue::Array(array) => ColumnType::Array(array.elem),
     }
 }
 
@@ -5234,7 +5414,8 @@ fn exact_point_lookup(
     limits: &ferrosa_jsonb::Limits,
 ) -> Option<crate::storage_provider::PointLookup> {
     use ferrosa_sql::{CmpOp, Expr, Operand, Term};
-    if select.join.is_some() {
+    // One relation only: a join, subquery or CTE reads others.
+    if select.tables().len() != 1 {
         return None;
     }
     let Expr::Compare {
@@ -5338,9 +5519,19 @@ pub(crate) async fn load_catalog_with_mvcc(
     // One slot per query: every provider records into it, and the query layer
     // takes it once after `execute` returns.
     let failure = ScanFailure::default();
-    let referenced: Vec<&ferrosa_sql::ast::TableRef> = std::iter::once(&stmt.from)
-        .chain(stmt.join.as_ref().map(|j| &j.table))
-        .collect();
+    // Every relation the statement reads, including joins, subqueries and CTE
+    // bodies, each once (a self-join names the same table twice).
+    let mut referenced: Vec<&ferrosa_sql::ast::TableRef> = Vec::new();
+    for t in stmt.tables() {
+        let same = |r: &&ferrosa_sql::ast::TableRef| {
+            r.table == t.table
+                && r.schema.as_deref().unwrap_or(default_schema)
+                    == t.schema.as_deref().unwrap_or(default_schema)
+        };
+        if !referenced.iter().any(same) {
+            referenced.push(t);
+        }
+    }
     // `pg_catalog.<relation>` is not stored: it is a projection built from the live
     // schema. Build the six catalog tables once when a referenced relation asks for
     // one, and serve each from that projection — an unresolvable column type is a
@@ -5513,6 +5704,94 @@ pub(crate) fn render_execute_result(
 
 #[cfg(test)]
 mod tests {
+    // -- arrays on the wire ------------------------------------------------------
+
+    fn array(elem: ferrosa_sql::ArrayElem, items: Vec<SqlValue>) -> SqlValue {
+        SqlValue::Array(ferrosa_sql::ArrayValue::new(elem, items))
+    }
+
+    #[test]
+    fn array_text_output_quotes_like_array_out() {
+        use ferrosa_sql::ArrayElem::*;
+        let cases = [
+            (
+                array(
+                    BigInt,
+                    vec![SqlValue::Int(1), SqlValue::Null, SqlValue::Int(-3)],
+                ),
+                "{1,NULL,-3}",
+            ),
+            (array(Text, vec![]), "{}"),
+            (
+                array(
+                    Text,
+                    vec![
+                        SqlValue::Text("plain".into()),
+                        SqlValue::Text(String::new().into()),
+                        SqlValue::Text("null".into()),
+                        SqlValue::Text("a b".into()),
+                        SqlValue::Text("x,y".into()),
+                        SqlValue::Text("q\"\\".into()),
+                    ],
+                ),
+                r#"{plain,"","null","a b","x,y","q\"\\"}"#,
+            ),
+        ];
+        for (value, expected) in cases {
+            let text = super::render_value(&value)
+                .expect("renders")
+                .expect("not null");
+            assert_eq!(String::from_utf8(text).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn array_binary_output_is_array_send() {
+        use ferrosa_sql::ArrayElem::*;
+        let bytes = super::encode_value(
+            1,
+            ColumnType::Array(BigInt),
+            &array(BigInt, vec![SqlValue::Int(7), SqlValue::Null]),
+        )
+        .unwrap()
+        .unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&1i32.to_be_bytes()); // ndim
+        expected.extend_from_slice(&1i32.to_be_bytes()); // has a NULL
+        expected.extend_from_slice(&20u32.to_be_bytes()); // int8
+        expected.extend_from_slice(&2i32.to_be_bytes()); // length
+        expected.extend_from_slice(&1i32.to_be_bytes()); // lower bound
+        expected.extend_from_slice(&8i32.to_be_bytes());
+        expected.extend_from_slice(&7i64.to_be_bytes());
+        expected.extend_from_slice(&(-1i32).to_be_bytes());
+        assert_eq!(bytes, expected);
+
+        let empty = super::encode_value(1, ColumnType::Array(Text), &array(Text, vec![]))
+            .unwrap()
+            .unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&0i32.to_be_bytes());
+        expected.extend_from_slice(&0i32.to_be_bytes());
+        expected.extend_from_slice(&25u32.to_be_bytes());
+        assert_eq!(empty, expected, "an empty array has no dimensions");
+    }
+
+    #[test]
+    fn oid_array_elements_are_unsigned() {
+        // Synthetic OIDs live in [16384, u32::MAX]; one above i32::MAX must encode,
+        // as the 4 unsigned bytes PostgreSQL's oid_send produces.
+        let big = i64::from(u32::MAX - 5);
+        let bytes = super::encode_value(
+            1,
+            ColumnType::Array(ferrosa_sql::ArrayElem::Oid),
+            &array(ferrosa_sql::ArrayElem::Oid, vec![SqlValue::Int(big)]),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(&bytes[8..12], &26u32.to_be_bytes(), "element type is oid");
+        assert_eq!(&bytes[24..28], &(u32::MAX - 5).to_be_bytes());
+    }
+
     use super::*;
     use ferrosa_sql::Value as SqlValue;
 
@@ -5544,6 +5823,25 @@ mod tests {
         assert_eq!(&*cache.key_for("ks", "a").1, "a");
         assert_eq!(&*cache.key_for("ks", "b").1, "b");
         assert_eq!(&*cache.key_for("other", "b").0, "other");
+    }
+
+    /// Synthetic catalog OIDs lie in [16384, 2^32). An `oid` column (OID 26) is an
+    /// UNSIGNED 4-byte value: one at or above 2^31 must encode, not fail as an
+    /// int4 would, and must round-trip through Bind (Lean: `Pg/Oid.lean`).
+    #[test]
+    fn an_oid_above_two_to_the_31_encodes_and_decodes_as_unsigned() {
+        let big = SqlValue::Int(i64::from(u32::MAX) - 5);
+        assert_eq!(column_type_oid(ColumnType::Oid), 26);
+        let bytes = encode_value(1, ColumnType::Oid, &big).expect("binary oid");
+        assert_eq!(bytes, (u32::MAX - 5).to_be_bytes().to_vec());
+        assert_eq!(decode_param(1, 26, Some(&bytes)), big);
+        assert_eq!(
+            encode_value(0, ColumnType::Oid, &big),
+            Some((u32::MAX - 5).to_string().into_bytes())
+        );
+        // Outside [0, 2^32) is not an oid: refused, never wrapped.
+        assert!(super::encode_value(1, ColumnType::Oid, &SqlValue::Int(-1)).is_err());
+        assert!(super::encode_value(1, ColumnType::Oid, &SqlValue::Int(1 << 32)).is_err());
     }
 
     fn encode_value(format: i16, col_type: ColumnType, value: &SqlValue) -> Option<Vec<u8>> {
@@ -6529,7 +6827,7 @@ mod tests {
 
     /// Parse a no-`FROM` expression select the way the wire path does.
     fn parsed_scalar_items(sql: &str) -> Vec<ScalarItem> {
-        match parse_statement(sql) {
+        match ferrosa_sql::parse_statement(sql) {
             Ok(Statement::SelectExprs(items)) => items,
             other => panic!("`{sql}` must be an expression select, got {other:?}"),
         }
@@ -7286,7 +7584,7 @@ mod txn_buffer_tests {
     }
 
     fn alter(sql: &str) -> ferrosa_sql::AlterTableStmt {
-        match parse_statement(sql) {
+        match ferrosa_sql::parse_statement(sql) {
             Ok(Statement::AlterTable(a)) => *a,
             other => panic!("expected AlterTable, got {other:?}"),
         }
@@ -10071,6 +10369,108 @@ mod scalar_subquery_tests {
         })
     }
 
+    /// The DataRow cells of a reply, as text.
+    fn text_rows(messages: &[BackendMessage]) -> Vec<Vec<Option<String>>> {
+        messages
+            .iter()
+            .filter_map(|m| match m {
+                BackendMessage::DataRow { columns } => Some(
+                    columns
+                        .iter()
+                        .map(|c| c.as_ref().map(|b| String::from_utf8_lossy(b).into_owned()))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_general_select_runs_through_the_front_end() {
+        let (_dir, engine, schema) = new_engine();
+        seed(&engine, &schema, "pgbench_accounts", 3).await;
+        seed(&engine, &schema, "pgbench_tellers", 1).await;
+        let msgs = run(
+            &engine,
+            &schema,
+            "SELECT a.k, a.pad || '!', t.k FROM pgbench_accounts AS a \
+             LEFT JOIN pgbench_tellers AS t ON t.k = a.k \
+             WHERE a.k IN ('k0', 'k2') ORDER BY a.k",
+        )
+        .await;
+        assert_eq!(error_sqlstate(&msgs), None, "{msgs:?}");
+        let some = |s: &str| Some(s.to_string());
+        assert_eq!(
+            text_rows(&msgs),
+            vec![
+                vec![some("k0"), some("p!"), some("k0")],
+                vec![some("k2"), some("p!"), None],
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expression_error_reaches_the_client_with_its_sqlstate() {
+        let (_dir, engine, schema) = new_engine();
+        seed(&engine, &schema, "pgbench_accounts", 2).await;
+        let msgs = run(
+            &engine,
+            &schema,
+            "SELECT k FROM pgbench_accounts WHERE char_length(pad) / 0 > 1",
+        )
+        .await;
+        assert_eq!(error_sqlstate(&msgs).as_deref(), Some("22012"), "{msgs:?}");
+        let msgs = run(
+            &engine,
+            &schema,
+            "SELECT pad::nowhere FROM pgbench_accounts",
+        )
+        .await;
+        assert_eq!(error_sqlstate(&msgs).as_deref(), Some("0A000"), "{msgs:?}");
+    }
+
+    /// Postgrex's type bootstrap names `pg_type` and `pg_attribute` unqualified:
+    /// PostgreSQL searches `pg_catalog` first, and so must this front end.
+    #[tokio::test]
+    async fn unqualified_catalog_relations_resolve_in_pg_catalog() {
+        let (_dir, engine, schema) = new_engine();
+        let msgs = run(
+            &engine,
+            &schema,
+            "SELECT t.oid, t.typname, t.typsend, coalesce(d.typelem, t.typelem), ARRAY (
+               SELECT a.atttypid FROM pg_attribute AS a
+               WHERE a.attrelid = t.typrelid AND a.attnum > 0 AND NOT a.attisdropped
+               ORDER BY a.attnum)
+             FROM pg_type AS t LEFT JOIN pg_type AS d ON t.typbasetype = d.oid
+             WHERE (t.typrelid = 0)
+             AND (t.typelem = 0 OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_type s
+                  WHERE s.typrelid != 0 AND s.oid = t.typelem))
+             AND t.oid IN (23, 1007)",
+        )
+        .await;
+        assert_eq!(error_sqlstate(&msgs), None, "{msgs:?}");
+        let some = |s: &str| Some(s.to_string());
+        assert_eq!(
+            text_rows(&msgs),
+            vec![
+                vec![
+                    some("23"),
+                    some("int4"),
+                    some("int4send"),
+                    some("0"),
+                    some("{}")
+                ],
+                vec![
+                    some("1007"),
+                    some("_int4"),
+                    some("array_send"),
+                    some("23"),
+                    some("{}")
+                ],
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn pgbench_census_line_runs_end_to_end() {
         // The acceptance query: three `count(*)` scalar subqueries concatenated by
@@ -10122,7 +10522,7 @@ mod scalar_subquery_tests {
 
     /// Parse a single table `SELECT` for the agreement checks below.
     fn select_stmt(sql: &str) -> SelectStmt {
-        match parse_statement(sql).expect("parses") {
+        match ferrosa_sql::parse_statement(sql).expect("parses") {
             Statement::Select(stmt) => *stmt,
             other => panic!("expected a table SELECT, got {other:?}"),
         }

@@ -12,7 +12,9 @@
 pub mod ast;
 pub mod catalog;
 pub mod exec;
+mod general;
 pub mod parser;
+mod parser_scalar;
 pub mod plan;
 pub mod provider;
 pub mod spill;
@@ -20,11 +22,12 @@ pub mod types;
 
 pub use ast::SelectStmt;
 pub use ast::{
-    AggArg, AlterOperation, AlterTableStmt, AnalyzeStmt, ArithOp, CastTarget, ColumnDef,
-    CopyFormatKind, CopyFromStdinStmt, CreateTableStmt, DeleteStmt, DropTableStatement, Expr,
-    ForeignKeyConstraint, InsertStmt, IsolationLevel, Operand, OrderItem, PgType, Projection,
-    Returning, ScalarItem, ScalarValue, SelectItem, SetExpr, Statement, Term, TruncateStatement,
-    UnsupportedClause, UpdateStmt, VacuumStmt,
+    AggArg, AlterOperation, AlterTableStmt, AnalyzeStmt, ArithOp, BinOp, CastTarget, ColumnDef,
+    CopyFormatKind, CopyFromStdinStmt, CreateTableStmt, Cte, DeleteStmt, DropTableStatement, Expr,
+    ForeignKeyConstraint, InsertStmt, IsolationLevel, JoinClause, JoinKind, Operand, OrderItem,
+    PgType, Projection, Returning, ScalarExpr, ScalarItem, ScalarValue, SelectItem, SetExpr,
+    Statement, Term, TruncateStatement, TypeName, UnaryOp, UnsupportedClause, UpdateStmt,
+    VacuumStmt,
 };
 pub use catalog::{Catalog, MapCatalog, SharedTable};
 pub use exec::{
@@ -32,6 +35,7 @@ pub use exec::{
     try_filter, try_project, AggFunc, AggSpec, AggregateError, CmpOp, Predicate, RowStream,
     SortDir, SortKey, TryRowStream,
 };
+pub use general::cast_type_supported;
 pub use parser::{parse, parse_statement, ParseError, MAX_EXPR_DEPTH};
 pub use plan::{
     describe, execute, execute_streaming, execute_with, infer_param_types, open_cursor, ExecError,
@@ -42,4 +46,4 @@ pub use spill::{
     default_temp_root, sweep_orphaned_temp_dirs, DirReserver, SpillCtx, SpillError, SpillReserver,
     SpillStats,
 };
-pub use types::{Column, ColumnType, RelSchema, Row, Value};
+pub use types::{ArrayElem, ArrayValue, Column, ColumnType, RelSchema, Row, Value};

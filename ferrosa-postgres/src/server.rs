@@ -790,7 +790,7 @@ async fn execute_simple_inner<O: ReplySink>(
     sql: &str,
     out: &mut O,
 ) -> std::io::Result<Vec<BackendMessage>> {
-    let stmt = match ferrosa_sql::parse_statement(sql) {
+    let stmt = match crate::catalog::parse_pg(sql) {
         Ok(s) => s,
         Err(e) => {
             session.mark_txn_failed();
@@ -935,17 +935,14 @@ fn track_select_reads(
             })?;
         return Ok(());
     }
+    // Every relation the statement reads (joins, subqueries, CTE bodies) is in
+    // the read set; a conflict on any of them must abort the transaction.
     let read_tables = session.txn_read_tables_mut();
-    read_tables.insert(format!(
-        "{}.{}",
-        select.from.schema.as_deref().unwrap_or(&ctx.default_schema),
-        select.from.table
-    ));
-    if let Some(join) = &select.join {
+    for table in select.tables() {
         read_tables.insert(format!(
             "{}.{}",
-            join.table.schema.as_deref().unwrap_or(&ctx.default_schema),
-            join.table.table
+            table.schema.as_deref().unwrap_or(&ctx.default_schema),
+            table.table
         ));
     }
     Ok(())
@@ -996,7 +993,9 @@ fn point_read_row_key(
     ctx: &QueryContext,
     select: &ferrosa_sql::SelectStmt,
 ) -> Option<crate::mvcc::RowKey> {
-    if select.join.is_some() {
+    // A point read names one row of ONE relation; anything that reads another
+    // relation (a join, a subquery, a CTE) stays table-granular.
+    if select.tables().len() != 1 {
         return None;
     }
     let ferrosa_sql::Expr::Compare { left, op, value } = select.filter.as_ref()? else {
@@ -5095,22 +5094,23 @@ pub(crate) mod txn_atomicity_tests {
         ctx.engine.shutdown().unwrap();
     }
 
-    /// A cast to a type ferrosa does not implement is refused BY NAME at parse
-    /// time (never accepted and ignored): the type as written is in the message.
+    /// A cast to a type ferrosa does not implement is refused BY NAME when the
+    /// statement is prepared (never accepted and ignored): the type as written is
+    /// in the message. (`::text` is a real cast now; `::nowhere` is not.)
     #[tokio::test]
     async fn a_cast_to_an_unsupported_type_is_refused_by_name() {
         let (_dir, ctx) = make_ctx().await;
         let mut session = Session::new(superuser());
         let response = session.on_parse(
             "bad".to_string(),
-            "SELECT relkind FROM pg_catalog.pg_class WHERE oid = $1::text",
+            "SELECT relkind FROM pg_catalog.pg_class WHERE oid = $1::nowhere",
             vec![],
         );
         match response {
             BackendMessage::ErrorResponse { fields } => {
                 assert_eq!(fields[1], (b'C', "0A000".to_string()));
                 assert!(
-                    fields[2].1.contains('`') && fields[2].1.contains("text"),
+                    fields[2].1.contains("nowhere"),
                     "the refusal names the type: {fields:?}"
                 );
             }

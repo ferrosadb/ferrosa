@@ -3,9 +3,10 @@
 use std::fmt;
 
 use crate::ast::{
-    AggArg, ArithOp, CastTarget, ColumnRef, DeleteStmt, Expr, InsertStmt, IsolationLevel, Join,
-    Operand, OrderItem, Projection, Returning, ScalarItem, ScalarValue, SelectItem, SelectStmt,
-    SetExpr, Statement, TableRef, Term, UnsupportedClause, UpdateStmt,
+    AggArg, ArithOp, BinOp, CastTarget, ColumnRef, Cte, DeleteStmt, Expr, InsertStmt,
+    IsolationLevel, Join, JoinClause, JoinKind, Operand, OrderItem, Projection, Returning,
+    ScalarExpr, ScalarItem, ScalarValue, SelectItem, SelectStmt, SetExpr, Statement, TableRef,
+    Term, UnsupportedClause, UpdateStmt,
 };
 use crate::exec::{AggFunc, CmpOp, SortDir};
 use crate::types::Value;
@@ -76,6 +77,11 @@ pub enum ParseError {
 /// Deepest expression nesting the parser accepts: far beyond any real
 /// predicate, far below what a 2 MiB worker stack can recurse.
 pub const MAX_EXPR_DEPTH: usize = 256;
+
+/// Stack left before [`Parser::nested`] switches to a fresh segment.
+const STACK_RED_ZONE: usize = 64 * 1024;
+/// Size of each fresh stack segment.
+const STACK_GROWTH: usize = 1024 * 1024;
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -170,6 +176,11 @@ pub fn parse_statement(sql: &str) -> Result<Statement, ParseError> {
             }
         }
         Some(Tok::Ident(w)) => match w.to_ascii_uppercase().as_str() {
+            "WITH" => {
+                let stmt = p.parse_with_select()?;
+                p.expect_end()?;
+                Ok(Statement::Select(Box::new(stmt)))
+            }
             // Transaction control: `BEGIN` / `START TRANSACTION` preserve an
             // explicit isolation level for the session layer.
             "BEGIN" | "START" => p.parse_begin(),
@@ -201,7 +212,7 @@ pub fn parse_statement(sql: &str) -> Result<Statement, ParseError> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum Tok {
+pub(crate) enum Tok {
     Select,
     From,
     Join,
@@ -252,6 +263,14 @@ enum Tok {
     /// The `-` arithmetic operator. A leading `-` immediately before a digit is
     /// part of a NUMERIC LITERAL (see the lexer), never this token.
     Minus,
+    /// `/` division.
+    Slash,
+    /// `%` modulo.
+    Percent,
+    /// `[` opening an `ARRAY[...]` constructor.
+    LBracket,
+    /// `]` closing an `ARRAY[...]` constructor.
+    RBracket,
 }
 
 /// Lex a top-level statement. A `CREATE` statement is lexed leniently on a
@@ -428,6 +447,24 @@ fn lex_mode(sql: &str, lenient: bool) -> Result<Vec<Tok>, ParseError> {
                 toks.push(Tok::Minus);
                 i += 1;
             }
+            // General scalar expressions (`parser_scalar`): division, modulo and
+            // `ARRAY[...]` constructor brackets.
+            '/' => {
+                toks.push(Tok::Slash);
+                i += 1;
+            }
+            '%' => {
+                toks.push(Tok::Percent);
+                i += 1;
+            }
+            '[' => {
+                toks.push(Tok::LBracket);
+                i += 1;
+            }
+            ']' => {
+                toks.push(Tok::RBracket);
+                i += 1;
+            }
             c if c.is_alphabetic() || c == '_' => {
                 let start = i;
                 while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
@@ -564,7 +601,30 @@ const UNSUPPORTED_AGGREGATES: &[&str] = &[
 /// Whether an identifier names an aggregate function the parser recognises —
 /// implemented OR refused-by-name. Used to decide whether `FUNC(` is an
 /// aggregate call rather than a column reference followed by a stray `(`.
-fn is_aggregate_name(word: &str) -> bool {
+/// Words that end a select item or table reference rather than naming it, so a
+/// bare alias is never taken from them (`FROM t LEFT JOIN u`, `... FOR UPDATE`).
+fn is_reserved_after_item(word: &str) -> bool {
+    matches!(
+        word.to_ascii_uppercase().as_str(),
+        "LEFT"
+            | "RIGHT"
+            | "FULL"
+            | "OUTER"
+            | "CROSS"
+            | "NATURAL"
+            | "USING"
+            | "FOR"
+            | "UNION"
+            | "EXCEPT"
+            | "INTERSECT"
+            | "RETURNING"
+            | "WINDOW"
+            | "FETCH"
+            | "SET"
+    )
+}
+
+pub(crate) fn is_aggregate_name(word: &str) -> bool {
     let up = word.to_ascii_uppercase();
     matches!(up.as_str(), "COUNT" | "SUM" | "MIN" | "MAX" | "AVG")
         || UNSUPPORTED_AGGREGATES.contains(&up.as_str())
@@ -572,7 +632,7 @@ fn is_aggregate_name(word: &str) -> bool {
 
 /// Map an aggregate identifier to its [`AggFunc`]; `None` for a recognised but
 /// unimplemented aggregate (the caller refuses it by name).
-fn aggregate_func(word: &str) -> Option<AggFunc> {
+pub(crate) fn aggregate_func(word: &str) -> Option<AggFunc> {
     match word.to_ascii_uppercase().as_str() {
         "COUNT" => Some(AggFunc::Count),
         "SUM" => Some(AggFunc::Sum),
@@ -583,11 +643,11 @@ fn aggregate_func(word: &str) -> Option<AggFunc> {
     }
 }
 
-struct Parser {
-    toks: Vec<Tok>,
-    pos: usize,
+pub(crate) struct Parser {
+    pub(crate) toks: Vec<Tok>,
+    pub(crate) pos: usize,
     /// Current expression nesting (see [`ParseError::TooDeep`]).
-    depth: usize,
+    pub(crate) depth: usize,
 }
 
 impl Parser {
@@ -600,7 +660,7 @@ impl Parser {
     }
 
     /// Run `f` one nesting level deeper, refusing past [`MAX_EXPR_DEPTH`].
-    fn nested<T>(
+    pub(crate) fn nested<T>(
         &mut self,
         f: impl FnOnce(&mut Self) -> Result<T, ParseError>,
     ) -> Result<T, ParseError> {
@@ -608,16 +668,31 @@ impl Parser {
             return Err(ParseError::TooDeep);
         }
         self.depth += 1;
-        let out = f(self);
+        // The depth limit bounds the recursion; growing the stack on demand keeps
+        // a debug build's large frames from overflowing a 2 MiB worker stack
+        // before the limit is reached.
+        let out = stacker::maybe_grow(STACK_RED_ZONE, STACK_GROWTH, || f(self));
         self.depth -= 1;
         out
     }
 
-    fn peek(&self) -> Option<&Tok> {
+    /// Count one more link of a left-deep operator chain (`a + b + c`, `x AND y
+    /// AND z`) against [`MAX_EXPR_DEPTH`]. A chain builds a tree as deep as it is
+    /// long without recursing here, and every later walk of that tree (lowering,
+    /// planning, evaluation, drop) does recurse, so its length is bounded too.
+    pub(crate) fn deepen(&mut self) -> Result<(), ParseError> {
+        if self.depth >= MAX_EXPR_DEPTH {
+            return Err(ParseError::TooDeep);
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    pub(crate) fn peek(&self) -> Option<&Tok> {
         self.toks.get(self.pos)
     }
 
-    fn next(&mut self) -> Option<Tok> {
+    pub(crate) fn next(&mut self) -> Option<Tok> {
         let t = self.toks.get(self.pos).cloned();
         if t.is_some() {
             self.pos += 1;
@@ -625,7 +700,7 @@ impl Parser {
         t
     }
 
-    fn expect(&mut self, want: &Tok, name: &'static str) -> Result<(), ParseError> {
+    pub(crate) fn expect(&mut self, want: &Tok, name: &'static str) -> Result<(), ParseError> {
         match self.next() {
             Some(ref t) if t == want => Ok(()),
             Some(t) => Err(ParseError::Unexpected {
@@ -636,7 +711,7 @@ impl Parser {
         }
     }
 
-    fn ident(&mut self) -> Result<String, ParseError> {
+    pub(crate) fn ident(&mut self) -> Result<String, ParseError> {
         match self.next() {
             Some(Tok::Ident(s) | Tok::QuotedIdent(s)) => Ok(s),
             Some(t) => Err(ParseError::Unexpected {
@@ -652,7 +727,7 @@ impl Parser {
     /// statement to end there: a scalar subquery's inner select is followed by
     /// the `)` that closes it and possibly a `||`. The public [`parse`] adds the
     /// end-of-statement check for a top-level statement.
-    fn parse_select_stmt(&mut self) -> Result<SelectStmt, ParseError> {
+    pub(crate) fn parse_select_stmt(&mut self) -> Result<SelectStmt, ParseError> {
         self.expect(&Tok::Select, "SELECT")?;
         let distinct = if matches!(self.peek(), Some(Tok::Distinct)) {
             self.next();
@@ -663,14 +738,10 @@ impl Parser {
         let projection = self.parse_projection()?;
         self.expect(&Tok::From, "FROM")?;
         let from = self.parse_table_ref()?;
-        let join = if matches!(self.peek(), Some(Tok::Join | Tok::Inner)) {
-            Some(self.parse_join()?)
-        } else {
-            None
-        };
+        let (join, joins) = self.parse_joins()?;
         let filter = if matches!(self.peek(), Some(Tok::Where)) {
             self.next();
-            Some(self.parse_expr()?)
+            Some(self.parse_condition()?)
         } else {
             None
         };
@@ -695,32 +766,51 @@ impl Parser {
             Vec::new()
         };
         // LIMIT and OFFSET in either order, both optional.
-        let mut limit = None;
-        let mut offset = None;
+        // Each may be a literal count, a `$n` parameter, or (LIMIT) `ALL`.
+        let (mut limit, mut limit_param, mut seen_limit) = (None, None, false);
+        let (mut offset, mut offset_param, mut seen_offset) = (None, None, false);
         loop {
             match self.peek() {
-                Some(Tok::Limit) if limit.is_none() => {
+                Some(Tok::Limit) if !seen_limit => {
                     self.next();
-                    limit = Some(self.parse_u64()?);
+                    seen_limit = true;
+                    if self.peek_word("ALL") {
+                        self.next();
+                    } else if let Some(Tok::Param(n)) = self.peek() {
+                        limit_param = Some(*n);
+                        self.next();
+                    } else {
+                        limit = Some(self.parse_u64()?);
+                    }
                 }
-                Some(Tok::Offset) if offset.is_none() => {
+                Some(Tok::Offset) if !seen_offset => {
                     self.next();
-                    offset = Some(self.parse_u64()?);
+                    seen_offset = true;
+                    if let Some(Tok::Param(n)) = self.peek() {
+                        offset_param = Some(*n);
+                        self.next();
+                    } else {
+                        offset = Some(self.parse_u64()?);
+                    }
                 }
                 _ => break,
             }
         }
         Ok(SelectStmt {
+            ctes: Vec::new(),
             distinct,
             projection,
             from,
             join,
+            joins,
             filter,
             group_by,
             having,
             order_by,
             limit,
             offset,
+            limit_param,
+            offset_param,
         })
     }
 
@@ -744,6 +834,11 @@ impl Parser {
     /// select (`SELECT 1`, `SELECT version()`, `SELECT $1`, `SELECT TRUE`) vs a
     /// table select. `self.pos` is at the `SELECT` token.
     fn is_expr_select(&self) -> bool {
+        // A `FROM` outside any parentheses makes it a table query, whatever its
+        // select list starts with (`SELECT coalesce(n, 0) FROM t`).
+        if self.has_top_level_from() {
+            return false;
+        }
         match self.toks.get(self.pos + 1) {
             Some(Tok::Int(_) | Tok::Float(_) | Tok::Str(_) | Tok::Param(_)) => true,
             // A leading `( SELECT ...` begins a scalar subquery operand, so this
@@ -760,6 +855,20 @@ impl Parser {
             }
             _ => false,
         }
+    }
+
+    /// Whether a `FROM` appears at parenthesis depth 0 after this `SELECT`.
+    fn has_top_level_from(&self) -> bool {
+        let mut depth = 0usize;
+        for tok in &self.toks[self.pos..] {
+            match tok {
+                Tok::LParen => depth += 1,
+                Tok::RParen => depth = depth.saturating_sub(1),
+                Tok::From if depth == 0 => return true,
+                _ => {}
+            }
+        }
+        false
     }
 
     /// Parse `SELECT <scalar> [, <scalar>]*` with no `FROM`. Assumes `self.pos`
@@ -845,7 +954,10 @@ impl Parser {
     }
 
     /// An optional output alias: `AS name` or a bare `name`.
-    fn parse_optional_alias(&mut self) -> Result<Option<String>, ParseError> {
+    pub(crate) fn parse_optional_alias(&mut self) -> Result<Option<String>, ParseError> {
+        if matches!(self.peek(), Some(Tok::Ident(w)) if is_reserved_after_item(w)) {
+            return Ok(None);
+        }
         if matches!(self.peek(), Some(Tok::As | Tok::Ident(_))) {
             if matches!(self.peek(), Some(Tok::As)) {
                 self.next();
@@ -1278,65 +1390,12 @@ impl Parser {
         !matches!(upper.as_str(), "TRUE" | "FALSE" | "NULL") && !bare_value_function(&upper)
     }
 
-    /// A single SELECT-list entry: an aggregate `FUNC(...)` if an identifier
-    /// whose uppercase name is a known aggregate is immediately followed by
-    /// `(`, otherwise a plain column reference.
-    ///
-    /// Concatenation is refused **by name** here: evaluating `col || 'x'` over a
-    /// `FROM` relation would need a select-list expression the planner does not
-    /// have (its projection is column indices, not computed cells), so a `||`
-    /// that follows an item is a named refusal rather than a token mismatch.
+    /// A single SELECT-list entry: a bare column or aggregate keeps its legacy
+    /// item, any other expression is [`SelectItem::Expr`].
     fn parse_select_item(&mut self) -> Result<SelectItem, ParseError> {
-        let mut item = self.parse_select_item_primary()?;
-        if matches!(self.peek(), Some(Tok::Concat)) {
-            return Err(ParseError::UnsupportedSelectExpr(
-                "`||` concatenation over a FROM relation",
-            ));
-        }
-        // An optional output alias (`AS name`, or a bare `name`) names this item's
-        // result column. Consumed after the concatenation refusal so `col || 'x'`
-        // is still refused by name rather than mistaken for an alias.
-        let alias = self.parse_optional_alias()?;
-        match &mut item {
-            SelectItem::Column { alias: a, .. } | SelectItem::Aggregate { alias: a, .. } => {
-                *a = alias;
-            }
-        }
-        Ok(item)
-    }
-
-    fn parse_select_item_primary(&mut self) -> Result<SelectItem, ParseError> {
-        self.reject_cast_call()?;
-        if let Some(Tok::Ident(word)) = self.peek() {
-            if is_aggregate_name(word) && matches!(self.toks.get(self.pos + 1), Some(Tok::LParen)) {
-                let raw = word.clone();
-                self.next(); // function name
-                self.next(); // (
-                let func = match aggregate_func(&raw) {
-                    Some(f) => f,
-                    // Recognised-but-unimplemented aggregate (I-MAPPABLE):
-                    // refuse it BY NAME rather than mis-parse it as a column or
-                    // approximate it.
-                    None => return Err(ParseError::UnsupportedAggregate(raw)),
-                };
-                let arg = if matches!(self.peek(), Some(Tok::Star)) {
-                    self.next();
-                    AggArg::Star
-                } else {
-                    AggArg::Column(self.parse_column_ref()?)
-                };
-                self.expect(&Tok::RParen, ")")?;
-                return Ok(SelectItem::Aggregate {
-                    func,
-                    arg,
-                    alias: None,
-                });
-            }
-        }
-        Ok(SelectItem::Column {
-            col: self.parse_column_ref()?,
-            alias: None,
-        })
+        // The general grammar (`parser_scalar`): a bare column or aggregate keeps
+        // its legacy item; anything else is `SelectItem::Expr`.
+        self.parse_general_select_item()
     }
 
     fn parse_column_list(&mut self) -> Result<Vec<ColumnRef>, ParseError> {
@@ -1395,7 +1454,7 @@ impl Parser {
         }
     }
 
-    fn parse_column_ref(&mut self) -> Result<ColumnRef, ParseError> {
+    pub(crate) fn parse_column_ref(&mut self) -> Result<ColumnRef, ParseError> {
         let first = self.ident()?;
         if matches!(self.peek(), Some(Tok::Dot)) {
             self.next();
@@ -1423,7 +1482,7 @@ impl Parser {
         let alias = if matches!(self.peek(), Some(Tok::As)) {
             self.next();
             Some(self.ident()?)
-        } else if matches!(self.peek(), Some(Tok::Ident(_))) {
+        } else if matches!(self.peek(), Some(Tok::Ident(w)) if !is_reserved_after_item(w)) {
             Some(self.ident()?)
         } else {
             None
@@ -1435,17 +1494,78 @@ impl Parser {
         })
     }
 
-    fn parse_join(&mut self) -> Result<Join, ParseError> {
-        if matches!(self.peek(), Some(Tok::Inner)) {
-            self.next();
+    /// Zero or more `[INNER | LEFT [OUTER]] JOIN table ON condition`. A single inner
+    /// join on `column = column` stays the legacy [`Join`] (hash-join fast path);
+    /// any other shape, or more than one join, is a list of [`JoinClause`]s.
+    fn parse_joins(&mut self) -> Result<(Option<Join>, Vec<JoinClause>), ParseError> {
+        let mut joins = Vec::new();
+        loop {
+            let kind = if matches!(self.peek(), Some(Tok::Join)) {
+                JoinKind::Inner
+            } else if matches!(self.peek(), Some(Tok::Inner)) {
+                self.next();
+                JoinKind::Inner
+            } else if self.peek_word("LEFT") {
+                self.next();
+                if self.peek_word("OUTER") {
+                    self.next();
+                }
+                JoinKind::Left
+            } else {
+                break;
+            };
+            self.expect(&Tok::Join, "JOIN")?;
+            let table = self.parse_table_ref()?;
+            self.expect(&Tok::On, "ON")?;
+            let on = self.parse_top_scalar_expr()?;
+            joins.push(JoinClause { kind, table, on });
         }
-        self.expect(&Tok::Join, "JOIN")?;
-        let table = self.parse_table_ref()?;
-        self.expect(&Tok::On, "ON")?;
-        let left = self.parse_column_ref()?;
-        self.expect(&Tok::Eq, "=")?;
-        let right = self.parse_column_ref()?;
-        Ok(Join { table, left, right })
+        if let [JoinClause {
+            kind: JoinKind::Inner,
+            on:
+                ScalarExpr::Binary {
+                    op: BinOp::Cmp(CmpOp::Eq),
+                    left,
+                    right,
+                },
+            ..
+        }] = joins.as_slice()
+        {
+            if matches!(
+                (&**left, &**right),
+                (ScalarExpr::Column(_), ScalarExpr::Column(_))
+            ) {
+                let Some(JoinClause { table, on, .. }) = joins.pop() else {
+                    unreachable!("matched one join above")
+                };
+                let ScalarExpr::Binary { left, right, .. } = on else {
+                    unreachable!("matched a binary above")
+                };
+                let (ScalarExpr::Column(left), ScalarExpr::Column(right)) = (*left, *right) else {
+                    unreachable!("matched two columns above")
+                };
+                return Ok((Some(Join { table, left, right }), joins));
+            }
+        }
+        Ok((None, joins))
+    }
+
+    /// `WITH name AS (SELECT ...) [, ...] SELECT ...`.
+    fn parse_with_select(&mut self) -> Result<SelectStmt, ParseError> {
+        self.expect_word("WITH")?;
+        let mut ctes = Vec::new();
+        loop {
+            let name = self.ident()?;
+            self.expect(&Tok::As, "AS")?;
+            let query = Box::new(self.parenthesised_select()?);
+            ctes.push(Cte { name, query });
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        let mut stmt = self.parse_select_stmt()?;
+        stmt.ctes = ctes;
+        Ok(stmt)
     }
 
     /// Boolean expression grammar with precedence
@@ -1613,7 +1733,7 @@ impl Parser {
         }
     }
 
-    fn parse_value(&mut self) -> Result<Value, ParseError> {
+    pub(crate) fn parse_value(&mut self) -> Result<Value, ParseError> {
         // Typed literal: a type-keyword identifier immediately followed by a
         // string literal — `TIMESTAMP '2024-01-15 10:30:00'`, `DATE '2024-01-15'`,
         // `TIME '10:30:00'`, `INET '10.0.0.1'`, `NUMERIC '123.45'` (also `DECIMAL`).
@@ -1663,7 +1783,7 @@ fn bare_value_function(upper: &str) -> bool {
 
 /// The kind of typed literal a leading keyword introduces (`TIMESTAMP '...'` etc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TypedLiteral {
+pub(crate) enum TypedLiteral {
     Timestamp,
     Date,
     Time,
@@ -1673,7 +1793,7 @@ enum TypedLiteral {
 
 /// Map an identifier to the typed-literal kind it introduces, if any
 /// (case-insensitive). `DECIMAL` is an alias for `NUMERIC`.
-fn typed_literal_kind(word: &str) -> Option<TypedLiteral> {
+pub(crate) fn typed_literal_kind(word: &str) -> Option<TypedLiteral> {
     match word.to_ascii_uppercase().as_str() {
         "TIMESTAMP" => Some(TypedLiteral::Timestamp),
         "DATE" => Some(TypedLiteral::Date),
@@ -2129,14 +2249,21 @@ mod tests {
     }
 
     #[test]
-    fn concatenation_is_refused_by_name_and_not_read_as_an_alias() {
-        // The alias is consumed AFTER the `||` refusal, so `pad || 'x'` is still a
-        // named UnsupportedSelectExpr and is never reinterpreted as `pad AS ||`.
-        let err = parse("SELECT pad || 'x' FROM t").unwrap_err();
-        assert!(
-            matches!(err, ParseError::UnsupportedSelectExpr(_)),
-            "expected the named concatenation refusal, got {err:?}"
-        );
+    fn concatenation_is_an_expression_and_not_read_as_an_alias() {
+        let stmt = parse("SELECT pad || 'x' FROM t").unwrap();
+        let Projection::Items(items) = &stmt.projection else {
+            panic!("expected items");
+        };
+        assert!(matches!(
+            &items[0],
+            SelectItem::Expr {
+                expr: ScalarExpr::Binary {
+                    op: BinOp::Concat,
+                    ..
+                },
+                alias: None
+            }
+        ));
     }
 
     #[test]
@@ -3862,20 +3989,17 @@ mod tests {
     }
 
     #[test]
-    fn concatenation_over_a_from_relation_is_refused_by_name() {
-        // `||` over a `FROM` relation needs a computed select-list expression the
-        // planner does not have. Both spellings must be refused by NAME (0A000),
-        // never mis-parsed as a column list or reported as a token mismatch.
+    fn concatenation_over_a_from_relation_is_a_table_select() {
+        // `||` over a FROM relation is a projected expression the general planner
+        // evaluates; it is no longer read as a no-FROM expression select.
         for sql in [
             "SELECT name || '!' FROM t",
             "SELECT 'a' || 'b' FROM t",
             "SELECT count(*) || 'x' FROM t",
         ] {
             match parse_statement(sql) {
-                Err(ParseError::UnsupportedSelectExpr(form)) => {
-                    assert_eq!(form, "`||` concatenation over a FROM relation");
-                }
-                other => panic!("`{sql}` must be refused by name, got {other:?}"),
+                Ok(Statement::Select(stmt)) => assert!(stmt.is_general(), "{sql}"),
+                other => panic!("`{sql}` must be a table select, got {other:?}"),
             }
         }
     }
@@ -3940,39 +4064,62 @@ mod tests {
     }
 
     #[test]
-    fn a_cast_to_a_type_ferrosa_does_not_implement_is_refused_by_name() {
-        // Never silently accepted and ignored: a cast target the engine cannot
-        // honour is refused by name — the type exactly as it was written, with its
-        // schema qualifier when one was given.
-        for (sql, ty) in [
-            ("SELECT relkind FROM t WHERE oid = $1::text", "text"),
-            ("SELECT relkind FROM t WHERE oid = $1::int4", "int4"),
+    fn a_cast_target_is_recorded_exactly_as_written() {
+        // A cast outside the legacy `regclass` term is a general expression; its
+        // target is kept as written (schema included) so the planner can refuse a
+        // type it does not implement BY NAME (see tests/scalar_expr.rs).
+        for (sql, schema, name) in [
+            ("SELECT relkind FROM t WHERE oid = $1::text", None, "text"),
+            ("SELECT relkind FROM t WHERE oid = $1::int4", None, "int4"),
             (
                 "SELECT relkind FROM t WHERE oid = $1::pg_catalog.regtype",
-                "pg_catalog.regtype",
+                Some("pg_catalog"),
+                "regtype",
             ),
-            ("SELECT relkind FROM t WHERE oid = $1::nowhere", "nowhere"),
+            (
+                "SELECT relkind FROM t WHERE oid = $1::nowhere",
+                None,
+                "nowhere",
+            ),
         ] {
-            match parse(sql) {
-                Err(ParseError::UnsupportedCast(name)) => assert_eq!(name, ty, "{sql}"),
-                other => panic!("`{sql}` must be refused by name, got {other:?}"),
-            }
+            let stmt = parse(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            let Some(Expr::Scalar(cmp)) = stmt.filter else {
+                panic!("{sql}: expected a general comparison");
+            };
+            let ScalarExpr::Binary { right, .. } = *cmp else {
+                panic!("{sql}: expected a binary comparison");
+            };
+            let ScalarExpr::Cast { ty, .. } = *right else {
+                panic!("{sql}: expected a cast on the right");
+            };
+            assert_eq!(ty.schema.as_deref(), schema, "{sql}");
+            assert_eq!(ty.name, name, "{sql}");
         }
     }
 
     #[test]
-    fn cast_function_syntax_is_refused_by_name_not_misparsed() {
-        // `CAST(x AS t)` is not implemented, so it is refused BY NAME rather than
-        // mis-parsed as a column named `CAST`. A bare `cast` column is still fine.
-        for sql in [
-            "SELECT CAST(k AS text) FROM t",
-            "SELECT relkind FROM t WHERE oid = CAST($1 AS regclass)",
-        ] {
-            match parse_statement(sql) {
-                Err(ParseError::UnsupportedCastExpr) => {}
-                other => panic!("`{sql}` must be refused by name, got {other:?}"),
-            }
-        }
+    fn cast_function_syntax_is_a_cast_and_a_bare_cast_column_is_a_column() {
+        let Statement::Select(stmt) = parse_statement("SELECT CAST(k AS text) FROM t").unwrap()
+        else {
+            panic!("expected a table select");
+        };
+        assert!(matches!(
+            &stmt.projection,
+            Projection::Items(items)
+                if matches!(&items[0], SelectItem::Expr { expr: ScalarExpr::Cast { .. }, .. })
+        ));
+        // `CAST($1 AS regclass)` keeps the legacy regclass term the front end resolves.
+        let stmt = parse("SELECT relkind FROM t WHERE oid = CAST($1 AS regclass)").unwrap();
+        assert!(matches!(
+            stmt.filter,
+            Some(Expr::Compare {
+                value: Term::Cast {
+                    ty: CastTarget::Regclass,
+                    ..
+                },
+                ..
+            })
+        ));
         assert!(parse("SELECT cast FROM t").is_ok());
     }
 

@@ -39,7 +39,7 @@ use std::fmt;
 
 use ferrosa_common::cql_type::CqlType;
 use ferrosa_schema::Schema;
-use ferrosa_sql::ColumnType;
+use ferrosa_sql::{ArrayElem, ColumnType};
 
 /// Postgres OID of `json` (D11: stored as jsonb).
 pub const PG_OID_JSON: u32 = 114;
@@ -113,7 +113,7 @@ const fn entry(
 
 /// Every engine-backed Postgres type ferrosa advertises, one row per
 /// `ColumnType`. Kept in step with [`for_column_type`] by a unit test.
-pub const ALL_PG_TYPES: [PgType; 17] = [
+pub const ALL_PG_TYPES: [PgType; 18] = [
     entry(23, "int4", 4, ColumnType::Int, true),
     entry(20, "int8", 8, ColumnType::BigInt, true),
     entry(25, "text", -1, ColumnType::Text, true),
@@ -136,11 +136,81 @@ pub const ALL_PG_TYPES: [PgType; 17] = [
     entry(PG_OID_JSONPATH, "jsonpath", -1, ColumnType::JsonPath, false),
     entry(1009, "_text", -1, ColumnType::TextArray, false),
     entry(1184, "timestamptz", 8, ColumnType::TimestampTz, true),
+    // Unsigned 4-byte object identifier: catalog OID columns (Sql/Oid.lean).
+    entry(26, "oid", 4, ColumnType::Oid, true),
 ];
+
+/// The array types the engine carries ([`ColumnType::Array`]), one per element
+/// type, with PostgreSQL's built-in array OIDs. Arrays are variable length and
+/// have a binary wire codec (`query::encode_array_binary`).
+pub const ARRAY_PG_TYPES: [PgType; 10] = [
+    entry(1007, "_int4", -1, ColumnType::Array(ArrayElem::Int), true),
+    entry(
+        1016,
+        "_int8",
+        -1,
+        ColumnType::Array(ArrayElem::BigInt),
+        true,
+    ),
+    entry(1028, "_oid", -1, ColumnType::Array(ArrayElem::Oid), true),
+    entry(1009, "_text", -1, ColumnType::Array(ArrayElem::Text), true),
+    entry(1000, "_bool", -1, ColumnType::Array(ArrayElem::Bool), true),
+    entry(
+        1022,
+        "_float8",
+        -1,
+        ColumnType::Array(ArrayElem::Float),
+        true,
+    ),
+    entry(2951, "_uuid", -1, ColumnType::Array(ArrayElem::Uuid), true),
+    entry(
+        1115,
+        "_timestamp",
+        -1,
+        ColumnType::Array(ArrayElem::Timestamp),
+        true,
+    ),
+    entry(
+        1231,
+        "_numeric",
+        -1,
+        ColumnType::Array(ArrayElem::Numeric),
+        false,
+    ),
+    entry(
+        3807,
+        "_jsonb",
+        -1,
+        ColumnType::Array(ArrayElem::Jsonb),
+        true,
+    ),
+];
+
+/// The Postgres type of an array's elements (`oid` is a 4-byte unsigned int).
+pub fn for_array_elem(elem: ArrayElem) -> PgType {
+    match elem {
+        ArrayElem::Int => ALL_PG_TYPES[0],
+        ArrayElem::BigInt => ALL_PG_TYPES[1],
+        ArrayElem::Oid => ALL_PG_TYPES[17],
+        ArrayElem::Text => ALL_PG_TYPES[2],
+        ArrayElem::Bool => ALL_PG_TYPES[3],
+        ArrayElem::Float => ALL_PG_TYPES[4],
+        ArrayElem::Uuid => ALL_PG_TYPES[5],
+        ArrayElem::Timestamp => ALL_PG_TYPES[7],
+        ArrayElem::Numeric => ALL_PG_TYPES[11],
+        ArrayElem::Jsonb => ALL_PG_TYPES[12],
+    }
+}
 
 /// The Postgres type for an engine relational column type.
 pub fn for_column_type(ty: ColumnType) -> PgType {
     let idx = match ty {
+        ColumnType::Array(elem) => {
+            return *ARRAY_PG_TYPES
+                .iter()
+                .find(|t| t.column_type == ColumnType::Array(elem))
+                .expect("ARRAY_PG_TYPES has one entry per ArrayElem (unit test)")
+        }
         ColumnType::Int => 0,
         ColumnType::BigInt => 1,
         ColumnType::Text => 2,
@@ -158,6 +228,7 @@ pub fn for_column_type(ty: ColumnType) -> PgType {
         ColumnType::JsonPath => 14,
         ColumnType::TextArray => 15,
         ColumnType::TimestampTz => 16,
+        ColumnType::Oid => 17,
     };
     ALL_PG_TYPES[idx]
 }
@@ -217,7 +288,11 @@ pub fn pg_type_of_column(
 
 /// The Postgres type advertised for a `PgType` OID, if ferrosa mints it.
 pub fn by_oid(oid: u32) -> Option<PgType> {
-    ALL_PG_TYPES.iter().find(|p| p.oid == oid).copied()
+    ALL_PG_TYPES
+        .iter()
+        .chain(ARRAY_PG_TYPES.iter())
+        .find(|p| p.oid == oid)
+        .copied()
 }
 
 /// D10: resolve a Postgres type name (as written in DDL) to a `CqlType`.

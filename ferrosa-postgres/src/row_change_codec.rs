@@ -260,6 +260,14 @@ fn write_value(value: &Value, builder: pg_mvcc_value::Builder<'_>) {
         }
         Value::Jsonb(document) => op.set_jsonb_value(document.as_bytes()),
         Value::JsonPath(path) => op.set_json_path_value(path),
+        Value::Array(array) => {
+            let mut encoded = op.init_array_value();
+            encoded.set_elem(array_elem_ordinal(array.elem));
+            let mut list = encoded.init_items(array.items.len() as u32);
+            for (index, item) in array.items.iter().enumerate() {
+                write_value(item, list.reborrow().get(index as u32));
+            }
+        }
         Value::TextArray(items) => {
             let mut list = op.init_text_array_value(items.len() as u32);
             for (index, item) in items.iter().enumerate() {
@@ -274,6 +282,45 @@ fn write_value(value: &Value, builder: pg_mvcc_value::Builder<'_>) {
             }
         }
     }
+}
+
+/// `ArrayElem` <-> its wire ordinal. Explicit, so reordering the Rust enum can
+/// never silently change what stored bytes mean.
+fn array_elem_ordinal(elem: ferrosa_sql::ArrayElem) -> u8 {
+    use ferrosa_sql::ArrayElem as E;
+    match elem {
+        E::Int => 0,
+        E::BigInt => 1,
+        E::Oid => 2,
+        E::Text => 3,
+        E::Bool => 4,
+        E::Float => 5,
+        E::Uuid => 6,
+        E::Timestamp => 7,
+        E::Numeric => 8,
+        E::Jsonb => 9,
+    }
+}
+
+fn array_elem_from_ordinal(ordinal: u8) -> Result<ferrosa_sql::ArrayElem, String> {
+    use ferrosa_sql::ArrayElem as E;
+    Ok(match ordinal {
+        0 => E::Int,
+        1 => E::BigInt,
+        2 => E::Oid,
+        3 => E::Text,
+        4 => E::Bool,
+        5 => E::Float,
+        6 => E::Uuid,
+        7 => E::Timestamp,
+        8 => E::Numeric,
+        9 => E::Jsonb,
+        other => {
+            return Err(format!(
+                "unknown PostgreSQL MVCC array element type {other}"
+            ))
+        }
+    })
 }
 
 fn read_value(reader: pg_mvcc_value::Reader<'_>) -> Result<Value, String> {
@@ -330,6 +377,17 @@ fn read_value(reader: pg_mvcc_value::Reader<'_>) -> Result<Value, String> {
                 )
             }
             op::JsonPathValue(path) => Value::JsonPath(read_text(path, "jsonpath value")?),
+            op::ArrayValue(array) => {
+                let array =
+                    array.map_err(|error| format!("read PostgreSQL MVCC array value: {error}"))?;
+                let elem = array_elem_from_ordinal(array.get_elem())?;
+                let items = read_value_list(
+                    array
+                        .get_items()
+                        .map_err(|error| format!("read PostgreSQL MVCC array items: {error}"))?,
+                )?;
+                Value::Array(ferrosa_sql::ArrayValue::new(elem, items))
+            }
             op::TextArrayValue(list) => {
                 let list =
                     list.map_err(|error| format!("read PostgreSQL MVCC text[] value: {error}"))?;
@@ -408,6 +466,18 @@ mod tests {
             jsonb(r#"{"a":[1.0,{"b":2}],"s":"x"}"#),
             Value::JsonPath("$.a[0]".into()),
             Value::TextArray(vec![Some("one".into()), None, Some(String::new())]),
+            Value::Array(ferrosa_sql::ArrayValue::new(
+                ferrosa_sql::ArrayElem::BigInt,
+                vec![Value::Int(1), Value::Null, Value::Int(-3)],
+            )),
+            Value::Array(ferrosa_sql::ArrayValue::new(
+                ferrosa_sql::ArrayElem::Text,
+                vec![],
+            )),
+            Value::Array(ferrosa_sql::ArrayValue::new(
+                ferrosa_sql::ArrayElem::Jsonb,
+                vec![jsonb(r#"{"error":"boom","attempt":1}"#)],
+            )),
         ]
     }
 

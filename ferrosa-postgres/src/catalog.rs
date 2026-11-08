@@ -147,6 +147,7 @@ fn attnum_vector(attnums: &[i64]) -> Value {
 
 /// OID column value — see the module-level OID-scheme note on the `Int` choice.
 fn oid_val(oid: u32) -> Value {
+    // Carried as Value::Int in [0, 2^32); the column type is ColumnType::Oid.
     Value::Int(i64::from(oid))
 }
 
@@ -173,7 +174,7 @@ const RESERVED_NAMESPACES: [&str; 2] = ["pg_catalog", "information_schema"];
 pub fn pg_namespace(schema: &Schema) -> InMemoryTable {
     let snapshot = schema.snapshot();
     let rel_schema = RelSchema::new(vec![
-        Column::new("oid", ColumnType::Int),
+        Column::new("oid", ColumnType::Oid),
         Column::new("nspname", ColumnType::Text),
     ]);
 
@@ -208,9 +209,9 @@ pub fn pg_namespace(schema: &Schema) -> InMemoryTable {
 pub fn pg_class(schema: &Schema) -> InMemoryTable {
     let snapshot = schema.snapshot();
     let rel_schema = RelSchema::new(vec![
-        Column::new("oid", ColumnType::Int),
+        Column::new("oid", ColumnType::Oid),
         Column::new("relname", ColumnType::Text),
-        Column::new("relnamespace", ColumnType::Int),
+        Column::new("relnamespace", ColumnType::Oid),
         Column::new("relkind", ColumnType::Text),
     ]);
 
@@ -256,10 +257,11 @@ pub fn pg_class(schema: &Schema) -> InMemoryTable {
 pub fn pg_attribute(schema: &Schema) -> Result<InMemoryTable, PgTypeError> {
     let snapshot = schema.snapshot();
     let rel_schema = RelSchema::new(vec![
-        Column::new("attrelid", ColumnType::Int),
+        Column::new("attrelid", ColumnType::Oid),
         Column::new("attname", ColumnType::Text),
-        Column::new("atttypid", ColumnType::Int),
+        Column::new("atttypid", ColumnType::Oid),
         Column::new("attnum", ColumnType::Int),
+        Column::new("attisdropped", ColumnType::Bool),
     ]);
 
     let mut rows: Vec<Row> = Vec::new();
@@ -287,47 +289,142 @@ fn attribute_row(relid: u32, col: &ColumnMetadata, attnum: i64, pg: PgType) -> R
         Value::Text(col.name.clone().into()),
         oid_val(pg.oid),
         Value::Int(attnum),
+        // A dropped column leaves the schema entirely; none is ever reported.
+        Value::Bool(false),
     ])
 }
 
-/// `pg_catalog.pg_type` — one row per distinct Postgres type actually used by
-/// the projected columns.
+/// `pg_catalog.pg_type` — every built-in type the front end carries, plus any
+/// other type a column uses.
 ///
-/// Columns: `oid` (Postgres type OID), `typname` (canonical type name).
+/// Columns: `oid`, `typname`, `typnamespace` (pg_catalog), `typlen`, `typtype`
+/// (`b` base), `typsend`/`typreceive`/`typoutput`/`typinput` (PostgreSQL's own
+/// I/O function names, which drivers such as Postgrex match to pick a codec),
+/// `typelem` (an array's element type, else 0), and `typrelid`/`typbasetype`
+/// (always 0: no composite or domain types exist).
 ///
 /// # Errors
 ///
-/// As [`pg_attribute`]: an unresolvable column type is a [`PgTypeError`].
+/// As [`pg_attribute`]: an unresolvable column type is a [`PgTypeError`], and so
+/// is a type with no known I/O function names (never guessed).
 pub fn pg_type(schema: &Schema) -> Result<InMemoryTable, PgTypeError> {
     let snapshot = schema.snapshot();
     let rel_schema = RelSchema::new(vec![
-        Column::new("oid", ColumnType::Int),
+        Column::new("oid", ColumnType::Oid),
         Column::new("typname", ColumnType::Text),
+        Column::new("typnamespace", ColumnType::Oid),
+        Column::new("typlen", ColumnType::Int),
+        Column::new("typtype", ColumnType::Text),
+        Column::new("typsend", ColumnType::Text),
+        Column::new("typreceive", ColumnType::Text),
+        Column::new("typoutput", ColumnType::Text),
+        Column::new("typinput", ColumnType::Text),
+        Column::new("typelem", ColumnType::Oid),
+        Column::new("typrelid", ColumnType::Oid),
+        Column::new("typbasetype", ColumnType::Oid),
     ]);
 
-    // Distinct types actually referenced by columns, sorted by OID for a
-    // deterministic projection.
-    let mut used: Vec<PgType> = Vec::new();
+    let mut types: Vec<(u32, &'static str, i16)> = crate::pg_types::ALL_PG_TYPES
+        .iter()
+        .chain(crate::pg_types::ARRAY_PG_TYPES.iter())
+        .map(|p| (p.oid, p.typname, p.typlen))
+        .collect();
     for ((ks, _), table) in &snapshot.tables {
         for col in table.columns.values() {
-            used.push(pg_type_of_column(&col.column_type, ks, schema)?);
+            let p = pg_type_of_column(&col.column_type, ks, schema)?;
+            types.push((p.oid, p.typname, p.typlen));
         }
     }
-    used.sort_unstable_by_key(|p| p.oid);
-    used.dedup_by_key(|p| p.oid);
+    types.sort_unstable_by_key(|t| t.0);
+    types.dedup_by_key(|t| t.0);
 
-    // Build the rows directly into the reused `used` buffer's capacity — no
-    // second `Vec` from a `map(..).collect()`, and only one row's worth of
-    // temporary at a time.
-    let mut rows: Vec<Row> = Vec::with_capacity(used.len());
-    for p in used {
-        rows.push(Row::new(vec![
-            oid_val(p.oid),
-            Value::Text(p.typname.to_string().into()),
-        ]));
+    let mut rows: Vec<Row> = Vec::with_capacity(types.len());
+    for (oid, typname, typlen) in types {
+        let io = io_functions(typname)
+            .ok_or_else(|| PgTypeError::UnknownPgTypeName(typname.to_string()))?;
+        let mut cells = Vec::with_capacity(12);
+        cells.push(oid_val(oid));
+        cells.push(Value::Text(typname.into()));
+        cells.push(oid_val(PG_CATALOG_NAMESPACE_OID));
+        cells.push(Value::Int(i64::from(typlen)));
+        cells.push(Value::Text("b".into()));
+        for f in io {
+            cells.push(Value::Text(f.into()));
+        }
+        cells.push(oid_val(array_element_oid(typname).unwrap_or(0)));
+        cells.push(oid_val(0));
+        cells.push(oid_val(0));
+        rows.push(Row::new(cells));
     }
 
     Ok(InMemoryTable::new(rel_schema, rows))
+}
+
+/// `oid` (OID 26).
+const PG_OID_OID: u32 = 26;
+/// `pg_catalog`'s namespace OID in PostgreSQL.
+const PG_CATALOG_NAMESPACE_OID: u32 = 11;
+
+/// PostgreSQL's `typsend`, `typreceive`, `typoutput`, `typinput` for a type.
+fn io_functions(typname: &str) -> Option<[String; 4]> {
+    if typname.starts_with('_') {
+        return Some(["array_send", "array_recv", "array_out", "array_in"].map(String::from));
+    }
+    // Types whose functions are `<name>send`, `<name>recv`, `<name>out`, `<name>in`.
+    let plain = matches!(
+        typname,
+        "int2"
+            | "int4"
+            | "int8"
+            | "text"
+            | "bool"
+            | "float4"
+            | "float8"
+            | "bytea"
+            | "oid"
+            | "varchar"
+            | "bpchar"
+            | "name"
+            | "char"
+    );
+    // Types whose functions are `<name>_send`, `<name>_recv`, ...
+    let underscored = matches!(
+        typname,
+        "uuid"
+            | "timestamp"
+            | "timestamptz"
+            | "date"
+            | "time"
+            | "inet"
+            | "numeric"
+            | "jsonb"
+            | "json"
+            | "jsonpath"
+            | "interval"
+    );
+    let sep = match (plain, underscored) {
+        (true, _) => "",
+        (_, true) => "_",
+        _ => return None,
+    };
+    Some([
+        format!("{typname}{sep}send"),
+        format!("{typname}{sep}recv"),
+        format!("{typname}{sep}out"),
+        format!("{typname}{sep}in"),
+    ])
+}
+
+/// The element type OID of a built-in array type.
+fn array_element_oid(typname: &str) -> Option<u32> {
+    let elem = typname.strip_prefix('_')?;
+    if elem == "oid" {
+        return Some(PG_OID_OID);
+    }
+    crate::pg_types::ALL_PG_TYPES
+        .iter()
+        .find(|p| p.typname == elem)
+        .map(|p| p.oid)
 }
 
 /// `pg_catalog.pg_index` — one row per index.
@@ -348,8 +445,8 @@ pub fn pg_type(schema: &Schema) -> Result<InMemoryTable, PgTypeError> {
 pub fn pg_index(schema: &Schema) -> InMemoryTable {
     let snapshot = schema.snapshot();
     let rel_schema = RelSchema::new(vec![
-        Column::new("indexrelid", ColumnType::Int),
-        Column::new("indrelid", ColumnType::Int),
+        Column::new("indexrelid", ColumnType::Oid),
+        Column::new("indrelid", ColumnType::Oid),
         Column::new("indisprimary", ColumnType::Bool),
         Column::new("indkey", ColumnType::TextArray),
     ]);
@@ -385,10 +482,10 @@ pub fn pg_index(schema: &Schema) -> InMemoryTable {
 pub fn pg_constraint(schema: &Schema) -> InMemoryTable {
     let snapshot = schema.snapshot();
     let rel_schema = RelSchema::new(vec![
-        Column::new("oid", ColumnType::Int),
+        Column::new("oid", ColumnType::Oid),
         Column::new("conname", ColumnType::Text),
         Column::new("contype", ColumnType::Text),
-        Column::new("conrelid", ColumnType::Int),
+        Column::new("conrelid", ColumnType::Oid),
         Column::new("conkey", ColumnType::TextArray),
     ]);
 
@@ -439,6 +536,163 @@ fn primary_key_attnums(keyspace: &str, table: &str, meta: &TableMetadata) -> Opt
             None
         }
     }
+}
+
+/// The `pg_catalog` relations this front end serves (projected or streamed).
+pub(crate) const CATALOG_RELATIONS: [&str; 9] = [
+    "pg_namespace",
+    "pg_class",
+    "pg_attribute",
+    "pg_type",
+    "pg_index",
+    "pg_constraint",
+    "pg_range",
+    "pg_description",
+    "pg_enum",
+];
+
+/// Parse a statement off the wire and apply PostgreSQL's implicit search path:
+/// `pg_catalog` is searched before every other schema, so an unqualified
+/// `pg_type` IS `pg_catalog.pg_type` (Postgrex's type bootstrap relies on it).
+/// A CTE of the same name still shadows the catalog relation, as in PostgreSQL.
+pub(crate) fn parse_pg(sql: &str) -> Result<ferrosa_sql::Statement, ferrosa_sql::ParseError> {
+    let mut stmt = ferrosa_sql::parse_statement(sql)?;
+    if let ferrosa_sql::Statement::Select(select) = &mut stmt {
+        qualify_catalog_names(select, &[]);
+        refuse_unknown_casts(select)?;
+    }
+    Ok(stmt)
+}
+
+/// Refuse, at Parse time and by the name as written, a cast to a type nothing
+/// here implements, as PostgreSQL refuses an unknown type when the statement is
+/// prepared rather than when it first runs.
+fn refuse_unknown_casts(
+    select: &mut ferrosa_sql::SelectStmt,
+) -> Result<(), ferrosa_sql::ParseError> {
+    let mut check =
+        |e: &mut ferrosa_sql::ScalarExpr| -> Result<(), ferrosa_sql::ParseError> { cast_check(e) };
+    walk_scalars(select, &mut check)
+}
+
+fn cast_check(e: &mut ferrosa_sql::ScalarExpr) -> Result<(), ferrosa_sql::ParseError> {
+    if let ferrosa_sql::ScalarExpr::Cast { ty, .. } = e {
+        if !ferrosa_sql::cast_type_supported(ty) {
+            let mut name = match &ty.schema {
+                Some(schema) => format!("{schema}.{}", ty.name),
+                None => ty.name.clone(),
+            };
+            if ty.array {
+                name.push_str("[]");
+            }
+            return Err(ferrosa_sql::ParseError::UnsupportedCast(name));
+        }
+    }
+    e.try_for_each_child_mut(&mut cast_check, &mut |q| {
+        walk_scalars(q, &mut |e| cast_check(e))
+    })
+}
+
+/// Apply `f` to every top-level scalar expression of `select` (select items,
+/// join conditions, general conditions, CTE bodies); `f` recurses itself.
+fn walk_scalars<E>(
+    select: &mut ferrosa_sql::SelectStmt,
+    f: &mut dyn FnMut(&mut ferrosa_sql::ScalarExpr) -> Result<(), E>,
+) -> Result<(), E> {
+    for cte in &mut select.ctes {
+        walk_scalars(&mut cte.query, f)?;
+    }
+    for join in &mut select.joins {
+        f(&mut join.on)?;
+    }
+    if let ferrosa_sql::Projection::Items(items) = &mut select.projection {
+        for item in items {
+            if let ferrosa_sql::SelectItem::Expr { expr, .. } = item {
+                f(expr)?;
+            }
+        }
+    }
+    for cond in select.filter.iter_mut().chain(select.having.iter_mut()) {
+        walk_condition(cond, f)?;
+    }
+    Ok(())
+}
+
+fn walk_condition<E>(
+    expr: &mut ferrosa_sql::Expr,
+    f: &mut dyn FnMut(&mut ferrosa_sql::ScalarExpr) -> Result<(), E>,
+) -> Result<(), E> {
+    use ferrosa_sql::Expr;
+    match expr {
+        Expr::And(a, b) | Expr::Or(a, b) => {
+            walk_condition(a, f)?;
+            walk_condition(b, f)
+        }
+        Expr::Not(a) => walk_condition(a, f),
+        Expr::Scalar(e) => f(e),
+        Expr::Compare { .. } => Ok(()),
+    }
+}
+
+fn qualify_catalog_names(select: &mut ferrosa_sql::SelectStmt, outer_ctes: &[String]) {
+    let mut ctes: Vec<String> = outer_ctes.to_vec();
+    for cte in &mut select.ctes {
+        qualify_catalog_names(&mut cte.query, &ctes);
+        ctes.push(cte.name.clone());
+    }
+    let qualify = |t: &mut ferrosa_sql::ast::TableRef| {
+        if t.schema.is_none()
+            && !ctes.contains(&t.table)
+            && CATALOG_RELATIONS.contains(&t.table.as_str())
+        {
+            t.schema = Some("pg_catalog".to_string());
+        }
+    };
+    qualify(&mut select.from);
+    if let Some(join) = &mut select.join {
+        qualify(&mut join.table);
+    }
+    for join in &mut select.joins {
+        qualify(&mut join.table);
+        qualify_in_scalar(&mut join.on, &ctes);
+    }
+    if let ferrosa_sql::Projection::Items(items) = &mut select.projection {
+        for item in items {
+            if let ferrosa_sql::SelectItem::Expr { expr, .. } = item {
+                qualify_in_scalar(expr, &ctes);
+            }
+        }
+    }
+    for cond in select.filter.iter_mut().chain(select.having.iter_mut()) {
+        qualify_in_condition(cond, &ctes);
+    }
+}
+
+fn qualify_in_condition(expr: &mut ferrosa_sql::Expr, ctes: &[String]) {
+    use ferrosa_sql::Expr;
+    match expr {
+        Expr::And(a, b) | Expr::Or(a, b) => {
+            qualify_in_condition(a, ctes);
+            qualify_in_condition(b, ctes);
+        }
+        Expr::Not(a) => qualify_in_condition(a, ctes),
+        Expr::Scalar(e) => qualify_in_scalar(e, ctes),
+        Expr::Compare { .. } => {}
+    }
+}
+
+fn qualify_in_scalar(expr: &mut ferrosa_sql::ScalarExpr, ctes: &[String]) {
+    let walked: Result<(), std::convert::Infallible> = expr.try_for_each_child_mut(
+        &mut |child| {
+            qualify_in_scalar(child, ctes);
+            Ok(())
+        },
+        &mut |query| {
+            qualify_catalog_names(query, ctes);
+            Ok(())
+        },
+    );
+    let Ok(()) = walked;
 }
 
 /// All catalog tables, keyed by their `pg_catalog` relation name, so a future
@@ -864,6 +1118,106 @@ mod tests {
 
         assert!(pairs.contains(&(23, "int4")), "pg_type rows: {pairs:?}");
         assert!(pairs.contains(&(25, "text")), "pg_type rows: {pairs:?}");
+    }
+
+    /// Postgrex's type bootstrap reads every type's I/O functions to pick its
+    /// codec, so `pg_type` lists every built-in type the front end carries (used
+    /// by a column or not), with PostgreSQL's own function names, `typelem` for
+    /// arrays, and zero `typrelid`/`typbasetype` (no composites or domains).
+    #[test]
+    fn pg_type_lists_every_builtin_type_with_its_io_functions() {
+        let schema = schema_with_ks_tbl();
+        let table = pg_type(&schema).expect("pg_type projects");
+        let col = |name: &str| {
+            table
+                .schema()
+                .index_of(name)
+                .unwrap_or_else(|| panic!("{name}"))
+        };
+        let rows = rows_of(&table);
+        let row = |oid: i64| {
+            rows.iter()
+                .find(|r| r.get(col("oid")) == &Value::Int(oid))
+                .unwrap_or_else(|| panic!("no pg_type row {oid}"))
+                .clone()
+        };
+        let text = |r: &Row, c: &str| match r.get(col(c)) {
+            Value::Text(t) => t.as_str().to_string(),
+            other => panic!("{c}: {other:?}"),
+        };
+        // int8 is used by no column of this schema, and is still listed.
+        let int8 = row(20);
+        assert_eq!(text(&int8, "typsend"), "int8send");
+        assert_eq!(text(&int8, "typreceive"), "int8recv");
+        assert_eq!(text(&int8, "typoutput"), "int8out");
+        assert_eq!(text(&int8, "typinput"), "int8in");
+        assert_eq!(int8.get(col("typelem")), &Value::Int(0));
+        assert_eq!(text(&row(2950), "typsend"), "uuid_send");
+        assert_eq!(text(&row(3802), "typreceive"), "jsonb_recv");
+        assert_eq!(text(&row(1184), "typsend"), "timestamptz_send");
+        let int4_array = row(1007);
+        assert_eq!(text(&int4_array, "typsend"), "array_send");
+        assert_eq!(int4_array.get(col("typelem")), &Value::Int(23));
+        // The `_oid` array names an `oid` element type, so `oid` has a row too.
+        assert_eq!(row(1028).get(col("typelem")), &Value::Int(26));
+        assert_eq!(text(&row(26), "typsend"), "oidsend");
+        for r in &rows {
+            assert_eq!(r.get(col("typrelid")), &Value::Int(0));
+            assert_eq!(r.get(col("typbasetype")), &Value::Int(0));
+        }
+        let mut oids: Vec<&Value> = rows.iter().map(|r| r.get(col("oid"))).collect();
+        let before = oids.len();
+        oids.dedup();
+        assert_eq!(before, oids.len(), "one row per type");
+    }
+
+    /// Every OID column of the catalog is typed `oid` (26), not `int4`: synthetic
+    /// relation OIDs reach 2^32 - 1, which an int4 cannot carry.
+    #[test]
+    fn catalog_oid_columns_are_typed_oid() {
+        let schema = schema_with_ks_tbl();
+        let tables = catalog_tables(&schema).expect("catalog projects");
+        let oid_columns = [
+            ("pg_namespace", "oid"),
+            ("pg_class", "oid"),
+            ("pg_class", "relnamespace"),
+            ("pg_attribute", "attrelid"),
+            ("pg_attribute", "atttypid"),
+            ("pg_type", "oid"),
+            ("pg_type", "typnamespace"),
+            ("pg_type", "typelem"),
+            ("pg_type", "typrelid"),
+            ("pg_type", "typbasetype"),
+            ("pg_index", "indexrelid"),
+            ("pg_index", "indrelid"),
+            ("pg_constraint", "oid"),
+            ("pg_constraint", "conrelid"),
+        ];
+        for (table, column) in oid_columns {
+            let (_, t) = tables.iter().find(|(n, _)| n == table).expect(table);
+            let i = t
+                .schema()
+                .index_of(column)
+                .unwrap_or_else(|| panic!("{table}.{column}"));
+            assert_eq!(
+                t.schema().columns[i].ty,
+                ColumnType::Oid,
+                "{table}.{column}"
+            );
+        }
+    }
+
+    #[test]
+    fn pg_attribute_reports_no_dropped_columns() {
+        let schema = schema_with_ks_tbl();
+        let table = pg_attribute(&schema).expect("pg_attribute projects");
+        let col = table
+            .schema()
+            .index_of("attisdropped")
+            .expect("attisdropped column");
+        assert!(rows_of(&table)
+            .iter()
+            .all(|r| r.get(col) == &Value::Bool(false)));
     }
 
     /// PG-T161a-06: a jsonb column projects as OID 3802 in `pg_attribute` and

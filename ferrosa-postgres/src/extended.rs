@@ -28,8 +28,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ferrosa_sql::{
-    parse_statement, DeleteStmt, InsertStmt, ScalarItem, SelectStmt, Statement, UpdateStmt,
-    Value as SqlValue,
+    DeleteStmt, InsertStmt, ScalarItem, SelectStmt, Statement, UpdateStmt, Value as SqlValue,
 };
 
 use crate::messages::{BackendMessage, TransactionStatus};
@@ -540,7 +539,7 @@ impl Session {
         query: &str,
         param_types: Vec<i32>,
     ) -> BackendMessage {
-        let parsed = match parse_statement(query) {
+        let parsed = match crate::catalog::parse_pg(query) {
             Ok(Statement::Select(select)) => PreparedKind::Select(select),
             Ok(Statement::SelectExprs(items)) => {
                 // Parameterized expression selects need $N type inference with no
@@ -961,7 +960,7 @@ mod tests {
             "t",
             std::sync::Arc::new(InMemoryTable::new(schema, rows)),
         );
-        let Ok(Statement::Select(select)) = parse_statement("SELECT id FROM t") else {
+        let Ok(Statement::Select(select)) = ferrosa_sql::parse_statement("SELECT id FROM t") else {
             panic!("fixture query must parse to a SELECT");
         };
         crate::result_stream::open_stream(

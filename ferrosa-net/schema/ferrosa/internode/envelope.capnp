@@ -600,7 +600,16 @@ struct PgMvccValue {
     jsonbValue @12 :Data;
     jsonPathValue @13 :Text;
     textArrayValue @14 :List(PgMvccTextOrNull);
+    # A one-dimensional array: `ferrosa_sql::ArrayElem` ordinal, then the
+    # elements (each itself a value; NULL elements are `nullValue`).
+    arrayValue @15 :PgMvccArray;
   }
+}
+
+struct PgMvccArray {
+  # `ferrosa_sql::ArrayElem` as its declaration ordinal (Int=0 ... Jsonb=9).
+  elem @0 :UInt8;
+  items @1 :List(PgMvccValue);
 }
 
 struct PgMvccRow {
