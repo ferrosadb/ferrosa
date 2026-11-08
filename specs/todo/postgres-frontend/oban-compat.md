@@ -280,3 +280,21 @@ fixing commit.
   * The test now asserts the real answer, `'12'` under `obj_description`:
     `pg_oban_ddl.rs` `obj_description_reads_the_table_comment`.
   * Lean: `Dml.lean` `rewrite_with_alias_keeps_name`, `rewrite_without_alias_renames`.
+
+## Follow-ups (not needed by the census; recorded here because the forge board was unreachable)
+
+* **The READ COMMITTED re-check costs O(rows × buffered writes).** Found by W2. A
+  general UPDATE/DELETE re-checks each target row against every write already
+  buffered in the transaction. Index the buffered writes by table and key so the
+  re-check becomes a lookup.
+* **Refused loudly today (0A000), and not used by the census:**
+  * numeric division;
+  * `AT TIME ZONE` with zones other than UTC;
+  * `json_build_object` with nested json values;
+  * timestamps with a non-zero UTC offset.
+* **Gaps W3 left open:**
+  * recorded indexes are not projected into `pg_class`/`pg_index`;
+  * an enum column is described as `text` on the wire;
+  * single-column index creation is still refused on pair/cluster;
+  * an enum-array `= ANY($n)` parameter OID is not accepted;
+  * the serial node tag is not taken from cluster membership.
