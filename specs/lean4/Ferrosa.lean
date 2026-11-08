@@ -41,6 +41,7 @@ import Ferrosa.Cql.Collections
 import Ferrosa.Cql.Index
 import Ferrosa.Cql.Aggregate
 import Ferrosa.Cql.AggregateObligations
+import Ferrosa.Cql.V5Framing
 import Ferrosa.Storage.Recovery
 import Ferrosa.Storage.Tombstone
 import Ferrosa.Storage.Format

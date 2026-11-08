@@ -23,7 +23,14 @@ import Ferrosa.Cql.Subscribe
 import Ferrosa.Flight.Subscribe
 import Ferrosa.Raft.Obligations
 import Ferrosa.Codec.Audit
+import Ferrosa.Cql.V5Framing
 
+#check Ferrosa.Cql.V5Framing.decode_old_strands_a_buffered_segment
+#check Ferrosa.Cql.V5Framing.framed_old_delivers_nothing
+#check Ferrosa.Cql.V5Framing.decode_old_breaks_progress
+#check Ferrosa.Cql.V5Framing.decode_new_progress
+#check Ferrosa.Cql.V5Framing.decode_new_reassembles
+#check Ferrosa.Cql.V5Framing.framed_new_delivers_all
 #check Ferrosa.Topology.DcQuorum.dc_quorum_writes_share_a_replica
 #check Ferrosa.Topology.DcQuorum.no_partition_admits_two_dc_quorum_writes
 #check Ferrosa.Topology.DcQuorum.node_gate_forces_a_shared_replica
