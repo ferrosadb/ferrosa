@@ -1,0 +1,13 @@
+[package]
+name = "ferrosa-plpgsql"
+description = "PL/pgSQL subset for Ferrosa's PostgreSQL front end: parser, interpreter, AssemblyScript converter"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Deliberately dependency-free: the parser, the interpreter and the converter are pure
+# over the `Host` trait, so they test without storage, wasm or a server.
+[dependencies]
+thiserror = "2"

@@ -2690,6 +2690,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrosa-plpgsql"
+version = "0.35.1"
+dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "ferrosa-postgres"
 version = "0.35.1"
 dependencies = [

@@ -1,0 +1,1 @@
+//! AssemblyScript converter (stub).

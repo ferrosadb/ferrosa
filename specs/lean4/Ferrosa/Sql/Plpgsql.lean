@@ -81,8 +81,8 @@ structure Host (σ : Type) where
   notify : Val → Val → σ → σ
 
 /-- PostgreSQL's reading of a condition value: only `true` is true; NULL and `false` are not. -/
-def truth : Option Val → Bool
-  | some (some "t") => true
+def truth : Val → Bool
+  | some "t" => true
   | _ => false
 
 /-- The value an expression evaluates to: the first column of `SELECT expr`'s one row (NULL if,
@@ -107,10 +107,22 @@ variable {σ : Type} (h : Host σ)
 /-- Bind an expression's variables from the environment, in order. -/
 def bindNames (env : Name → Val) (e : Expr) : List Val := e.refs.map env
 
+/-- An expression's value: `SELECT e` through the host — except an expression that *is* one
+    variable (`$1` bound to it), which is that variable's value, exactly what `SELECT $1`
+    returns. Both runtimes take this shortcut, so it is part of the semantics. -/
+def evalE (env : Name → Val) (s : σ) (e : Expr) : Val × σ :=
+  match e.refs with
+  | [x] => if e.sql = "$1" then (env x, s) else
+      let (r, s') := h.query e.sql (bindNames env e) s
+      (scalar r, s')
+  | _ =>
+      let (r, s') := h.query e.sql (bindNames env e) s
+      (scalar r, s')
+
 def evalCond (env : Name → Val) (s : σ) : Cond → Bool × σ
   | .expr e =>
-      let (r, s') := h.query e.sql (bindNames env e) s
-      (truth r, s')
+      let (v, s') := evalE h env s e
+      (truth v, s')
   | .existsQ neg q =>
       let (r, s') := h.query q.sql (bindNames env q) s
       (if neg then r.isNone else r.isSome, s')
@@ -119,18 +131,18 @@ mutual
 /-- Run one statement. -/
 def interp (env : Name → Val) (s : σ) : Stmt → (Name → Val) × Outcome σ
   | .assign x e =>
-      let (r, s') := h.query e.sql (bindNames env e) s
-      (fun y => if y = x then scalar r else env y, .done s')
+      let (v, s') := evalE h env s e
+      (fun y => if y = x then v else env y, .done s')
   | .perform e => (env, .done (h.query e.sql (bindNames env e) s).2)
   | .exec e => (env, .done (h.execute e.sql (bindNames env e) s))
   | .notify c p =>
-      let (rc, s1) := h.query c.sql (bindNames env c) s
-      let (rp, s2) := h.query p.sql (bindNames env p) s1
-      (env, .done (h.notify (scalar rc) (scalar rp) s2))
+      let (vc, s1) := evalE h env s c
+      let (vp, s2) := evalE h env s1 p
+      (env, .done (h.notify vc vp s2))
   | .ret none => (env, .returned none s)
   | .ret (some e) =>
-      let (r, s') := h.query e.sql (bindNames env e) s
-      (env, .returned (scalar r) s')
+      let (v, s') := evalE h env s e
+      (env, .returned v s')
   | .ifThen c t f =>
       let (b, s') := evalCond h env s c
       if b then interpList env s' t else interpList env s' f
@@ -203,10 +215,20 @@ variable {σ : Type} (h : Host σ)
 
 def bindSlots (store : Nat → Val) (e : CExpr) : List Val := e.slots.map store
 
+/-- The generated code's expression evaluation, with the same one-variable shortcut. -/
+def runE (store : Nat → Val) (s : σ) (e : CExpr) : Val × σ :=
+  match e.slots with
+  | [k] => if e.sql = "$1" then (store k, s) else
+      let (r, s') := h.query e.sql (bindSlots store e) s
+      (scalar r, s')
+  | _ =>
+      let (r, s') := h.query e.sql (bindSlots store e) s
+      (scalar r, s')
+
 def runCond (store : Nat → Val) (s : σ) : CCond → Bool × σ
   | .expr e =>
-      let (r, s') := h.query e.sql (bindSlots store e) s
-      (truth r, s')
+      let (v, s') := runE h store s e
+      (truth v, s')
   | .existsQ neg q =>
       let (r, s') := h.query q.sql (bindSlots store q) s
       (if neg then r.isNone else r.isSome, s')
@@ -215,18 +237,18 @@ mutual
 /-- The compiled program's semantics: what the generated code does, statement by statement. -/
 def run (store : Nat → Val) (s : σ) : CStmt → (Nat → Val) × Outcome σ
   | .assign k e =>
-      let (r, s') := h.query e.sql (bindSlots store e) s
-      (fun j => if j = k then scalar r else store j, .done s')
+      let (v, s') := runE h store s e
+      (fun j => if j = k then v else store j, .done s')
   | .perform e => (store, .done (h.query e.sql (bindSlots store e) s).2)
   | .exec e => (store, .done (h.execute e.sql (bindSlots store e) s))
   | .notify c p =>
-      let (rc, s1) := h.query c.sql (bindSlots store c) s
-      let (rp, s2) := h.query p.sql (bindSlots store p) s1
-      (store, .done (h.notify (scalar rc) (scalar rp) s2))
+      let (vc, s1) := runE h store s c
+      let (vp, s2) := runE h store s1 p
+      (store, .done (h.notify vc vp s2))
   | .ret none => (store, .returned none s)
   | .ret (some e) =>
-      let (r, s') := h.query e.sql (bindSlots store e) s
-      (store, .returned (scalar r) s')
+      let (v, s') := runE h store s e
+      (store, .returned v s')
   | .ifThen c t f =>
       let (b, s') := runCond h store s c
       if b then runList store s' t else runList store s' f
@@ -263,6 +285,21 @@ theorem binds_agree (layout : Name → Nat) (env : Name → Val) (store : Nat �
   intro x _
   exact hag x
 
+/-- Evaluation agrees: the one-variable shortcut reads the same value from the slot as from
+    the name, and every other expression sends the same SQL with the same parameters. -/
+theorem eval_agrees {σ : Type} (h : Host σ) (layout : Name → Nat) (env : Name → Val)
+    (store : Nat → Val) (hag : Agrees layout env store) (s : σ) (e : Expr) :
+    runE h store s (lowerExpr layout e) = evalE h env s e := by
+  have hb := binds_agree layout env store hag e
+  unfold runE evalE
+  simp only [lowerExpr] at hb ⊢
+  cases hr : e.refs with
+  | nil => simp only [hr, List.map_nil] at hb ⊢; rw [hb]
+  | cons x rest =>
+    cases rest with
+    | nil => simp only [hr, List.map_cons, List.map_nil, hag x] at hb ⊢; rw [hb]
+    | cons y more => simp only [hr, List.map_cons] at hb ⊢; rw [hb]
+
 /-- Assigning the same value to `x` and to its slot preserves agreement (this is where
     injectivity is needed). -/
 theorem assign_agrees (layout : Name → Nat) (hinj : Injective layout)
@@ -280,8 +317,7 @@ theorem cond_agrees {σ : Type} (h : Host σ) (layout : Name → Nat) (env : Nam
     runCond h store s (lowerCond layout c) = evalCond h env s c := by
   cases c with
   | expr e =>
-      simp only [runCond, evalCond, lowerCond, lowerExpr_sql,
-        binds_agree layout env store hag e]
+      simp only [runCond, evalCond, lowerCond, eval_agrees h layout env store hag s e]
   | existsQ n q =>
       simp only [runCond, evalCond, lowerCond, lowerExpr_sql,
         binds_agree layout env store hag q]
@@ -301,7 +337,7 @@ theorem convert_agrees {σ : Type} (h : Host σ) (layout : Name → Nat) (hinj :
       Agrees layout env store →
       ResultAgrees layout (interp h env s st) (run h store s (convert layout st))
   | .assign x e, env, store, s, hag => by
-      simp only [interp, run, convert, lowerExpr_sql, binds_agree layout env store hag e, ResultAgrees, true_and]
+      simp only [interp, run, convert, eval_agrees h layout env store hag, ResultAgrees, true_and]
       exact assign_agrees layout hinj env store hag x _
   | .perform e, env, store, s, hag => by
       simp only [interp, run, convert, lowerExpr_sql, binds_agree layout env store hag e, ResultAgrees, true_and]
@@ -310,14 +346,13 @@ theorem convert_agrees {σ : Type} (h : Host σ) (layout : Name → Nat) (hinj :
       simp only [interp, run, convert, lowerExpr_sql, binds_agree layout env store hag e, ResultAgrees, true_and]
       exact hag
   | .notify c p, env, store, s, hag => by
-      simp only [interp, run, convert, lowerExpr_sql, binds_agree layout env store hag c,
-        binds_agree layout env store hag p, ResultAgrees, true_and]
+      simp only [interp, run, convert, eval_agrees h layout env store hag, ResultAgrees, true_and]
       exact hag
   | .ret none, env, store, s, hag => by
       simp only [interp, run, convert, ResultAgrees, true_and]
       exact hag
   | .ret (some e), env, store, s, hag => by
-      simp only [interp, run, convert, lowerExpr_sql, binds_agree layout env store hag e, ResultAgrees, true_and]
+      simp only [interp, run, convert, eval_agrees h layout env store hag, ResultAgrees, true_and]
       exact hag
   | .ifThen c t f, env, store, s, hag => by
       simp only [interp, run, convert, cond_agrees h layout env store hag s c]
