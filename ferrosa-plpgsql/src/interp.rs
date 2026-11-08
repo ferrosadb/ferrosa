@@ -8,6 +8,7 @@
 
 use crate::ast::{Cond, Expr, Program, RoutineKind, Stmt, VarId, VarKind};
 use crate::host::{Host, SqlError, TriggerCall, Value, FETCH_BATCH};
+use crate::messages::{self, err};
 use crate::types::{OID_BOOL, OID_TEXT};
 
 /// The inputs of one run.
@@ -49,10 +50,7 @@ pub fn interpret(
         Flow::Returned(value) => Ok(Some(value)),
         Flow::Next => match program.kind {
             RoutineKind::Do | RoutineKind::Void => Ok(None),
-            RoutineKind::Scalar(_) | RoutineKind::Trigger => Err(SqlError::new(
-                "2F005",
-                "control reached end of function without RETURN",
-            )),
+            RoutineKind::Scalar(_) | RoutineKind::Trigger => Err(err(messages::NO_RETURN)),
         },
     }
 }
@@ -61,23 +59,11 @@ pub fn interpret(
 fn initial_slots(program: &Program, call: Call) -> Result<Vec<Value>, SqlError> {
     let Call { args, trigger } = call;
     if args.len() != program.arg_count {
-        return Err(SqlError::new(
-            "XX000",
-            format!(
-                "called with {} arguments, declared {}",
-                args.len(),
-                program.arg_count
-            ),
-        ));
+        return Err(err(messages::ARGUMENT_SHAPE));
     }
     let trigger = match (&program.kind, trigger) {
         (RoutineKind::Trigger, Some(t)) => Some(t),
-        (RoutineKind::Trigger, None) => {
-            return Err(SqlError::new(
-                "0A000",
-                "trigger functions can only be called as triggers",
-            ))
-        }
+        (RoutineKind::Trigger, None) => return Err(err(messages::NOT_A_TRIGGER_CALL)),
         (_, _) => None,
     };
     let mut args = args.into_iter();
@@ -116,29 +102,23 @@ fn split_trigger(
             String::new(),
         ));
     };
-    let new_row = fit_row(new_row, program.new_fields().len(), "NEW")?;
-    let old_row = fit_row(old_row, program.old_fields().len(), "OLD")?;
+    let new_row = fit_row(new_row, program.new_fields().len())?;
+    let old_row = fit_row(old_row, program.old_fields().len())?;
     Ok((new_row.into_iter(), old_row.into_iter(), op))
 }
 
 /// A trigger row must hold exactly the referenced fields. An absent row (`NEW` in a DELETE)
 /// reads as NULLs, as PostgreSQL's unassigned record does for an AFTER trigger.
-fn fit_row(row: Option<Vec<Value>>, want: usize, which: &str) -> Result<Vec<Value>, SqlError> {
+fn fit_row(row: Option<Vec<Value>>, want: usize) -> Result<Vec<Value>, SqlError> {
     match row {
         Some(values) if values.len() == want => Ok(values),
-        Some(values) => Err(SqlError::new(
-            "XX000",
-            format!(
-                "{which} carries {} fields, the function references {want}",
-                values.len()
-            ),
-        )),
+        Some(_) => Err(err(messages::ROW_SHAPE)),
         None => Ok(vec![Value::null(0); want]),
     }
 }
 
-fn shape(what: &str) -> SqlError {
-    SqlError::new("XX000", format!("trigger call is missing a {what} value"))
+fn shape(_what: &str) -> SqlError {
+    err(messages::ROW_SHAPE)
 }
 
 /// Whether execution falls through to the next statement or has returned.
@@ -241,13 +221,7 @@ impl Machine<'_, '_> {
             Cond::Expr(expr) => {
                 let value = self.eval(expr)?;
                 if !value.is_null() && value.type_oid != OID_BOOL {
-                    return Err(SqlError::new(
-                        "42804",
-                        format!(
-                            "IF condition must be boolean, got type OID {}",
-                            value.type_oid
-                        ),
-                    ));
+                    return Err(err(messages::NOT_BOOLEAN));
                 }
                 Ok(value.is_true())
             }
@@ -277,7 +251,7 @@ impl Machine<'_, '_> {
         let channel = self.eval(channel)?;
         let payload = self.eval(payload)?;
         let Some(channel) = channel.text.filter(|c| !c.is_empty()) else {
-            return Err(SqlError::new("22023", "channel name cannot be empty"));
+            return Err(err(messages::EMPTY_CHANNEL));
         };
         self.host
             .notify(&channel, payload.text.as_deref().unwrap_or(""))
@@ -292,14 +266,7 @@ impl Machine<'_, '_> {
             return Ok(());
         };
         if row.len() != targets.len() {
-            return Err(SqlError::new(
-                "42601",
-                format!(
-                    "query returned {} columns into {} targets",
-                    row.len(),
-                    targets.len()
-                ),
-            ));
+            return Err(err(messages::INTO_COLUMNS));
         }
         for (target, value) in targets.iter().zip(row) {
             self.assign(*target, value)?;
@@ -313,13 +280,13 @@ impl Machine<'_, '_> {
 
     fn assign(&mut self, target: VarId, value: Value) -> Result<(), SqlError> {
         let var = &self.program.variables[target.0];
-        self.slots[target.0] = fit_type(value, var.type_oid, &var.name)?;
+        self.slots[target.0] = fit_type(value, var.type_oid)?;
         Ok(())
     }
 
     fn fit_return(&self, value: Value) -> Result<Value, SqlError> {
         match self.program.kind {
-            RoutineKind::Scalar(oid) => fit_type(value, Some(oid), "the return value"),
+            RoutineKind::Scalar(oid) => fit_type(value, Some(oid)),
             _ => Ok(value),
         }
     }
@@ -334,14 +301,10 @@ pub(crate) fn bare_variable(expr: &Expr) -> Option<VarId> {
 }
 
 fn single_column(row: Vec<Value>) -> Result<Value, SqlError> {
-    let n = row.len();
     let mut columns = row.into_iter();
     match (columns.next(), columns.next()) {
         (Some(value), None) => Ok(value),
-        _ => Err(SqlError::new(
-            "42601",
-            format!("query returned {n} columns where one value was expected"),
-        )),
+        _ => Err(err(messages::NOT_ONE_COLUMN)),
     }
 }
 
@@ -353,7 +316,7 @@ fn text_like(oid: u32) -> bool {
 /// A value stored into a slot (or returned) of a declared type. NULL takes the declared type;
 /// a value of that type (or text into varchar) is kept. Anything else would need an assignment
 /// cast, which this subset does not perform, so it is refused rather than stored mistyped.
-pub(crate) fn fit_type(value: Value, declared: Option<u32>, what: &str) -> Result<Value, SqlError> {
+pub(crate) fn fit_type(value: Value, declared: Option<u32>) -> Result<Value, SqlError> {
     let Some(oid) = declared else {
         return Ok(value);
     };
@@ -366,11 +329,5 @@ pub(crate) fn fit_type(value: Value, declared: Option<u32>, what: &str) -> Resul
             text: value.text,
         });
     }
-    Err(SqlError::new(
-        "42804",
-        format!(
-            "cannot store a value of type OID {} into {what} of type OID {oid}: assignment casts are not supported",
-            value.type_oid
-        ),
-    ))
+    Err(err(messages::ASSIGNMENT_CAST))
 }

@@ -23,7 +23,9 @@ mod error;
 mod host;
 mod interp;
 mod lexer;
+mod messages;
 mod parser;
+pub mod testing;
 mod types;
 pub mod utility;
 

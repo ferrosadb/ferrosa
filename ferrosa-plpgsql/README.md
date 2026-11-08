@@ -39,8 +39,16 @@ in an `Arc<str>`, because a variable keeps its value while it is bound as a para
   fetch one row. Runtime errors carry PostgreSQL's SQLSTATEs (`2F005`, `42804`, `42601`,
   `22023`, `0A000`).
 
-Not yet: the AssemblyScript converter (`assemblyscript`) and the front-end statement parser
-(`utility`) are separate commits.
+- **Converter** (`assemblyscript::convert`): the interpreter's algorithm over the same slots,
+  as AssemblyScript against the canonical ABI of the `routine` world (`ferrosa-udf`'s
+  `src/wit/plpgsql.wit`). SQL is a static UTF-8 data segment; parameters are copied from
+  slots; every fallible step returns the error result. Runtime errors share SQLSTATE and text
+  with the interpreter (`messages`). `ferrosa-udf/tests/plpgsql_compiled.rs` runs both and
+  compares results and host calls.
+- **`testing::ScriptedHost`**: the recording host both runtimes are tested against.
+
+A compiled function allocates from a bump heap reclaimed after each call, so a `PERFORM`
+over a very large result can reach the sandbox memory limit (`54000`) — it fails loudly.
 
 ## Variable binding rule
 

@@ -15,9 +15,12 @@ pub mod component;
 pub mod convert;
 pub mod error;
 pub mod executor;
+/// Compiled PL/pgSQL functions: the `routine` world runner (D13).
+pub mod plpgsql;
 pub mod sandbox;
 
 pub use arena::UdfArena;
 pub use error::UdfError;
 pub use executor::{FunctionKind, StreamingAggregateInvocation, UdfExecutor};
+pub use plpgsql::{BoxedHost, PlpgsqlComponent};
 pub use sandbox::SandboxConfig;

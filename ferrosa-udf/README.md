@@ -53,6 +53,20 @@ gated behind a `ferrosa:streaming-aggregate:v1` custom-section marker.
   wasmtime-backed `WebAssembly` shim, then componentizes the core module to the
   `udf` WIT world via `wit-component`. Powers `CREATE FUNCTION ... LANGUAGE assemblyscript`.
 
+- **Compiled PL/pgSQL functions** (D13, module `plpgsql`, world `routine` in
+  `src/wit/plpgsql.wit`) — `UdfExecutor::load_plpgsql` compiles component bytes;
+  `call_plpgsql(component, call, host)` runs one call with a `ferrosa_plpgsql::Host` moved
+  into the store and handed back. The component imports the host interface (`query` →
+  cursor, `fetch(cursor, max)` in bounded batches, `close`, `execute`, `notify`); values
+  cross as `{type-oid, text}`. Same sandbox as a CQL UDF: the executor's engine, fuel
+  `max_fuel`, `max_memory_bytes`, and an epoch deadline that counts **guest** time only (host
+  time — the SQL the function runs — is subtracted). A trap is SQLSTATE `54000` for a
+  resource limit, `XX000` otherwise.
+- **`component::compile_plpgsql(program)`** (feature `asc-udf`) — converts a parsed
+  `ferrosa_plpgsql::Program` to AssemblyScript, compiles it in process and componentizes it
+  to the `routine` world. A converter output that fails to compile reports the numbered
+  generated source.
+
 ## How it works
 
 | Module | Responsibility |
@@ -84,6 +98,9 @@ contract lives at `src/wit/ferrosa-udf.wit` (worlds `udf` and `uda`).
 ## Dependencies
 
 **Calls** (ferrosa crates this depends on):
+
+- **`ferrosa-plpgsql`** — the `Host` trait, `Value`, `Program` and the AssemblyScript
+  converter for compiled PL/pgSQL.
 
 - **`ferrosa-common`** — `CqlValue`, `CqlType` (the type model it converts to/from
   the WIT ABI).
@@ -118,6 +135,11 @@ pipeline tests build under `--features asc-udf`; the tests that actually run the
 `FERROSA_ASC_BUNDLE` pointing at a bundle built by
 `examples/asc-poc/build-bundle.sh` (they `panic!` with setup instructions if it
 is absent, per repo test policy — no silent skips).
+
+`tests/plpgsql_compiled.rs` (features `asc-udf live-infra-tests`, bundle required) runs
+every case through the interpreter and through the compiled component against identically
+scripted hosts and requires the same result and the same host-call sequence; it also checks
+that a guest that never stops is ended by fuel with `54000`.
 
 ```bash
 cargo test -p ferrosa-udf

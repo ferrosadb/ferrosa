@@ -255,6 +255,16 @@ impl UdfExecutor {
         })
     }
 
+    /// The engine every component of this executor is compiled for.
+    pub(crate) fn engine(&self) -> &Engine {
+        &self.engine
+    }
+
+    /// The sandbox limits every call runs under.
+    pub(crate) fn sandbox(&self) -> &SandboxConfig {
+        &self.config
+    }
+
     /// Create a store with the sandbox limiter and `fuel` installed.
     fn new_store(&self, fuel: u64) -> Result<Store<GuestState>, UdfError> {
         let mut store = Store::new(&self.engine, GuestState::new(&self.config));

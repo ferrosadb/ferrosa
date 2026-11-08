@@ -2933,6 +2933,7 @@ dependencies = [
  "anyhow",
  "bumpalo",
  "ferrosa-common",
+ "ferrosa-plpgsql",
  "num-bigint",
  "rquickjs",
  "slotmap",
