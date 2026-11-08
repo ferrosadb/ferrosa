@@ -151,6 +151,15 @@ pub fn parse(sql: &str) -> Result<SelectStmt, ParseError> {
     Ok(stmt)
 }
 
+/// Parse one scalar expression, alone (a column DEFAULT's recorded text).
+pub(crate) fn parse_scalar_expression(sql: &str) -> Result<crate::ast::ScalarExpr, ParseError> {
+    let toks = lex(sql.trim())?;
+    let mut p = Parser::new(toks);
+    let expr = p.parse_top_scalar_expr()?;
+    p.expect_end()?;
+    Ok(expr)
+}
+
 /// Parse a top-level statement off the Postgres wire: a table `SELECT`, a
 /// no-`FROM` expression `SELECT` (`SELECT 1`, `SELECT version()`), transaction
 /// control (`BEGIN`/`COMMIT`/`ROLLBACK`), or a session statement (`SET`/`RESET`).

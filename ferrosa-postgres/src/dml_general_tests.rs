@@ -109,7 +109,14 @@ fn jobs_meta() -> TableMetadata {
         clustering_key: vec![],
         params: TableParams::default(),
         flags: HashSet::new(),
-        extensions: HashMap::new(),
+        // Oban's `worker NOT NULL` and `attempt_range` CHECK, as W3's DDL records them.
+        extensions: HashMap::from([
+            crate::pg_constraint::not_null_extension("worker"),
+            crate::pg_constraint::check_extension(
+                "attempt_range",
+                "attempt between 0 and max_attempts",
+            ),
+        ]),
         is_system: false,
     }
 }
@@ -548,4 +555,215 @@ async fn standalone_execution_commits_the_statement_atomically() {
     ok(&read);
     let prios: Vec<String> = text_rows(&read).into_iter().map(|r| r[1].clone()).collect();
     assert_eq!(prios, ["10", "11", "0", "10", "10", "12"]);
+}
+
+/// The complete new row (old row overlaid with the SET values) is checked against
+/// NOT NULL and every CHECK, so a cross-column CHECK sees the columns the
+/// statement did not assign.
+#[tokio::test]
+async fn a_general_update_enforces_not_null_and_checks_on_the_new_row() {
+    let (_dir, ctx) = jobs_ctx().await;
+    let mut s = Session::new(superuser());
+    for (sql, state) in [
+        (
+            "UPDATE oban_jobs AS o SET attempt = 99 WHERE o.id = 1",
+            "23514",
+        ),
+        (
+            "UPDATE oban_jobs AS o SET worker = NULL WHERE o.id = 1",
+            "23502",
+        ),
+        (
+            "UPDATE oban_jobs AS o SET max_attempts = 0 WHERE o.id = 5",
+            "23514",
+        ),
+    ] {
+        let reply = simple(&ctx, &mut s, sql).await;
+        assert_eq!(sqlstate(&reply).as_deref(), Some(state), "{sql}: {reply:?}");
+    }
+    assert_eq!(
+        jobs(&ctx, "worker, attempt, max_attempts").await[0],
+        ["1", "W", "0", "20"]
+    );
+    ok(&simple(
+        &ctx,
+        &mut s,
+        "UPDATE oban_jobs AS o SET attempt = 20 WHERE o.id = 1",
+    )
+    .await);
+}
+
+/// `public.jobs2`: Oban's defaulted columns, recorded as W3's DDL records them.
+fn defaults_meta() -> TableMetadata {
+    let cols = [
+        ("id", "bigint"),
+        ("state", "text"),
+        ("queue", "text"),
+        ("worker", "text"),
+        ("attempt", "int"),
+        ("inserted_at", "timestamp"),
+        ("meta", "jsonb"),
+    ];
+    let mut meta = jobs_meta();
+    meta.name = "jobs2".to_string();
+    meta.columns
+        .retain(|name, _| cols.iter().any(|(n, _)| n == name));
+    for (name, ty) in cols {
+        meta.columns
+            .entry(name.to_string())
+            .or_insert_with(|| ColumnMetadata {
+                name: name.to_string(),
+                kind: ColumnKind::Regular,
+                position: 0,
+                column_type: ty.to_string(),
+                clustering_order: ClusteringOrder::None,
+                mask: None,
+            });
+    }
+    meta.extensions = HashMap::from([
+        crate::pg_constraint::not_null_extension("worker"),
+        crate::pg_constraint::not_null_extension("state"),
+        crate::pg_default::serial_extension("id"),
+        crate::pg_default::default_extension("state", "'available'"),
+        crate::pg_default::default_extension("queue", "'default'"),
+        crate::pg_default::default_extension("attempt", "0"),
+        crate::pg_default::default_extension("inserted_at", "timezone('UTC', now())"),
+        crate::pg_default::default_extension("meta", "'{}'"),
+    ]);
+    meta
+}
+
+async fn defaults_ctx() -> (tempfile::TempDir, QueryContext) {
+    let (dir, ctx) = jobs_ctx().await;
+    let meta = defaults_meta();
+    ctx.engine.register_table(meta.to_storage_schema()).unwrap();
+    ctx.schema.create_table(meta, &superuser()).expect("jobs2");
+    (dir, ctx)
+}
+
+/// INSERT fills every omitted column from its DEFAULT and mints a bigserial id
+/// (D15); RETURNING sees the filled values (`Dml.lean`, `fill`).
+#[tokio::test]
+async fn insert_applies_defaults_and_mints_a_bigserial_id() {
+    let (_dir, ctx) = defaults_ctx().await;
+    let mut s = Session::new(superuser());
+    let before = crate::query::wall_clock_micros();
+    let reply = simple(
+        &ctx,
+        &mut s,
+        "INSERT INTO jobs2 (worker) VALUES ('W') RETURNING id, state, queue, attempt, meta",
+    )
+    .await;
+    ok(&reply);
+    let got = text_rows(&reply);
+    assert_eq!(got.len(), 1);
+    let id: i64 = got[0][0].parse().expect("a bigint id");
+    assert!(id > 0, "a D15 id is positive: {id}");
+    assert_eq!(&got[0][1..], ["available", "default", "0", "{}"]);
+    let again = simple(
+        &ctx,
+        &mut s,
+        "INSERT INTO jobs2 (worker) VALUES ('W') RETURNING id",
+    )
+    .await;
+    ok(&again);
+    assert_ne!(
+        text_rows(&again)[0][0],
+        got[0][0],
+        "each row gets its own id"
+    );
+    let read = simple(
+        &ctx,
+        &mut s,
+        &format!("SELECT inserted_at FROM jobs2 WHERE id = {id}"),
+    )
+    .await;
+    ok(&read);
+    let stamp = text_rows(&read)[0][0].clone();
+    assert_ne!(stamp, "NULL", "inserted_at took timezone('UTC', now())");
+    assert!(before > 0 && stamp.starts_with("20"), "{stamp}");
+}
+
+#[tokio::test]
+async fn an_explicit_value_wins_over_the_default_and_the_serial() {
+    let (_dir, ctx) = defaults_ctx().await;
+    let mut s = Session::new(superuser());
+    let reply = simple(
+        &ctx,
+        &mut s,
+        "INSERT INTO jobs2 (id, worker, state, attempt) VALUES (42, 'W', 'scheduled', 3) RETURNING id, state, attempt, queue",
+    )
+    .await;
+    ok(&reply);
+    assert_eq!(text_rows(&reply), [["42", "scheduled", "3", "default"]]);
+    // An explicit NULL is a value, not "use the default": NOT NULL refuses it.
+    let reply = simple(
+        &ctx,
+        &mut s,
+        "INSERT INTO jobs2 (worker, state) VALUES ('W', NULL)",
+    )
+    .await;
+    assert_eq!(sqlstate(&reply).as_deref(), Some("23502"), "{reply:?}");
+}
+
+#[tokio::test]
+async fn the_census_insert_over_the_extended_protocol_returns_its_id() {
+    let (_dir, ctx) = defaults_ctx().await;
+    let mut s = Session::new(superuser());
+    let sql = r#"INSERT INTO "public"."jobs2" ("meta","state","queue","worker","attempt") VALUES ($1,$2,$3,$4,$5) RETURNING "id""#;
+    assert!(matches!(
+        s.on_parse("ins".into(), sql, vec![0; 5]),
+        BackendMessage::ParseComplete
+    ));
+    let described = describe(&ctx, &mut s, b'S', "ins").await;
+    assert!(
+        matches!(described.get(1), Some(BackendMessage::RowDescription { fields }) if fields.len() == 1),
+        "{described:?}"
+    );
+    let params: Vec<Option<Vec<u8>>> = ["{\"k\": 1}", "available", "default", "Oban.Worker", "0"]
+        .iter()
+        .map(|p| Some(p.as_bytes().to_vec()))
+        .collect();
+    let bound = s.on_bind(
+        String::new(),
+        "ins".into(),
+        &[],
+        &params,
+        vec![],
+        &crate::jsonb_wire::test_limits(),
+    );
+    assert!(matches!(bound, BackendMessage::BindComplete), "{bound:?}");
+    let mut out: Vec<BackendMessage> = Vec::new();
+    let tail = execute_portal_to(&ctx, &mut s, "", 0, &mut out)
+        .await
+        .unwrap();
+    out.extend(tail);
+    ok(&out);
+    let id: i64 = text_rows(&out)[0][0].parse().expect("an id");
+    assert!(id > 0);
+    let read = simple(
+        &ctx,
+        &mut s,
+        &format!("SELECT worker, inserted_at IS NOT NULL FROM jobs2 WHERE id = {id}"),
+    )
+    .await;
+    ok(&read);
+    assert_eq!(text_rows(&read), [["Oban.Worker", "t"]]);
+}
+
+/// D14: a row-locking clause is accepted and takes no lock; the rows read are
+/// the rows a plain SELECT reads.
+#[tokio::test]
+async fn select_for_update_skip_locked_is_accepted_and_reads_normally() {
+    let (_dir, ctx) = jobs_ctx().await;
+    let mut s = Session::new(superuser());
+    for sql in [
+        "SELECT id FROM oban_jobs WHERE state = 'completed' FOR UPDATE SKIP LOCKED",
+        "SELECT id FROM oban_jobs WHERE state = 'completed' LIMIT 5 FOR NO KEY UPDATE NOWAIT",
+        "SELECT o.id FROM oban_jobs AS o WHERE o.state = 'completed' FOR SHARE OF o",
+    ] {
+        let reply = simple(&ctx, &mut s, sql).await;
+        ok(&reply);
+        assert_eq!(text_rows(&reply), [["5"]], "{sql}");
+    }
 }

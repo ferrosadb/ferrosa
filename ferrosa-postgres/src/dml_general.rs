@@ -333,7 +333,7 @@ impl Writer<'_> {
             self.recheck(set, &pk, &ck, &old)?;
         }
         let mutation = if self.update {
-            self.update_mutation(&pk, &ck, sets)?
+            self.update_mutation(&pk, &ck, sets, old)?
         } else {
             self.delete_mutation(&pk, &ck, old)?
         };
@@ -402,8 +402,18 @@ impl Writer<'_> {
         pk: &[CqlValue],
         ck: &[CqlValue],
         sets: Vec<SqlValue>,
+        old: Vec<SqlValue>,
     ) -> Result<Mutation, BackendMessage> {
         let meta = self.target.meta;
+        // The complete new row, for NOT NULL, enum and CHECK: the old row overlaid
+        // with the SET values as they will be stored.
+        let mut new_row: HashMap<String, SqlValue> = self
+            .layout
+            .old
+            .iter()
+            .map(|c| c.name.clone())
+            .zip(old)
+            .collect();
         let mut cells: Vec<(u16, CqlValue)> = Vec::with_capacity(sets.len());
         let mut assigned: HashMap<String, CqlValue> = HashMap::with_capacity(sets.len());
         for (column, value) in self.layout.sets.iter().zip(sets) {
@@ -422,9 +432,13 @@ impl Writer<'_> {
                 )
             })?;
             let cql = self.target.to_cql(self.env, name, &value)?;
+            let stored = crate::storage_provider::cql_to_value(&cql)
+                .map_err(|e| error_response("XX000", &e))?;
+            new_row.insert(name.to_string(), stored);
             assigned.insert(name.to_string(), cql.clone());
             cells.push((index, cql));
         }
+        crate::pg_constraint::check_row(self.env.schema, meta, &new_row)?;
         crate::pg_fk::check_child_row(self.env.engine, self.env.schema, meta, &assigned)
             .map_err(|(code, message)| error_response(&code, &message))?;
         let timestamp = crate::query::dml_timestamp();

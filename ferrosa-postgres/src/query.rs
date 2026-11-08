@@ -3179,6 +3179,18 @@ pub(crate) async fn execute_insert(
     // Every row's mutation, built and VALIDATED BEFORE any is applied — statement
     // atomicity (see the function doc).
     let mut mutations: Vec<PgWrite> = Vec::with_capacity(ins.rows.len());
+    // The omitted columns' bigserial ids and DEFAULTs, compiled once for every row.
+    let defaults = match crate::insert_defaults::InsertDefaults::compile(meta, &ins.columns) {
+        Ok(defaults) => defaults,
+        Err(error) => return vec![error],
+    };
+    let fill_ctx = crate::insert_defaults::FillCtx {
+        meta,
+        schema,
+        ks,
+        timestamp_micros,
+        jsonb_limits,
+    };
 
     for row_index in 0..ins.rows.len() {
         // Resolve THIS row's named columns (per CQL type), substituting bound params;
@@ -3216,6 +3228,15 @@ pub(crate) async fn execute_insert(
             }
             col_values.insert(col_name.clone(), value);
             sql_values.insert(col_name.clone(), sql_value);
+        }
+        // Fill the omitted columns BEFORE the constraint check judges the row.
+        let mut fill = crate::insert_defaults::RowFill {
+            col_values: &mut col_values,
+            sql_values: &mut sql_values,
+            regular_cells: &mut regular_cells,
+        };
+        if let Err(error) = defaults.apply(&fill_ctx, &mut fill) {
+            return vec![error];
         }
         // Every NOT NULL column must have been given a non-NULL value (Lean
         // `Ferrosa.Sql.Constraint.admitted_writes_preserve_constraints`).

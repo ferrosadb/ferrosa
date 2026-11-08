@@ -97,6 +97,24 @@ Size: roughly 4–6k lines.
 
 Size: roughly 2–3k lines.
 
+**Status (feat/pg-w2-dml).** Design in D16; Lean model in `Ferrosa/Sql/Dml.lean`.
+
+* Done, end to end through the front end:
+  * census rows 13, 14 and 15: the claim (CTE, `FOR UPDATE SKIP LOCKED`,
+    `UPDATE … FROM`, `RETURNING`), the ack (`= ANY`, timestamp equality), and the
+    plugins' `DELETE`/`UPDATE … WHERE id IN (SELECT … LIMIT n)`;
+  * `UPDATE`/`DELETE … RETURNING`;
+  * INSERT DEFAULTs and bigserial ids (row 12).
+  * Tests: `ferrosa-sql/tests/dml_parse.rs`, `dml_exec.rs`, `default_expr.rs`;
+    `ferrosa-postgres/src/dml_general_tests.rs`; the wire tests in
+    `tests/m1_join_live.rs`.
+* Waiting on W3's array column storage:
+  * the claim's `attempted_by = $5` (`text[]`) and the `errors`/`tags` columns;
+  * an array bound to `ANY($4)`.
+
+  The engine side of arrays is done and tested in `dml_exec.rs`. Storing them and
+  decoding array parameters are W3's.
+
 ### W3 — DDL and catalog
 
 * DDL over the extended protocol.

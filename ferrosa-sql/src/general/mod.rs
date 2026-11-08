@@ -19,10 +19,12 @@
 //! is genuinely duplicated (a join emitting one left row against several right
 //! rows).
 
+mod constant;
 mod dml;
 mod eval;
 pub(crate) mod run;
 
+pub use constant::{compile_default, DefaultExpr};
 pub(crate) use dml::{compile_dml, infer_dml_params};
 
 use std::cell::{Cell, RefCell};
