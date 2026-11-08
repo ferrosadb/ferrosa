@@ -362,3 +362,64 @@ _Phase 0 (grill-me) complete: 10 questions asked across two rounds, 10 user deci
 handling (Q2 — now richer under multi-db), legacy bcrypt-role migration (Q3), SCRAM channel
 binding (Q4), CQL grant backward-compat at rollout (D8b), implicit-vs-explicit default-db
 listing (D8c)._
+
+---
+
+## D12 — Run Postgrex, Ecto and Oban unchanged _(2026-11-08; from the Oban census)_
+
+**Decision:** The front end grows what an Elixir application needs to run Oban 2.19 with its
+**stock** migrations (`Oban.Migration.up(version: 12)`) and execute jobs, as captured in
+`oban-compat.md` and `ferrosa-postgres/tests/fixtures/oban_census.sql`. Oban runs with
+`notifier: Oban.Notifiers.PG` and `peer: Oban.Peers.Global`. The acceptance test is the census
+replayed through a real Postgrex/Ecto/Oban client: migrations apply, a job is inserted, claimed,
+executed and acknowledged.
+
+## D13 — PL/pgSQL through the UDF substrate, with a host interface
+
+**Decision:**
+
+* **`CREATE FUNCTION … LANGUAGE plpgsql`** is parsed into a PL/pgSQL AST, converted to
+  AssemblyScript and compiled in process to a `ferrosa-udf` component. The component is
+  cached by the hash of its source, so it has the same sandbox (fuel, memory, epoch) and the
+  same replication as a CQL UDF.
+* **`DO $$ … $$`** is one-shot. It runs on an interpreter over the same AST rather than being
+  compiled.
+* **Host interface.** Both reach the database through a new WIT host interface:
+  * `query(sql, params) → rows`;
+  * `execute(sql, params) → count`;
+  * `notify(channel, payload)`.
+
+  It executes inside the **calling transaction**, so a `DO` block in a migration commits or
+  rolls back with it.
+* **Triggers.** `CREATE TRIGGER … AFTER INSERT|UPDATE [OF col] … FOR EACH ROW EXECUTE
+  PROCEDURE f()` is stored in the schema and **fires**, with `NEW`, `OLD` and `TG_OP` bound.
+  `DROP TRIGGER` / `DROP FUNCTION [IF EXISTS]` remove them.
+* **`pg_notify` / `NOTIFY` / `LISTEN`** are implemented, so a trigger that notifies is real
+  rather than accepted and ignored.
+* **Fail loudly.** A PL/pgSQL construct outside the supported subset is refused with
+  `0A000` naming it — never compiled to a no-op.
+
+## D14 — `FOR UPDATE [SKIP LOCKED | NOWAIT]` relies on Accord, not row locks
+
+**Decision:** Row-locking clauses are parsed and accepted, and take **no** row locks. Inside a
+transaction block (D11) Accord's strict serializability already prevents two transactions from
+both committing an update to the same row: the loser gets `40001`.
+
+**Consequences (accepted):**
+
+* Postgres would *skip* a locked row; here a concurrent claimer of the same row aborts with
+  `40001`, and a client that retries (Oban's next poll) converges.
+* No row is ever claimed twice.
+* Pickup under contention is slower than with real `SKIP LOCKED`.
+* The documentation and `oban-compat.md` state this difference; it is not silent.
+
+## D15 — `serial` / `bigserial` defaults are unique 64-bit ids, not sequences
+
+**Decision:** A `serial`-family column gets a server-generated **unique** 64-bit value:
+* HLC-derived, so unique across nodes without coordination;
+* not dense, and not ordered across nodes;
+* positive, and within the column's width (`smallserial` and `serial` are refused if the id
+  would not fit).
+
+`nextval`, `setval`, `currval` and `CREATE SEQUENCE` remain unsupported and fail with
+`0A000` — there is no sequence to read.
