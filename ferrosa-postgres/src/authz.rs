@@ -118,6 +118,10 @@ pub(crate) fn statement_permissions(
         // rows, so they need no table permission — the same treatment a session
         // statement gets.
         Statement::Vacuum(_) | Statement::Analyze(_) => Vec::new(),
+        // A comment is part of the table's definition: ALTER, as for ALTER TABLE.
+        Statement::Comment(comment) => {
+            vec![(Permission::Alter, table(&comment.table, default_schema))]
+        }
         // LOCK holds off the table's writers, so it needs the permission a writer needs.
         Statement::Lock(lock) => lock
             .tables

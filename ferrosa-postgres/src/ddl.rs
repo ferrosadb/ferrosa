@@ -37,6 +37,11 @@ use crate::messages::BackendMessage;
 use crate::pg_types::{cql_type_for_pg_name, PgTypeError};
 use crate::query::error_response;
 
+/// The table extension holding a table's `COMMENT ON TABLE` text. An empty value is no
+/// comment (PostgreSQL treats `IS ''` like `IS NULL`), which is also how a comment is
+/// removed: table extensions can be set but not deleted.
+pub(crate) const COMMENT_EXTENSION: &str = "pg.comment";
+
 /// Applies schema changes for the Postgres front-end.
 ///
 /// Implemented by [`ClusterDdl`] (the production path). A failure is reported
@@ -287,10 +292,49 @@ async fn dispatch_ddl(env: DdlEnv<'_>, stmt: ferrosa_sql::Statement) -> Vec<Back
         Statement::CreateTable(create) => execute_create_table(env, &create).await,
         Statement::DropTable(drop) => execute_drop_table(env, &drop).await,
         Statement::AlterTable(alter) => execute_alter_table(env, &alter).await,
+        Statement::Comment(comment) => execute_comment(env, *comment).await,
         other => refuse(
             "XX000",
             &format!("internal: {other:?} is not a DDL statement"),
         ),
+    }
+}
+
+/// `COMMENT ON TABLE t IS 'text' | NULL`: set (or clear) the table's comment extension,
+/// through the schema-change path like any other table change — so it is transactional.
+async fn execute_comment(env: DdlEnv<'_>, stmt: ferrosa_sql::CommentStmt) -> Vec<BackendMessage> {
+    let Some(executor) = env.executor else {
+        return refuse(
+            "0A000",
+            "COMMENT is not available: this server has no schema-change path",
+        );
+    };
+    let keyspace = stmt.table.schema.as_deref().unwrap_or(env.default_schema);
+    if !env
+        .view
+        .tables
+        .contains_key(&(keyspace.to_string(), stmt.table.table.clone()))
+    {
+        return refuse(
+            "42P01",
+            &format!("relation \"{}\" does not exist", stmt.table.table),
+        );
+    }
+    let updates = TableUpdates {
+        params: None,
+        add_columns: Vec::new(),
+        drop_columns: Vec::new(),
+        extensions: Some(HashMap::from([(
+            COMMENT_EXTENSION.to_string(),
+            stmt.comment.unwrap_or_default(),
+        )])),
+    };
+    match executor
+        .alter_table(keyspace, &stmt.table.table, updates)
+        .await
+    {
+        Ok(()) => complete_with("COMMENT"),
+        Err(error) => refuse("58000", &format!("COMMENT failed: {error}")),
     }
 }
 

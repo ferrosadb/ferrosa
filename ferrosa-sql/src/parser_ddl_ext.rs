@@ -8,7 +8,7 @@
 //! A child module of `parser`, so it shares the private lexer and `Parser`. No recursion.
 
 use super::{ParseError, Parser, Tok};
-use crate::ast::{LockMode, LockStmt, Statement};
+use crate::ast::{CommentStmt, LockMode, LockStmt, Statement};
 
 impl Parser {
     /// `LOCK [TABLE] [ONLY] name [, ...] [IN <mode> MODE]`. `NOWAIT` is refused: the
@@ -39,6 +39,33 @@ impl Parser {
         }
         self.expect_end()?;
         Ok(Statement::Lock(LockStmt { tables, mode }))
+    }
+
+    /// `COMMENT ON TABLE name IS 'text' | NULL`. Only tables carry comments here; any other
+    /// object kind is refused by name.
+    pub(super) fn parse_comment(&mut self) -> Result<Statement, ParseError> {
+        self.expect_ident_kw("COMMENT")?;
+        self.expect(&Tok::On, "ON")?;
+        let kind = self.ident()?.to_ascii_uppercase();
+        if kind != "TABLE" {
+            return Err(ParseError::Unsupported(format!(
+                "COMMENT ON {kind} (only COMMENT ON TABLE)"
+            )));
+        }
+        let table = self.parse_qualified_table()?;
+        self.expect_ident_kw("IS")?;
+        let comment = match self.next() {
+            Some(Tok::Str(text)) => Some(text),
+            Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("NULL") => None,
+            other => {
+                return Err(ParseError::Unexpected {
+                    expected: "a string literal or NULL",
+                    found: format!("{other:?}"),
+                })
+            }
+        };
+        self.expect_end()?;
+        Ok(Statement::Comment(Box::new(CommentStmt { table, comment })))
     }
 
     /// `<mode> MODE`, the words after `IN`.
@@ -97,6 +124,26 @@ mod tests {
         assert_eq!(lock.mode, LockMode::AccessExclusive);
         assert_eq!(lock.tables.len(), 2);
         assert_eq!(lock.tables[0].schema.as_deref(), Some("public"));
+    }
+
+    #[test]
+    fn comment_on_table_parses_text_and_null() {
+        let Ok(Statement::Comment(c)) =
+            parse_statement("COMMENT ON TABLE \"public\".oban_jobs IS '12'")
+        else {
+            panic!("COMMENT must parse");
+        };
+        assert_eq!(c.table.schema.as_deref(), Some("public"));
+        assert_eq!(c.table.table, "oban_jobs");
+        assert_eq!(c.comment.as_deref(), Some("12"));
+        let Ok(Statement::Comment(c)) = parse_statement("COMMENT ON TABLE t IS NULL") else {
+            panic!("COMMENT IS NULL must parse");
+        };
+        assert_eq!(c.comment, None);
+        assert!(matches!(
+            parse_statement("COMMENT ON COLUMN t.c IS 'x'"),
+            Err(ParseError::Unsupported(form)) if form.contains("COLUMN")
+        ));
     }
 
     #[test]

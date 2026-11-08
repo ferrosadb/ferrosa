@@ -488,3 +488,134 @@ async fn lock_of_a_missing_table_is_42p01_and_nowait_is_0a000() {
         "0A000"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 4. COMMENT ON TABLE and pg_description (census statements 51 and 8)
+// ---------------------------------------------------------------------------
+
+const TABLE_COMMENT: &str = "SELECT d.description FROM pg_catalog.pg_description d \
+     JOIN pg_catalog.pg_class c ON d.objoid = c.oid WHERE c.relname = 'oban_jobs'";
+
+async fn create_jobs(client: &Client) {
+    client
+        .batch_execute("CREATE TABLE oban_jobs (id bigint PRIMARY KEY, queue text)")
+        .await
+        .expect("create oban_jobs");
+}
+
+/// Oban records its migration version as the table comment and reads it back through
+/// `pg_description`.
+#[tokio::test]
+async fn comment_on_table_is_stored_and_projected_in_pg_description() {
+    let fx = start().await;
+    create_jobs(&fx.client).await;
+    assert!(
+        rows(&fx.client, TABLE_COMMENT).await.is_empty(),
+        "no comment yet"
+    );
+    fx.client
+        .execute("COMMENT ON TABLE \"public\".oban_jobs IS '12'", &[])
+        .await
+        .expect("COMMENT ON TABLE over the extended protocol");
+    assert_eq!(
+        rows(&fx.client, TABLE_COMMENT).await,
+        vec![vec![Some("12".to_string())]]
+    );
+    // A later comment replaces it; IS NULL removes it (as does '', in PostgreSQL).
+    fx.client
+        .batch_execute("COMMENT ON TABLE oban_jobs IS '13'")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(&fx.client, TABLE_COMMENT).await,
+        vec![vec![Some("13".to_string())]]
+    );
+    fx.client
+        .batch_execute("COMMENT ON TABLE oban_jobs IS NULL")
+        .await
+        .unwrap();
+    assert!(rows(&fx.client, TABLE_COMMENT).await.is_empty());
+}
+
+/// pg_description's shape: the comment of a table is the row with `classoid` =
+/// `pg_class` (1259) and `objsubid` = 0.
+#[tokio::test]
+async fn pg_description_row_shape() {
+    let fx = start().await;
+    create_jobs(&fx.client).await;
+    fx.client
+        .batch_execute("COMMENT ON TABLE oban_jobs IS 'v12'")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(
+            &fx.client,
+            "SELECT classoid, objsubid, description FROM pg_catalog.pg_description"
+        )
+        .await,
+        vec![vec![
+            Some("1259".to_string()),
+            Some("0".to_string()),
+            Some("v12".to_string())
+        ]]
+    );
+}
+
+/// The comment is transactional DDL like any other: ROLLBACK discards it.
+#[tokio::test]
+async fn comment_inside_a_rolled_back_block_is_discarded() {
+    let fx = start().await;
+    create_jobs(&fx.client).await;
+    fx.client.batch_execute("BEGIN").await.unwrap();
+    fx.client
+        .batch_execute("COMMENT ON TABLE oban_jobs IS '12'")
+        .await
+        .unwrap();
+    fx.client.batch_execute("ROLLBACK").await.unwrap();
+    assert!(rows(&fx.client, TABLE_COMMENT).await.is_empty());
+}
+
+#[tokio::test]
+async fn comment_refusals_are_named() {
+    let fx = start().await;
+    assert_eq!(
+        code(
+            fx.client
+                .batch_execute("COMMENT ON TABLE missing IS 'x'")
+                .await
+        ),
+        "42P01"
+    );
+    create_jobs(&fx.client).await;
+    assert_eq!(
+        code(
+            fx.client
+                .batch_execute("COMMENT ON COLUMN oban_jobs.queue IS 'x'")
+                .await
+        ),
+        "0A000"
+    );
+}
+
+/// Census statement 8 reads the comment with `obj_description(oid, 'pg_class')`, a function
+/// call in a projection plus a LEFT JOIN: that needs W1's expression engine. Until W1
+/// merges it is refused loudly, never answered with an empty or wrong row. This test pins
+/// that refusal; W1's merge replaces it with the real answer ('12').
+#[tokio::test]
+async fn obj_description_awaits_the_expression_engine() {
+    let fx = start().await;
+    create_jobs(&fx.client).await;
+    fx.client
+        .batch_execute("COMMENT ON TABLE oban_jobs IS '12'")
+        .await
+        .unwrap();
+    let census_8 = "SELECT pg_catalog.obj_description(pg_class.oid, 'pg_class') FROM pg_class \
+         LEFT JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace \
+         WHERE pg_class.relname = 'oban_jobs' AND pg_namespace.nspname = 'public'";
+    let error = fx
+        .client
+        .simple_query(census_8)
+        .await
+        .expect_err("refused until W1 lands function calls in projections");
+    assert!(error.code().is_some(), "a typed SQLSTATE: {error:?}");
+}

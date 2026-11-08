@@ -852,6 +852,19 @@ semantics, never a no-op:
 Tests: `tests/pg_oban_ddl.rs` (`migration_lock_serializes_two_migrators`,
 `migration_lock_holds_off_writers_of_the_table`, …) and `tests/pg_lock_cluster.rs`.
 
+### `COMMENT ON TABLE` and `pg_description` (`catalog_stream`)
+
+`COMMENT ON TABLE t IS 'text' | NULL` sets the table's `pg.comment` extension through the
+schema-change path (so it is transactional DDL and needs `ALTER`); `IS NULL` and `IS ''`
+both remove it, as in PostgreSQL. Other object kinds (`COMMENT ON COLUMN` …) are `0A000`.
+`pg_catalog.pg_description` projects one row per commented table (`objoid`, `classoid` =
+1259, `objsubid` = 0, `description`) as a **streamed** catalog relation: the scan holds
+the shared schema snapshot and builds each row on pull. Oban reads its migration version
+with `obj_description(oid, 'pg_class')` over a `LEFT JOIN` (census statement 8); that form
+needs the expression engine (W1) and is refused loudly until then
+(`obj_description_awaits_the_expression_engine` pins the refusal). Catalog relations are
+resolved only when qualified `pg_catalog.` today; unqualified resolution is W1's.
+
 ### Extended-protocol transaction boundary
 
 Extended-protocol pipelines stage DML until `Sync` and commit the group as one atomic batch. An error rolls back preceding writes in that group, disconnect discards staging, and an explicit `BEGIN` remains open across `Sync`. Commit failures are reported before `ReadyForQuery`. Tests: `server::txn_atomicity_tests::extended_pipeline_*`.

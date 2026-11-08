@@ -77,6 +77,17 @@ pub enum Statement {
     Analyze(AnalyzeStmt),
     /// `LOCK [TABLE] [ONLY] t [, ...] [IN <mode> MODE]` (see [`LockStmt`]).
     Lock(LockStmt),
+    /// `COMMENT ON TABLE t IS 'text' | NULL` (see [`CommentStmt`]).
+    Comment(Box<CommentStmt>),
+}
+
+/// `COMMENT ON TABLE t IS 'text' | NULL`. `comment` is `None` for `IS NULL`, which removes
+/// the comment (as does an empty string, in PostgreSQL). Other object kinds are refused at
+/// parse time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentStmt {
+    pub table: TableRef,
+    pub comment: Option<String>,
 }
 
 /// `LOCK [TABLE] [ONLY] name [, ...] [IN <mode> MODE]`.

@@ -1578,7 +1578,8 @@ pub(crate) fn is_utility(stmt: &Statement) -> bool {
         Statement::CreateTable(_)
         | Statement::DropTable(_)
         | Statement::AlterTable(_)
-        | Statement::Lock(_) => true,
+        | Statement::Lock(_)
+        | Statement::Comment(_) => true,
         Statement::Select(_)
         | Statement::SelectExprs(_)
         | Statement::Begin { .. }
@@ -1674,7 +1675,10 @@ async fn execute_statement(
         )],
         // DDL (T-132a): through the same schema-change path CQL DDL uses — applied now in
         // autocommit, buffered until COMMIT inside a transaction block (`ddl_txn`).
-        stmt @ (Statement::CreateTable(_) | Statement::DropTable(_) | Statement::AlterTable(_)) => {
+        stmt @ (Statement::CreateTable(_)
+        | Statement::DropTable(_)
+        | Statement::AlterTable(_)
+        | Statement::Comment(_)) => {
             crate::ddl::execute_ddl_statement(ddl, schema, default_schema, stmt, txn).await
         }
         // `COPY ... FROM STDIN` cannot be answered in one step: the payload arrives AFTER the
@@ -5460,6 +5464,12 @@ pub(crate) async fn load_catalog_with_mvcc(
     for table_ref in referenced {
         let keyspace = table_ref.schema.as_deref().unwrap_or(default_schema);
         if keyspace == PG_CATALOG {
+            if let Some(streamed) =
+                crate::catalog_stream::streamed_catalog_table(&table_ref.table, schema)
+            {
+                catalog = catalog.with_table(keyspace, &table_ref.table, streamed);
+                continue;
+            }
             let Some(table) = catalog_tables
                 .as_ref()
                 .and_then(|tables| tables.iter().find(|(name, _)| name == &table_ref.table))

@@ -64,7 +64,7 @@ fn namespace_oid(keyspace: &str) -> u32 {
 }
 
 /// OID of the relation (table) `keyspace.table`.
-fn relation_oid(keyspace: &str, table: &str) -> u32 {
+pub(crate) fn relation_oid(keyspace: &str, table: &str) -> u32 {
     synthetic_oid("relation", &format!("{keyspace}.{table}"))
 }
 

@@ -193,6 +193,7 @@ pub fn parse_statement(sql: &str) -> Result<Statement, ParseError> {
             "VACUUM" => p.parse_vacuum(),
             "ANALYZE" | "ANALYSE" => p.parse_analyze(),
             "LOCK" => p.parse_lock(),
+            "COMMENT" => p.parse_comment(),
             other => Err(ParseError::Unexpected {
                 expected: "a statement",
                 found: other.to_string(),

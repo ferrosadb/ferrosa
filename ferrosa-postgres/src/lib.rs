@@ -14,6 +14,7 @@
 
 pub(crate) mod authz;
 pub mod catalog;
+mod catalog_stream;
 pub mod cluster_read;
 pub mod codec;
 pub mod connection;
