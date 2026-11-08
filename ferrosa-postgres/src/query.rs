@@ -1865,6 +1865,7 @@ async fn execute_statement(
                     default_schema,
                     txn,
                     jsonb_limits,
+                    row_events: None,
                 },
                 &ins,
                 &[],
@@ -1881,6 +1882,7 @@ async fn execute_statement(
                 default_schema,
                 txn,
                 jsonb_limits,
+                row_events: None,
             };
             execute_update(context, &upd, &[]).await
         }
@@ -1893,6 +1895,7 @@ async fn execute_statement(
                 default_schema,
                 txn,
                 jsonb_limits,
+                row_events: None,
             };
             execute_delete(context, &del, &[]).await
         }
@@ -3015,6 +3018,9 @@ pub(crate) struct DmlContext<'a> {
     pub txn: Option<&'a mut TxnWriteSet>,
     /// Tunable jsonb ingest limits (D14b) for text bound to jsonb columns.
     pub jsonb_limits: &'a ferrosa_jsonb::Limits,
+    /// Where a write to a table with triggers records its row event (D13); `None` when the
+    /// caller fires no triggers.
+    pub(crate) row_events: crate::procedural::triggers::EventSink<'a>,
 }
 
 impl ReturningOpts<'_> {
@@ -3069,6 +3075,7 @@ pub(crate) async fn execute_insert(
         default_schema,
         mut txn,
         jsonb_limits,
+        row_events,
     } = context;
 
     let ReturningOpts {
@@ -3210,6 +3217,18 @@ pub(crate) async fn execute_insert(
             ),
             meta.id,
         ));
+        // D13: a table with triggers queues this row's event for the statement's end.
+        if let Err(error) = crate::procedural::triggers::record(row_events, meta, || {
+            crate::procedural::triggers::RowEvent {
+                keyspace: ks.to_string(),
+                table: ins.table.table.clone(), // the event outlives the borrowed statement
+                op: crate::procedural::triggers::RowOp::Insert,
+                new: sql_values.into_iter().collect(),
+                old: None,
+            }
+        }) {
+            return vec![error];
+        }
 
         if let Some(result) = returning {
             match &mut combined_returning {
@@ -3643,6 +3662,7 @@ struct UpdateTarget<'a> {
     upd: &'a UpdateStmt,
     params: &'a [SqlValue],
     jsonb_limits: &'a ferrosa_jsonb::Limits,
+    row_events: crate::procedural::triggers::EventSink<'a>,
 }
 
 /// The context a resolved-row `DELETE` write runs against.
@@ -3891,6 +3911,24 @@ fn current_image_for_set(
     Ok(image)
 }
 
+/// A resolved row's whole image as SQL values (a trigger's `OLD`).
+fn full_image(
+    row: &ResolvedRow,
+) -> Result<std::collections::HashMap<String, SqlValue>, BackendMessage> {
+    row.values
+        .iter()
+        .map(|(name, cql)| {
+            let sql = crate::storage_provider::cql_to_value(cql).map_err(|error| {
+                error_response(
+                    "58000",
+                    &format!("UPDATE cannot represent stored column \"{name}\": {error}"),
+                )
+            })?;
+            Ok((name.clone(), sql)) // the resolved row stays borrowed by the write that follows
+        })
+        .collect()
+}
+
 /// Build the storage mutation a resolved-row `UPDATE` writes for ONE row. `current` is
 /// the row image the SET expressions evaluate against (the resolved row for the
 /// index/scan path, the committed row for the storage-key path).
@@ -3899,7 +3937,7 @@ fn build_update_mutation(
     pk_values: &[CqlValue],
     ck_values: &[CqlValue],
     current: Option<&std::collections::HashMap<String, SqlValue>>,
-) -> Result<Mutation, BackendMessage> {
+) -> Result<(Mutation, Vec<(String, SqlValue)>), BackendMessage> {
     let meta = ctx.meta;
     // SET assignments -> regular/static cells (by storage index).
     let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
@@ -3908,6 +3946,8 @@ fn build_update_mutation(
     // UPDATE does not touch keeps its already-valid old value and needs no check).
     let mut assigned: std::collections::HashMap<String, CqlValue> =
         std::collections::HashMap::new();
+    // The SQL values assigned, for a trigger's NEW (D13).
+    let mut assigned_sql: Vec<(String, SqlValue)> = Vec::with_capacity(ctx.upd.assignments.len());
     for (col_name, expr) in &ctx.upd.assignments {
         let col_meta = meta.columns.get(col_name).ok_or_else(|| {
             error_response(
@@ -3926,6 +3966,7 @@ fn build_update_mutation(
         .map_err(|error| error_response("42704", &error.to_string()))?;
         let sql_value = eval_set_expr(expr, current, ctx.params, ctx.timestamp_micros)?;
         let value = value_to_cql(&sql_value, &cql_type, ctx.jsonb_limits)?;
+        assigned_sql.push((col_name.clone(), sql_value)); // the column name is borrowed from the statement
         if !matches!(col_meta.kind, ColumnKind::Regular | ColumnKind::Static) {
             return Err(error_response(
                 "0A000",
@@ -3953,13 +3994,35 @@ fn build_update_mutation(
     let key = ferrosa_row_bridge::build_decorated_key(pk_values, &[])
         .map_err(|error| error_response("22000", &error.to_string()))?;
     let row = ferrosa_row_bridge::build_row(&regular_cells, ck_values, timestamp, None);
-    Ok(Mutation::new(
+    let mutation = Mutation::new(
         ctx.ks.to_string(),
         ctx.table.to_string(),
         key,
         vec![row],
         timestamp,
-    ))
+    );
+    Ok((mutation, assigned_sql))
+}
+
+/// D13: queue an UPDATE's row event when the table has triggers. `old` is the full row before
+/// the update; `NEW` is `old` with the assigned values over it.
+fn record_update_event(
+    ctx: &UpdateTarget<'_>,
+    old: std::collections::HashMap<String, SqlValue>,
+    assigned: Vec<(String, SqlValue)>,
+) -> Result<(), BackendMessage> {
+    crate::procedural::triggers::record(ctx.row_events, ctx.meta, || {
+        let set_columns = assigned.iter().map(|(c, _)| c.clone()).collect(); // names kept beside the values
+        let mut new = old.clone(); // OLD and NEW are both bound: two images of the row
+        new.extend(assigned);
+        crate::procedural::triggers::RowEvent {
+            keyspace: ctx.ks.to_string(),
+            table: ctx.table.to_string(),
+            op: crate::procedural::triggers::RowOp::Update { set_columns },
+            new,
+            old: Some(old),
+        }
+    })
 }
 
 /// Initial candidate selection is a statement snapshot plus own writes. The
@@ -4277,8 +4340,13 @@ async fn apply_update_row(
         row
     };
     let image = current_image_for_set(row, ctx.upd).map_err(|message| vec![message])?;
-    let mutation = build_update_mutation(ctx, &row.pk_values, &row.ck_values, Some(&image))
-        .map_err(|message| vec![message])?;
+    let (mutation, assigned) =
+        build_update_mutation(ctx, &row.pk_values, &row.ck_values, Some(&image))
+            .map_err(|message| vec![message])?;
+    if ctx.row_events.is_some() && crate::procedural::triggers::has_triggers(ctx.meta) {
+        let old = full_image(row).map_err(|message| vec![message])?;
+        record_update_event(ctx, old, assigned).map_err(|message| vec![message])?;
+    }
     apply_or_buffer_silent(
         ctx.engine,
         ctx.schema,
@@ -4581,6 +4649,7 @@ pub(crate) async fn execute_update(
         default_schema,
         mut txn,
         jsonb_limits,
+        row_events,
     } = context;
 
     // UPDATE ... RETURNING is out of scope for this PR (only INSERT RETURNING is
@@ -4643,6 +4712,7 @@ pub(crate) async fn execute_update(
             upd,
             params,
             jsonb_limits,
+            row_events,
         };
         return update_read_committed(&target, buffer, &where_values).await;
     }
@@ -4661,6 +4731,7 @@ pub(crate) async fn execute_update(
             upd,
             params,
             jsonb_limits,
+            row_events,
         };
         return update_rows_by_predicate(&target, txn, &where_values).await;
     }
@@ -4696,7 +4767,9 @@ pub(crate) async fn execute_update(
     let needs_read = upd
         .assignments
         .iter()
-        .any(|(_, expr)| expr.references_column());
+        .any(|(_, expr)| expr.references_column())
+        // D13: a trigger needs the whole OLD row.
+        || (row_events.is_some() && crate::procedural::triggers::has_triggers(meta));
     let current: Option<HashMap<String, SqlValue>> = if needs_read {
         match read_current_row_for_update(
             engine,
@@ -4727,11 +4800,19 @@ pub(crate) async fn execute_update(
         upd,
         params,
         jsonb_limits,
+        row_events,
     };
-    let mutation = match build_update_mutation(&target, &pk_values, &ck_values, current.as_ref()) {
-        Ok(mutation) => mutation,
-        Err(msg) => return vec![msg],
-    };
+    let (mutation, assigned) =
+        match build_update_mutation(&target, &pk_values, &ck_values, current.as_ref()) {
+            Ok(built) => built,
+            Err(msg) => return vec![msg],
+        };
+    // A row that does not exist has no OLD and is not an affected row: no trigger event.
+    if let Some(old) = current {
+        if let Err(error) = record_update_event(&target, old, assigned) {
+            return vec![error];
+        }
+    }
     apply_or_buffer(
         engine,
         schema,
@@ -4997,6 +5078,7 @@ pub(crate) async fn execute_delete(
         default_schema,
         mut txn,
         jsonb_limits,
+        row_events: _,
     } = context;
 
     // DELETE ... RETURNING is out of scope for this PR. Fail loud.

@@ -1117,6 +1117,7 @@ pub(crate) fn dml_context<'a>(
         default_schema: &ctx.default_schema,
         txn,
         jsonb_limits: &ctx.jsonb_limits,
+        row_events: None,
     }
 }
 
@@ -1163,6 +1164,18 @@ async fn run_data_statement<O: ReplySink>(
             session.mark_txn_failed();
             return Ok(vec![error]);
         }
+    }
+    if writes_triggered_table(ctx, stmt) {
+        let msgs =
+            execute_dml_firing(ctx, session, stmt, &[], query::ReturningOpts::simple(), 0).await;
+        if session.in_txn()
+            && msgs
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. }))
+        {
+            session.mark_txn_failed();
+        }
+        return Ok(msgs);
     }
     let snapshot = read_snapshot(ctx, session);
     let in_txn = session.in_txn();
@@ -2108,29 +2121,21 @@ pub(crate) async fn execute_in_session(
     sql: &str,
     statement: ferrosa_sql::Statement,
     params: Vec<ferrosa_sql::Value>,
-    _depth: usize,
+    depth: usize,
 ) -> Vec<BackendMessage> {
     use ferrosa_sql::Statement;
     if let Some(error) = expired_transaction_error(ctx, session) {
         session.mark_txn_failed();
         return vec![error];
     }
-    let timestamp_micros = session.timestamp_micros();
-    let txn = Some(session.txn_writes_mut());
-    let context = query::DmlContext {
-        timestamp_micros,
-        ..dml_context(ctx, txn)
-    };
     match statement {
-        Statement::Insert(ins) => {
+        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
             let opts = query::ReturningOpts {
                 with_row_description: false,
                 result_formats: &[],
             };
-            query::execute_insert(context, &ins, &params, opts).await
+            execute_dml_firing(ctx, session, &statement, &params, opts, depth).await
         }
-        Statement::Update(upd) => query::execute_update(context, &upd, &params).await,
-        Statement::Delete(del) => query::execute_delete(context, &del, &params).await,
         other if params.is_empty() => {
             let mut sink: Vec<BackendMessage> = Vec::new();
             match run_data_statement(ctx, session, sql, &other, &mut sink).await {
@@ -2148,6 +2153,78 @@ pub(crate) async fn execute_in_session(
             "0A000",
             "parameters are bound only into SELECT, INSERT, UPDATE and DELETE",
         )],
+    }
+}
+
+/// Whether a DML statement writes a table that has triggers (D13).
+pub(crate) fn writes_triggered_table(
+    ctx: &QueryContext,
+    statement: &ferrosa_sql::Statement,
+) -> bool {
+    let table = match statement {
+        ferrosa_sql::Statement::Insert(ins) => &ins.table,
+        ferrosa_sql::Statement::Update(upd) => &upd.table,
+        _ => return false,
+    };
+    let keyspace = table.schema.as_deref().unwrap_or(&ctx.default_schema);
+    ctx.schema
+        .snapshot()
+        .tables
+        .get(&(keyspace.to_string(), table.table.clone()))
+        .is_some_and(crate::procedural::triggers::has_triggers)
+}
+
+/// Run INSERT/UPDATE/DELETE in the session's transaction, then fire the AFTER ROW triggers of
+/// the rows it wrote (D13), before returning. A trigger failure fails the statement.
+pub(crate) async fn execute_dml_firing(
+    ctx: &QueryContext,
+    session: &mut Session,
+    statement: &ferrosa_sql::Statement,
+    params: &[ferrosa_sql::Value],
+    opts: query::ReturningOpts<'_>,
+    depth: usize,
+) -> Vec<BackendMessage> {
+    let events = std::sync::Mutex::new(crate::procedural::triggers::RowEvents::default());
+    let timestamp_micros = session.timestamp_micros();
+    let txn = if session.in_txn() {
+        Some(session.txn_writes_mut())
+    } else {
+        None
+    };
+    let context = query::DmlContext {
+        timestamp_micros,
+        row_events: Some(&events),
+        ..dml_context(ctx, txn)
+    };
+    let messages = match statement {
+        ferrosa_sql::Statement::Insert(ins) => {
+            query::execute_insert(context, ins, params, opts).await
+        }
+        ferrosa_sql::Statement::Update(upd) => query::execute_update(context, upd, params).await,
+        ferrosa_sql::Statement::Delete(del) => query::execute_delete(context, del, params).await,
+        _ => vec![query::error_response(
+            "XX000",
+            "internal error: a non-DML statement reached the trigger path",
+        )],
+    };
+    if messages
+        .iter()
+        .any(|m| matches!(m, BackendMessage::ErrorResponse { .. }))
+    {
+        return messages;
+    }
+    let events = match events.into_inner() {
+        Ok(events) => events,
+        Err(_) => {
+            return vec![query::error_response(
+                "XX000",
+                "trigger event queue lock poisoned",
+            )]
+        }
+    };
+    match crate::procedural::triggers::fire(ctx, session, events, depth).await {
+        Ok(()) => messages,
+        Err(error) => vec![error],
     }
 }
 
@@ -2302,44 +2379,25 @@ async fn execute_portal_inner(
         // poisons the transaction (`execute_dml`).
         PreparedKind::Insert(ins) => {
             // Extended Execute: no leading RowDescription for RETURNING (sent at
-            // Describe time); rows honor the portal's result formats.
+            // Describe time); rows honor the portal's result formats. AFTER ROW
+            // triggers (D13) fire before the result returns.
             let returning_opts = query::ReturningOpts {
                 with_row_description: false,
                 result_formats: &result_formats,
             };
-            let in_txn = session.in_txn();
-            let transaction_writes = if in_txn {
-                Some(session.txn_writes_mut())
-            } else {
-                None
-            };
-            let msgs = query::execute_insert(
-                query::DmlContext {
-                    timestamp_micros,
-                    ..dml_context(ctx, transaction_writes)
-                },
-                &ins,
-                &params,
-                returning_opts,
-            )
-            .await;
+            let statement = ferrosa_sql::Statement::Insert(ins);
+            let msgs =
+                execute_dml_firing(ctx, session, &statement, &params, returning_opts, 0).await;
             execute_dml(session, msgs)
         }
         PreparedKind::Update(upd) => {
-            let txn = if session.in_txn() {
-                Some(session.txn_writes_mut())
-            } else {
-                None
+            let returning_opts = query::ReturningOpts {
+                with_row_description: false,
+                result_formats: &result_formats,
             };
-            let msgs = query::execute_update(
-                query::DmlContext {
-                    timestamp_micros,
-                    ..dml_context(ctx, txn)
-                },
-                &upd,
-                &params,
-            )
-            .await;
+            let statement = ferrosa_sql::Statement::Update(upd);
+            let msgs =
+                execute_dml_firing(ctx, session, &statement, &params, returning_opts, 0).await;
             execute_dml(session, msgs)
         }
         PreparedKind::Utility(statement) => {

@@ -2717,6 +2717,7 @@ dependencies = [
  "ferrosa-sql",
  "ferrosa-sstable",
  "ferrosa-storage",
+ "ferrosa-udf",
  "futures",
  "hmac 0.12.1",
  "imbl",

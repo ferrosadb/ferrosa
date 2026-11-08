@@ -66,6 +66,23 @@ pub trait DdlExecutor: Send + Sync {
         name: &str,
         columns: &[String],
     ) -> Result<(), String>;
+    /// Store a user function (D13: a PL/pgSQL function) through the same path a CQL
+    /// `CREATE FUNCTION` uses, so it replicates the same way.
+    async fn create_function(
+        &self,
+        _function: ferrosa_schema::UserFunctionMetadata,
+    ) -> Result<(), String> {
+        Err("this schema-change path cannot store functions".into())
+    }
+    /// Remove a user function overload through the same path.
+    async fn drop_function(
+        &self,
+        _keyspace: &str,
+        _name: &str,
+        _arg_types: Vec<CqlType>,
+    ) -> Result<(), String> {
+        Err("this schema-change path cannot drop functions".into())
+    }
 }
 
 /// [`DdlExecutor`] over the shared, atomically swappable [`DdlPath`] that the
@@ -113,6 +130,32 @@ impl DdlExecutor for ClusterDdl {
             keyspace: keyspace.to_string(),
             table: table.to_string(),
             updates: Box::new(updates),
+        })
+        .await
+        .map_err(|e| e.to_string())
+    }
+
+    async fn create_function(
+        &self,
+        function: ferrosa_schema::UserFunctionMetadata,
+    ) -> Result<(), String> {
+        let path = self.path.load_full();
+        path.execute(DdlOperation::CreateFunction(function))
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn drop_function(
+        &self,
+        keyspace: &str,
+        name: &str,
+        arg_types: Vec<CqlType>,
+    ) -> Result<(), String> {
+        let path = self.path.load_full();
+        path.execute(DdlOperation::DropFunction {
+            keyspace: keyspace.to_string(),
+            name: name.to_string(),
+            arg_types,
         })
         .await
         .map_err(|e| e.to_string())

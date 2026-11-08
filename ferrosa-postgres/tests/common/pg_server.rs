@@ -242,15 +242,44 @@ pub async fn start_server_with_ddl() -> TestServer {
     start_server_configured(0, Default::default(), AccordAccess::disabled(), true).await
 }
 
+/// DDL plus a chosen PL/pgSQL function backend (D13).
+pub async fn start_server_with_procedural(
+    procedural: ferrosa_postgres::procedural::Procedural,
+) -> TestServer {
+    start_server_full(
+        0,
+        Default::default(),
+        AccordAccess::disabled(),
+        true,
+        procedural,
+    )
+    .await
+}
+
 async fn start_server_configured(
     rows: usize,
     limits: ferrosa_postgres::PortalLimits,
     accord: AccordAccess,
     enable_ddl: bool,
 ) -> TestServer {
+    start_server_full(rows, limits, accord, enable_ddl, Default::default()).await
+}
+
+async fn start_server_full(
+    rows: usize,
+    limits: ferrosa_postgres::PortalLimits,
+    accord: AccordAccess,
+    enable_ddl: bool,
+    procedural: ferrosa_postgres::procedural::Procedural,
+) -> TestServer {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = StorageEngine::new(engine_config(dir.path()), None).expect("engine");
     engine.register_table(storage_schema()).expect("register");
+    if enable_ddl {
+        // The schema-change path persists functions (and other DDL) into the system tables,
+        // as on a real node.
+        engine.register_system_tables().expect("system tables");
+    }
     for i in 0..rows {
         write_row(&engine, i);
     }
@@ -264,7 +293,7 @@ async fn start_server_configured(
     ));
     let portals = Arc::new(ferrosa_postgres::SuspendedPortals::new(limits));
     let ctx = Arc::new(QueryContext {
-        procedural: Default::default(),
+        procedural: Arc::new(procedural),
         cluster_read: Default::default(),
         engine: Arc::clone(&engine),
         schema: Arc::clone(&schema),

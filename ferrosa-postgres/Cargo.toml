@@ -13,6 +13,8 @@ ferrosa-schema = { path = "../ferrosa-schema" }
 ferrosa-sql = { path = "../ferrosa-sql" }
 # PL/pgSQL (D13): DO blocks, functions, triggers and the LISTEN/NOTIFY statements.
 ferrosa-plpgsql = { path = "../ferrosa-plpgsql" }
+# Compiled PL/pgSQL functions run in the UDF sandbox (the `routine` world runner).
+ferrosa-udf = { path = "../ferrosa-udf" }
 ferrosa-storage = { path = "../ferrosa-storage" }
 ferrosa-common = { path = "../ferrosa-common" }
 # Reuse the canonical SELECT partition->row decomposition
@@ -78,6 +80,10 @@ live-infra-tests = []
 # building. They are red until those land, so they are built only on request:
 #   cargo test -p ferrosa-postgres --features pending-workstreams
 pending-workstreams = []
+# D13: compile CREATE FUNCTION ... LANGUAGE plpgsql in process (AssemblyScript toolchain in
+# QuickJS; needs FERROSA_ASC_BUNDLE at run time). Without it the binary chooses another
+# FunctionBackend explicitly.
+plpgsql-compile = ["ferrosa-udf/asc-udf"]
 
 [dev-dependencies]
 indexmap = { version = "2", features = ["serde"] }

@@ -983,6 +983,54 @@ path), and run by `procedural::execute`.
 - The notification's process id is a per-session id from the hub. (`BackendKeyData` still
   advertises `0`: the cancel protocol is a separate follow-up.)
 
+### DO blocks
+
+`DO [LANGUAGE plpgsql] $$ … $$` is parsed by `ferrosa-plpgsql` (refusing constructs outside
+the subset with `0A000` before anything runs) and **interpreted** on a blocking thread whose
+host calls are served from the session (`procedural/host.rs`): `query` opens the portal read
+path (snapshot, read-set tracking, read-your-own-writes) and `fetch` pulls at most the
+requested rows; `execute` runs DML with parameters bound, or any other statement through the
+simple-query dispatch; `notify` queues in the transaction. Outside a transaction block the
+DO block is its own implicit transaction (all or nothing); inside one, a failure poisons the
+block (`25P02` afterwards). Expressions evaluate as `SELECT <expr>` through the SQL engine
+with variables bound as `$n` (a literal-only select on the legacy scalar grammar has its `$n`
+substituted by the host). DDL inside a DO block reaches the DDL path inside the block's
+transaction and is refused there with `25001` until transactional DDL (W3) lands.
+
+### PL/pgSQL functions
+
+`CREATE [OR REPLACE] FUNCTION … LANGUAGE plpgsql` parses and compiles the body first (a
+refused body never replaces a function), then stores it through
+`DdlExecutor::create_function` → `DdlOperation::CreateFunction`, the path CQL functions take,
+as language `plpgsql` with a JSON body envelope (source + signature). `RETURNS trigger` /
+`void` are recorded as the marker types `pg_catalog.trigger` / `pg_catalog.void`. Each node
+compiles on first use and caches by the SHA-256 of the envelope (`CACHE_CAPACITY` 256).
+How functions run is the node's explicit `procedural::FunctionBackend`, logged at startup:
+`Compiled` (D13; `ferrosa` feature `plpgsql-compile`, part of `full`; needs
+`FERROSA_ASC_BUNDLE`), `Interpreted` (tests), or `Unavailable` (`CREATE FUNCTION` and trigger
+firing refuse with `0A000` naming the reason). `DROP FUNCTION [IF EXISTS] name[(types)]`
+refuses with `2BP01` while a trigger uses the function. SQLSTATEs: `42723` duplicate,
+`42P13` changed return type, `42883` missing, `42725` ambiguous name, `25001` inside a
+transaction block (DDL is not transactional yet). Calling a PL/pgSQL function from a SQL
+expression (`SELECT f(1)`) is not wired: the expression engine has no user-function hook.
+
+### Triggers
+
+`CREATE TRIGGER name AFTER INSERT | UPDATE [OF col, …] [OR …] ON t FOR EACH ROW EXECUTE
+PROCEDURE|FUNCTION f()` stores the trigger in table extension `pg.triggers` (JSON) through
+`ALTER TABLE`'s schema-change path; `DROP TRIGGER [IF EXISTS] name ON t` removes it.
+Refused by name: BEFORE, INSTEAD OF, FOR EACH STATEMENT, DELETE/TRUNCATE events, WHEN,
+trigger arguments, constraint triggers. Firing: `DmlContext::row_events` makes INSERT and
+UPDATE record one event per written row of a table with triggers (`NEW`, `OLD`, the `SET`
+columns); `server::execute_dml_firing` then runs, before the statement returns and before
+any commit, every matching trigger once per event in row order then trigger-name order, with
+`NEW`/`OLD` fields bound with their column's type OID and `TG_OP`, through the same session —
+so trigger writes join the transaction (`specs/lean4/Ferrosa/Sql/Trigger.lean`). UPDATE OF
+fires when one of its columns is a SET target (PostgreSQL's rule). An UPDATE of a row that
+does not exist records no event. Bounds: `MAX_ROW_EVENTS` (100,000) events per statement
+(`54000`), trigger nesting `MAX_TRIGGER_DEPTH` (16, `54001`; each level is boxed, so the bound
+— not the stack — ends a cascade). A trigger error fails the statement.
+
 **Cluster status (precise):** delivery is **node-local**. A standalone node delivers to every
 session. On a cluster node (`AccordAccess::committer()` is `Some`), `LISTEN` is refused with
 `0A000` — a session that subscribed there would silently miss notifications committed on

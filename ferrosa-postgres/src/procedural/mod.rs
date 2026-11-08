@@ -4,7 +4,9 @@
 //! Statements are recognised by [`ferrosa_plpgsql::utility::parse_utility`] before the SQL
 //! engine sees them; [`execute`] runs them against the session.
 
+pub mod functions;
 mod host;
+pub(crate) mod triggers;
 
 use std::sync::Arc;
 
@@ -17,16 +19,48 @@ use crate::notify::{ListenAction, NotifyHub, TxnNotes};
 use crate::query::error_response;
 use crate::server::QueryContext;
 
-/// The node-wide procedural state every session shares: the notification hub.
+pub use functions::FunctionBackend;
+
+/// The node-wide procedural state every session shares: the notification hub, how PL/pgSQL
+/// functions run on this node, and the compiled functions by source hash.
 pub struct Procedural {
     pub(crate) hub: Arc<NotifyHub>,
+    pub(crate) backend: FunctionBackend,
+    pub(crate) functions: functions::FunctionCache,
 }
 
-impl Default for Procedural {
-    fn default() -> Self {
+impl Procedural {
+    /// Procedural state running functions with `backend`. The choice is logged.
+    pub fn new(backend: FunctionBackend) -> Self {
+        match &backend {
+            FunctionBackend::Compiled(_) => tracing::info!("PL/pgSQL functions run compiled (D13)"),
+            FunctionBackend::Interpreted => {
+                tracing::warn!("PL/pgSQL functions run on the interpreter (test/dev backend)")
+            }
+            FunctionBackend::Unavailable(reason) => {
+                tracing::warn!(%reason, "PL/pgSQL functions are unavailable on this node")
+            }
+        }
         Self {
             hub: Arc::new(NotifyHub::default()),
+            backend,
+            functions: functions::FunctionCache::default(),
         }
+    }
+
+    /// The interpreter backend, for tests.
+    pub fn interpreted() -> Self {
+        Self::new(FunctionBackend::Interpreted)
+    }
+}
+
+/// No function backend: `CREATE FUNCTION` and trigger firing refuse with `0A000`. LISTEN/NOTIFY
+/// and `DO` (always interpreted) work.
+impl Default for Procedural {
+    fn default() -> Self {
+        Self::new(FunctionBackend::Unavailable(
+            "no PL/pgSQL function backend is configured".into(),
+        ))
     }
 }
 
@@ -128,10 +162,18 @@ async fn dispatch(
             pg_notify(ctx, session, &channel, &payload, params, protocol).await
         }
         Utility::Do { body } => do_block(ctx, session, &body).await,
-        other => Err(error_response(
-            "0A000",
-            &format!("{} is not implemented yet", statement_name(&other)),
-        )),
+        Utility::CreateFunction(f) => functions::create(ctx, session, f).await,
+        Utility::DropFunction {
+            if_exists,
+            name,
+            arg_types,
+        } => functions::drop(ctx, session, if_exists, name, arg_types).await,
+        Utility::CreateTrigger(t) => triggers::create(ctx, session, t).await,
+        Utility::DropTrigger {
+            if_exists,
+            name,
+            table,
+        } => triggers::drop(ctx, session, if_exists, name, table).await,
     };
     result.unwrap_or_else(|error| vec![error])
 }
