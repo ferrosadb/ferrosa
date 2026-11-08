@@ -42,4 +42,4 @@ pub use spill::{
     default_temp_root, sweep_orphaned_temp_dirs, DirReserver, SpillCtx, SpillError, SpillReserver,
     SpillStats,
 };
-pub use types::{Column, ColumnType, RelSchema, Row, Value};
+pub use types::{ArrayElem, ArrayValue, Column, ColumnType, RelSchema, Row, Value};

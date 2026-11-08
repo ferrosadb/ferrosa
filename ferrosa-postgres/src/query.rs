@@ -116,6 +116,7 @@ fn render_value(value: &SqlValue) -> Result<Option<Vec<u8>>, EncodeError> {
         SqlValue::Numeric { unscaled, scale } => render_numeric_text(unscaled, *scale).into_bytes(),
         // PostgreSQL jsonb text (D26), or a typed error for a corrupt cell.
         SqlValue::Jsonb(doc) => crate::jsonb_wire::render_text(doc)?,
+        SqlValue::Array(array) => render_array_text(array)?,
         SqlValue::JsonPath(_) | SqlValue::TextArray(_) => {
             return Err(EncodeError::unsupported(
                 "result format for jsonpath and text[] values is not supported yet (T-161b)",
@@ -123,6 +124,86 @@ fn render_value(value: &SqlValue) -> Result<Option<Vec<u8>>, EncodeError> {
         }
     };
     Ok(Some(text))
+}
+
+/// PostgreSQL `array_out`: `{a,b,NULL}`. An element is double-quoted when it is
+/// empty, spells `NULL` (any case), or contains a delimiter, brace, quote,
+/// backslash or whitespace; inside quotes `"` and `\` are backslash-escaped.
+fn render_array_text(array: &ferrosa_sql::ArrayValue) -> Result<Vec<u8>, EncodeError> {
+    let mut out = Vec::with_capacity(2 + array.items.len() * 4);
+    out.push(b'{');
+    for (index, item) in array.items.iter().enumerate() {
+        if index > 0 {
+            out.push(b',');
+        }
+        match render_value(item)? {
+            None => out.extend_from_slice(b"NULL"),
+            Some(text) if array_text_needs_quotes(&text) => {
+                out.push(b'"');
+                for byte in text {
+                    if byte == b'"' || byte == b'\\' {
+                        out.push(b'\\');
+                    }
+                    out.push(byte);
+                }
+                out.push(b'"');
+            }
+            Some(text) => out.extend_from_slice(&text),
+        }
+    }
+    out.push(b'}');
+    Ok(out)
+}
+
+fn array_text_needs_quotes(text: &[u8]) -> bool {
+    text.is_empty()
+        || text.eq_ignore_ascii_case(b"NULL")
+        || text
+            .iter()
+            .any(|b| matches!(b, b'{' | b'}' | b',' | b'"' | b'\\') || b.is_ascii_whitespace())
+}
+
+/// PostgreSQL `array_send` for a one-dimensional array: ndim, has-null flag,
+/// element OID, then (length, lower bound 1), then each element as a 4-byte
+/// length (`-1` for NULL) and its own binary encoding.
+fn encode_array_binary(array: &ferrosa_sql::ArrayValue) -> Result<Vec<u8>, EncodeError> {
+    let elem_type = crate::pg_types::for_array_elem(array.elem);
+    let mut out = Vec::with_capacity(20 + array.items.len() * 8);
+    let ndim: i32 = if array.items.is_empty() { 0 } else { 1 };
+    let has_null = array.items.iter().any(SqlValue::is_null);
+    out.extend_from_slice(&ndim.to_be_bytes());
+    out.extend_from_slice(&i32::from(has_null).to_be_bytes());
+    out.extend_from_slice(&elem_type.oid.to_be_bytes());
+    if ndim == 1 {
+        let len = i32::try_from(array.items.len()).map_err(|_| {
+            EncodeError::from("array is too long for the PostgreSQL wire format".to_string())
+        })?;
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(&1i32.to_be_bytes());
+    }
+    for item in array.items.iter() {
+        let bytes = match (array.elem, item) {
+            // `oid` is unsigned: a synthetic OID can exceed i32::MAX.
+            (ferrosa_sql::ArrayElem::Oid, SqlValue::Int(oid)) => Some(
+                u32::try_from(*oid)
+                    .map_err(|_| EncodeError::from(format!("{oid} is not a valid oid")))?
+                    .to_be_bytes()
+                    .to_vec(),
+            ),
+            _ => encode_value(1, elem_type.column_type, item)?,
+        };
+        match bytes {
+            None => out.extend_from_slice(&(-1i32).to_be_bytes()),
+            Some(bytes) => {
+                let len = i32::try_from(bytes.len()).map_err(|_| {
+                    EncodeError::from("array element is too long for the wire format".to_string())
+                })?;
+                out.extend_from_slice(&len.to_be_bytes());
+                out.extend_from_slice(&bytes);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Postgres text spelling of an `f64`: shortest round-trip form, with the
@@ -806,6 +887,7 @@ pub fn encode_value(
         }
         // jsonb_send: version byte 0x01 then the PostgreSQL text form (D11, D26).
         SqlValue::Jsonb(doc) => Some(crate::jsonb_wire::render_binary(doc)?),
+        SqlValue::Array(array) => Some(encode_array_binary(array)?),
         SqlValue::JsonPath(_) | SqlValue::TextArray(_) => {
             return Err(EncodeError::unsupported(&format!(
                 "no binary codec for {col_type:?} (T-161b)"
@@ -1232,6 +1314,18 @@ fn value_type_name(value: &SqlValue) -> &'static str {
         SqlValue::Jsonb(_) => "jsonb",
         SqlValue::JsonPath(_) => "jsonpath",
         SqlValue::TextArray(_) => "text[]",
+        SqlValue::Array(array) => match array.elem {
+            ferrosa_sql::ArrayElem::Int => "integer[]",
+            ferrosa_sql::ArrayElem::BigInt => "bigint[]",
+            ferrosa_sql::ArrayElem::Oid => "oid[]",
+            ferrosa_sql::ArrayElem::Text => "text[]",
+            ferrosa_sql::ArrayElem::Bool => "boolean[]",
+            ferrosa_sql::ArrayElem::Float => "double precision[]",
+            ferrosa_sql::ArrayElem::Uuid => "uuid[]",
+            ferrosa_sql::ArrayElem::Timestamp => "timestamp[]",
+            ferrosa_sql::ArrayElem::Numeric => "numeric[]",
+            ferrosa_sql::ArrayElem::Jsonb => "jsonb[]",
+        },
     }
 }
 
@@ -5172,6 +5266,7 @@ fn value_column_type(v: &SqlValue) -> ColumnType {
         SqlValue::Jsonb(_) => ColumnType::Jsonb,
         SqlValue::JsonPath(_) => ColumnType::JsonPath,
         SqlValue::TextArray(_) => ColumnType::TextArray,
+        SqlValue::Array(array) => ColumnType::Array(array.elem),
     }
 }
 
@@ -5513,6 +5608,94 @@ pub(crate) fn render_execute_result(
 
 #[cfg(test)]
 mod tests {
+    // -- arrays on the wire ------------------------------------------------------
+
+    fn array(elem: ferrosa_sql::ArrayElem, items: Vec<SqlValue>) -> SqlValue {
+        SqlValue::Array(ferrosa_sql::ArrayValue::new(elem, items))
+    }
+
+    #[test]
+    fn array_text_output_quotes_like_array_out() {
+        use ferrosa_sql::ArrayElem::*;
+        let cases = [
+            (
+                array(
+                    BigInt,
+                    vec![SqlValue::Int(1), SqlValue::Null, SqlValue::Int(-3)],
+                ),
+                "{1,NULL,-3}",
+            ),
+            (array(Text, vec![]), "{}"),
+            (
+                array(
+                    Text,
+                    vec![
+                        SqlValue::Text("plain".into()),
+                        SqlValue::Text(String::new().into()),
+                        SqlValue::Text("null".into()),
+                        SqlValue::Text("a b".into()),
+                        SqlValue::Text("x,y".into()),
+                        SqlValue::Text("q\"\\".into()),
+                    ],
+                ),
+                r#"{plain,"","null","a b","x,y","q\"\\"}"#,
+            ),
+        ];
+        for (value, expected) in cases {
+            let text = super::render_value(&value)
+                .expect("renders")
+                .expect("not null");
+            assert_eq!(String::from_utf8(text).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn array_binary_output_is_array_send() {
+        use ferrosa_sql::ArrayElem::*;
+        let bytes = super::encode_value(
+            1,
+            ColumnType::Array(BigInt),
+            &array(BigInt, vec![SqlValue::Int(7), SqlValue::Null]),
+        )
+        .unwrap()
+        .unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&1i32.to_be_bytes()); // ndim
+        expected.extend_from_slice(&1i32.to_be_bytes()); // has a NULL
+        expected.extend_from_slice(&20u32.to_be_bytes()); // int8
+        expected.extend_from_slice(&2i32.to_be_bytes()); // length
+        expected.extend_from_slice(&1i32.to_be_bytes()); // lower bound
+        expected.extend_from_slice(&8i32.to_be_bytes());
+        expected.extend_from_slice(&7i64.to_be_bytes());
+        expected.extend_from_slice(&(-1i32).to_be_bytes());
+        assert_eq!(bytes, expected);
+
+        let empty = super::encode_value(1, ColumnType::Array(Text), &array(Text, vec![]))
+            .unwrap()
+            .unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&0i32.to_be_bytes());
+        expected.extend_from_slice(&0i32.to_be_bytes());
+        expected.extend_from_slice(&25u32.to_be_bytes());
+        assert_eq!(empty, expected, "an empty array has no dimensions");
+    }
+
+    #[test]
+    fn oid_array_elements_are_unsigned() {
+        // Synthetic OIDs live in [16384, u32::MAX]; one above i32::MAX must encode,
+        // as the 4 unsigned bytes PostgreSQL's oid_send produces.
+        let big = i64::from(u32::MAX - 5);
+        let bytes = super::encode_value(
+            1,
+            ColumnType::Array(ferrosa_sql::ArrayElem::Oid),
+            &array(ferrosa_sql::ArrayElem::Oid, vec![SqlValue::Int(big)]),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(&bytes[8..12], &26u32.to_be_bytes(), "element type is oid");
+        assert_eq!(&bytes[24..28], &(u32::MAX - 5).to_be_bytes());
+    }
+
     use super::*;
     use ferrosa_sql::Value as SqlValue;
 
