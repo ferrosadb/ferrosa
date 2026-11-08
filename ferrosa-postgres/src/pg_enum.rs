@@ -197,6 +197,7 @@ pub(crate) fn all(view: &SchemaSnapshot) -> Vec<(String, String, EnumType)> {
                 let ty = added_labels(meta, name)
                     .into_iter()
                     .fold(EnumType::decode(text)?, EnumType::add_value);
+                // Owned names: the result outlives the snapshot it was read from.
                 Some((keyspace.clone(), name.to_string(), ty))
             })
         })
@@ -330,7 +331,7 @@ pub(crate) fn enum_type_rows(view: &SchemaSnapshot) -> Vec<EnumTypeRow> {
         let typnamespace = crate::catalog::namespace_oid(&keyspace);
         rows.push(EnumTypeRow {
             oid,
-            typname: name.clone(),
+            typname: name.clone(), // the array row below also names the type
             typnamespace,
             typtype: "e",
             typsend: "enum_send",

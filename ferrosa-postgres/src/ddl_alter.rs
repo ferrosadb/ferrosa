@@ -167,7 +167,8 @@ fn plan_action(
             column,
             ty,
             user_type,
-        } => alter_type(keyspace, plan, &column, ty, user_type.as_ref()),
+            array,
+        } => alter_type(keyspace, plan, &column, ty, user_type.as_ref(), array),
         AlterOperation::SetDefault { column, sql } => {
             let def = existing_column(plan, &column)?;
             check_enum_default(env, &plan.meta, &def.name, &sql)?;
@@ -311,6 +312,7 @@ fn alter_type(
     column: &str,
     ty: ferrosa_sql::PgType,
     user_type: Option<&ferrosa_sql::ast::TableRef>,
+    array: bool,
 ) -> Result<(), BackendMessage> {
     let current = existing_column(plan, column)?;
     let same = match user_type {
@@ -326,6 +328,7 @@ fn alter_type(
                 primary_key: false,
                 user_type: None,
                 default: None,
+                array,
                 serial: false,
             };
             crate::pg_enum::column_enum(&plan.meta, column).is_none()

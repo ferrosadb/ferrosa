@@ -209,7 +209,7 @@ pub fn parse_statement(sql: &str) -> Result<Statement, ParseError> {
             "CREATE" => p.parse_create_any(),
             "COPY" => p.parse_copy(),
             "ALTER" => p.parse_alter_any(),
-            "DROP" => p.parse_drop(),
+            "DROP" => p.parse_drop_any(),
             "TRUNCATE" => p.parse_truncate(),
             "VACUUM" => p.parse_vacuum(),
             "ANALYZE" | "ANALYSE" => p.parse_analyze(),
@@ -3717,7 +3717,8 @@ mod tests {
             "CREATE TABLE t ()",
             "CREATE TABLE t (a int PRIMARY KEY",
             "CREATE TABLE t (a int PRIMARY KEY) extra",
-            "CREATE INDEX i ON t (a)",
+            // `CREATE INDEX i ON t (a)` is no longer malformed: it parses (W3, `pg_index`).
+            "CREATE INDEX i ON t",
             "CREATE TABLE t (a varchar(x) PRIMARY KEY)",
             "CREATE TABLE \"t (a int PRIMARY KEY)",
         ];

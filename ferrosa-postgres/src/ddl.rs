@@ -300,6 +300,24 @@ async fn dispatch_ddl(env: DdlEnv<'_>, stmt: ferrosa_sql::Statement) -> Vec<Back
         Statement::Comment(comment) => execute_comment(env, *comment).await,
         Statement::CreateType(create) => execute_create_type(env, *create).await,
         Statement::AlterType(alter) => execute_alter_type(env, *alter).await,
+        Statement::CreateIndex(create) => match env.executor {
+            Some(executor) => {
+                crate::pg_index::execute_create_index(env.clone(), executor, *create).await
+            }
+            None => refuse(
+                "0A000",
+                "CREATE INDEX is not available: no schema-change path",
+            ),
+        },
+        Statement::DropIndex(drop) => match env.executor {
+            Some(executor) => {
+                crate::pg_index::execute_drop_index(env.clone(), executor, *drop).await
+            }
+            None => refuse(
+                "0A000",
+                "DROP INDEX is not available: no schema-change path",
+            ),
+        },
         other => refuse(
             "XX000",
             &format!("internal: {other:?} is not a DDL statement"),
@@ -941,6 +959,7 @@ pub(crate) fn plan_create_table(
                 primary_key: true,
                 user_type: None,
                 default: None,
+                array: false,
                 serial: false,
             },
         );
@@ -1058,7 +1077,18 @@ fn schema_refusal(error: &ferrosa_schema::SchemaError) -> BackendMessage {
 }
 
 /// The CQL type string stored for `def`, through the one PG-name map (D10).
-pub(crate) fn cql_type_string(def: &ColumnDef) -> Result<&'static str, BackendMessage> {
+/// The CQL type of a column definition: its scalar type, or for `T[]` a frozen list of it
+/// (frozen, so the array is one cell and an empty array stays distinct from NULL).
+pub(crate) fn cql_type_string(def: &ColumnDef) -> Result<String, BackendMessage> {
+    let base = scalar_cql_type_string(def)?;
+    Ok(if def.array {
+        format!("frozen<list<{base}>>")
+    } else {
+        base.to_string()
+    })
+}
+
+fn scalar_cql_type_string(def: &ColumnDef) -> Result<&'static str, BackendMessage> {
     let cql = cql_type_for_pg_name(pg_type_name(def.ty)).map_err(|e| match e {
         PgTypeError::UnknownPgTypeName(name) => error_response(
             "42704",

@@ -87,6 +87,32 @@ pub enum Statement {
     CreateType(Box<CreateTypeStmt>),
     /// `ALTER TYPE [schema.]name ADD VALUE [IF NOT EXISTS] 'label'` (see [`AlterTypeStmt`]).
     AlterType(Box<AlterTypeStmt>),
+    /// `CREATE INDEX [IF NOT EXISTS] name ON t [USING m] (cols) [WHERE pred]`.
+    CreateIndex(Box<CreateIndexStmt>),
+    /// `DROP INDEX [IF EXISTS] name [, ...]`.
+    DropIndex(Box<DropIndexStmt>),
+}
+
+/// `CREATE INDEX [IF NOT EXISTS] name ON t [USING method] (col [ASC|DESC], ...) [WHERE pred]`.
+/// `UNIQUE`, expression keys and other methods are refused at parse time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateIndexStmt {
+    pub name: String,
+    pub table: TableRef,
+    pub if_not_exists: bool,
+    /// `btree` (the default), `hash` or `gin`, lower-cased.
+    pub method: String,
+    /// `(column, descending)`, in key order.
+    pub columns: Vec<(String, bool)>,
+    /// A partial index's predicate, as canonical SQL.
+    pub predicate: Option<String>,
+}
+
+/// `DROP INDEX [IF EXISTS] [schema.]name [, ...]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropIndexStmt {
+    pub if_exists: bool,
+    pub names: Vec<TableRef>,
 }
 
 /// `CREATE TYPE [schema.]name AS ENUM ('label', ...)`. Only enum types are accepted; the
@@ -284,6 +310,8 @@ pub enum AlterOperation {
         column: String,
         ty: PgType,
         user_type: Option<TableRef>,
+        /// `T[]`.
+        array: bool,
     },
     /// `ALTER [COLUMN] c SET DEFAULT <expr>`, the expression as canonical SQL text.
     SetDefault { column: String, sql: String },
@@ -358,6 +386,8 @@ pub struct ColumnDef {
     /// with the general scalar grammar, so it is syntactically valid; never compare it
     /// byte-for-byte with what the client sent).
     pub default: Option<String>,
+    /// `T[]`: a one-dimensional array of `ty` (stored as a frozen CQL list).
+    pub array: bool,
     /// `bigserial` / `serial8`: `ty` is [`PgType::BigInt`] and the column's value, when an
     /// INSERT omits it, is a server-generated unique id (D15). `serial`/`smallserial` are
     /// refused at parse time (an id does not fit).

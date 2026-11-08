@@ -693,6 +693,7 @@ impl Parser {
         } else {
             self.parse_column_type()?
         };
+        let array = self.parse_array_suffix()?;
         let mut def = ColumnDef {
             name,
             ty,
@@ -701,6 +702,7 @@ impl Parser {
             primary_key: false,
             user_type,
             default: None,
+            array,
             serial,
         };
         let mut reference = None;
@@ -936,6 +938,26 @@ impl Parser {
             }),
             None => Err(ParseError::UnexpectedEnd),
         }
+    }
+
+    /// An optional `[]` after a type: a one-dimensional array. `[n]` and multi-dimensional
+    /// arrays are refused (PostgreSQL ignores the bound; ferrosa will not pretend to).
+    pub(super) fn parse_array_suffix(&mut self) -> Result<bool, ParseError> {
+        if !matches!(self.peek(), Some(Tok::LBracket)) {
+            return Ok(false);
+        }
+        self.next();
+        if !matches!(self.next(), Some(Tok::RBracket)) {
+            return Err(ParseError::Unsupported(
+                "an array type with a size bound".into(),
+            ));
+        }
+        if matches!(self.peek(), Some(Tok::LBracket)) {
+            return Err(ParseError::Unsupported(
+                "a multi-dimensional array type".into(),
+            ));
+        }
+        Ok(true)
     }
 
     /// `bigserial`/`serial8` → `true` (consumed). `serial`, `serial4`, `smallserial` and

@@ -161,8 +161,20 @@ pub fn cql_to_value(v: &CqlValue) -> Result<Value, String> {
         CqlValue::Varint(b) => Value::numeric(b.clone(), 0),
         // These values have no lossless SQL scalar representation here. Fail
         // the query instead of returning NULL for a non-NULL stored value.
+        // A frozen list is an array column (`pg_array`); its element type follows the items.
+        // (An empty list's element type is taken from the column at encoding time.)
+        CqlValue::List(items) => {
+            let elem = items
+                .iter()
+                .find(|i| !matches!(i, CqlValue::Null))
+                .map_or(ferrosa_sql::ArrayElem::Text, crate::pg_array::elem_of);
+            let values = items
+                .iter()
+                .map(cql_to_value)
+                .collect::<Result<Vec<_>, _>>()?;
+            Value::Array(ferrosa_sql::ArrayValue::new(elem, values))
+        }
         CqlValue::Duration { .. }
-        | CqlValue::List(_)
         | CqlValue::Set(_)
         | CqlValue::Map(_)
         | CqlValue::Tuple(_)
@@ -1712,7 +1724,8 @@ mod tests {
             nanos: 3
         })
         .is_err());
-        assert!(super::cql_to_value(&CqlValue::List(vec![CqlValue::Int(1)])).is_err());
+        // A list is an array value now (W3, `pg_array`); a set still has no SQL form.
+        assert!(super::cql_to_value(&CqlValue::Set(vec![CqlValue::Int(1)])).is_err());
         assert!(super::cql_to_value(&CqlValue::Timestamp(i64::MAX)).is_err());
     }
 

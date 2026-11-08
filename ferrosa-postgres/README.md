@@ -949,6 +949,32 @@ Key columns are NOT NULL by construction.
 - A `CHECK` written inside `CREATE TABLE` is still refused by name (`0A000`); Oban adds its
   checks with `ALTER TABLE`.
 
+### `CREATE INDEX` / `DROP INDEX` (`pg_index`)
+
+Ferrosa secondary indexes cover one column. A **single-column, non-partial, ascending
+`btree`/`hash` index** is a real secondary index (built through `DdlPath`; on pair/cluster
+index creation is still refused, the existing `t_9fba4678` readiness gap). A **composite,
+partial (`WHERE`), `DESC` or `USING gin` index is accepted and recorded but builds nothing
+and is never used for planning** — those queries scan. Every index is recorded as
+`pg.index.<name>` (JSON) on its table; names are unique per schema (`42P07`), `IF NOT
+EXISTS` is idempotent, `DROP INDEX [IF EXISTS]` removes the record and any physical index,
+a key/foreign-key index cannot be dropped (`0A000`), a missing one is `42704`. `UNIQUE`,
+expression keys, `CONCURRENTLY` and other methods are `0A000`. Recorded indexes are not
+yet projected into `pg_class`/`pg_index`. Both statements are transactional DDL.
+
+### Array columns (`pg_array`, on W1's `ArrayValue`)
+
+`text[]`, `jsonb[]` (and arrays of the other element types the engine carries) are
+one-dimensional array columns stored as a **frozen** CQL list, so the array is one cell and
+an empty array (`'{}'`) stays distinct from NULL. Input: PostgreSQL's array text form
+(`'{a,"b c"}'`, quoted elements, backslash escapes) for literals and text parameters, and
+`array_recv`'s binary form for `text[]`/`jsonb[]` parameters (OIDs 1009/3807). Output is
+W1's `array_out`/`array_send`; the binary header carries the column's element OID even for
+an empty array. Refused, never substituted: a NULL element (`0A000` — a CQL list cannot
+hold NULL), a multi-dimensional or size-bounded array type (`0A000`), a malformed literal
+(`22P02`). `ARRAY[...]` constructors in DML are W1/W2's (a DEFAULT of `ARRAY[]::jsonb[]` is
+recorded as SQL and applied by W2's INSERT).
+
 ### Extended-protocol transaction boundary
 
 Extended-protocol pipelines stage DML until `Sync` and commit the group as one atomic batch. An error rolls back preceding writes in that group, disconnect discards staging, and an explicit `BEGIN` remains open across `Sync`. Commit failures are reported before `ReadyForQuery`. Tests: `server::txn_atomicity_tests::extended_pipeline_*`.

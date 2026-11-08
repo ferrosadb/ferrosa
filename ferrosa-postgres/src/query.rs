@@ -166,8 +166,17 @@ fn array_text_needs_quotes(text: &[u8]) -> bool {
 /// PostgreSQL `array_send` for a one-dimensional array: ndim, has-null flag,
 /// element OID, then (length, lower bound 1), then each element as a 4-byte
 /// length (`-1` for NULL) and its own binary encoding.
-fn encode_array_binary(array: &ferrosa_sql::ArrayValue) -> Result<Vec<u8>, EncodeError> {
-    let elem_type = crate::pg_types::for_array_elem(array.elem);
+fn encode_array_binary(
+    array: &ferrosa_sql::ArrayValue,
+    col_type: ColumnType,
+) -> Result<Vec<u8>, EncodeError> {
+    // The column's element type wins: an empty array read from storage has no item to say
+    // what it holds, and the header must carry the element OID the client was told.
+    let elem = match col_type {
+        ColumnType::Array(elem) => elem,
+        _ => array.elem,
+    };
+    let elem_type = crate::pg_types::for_array_elem(elem);
     let mut out = Vec::with_capacity(20 + array.items.len() * 8);
     let ndim: i32 = if array.items.is_empty() { 0 } else { 1 };
     let has_null = array.items.iter().any(SqlValue::is_null);
@@ -414,10 +423,34 @@ impl ParamError {
 
 /// Parameter type OIDs the decoder maps. Anything else (except `0`,
 /// unspecified) is refused rather than decoded as text.
-const SUPPORTED_PARAM_OIDS: [i32; 20] = [
-    16, 17, 19, 20, 21, 23, 25, 26, 114, 700, 701, 869, 1043, 1082, 1083, 1114, 1184, 1700, 2950,
+const SUPPORTED_PARAM_OIDS: [i32; 22] = [
+    16,
+    17,
+    19,
+    20,
+    21,
+    23,
+    25,
+    26,
+    114,
+    700,
+    701,
+    869,
+    1043,
+    1082,
+    1083,
+    1114,
+    1184,
+    1700,
+    2950,
     3802,
+    PARAM_OID_TEXT_ARRAY,
+    PARAM_OID_JSONB_ARRAY,
 ];
+
+/// `text[]` and `jsonb[]` parameter OIDs (`pg_array`).
+const PARAM_OID_TEXT_ARRAY: i32 = 1009;
+const PARAM_OID_JSONB_ARRAY: i32 = 3807;
 
 /// `json` (D11: stored as jsonb) and `jsonb` parameter OIDs.
 const PARAM_OID_JSON: i32 = 114;
@@ -457,11 +490,55 @@ pub(crate) fn decode_param_checked(
     if matches!(type_oid, PARAM_OID_JSON | PARAM_OID_JSONB) {
         return decode_param_jsonb(format, type_oid, raw, jsonb_limits);
     }
+    if matches!(type_oid, PARAM_OID_TEXT_ARRAY | PARAM_OID_JSONB_ARRAY) {
+        return decode_param_array(format, raw);
+    }
     if format == 1 {
         decode_param_binary(type_oid, raw)
     } else {
         decode_param_text(type_oid, raw)
     }
+}
+
+/// A NULL element cannot be stored: an array column is a CQL list, and a CQL list holds no
+/// NULL. Refused rather than stored as something else.
+fn null_array_element() -> BackendMessage {
+    error_response(
+        "0A000",
+        "NULL array elements are not supported: an array column is stored as a CQL list, \
+         which cannot hold NULL",
+    )
+}
+
+/// `text[]`/`jsonb[]` parameter: binary is `array_recv`'s format; text is the array literal,
+/// kept as text and parsed against the target column (`pg_array::parse_text_array`).
+fn decode_param_array(format: i16, raw: &[u8]) -> Result<SqlValue, ParamError> {
+    let to_param = |m: BackendMessage| match m {
+        BackendMessage::ErrorResponse { fields } => {
+            let field = |k: u8| {
+                fields
+                    .iter()
+                    .find(|(f, _)| *f == k)
+                    .map(|(_, v)| v.clone()) // the parameter error owns its text
+                    .unwrap_or_default()
+            };
+            // `pg_array` refuses with exactly these codes.
+            let code: &'static str = match field(b'C').as_str() {
+                "22P02" => "22P02",
+                "0A000" => "0A000",
+                "22021" => "22021",
+                _ => "08P01",
+            };
+            ParamError::new(code, field(b'M'))
+        }
+        other => ParamError::new("XX000", format!("{other:?}")),
+    };
+    if format == 1 {
+        return crate::pg_array::decode_binary_array(raw).map_err(to_param);
+    }
+    std::str::from_utf8(raw)
+        .map(|text| SqlValue::Text(text.to_string().into()))
+        .map_err(|_| ParamError::new("22021", "array parameter is not valid UTF-8".to_string()))
 }
 
 /// jsonb / json parameter: parse under the configured limits (D14b).
@@ -898,7 +975,7 @@ pub fn encode_value(
         }
         // jsonb_send: version byte 0x01 then the PostgreSQL text form (D11, D26).
         SqlValue::Jsonb(doc) => Some(crate::jsonb_wire::render_binary(doc)?),
-        SqlValue::Array(array) => Some(encode_array_binary(array)?),
+        SqlValue::Array(array) => Some(encode_array_binary(array, col_type)?),
         SqlValue::JsonPath(_) | SqlValue::TextArray(_) => {
             return Err(EncodeError::unsupported(&format!(
                 "no binary codec for {col_type:?} (T-161b)"
@@ -1741,7 +1818,9 @@ pub(crate) fn is_utility(stmt: &Statement) -> bool {
         | Statement::Lock(_)
         | Statement::Comment(_)
         | Statement::CreateType(_)
-        | Statement::AlterType(_) => true,
+        | Statement::AlterType(_)
+        | Statement::CreateIndex(_)
+        | Statement::DropIndex(_) => true,
         Statement::Select(_)
         | Statement::SelectExprs(_)
         | Statement::Begin { .. }
@@ -1848,7 +1927,9 @@ async fn execute_statement(
         | Statement::AlterTable(_)
         | Statement::Comment(_)
         | Statement::CreateType(_)
-        | Statement::AlterType(_)) => {
+        | Statement::AlterType(_)
+        | Statement::CreateIndex(_)
+        | Statement::DropIndex(_)) => {
             let probe = EnvProbe { env };
             crate::ddl::execute_ddl_statement(ddl, schema, default_schema, stmt, txn, Some(&probe))
                 .await
@@ -3028,6 +3109,25 @@ pub(crate) fn value_to_cql(
                 .map_err(|e| error_response(e.sqlstate, &e.message))?;
             CqlValue::Jsonb(doc)
         }
+        (CqlType::List(inner), SqlValue::Array(array)) => CqlValue::List(
+            array
+                .items
+                .iter()
+                .map(|item| match item {
+                    SqlValue::Null => Err(null_array_element()),
+                    item => value_to_cql(item, inner, jsonb_limits),
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        (CqlType::List(inner), SqlValue::Text(text)) => CqlValue::List(
+            crate::pg_array::parse_text_array(text)?
+                .into_iter()
+                .map(|item| match item {
+                    Some(item) => value_to_cql(&SqlValue::Text(item.into()), inner, jsonb_limits),
+                    None => Err(null_array_element()),
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
         // A COPY payload carries NO TYPES: every field arrives as bytes, so the destination COLUMN
         // is the only thing that can say what a field means. PostgreSQL parses COPY input per the
         // target column's type for the same reason. Without this arm, `COPY t FROM STDIN` into any

@@ -594,10 +594,125 @@ pub(crate) const CATALOG_RELATIONS: [&str; 9] = [
 pub(crate) fn parse_pg(sql: &str) -> Result<ferrosa_sql::Statement, ferrosa_sql::ParseError> {
     let mut stmt = ferrosa_sql::parse_statement(sql)?;
     if let ferrosa_sql::Statement::Select(select) = &mut stmt {
+        rewrite_obj_description(select)?;
         qualify_catalog_names(select, &[]);
         refuse_unknown_casts(select)?;
     }
     Ok(stmt)
+}
+
+/// `obj_description(oid, 'catalog')` is a lookup in `pg_description`; rewrite it
+/// to that scalar subquery so the engine needs no catalog function. Ecto checks
+/// Oban's migration version with it. A catalog other than the ones a comment
+/// can be on here is refused by name.
+fn rewrite_obj_description(
+    select: &mut ferrosa_sql::SelectStmt,
+) -> Result<(), ferrosa_sql::ParseError> {
+    walk_scalars(select, &mut |e| rewrite_obj_description_in(e))
+}
+
+fn rewrite_obj_description_in(
+    e: &mut ferrosa_sql::ScalarExpr,
+) -> Result<(), ferrosa_sql::ParseError> {
+    use ferrosa_sql::ScalarExpr;
+    e.try_for_each_child_mut(&mut rewrite_obj_description_in, &mut |q| {
+        rewrite_obj_description(q)
+    })?;
+    let ScalarExpr::Func { name, args } = e else {
+        return Ok(());
+    };
+    if name.strip_prefix("pg_catalog.").unwrap_or(name) != "obj_description" {
+        return Ok(());
+    }
+    let classoid = match args.get(1) {
+        None => None,
+        Some(ScalarExpr::Literal(Value::Text(c))) => Some(match c.as_str() {
+            "pg_class" => 1259,
+            "pg_type" => 1247,
+            "pg_namespace" => 2615,
+            _ => {
+                return Err(ferrosa_sql::ParseError::UnsupportedSelectExpr(
+                    "obj_description for that catalog",
+                ))
+            }
+        }),
+        Some(_) => {
+            return Err(ferrosa_sql::ParseError::UnsupportedSelectExpr(
+                "obj_description with a non-literal catalog name",
+            ))
+        }
+    };
+    if args.is_empty() || args.len() > 2 {
+        return Err(ferrosa_sql::ParseError::UnsupportedSelectExpr(
+            "obj_description takes one or two arguments",
+        ));
+    }
+    let object = args.swap_remove(0);
+    *e = ScalarExpr::Subquery(Box::new(description_lookup(object, classoid)));
+    Ok(())
+}
+
+/// `(SELECT d.description FROM pg_catalog.pg_description AS d WHERE d.objoid = <object>
+/// [AND d.classoid = <classoid>] AND d.objsubid = 0)`.
+fn description_lookup(
+    object: ferrosa_sql::ScalarExpr,
+    classoid: Option<i64>,
+) -> ferrosa_sql::SelectStmt {
+    use ferrosa_sql::{BinOp, CmpOp, ScalarExpr};
+    let col = |name: &str| {
+        ScalarExpr::Column(ferrosa_sql::ast::ColumnRef {
+            qualifier: Some("d".into()),
+            name: name.into(),
+        })
+    };
+    let eq = |l: ScalarExpr, r: ScalarExpr| ScalarExpr::Binary {
+        op: BinOp::Cmp(CmpOp::Eq),
+        left: Box::new(l),
+        right: Box::new(r),
+    };
+    let and = |l: ScalarExpr, r: ScalarExpr| ScalarExpr::Binary {
+        op: BinOp::And,
+        left: Box::new(l),
+        right: Box::new(r),
+    };
+    let mut cond = eq(col("objoid"), object);
+    if let Some(c) = classoid {
+        cond = and(
+            cond,
+            eq(col("classoid"), ScalarExpr::Literal(Value::Int(c))),
+        );
+    }
+    cond = and(
+        cond,
+        eq(col("objsubid"), ScalarExpr::Literal(Value::Int(0))),
+    );
+    ferrosa_sql::SelectStmt {
+        ctes: Vec::new(),
+        distinct: false,
+        projection: ferrosa_sql::Projection::Items(vec![ferrosa_sql::SelectItem::Column {
+            col: ferrosa_sql::ast::ColumnRef {
+                qualifier: Some("d".into()),
+                name: "description".into(),
+            },
+            alias: None,
+        }]),
+        from: ferrosa_sql::ast::TableRef {
+            schema: Some("pg_catalog".into()),
+            table: "pg_description".into(),
+            alias: Some("d".into()),
+        },
+        join: None,
+        joins: Vec::new(),
+        filter: Some(ferrosa_sql::Expr::Scalar(Box::new(cond))),
+        group_by: Vec::new(),
+        having: None,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        limit_param: None,
+        offset_param: None,
+        lock: None,
+    }
 }
 
 /// Refuse, at Parse time and by the name as written, a cast to a type nothing
@@ -1271,6 +1386,20 @@ mod tests {
                 "{table}.{column}"
             );
         }
+    }
+
+    #[test]
+    fn obj_description_becomes_a_pg_description_lookup() {
+        let sql = "SELECT pg_catalog.obj_description(pg_class.oid, 'pg_class') FROM pg_class \
+                   LEFT JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace \
+                   WHERE pg_class.relname = 'oban_jobs' AND pg_namespace.nspname = 'public'";
+        let ferrosa_sql::Statement::Select(select) = parse_pg(sql).expect("parses") else {
+            panic!("a select");
+        };
+        assert_eq!(select.from.schema.as_deref(), Some("pg_catalog"));
+        let tables: Vec<&str> = select.tables().iter().map(|t| t.table.as_str()).collect();
+        assert!(tables.contains(&"pg_description"), "{tables:?}");
+        assert!(parse_pg("SELECT obj_description(1, 'pg_proc')").is_err());
     }
 
     #[test]

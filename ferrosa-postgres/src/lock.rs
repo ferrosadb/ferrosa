@@ -71,6 +71,7 @@ fn resolve(
             let keyspace = t.schema.as_deref().unwrap_or(&ctx.default_schema);
             snapshot
                 .tables
+                // The table map is keyed by an owned pair, so a lookup needs one.
                 .get(&(keyspace.to_string(), t.table.clone()))
                 .map(|meta| (format!("{keyspace}.{}", t.table), meta.id))
                 .ok_or_else(|| {

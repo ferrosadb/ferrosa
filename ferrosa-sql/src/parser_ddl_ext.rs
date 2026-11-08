@@ -9,7 +9,8 @@
 
 use super::{ParseError, Parser, Tok};
 use crate::ast::{
-    AlterOperation, AlterTypeStmt, CommentStmt, CreateTypeStmt, LockMode, LockStmt, Statement,
+    AlterOperation, AlterTypeStmt, CommentStmt, CreateIndexStmt, CreateTypeStmt, DropIndexStmt,
+    LockMode, LockStmt, Statement,
 };
 
 impl Parser {
@@ -25,12 +26,142 @@ impl Parser {
     pub(super) fn parse_create_any(&mut self) -> Result<Statement, ParseError> {
         match self.second_word().as_deref() {
             Some("TYPE") => self.parse_create_type(),
+            Some("INDEX") => self.parse_create_index(),
+            Some("UNIQUE") => Err(ParseError::Unsupported(
+                "CREATE UNIQUE INDEX (uniqueness is not enforced by ferrosa indexes)".into(),
+            )),
             Some("SEQUENCE") => Err(ParseError::Unsupported(
                 "CREATE SEQUENCE (there are no sequences; bigserial columns get unique \
                  server-generated ids, D15)"
                     .into(),
             )),
             _ => self.parse_create(),
+        }
+    }
+
+    /// `DROP INDEX …` or `DROP TABLE …` (the latter in `parser_ddl`).
+    pub(super) fn parse_drop_any(&mut self) -> Result<Statement, ParseError> {
+        if self.second_word().as_deref() != Some("INDEX") {
+            return self.parse_drop();
+        }
+        self.expect_ident_kw("DROP")?;
+        self.expect_ident_kw("INDEX")?;
+        if self.peek_is_kw("CONCURRENTLY") {
+            return Err(ParseError::Unsupported("DROP INDEX CONCURRENTLY".into()));
+        }
+        let if_exists = self.parse_if_exists_flag()?;
+        let mut names = vec![self.parse_qualified_table()?];
+        while matches!(self.peek(), Some(Tok::Comma)) {
+            self.next();
+            names.push(self.parse_qualified_table()?);
+        }
+        if self.peek_is_kw("CASCADE") || self.peek_is_kw("RESTRICT") {
+            return Err(ParseError::Unsupported(
+                "DROP INDEX ... CASCADE/RESTRICT".into(),
+            ));
+        }
+        self.expect_end()?;
+        Ok(Statement::DropIndex(Box::new(DropIndexStmt {
+            if_exists,
+            names,
+        })))
+    }
+
+    fn parse_if_exists_flag(&mut self) -> Result<bool, ParseError> {
+        if !self.peek_is_kw("IF") {
+            return Ok(false);
+        }
+        self.next();
+        self.expect_ident_kw("EXISTS")?;
+        Ok(true)
+    }
+
+    /// `CREATE INDEX [IF NOT EXISTS] name ON t [USING m] (col [ASC|DESC], ...) [WHERE p]`.
+    fn parse_create_index(&mut self) -> Result<Statement, ParseError> {
+        self.expect_ident_kw("CREATE")?;
+        self.expect_ident_kw("INDEX")?;
+        if self.peek_is_kw("CONCURRENTLY") {
+            return Err(ParseError::Unsupported("CREATE INDEX CONCURRENTLY".into()));
+        }
+        let if_not_exists = if self.peek_is_kw("IF") {
+            self.next();
+            self.expect(&Tok::Not, "NOT")?;
+            self.expect_ident_kw("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.ident()?;
+        self.expect(&Tok::On, "ON")?;
+        let table = self.parse_qualified_table()?;
+        let method = self.parse_index_method()?;
+        let columns = self.parse_index_columns()?;
+        let predicate = if matches!(self.peek(), Some(Tok::Where)) {
+            self.next();
+            let start = self.pos;
+            self.pos = self.toks.len();
+            Some(self.parse_expression_slice(start, self.pos, "an index predicate")?)
+        } else {
+            None
+        };
+        self.expect_end()?;
+        Ok(Statement::CreateIndex(Box::new(CreateIndexStmt {
+            name,
+            table,
+            if_not_exists,
+            method,
+            columns,
+            predicate,
+        })))
+    }
+
+    fn parse_index_method(&mut self) -> Result<String, ParseError> {
+        if !self.peek_is_kw("USING") {
+            return Ok("btree".into());
+        }
+        self.next();
+        let method = self.ident()?.to_ascii_lowercase();
+        match method.as_str() {
+            "btree" | "hash" | "gin" => Ok(method),
+            other => Err(ParseError::Unsupported(format!("index method {other}"))),
+        }
+    }
+
+    fn parse_index_columns(&mut self) -> Result<Vec<(String, bool)>, ParseError> {
+        self.expect(&Tok::LParen, "(")?;
+        let mut columns = Vec::new();
+        loop {
+            if matches!(self.peek(), Some(Tok::LParen)) {
+                return Err(ParseError::Unsupported("an expression index key".into()));
+            }
+            let column = self.ident()?;
+            let desc = match self.peek() {
+                Some(Tok::Desc) => {
+                    self.next();
+                    true
+                }
+                Some(Tok::Asc) => {
+                    self.next();
+                    false
+                }
+                _ => false,
+            };
+            if self.peek_is_kw("NULLS") || self.peek_is_kw("COLLATE") {
+                return Err(ParseError::Unsupported(
+                    "NULLS/COLLATE in an index key".into(),
+                ));
+            }
+            columns.push((column, desc));
+            match self.next() {
+                Some(Tok::Comma) => {}
+                Some(Tok::RParen) => return Ok(columns),
+                other => {
+                    return Err(ParseError::Unexpected {
+                        expected: ", or )",
+                        found: format!("{other:?}"),
+                    })
+                }
+            }
         }
     }
 
@@ -364,6 +495,7 @@ impl Parser {
 
     fn parse_alter_column_type(&mut self, column: String) -> Result<AlterOperation, ParseError> {
         let (ty, user_type) = self.parse_column_type()?;
+        let array = self.parse_array_suffix()?;
         if self.peek_is_kw("USING") || self.peek_is_kw("COLLATE") {
             return Err(ParseError::UnsupportedAlter(
                 "ALTER COLUMN ... TYPE ... USING/COLLATE".into(),
@@ -373,6 +505,7 @@ impl Parser {
             column,
             ty,
             user_type,
+            array,
         })
     }
 

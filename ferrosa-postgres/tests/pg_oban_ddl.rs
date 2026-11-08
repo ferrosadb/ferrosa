@@ -1173,3 +1173,155 @@ async fn set_unlogged_is_recorded() {
         Some("true")
     );
 }
+
+// ---------------------------------------------------------------------------
+// 9. CREATE / DROP INDEX (census 11-13, 17-18, 24-27, 30-31, 41-45)
+// ---------------------------------------------------------------------------
+
+fn physical_index(fx: &Fixture, table: &str, name: &str) -> bool {
+    fx.schema.snapshot().indexes.contains_key(&(
+        "public".to_string(),
+        table.to_string(),
+        name.to_string(),
+    ))
+}
+
+/// A single-column index is a real secondary index; IF NOT EXISTS is idempotent;
+/// DROP INDEX IF EXISTS removes it and tolerates a missing name.
+#[tokio::test]
+async fn single_column_index_is_built_and_dropped() {
+    let fx = oban_jobs().await;
+    let c = &fx.client;
+    let create = "CREATE INDEX IF NOT EXISTS \"oban_jobs_queue_index\" ON \"public\".\"oban_jobs\" (\"queue\")";
+    c.execute(create, &[]).await.expect("CREATE INDEX");
+    c.execute(create, &[]).await.expect("IF NOT EXISTS");
+    assert!(physical_index(&fx, "oban_jobs", "oban_jobs_queue_index"));
+    assert_eq!(
+        code(
+            c.batch_execute("CREATE INDEX \"oban_jobs_queue_index\" ON oban_jobs (state)")
+                .await
+        ),
+        "42P07"
+    );
+    c.execute(
+        "DROP INDEX IF EXISTS \"public\".\"oban_jobs_queue_index\"",
+        &[],
+    )
+    .await
+    .expect("DROP INDEX");
+    assert!(!physical_index(&fx, "oban_jobs", "oban_jobs_queue_index"));
+    c.execute(
+        "DROP INDEX IF EXISTS \"public\".\"oban_jobs_args_vector\"",
+        &[],
+    )
+    .await
+    .expect("IF EXISTS tolerates a missing index");
+    assert_eq!(code(c.batch_execute("DROP INDEX nope").await), "42704");
+}
+
+/// Composite, partial, DESC and GIN indexes are accepted and recorded, but build no
+/// physical index (ferrosa's secondary indexes are single-column): queries scan. The
+/// partial predicate must parse.
+#[tokio::test]
+async fn composite_partial_and_gin_indexes_are_recorded_not_built() {
+    let fx = oban_jobs().await;
+    let c = &fx.client;
+    for (name, sql) in [
+        ("oban_jobs_state_queue_priority_scheduled_at_id_index",
+         "CREATE INDEX IF NOT EXISTS \"oban_jobs_state_queue_priority_scheduled_at_id_index\" ON \"public\".\"oban_jobs\" (\"state\", \"queue\", \"attempt\", \"id\")"),
+        ("oban_jobs_attempted_at_id_index",
+         "CREATE INDEX IF NOT EXISTS \"oban_jobs_attempted_at_id_index\" ON \"public\".\"oban_jobs\" (attempted_at desc, \"id\") WHERE state in ('completed', 'discarded')"),
+        ("oban_jobs_args_index",
+         "CREATE INDEX IF NOT EXISTS \"oban_jobs_args_index\" ON \"public\".\"oban_jobs\" USING gin (\"args\")"),
+        ("oban_jobs_scheduled_at_index",
+         "CREATE INDEX \"oban_jobs_scheduled_at_index\" ON \"public\".\"oban_jobs\" (\"attempted_at\") WHERE state in ('available', 'scheduled')"),
+    ] {
+        c.execute(sql, &[]).await.unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        assert!(
+            extension(&fx, "oban_jobs", &format!("pg.index.{name}")).is_some(),
+            "{name} is recorded"
+        );
+        assert!(!physical_index(&fx, "oban_jobs", name), "{name} builds nothing");
+    }
+    c.batch_execute("DROP INDEX oban_jobs_args_index")
+        .await
+        .expect("drop a recorded index");
+    assert_eq!(
+        extension(&fx, "oban_jobs", "pg.index.oban_jobs_args_index").as_deref(),
+        Some("")
+    );
+    for sql in [
+        "CREATE UNIQUE INDEX u ON oban_jobs (queue)",
+        "CREATE INDEX e ON oban_jobs ((lower(queue)))",
+        "CREATE INDEX b ON oban_jobs USING brin (queue)",
+        "CREATE INDEX m ON oban_jobs (no_such_column)",
+    ] {
+        let got = code(c.batch_execute(sql).await);
+        assert!(got == "0A000" || got == "42703", "{sql}: {got}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 6. Array columns text[] / jsonb[] (census 10, 22, 28-29, 54)
+// ---------------------------------------------------------------------------
+
+/// `text[]`/`jsonb[]` columns store one-dimensional arrays: text literals (`'{a,b}'`,
+/// `'{}'`), binary array parameters, and an empty array that stays distinct from NULL.
+#[tokio::test]
+async fn array_columns_round_trip() {
+    let fx = start().await;
+    let c = &fx.client;
+    c.execute(
+        "CREATE TABLE arr (id int PRIMARY KEY, \"tags\" text[], \"errors\" jsonb[] NOT NULL)",
+        &[],
+    )
+    .await
+    .expect("array column types");
+    c.batch_execute(
+        "INSERT INTO arr (id, tags, errors) VALUES (1, '{a,\"b c\"}', '{}'), \
+         (2, NULL, '{\"{\\\"k\\\": 1}\"}')",
+    )
+    .await
+    .expect("array text literals");
+    assert_eq!(
+        rows(c, "SELECT tags, errors FROM arr WHERE id = 1").await,
+        vec![vec![
+            Some("{a,\"b c\"}".to_string()),
+            Some("{}".to_string())
+        ]]
+    );
+    assert_eq!(
+        rows(c, "SELECT tags FROM arr WHERE id = 2").await,
+        vec![vec![None]],
+        "NULL is not an empty array"
+    );
+    let tags = vec!["x", "y"];
+    c.execute(
+        "INSERT INTO arr (id, tags, errors) VALUES ($1, $2, '{}')",
+        &[&3_i32, &tags],
+    )
+    .await
+    .expect("a binary text[] parameter");
+    let row = c
+        .query_one("SELECT tags FROM arr WHERE id = 3", &[])
+        .await
+        .expect("binary text[] result");
+    assert_eq!(row.get::<_, Vec<String>>(0), vec!["x", "y"]);
+    // Census 22 and 29: ADD COLUMN ... text[], ALTER COLUMN ... TYPE text[] (same type).
+    c.execute(
+        "ALTER TABLE arr ADD COLUMN IF NOT EXISTS \"attempted_by\" text[]",
+        &[],
+    )
+    .await
+    .expect("ADD COLUMN text[]");
+    c.execute("ALTER TABLE arr ALTER COLUMN \"tags\" TYPE text[]", &[])
+        .await
+        .expect("same array type is a no-op");
+    assert_eq!(
+        code(
+            c.batch_execute("INSERT INTO arr (id, errors) VALUES (9, '{oops')")
+                .await
+        ),
+        "22P02"
+    );
+}
