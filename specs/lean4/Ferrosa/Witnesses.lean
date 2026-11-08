@@ -23,6 +23,9 @@ import Ferrosa.Cql.Subscribe
 import Ferrosa.Flight.Subscribe
 import Ferrosa.Raft.Obligations
 import Ferrosa.Codec.Audit
+import Ferrosa.Sql.Ddl
+import Ferrosa.Sql.Enum
+import Ferrosa.Sql.Serial
 
 #check Ferrosa.Topology.DcQuorum.dc_quorum_writes_share_a_replica
 #check Ferrosa.Topology.DcQuorum.no_partition_admits_two_dc_quorum_writes
@@ -115,6 +118,24 @@ import Ferrosa.Codec.Audit
 #check Ferrosa.Sql.Txn.one_decision_is_atomic
 #check Ferrosa.Sql.Txn.serializable_requires_the_read_set
 #check Ferrosa.Sql.Txn.snapshot_isolation_permits_write_skew
+-- Transactional DDL, enum types and serial ids on the PostgreSQL front end (`Ferrosa/Sql/`).
+#check Ferrosa.Sql.Ddl.buffered_statement_is_visible
+#check Ferrosa.Sql.Ddl.rollback_applies_nothing
+#check Ferrosa.Sql.Ddl.commit_success_is_the_whole_batch
+#check Ferrosa.Sql.Ddl.commit_reproduces_the_view
+#check Ferrosa.Sql.Ddl.failed_commit_reports_the_exact_prefix
+#check Ferrosa.Sql.Ddl.third_of_five_fails_loudly
+#check Ferrosa.Sql.Enum.addValue_idempotent
+#check Ferrosa.Sql.Enum.addValue_keeps_labels
+#check Ferrosa.Sql.Enum.validated_is_label
+#check Ferrosa.Sql.Enum.write_keeps_only_labels
+#check Ferrosa.Sql.Enum.stored_labels_survive_add_value
+#check Ferrosa.Sql.Serial.compose_injective
+#check Ferrosa.Sql.Serial.distinct_nodes_never_collide
+#check Ferrosa.Sql.Serial.fits_a_positive_bigint
+#check Ferrosa.Sql.Serial.serial_cannot_hold_an_id
+#check Ferrosa.Sql.Serial.next_strictly_increases
+#check Ferrosa.Sql.Serial.same_node_distinct_pairs
 #check Ferrosa.Sql.commit_is_not_atomic_across_statements
 #check Ferrosa.Sql.count_star_and_count_col_disagree
 #check Ferrosa.Sql.null_passes_a_naive_not_equal
