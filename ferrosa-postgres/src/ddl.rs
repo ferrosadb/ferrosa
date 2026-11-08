@@ -300,6 +300,24 @@ async fn dispatch_ddl(env: DdlEnv<'_>, stmt: ferrosa_sql::Statement) -> Vec<Back
         Statement::Comment(comment) => execute_comment(env, *comment).await,
         Statement::CreateType(create) => execute_create_type(env, *create).await,
         Statement::AlterType(alter) => execute_alter_type(env, *alter).await,
+        Statement::CreateIndex(create) => match env.executor {
+            Some(executor) => {
+                crate::pg_index::execute_create_index(env.clone(), executor, *create).await
+            }
+            None => refuse(
+                "0A000",
+                "CREATE INDEX is not available: no schema-change path",
+            ),
+        },
+        Statement::DropIndex(drop) => match env.executor {
+            Some(executor) => {
+                crate::pg_index::execute_drop_index(env.clone(), executor, *drop).await
+            }
+            None => refuse(
+                "0A000",
+                "DROP INDEX is not available: no schema-change path",
+            ),
+        },
         other => refuse(
             "XX000",
             &format!("internal: {other:?} is not a DDL statement"),

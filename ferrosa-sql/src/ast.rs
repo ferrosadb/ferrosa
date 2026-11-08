@@ -83,6 +83,32 @@ pub enum Statement {
     CreateType(Box<CreateTypeStmt>),
     /// `ALTER TYPE [schema.]name ADD VALUE [IF NOT EXISTS] 'label'` (see [`AlterTypeStmt`]).
     AlterType(Box<AlterTypeStmt>),
+    /// `CREATE INDEX [IF NOT EXISTS] name ON t [USING m] (cols) [WHERE pred]`.
+    CreateIndex(Box<CreateIndexStmt>),
+    /// `DROP INDEX [IF EXISTS] name [, ...]`.
+    DropIndex(Box<DropIndexStmt>),
+}
+
+/// `CREATE INDEX [IF NOT EXISTS] name ON t [USING method] (col [ASC|DESC], ...) [WHERE pred]`.
+/// `UNIQUE`, expression keys and other methods are refused at parse time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateIndexStmt {
+    pub name: String,
+    pub table: TableRef,
+    pub if_not_exists: bool,
+    /// `btree` (the default), `hash` or `gin`, lower-cased.
+    pub method: String,
+    /// `(column, descending)`, in key order.
+    pub columns: Vec<(String, bool)>,
+    /// A partial index's predicate, as canonical SQL.
+    pub predicate: Option<String>,
+}
+
+/// `DROP INDEX [IF EXISTS] [schema.]name [, ...]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropIndexStmt {
+    pub if_exists: bool,
+    pub names: Vec<TableRef>,
 }
 
 /// `CREATE TYPE [schema.]name AS ENUM ('label', ...)`. Only enum types are accepted; the

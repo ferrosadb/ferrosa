@@ -33,6 +33,7 @@ mod pg_constraint;
 mod pg_default;
 mod pg_enum;
 pub mod pg_fk;
+mod pg_index;
 pub mod pg_key;
 pub mod pg_types;
 pub mod portal_limits;

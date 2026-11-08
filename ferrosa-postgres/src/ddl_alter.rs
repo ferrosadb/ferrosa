@@ -329,8 +329,7 @@ fn alter_type(
                 serial: false,
             };
             crate::pg_enum::column_enum(&plan.meta, column).is_none()
-                && crate::ddl::cql_type_string(&def)
-                    .is_ok_and(|t| t == current.column_type)
+                && crate::ddl::cql_type_string(&def).is_ok_and(|t| t == current.column_type)
         }
     };
     if same {

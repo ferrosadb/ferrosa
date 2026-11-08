@@ -1732,7 +1732,9 @@ pub(crate) fn is_utility(stmt: &Statement) -> bool {
         | Statement::Lock(_)
         | Statement::Comment(_)
         | Statement::CreateType(_)
-        | Statement::AlterType(_) => true,
+        | Statement::AlterType(_)
+        | Statement::CreateIndex(_)
+        | Statement::DropIndex(_) => true,
         Statement::Select(_)
         | Statement::SelectExprs(_)
         | Statement::Begin { .. }
@@ -1833,7 +1835,9 @@ async fn execute_statement(
         | Statement::AlterTable(_)
         | Statement::Comment(_)
         | Statement::CreateType(_)
-        | Statement::AlterType(_)) => {
+        | Statement::AlterType(_)
+        | Statement::CreateIndex(_)
+        | Statement::DropIndex(_)) => {
             let probe = EnvProbe { env };
             crate::ddl::execute_ddl_statement(ddl, schema, default_schema, stmt, txn, Some(&probe))
                 .await

@@ -142,6 +142,21 @@ pub(crate) fn statement_permissions(
                     .to_string(),
             ),
         )],
+        // An index changes its table's definition: ALTER on the table; a DROP INDEX names no
+        // table, so it needs ALTER on the keyspace.
+        Statement::CreateIndex(create) => {
+            vec![(Permission::Alter, table(&create.table, default_schema))]
+        }
+        Statement::DropIndex(drop) => drop
+            .names
+            .iter()
+            .map(|n| {
+                (
+                    Permission::Alter,
+                    Resource::Keyspace(n.schema.as_deref().unwrap_or(default_schema).to_string()),
+                )
+            })
+            .collect(),
         // A comment is part of the table's definition: ALTER, as for ALTER TABLE.
         Statement::Comment(comment) => {
             vec![(Permission::Alter, table(&comment.table, default_schema))]

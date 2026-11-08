@@ -29,7 +29,9 @@ pub use ast::{
     Statement, Term, TruncateStatement, TypeName, UnaryOp, UnsupportedClause, UpdateStmt,
     VacuumStmt,
 };
-pub use ast::{AlterTypeStmt, CommentStmt, CreateTypeStmt, LockMode, LockStmt};
+pub use ast::{
+    AlterTypeStmt, CommentStmt, CreateIndexStmt, CreateTypeStmt, DropIndexStmt, LockMode, LockStmt,
+};
 pub use catalog::{Catalog, MapCatalog, SharedTable};
 pub use exec::{
     dedup, fallible, filter, hash_aggregate, hash_join, limit_offset, project, seq_scan, sort,
