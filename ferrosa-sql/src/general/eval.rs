@@ -472,6 +472,10 @@ pub(crate) fn cast(v: Value, ty: ColumnType) -> R<Value> {
     match ty {
         ColumnType::Text => Ok(Value::Text(text_of(&v)?.into())),
         ColumnType::Int | ColumnType::BigInt => to_int(v, ty),
+        ColumnType::Oid => match to_int(v, ColumnType::BigInt)? {
+            Value::Int(n) if (0..=i64::from(u32::MAX)).contains(&n) => Ok(Value::Int(n)),
+            _ => Err(out_of_range("oid")),
+        },
         ColumnType::Bool => to_bool(v),
         ColumnType::Float => match v {
             Value::Text(t) => t

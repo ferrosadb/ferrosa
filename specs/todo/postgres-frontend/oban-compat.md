@@ -153,8 +153,7 @@ against ferrosa.
   * Text results are correct.
   * In binary results an OID at or above 2³¹ fails to encode, because `int4` is signed.
   * Fix: an `oid` column type (OID 26, unsigned 4-byte binary).
-  * Status: on W1's work list. Under the owner's rule, a found bug is fixed with a
-    test and a Lean spec before the work is done.
+  * Status: FIXED. `ColumnType::Oid` (unsigned 4-byte binary, text and Bind), every catalog OID column typed `oid`. Lean: `Sql/Oid.lean`. Tests: `an_oid_above_two_to_the_31_encodes_and_decodes_as_unsigned`, `catalog_oid_columns_are_typed_oid`.
 * **Operator chains escaped the depth limit.** Fixed (2cb904c3): a long
   `AND`/`+`/`||` chain built a tree as deep as the chain, and every recursive walk
   of it could overflow a worker stack. Each link now counts against

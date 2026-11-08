@@ -296,6 +296,10 @@ pub enum ColumnType {
     TextArray,
     /// A one-dimensional array of `ArrayElem` (`int8[]`, `jsonb[]`, `oid[]`, ...).
     Array(ArrayElem),
+    /// `oid` (OID 26): an unsigned 32-bit object identifier, carried as
+    /// `Value::Int` in `[0, 2^32)`. Catalog OID columns use it; an `int4` cannot
+    /// carry the synthetic OIDs at or above 2^31 (`Sql/Oid.lean`).
+    Oid,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

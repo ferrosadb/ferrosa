@@ -1086,7 +1086,8 @@ fn cast_type(ty: &TypeName) -> Result<ColumnType, ExecError> {
 fn scalar_type(name: &str) -> Option<ColumnType> {
     Some(match name.to_ascii_lowercase().as_str() {
         "int" | "int4" | "integer" | "int2" | "smallint" => ColumnType::Int,
-        "int8" | "bigint" | "oid" => ColumnType::BigInt,
+        "int8" | "bigint" => ColumnType::BigInt,
+        "oid" => ColumnType::Oid,
         "text" | "varchar" | "character varying" | "char" | "character" | "bpchar" | "name" => {
             ColumnType::Text
         }
@@ -1108,6 +1109,7 @@ fn array_elem(ty: ColumnType) -> Result<ArrayElem, ExecError> {
     Ok(match ty {
         ColumnType::Int => ArrayElem::Int,
         ColumnType::BigInt => ArrayElem::BigInt,
+        ColumnType::Oid => ArrayElem::Oid,
         ColumnType::Text => ArrayElem::Text,
         ColumnType::Bool => ArrayElem::Bool,
         ColumnType::Float => ArrayElem::Float,
@@ -1123,7 +1125,8 @@ fn array_elem(ty: ColumnType) -> Result<ArrayElem, ExecError> {
 fn elem_type(elem: ArrayElem) -> ColumnType {
     match elem {
         ArrayElem::Int => ColumnType::Int,
-        ArrayElem::BigInt | ArrayElem::Oid => ColumnType::BigInt,
+        ArrayElem::BigInt => ColumnType::BigInt,
+        ArrayElem::Oid => ColumnType::Oid,
         ArrayElem::Text => ColumnType::Text,
         ArrayElem::Bool => ColumnType::Bool,
         ArrayElem::Float => ColumnType::Float,

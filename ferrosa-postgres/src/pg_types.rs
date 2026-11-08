@@ -113,7 +113,7 @@ const fn entry(
 
 /// Every engine-backed Postgres type ferrosa advertises, one row per
 /// `ColumnType`. Kept in step with [`for_column_type`] by a unit test.
-pub const ALL_PG_TYPES: [PgType; 17] = [
+pub const ALL_PG_TYPES: [PgType; 18] = [
     entry(23, "int4", 4, ColumnType::Int, true),
     entry(20, "int8", 8, ColumnType::BigInt, true),
     entry(25, "text", -1, ColumnType::Text, true),
@@ -136,6 +136,8 @@ pub const ALL_PG_TYPES: [PgType; 17] = [
     entry(PG_OID_JSONPATH, "jsonpath", -1, ColumnType::JsonPath, false),
     entry(1009, "_text", -1, ColumnType::TextArray, false),
     entry(1184, "timestamptz", 8, ColumnType::TimestampTz, true),
+    // Unsigned 4-byte object identifier: catalog OID columns (Sql/Oid.lean).
+    entry(26, "oid", 4, ColumnType::Oid, true),
 ];
 
 /// The array types the engine carries ([`ColumnType::Array`]), one per element
@@ -189,7 +191,7 @@ pub fn for_array_elem(elem: ArrayElem) -> PgType {
     match elem {
         ArrayElem::Int => ALL_PG_TYPES[0],
         ArrayElem::BigInt => ALL_PG_TYPES[1],
-        ArrayElem::Oid => entry(26, "oid", 4, ColumnType::Int, true),
+        ArrayElem::Oid => ALL_PG_TYPES[17],
         ArrayElem::Text => ALL_PG_TYPES[2],
         ArrayElem::Bool => ALL_PG_TYPES[3],
         ArrayElem::Float => ALL_PG_TYPES[4],
@@ -226,6 +228,7 @@ pub fn for_column_type(ty: ColumnType) -> PgType {
         ColumnType::JsonPath => 14,
         ColumnType::TextArray => 15,
         ColumnType::TimestampTz => 16,
+        ColumnType::Oid => 17,
     };
     ALL_PG_TYPES[idx]
 }
