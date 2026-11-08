@@ -26,6 +26,7 @@ pub use ast::{
     Returning, ScalarItem, ScalarValue, SelectItem, SetExpr, Statement, Term, TruncateStatement,
     UnsupportedClause, UpdateStmt, VacuumStmt,
 };
+pub use ast::{LockMode, LockStmt};
 pub use catalog::{Catalog, MapCatalog, SharedTable};
 pub use exec::{
     dedup, fallible, filter, hash_aggregate, hash_join, limit_offset, project, seq_scan, sort,

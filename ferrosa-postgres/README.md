@@ -831,6 +831,27 @@ Tests: `tests/pg_oban_ddl.rs` (`ddl_inside_a_transaction_is_buffered_until_commi
 `rollback_discards_buffered_ddl`, `commit_refuses_a_batch_a_concurrent_change_invalidated`,
 …).
 
+### `LOCK TABLE` (`lock`)
+
+`LOCK [TABLE] [ONLY] t [, …] [IN <mode> MODE]` — Ecto's migration lock — has real
+semantics, never a no-op:
+
+- Only inside a transaction block (`25P01` otherwise); a missing table is `42P01` and takes
+  nothing; it needs `MODIFY` on each table; `NOWAIT` is refused (`0A000`).
+- **Standalone node: a blocking lock.** The transaction takes local writer ownership of
+  every stripe of the table (`mvcc::writer_ownership`), held until `COMMIT`/`ROLLBACK`.
+  Another `LOCK` of the table, and any writer of it, waits; a cycle is `40P01`. Every mode
+  is treated alike, which is **stronger** than PostgreSQL for the weak modes (`SHARE UPDATE
+  EXCLUSIVE` admits plain `INSERT`s in PostgreSQL and blocks them here). Readers never wait.
+- **Every node: the table joins the transaction's read set**, so a serializable
+  transaction — every transaction block on a cluster, where blocks run on Accord (D11) —
+  fails at `COMMIT` with `40001` if another transaction wrote the table after it began. On
+  a cluster that is the whole lock: optimistic, not blocking; of two concurrent migrators
+  the second to commit is refused. Writer ownership is node-local, so it is not taken there.
+
+Tests: `tests/pg_oban_ddl.rs` (`migration_lock_serializes_two_migrators`,
+`migration_lock_holds_off_writers_of_the_table`, …) and `tests/pg_lock_cluster.rs`.
+
 ### Extended-protocol transaction boundary
 
 Extended-protocol pipelines stage DML until `Sync` and commit the group as one atomic batch. An error rolls back preceding writes in that group, disconnect discards staging, and an explicit `BEGIN` remains open across `Sync`. Commit failures are reported before `ReadyForQuery`. Tests: `server::txn_atomicity_tests::extended_pipeline_*`.

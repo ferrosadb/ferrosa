@@ -404,3 +404,87 @@ async fn dml_against_a_table_created_in_the_same_block_is_refused() {
     assert_eq!(error, "42P01");
     c.batch_execute("ROLLBACK").await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// 3. LOCK TABLE (census statement 5, Ecto's migration lock)
+// ---------------------------------------------------------------------------
+
+const MIGRATION_LOCK: &str = "LOCK TABLE \"schema_migrations\" IN SHARE UPDATE EXCLUSIVE MODE";
+
+/// Two migrators each take Ecto's lock. On a standalone node the lock is real: the second
+/// waits until the first transaction ends, then proceeds.
+#[tokio::test]
+async fn migration_lock_serializes_two_migrators() {
+    let fx = start().await;
+    fx.client.batch_execute(SCHEMA_MIGRATIONS).await.unwrap();
+    let second = connect_to(&fx).await;
+    fx.client.batch_execute("BEGIN").await.unwrap();
+    fx.client
+        .execute(MIGRATION_LOCK, &[])
+        .await
+        .expect("LOCK TABLE over the extended protocol");
+    second.batch_execute("BEGIN").await.unwrap();
+    let waiter =
+        tokio::spawn(async move { second.batch_execute(MIGRATION_LOCK).await.map(|()| second) });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !waiter.is_finished(),
+        "the second migrator must wait while the first holds the lock"
+    );
+    fx.client.batch_execute("COMMIT").await.unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("the lock is granted once the holder commits")
+        .expect("task")
+        .expect("LOCK succeeds");
+    second.batch_execute("COMMIT").await.unwrap();
+}
+
+/// While the lock is held, a writer of the locked table waits too — stronger than
+/// PostgreSQL's SHARE UPDATE EXCLUSIVE, which admits plain writers (documented).
+#[tokio::test]
+async fn migration_lock_holds_off_writers_of_the_table() {
+    let fx = start().await;
+    fx.client.batch_execute(SCHEMA_MIGRATIONS).await.unwrap();
+    let writer = connect_to(&fx).await;
+    fx.client.batch_execute("BEGIN").await.unwrap();
+    fx.client.batch_execute(MIGRATION_LOCK).await.unwrap();
+    let insert = tokio::spawn(async move {
+        writer
+            .batch_execute("INSERT INTO schema_migrations (version) VALUES (7)")
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!insert.is_finished(), "a writer waits for the lock holder");
+    fx.client.batch_execute("ROLLBACK").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), insert)
+        .await
+        .expect("the writer proceeds after ROLLBACK")
+        .expect("task")
+        .expect("insert succeeds");
+}
+
+#[tokio::test]
+async fn lock_outside_a_transaction_block_is_25p01() {
+    let fx = start().await;
+    fx.client.batch_execute(SCHEMA_MIGRATIONS).await.unwrap();
+    assert_eq!(code(fx.client.batch_execute(MIGRATION_LOCK).await), "25P01");
+}
+
+#[tokio::test]
+async fn lock_of_a_missing_table_is_42p01_and_nowait_is_0a000() {
+    let fx = start().await;
+    fx.client.batch_execute("BEGIN").await.unwrap();
+    assert_eq!(code(fx.client.batch_execute(MIGRATION_LOCK).await), "42P01");
+    fx.client.batch_execute("ROLLBACK").await.unwrap();
+    fx.client.batch_execute(SCHEMA_MIGRATIONS).await.unwrap();
+    fx.client.batch_execute("BEGIN").await.unwrap();
+    assert_eq!(
+        code(
+            fx.client
+                .batch_execute("LOCK TABLE schema_migrations NOWAIT")
+                .await
+        ),
+        "0A000"
+    );
+}

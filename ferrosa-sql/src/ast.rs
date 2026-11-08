@@ -75,6 +75,31 @@ pub enum Statement {
     /// `ANALYZE [table]` (see [`AnalyzeStmt`]). Accepted and answered as a
     /// successful no-op: no statistics are collected.
     Analyze(AnalyzeStmt),
+    /// `LOCK [TABLE] [ONLY] t [, ...] [IN <mode> MODE]` (see [`LockStmt`]).
+    Lock(LockStmt),
+}
+
+/// `LOCK [TABLE] [ONLY] name [, ...] [IN <mode> MODE]`.
+///
+/// The front end gives it real semantics (it is never a no-op): see `ferrosa-postgres`'s
+/// `lock` module. `NOWAIT` is refused at parse time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockStmt {
+    pub tables: Vec<TableRef>,
+    pub mode: LockMode,
+}
+
+/// PostgreSQL's eight table lock modes, as written. `ACCESS EXCLUSIVE` is the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockMode {
+    AccessShare,
+    RowShare,
+    RowExclusive,
+    ShareUpdateExclusive,
+    Share,
+    ShareRowExclusive,
+    Exclusive,
+    AccessExclusive,
 }
 
 /// `TRUNCATE [TABLE] a [, b, ...]`. `tables` is non-empty; every entry names a

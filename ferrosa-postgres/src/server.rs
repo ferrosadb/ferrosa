@@ -836,6 +836,17 @@ async fn execute_simple_inner<O: ReplySink>(
                 tag: "ROLLBACK".to_string(),
             }])
         }
+        // LOCK needs the session: it takes ownership held by the transaction.
+        ferrosa_sql::Statement::Lock(lock) => {
+            let msgs = crate::lock::lock_tables(ctx, session, &lock).await;
+            if msgs
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. }))
+            {
+                session.mark_txn_failed();
+            }
+            Ok(msgs)
+        }
         // Data + session statements: delegate to the stateless executor. (It
         // re-parses; cheap, and keeps the executor self-contained.) In an open
         // transaction, DML is BUFFERED into the session write-set instead of
@@ -2242,6 +2253,10 @@ async fn execute_portal_inner(
         // DDL over the extended protocol: the simple-query executor, inside the open
         // transaction when there is one. A failure poisons the transaction like DML's.
         PreparedKind::Utility(stmt) => {
+            if let ferrosa_sql::Statement::Lock(lock) = stmt.as_ref() {
+                let msgs = crate::lock::lock_tables(ctx, session, lock).await;
+                return execute_dml(session, msgs);
+            }
             let snapshot = read_snapshot(ctx, session);
             let mut env = read_env(ctx, &snapshot);
             env.timestamp_micros = timestamp_micros;

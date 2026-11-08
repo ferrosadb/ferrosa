@@ -118,6 +118,12 @@ pub(crate) fn statement_permissions(
         // rows, so they need no table permission — the same treatment a session
         // statement gets.
         Statement::Vacuum(_) | Statement::Analyze(_) => Vec::new(),
+        // LOCK holds off the table's writers, so it needs the permission a writer needs.
+        Statement::Lock(lock) => lock
+            .tables
+            .iter()
+            .map(|t| (Permission::Modify, table(t, default_schema)))
+            .collect(),
         Statement::SelectExprs(_)
         | Statement::Begin { .. }
         | Statement::Commit

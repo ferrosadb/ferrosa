@@ -12,6 +12,8 @@ use crate::types::Value;
 
 #[path = "parser_ddl.rs"]
 mod ddl;
+#[path = "parser_ddl_ext.rs"]
+mod ddl_ext;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
@@ -66,6 +68,8 @@ pub enum ParseError {
     MissingPrimaryKey,
     /// The primary key names a column the table does not define.
     UnknownPrimaryKeyColumn(String),
+    /// A statement form outside the supported subset, named by the caller (`0A000`).
+    Unsupported(String),
     /// An expression nests (parentheses, `NOT`) deeper than
     /// [`MAX_EXPR_DEPTH`]. The parser recurses per level, so without this
     /// bound a client-chosen depth overflows the parsing thread's stack and
@@ -116,6 +120,7 @@ impl fmt::Display for ParseError {
             ParseError::UnknownPrimaryKeyColumn(c) => {
                 write!(f, "primary key column `{c}` is not defined")
             }
+            ParseError::Unsupported(form) => write!(f, "{form} is not supported"),
             ParseError::TooDeep => {
                 write!(f, "expression nests deeper than {MAX_EXPR_DEPTH} levels")
             }
@@ -187,6 +192,7 @@ pub fn parse_statement(sql: &str) -> Result<Statement, ParseError> {
             "TRUNCATE" => p.parse_truncate(),
             "VACUUM" => p.parse_vacuum(),
             "ANALYZE" | "ANALYSE" => p.parse_analyze(),
+            "LOCK" => p.parse_lock(),
             other => Err(ParseError::Unexpected {
                 expected: "a statement",
                 found: other.to_string(),

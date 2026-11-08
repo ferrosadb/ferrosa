@@ -722,7 +722,7 @@ impl Parser {
         }
     }
 
-    fn peek_is_kw(&self, kw: &str) -> bool {
+    pub(super) fn peek_is_kw(&self, kw: &str) -> bool {
         matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case(kw))
     }
 

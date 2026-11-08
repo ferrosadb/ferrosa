@@ -1042,7 +1042,8 @@ pub(crate) fn parse_error_sqlstate(error: &ferrosa_sql::ParseError) -> &'static 
         | ParseError::UnsupportedSelectExpr(_)
         | ParseError::UnsupportedCast(_)
         | ParseError::UnsupportedCastExpr
-        | ParseError::UnsupportedAggregate(_) => "0A000",
+        | ParseError::UnsupportedAggregate(_)
+        | ParseError::Unsupported(_) => "0A000",
         ParseError::UnknownType(_) => "42704",
         ParseError::DuplicateColumn(_) => "42701",
         ParseError::MultiplePrimaryKeys => "42P16",
@@ -1574,7 +1575,10 @@ pub(crate) fn write_error_response(error: &ferrosa_common::Error) -> BackendMess
 /// be classified here before it compiles.
 pub(crate) fn is_utility(stmt: &Statement) -> bool {
     match stmt {
-        Statement::CreateTable(_) | Statement::DropTable(_) | Statement::AlterTable(_) => true,
+        Statement::CreateTable(_)
+        | Statement::DropTable(_)
+        | Statement::AlterTable(_)
+        | Statement::Lock(_) => true,
         Statement::Select(_)
         | Statement::SelectExprs(_)
         | Statement::Begin { .. }
@@ -1657,10 +1661,12 @@ async fn execute_statement(
         // reaches `dispatch` directly without session state, where there is no
         // transaction to begin or commit. Failing loud beats silently reporting
         // a COMMIT that buffered nothing.
-        Statement::Begin { .. } | Statement::Commit | Statement::Rollback => vec![error_response(
-            "0A000",
-            "transaction control requires a session; this path has no transaction state",
-        )],
+        Statement::Begin { .. } | Statement::Commit | Statement::Rollback | Statement::Lock(_) => {
+            vec![error_response(
+                "0A000",
+                "transaction control requires a session; this path has no transaction state",
+            )]
+        }
         // Session GUCs are not modeled yet.
         Statement::Set { .. } | Statement::Reset { .. } => vec![error_response(
             "0A000",

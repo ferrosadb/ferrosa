@@ -24,6 +24,7 @@ mod ddl_txn;
 pub mod extended;
 pub mod handshake;
 pub mod jsonb_wire;
+mod lock;
 pub mod messages;
 mod mvcc;
 pub mod pg_fk;
