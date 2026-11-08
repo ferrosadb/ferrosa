@@ -3134,6 +3134,11 @@ pub(crate) async fn execute_insert(
             col_values.insert(col_name.clone(), value);
             sql_values.insert(col_name.clone(), sql_value);
         }
+        // Every NOT NULL column must have been given a non-NULL value (Lean
+        // `Ferrosa.Sql.Constraint.admitted_writes_preserve_constraints`).
+        if let Err(violation) = crate::pg_constraint::check_inserted_row(meta, &sql_values) {
+            return vec![violation];
+        }
 
         // Enforce every FOREIGN KEY on this table BEFORE the write. The check is a normal read
         // of the parent (a point read, or a lookup through the parent-key index), so it lands in
@@ -3610,6 +3615,7 @@ fn resolve_dml_value<'a>(
         ferrosa_row_bridge::parse_cql_type_in_keyspace(&col_meta.column_type, ks, schema)
             .map_err(|e| error_response("42704", &e.to_string()))?;
     let sql_value = substitute_param(sv, bound.params, bound.timestamp_micros)?;
+    crate::pg_constraint::check_column_value(meta, col_name, &sql_value)?;
     if crate::pg_enum::column_enum(meta, col_name).is_some() {
         crate::pg_enum::check_value(&schema.snapshot(), meta, col_name, &sql_value)?;
     }
@@ -3931,6 +3937,7 @@ fn build_update_mutation(
         )
         .map_err(|error| error_response("42704", &error.to_string()))?;
         let sql_value = eval_set_expr(expr, current, ctx.params, ctx.timestamp_micros)?;
+        crate::pg_constraint::check_column_value(meta, col_name, &sql_value)?;
         if crate::pg_enum::column_enum(meta, col_name).is_some() {
             crate::pg_enum::check_value(&ctx.schema.snapshot(), meta, col_name, &sql_value)?;
         }

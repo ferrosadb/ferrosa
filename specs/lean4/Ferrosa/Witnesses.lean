@@ -26,6 +26,7 @@ import Ferrosa.Codec.Audit
 import Ferrosa.Sql.Ddl
 import Ferrosa.Sql.Enum
 import Ferrosa.Sql.Serial
+import Ferrosa.Sql.Constraint
 import Ferrosa.Sql.Expr
 import Ferrosa.Sql.Limit
 import Ferrosa.Sql.Oid
@@ -159,6 +160,12 @@ import Ferrosa.Sql.Oid
 #check Ferrosa.Sql.Serial.serial_cannot_hold_an_id
 #check Ferrosa.Sql.Serial.next_strictly_increases
 #check Ferrosa.Sql.Serial.same_node_distinct_pairs
+#check Ferrosa.Sql.Constraint.admitted_writes_preserve_constraints
+#check Ferrosa.Sql.Constraint.violating_write_is_refused
+#check Ferrosa.Sql.Constraint.unenforced_not_null_stores_a_null
+#check Ferrosa.Sql.Constraint.unknown_check_passes
+#check Ferrosa.Sql.Constraint.not_valid_still_checks_new_writes
+#check Ferrosa.Sql.Constraint.validated_add_holds_on_existing_rows
 #check Ferrosa.Sql.commit_is_not_atomic_across_statements
 #check Ferrosa.Sql.count_star_and_count_col_disagree
 #check Ferrosa.Sql.null_passes_a_naive_not_equal

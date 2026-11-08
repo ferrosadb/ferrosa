@@ -200,3 +200,4 @@ fixing commit.
 | Found by | Bug | Status |
 |---|---|---|
 | W3 | Enum `ADD VALUE` (as first built in W3, 18ec1c1a) rewrote the whole label list, so two concurrent adds of different labels lost one. Now one key per added label; test `pg_enum::tests::concurrent_add_values_both_survive`, Lean `Ferrosa.Sql.Enum.concurrent_adds_both_survive` | Fixed in 72a8ecfc |
+| W3 | `CREATE TABLE … col type NOT NULL` dropped the `NOT NULL` of every non-key column (T-132a), so a NULL was stored silently. Now recorded (`pg.not_null.<col>`) and enforced on INSERT (omitted or NULL) and UPDATE: `23502`. Test `not_null_on_a_regular_column_is_enforced`; Lean `Ferrosa.Sql.Constraint` (`unenforced_not_null_stores_a_null`, `admitted_writes_preserve_constraints`) | Fixed in NOTNULL_HASH |

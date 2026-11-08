@@ -912,6 +912,13 @@ are `0A000`; `CREATE SEQUENCE`, `nextval`, `setval`, `currval` and `lastval` are
 narrow scalar grammar, a W1 item). Column DEFAULTs are recorded as
 `pg.column_default.<col>` (canonical SQL text) — the shared format of `pg_default`.
 
+### Enforced `NOT NULL` (`pg_constraint`, Lean `Ferrosa.Sql.Constraint`)
+
+A non-key column declared `NOT NULL` is recorded (`pg.not_null.<col>`) and enforced: an
+`INSERT` that omits it or writes NULL, and an `UPDATE` that sets it to NULL, are refused
+with `23502` and write nothing. (It used to be parsed and dropped; see `oban-compat.md`.)
+Key columns are NOT NULL by construction.
+
 ### Extended-protocol transaction boundary
 
 Extended-protocol pipelines stage DML until `Sync` and commit the group as one atomic batch. An error rolls back preceding writes in that group, disconnect discards staging, and an explicit `BEGIN` remains open across `Sync`. Commit failures are reported before `ReadyForQuery`. Tests: `server::txn_atomicity_tests::extended_pipeline_*`.

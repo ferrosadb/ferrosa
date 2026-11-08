@@ -885,3 +885,53 @@ async fn narrow_serials_and_sequences_are_refused() {
         assert_eq!(code(fx.client.simple_query(sql).await), "0A000", "{sql}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Found while building: a non-key NOT NULL was parsed and dropped, never enforced.
+// ---------------------------------------------------------------------------
+
+/// `worker text NOT NULL` must refuse a NULL — explicit, omitted, bound, or by UPDATE —
+/// with 23502. It used to store the NULL silently.
+#[tokio::test]
+async fn not_null_on_a_regular_column_is_enforced() {
+    let fx = start().await;
+    let c = &fx.client;
+    c.batch_execute("CREATE TABLE nn (id int PRIMARY KEY, worker text NOT NULL, note text)")
+        .await
+        .unwrap();
+    for sql in [
+        "INSERT INTO nn (id, worker) VALUES (1, NULL)",
+        "INSERT INTO nn (id, note) VALUES (2, 'no worker')",
+    ] {
+        assert_eq!(code(c.batch_execute(sql).await), "23502", "{sql}");
+    }
+    let none: Option<&str> = None;
+    assert_eq!(
+        code(
+            c.execute(
+                "INSERT INTO nn (id, worker) VALUES ($1, $2)",
+                &[&3_i32, &none]
+            )
+            .await
+        ),
+        "23502"
+    );
+    c.batch_execute("INSERT INTO nn (id, worker) VALUES (4, 'W')")
+        .await
+        .expect("a non-NULL value is admitted");
+    assert_eq!(
+        code(
+            c.batch_execute("UPDATE nn SET worker = NULL WHERE id = 4")
+                .await
+        ),
+        "23502"
+    );
+    // A nullable column still takes NULL.
+    c.batch_execute("UPDATE nn SET note = NULL WHERE id = 4")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(c, "SELECT id, worker FROM nn").await,
+        vec![vec![Some("4".to_string()), Some("W".to_string())]]
+    );
+}

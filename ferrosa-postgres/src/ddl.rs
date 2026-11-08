@@ -876,6 +876,12 @@ pub(crate) async fn execute_create_table(
     table.extensions.extend(
         stmt.columns
             .iter()
+            .filter(|def| def.not_null && !def.primary_key)
+            .map(|def| crate::pg_constraint::not_null_extension(&def.name)),
+    );
+    table.extensions.extend(
+        stmt.columns
+            .iter()
             .filter(|def| def.serial)
             .map(|def| crate::pg_default::serial_extension(&def.name)),
     );
