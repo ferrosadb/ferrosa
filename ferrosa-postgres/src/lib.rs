@@ -23,8 +23,12 @@ mod copy_stdin;
 pub mod ddl;
 mod ddl_alter;
 mod ddl_txn;
+mod dml_general;
+#[cfg(test)]
+mod dml_general_tests;
 pub mod extended;
 pub mod handshake;
+mod insert_defaults;
 pub mod jsonb_wire;
 mod lock;
 pub mod messages;

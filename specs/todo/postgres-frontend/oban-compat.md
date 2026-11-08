@@ -39,7 +39,7 @@ executive_summary: >-
 | 8 | `CREATE INDEX [IF NOT EXISTS] … [WHERE …] [USING gin]`, `DROP INDEX IF EXISTS` | Oban schema | ~~Not parsed~~ **Done (W3):** single-column btree/hash built; composite/partial/DESC/gin recorded, not used for planning |
 | 9 | `ALTER TABLE … ADD COLUMN IF NOT EXISTS`, `ALTER COLUMN … TYPE / SET DEFAULT / SET NOT NULL`, `ADD/DROP CONSTRAINT … CHECK … [NOT VALID]`, `SET UNLOGGED` | Oban schema | ~~`ALTER` not supported (T-132b)~~ **Done (W3):** all census forms; `CHECK` enforced via W1's engine; DEFAULTs recorded (applied at INSERT by W2) |
 | 10 | `COMMENT ON TABLE … IS '12'` and `pg_catalog.obj_description(oid, 'pg_class')` | Oban migration versioning | ~~No comments, no `pg_description`~~ **Done (W3):** `COMMENT ON TABLE`, streamed `pg_description`. `obj_description(...)` itself awaits W1 (function calls in projections) |
-| 11 | `DO $$ … $$`, `CREATE FUNCTION … LANGUAGE plpgsql`, `CREATE TRIGGER`, `DROP FUNCTION/TRIGGER` | Stock Oban migrations v1–v10; dropped again by v11 | **W4 done (feat/pg-w4-plpgsql)**, statement by statement under "W4 status" below. Still waiting on W1/W3: the DO guard's `'public'::regnamespace`, `CREATE TYPE … AS ENUM`, and DDL inside a migration's transaction (25001 until transactional DDL lands) |
+| 11 | `DO $$ … $$`, `CREATE FUNCTION … LANGUAGE plpgsql`, `CREATE TRIGGER`, `DROP FUNCTION/TRIGGER` | Stock Oban migrations v1–v10; dropped again by v11 | **Done (W4, feat/pg-w4-plpgsql)**, statement by statement under "W4 status" below |
 | 12 | `INSERT … RETURNING "id"` with a sequence default, jsonb and enum and array parameters | `Oban.insert` | Sequence default; enum and array values |
 | 13 | `WITH s AS (SELECT … ORDER BY … LIMIT $n FOR UPDATE SKIP LOCKED) UPDATE t SET … FROM s WHERE t.id = s.id AND … RETURNING …` | Oban fetch (every poll) | CTE, `FOR UPDATE SKIP LOCKED`, `UPDATE … FROM`, `UPDATE … RETURNING`, non-key predicates |
 | 14 | `UPDATE t SET … WHERE id = $1 AND state = ANY($2) AND attempted_at = $3` | Oban ack (every job) | `= ANY($n)` over an array parameter; conditional update on non-key columns |
@@ -97,6 +97,24 @@ Size: roughly 4–6k lines.
 
 Size: roughly 2–3k lines.
 
+**Status (feat/pg-w2-dml).** Design in D16; Lean model in `Ferrosa/Sql/Dml.lean`.
+
+* Done, end to end through the front end:
+  * census rows 13, 14 and 15: the claim (CTE, `FOR UPDATE SKIP LOCKED`,
+    `UPDATE … FROM`, `RETURNING`), the ack (`= ANY`, timestamp equality), and the
+    plugins' `DELETE`/`UPDATE … WHERE id IN (SELECT … LIMIT n)`;
+  * `UPDATE`/`DELETE … RETURNING`;
+  * INSERT DEFAULTs and bigserial ids (row 12).
+  * Tests: `ferrosa-sql/tests/dml_parse.rs`, `dml_exec.rs`, `default_expr.rs`;
+    `ferrosa-postgres/src/dml_general_tests.rs`; the wire tests in
+    `tests/m1_join_live.rs`.
+* Proven verbatim: `tests/pg_oban_dml.rs` `the_census_dml_runs_verbatim`.
+  * The census table is built from the census's own DDL (lines 10–49, less the
+    PL/pgSQL).
+  * Census statements 54, 55, 57 and 58 then run as written over tokio-postgres, with
+    `text[]`/`jsonb[]` parameters and `= ANY($4)`.
+  * Array storage comes from W3.
+
 ### W3 — DDL and catalog
 
 * DDL over the extended protocol.
@@ -127,8 +145,8 @@ Size: roughly 5–7k lines.
 
 | Census statement | Today |
 |---|---|
-| `DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_type WHERE … 'public'::regnamespace::oid) THEN CREATE TYPE … END IF; END$$` | The DO block parses and interprets. Its EXISTS guard reads at most one row. The guard stops at `'public'::regnamespace` (0A000, W1/W3); the CREATE TYPE is W3's; DDL inside the block's transaction is 25001 until W3. Pending test: `awaits_w1_w3_the_census_do_block_creates_the_enum` |
-| `CREATE OR REPLACE FUNCTION "public".oban_jobs_notify() … LANGUAGE plpgsql` (v1 and v2) | Stored and compiled. Fires: the v1 body runs unchanged and delivers its JSON payloads (`the_oban_v1_notify_trigger_notifies_on_insert_and_on_state_change`, on a text `state` column). Inside a migration transaction: 25001 until W3 |
+| `DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_type WHERE … 'public'::regnamespace::oid) THEN CREATE TYPE … END IF; END$$` | **Works**, on both protocols. The guard reads at most one row; the CREATE TYPE (W3) commits with the block, and a second run finds the type and does nothing. Test: `the_census_do_block_creates_the_enum_once` |
+| `CREATE OR REPLACE FUNCTION "public".oban_jobs_notify() … LANGUAGE plpgsql` (v1 and v2) | Stored and compiled, also inside a migration transaction (buffered with the block's DDL). Fires: the v1 body runs unchanged and delivers its JSON payloads (`the_oban_v1_notify_trigger_notifies_on_insert_and_on_state_change`, on a text `state` column) |
 | `DROP TRIGGER IF EXISTS oban_notify ON "public".oban_jobs` | Works |
 | `CREATE TRIGGER oban_notify AFTER INSERT [OR UPDATE OF state] … EXECUTE PROCEDURE …` | Stored with the table; fires once per row inside the transaction |
 | `CREATE OR REPLACE FUNCTION "public".oban_wrap_id(value bigint) RETURNS int … IMMUTABLE` | Stored and compiled. Calling it from SQL is not wired (the census never calls it) |
@@ -236,11 +254,68 @@ fixing commit.
 | W3 | Enum `ADD VALUE` (as first built in W3, 18ec1c1a) rewrote the whole label list, so two concurrent adds of different labels lost one. Now one key per added label; test `pg_enum::tests::concurrent_add_values_both_survive`, Lean `Ferrosa.Sql.Enum.concurrent_adds_both_survive` | Fixed in 72a8ecfc |
 | W3 | `CREATE TABLE … col type NOT NULL` dropped the `NOT NULL` of every non-key column (T-132a), so a NULL was stored silently. Now recorded (`pg.not_null.<col>`) and enforced on INSERT (omitted or NULL) and UPDATE: `23502`. Test `not_null_on_a_regular_column_is_enforced`; Lean `Ferrosa.Sql.Constraint` (`unenforced_not_null_stores_a_null`, `admitted_writes_preserve_constraints`) | Fixed in 44224a7a |
 
+## Found while building W2
+
+* **`'…'::jsonb` was refused as an impossible cast.** The general engine's cast had no
+  arm for text → jsonb, so `'{}'::jsonb` and a text literal assigned to a jsonb column
+  (`SET meta = '{}'`, Oban's `meta` DEFAULT) failed with 42846.
+  * Fixed (7e3ad2fa): the cast parses the text under the engine's jsonb limits, and
+    malformed JSON is 22P02, never NULL.
+  * Test: `general::eval::tests::text_casts_to_jsonb_by_parsing_it`, and
+    `dml_exec.rs` `a_text_literal_is_assigned_to_a_timestamp_or_jsonb_column`.
+  * Lean: `Dml.lean` `assign_never_nulls`.
+* **`RETURNING` reported a timestamp at a precision the row is not stored with.**
+  * A `timestamp` cell keeps whole milliseconds (a CQL `timestamp`; documented in the
+    README).
+  * `INSERT … RETURNING` echoed the supplied microseconds, and a general
+    `UPDATE … RETURNING` reported the unstored SET value.
+  * Oban acknowledges a job with `attempted_at = $5`, where `$5` is the value the
+    claim's `RETURNING` gave it. That comparison against the stored millisecond
+    value matched nothing, so no job could be acknowledged.
+  * Found by `tests/pg_oban_dml.rs` (`oban_insert_claim_and_ack_one_job`) over a real
+    driver.
+  * Fixed: `RETURNING` reports the row as stored.
+    * INSERT round-trips each supplied value through its storage encoding.
+    * The DML read truncates a value assigned to a millisecond column exactly as the
+      storage does (`DmlSpec::store_millis`, toward zero).
+  * Tests: `dml_exec.rs` `a_millisecond_column_returns_its_value_as_stored`;
+    `dml_general_tests` `returning_reports_a_timestamp_as_stored`.
+  * Lean: `Dml.lean` `returning_reports_the_stored_value`,
+    `unstored_returning_can_miss`.
+  * Not changed: microsecond storage itself is the documented limitation it was.
+* **`obj_description(…)` came back as a column named `?column?`.** W1's rewrite (7309d7d7)
+  turns the call into a `pg_description` subquery, whose default output name is
+  `?column?`. PostgreSQL names the column `obj_description`.
+  * The same merge left W3's test pinning the old refusal of census statement 8, and that
+    test then failed.
+  * Fixed: the rewrite keeps the function's name as the item's alias.
+  * The test now asserts the real answer, `'12'` under `obj_description`:
+    `pg_oban_ddl.rs` `obj_description_reads_the_table_comment`.
+  * Lean: `Dml.lean` `rewrite_with_alias_keeps_name`, `rewrite_without_alias_renames`.
+
+## Follow-ups (not needed by the census; recorded here because the forge board was unreachable)
+
+* **The READ COMMITTED re-check costs O(rows × buffered writes).** Found by W2. A
+  general UPDATE/DELETE re-checks each target row against every write already
+  buffered in the transaction. Index the buffered writes by table and key so the
+  re-check becomes a lookup.
+* **Refused loudly today (0A000), and not used by the census:**
+  * numeric division;
+  * `AT TIME ZONE` with zones other than UTC;
+  * `json_build_object` with nested json values;
+  * timestamps with a non-zero UTC offset.
+* **Gaps W3 left open:**
+  * recorded indexes are not projected into `pg_class`/`pg_index`;
+  * an enum column is described as `text` on the wire;
+  * single-column index creation is still refused on pair/cluster;
+  * an enum-array `= ANY($n)` parameter OID is not accepted;
+  * the serial node tag is not taken from cluster membership.
+
 ## Found while building W4
 
 | # | Found | Fix | Commit |
 |---|---|---|---|
 | 1 | The census fixture stores each statement on one line, so the capture flattened newlines. In Oban's v1 notify function that put the rest of the body inside a `--` comment, and a replay would send a function with no `END`. Found by `ferrosa-plpgsql/tests/census.rs`. | The fixture's comment is now `/* … */`, which PostgreSQL reads identically. Lean: `flattening_a_line_comment_swallows_code`, `a_block_comment_survives_flattening` | fixed in ff51578c |
-| 2 | A trigger whose write fires itself overflowed the stack before the depth bound was reached: each nesting level lived on the stack. | Each level is boxed, so the bound ends a cascade with 54001. Test: `a_trigger_that_fires_itself_stops_at_the_depth_bound`. The bound is the Lean trigger model's assumption; once-per-row is `fires_exactly_once` | fixed in 49396d2f |
+| 2 | A trigger whose write fires itself overflowed the stack before the depth bound was reached: each nesting level lived on the stack. | Each level is boxed and the bound is 8 (16 still overflowed a 2 MiB debug stack once W2's DML path joined the chain), so the bound ends a cascade with 54001. Test: `a_trigger_that_fires_itself_stops_at_the_depth_bound`. The bound is the Lean trigger model's assumption; once-per-row is `fires_exactly_once` | fixed in 49396d2f |
 | 3 | A multi-statement simple query (`BEGIN; NOTIFY …; COMMIT` in one `Query`) is refused with a parse error. PostgreSQL runs each statement. Postgrex and Ecto never send one. | Not fixed: this is the general simple-query dispatcher, which belongs to no W4 file. Needs a decision on who owns it | open: outside W4 |
 

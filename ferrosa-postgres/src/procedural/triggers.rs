@@ -33,8 +33,11 @@ pub(crate) const TRIGGERS_KEY: &str = "pg.triggers";
 /// Row events one statement may queue (`54000` beyond): the trigger queue is bounded.
 pub(crate) const MAX_ROW_EVENTS: usize = 100_000;
 /// Nested trigger firing (a trigger's write firing a trigger), PostgreSQL's
-/// `max_stack_depth` analogue (`54001` beyond).
-pub(crate) const MAX_TRIGGER_DEPTH: usize = 16;
+/// `max_stack_depth` analogue (`54001` beyond). Each level's future is boxed, but polling
+/// still nests one call chain per level, so the bound is set below what a 2 MiB tokio worker
+/// stack holds in a debug build (`a_trigger_that_fires_itself_stops_at_the_depth_bound` runs
+/// on a 2 MiB test thread; 16 overflowed it).
+pub(crate) const MAX_TRIGGER_DEPTH: usize = 8;
 
 /// A stored trigger.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

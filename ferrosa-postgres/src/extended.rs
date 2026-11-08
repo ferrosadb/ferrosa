@@ -54,6 +54,8 @@ pub enum PreparedKind {
     Insert(Box<InsertStmt>),
     Update(Box<UpdateStmt>),
     Delete(Box<DeleteStmt>),
+    /// A general `UPDATE`/`DELETE` (`FROM`, `WITH`, a general `WHERE`, `RETURNING`).
+    Dml(Box<ferrosa_sql::DmlStmt>),
     /// A parameterless utility statement (DDL): no `$N`, no result rows. Ecto sends every
     /// migration statement as an unnamed prepared statement, so DDL has to be preparable;
     /// executing it runs the same executor the simple-query path uses
@@ -623,6 +625,7 @@ impl Session {
             Ok(Statement::Insert(ins)) => PreparedKind::Insert(ins),
             Ok(Statement::Update(upd)) => PreparedKind::Update(upd),
             Ok(Statement::Delete(del)) => PreparedKind::Delete(del),
+            Ok(Statement::Dml(d)) => PreparedKind::Dml(d),
             Ok(stmt) if crate::query::is_utility(&stmt) => PreparedKind::Utility(Box::new(stmt)),
             Ok(_) => {
                 // BEGIN/COMMIT/ROLLBACK/SET reach the backend via simple Query.

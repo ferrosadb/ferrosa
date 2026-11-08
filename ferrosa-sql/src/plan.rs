@@ -429,6 +429,113 @@ impl RowCursor {
     }
 }
 
+/// What the front end asks of a general `UPDATE`/`DELETE`'s read
+/// ([`open_dml_cursor`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DmlSpec {
+    /// The target's storage-key columns, in key order. Hidden columns (a
+    /// synthetic key) are named here too: the read projects them by name.
+    pub key_columns: Vec<String>,
+    /// Also project the old value of every target column, for the READ
+    /// COMMITTED re-check after the writer owns the row (D16).
+    pub old_row: bool,
+    /// Timestamp columns whose storage keeps whole milliseconds (a CQL
+    /// `timestamp` cell). A value assigned to one is truncated as the storage
+    /// truncates it (toward zero), before `RETURNING` reads it, so `RETURNING`
+    /// reports the row as stored rather than a precision no read will return.
+    pub store_millis: Vec<String>,
+}
+
+/// The shape of each row a DML read yields: `keys ++ sets ++ returning ++ old`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DmlLayout {
+    /// The storage key, in [`DmlSpec::key_columns`] order.
+    pub keys: Vec<Column>,
+    /// The new value of each `SET` column, named by the column and typed by it.
+    pub sets: Vec<Column>,
+    /// The `RETURNING` values, over the new row (empty without `RETURNING`).
+    pub returning: Vec<Column>,
+    /// The old value of every target column, when [`DmlSpec::old_row`] asked.
+    pub old: Vec<Column>,
+}
+
+impl DmlLayout {
+    /// Every column of a row, in order.
+    pub fn all_columns(&self) -> Vec<Column> {
+        self.keys
+            .iter()
+            .chain(&self.sets)
+            .chain(&self.returning)
+            .chain(&self.old)
+            .cloned()
+            .collect()
+    }
+
+    /// Where the `RETURNING` values start in a row.
+    pub fn returning_start(&self) -> usize {
+        self.keys.len() + self.sets.len()
+    }
+
+    /// Where the old row starts in a row.
+    pub fn old_start(&self) -> usize {
+        self.returning_start() + self.returning.len()
+    }
+}
+
+/// Plan and open the read half of a general `UPDATE`/`DELETE`: one row per
+/// target row to write (see [`DmlLayout`]). Nothing is written here; the caller
+/// writes each row by its key (`Dml.lean`, `read_then_write_eq_declarative`).
+///
+/// # Errors
+///
+/// Any [`ExecError`] from resolution, parameter validation or a blocking
+/// operator; an assignment to a storage-key column is [`ExecError::Unsupported`].
+pub fn open_dml_cursor(
+    stmt: &crate::ast::DmlStmt,
+    spec: &DmlSpec,
+    catalog: &dyn Catalog,
+    default_schema: &str,
+    params: &[Value],
+    ctx: &SpillCtx,
+) -> Result<(RowCursor, DmlLayout), ExecError> {
+    let (query, layout) = crate::general::compile_dml(stmt, spec, catalog, default_schema)?;
+    let (rows, fence) = crate::general::run::open_top(&query, params, ctx)?;
+    let cursor = RowCursor {
+        columns: crate::general::columns(&query).to_vec(),
+        rows,
+        fence: Some(fence),
+    };
+    Ok((cursor, layout))
+}
+
+/// The [`DmlLayout`] of a general `UPDATE`/`DELETE`, without running it.
+///
+/// # Errors
+///
+/// As [`open_dml_cursor`]'s resolution errors.
+pub fn describe_dml(
+    stmt: &crate::ast::DmlStmt,
+    spec: &DmlSpec,
+    catalog: &dyn Catalog,
+    default_schema: &str,
+) -> Result<DmlLayout, ExecError> {
+    Ok(crate::general::compile_dml(stmt, spec, catalog, default_schema)?.1)
+}
+
+/// Each `$n`'s type in a general `UPDATE`/`DELETE`, `$1` first.
+///
+/// # Errors
+///
+/// As [`open_dml_cursor`]'s resolution errors.
+pub fn infer_dml_param_types(
+    stmt: &crate::ast::DmlStmt,
+    spec: &DmlSpec,
+    catalog: &dyn Catalog,
+    default_schema: &str,
+) -> Result<Vec<ColumnType>, ExecError> {
+    crate::general::infer_dml_params(stmt, spec, catalog, default_schema)
+}
+
 /// Resolve, plan and open `stmt` without pulling any output row.
 ///
 /// Blocking operators (sort, aggregate, join, distinct) consume their input

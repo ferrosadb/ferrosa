@@ -33,6 +33,7 @@ import Ferrosa.Sql.Constraint
 import Ferrosa.Sql.Expr
 import Ferrosa.Sql.Limit
 import Ferrosa.Sql.Oid
+import Ferrosa.Sql.Dml
 
 #check Ferrosa.Sql.Expr.legacy_compare_agrees
 #check Ferrosa.Sql.Expr.any_true_iff
@@ -55,6 +56,23 @@ import Ferrosa.Sql.Oid
 #check Ferrosa.Sql.Oid.int4_cannot_carry_high_oids
 #check Ferrosa.Sql.Oid.oid_round_trips
 #check Ferrosa.Sql.Oid.oid_refuses_outside_range
+#check Ferrosa.Sql.Dml.read_then_write_eq_declarative
+#check Ferrosa.Sql.Dml.delete_read_then_write_eq_declarative
+#check Ferrosa.Sql.Dml.returning_sees_new_row
+#check Ferrosa.Sql.Dml.firstPerRun_strict
+#check Ferrosa.Sql.Dml.firstPerRun_complete
+#check Ferrosa.Sql.Dml.firstPerRun_first
+#check Ferrosa.Sql.Dml.legacy_where_agrees
+#check Ferrosa.Sql.Dml.legacy_set_agrees
+#check Ferrosa.Sql.Dml.explicit_value_wins
+#check Ferrosa.Sql.Dml.omitted_column_takes_default
+#check Ferrosa.Sql.Dml.omitted_without_default_is_null
+#check Ferrosa.Sql.Dml.rc_unchanged_writes
+#check Ferrosa.Sql.Dml.rc_no_double_claim
+#check Ferrosa.Sql.Dml.assign_never_nulls
+#check Ferrosa.Sql.Dml.returning_reports_the_stored_value
+#check Ferrosa.Sql.Dml.unstored_returning_can_miss
+#check Ferrosa.Sql.Dml.rewrite_with_alias_keeps_name
 #check Ferrosa.Topology.DcQuorum.dc_quorum_writes_share_a_replica
 #check Ferrosa.Topology.DcQuorum.no_partition_admits_two_dc_quorum_writes
 #check Ferrosa.Topology.DcQuorum.node_gate_forces_a_shared_replica

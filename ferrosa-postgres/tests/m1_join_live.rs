@@ -1076,43 +1076,71 @@ async fn extended_parameterized_delete_applies() {
     assert!(rows.is_empty(), "the deleted row is gone");
 }
 
+/// UPDATE ... RETURNING over the wire (lane W2): the rows come back over the new
+/// row, typed by a real client's Describe.
 #[tokio::test]
-async fn extended_update_returning_is_unsupported_fail_loud() {
+async fn extended_update_returning_returns_the_new_row() {
     let (client, _dir) = dml_client().await;
-    // UPDATE ... RETURNING is out of scope this PR: a clear 0A000, not a silent
-    // drop of the RETURNING clause.
-    let err = client
+    let rows = client
         .query(
-            "UPDATE users SET name = $1 WHERE id = $2 RETURNING id",
+            "UPDATE users SET name = $1 WHERE id = $2 RETURNING id, name",
             &[&"x", &1i32],
         )
         .await
-        .expect_err("UPDATE RETURNING must fail loud");
-    assert_eq!(
-        err.code().map(|c| c.code()),
-        Some("0A000"),
-        "UPDATE RETURNING should be feature_not_supported, got: {err}"
-    );
-    // The connection survives (its own Sync/ReadyForQuery): a plain read works.
-    let ok = client
+        .expect("UPDATE RETURNING runs");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i32>(0), 1);
+    assert_eq!(rows[0].get::<_, &str>(1), "x");
+    let read = client
         .query("SELECT name FROM users WHERE id = $1", &[&1i32])
         .await
-        .expect("session usable after the fail-loud error");
-    assert_eq!(ok.len(), 1);
+        .expect("the updated row is readable");
+    assert_eq!(read[0].get::<_, &str>(0), "x");
 }
 
+/// A general UPDATE (aliased target, non-key WHERE) over the wire: the client
+/// learns each `$n`'s type from Describe and binds it; only a matching row moves.
 #[tokio::test]
-async fn extended_delete_returning_is_unsupported_fail_loud() {
+async fn extended_general_update_infers_parameter_types() {
     let (client, _dir) = dml_client().await;
-    let err = client
+    let n = client
+        .execute(
+            "UPDATE users AS u SET name = $1 WHERE (u.id = $2) AND (u.name <> $3)",
+            &[&"carol", &1i32, &"nobody"],
+        )
+        .await
+        .expect("a general UPDATE with bound params runs");
+    assert_eq!(n, 1);
+    let n = client
+        .execute(
+            "UPDATE users AS u SET name = $1 WHERE (u.id = $2) AND (u.name = $3)",
+            &[&"dave", &1i32, &"not carol"],
+        )
+        .await
+        .expect("a non-matching general UPDATE runs");
+    assert_eq!(n, 0, "the extra predicate excluded the row");
+    let read = client
+        .query("SELECT name FROM users WHERE id = $1", &[&1i32])
+        .await
+        .unwrap();
+    assert_eq!(read[0].get::<_, &str>(0), "carol");
+}
+
+/// DELETE ... RETURNING over the wire returns the deleted row, and it is gone.
+#[tokio::test]
+async fn extended_delete_returning_returns_the_deleted_row() {
+    let (client, _dir) = dml_client().await;
+    let rows = client
         .query("DELETE FROM users WHERE id = $1 RETURNING id", &[&1i32])
         .await
-        .expect_err("DELETE RETURNING must fail loud");
-    assert_eq!(
-        err.code().map(|c| c.code()),
-        Some("0A000"),
-        "DELETE RETURNING should be feature_not_supported, got: {err}"
-    );
+        .expect("DELETE RETURNING runs");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i32>(0), 1);
+    let read = client
+        .query("SELECT name FROM users WHERE id = $1", &[&1i32])
+        .await
+        .expect("query after delete succeeds");
+    assert!(read.is_empty(), "the deleted row is gone");
 }
 
 #[tokio::test]

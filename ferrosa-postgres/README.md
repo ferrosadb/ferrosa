@@ -1185,8 +1185,8 @@ simple-query dispatch; `notify` queues in the transaction. Outside a transaction
 DO block is its own implicit transaction (all or nothing); inside one, a failure poisons the
 block (`25P02` afterwards). Expressions evaluate as `SELECT <expr>` through the SQL engine
 with variables bound as `$n` (a literal-only select on the legacy scalar grammar has its `$n`
-substituted by the host). DDL inside a DO block reaches the DDL path inside the block's
-transaction and is refused there with `25001` until transactional DDL (W3) lands.
+substituted by the host). DDL inside a DO block is buffered with the block's transaction (W3's
+`ddl_txn`) and commits or rolls back with it.
 
 ### PL/pgSQL functions
 
@@ -1201,8 +1201,11 @@ How functions run is the node's explicit `procedural::FunctionBackend`, logged a
 `FERROSA_ASC_BUNDLE`), `Interpreted` (tests), or `Unavailable` (`CREATE FUNCTION` and trigger
 firing refuse with `0A000` naming the reason). `DROP FUNCTION [IF EXISTS] name[(types)]`
 refuses with `2BP01` while a trigger uses the function. SQLSTATEs: `42723` duplicate,
-`42P13` changed return type, `42883` missing, `42725` ambiguous name, `25001` inside a
-transaction block (DDL is not transactional yet). Calling a PL/pgSQL function from a SQL
+`42P13` changed return type, `42883` missing, `42725` ambiguous name. Inside a transaction
+block, function and trigger DDL plan against the block's view and are buffered as
+`ddl_txn` steps (`CreateFunction`, `DropFunction`, the trigger's table ALTER), applied at
+COMMIT and dropped by ROLLBACK; triggers fire from the committed schema, as DML in a block
+reads it. Calling a PL/pgSQL function from a SQL
 expression (`SELECT f(1)`) is not wired: the expression engine has no user-function hook.
 
 ### Triggers
@@ -1216,10 +1219,12 @@ UPDATE record one event per written row of a table with triggers (`NEW`, `OLD`, 
 columns); `server::execute_dml_firing` then runs, before the statement returns and before
 any commit, every matching trigger once per event in row order then trigger-name order, with
 `NEW`/`OLD` fields bound with their column's type OID and `TG_OP`, through the same session —
-so trigger writes join the transaction (`specs/lean4/Ferrosa/Sql/Trigger.lean`). UPDATE OF
+so trigger writes join the transaction. W2's general `UPDATE` (non-key `WHERE`,
+`RETURNING`, `UPDATE … FROM`) records the same events (`DmlRun::row_events`) and fires through
+`server::execute_general_dml_firing` (`specs/lean4/Ferrosa/Sql/Trigger.lean`). UPDATE OF
 fires when one of its columns is a SET target (PostgreSQL's rule). An UPDATE of a row that
 does not exist records no event. Bounds: `MAX_ROW_EVENTS` (100,000) events per statement
-(`54000`), trigger nesting `MAX_TRIGGER_DEPTH` (16, `54001`; each level is boxed, so the bound
+(`54000`), trigger nesting `MAX_TRIGGER_DEPTH` (8, `54001`; each level is boxed, so the bound
 — not the stack — ends a cascade). A trigger error fails the statement.
 
 **Cluster status (precise):** delivery is **node-local**. A standalone node delivers to every

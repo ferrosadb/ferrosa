@@ -52,6 +52,10 @@ pub enum Statement {
     Update(Box<UpdateStmt>),
     /// `DELETE FROM t WHERE ...`. Boxed for size parity with `Select`.
     Delete(Box<DeleteStmt>),
+    /// An `UPDATE` or `DELETE` the keyed legacy forms cannot carry: an aliased
+    /// target, `FROM`/`USING`, `WITH`, a general `WHERE`, or `RETURNING`
+    /// expressions (see [`DmlStmt`]). Boxed for size parity with `Select`.
+    Dml(Box<DmlStmt>),
     /// `CREATE TABLE [IF NOT EXISTS] ...` (D10 Ecto-migration subset). Parse
     /// only: execution and schema creation are later packets. Boxed for size
     /// parity with `Select`.
@@ -598,6 +602,105 @@ pub struct DeleteStmt {
     pub returning: Option<Returning>,
 }
 
+/// A general `UPDATE` or `DELETE`:
+///
+/// ```text
+/// [WITH …] UPDATE t [[AS] a] SET c = <expr>, … [FROM r, …] [WHERE <cond>] [RETURNING …]
+/// [WITH …] DELETE FROM t [[AS] a] [USING r, …] [WHERE <cond>] [RETURNING …]
+/// ```
+///
+/// The parser produces this only when the statement does not fit the keyed
+/// legacy [`UpdateStmt`] / [`DeleteStmt`], so pgbench's shapes keep their fast
+/// path (`specs/lean4/Ferrosa/Sql/Dml.lean`, `legacy_where_agrees` and
+/// `legacy_set_agrees`, are why that choice does not change a statement's
+/// meaning).
+///
+/// It runs as one general `SELECT` over the target joined with `from` (see
+/// [`DmlStmt::read_select`]) followed by one keyed write per matching row
+/// (`read_then_write_eq_declarative`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DmlStmt {
+    /// `WITH name AS (SELECT …), …`, visible to every clause.
+    pub ctes: Vec<Cte>,
+    /// The table written, with its alias if one was given.
+    pub target: TableRef,
+    pub action: DmlAction,
+    /// `UPDATE … FROM` / `DELETE … USING`: further relations, cross-joined with
+    /// the target and constrained by `filter`.
+    pub from: Vec<TableRef>,
+    pub filter: Option<Expr>,
+    /// `RETURNING *` or a list of expressions, evaluated over the new row (an
+    /// `UPDATE`) or the deleted row.
+    pub returning: Option<Projection>,
+}
+
+/// What a [`DmlStmt`] does to each matching target row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DmlAction {
+    /// `SET col = expr, …`: each expression is evaluated over the old row.
+    Update(Vec<(String, ScalarExpr)>),
+    /// Remove the row.
+    Delete,
+}
+
+impl DmlStmt {
+    /// The read half: `[WITH …] SELECT <set exprs, returning exprs> FROM target
+    /// [JOIN r ON TRUE …] [WHERE filter]`. Its [`SelectStmt::tables`] is every
+    /// relation the statement reads, which is what authorization, catalog
+    /// loading and the transaction's read set need.
+    pub fn read_select(&self) -> SelectStmt {
+        let mut items: Vec<SelectItem> = Vec::new();
+        if let DmlAction::Update(sets) = &self.action {
+            items.extend(sets.iter().map(|(_, e)| SelectItem::Expr {
+                expr: e.clone(),
+                alias: None,
+            }));
+        }
+        if let Some(Projection::Items(ret)) = &self.returning {
+            items.extend(ret.iter().cloned());
+        }
+        let projection = if items.is_empty() {
+            Projection::Star
+        } else {
+            Projection::Items(items)
+        };
+        let joins = self
+            .from
+            .iter()
+            .map(|t| JoinClause {
+                kind: JoinKind::Inner,
+                table: t.clone(),
+                on: ScalarExpr::Literal(Value::Bool(true)),
+            })
+            .collect();
+        SelectStmt {
+            ctes: self.ctes.clone(),
+            distinct: false,
+            projection,
+            from: self.target.clone(),
+            join: None,
+            joins,
+            filter: self.filter.clone(),
+            group_by: Vec::new(),
+            having: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            limit_param: None,
+            offset_param: None,
+            lock: None,
+        }
+    }
+
+    /// The command tag's verb.
+    pub fn verb(&self) -> &'static str {
+        match self.action {
+            DmlAction::Update(_) => "UPDATE",
+            DmlAction::Delete => "DELETE",
+        }
+    }
+}
+
 /// A `RETURNING` clause: either `RETURNING *` (all of the table's columns, in
 /// schema order — resolved at execute time) or an explicit list of column names.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -753,6 +856,37 @@ pub struct SelectStmt {
     pub limit_param: Option<usize>,
     /// `OFFSET $n`, as `limit_param`.
     pub offset_param: Option<usize>,
+    /// `FOR UPDATE [OF …] [NOWAIT | SKIP LOCKED]` and the weaker strengths.
+    /// Recorded and accepted, and takes no row locks (decision D14): inside a
+    /// transaction block Accord's serializability makes the losing writer fail
+    /// with 40001, and under READ COMMITTED a later write of the row re-checks
+    /// it (D16).
+    pub lock: Option<RowLock>,
+}
+
+/// A row-locking clause as written (see [`SelectStmt::lock`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowLock {
+    pub strength: LockStrength,
+    /// `OF t, …`: the relations named, or empty for all of them.
+    pub of: Vec<String>,
+    pub wait: LockWait,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockStrength {
+    Update,
+    NoKeyUpdate,
+    Share,
+    KeyShare,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockWait {
+    /// Neither `NOWAIT` nor `SKIP LOCKED`.
+    Wait,
+    NoWait,
+    SkipLocked,
 }
 
 /// The right-hand side of a comparison: either an inline literal or a bound

@@ -330,7 +330,7 @@ policy, not native PostgreSQL default transaction-timeout parity.
 | Slow listener's queue fills | Memory growth or lost notifications | Bounded queue; the notifying COMMIT is refused with 54000 before applying |
 | LISTEN on a cluster node misses other nodes' commits | Silent loss | LISTEN refused with 0A000 on a cluster node |
 | Trigger effect outside the statement's transaction | Rolled-back insert leaves an audit row | Trigger runs through the same session host (`trigger_writes_join_the_transaction_and_roll_back_with_it`) |
-| Trigger cascade | Stack overflow / hang | Depth 16 (54001), each level boxed |
+| Trigger cascade | Stack overflow / hang | Depth 8 (54001), each level boxed; verified on a 2 MiB stack |
 | Unbounded trigger queue | Memory growth on a bulk statement | 100,000 events per statement (54000) |
 | PL/pgSQL query result gathered whole | Memory growth | Host `fetch` pulls at most the requested rows from the portal stream; EXISTS and scalar reads stop after one row |
 | Function compiled differently on two nodes | Divergent trigger behaviour | Cache keyed by the stored envelope's hash; same source, same compile |

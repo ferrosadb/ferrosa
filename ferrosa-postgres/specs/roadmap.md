@@ -474,7 +474,6 @@ Binding a replacement lazily reclaims only retired-incarnation MVCC heads and sc
 
 - Cross-node NOTIFY delivery through the Accord apply observer (design in README); lift the
   cluster LISTEN refusal when it lands.
-- Transactional function/trigger DDL with W3's buffered DDL (today 25001 inside a block).
 - Calling PL/pgSQL functions from SQL expressions (needs a user-function hook in the engine).
 - DELETE and statement-level triggers; BEFORE triggers.
 - `BackendKeyData` pid and the notification pid agree once cancellation is wired.

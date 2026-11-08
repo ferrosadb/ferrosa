@@ -162,6 +162,15 @@ fn eval_node(e: &CExpr, env: &Env<'_>) -> R<Value> {
                 format!("AT TIME ZONE needs a timestamp, not {}", type_name(&other)),
             )),
         },
+        CExpr::StoreMillis(inner) => match eval(inner, env)? {
+            // Exactly the storage's `micros / 1000` (toward zero), back in micros.
+            Value::Timestamp(micros) => Ok(Value::Timestamp(micros / 1000 * 1000)),
+            Value::Null => Ok(Value::Null),
+            other => Err(internal(format!(
+                "a millisecond column was assigned a {}",
+                type_name(&other)
+            ))),
+        },
     }
 }
 
@@ -644,6 +653,19 @@ pub(crate) fn cast(v: Value, ty: ColumnType) -> R<Value> {
             other => Err(cannot_cast(&other, ty)),
         },
         ColumnType::Array(elem) => cast_array(v, elem),
+        ColumnType::Jsonb => match v {
+            Value::Jsonb(_) => Ok(v),
+            Value::Text(t) => {
+                let encoded = ferrosa_jsonb::parse_text(t.as_str().as_bytes(), &json_limits()?)
+                    .map_err(|e| {
+                        ExecError::eval("22P02", format!("invalid input syntax for type json: {e}"))
+                    })?;
+                ferrosa_jsonb::JsonbValue::from_encoded(encoded)
+                    .map(Value::Jsonb)
+                    .map_err(|e| ExecError::eval("22P02", e.to_string()))
+            }
+            other => Err(cannot_cast(&other, ty)),
+        },
         other_ty => {
             if super::literal_type(&v) == Some(other_ty) {
                 Ok(v)
@@ -1093,6 +1115,28 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// `'{"a": 1}'::jsonb` parses the text (it was refused as an impossible
+    /// cast), and malformed JSON is 22P02, never NULL.
+    #[test]
+    fn text_casts_to_jsonb_by_parsing_it() {
+        let v = cast(Value::Text("{\"a\": 1}".into()), ColumnType::Jsonb).unwrap();
+        let Value::Jsonb(j) = v else {
+            panic!("expected jsonb, got {v:?}")
+        };
+        assert_eq!(text_of(&Value::Jsonb(j)).unwrap(), "{\"a\": 1}");
+        let err = cast(Value::Text("{nope".into()), ColumnType::Jsonb).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ExecError::Eval {
+                    sqlstate: "22P02",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]

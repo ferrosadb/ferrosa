@@ -76,10 +76,6 @@ indexmap = "2"
 #   FERROSA_TEST_CONTAINERS=1 cargo test -p ferrosa-postgres \
 #     --features live-infra-tests --test differential_oracle -- --nocapture
 live-infra-tests = []
-# Tests that pin behaviour other workstreams (W1 expressions, W3 transactional DDL) are still
-# building. They are red until those land, so they are built only on request:
-#   cargo test -p ferrosa-postgres --features pending-workstreams
-pending-workstreams = []
 # D13: compile CREATE FUNCTION ... LANGUAGE plpgsql in process (AssemblyScript toolchain in
 # QuickJS; needs FERROSA_ASC_BUNDLE at run time). Without it the binary chooses another
 # FunctionBackend explicitly.

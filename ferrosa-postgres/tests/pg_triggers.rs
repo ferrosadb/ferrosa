@@ -494,3 +494,44 @@ async fn compiled_trigger_function_fires_and_notifies() {
         "the compiled audit trigger wrote in the same transaction"
     );
 }
+
+/// Oban's claim and ack are general UPDATEs (W2: non-key predicates, RETURNING, `= ANY`);
+/// a trigger on the table fires for them too, on both protocols, once per updated row.
+#[tokio::test]
+async fn a_trigger_fires_for_general_updates_with_returning_on_both_protocols() {
+    let server = server().await;
+    let (a, mut rx) = listener(server.port).await;
+    run(&a, &["LISTEN rows"]).await;
+    let b = pg_server::connect(server.port).await;
+    run(
+        &b,
+        &[
+            "CREATE FUNCTION renamed() RETURNS trigger AS $$ BEGIN PERFORM pg_notify('rows', OLD.name || '->' || NEW.name); RETURN NULL; END $$ LANGUAGE plpgsql",
+            "CREATE TRIGGER on_rename AFTER UPDATE OF name ON t FOR EACH ROW EXECUTE PROCEDURE renamed()",
+            "INSERT INTO t (id, ck, name, score) VALUES ('g', 1, 'a', 7), ('g', 2, 'b', 7), ('h', 1, 'c', 8)",
+        ],
+    )
+    .await;
+    let messages = b
+        .simple_query("UPDATE t SET name = 'z' WHERE score = 7 RETURNING ck")
+        .await
+        .expect("general update, simple protocol");
+    let returned = messages
+        .iter()
+        .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
+        .count();
+    assert_eq!(returned, 2);
+    let mut got = vec![next(&mut rx).await, next(&mut rx).await];
+    got.sort();
+    assert_eq!(got, vec!["a->z", "b->z"]);
+    quiet(&mut rx).await;
+    let rows = b
+        .query(
+            "UPDATE t SET name = $1 WHERE score = $2 RETURNING ck",
+            &[&"y", &8i32],
+        )
+        .await
+        .expect("general update, extended protocol");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(next(&mut rx).await, "c->y");
+}
