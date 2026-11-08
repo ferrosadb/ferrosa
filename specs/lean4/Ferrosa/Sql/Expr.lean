@@ -223,6 +223,61 @@ theorem not_in_with_null_never_true (x : V) (xs : List V) (h : V.null ∈ xs) :
   have := (any_false_iff x xs).mp hfalse .null h
   simp [veq_null_right] at this
 
+/-! ### The evaluator's loop
+
+  The Rust evaluator computes `IN (…)`, `= ANY(array)` and `IN (subquery)` (which
+  the parser lowers to `= ANY(ARRAY(subquery))`, as PostgreSQL defines it) with a
+  left fold that starts at FALSE and stops at the first TRUE. These show that
+  loop is `anyEq`, and that stopping early never changes the answer.
+-/
+
+/-- The loop: `acc := acc OR (x = e)` over the elements, left to right. -/
+def anyLoop (x : V) (acc : TV) : List V → TV
+  | [] => acc
+  | e :: es => anyLoop x (tvOr acc (veq x e)) es
+
+theorem tvOr_true_left (b : TV) : tvOr (some true) b = some true := by
+  cases b <;> rfl
+
+/-- Once the accumulator is TRUE it stays TRUE, so breaking out is sound. -/
+theorem anyLoop_true_absorbs (x : V) (xs : List V) : anyLoop x (some true) xs = some true := by
+  induction xs with
+  | nil => rfl
+  | cons e es ih => simp [anyLoop, tvOr_true_left, ih]
+
+theorem tvOr_assoc (a b c : TV) : tvOr (tvOr a b) c = tvOr a (tvOr b c) := by
+  cases a with
+  | none => cases b with
+    | none => cases c with
+      | none => rfl
+      | some z => cases z <;> rfl
+    | some y => cases y <;> cases c <;> try rfl
+                all_goals (rename_i z; cases z <;> rfl)
+  | some x => cases x <;> cases b <;> try rfl
+              all_goals first
+                | (rename_i y; cases y <;> cases c <;> try rfl
+                   all_goals (rename_i z; cases z <;> rfl))
+                | (cases c <;> try rfl
+                   all_goals (rename_i z; cases z <;> rfl))
+
+theorem tvOr_false_left (b : TV) : tvOr (some false) b = b := by
+  cases b with
+  | none => rfl
+  | some y => cases y <;> rfl
+
+theorem anyLoop_acc (x : V) (acc : TV) (xs : List V) :
+    anyLoop x acc xs = tvOr acc (anyEq x xs) := by
+  induction xs generalizing acc with
+  | nil =>
+    cases acc with
+    | none => rfl
+    | some b => cases b <;> rfl
+  | cons e es ih => simp [anyLoop, anyEq, ih, tvOr_assoc]
+
+/-- The loop from FALSE is exactly `anyEq`. -/
+theorem anyLoop_is_anyEq (x : V) (xs : List V) : anyLoop x (some false) xs = anyEq x xs := by
+  rw [anyLoop_acc, tvOr_false_left]
+
 /-! ## `coalesce` -/
 
 def coalesce : List V → V

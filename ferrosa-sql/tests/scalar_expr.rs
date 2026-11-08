@@ -557,3 +557,51 @@ fn limit_parameter_types_are_inferred_as_bigint() {
     let params = ferrosa_sql::infer_param_types(&stmt, &catalog(), "public").unwrap();
     assert_eq!(params, vec![ColumnType::Int, ColumnType::BigInt]);
 }
+
+// -- IN / = ANY over a subquery (PostgreSQL defines IN (subquery) as = ANY) ------
+
+#[test]
+fn in_a_subquery_matches_any_row_it_returns() {
+    assert_eq!(
+        select(
+            "SELECT id FROM t WHERE id IN (SELECT tid FROM u) ORDER BY id",
+            &[]
+        ),
+        vec![vec![int(1)], vec![int(3)]]
+    );
+    assert_eq!(
+        select(
+            "SELECT id FROM t WHERE id = ANY (SELECT tid FROM u WHERE tag = 'green')",
+            &[]
+        ),
+        vec![vec![int(3)]]
+    );
+    assert_eq!(
+        select(
+            "SELECT id FROM t WHERE id NOT IN (SELECT tid FROM u) ORDER BY id",
+            &[]
+        ),
+        vec![vec![int(2)]]
+    );
+}
+
+#[test]
+fn not_in_a_subquery_that_returns_a_null_is_never_true() {
+    // n is NULL on id 1: NOT IN over a set holding NULL keeps nothing
+    // (Expr.lean not_in_with_null_never_true).
+    assert_eq!(
+        select("SELECT id FROM t WHERE a NOT IN (SELECT n FROM t)", &[]),
+        Vec::<Vec<Value>>::new()
+    );
+}
+
+#[test]
+fn in_a_limited_subquery_as_oban_prunes() {
+    assert_eq!(
+        select(
+            "SELECT id FROM t WHERE id IN (SELECT id FROM t WHERE a > 1 ORDER BY id LIMIT 1)",
+            &[]
+        ),
+        vec![vec![int(2)]]
+    );
+}

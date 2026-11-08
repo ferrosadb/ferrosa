@@ -95,6 +95,11 @@ impl Parser {
             self.next();
             if self.peek_word("ANY") || self.peek_word("SOME") {
                 self.next();
+                // `op ANY (SELECT …)` compares against the subquery's rows.
+                if self.starts_subquery() {
+                    let query = self.parenthesised_select()?;
+                    return Ok(any_of_subquery(left, op, query));
+                }
                 self.expect(&Tok::LParen, "(")?;
                 let right = self.parse_scalar_expr()?;
                 self.expect(&Tok::RParen, ")")?;
@@ -123,6 +128,20 @@ impl Parser {
         }
         if self.peek_word("IN") {
             self.next();
+            // PostgreSQL defines `x IN (subquery)` as `x = ANY (subquery)`, and
+            // `NOT IN` as its negation; the same three-valued rules follow.
+            if self.starts_subquery() {
+                let query = self.parenthesised_select()?;
+                let any = any_of_subquery(left, CmpOp::Eq, query);
+                return Ok(if negated {
+                    ScalarExpr::Unary {
+                        op: UnaryOp::Not,
+                        expr: Box::new(any),
+                    }
+                } else {
+                    any
+                });
+            }
             self.expect(&Tok::LParen, "(")?;
             let list = self.scalar_list(&Tok::RParen)?;
             return Ok(ScalarExpr::InList {
@@ -282,6 +301,12 @@ impl Parser {
         let inner = self.parse_scalar_expr()?;
         self.expect(&Tok::RParen, ")")?;
         Ok(inner)
+    }
+
+    /// Whether the next tokens are `( SELECT` (or `( WITH`).
+    fn starts_subquery(&self) -> bool {
+        matches!(self.peek(), Some(Tok::LParen))
+            && matches!(self.toks.get(self.pos + 1), Some(Tok::Select))
     }
 
     pub(crate) fn parenthesised_select(&mut self) -> Result<crate::ast::SelectStmt, ParseError> {
@@ -542,6 +567,15 @@ impl Parser {
             Tok::Ge => Some(CmpOp::Ge),
             _ => None,
         }
+    }
+}
+
+/// `left <op> ANY (query)`: the subquery's single column as an array.
+fn any_of_subquery(left: ScalarExpr, op: CmpOp, query: crate::ast::SelectStmt) -> ScalarExpr {
+    ScalarExpr::Any {
+        left: Box::new(left),
+        op,
+        right: Box::new(ScalarExpr::ArraySubquery(Box::new(query))),
     }
 }
 

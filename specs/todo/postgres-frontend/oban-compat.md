@@ -184,3 +184,10 @@ against ferrosa.
   * `json_build_object`.
 
   Open, W1. Wire them up as the Oban statements need them.
+* **`x IN (SELECT …)` was read as a scalar subquery inside a list.** It failed
+  with 21000 once the subquery returned more than one row. Fixed: `IN (subquery)`
+  and `op ANY (subquery)` now lower to `op ANY (ARRAY(subquery))`, which is how
+  PostgreSQL defines them; `NOT IN` is the negation. Lean:
+  `anyLoop_is_anyEq` and `anyLoop_true_absorbs` (the evaluator's early-exit
+  fold equals `anyEq`).
+* **`array_append` is missing** (census row 15). Open, W1/W2.
