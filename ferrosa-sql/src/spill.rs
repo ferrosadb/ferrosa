@@ -159,6 +159,13 @@ fn value_heap_bytes(v: &Value) -> usize {
                     .map(|i| i.as_ref().map_or(0, String::capacity))
                     .sum::<usize>()
         }
+        // The shared slice's element slots plus each element's own heap bytes.
+        // Counted in full even when other rows share the `Arc`: over-counting
+        // spills early, under-counting could exhaust memory.
+        Value::Array(array) => {
+            array.items.len() * std::mem::size_of::<Value>()
+                + array.items.iter().map(value_heap_bytes).sum::<usize>()
+        }
         Value::Null
         | Value::Int(_)
         | Value::Bool(_)
@@ -222,6 +229,16 @@ pub fn canonical_cmp(a: &Value, b: &Value) -> Ordering {
         (Value::Jsonb(x), Value::Jsonb(y)) => x.cmp(y),
         (Value::JsonPath(x), Value::JsonPath(y)) => x.cmp(y),
         (Value::TextArray(x), Value::TextArray(y)) => x.cmp(y),
+        // Element type first, then element-wise canonical order, then length:
+        // Equal exactly when the arrays are structurally equal.
+        (Value::Array(x), Value::Array(y)) => x.elem.cmp(&y.elem).then_with(|| {
+            x.items
+                .iter()
+                .zip(y.items.iter())
+                .map(|(a, b)| canonical_cmp(a, b))
+                .find(|o| *o != Ordering::Equal)
+                .unwrap_or_else(|| x.items.len().cmp(&y.items.len()))
+        }),
         // Unreachable: equal tags imply the same variant.
         _ => Ordering::Equal,
     }
@@ -245,6 +262,7 @@ fn type_tag(v: &Value) -> u8 {
         Value::Jsonb(_) => 12,
         Value::JsonPath(_) => 13,
         Value::TextArray(_) => 14,
+        Value::Array(_) => 15,
     }
 }
 

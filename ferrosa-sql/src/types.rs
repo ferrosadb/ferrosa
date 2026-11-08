@@ -71,6 +71,47 @@ pub enum Value {
     /// `text[]` (OID 1009), value-only: no column of this type is stored.
     /// Elements may be NULL.
     TextArray(Vec<Option<String>>),
+    /// A one-dimensional PostgreSQL array of `elem` (`int8[]`, `jsonb[]`,
+    /// `oid[]`, ...). Elements may be NULL. The items are shared (`Arc<[Value]>`)
+    /// so an array moves through scans, joins and projections without copying.
+    Array(ArrayValue),
+}
+
+/// The element type of a [`Value::Array`] / [`ColumnType::Array`].
+///
+/// A separate `Copy` enum (not `Box<ColumnType>`) keeps [`ColumnType`] `Copy`;
+/// arrays are one-dimensional, so an element is never itself an array.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub enum ArrayElem {
+    Int,
+    BigInt,
+    Oid,
+    Text,
+    Bool,
+    Float,
+    Uuid,
+    Timestamp,
+    Numeric,
+    Jsonb,
+}
+
+/// A one-dimensional array: its element type and its elements.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct ArrayValue {
+    pub elem: ArrayElem,
+    pub items: std::sync::Arc<[Value]>,
+}
+
+impl ArrayValue {
+    /// Build from owned items (moved, not copied).
+    pub fn new(elem: ArrayElem, items: Vec<Value>) -> Self {
+        Self {
+            elem,
+            items: items.into(),
+        }
+    }
 }
 
 impl Value {
@@ -139,6 +180,12 @@ impl Value {
             (Value::Jsonb(a), Value::Jsonb(b)) => Some(a.cmp(b)),
             (Value::JsonPath(a), Value::JsonPath(b)) => Some(a.cmp(b)),
             (Value::TextArray(a), Value::TextArray(b)) => Some(a.cmp(b)),
+            // Arrays of the same element type: element-wise, then by length
+            // (PostgreSQL's btree array order); an element that is itself
+            // incomparable makes the whole comparison UNKNOWN.
+            (Value::Array(a), Value::Array(b)) if a.elem == b.elem => {
+                cmp_arrays(&a.items, &b.items)
+            }
             // Cross-type and NULL are UNKNOWN. Listed by first operand so a new
             // `Value` variant is a compile error here, not a silent UNKNOWN.
             (
@@ -156,11 +203,25 @@ impl Value {
                 | Value::Numeric { .. }
                 | Value::Jsonb(_)
                 | Value::JsonPath(_)
-                | Value::TextArray(_),
+                | Value::TextArray(_)
+                | Value::Array(_),
                 _,
             ) => None,
         }
     }
+}
+
+/// PostgreSQL btree order for arrays: the first unequal element decides; a
+/// shorter array that is a prefix of the other sorts first. NULL elements make
+/// the comparison UNKNOWN (`None`), like any other NULL comparison here.
+fn cmp_arrays(a: &[Value], b: &[Value]) -> Option<Ordering> {
+    for (x, y) in a.iter().zip(b.iter()) {
+        match x.sql_cmp(y)? {
+            Ordering::Equal => continue,
+            other => return Some(other),
+        }
+    }
+    Some(a.len().cmp(&b.len()))
 }
 
 /// Strip trailing decimal zeros from a `(unscaled, scale)` decimal: while the
@@ -233,6 +294,8 @@ pub enum ColumnType {
     JsonPath,
     /// `text[]` (OID 1009); value-only.
     TextArray,
+    /// A one-dimensional array of `ArrayElem` (`int8[]`, `jsonb[]`, `oid[]`, ...).
+    Array(ArrayElem),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

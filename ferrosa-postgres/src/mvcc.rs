@@ -1354,6 +1354,10 @@ fn validate_snapshot(
 /// and deliberately does NOT allocate: it is a walk, not a serialization.
 fn value_heap_bytes(value: &Value) -> usize {
     match value {
+        Value::Array(array) => {
+            array.items.len() * std::mem::size_of::<Value>()
+                + array.items.iter().map(value_heap_bytes).sum::<usize>()
+        }
         Value::Null
         | Value::Int(_)
         | Value::Bool(_)
