@@ -10,6 +10,7 @@
   which is why it is printed with the reference material rather than as a chapter.
 -/
 import Ferrosa.Unimplemented
+import Ferrosa.Sql.Plpgsql
 import Ferrosa.Cdc.Subscribe
 import Ferrosa.Commons.Hll
 import Ferrosa.Unsafe.Invariants
@@ -115,6 +116,11 @@ import Ferrosa.Codec.Audit
 #check Ferrosa.Sql.Txn.one_decision_is_atomic
 #check Ferrosa.Sql.Txn.serializable_requires_the_read_set
 #check Ferrosa.Sql.Txn.snapshot_isolation_permits_write_skew
+-- PL/pgSQL (D13): the converter's output, run, equals the interpreter's result.
+#check Ferrosa.Sql.Plpgsql.convert_agrees
+#check Ferrosa.Sql.Plpgsql.convertList_agrees
+#check Ferrosa.Sql.Plpgsql.compiled_returns_what_the_interpreter_returns
+#check Ferrosa.Sql.Plpgsql.exists_ignores_everything_after_the_first_row
 #check Ferrosa.Sql.commit_is_not_atomic_across_statements
 #check Ferrosa.Sql.count_star_and_count_col_disagree
 #check Ferrosa.Sql.null_passes_a_naive_not_equal
