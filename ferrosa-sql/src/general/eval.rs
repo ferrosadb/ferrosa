@@ -348,7 +348,85 @@ fn function(f: Func, args: &[CExpr], env: &Env<'_>) -> R<Value> {
             Ok(best)
         }
         Func::Now => Ok(Value::Timestamp(env.rt.now_micros)),
+        Func::Timezone => {
+            let zone = eval(&args[0], env)?;
+            let ts = eval(&args[1], env)?;
+            match (&zone, &ts) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Text(z), Value::Timestamp(_)) if super::is_utc(z.as_str()) => Ok(ts),
+                (Value::Text(z), Value::Timestamp(_)) => Err(ExecError::Unsupported(format!(
+                    "timezone() with zone {:?} (only UTC)",
+                    z.as_str()
+                ))),
+                _ => Err(no_function("timezone", &ts)),
+            }
+        }
+        Func::ArrayAppend(elem) => {
+            let item = cast(eval(&args[1], env)?, super::elem_type(elem))?;
+            let mut items: Vec<Value> = match eval(&args[0], env)? {
+                Value::Null => Vec::with_capacity(1),
+                Value::Array(a) => a.items.iter().cloned().collect(),
+                other => return Err(no_function("array_append", &other)),
+            };
+            items.push(item);
+            Ok(Value::Array(ArrayValue::new(elem, items)))
+        }
+        Func::JsonBuildObject => json_build_object(args, env),
     }
+}
+
+/// `json_build_object(k, v, …)`: keys are text, values are scalars (a nested
+/// json value is not supported yet and is refused, never stringified).
+fn json_build_object(args: &[CExpr], env: &Env<'_>) -> R<Value> {
+    use ferrosa_jsonb::{JsonbBuilder, JsonbValue, Number};
+    let limits = json_limits()?;
+    let json_err = |e: ferrosa_jsonb::JsonbError| ExecError::eval("22023", e.to_string());
+    let mut b = JsonbBuilder::new(limits);
+    b.begin_object().map_err(json_err)?;
+    for pair in args.chunks(2) {
+        let key = match eval(&pair[0], env)? {
+            Value::Null => {
+                return Err(ExecError::eval(
+                    "22004",
+                    "null value not allowed for object key",
+                ))
+            }
+            k => text_of(&k)?,
+        };
+        b.key(&key).map_err(json_err)?;
+        match eval(&pair[1], env)? {
+            Value::Null => b.null(),
+            Value::Bool(v) => b.boolean(v),
+            Value::Int(n) => b.number(Number::from_i64(n)),
+            Value::Float(x) => b.number(Number::from_f64_shortest(x.0).map_err(json_err)?),
+            Value::Numeric { unscaled, scale } => {
+                b.number(Number::parse_lexeme(&numeric_text(&unscaled, scale)).map_err(json_err)?)
+            }
+            v @ (Value::Text(_) | Value::Uuid(_) | Value::Timestamp(_)) => b.string(&text_of(&v)?),
+            other => {
+                return Err(ExecError::Unsupported(format!(
+                    "json_build_object with a {} value",
+                    type_name(&other)
+                )))
+            }
+        }
+        .map_err(json_err)?;
+    }
+    b.end_object().map_err(json_err)?;
+    let encoded = b.finish().map_err(json_err)?;
+    JsonbValue::from_encoded(encoded)
+        .map(Value::Jsonb)
+        .map_err(json_err)
+}
+
+/// The engine's jsonb limits: the crate defaults (the front end's configured
+/// limits apply to client input; values built here are bounded by these).
+fn json_limits() -> R<ferrosa_jsonb::Limits> {
+    ferrosa_jsonb::Limits::from_config(
+        &ferrosa_jsonb::LimitsConfig::default(),
+        ferrosa_jsonb::HARD_MAX_ENCODED_BYTES as u64,
+    )
+    .map_err(|e| internal(format!("jsonb limits: {e}")))
 }
 
 fn negate(v: Value, ty: ColumnType) -> R<Value> {
@@ -624,6 +702,18 @@ pub(crate) fn text_of(v: &Value) -> R<String> {
         Value::Float(x) => x.0.to_string(),
         Value::Uuid(u) => u.to_string(),
         Value::Numeric { unscaled, scale } => numeric_text(unscaled, *scale),
+        Value::Jsonb(doc) => {
+            let view = doc
+                .view()
+                .map_err(|e| ExecError::eval("22023", e.to_string()))?;
+            ferrosa_jsonb::print_to_string(
+                view.root(),
+                ferrosa_jsonb::TextStyle::PgText,
+                usize::MAX,
+            )
+            .map_err(|e| ExecError::eval("54000", format!("{e:?}")))?
+        }
+        Value::Timestamp(micros) => timestamp_text(*micros),
         Value::Array(a)
             if a.elem == ArrayElem::Text
                 || a.elem == ArrayElem::Int
@@ -646,6 +736,40 @@ pub(crate) fn text_of(v: &Value) -> R<String> {
             )))
         }
     })
+}
+
+/// `YYYY-MM-DD HH:MM:SS[.ffffff]` for microseconds since the Unix epoch (UTC).
+fn timestamp_text(micros: i64) -> String {
+    let secs = micros.div_euclid(1_000_000);
+    let frac = micros.rem_euclid(1_000_000);
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    let base = format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}",
+        tod / 3600,
+        tod % 3600 / 60,
+        tod % 60
+    );
+    if frac == 0 {
+        base
+    } else {
+        format!("{base}.{}", format!("{frac:06}").trim_end_matches('0'))
+    }
+}
+
+/// Howard Hinnant's days-to-civil algorithm (proleptic Gregorian).
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    (y, m, d)
 }
 
 pub(crate) fn numeric_text(unscaled: &BigInt, scale: i32) -> String {
@@ -731,6 +855,15 @@ fn no_function(name: &str, arg: &Value) -> ExecError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamp_text_is_postgres_iso() {
+        assert_eq!(timestamp_text(0), "1970-01-01 00:00:00");
+        // 2000-02-29 12:34:56.5 UTC: a leap day, fractional seconds trimmed.
+        assert_eq!(timestamp_text(951_827_696_500_000), "2000-02-29 12:34:56.5");
+        // Before the epoch.
+        assert_eq!(timestamp_text(-1), "1969-12-31 23:59:59.999999");
+    }
 
     #[test]
     fn numeric_text_places_the_point() {

@@ -605,3 +605,62 @@ fn in_a_limited_subquery_as_oban_prunes() {
         vec![vec![int(2)]]
     );
 }
+
+// -- functions Oban's defaults, plugins and triggers call -----------------------
+
+#[test]
+fn timezone_utc_flips_between_timestamp_and_timestamptz() {
+    let rows = select(
+        "SELECT timezone('UTC', now()) IS NOT NULL FROM t WHERE id = 1",
+        &[],
+    );
+    assert_eq!(rows, vec![vec![Value::Bool(true)]]);
+    let Statement::Select(stmt) = parse_statement("SELECT timezone('UTC', now()) FROM t").unwrap()
+    else {
+        panic!()
+    };
+    let cols = ferrosa_sql::describe(&stmt, &catalog(), "public").unwrap();
+    assert_eq!(
+        cols[0].ty,
+        ColumnType::Timestamp,
+        "timezone(zone, timestamptz) is a timestamp"
+    );
+    let err = select_err("SELECT timezone('America/New_York', now()) FROM t", &[]);
+    assert_eq!(sqlstate(&err), "0A000", "{err}");
+}
+
+#[test]
+fn array_append_adds_one_element_and_starts_a_null_array() {
+    let tags = Value::Array(ArrayValue::new(ArrayElem::Text, vec![text("a")]));
+    assert_eq!(
+        select("SELECT array_append($1, s) FROM t WHERE id = 2", &[tags]),
+        vec![vec![Value::Array(ArrayValue::new(
+            ArrayElem::Text,
+            vec![text("a"), text("y")]
+        ))]]
+    );
+    assert_eq!(
+        select(
+            "SELECT array_append(CAST(NULL AS text[]), s) FROM t WHERE id = 2",
+            &[]
+        ),
+        vec![vec![Value::Array(ArrayValue::new(
+            ArrayElem::Text,
+            vec![text("y")]
+        ))]]
+    );
+}
+
+#[test]
+fn json_build_object_builds_an_object_from_pairs() {
+    let rows = select(
+        "SELECT json_build_object('queue', s, 'n', a, 'none', n)::text FROM t WHERE id = 1",
+        &[],
+    );
+    assert_eq!(
+        rows,
+        vec![vec![text(r#"{"n": 1, "none": null, "queue": "x"}"#)]]
+    );
+    let err = select_err("SELECT json_build_object('odd') FROM t", &[]);
+    assert_eq!(sqlstate(&err), "42883", "{err}");
+}

@@ -168,6 +168,12 @@ pub(crate) enum Func {
     Greatest,
     Least,
     Now,
+    /// `timezone(zone, ts)`, UTC only: flips timestamp ⇄ timestamptz.
+    Timezone,
+    /// `array_append(array, elem)`; the element type of the result.
+    ArrayAppend(ArrayElem),
+    /// `json_build_object(k1, v1, …)` over scalar values.
+    JsonBuildObject,
 }
 
 /// Plan-time type of an expression. `None` is an untyped NULL or parameter,
@@ -1276,6 +1282,32 @@ fn function(name: &str, args: &[Ty]) -> Result<(Func, Ty), ExecError> {
         "now" | "transaction_timestamp" | "statement_timestamp" | "current_timestamp" => {
             arity(0..=0)?;
             (Func::Now, Some(ColumnType::TimestampTz))
+        }
+        "timezone" => {
+            arity(2..=2)?;
+            let ty = match args[1] {
+                Some(ColumnType::Timestamp) => ColumnType::TimestampTz,
+                _ => ColumnType::Timestamp,
+            };
+            (Func::Timezone, Some(ty))
+        }
+        "array_append" => {
+            arity(2..=2)?;
+            let elem = match (args[0], args[1]) {
+                (Some(ColumnType::Array(e)), _) => e,
+                (_, Some(t)) => array_elem(t)?,
+                _ => ArrayElem::Text,
+            };
+            (Func::ArrayAppend(elem), Some(ColumnType::Array(elem)))
+        }
+        "json_build_object" => {
+            if !args.len().is_multiple_of(2) {
+                return Err(ExecError::eval(
+                    "42883",
+                    "json_build_object needs an even number of arguments (key, value pairs)",
+                ));
+            }
+            (Func::JsonBuildObject, Some(ColumnType::Json))
         }
         _ => {
             return Err(ExecError::eval(
