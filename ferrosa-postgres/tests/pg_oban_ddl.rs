@@ -598,11 +598,11 @@ async fn comment_refusals_are_named() {
 }
 
 /// Census statement 8 reads the comment with `obj_description(oid, 'pg_class')`, a function
-/// call in a projection plus a LEFT JOIN: that needs W1's expression engine. Until W1
-/// merges it is refused loudly, never answered with an empty or wrong row. This test pins
-/// that refusal; W1's merge replaces it with the real answer ('12').
+/// call in a projection plus a LEFT JOIN. W1's expression engine answers it: Ecto reads
+/// Oban's migration version ('12') from it, under PostgreSQL's output name
+/// `obj_description`.
 #[tokio::test]
-async fn obj_description_awaits_the_expression_engine() {
+async fn obj_description_reads_the_table_comment() {
     let fx = start().await;
     create_jobs(&fx.client).await;
     fx.client
@@ -612,12 +612,24 @@ async fn obj_description_awaits_the_expression_engine() {
     let census_8 = "SELECT pg_catalog.obj_description(pg_class.oid, 'pg_class') FROM pg_class \
          LEFT JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace \
          WHERE pg_class.relname = 'oban_jobs' AND pg_namespace.nspname = 'public'";
-    let error = fx
+    let messages = fx
         .client
         .simple_query(census_8)
         .await
-        .expect_err("refused until W1 lands function calls in projections");
-    assert!(error.code().is_some(), "a typed SQLSTATE: {error:?}");
+        .expect("census statement 8 runs");
+    let mut names = Vec::new();
+    let mut values = Vec::new();
+    for message in messages {
+        match message {
+            SimpleQueryMessage::RowDescription(columns) => {
+                names.extend(columns.iter().map(|c| c.name().to_string()));
+            }
+            SimpleQueryMessage::Row(row) => values.push(row.get(0).map(str::to_string)),
+            _ => {}
+        }
+    }
+    assert_eq!(names, ["obj_description"], "PostgreSQL's output name");
+    assert_eq!(values, [Some("12".to_string())]);
 }
 
 // ---------------------------------------------------------------------------

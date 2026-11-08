@@ -523,4 +523,31 @@ owns the row only after the first commits, finds `a` and fails: never a double c
 theorem rc_no_double_claim (s a b : V) (h : a ≠ s) : rcWrite s a b = .error () := by
   simp [rcWrite, h]
 
+/-! ## 7. A rewritten call keeps its output name
+
+The front end rewrites `obj_description(oid, cat)` into a `pg_description` subquery.
+A select item's default output name comes from its expression: a function call is named
+after the function, a subquery `?column?`. So a rewrite that does not pin the name
+renames the client's column (`rewrite_without_alias_renames`). Pinning the original
+name as the alias keeps it (`rewrite_with_alias_keeps_name`).
+-/
+
+inductive Item where
+  | func (name : String)
+  | subquery
+
+/-- PostgreSQL's default output name. -/
+def defaultName : Item → String
+  | .func n => n
+  | .subquery => "?column?"
+
+/-- The output name of an item with an optional alias. -/
+def outName (alias : Option String) (i : Item) : String := alias.getD (defaultName i)
+
+theorem rewrite_without_alias_renames :
+    outName none .subquery ≠ outName none (.func "obj_description") := by decide
+
+theorem rewrite_with_alias_keeps_name (n : String) :
+    outName (some (defaultName (.func n))) .subquery = outName none (.func n) := rfl
+
 end Ferrosa.Sql.Dml

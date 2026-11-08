@@ -271,3 +271,12 @@ fixing commit.
   * Lean: `Dml.lean` `returning_reports_the_stored_value`,
     `unstored_returning_can_miss`.
   * Not changed: microsecond storage itself is the documented limitation it was.
+* **`obj_description(…)` came back as a column named `?column?`.** W1's rewrite (7309d7d7)
+  turns the call into a `pg_description` subquery, whose default output name is
+  `?column?`. PostgreSQL names the column `obj_description`.
+  * The same merge left W3's test pinning the old refusal of census statement 8, and that
+    test then failed.
+  * Fixed: the rewrite keeps the function's name as the item's alias.
+  * The test now asserts the real answer, `'12'` under `obj_description`:
+    `pg_oban_ddl.rs` `obj_description_reads_the_table_comment`.
+  * Lean: `Dml.lean` `rewrite_with_alias_keeps_name`, `rewrite_without_alias_renames`.
