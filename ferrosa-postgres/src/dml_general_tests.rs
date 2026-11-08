@@ -2,9 +2,8 @@
 //! protocol, the extended protocol (Parse/Describe/Bind/Execute), transactions,
 //! READ COMMITTED ownership (D16) and serializable read sets.
 //!
-//! `oban_jobs` here is the census table without its array columns: storing
-//! `text[]`/`jsonb[]` is lane W3's (array column storage). The array-valued
-//! parts of the claim are covered in `ferrosa-sql/tests/dml_exec.rs`.
+//! `oban_jobs` here is the census table without its array columns; the census
+//! statements run verbatim, arrays included, in `tests/pg_oban_dml.rs`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;

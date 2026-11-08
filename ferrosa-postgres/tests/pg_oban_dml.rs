@@ -5,10 +5,9 @@
 //! census's `CREATE TYPE` / `CREATE TABLE`: an enum state, a `bigserial` id and
 //! DEFAULTs.
 //!
-//! The census table's array columns (`errors jsonb[]`, `attempted_by text[]`,
-//! `tags text[]`) and an array bound to `ANY($4)` need array column storage,
-//! which is lane W3's; until it lands they are left out here and covered by
-//! `ferrosa-sql/tests/dml_exec.rs`.
+//! The first tests use the table without its array columns; the last,
+//! `the_census_dml_runs_verbatim`, builds the census table from the census's own
+//! DDL and runs its INSERT, fetch and ack verbatim, arrays included.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -413,4 +412,118 @@ async fn the_pruner_deletes_completed_jobs_in_batches() {
         .expect("prune");
     assert_eq!(pruned, 2);
     assert_eq!(rows(&fx.client, "SELECT id FROM oban_jobs").await.len(), 1);
+}
+
+/// One census line (1-based), verbatim.
+fn census(line: usize) -> &'static str {
+    include_str!("fixtures/oban_census.sql")
+        .lines()
+        .nth(line - 1)
+        .expect("a census line")
+        .trim_end_matches(';')
+}
+
+/// The census's table DDL (lines 10–49, less the PL/pgSQL, trigger, comment and
+/// `oban_peers` statements that are W4's or unrelated), then its DML verbatim:
+/// `Oban.insert` (54, 58), the fetch (55) and the ack (57), arrays included.
+#[tokio::test]
+async fn the_census_dml_runs_verbatim() {
+    let fx = start().await;
+    fx.client
+        .execute(CREATE_STATE, &[])
+        .await
+        .expect("CREATE TYPE");
+    for line in [
+        10, 11, 12, 13, 17, 18, 19, 20, 22, 24, 25, 26, 27, 28, 29, 30, 31, 35, 36, 37, 38, 39, 40,
+        41, 42, 43, 44, 45, 48, 49,
+    ] {
+        fx.client
+            .execute(census(line), &[])
+            .await
+            .unwrap_or_else(|e| panic!("census line {line}: {e:?}"));
+    }
+    let no_errors: Vec<Jsonb> = Vec::new();
+    let inserted = fx
+        .client
+        .query(
+            census(54),
+            &[
+                &Jsonb("{\"id\": 1}"),
+                &Jsonb("{}"),
+                &"available",
+                &20i32,
+                &"default",
+                &"MyApp.Worker",
+                &no_errors,
+                &vec!["tag-a"],
+                &0i32,
+            ],
+        )
+        .await
+        .expect("census 54: Oban.insert");
+    let id: i64 = inserted[0].get(0);
+    let at = std::time::SystemTime::now();
+    let claimed = fx
+        .client
+        .query(
+            census(55),
+            &[
+                &"default",
+                &10i64,
+                &"executing",
+                &at,
+                &vec!["node-1"],
+                &1i32,
+            ],
+        )
+        .await
+        .expect("census 55: the fetch");
+    assert_eq!(claimed.len(), 1);
+    let job = &claimed[0];
+    assert_eq!(job.get::<_, i64>(0), id);
+    assert_eq!(job.get::<_, &str>(1), "executing");
+    assert_eq!(job.get::<_, Vec<String>>(6), ["tag-a"], "tags");
+    assert_eq!(job.get::<_, i32>(8), 1, "attempt");
+    assert_eq!(job.get::<_, Vec<String>>(9), ["node-1"], "attempted_by");
+    let attempted: std::time::SystemTime = job.get(12);
+    let acked = fx
+        .client
+        .execute(
+            census(57),
+            &[
+                &"completed",
+                &std::time::SystemTime::now(),
+                &id,
+                &vec!["executing", "available"],
+                &attempted,
+            ],
+        )
+        .await
+        .expect("census 57: the ack");
+    assert_eq!(acked, 1);
+    let state = rows(
+        &fx.client,
+        &format!("SELECT state FROM oban_jobs WHERE id = {id}"),
+    )
+    .await;
+    assert_eq!(state, [[Some("completed".to_string())]]);
+    let second = fx
+        .client
+        .query(
+            census(58),
+            &[
+                &Jsonb("{}"),
+                &Jsonb("{}"),
+                &"available",
+                &20i32,
+                &"default",
+                &"MyApp.Worker",
+                &no_errors,
+                &0i32,
+                &Vec::<&str>::new(),
+            ],
+        )
+        .await
+        .expect("census 58: a second Oban.insert");
+    assert_ne!(second[0].get::<_, i64>(0), id);
 }

@@ -108,12 +108,12 @@ Size: roughly 2–3k lines.
   * Tests: `ferrosa-sql/tests/dml_parse.rs`, `dml_exec.rs`, `default_expr.rs`;
     `ferrosa-postgres/src/dml_general_tests.rs`; the wire tests in
     `tests/m1_join_live.rs`.
-* Waiting on W3's array column storage:
-  * the claim's `attempted_by = $5` (`text[]`) and the `errors`/`tags` columns;
-  * an array bound to `ANY($4)`.
-
-  The engine side of arrays is done and tested in `dml_exec.rs`. Storing them and
-  decoding array parameters are W3's.
+* Proven verbatim: `tests/pg_oban_dml.rs` `the_census_dml_runs_verbatim`.
+  * The census table is built from the census's own DDL (lines 10–49, less the
+    PL/pgSQL).
+  * Census statements 54, 55, 57 and 58 then run as written over tokio-postgres, with
+    `text[]`/`jsonb[]` parameters and `= ANY($4)`.
+  * Array storage comes from W3.
 
 ### W3 — DDL and catalog
 
