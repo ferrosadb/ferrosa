@@ -162,6 +162,15 @@ fn eval_node(e: &CExpr, env: &Env<'_>) -> R<Value> {
                 format!("AT TIME ZONE needs a timestamp, not {}", type_name(&other)),
             )),
         },
+        CExpr::StoreMillis(inner) => match eval(inner, env)? {
+            // Exactly the storage's `micros / 1000` (toward zero), back in micros.
+            Value::Timestamp(micros) => Ok(Value::Timestamp(micros / 1000 * 1000)),
+            Value::Null => Ok(Value::Null),
+            other => Err(internal(format!(
+                "a millisecond column was assigned a {}",
+                type_name(&other)
+            ))),
+        },
     }
 }
 

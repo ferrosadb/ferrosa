@@ -252,3 +252,22 @@ fixing commit.
   * Test: `general::eval::tests::text_casts_to_jsonb_by_parsing_it`, and
     `dml_exec.rs` `a_text_literal_is_assigned_to_a_timestamp_or_jsonb_column`.
   * Lean: `Dml.lean` `assign_never_nulls`.
+* **`RETURNING` reported a timestamp at a precision the row is not stored with.**
+  * A `timestamp` cell keeps whole milliseconds (a CQL `timestamp`; documented in the
+    README).
+  * `INSERT … RETURNING` echoed the supplied microseconds, and a general
+    `UPDATE … RETURNING` reported the unstored SET value.
+  * Oban acknowledges a job with `attempted_at = $5`, where `$5` is the value the
+    claim's `RETURNING` gave it. That comparison against the stored millisecond
+    value matched nothing, so no job could be acknowledged.
+  * Found by `tests/pg_oban_dml.rs` (`oban_insert_claim_and_ack_one_job`) over a real
+    driver.
+  * Fixed: `RETURNING` reports the row as stored.
+    * INSERT round-trips each supplied value through its storage encoding.
+    * The DML read truncates a value assigned to a millisecond column exactly as the
+      storage does (`DmlSpec::store_millis`, toward zero).
+  * Tests: `dml_exec.rs` `a_millisecond_column_returns_its_value_as_stored`;
+    `dml_general_tests` `returning_reports_a_timestamp_as_stored`.
+  * Lean: `Dml.lean` `returning_reports_the_stored_value`,
+    `unstored_returning_can_miss`.
+  * Not changed: microsecond storage itself is the documented limitation it was.

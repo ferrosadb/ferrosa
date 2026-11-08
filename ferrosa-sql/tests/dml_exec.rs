@@ -118,7 +118,7 @@ fn dml(sql: &str) -> DmlStmt {
 fn spec(keys: &[&str]) -> DmlSpec {
     DmlSpec {
         key_columns: keys.iter().map(|k| k.to_string()).collect(),
-        old_row: false,
+        ..DmlSpec::default()
     }
 }
 
@@ -298,6 +298,7 @@ fn returning_sees_the_new_row_and_the_old_row_is_available() {
     let s = DmlSpec {
         key_columns: vec!["k".into()],
         old_row: true,
+        ..DmlSpec::default()
     };
     let (layout, rows) = run(
         &kv(),
@@ -413,4 +414,33 @@ fn an_evaluation_error_in_set_fails_the_read() {
         ),
         "{err:?}"
     );
+}
+
+/// A column whose storage keeps milliseconds: the SET value, and so RETURNING,
+/// is the value as it will be stored, so a client comparing a later read with
+/// what RETURNING gave it (Oban's ack, `attempted_at = $5`) finds it equal.
+#[test]
+fn a_millisecond_column_returns_its_value_as_stored() {
+    let s = DmlSpec {
+        key_columns: vec!["k".into()],
+        store_millis: vec!["ts".into()],
+        ..DmlSpec::default()
+    };
+    let micros = 1_704_164_645_123_456;
+    let (_, rows) = run(
+        &kv(),
+        "UPDATE ts AS x SET ts = $1 RETURNING x.ts",
+        &[Value::Timestamp(micros)],
+        &s,
+    );
+    let stored = Value::Timestamp(1_704_164_645_123_000);
+    assert_eq!(rows, [vec![int(1), stored.clone(), stored]]);
+    // Before 1970 the storage truncates toward zero, and so does the SET value.
+    let (_, rows) = run(
+        &kv(),
+        "UPDATE ts AS x SET ts = $1",
+        &[Value::Timestamp(-1_500)],
+        &s,
+    );
+    assert_eq!(rows[0][1], Value::Timestamp(-1_000));
 }

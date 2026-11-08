@@ -67,6 +67,8 @@ import Ferrosa.Sql.Dml
 #check Ferrosa.Sql.Dml.rc_unchanged_writes
 #check Ferrosa.Sql.Dml.rc_no_double_claim
 #check Ferrosa.Sql.Dml.assign_never_nulls
+#check Ferrosa.Sql.Dml.returning_reports_the_stored_value
+#check Ferrosa.Sql.Dml.unstored_returning_can_miss
 #check Ferrosa.Topology.DcQuorum.dc_quorum_writes_share_a_replica
 #check Ferrosa.Topology.DcQuorum.no_partition_admits_two_dc_quorum_writes
 #check Ferrosa.Topology.DcQuorum.node_gate_forces_a_shared_replica

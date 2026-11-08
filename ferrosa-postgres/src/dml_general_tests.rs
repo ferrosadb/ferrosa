@@ -767,3 +767,35 @@ async fn select_for_update_skip_locked_is_accepted_and_reads_normally() {
         assert_eq!(text_rows(&reply), [["5"]], "{sql}");
     }
 }
+
+/// A `timestamp` cell keeps milliseconds. RETURNING reports the row as stored, so
+/// a later comparison against what RETURNING gave (Oban's ack) is equal.
+#[tokio::test]
+async fn returning_reports_a_timestamp_as_stored() {
+    let (_dir, ctx) = defaults_ctx().await;
+    let mut s = Session::new(superuser());
+    let reply = simple(
+        &ctx,
+        &mut s,
+        "INSERT INTO jobs2 (id, worker, inserted_at) VALUES (7, 'W', TIMESTAMP '2024-01-02 03:04:05.123456') RETURNING inserted_at",
+    )
+    .await;
+    ok(&reply);
+    assert_eq!(text_rows(&reply), [["2024-01-02 03:04:05.123"]]);
+    let reply = simple(
+        &ctx,
+        &mut s,
+        "UPDATE jobs2 AS j SET inserted_at = TIMESTAMP '2024-01-02 03:04:05.987654' WHERE j.id = 7 RETURNING j.inserted_at",
+    )
+    .await;
+    ok(&reply);
+    assert_eq!(text_rows(&reply), [["2024-01-02 03:04:05.987"]]);
+    let read = simple(
+        &ctx,
+        &mut s,
+        "SELECT id FROM jobs2 AS j WHERE j.inserted_at = TIMESTAMP '2024-01-02 03:04:05.987'",
+    )
+    .await;
+    ok(&read);
+    assert_eq!(text_rows(&read), [["7"]]);
+}

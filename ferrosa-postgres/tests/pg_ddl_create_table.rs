@@ -188,7 +188,9 @@ mod timestamp_regression {
         .await;
         assert_eq!(first.len(), 2);
         assert_eq!(first[0], first[1], "one transaction time for every row");
-        assert!((before_begin..=after_begin).contains(&first[0]));
+        // RETURNING reports the row as stored, and a `timestamp` cell keeps milliseconds.
+        assert!((before_begin / 1000 * 1000..=after_begin).contains(&first[0]));
+        assert_eq!(first[0] % 1000, 0, "RETURNING reports the stored precision");
         tokio::time::sleep(Duration::from_millis(30)).await;
         let second = timestamps(
             client,
@@ -204,7 +206,7 @@ mod timestamp_regression {
         client.batch_execute("COMMIT").await.unwrap();
         let stored = timestamps(client, "SELECT mtime FROM pgbench_history").await;
         assert_eq!(stored.len(), 3);
-        assert!(stored.iter().all(|value| *value == first[0] / 1000 * 1000));
+        assert!(stored.iter().all(|value| *value == first[0]));
     }
 
     #[tokio::test]
@@ -228,7 +230,8 @@ mod timestamp_regression {
         assert_eq!(row.columns()[0].type_(), &Type::TIMESTAMP);
         let first: SystemTime = row.get(0);
         let first_micros = first.duration_since(UNIX_EPOCH).unwrap().as_micros() as i64;
-        assert!((before_begin..=after_begin).contains(&first_micros));
+        // RETURNING reports the row as stored, and a `timestamp` cell keeps milliseconds.
+        assert!((before_begin / 1000 * 1000..=after_begin).contains(&first_micros));
         tokio::time::sleep(Duration::from_millis(30)).await;
         let current = timestamps(
             client,

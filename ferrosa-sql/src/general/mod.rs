@@ -169,6 +169,9 @@ pub(crate) enum CExpr {
     /// `x AT TIME ZONE 'UTC'` either way round: the instant's microseconds are
     /// unchanged, only the static type flips between timestamp and timestamptz.
     AtUtc(Box<CExpr>),
+    /// A timestamp as a millisecond-precision column stores it (a DML `SET` into
+    /// one; see `DmlSpec::store_millis`).
+    StoreMillis(Box<CExpr>),
 }
 
 /// The functions the engine evaluates. Anything else is refused by name.

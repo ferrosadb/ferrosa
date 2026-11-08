@@ -100,6 +100,26 @@ impl<'a> Target<'a> {
             .collect()
     }
 
+    /// The columns whose storage keeps whole milliseconds (CQL `timestamp`).
+    fn millis_columns(
+        &self,
+        schema: &ferrosa_schema::Schema,
+    ) -> Result<Vec<String>, BackendMessage> {
+        let mut out = Vec::new();
+        for (name, column) in &self.meta.columns {
+            let ty = ferrosa_row_bridge::parse_cql_type_in_keyspace(
+                &column.column_type,
+                &self.ks,
+                schema,
+            )
+            .map_err(|e| error_response("42704", &e.to_string()))?;
+            if ty == CqlType::Timestamp {
+                out.push(name.clone());
+            }
+        }
+        Ok(out)
+    }
+
     fn cql_type(&self, env: &ReadEnv<'_>, column: &str) -> Result<CqlType, BackendMessage> {
         let meta = self.meta.columns.get(column).ok_or_else(|| {
             error_response(
@@ -221,6 +241,7 @@ async fn read_and_write(
     let spec = DmlSpec {
         key_columns: target.key_columns(),
         old_row: true,
+        store_millis: target.millis_columns(run.env.schema)?,
     };
     let pending = set
         .pending_writes()
@@ -601,6 +622,7 @@ pub(crate) async fn describe(
     let spec = DmlSpec {
         key_columns: target.key_columns(),
         old_row: true,
+        store_millis: target.millis_columns(&ctx.schema)?,
     };
     let read = dml.read_select();
     let (catalog, _scans) =

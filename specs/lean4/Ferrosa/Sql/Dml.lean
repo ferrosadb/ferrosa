@@ -483,6 +483,31 @@ theorem assign_never_nulls {J : Type} (parse : String → Option J) (s : String)
   | none => simp
   | some j => simp
 
+/-! ## 5c. `RETURNING` reports the row as stored
+
+A `timestamp` cell keeps whole milliseconds: the store maps microseconds `m` to
+`m / 1000 * 1000` (toward zero). Oban's ack compares the stored column with the value
+`RETURNING` gave it (`attempted_at = $5`). If `RETURNING` reports the unstored value, the
+two differ whenever the value had sub-millisecond digits, and the ack matches nothing
+(`unstored_returning_can_miss`). Reporting `store v` matches, because storing is
+idempotent (`returning_reports_the_stored_value`).
+-/
+
+/-- The millisecond store of a microsecond timestamp (Rust's `/` truncates toward zero). -/
+def storeMillis (m : Int) : Int := m.tdiv 1000 * 1000
+
+theorem storeMillis_idem (m : Int) : storeMillis (storeMillis m) = storeMillis m := by
+  unfold storeMillis
+  rw [Int.mul_tdiv_cancel _ (by decide : (1000 : Int) ≠ 0)]
+
+/-- The stored cell equals what `RETURNING` reported, once that is the stored value. -/
+theorem returning_reports_the_stored_value (m : Int) :
+    storeMillis (storeMillis m) = storeMillis m :=
+  storeMillis_idem m
+
+/-- Reporting the unstored value can miss: a microsecond value is not its stored form. -/
+theorem unstored_returning_can_miss : storeMillis 1500 ≠ 1500 := by decide
+
 /-! ## 6. READ COMMITTED: re-check after ownership, fail on a concurrent change (D16) -/
 
 /-- Write `new` over a row read as `snap`, finding it now as `cur`: 40001 if it moved. -/

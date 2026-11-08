@@ -186,12 +186,8 @@ impl Compiler<'_> {
             let ty = target.columns[local].ty;
             let (c, et) = self.expr(expr, scope, ctes, &mut Ctx::Row { clause: "SET" })?;
             self.record(&c, Some(ty));
-            out.push((
-                local,
-                Column::new(name.clone(), ty),
-                assign(c, et, ty),
-                has_subquery(expr),
-            ));
+            let c = store(assign(c, et, ty), ty, spec.store_millis.contains(name));
+            out.push((local, Column::new(name.clone(), ty), c, has_subquery(expr)));
         }
         Ok(out)
     }
@@ -365,6 +361,17 @@ fn assign(c: CExpr, ty_of: Ty, column: ColumnType) -> CExpr {
     match ty_of {
         Some(t) if t != column => CExpr::Cast(Box::new(c), column),
         _ => c,
+    }
+}
+
+/// Truncate a value assigned to a millisecond-precision timestamp column as its
+/// storage will (`Dml.lean`, `returning_reports_the_stored_value`).
+fn store(c: CExpr, column: ColumnType, millis: bool) -> CExpr {
+    let timestamp = matches!(column, ColumnType::Timestamp | ColumnType::TimestampTz);
+    if millis && timestamp {
+        CExpr::StoreMillis(Box::new(c))
+    } else {
+        c
     }
 }
 

@@ -439,6 +439,11 @@ pub struct DmlSpec {
     /// Also project the old value of every target column, for the READ
     /// COMMITTED re-check after the writer owns the row (D16).
     pub old_row: bool,
+    /// Timestamp columns whose storage keeps whole milliseconds (a CQL
+    /// `timestamp` cell). A value assigned to one is truncated as the storage
+    /// truncates it (toward zero), before `RETURNING` reads it, so `RETURNING`
+    /// reports the row as stored rather than a precision no read will return.
+    pub store_millis: Vec<String>,
 }
 
 /// The shape of each row a DML read yields: `keys ++ sets ++ returning ++ old`.

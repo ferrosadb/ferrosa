@@ -3226,8 +3226,18 @@ pub(crate) async fn execute_insert(
                     regular_cells.push((idx, value.clone()));
                 }
             }
+            // RETURNING reports the value as stored (a `timestamp` cell keeps
+            // milliseconds), not as supplied; NULL stays NULL.
+            let stored = if sql_value.is_null() {
+                sql_value
+            } else {
+                match crate::storage_provider::cql_to_value(&value) {
+                    Ok(stored) => stored,
+                    Err(e) => return vec![error_response("XX000", &e)],
+                }
+            };
             col_values.insert(col_name.clone(), value);
-            sql_values.insert(col_name.clone(), sql_value);
+            sql_values.insert(col_name.clone(), stored);
         }
         // Fill the omitted columns BEFORE the constraint check judges the row.
         let mut fill = crate::insert_defaults::RowFill {
