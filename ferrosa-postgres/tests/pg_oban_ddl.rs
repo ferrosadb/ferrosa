@@ -654,3 +654,166 @@ async fn pg_range_exists_and_is_empty() {
         ]
     );
 }
+
+// ---------------------------------------------------------------------------
+// 5. Enum types (census statements 9, 10, 36, 53, 56)
+// ---------------------------------------------------------------------------
+
+const CREATE_STATE: &str = "CREATE TYPE \"public\".oban_job_state AS ENUM \
+     ('available', 'scheduled', 'executing')";
+const STATE_TABLE: &str = "CREATE TABLE jobs (id bigint PRIMARY KEY, \
+     \"state\" \"public\".oban_job_state NOT NULL)";
+
+async fn enum_fixture() -> Fixture {
+    let fx = start().await;
+    fx.client
+        .execute(CREATE_STATE, &[])
+        .await
+        .expect("CREATE TYPE ... AS ENUM over the extended protocol");
+    fx.client
+        .execute(STATE_TABLE, &[])
+        .await
+        .expect("a column typed by the enum");
+    fx
+}
+
+/// A value outside the enum is refused (22P02), over both protocols; a label is stored
+/// and read back as its text.
+#[tokio::test]
+async fn enum_column_accepts_labels_and_refuses_other_values() {
+    let fx = enum_fixture().await;
+    fx.client
+        .batch_execute("INSERT INTO jobs (id, state) VALUES (1, 'available')")
+        .await
+        .expect("a declared label");
+    assert_eq!(
+        code(
+            fx.client
+                .batch_execute("INSERT INTO jobs (id, state) VALUES (2, 'bogus')")
+                .await
+        ),
+        "22P02"
+    );
+    assert_eq!(
+        code(
+            fx.client
+                .execute(
+                    "INSERT INTO jobs (id, state) VALUES ($1, $2)",
+                    &[&3_i64, &"nope"]
+                )
+                .await
+        ),
+        "22P02"
+    );
+    assert_eq!(
+        code(
+            fx.client
+                .batch_execute("UPDATE jobs SET state = 'bogus' WHERE id = 1")
+                .await
+        ),
+        "22P02"
+    );
+    assert_eq!(
+        rows(&fx.client, "SELECT state FROM jobs").await,
+        vec![vec![Some("available".to_string())]]
+    );
+}
+
+/// `ADD VALUE IF NOT EXISTS` is idempotent; the new label is then accepted; an existing
+/// label without `IF NOT EXISTS` is 42710; a missing type is 42704.
+#[tokio::test]
+async fn alter_type_add_value() {
+    let fx = enum_fixture().await;
+    let add = "ALTER TYPE \"public\".oban_job_state ADD VALUE IF NOT EXISTS 'cancelled'";
+    fx.client.execute(add, &[]).await.expect("ADD VALUE");
+    fx.client.batch_execute(add).await.expect("ADD VALUE again");
+    fx.client
+        .batch_execute("INSERT INTO jobs (id, state) VALUES (1, 'cancelled')")
+        .await
+        .expect("the added label is accepted");
+    assert_eq!(
+        code(
+            fx.client
+                .batch_execute("ALTER TYPE oban_job_state ADD VALUE 'available'")
+                .await
+        ),
+        "42710"
+    );
+    assert_eq!(
+        code(
+            fx.client
+                .batch_execute("ALTER TYPE no_such_type ADD VALUE 'x'")
+                .await
+        ),
+        "42704"
+    );
+}
+
+#[tokio::test]
+async fn enum_definition_refusals() {
+    let fx = enum_fixture().await;
+    assert_eq!(code(fx.client.batch_execute(CREATE_STATE).await), "42710");
+    assert_eq!(
+        code(
+            fx.client
+                .batch_execute("CREATE TYPE dup AS ENUM ('a', 'a')")
+                .await
+        ),
+        "42710"
+    );
+    assert_eq!(
+        code(
+            fx.client
+                .batch_execute("CREATE TABLE t2 (id int PRIMARY KEY, s no_such_type)")
+                .await
+        ),
+        "42704"
+    );
+}
+
+/// The enum is visible in pg_type (with its array type), and pg_attribute types the column
+/// by it. The type's backing storage is not visible as a relation.
+#[tokio::test]
+async fn enum_is_projected_in_the_catalog() {
+    let fx = enum_fixture().await;
+    let types = rows(
+        &fx.client,
+        "SELECT typname FROM pg_catalog.pg_type WHERE typname = 'oban_job_state' \
+         OR typname = '_oban_job_state'",
+    )
+    .await;
+    let mut names: Vec<String> = types.into_iter().filter_map(|r| r[0].clone()).collect();
+    names.sort();
+    assert_eq!(names, vec!["_oban_job_state", "oban_job_state"]);
+    assert_eq!(
+        rows(
+            &fx.client,
+            "SELECT t.typname FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_type t \
+             ON a.atttypid = t.oid WHERE a.attname = 'state'"
+        )
+        .await,
+        vec![vec![Some("oban_job_state".to_string())]]
+    );
+    assert!(rows(
+        &fx.client,
+        "SELECT relname FROM pg_catalog.pg_class WHERE relname = '_sys_pg_types'"
+    )
+    .await
+    .is_empty());
+}
+
+/// Enum DDL is transactional: a type created in a block is usable by later statements in
+/// it, and ROLLBACK discards both.
+#[tokio::test]
+async fn enum_ddl_is_transactional() {
+    let fx = start().await;
+    let c = &fx.client;
+    c.batch_execute("BEGIN").await.unwrap();
+    c.batch_execute(CREATE_STATE).await.unwrap();
+    c.batch_execute(STATE_TABLE)
+        .await
+        .expect("the buffered type is visible to the next statement");
+    c.batch_execute("ROLLBACK").await.unwrap();
+    assert!(!table_exists(&fx, "jobs"));
+    assert_eq!(code(c.batch_execute(STATE_TABLE).await), "42704");
+}

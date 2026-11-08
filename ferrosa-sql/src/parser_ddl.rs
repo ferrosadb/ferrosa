@@ -653,12 +653,13 @@ impl Parser {
         &mut self,
     ) -> Result<(ColumnDef, Option<ForeignKeyConstraint>), ParseError> {
         let name = self.ident()?;
-        let ty = self.parse_pg_type()?;
+        let (ty, user_type) = self.parse_column_type()?;
         let mut def = ColumnDef {
             name,
             ty,
             not_null: false,
             primary_key: false,
+            user_type,
         };
         let mut reference = None;
         while let Some(tok) = self.peek() {
@@ -885,6 +886,27 @@ impl Parser {
                 found: format!("{t:?}"),
             }),
             None => Err(ParseError::UnexpectedEnd),
+        }
+    }
+
+    /// A column's type: a built-in type, or else a (possibly schema-qualified) user-defined
+    /// type name, which the front end resolves. A built-in refusal (`SERIAL`, a bad
+    /// modifier) is not reinterpreted as a user type.
+    fn parse_column_type(&mut self) -> Result<(PgType, Option<TableRef>), ParseError> {
+        let start = self.pos;
+        let first = match self.peek() {
+            Some(Tok::Ident(w) | Tok::QuotedIdent(w)) => w.to_ascii_lowercase(),
+            _ => String::new(),
+        };
+        match self.parse_pg_type() {
+            Ok(ty) => Ok((ty, None)),
+            // Only an unknown FIRST word is a user type name; `time with time zone` is a
+            // built-in spelling refused as such.
+            Err(ParseError::UnknownType(name)) if name == first => {
+                self.pos = start;
+                Ok((PgType::Text, Some(self.parse_qualified_table()?)))
+            }
+            Err(other) => Err(other),
         }
     }
 

@@ -1579,7 +1579,9 @@ pub(crate) fn is_utility(stmt: &Statement) -> bool {
         | Statement::DropTable(_)
         | Statement::AlterTable(_)
         | Statement::Lock(_)
-        | Statement::Comment(_) => true,
+        | Statement::Comment(_)
+        | Statement::CreateType(_)
+        | Statement::AlterType(_) => true,
         Statement::Select(_)
         | Statement::SelectExprs(_)
         | Statement::Begin { .. }
@@ -1678,7 +1680,9 @@ async fn execute_statement(
         stmt @ (Statement::CreateTable(_)
         | Statement::DropTable(_)
         | Statement::AlterTable(_)
-        | Statement::Comment(_)) => {
+        | Statement::Comment(_)
+        | Statement::CreateType(_)
+        | Statement::AlterType(_)) => {
             crate::ddl::execute_ddl_statement(ddl, schema, default_schema, stmt, txn).await
         }
         // `COPY ... FROM STDIN` cannot be answered in one step: the payload arrives AFTER the
@@ -3521,6 +3525,9 @@ fn resolve_dml_value<'a>(
         ferrosa_row_bridge::parse_cql_type_in_keyspace(&col_meta.column_type, ks, schema)
             .map_err(|e| error_response("42704", &e.to_string()))?;
     let sql_value = substitute_param(sv, bound.params, bound.timestamp_micros)?;
+    if crate::pg_enum::column_enum(meta, col_name).is_some() {
+        crate::pg_enum::check_value(&schema.snapshot(), meta, col_name, &sql_value)?;
+    }
     let value = value_to_cql(&sql_value, &cql_type, bound.jsonb_limits)?;
     Ok((col_meta, sql_value, value))
 }
@@ -3839,6 +3846,9 @@ fn build_update_mutation(
         )
         .map_err(|error| error_response("42704", &error.to_string()))?;
         let sql_value = eval_set_expr(expr, current, ctx.params, ctx.timestamp_micros)?;
+        if crate::pg_enum::column_enum(meta, col_name).is_some() {
+            crate::pg_enum::check_value(&ctx.schema.snapshot(), meta, col_name, &sql_value)?;
+        }
         let value = value_to_cql(&sql_value, &cql_type, ctx.jsonb_limits)?;
         if !matches!(col_meta.kind, ColumnKind::Regular | ColumnKind::Static) {
             return Err(error_response(

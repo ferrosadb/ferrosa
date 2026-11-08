@@ -42,7 +42,7 @@ const FIRST_USER_OID: u32 = 16_384;
 ///
 /// FNV-1a over `"{kind}:{name}"`, folded into `[FIRST_USER_OID, u32::MAX]`. The
 /// `kind` prefix keeps a namespace and a same-named relation from colliding.
-fn synthetic_oid(kind: &str, name: &str) -> u32 {
+pub(crate) fn synthetic_oid(kind: &str, name: &str) -> u32 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = FNV_OFFSET;
@@ -59,7 +59,7 @@ fn synthetic_oid(kind: &str, name: &str) -> u32 {
 }
 
 /// OID of the namespace (Postgres schema) for a keyspace name.
-fn namespace_oid(keyspace: &str) -> u32 {
+pub(crate) fn namespace_oid(keyspace: &str) -> u32 {
     synthetic_oid("namespace", keyspace)
 }
 
@@ -158,8 +158,17 @@ fn sorted_keyspaces(snapshot: &SchemaSnapshot) -> Vec<String> {
 }
 
 /// `(keyspace, table)` pairs from the snapshot, sorted for deterministic order.
+///
+/// Tables with ferrosa's reserved `_sys_` prefix (the enum metadata table,
+/// `pg_enum::META_TABLE`) are ferrosa's own storage, not relations a client created, so
+/// they are not projected.
 fn sorted_tables(snapshot: &SchemaSnapshot) -> Vec<(String, String)> {
-    let mut keys: Vec<(String, String)> = snapshot.tables.keys().cloned().collect();
+    let mut keys: Vec<(String, String)> = snapshot
+        .tables
+        .keys()
+        .filter(|(_, table)| !is_reserved_column_name(table))
+        .cloned() // the projection's sort key list; owned so it can be sorted
+        .collect();
     keys.sort();
     keys
 }
@@ -272,7 +281,11 @@ pub fn pg_attribute(schema: &Schema) -> Result<InMemoryTable, PgTypeError> {
         // `column_attnums`, the one place the number is decided (1-based for a table
         // column, negative for a reserved `_sys_` SYSTEM column — see that function).
         for (col, (_, attnum)) in meta.columns.values().zip(column_attnums(meta)) {
-            let pg = pg_type_of_column(&col.column_type, &ks, schema)?;
+            let mut pg = pg_type_of_column(&col.column_type, &ks, schema)?;
+            // An enum-typed column is stored as text but is typed by its enum.
+            if let Some((type_ks, type_name)) = crate::pg_enum::column_enum(meta, &col.name) {
+                pg.oid = crate::pg_enum::enum_oid(type_ks, type_name);
+            }
             rows.push(attribute_row(relid, col, attnum, pg));
         }
     }
@@ -308,7 +321,10 @@ pub fn pg_type(schema: &Schema) -> Result<InMemoryTable, PgTypeError> {
     // Distinct types actually referenced by columns, sorted by OID for a
     // deterministic projection.
     let mut used: Vec<PgType> = Vec::new();
-    for ((ks, _), table) in &snapshot.tables {
+    for ((ks, name), table) in &snapshot.tables {
+        if is_reserved_column_name(name) {
+            continue;
+        }
         for col in table.columns.values() {
             used.push(pg_type_of_column(&col.column_type, ks, schema)?);
         }
@@ -324,6 +340,13 @@ pub fn pg_type(schema: &Schema) -> Result<InMemoryTable, PgTypeError> {
         rows.push(Row::new(vec![
             oid_val(p.oid),
             Value::Text(p.typname.to_string().into()),
+        ]));
+    }
+    // User enum types and their array types (`pg_enum::enum_type_rows`).
+    for row in crate::pg_enum::enum_type_rows(&snapshot) {
+        rows.push(Row::new(vec![
+            oid_val(row.oid),
+            Value::Text(row.typname.into()),
         ]));
     }
 
@@ -473,6 +496,18 @@ pub fn catalog_tables(schema: &Schema) -> Result<Vec<(String, InMemoryTable)>, P
 /// `relkind = 'i'` — so it resolves to [`index_oid`]. Returns `None` when nothing
 /// by that name exists; the caller turns that into a `42P01` (undefined_table),
 /// never a zero OID that would silently match nothing.
+/// `'name'::regnamespace`: the namespace OID of the keyspace (or reserved schema) `name`,
+/// or `None` when no such schema exists (PostgreSQL's `3F000`). The integration point for the
+/// expression engine's `regnamespace` cast (census statement 9's `'public'::regnamespace::oid`).
+// Called by the W1 cast engine once it merges; until then only the tests call it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn resolve_regnamespace(schema: &Schema, name: &str) -> Option<u32> {
+    let name = name.trim_matches('"');
+    let known =
+        RESERVED_NAMESPACES.contains(&name) || schema.snapshot().keyspaces.contains_key(name);
+    known.then(|| namespace_oid(name))
+}
+
 pub(crate) fn resolve_regclass(schema: &Schema, default_schema: &str, name: &str) -> Option<u32> {
     let (keyspace, table) = match parse_relation_name(name)?.as_slice() {
         [table] => (default_schema.to_string(), table.clone()),
@@ -703,6 +738,24 @@ mod tests {
     }
 
     /// Collect a provider's rows into a Vec for assertions.
+    /// `'public'::regnamespace` resolves to the same OID `pg_namespace` reports; an unknown
+    /// schema resolves to nothing (the caller's `3F000`).
+    #[test]
+    fn regnamespace_resolves_to_the_pg_namespace_oid() {
+        let schema = schema_with_ks_tbl();
+        let ns = pg_namespace(&schema);
+        let ks_row = rows_of(&ns)
+            .into_iter()
+            .find(|r| r.0[1] == Value::Text("ks".to_string().into()))
+            .expect("ks row");
+        assert_eq!(
+            resolve_regnamespace(&schema, "ks").map(|o| Value::Int(i64::from(o))),
+            Some(ks_row.0[0].clone())
+        );
+        assert!(resolve_regnamespace(&schema, "pg_catalog").is_some());
+        assert_eq!(resolve_regnamespace(&schema, "nope"), None);
+    }
+
     fn rows_of(table: &InMemoryTable) -> Vec<Row> {
         table.scan().collect()
     }

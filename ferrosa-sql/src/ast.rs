@@ -79,6 +79,27 @@ pub enum Statement {
     Lock(LockStmt),
     /// `COMMENT ON TABLE t IS 'text' | NULL` (see [`CommentStmt`]).
     Comment(Box<CommentStmt>),
+    /// `CREATE TYPE [schema.]name AS ENUM ('label', ...)` (see [`CreateTypeStmt`]).
+    CreateType(Box<CreateTypeStmt>),
+    /// `ALTER TYPE [schema.]name ADD VALUE [IF NOT EXISTS] 'label'` (see [`AlterTypeStmt`]).
+    AlterType(Box<AlterTypeStmt>),
+}
+
+/// `CREATE TYPE [schema.]name AS ENUM ('label', ...)`. Only enum types are accepted; the
+/// labels are kept in declaration order (duplicates are the front end's refusal).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTypeStmt {
+    pub name: TableRef,
+    pub labels: Vec<String>,
+}
+
+/// `ALTER TYPE [schema.]name ADD VALUE [IF NOT EXISTS] 'label'`. `BEFORE`/`AFTER` placement
+/// and every other `ALTER TYPE` form are refused at parse time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlterTypeStmt {
+    pub name: TableRef,
+    pub value: String,
+    pub if_not_exists: bool,
 }
 
 /// `COMMENT ON TABLE t IS 'text' | NULL`. `comment` is `None` for `IS NULL`, which removes
@@ -294,6 +315,10 @@ pub struct ColumnDef {
     pub not_null: bool,
     /// True when the column is part of the table's primary key.
     pub primary_key: bool,
+    /// A user-defined type named as the column type (`"public".oban_job_state`), as
+    /// written. `ty` is then [`PgType::Text`], the storage of an enum; the front end
+    /// resolves the name and refuses one that is not a known type.
+    pub user_type: Option<TableRef>,
 }
 
 /// A PostgreSQL column type accepted by `CREATE TABLE`, as written (aliases

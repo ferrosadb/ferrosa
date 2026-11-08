@@ -185,9 +185,9 @@ pub fn parse_statement(sql: &str) -> Result<Statement, ParseError> {
             "INSERT" => p.parse_insert(),
             "UPDATE" => p.parse_update(),
             "DELETE" => p.parse_delete(),
-            "CREATE" => p.parse_create(),
+            "CREATE" => p.parse_create_any(),
             "COPY" => p.parse_copy(),
-            "ALTER" => p.parse_alter_table(),
+            "ALTER" => p.parse_alter_any(),
             "DROP" => p.parse_drop(),
             "TRUNCATE" => p.parse_truncate(),
             "VACUUM" => p.parse_vacuum(),
@@ -3395,7 +3395,9 @@ mod tests {
 
     #[test]
     fn create_table_structural_errors_are_typed() {
-        let cases: [(&str, ParseError); 6] = [
+        // An unknown simple type name (`a wibble`) now parses as a user-defined type name,
+        // which the front end resolves and refuses with the same SQLSTATE (42704).
+        let cases: [(&str, ParseError); 5] = [
             (
                 "CREATE TABLE t (a int PRIMARY KEY, b int PRIMARY KEY)",
                 ParseError::MultiplePrimaryKeys,
@@ -3411,10 +3413,6 @@ mod tests {
             (
                 "CREATE TABLE t (a int, PRIMARY KEY (z))",
                 ParseError::UnknownPrimaryKeyColumn("z".into()),
-            ),
-            (
-                "CREATE TABLE t (a wibble PRIMARY KEY)",
-                ParseError::UnknownType("wibble".into()),
             ),
             (
                 "CREATE TABLE t (a time with time zone PRIMARY KEY)",

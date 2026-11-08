@@ -118,6 +118,29 @@ pub(crate) fn statement_permissions(
         // rows, so they need no table permission — the same treatment a session
         // statement gets.
         Statement::Vacuum(_) | Statement::Analyze(_) => Vec::new(),
+        // A type is a keyspace object: CREATE / ALTER on the keyspace, as for tables.
+        Statement::CreateType(create) => vec![(
+            Permission::Create,
+            Resource::Keyspace(
+                create
+                    .name
+                    .schema
+                    .as_deref()
+                    .unwrap_or(default_schema)
+                    .to_string(),
+            ),
+        )],
+        Statement::AlterType(alter) => vec![(
+            Permission::Alter,
+            Resource::Keyspace(
+                alter
+                    .name
+                    .schema
+                    .as_deref()
+                    .unwrap_or(default_schema)
+                    .to_string(),
+            ),
+        )],
         // A comment is part of the table's definition: ALTER, as for ALTER TABLE.
         Statement::Comment(comment) => {
             vec![(Permission::Alter, table(&comment.table, default_schema))]

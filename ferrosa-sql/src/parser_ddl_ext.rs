@@ -8,9 +8,108 @@
 //! A child module of `parser`, so it shares the private lexer and `Parser`. No recursion.
 
 use super::{ParseError, Parser, Tok};
-use crate::ast::{CommentStmt, LockMode, LockStmt, Statement};
+use crate::ast::{AlterTypeStmt, CommentStmt, CreateTypeStmt, LockMode, LockStmt, Statement};
 
 impl Parser {
+    /// The word after the statement's first keyword, upper-cased, without consuming it.
+    fn second_word(&self) -> Option<String> {
+        match self.toks.get(self.pos + 1) {
+            Some(Tok::Ident(w)) => Some(w.to_ascii_uppercase()),
+            _ => None,
+        }
+    }
+
+    /// `CREATE TYPE …` or `CREATE TABLE …` (the latter in `parser_ddl`).
+    pub(super) fn parse_create_any(&mut self) -> Result<Statement, ParseError> {
+        match self.second_word().as_deref() {
+            Some("TYPE") => self.parse_create_type(),
+            _ => self.parse_create(),
+        }
+    }
+
+    /// `ALTER TYPE …` or `ALTER TABLE …` (the latter in `parser_ddl`).
+    pub(super) fn parse_alter_any(&mut self) -> Result<Statement, ParseError> {
+        match self.second_word().as_deref() {
+            Some("TYPE") => self.parse_alter_type(),
+            _ => self.parse_alter_table(),
+        }
+    }
+
+    /// `CREATE TYPE [schema.]name AS ENUM ( 'label' [, ...] )`. Composite, range and base
+    /// types are refused by name.
+    fn parse_create_type(&mut self) -> Result<Statement, ParseError> {
+        self.expect_ident_kw("CREATE")?;
+        self.expect_ident_kw("TYPE")?;
+        let name = self.parse_qualified_table()?;
+        self.expect(&Tok::As, "AS")?;
+        if !self.peek_is_kw("ENUM") {
+            return Err(ParseError::Unsupported(
+                "CREATE TYPE other than AS ENUM".into(),
+            ));
+        }
+        self.next(); // ENUM
+        self.expect(&Tok::LParen, "(")?;
+        let mut labels = Vec::new();
+        if !matches!(self.peek(), Some(Tok::RParen)) {
+            labels.push(self.string_literal()?);
+            while matches!(self.peek(), Some(Tok::Comma)) {
+                self.next();
+                labels.push(self.string_literal()?);
+            }
+        }
+        self.expect(&Tok::RParen, ")")?;
+        self.expect_end()?;
+        Ok(Statement::CreateType(Box::new(CreateTypeStmt {
+            name,
+            labels,
+        })))
+    }
+
+    /// `ALTER TYPE [schema.]name ADD VALUE [IF NOT EXISTS] 'label'`.
+    fn parse_alter_type(&mut self) -> Result<Statement, ParseError> {
+        self.expect_ident_kw("ALTER")?;
+        self.expect_ident_kw("TYPE")?;
+        let name = self.parse_qualified_table()?;
+        if !self.peek_is_kw("ADD") {
+            return Err(ParseError::Unsupported(
+                "ALTER TYPE other than ADD VALUE".into(),
+            ));
+        }
+        self.next(); // ADD
+        self.expect_ident_kw("VALUE")?;
+        let if_not_exists = if self.peek_is_kw("IF") {
+            self.next();
+            self.expect(&Tok::Not, "NOT")?;
+            self.expect_ident_kw("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let value = self.string_literal()?;
+        if self.peek_is_kw("BEFORE") || self.peek_is_kw("AFTER") {
+            return Err(ParseError::Unsupported(
+                "ALTER TYPE ... ADD VALUE BEFORE/AFTER (labels are appended)".into(),
+            ));
+        }
+        self.expect_end()?;
+        Ok(Statement::AlterType(Box::new(AlterTypeStmt {
+            name,
+            value,
+            if_not_exists,
+        })))
+    }
+
+    /// A `'single quoted'` string literal.
+    fn string_literal(&mut self) -> Result<String, ParseError> {
+        match self.next() {
+            Some(Tok::Str(s)) => Ok(s),
+            other => Err(ParseError::Unexpected {
+                expected: "a string literal",
+                found: format!("{other:?}"),
+            }),
+        }
+    }
+
     /// `LOCK [TABLE] [ONLY] name [, ...] [IN <mode> MODE]`. `NOWAIT` is refused: the
     /// front end's lock waits, and a `NOWAIT` that waited would be a lie.
     pub(super) fn parse_lock(&mut self) -> Result<Statement, ParseError> {
@@ -144,6 +243,48 @@ mod tests {
             parse_statement("COMMENT ON COLUMN t.c IS 'x'"),
             Err(ParseError::Unsupported(form)) if form.contains("COLUMN")
         ));
+    }
+
+    #[test]
+    fn oban_enum_ddl_parses() {
+        let Ok(Statement::CreateType(t)) = parse_statement(
+            "CREATE TYPE \"public\".oban_job_state AS ENUM ( 'available', 'suspended' )",
+        ) else {
+            panic!("CREATE TYPE must parse");
+        };
+        assert_eq!(t.name.table, "oban_job_state");
+        assert_eq!(t.labels, vec!["available", "suspended"]);
+        let Ok(Statement::AlterType(a)) = parse_statement(
+            "ALTER TYPE \"public\".oban_job_state ADD VALUE IF NOT EXISTS 'cancelled'",
+        ) else {
+            panic!("ALTER TYPE must parse");
+        };
+        assert!(a.if_not_exists);
+        assert_eq!(a.value, "cancelled");
+        assert!(matches!(
+            parse_statement("CREATE TYPE c AS (a int)"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_statement("ALTER TYPE t ADD VALUE 'x' BEFORE 'y'"),
+            Err(ParseError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn a_column_typed_by_a_user_type_records_the_name() {
+        let Ok(Statement::CreateTable(t)) = parse_statement(
+            "CREATE TABLE j (id bigint PRIMARY KEY, \"state\" \"public\".oban_job_state NOT NULL)",
+        ) else {
+            panic!("CREATE TABLE must parse");
+        };
+        let state = &t.columns[1];
+        let user_type = state.user_type.as_ref().expect("user type recorded");
+        assert_eq!(user_type.schema.as_deref(), Some("public"));
+        assert_eq!(user_type.table, "oban_job_state");
+        assert!(state.not_null);
+        // A built-in refusal is not reinterpreted as a user type.
+        assert!(parse_statement("CREATE TABLE s (id serial PRIMARY KEY)").is_err());
     }
 
     #[test]

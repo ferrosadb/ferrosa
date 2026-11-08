@@ -868,6 +868,34 @@ resolved only when qualified `pg_catalog.` today; unqualified resolution is W1's
 `pg_catalog.pg_range` exists with PostgreSQL's columns and **no rows** — correct, since
 ferrosa has no range types — because Postgrex's type bootstrap `LEFT JOIN`s it.
 
+### Enum types (`pg_enum`, Lean `Ferrosa.Sql.Enum`)
+
+- `CREATE TYPE [schema.]name AS ENUM ('a', …)` and `ALTER TYPE … ADD VALUE [IF NOT EXISTS]
+  'x'` (appended; `BEFORE`/`AFTER` and every other `CREATE`/`ALTER TYPE` form are `0A000`).
+  A repeated label or an existing type is `42710`; a missing type `42704`; `ADD VALUE IF NOT
+  EXISTS` of an existing label is a no-op (idempotent). Both are transactional DDL.
+- **Storage of the definition.** A keyspace's enums live as `pg.enum.<name>` extensions on a
+  hidden, row-less table `_sys_pg_types` in that keyspace, so creating a type and adding a
+  value are ordinary replicated `CREATE TABLE`/`ALTER TABLE` schema changes (the schema layer
+  has no replicated "alter type"). The table is hidden from the `pg_catalog` projections
+  (`_sys_` is ferrosa's reserved prefix; a user `CREATE TABLE _sys_…` is `42939`); CQL sees it.
+- **Columns.** A column typed by an enum (`"state" "public".oban_job_state`) is stored as
+  `text`, marked `pg.enum_column.<col>`; every `INSERT`/`UPDATE` value is validated against
+  the type's current labels and a non-label is `22P02` (both protocols). An unknown type name
+  in a column is `42704`.
+- **Catalog.** `pg_type` carries a row for each enum and its array type `_name`
+  (`pg_enum::enum_type_rows` also holds the bootstrap facts — `typtype` `e`/`b`,
+  `enum_send`/`array_send` …, `typelem` — for W1's `pg_type` columns), and
+  `pg_attribute.atttypid` of an enum column is the enum's OID.
+- **Divergences, stated.** On the wire (`RowDescription`/`ParameterDescription`) an enum
+  column is described as `text` (25), not the enum OID; the values are exact, and carrying
+  the enum OID needs an engine column type that holds a type OID (coordinate with W1).
+  `ADD VALUE` rewrites the label list, so two sessions adding different values to the same
+  type at the same instant can lose one (last schema change wins).
+- **Awaiting W1 (cast engine).** `'x'::schema.enum` and `'public'::regnamespace::oid` are
+  refused by the parser today (`UnsupportedCast`); their semantics are implemented as
+  `pg_enum::cast_text_to_enum` and `catalog::resolve_regnamespace` for W1's cast evaluation.
+
 ### Extended-protocol transaction boundary
 
 Extended-protocol pipelines stage DML until `Sync` and commit the group as one atomic batch. An error rolls back preceding writes in that group, disconnect discards staging, and an explicit `BEGIN` remains open across `Sync`. Commit failures are reported before `ReadyForQuery`. Tests: `server::txn_atomicity_tests::extended_pipeline_*`.

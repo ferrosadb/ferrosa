@@ -28,6 +28,7 @@ pub mod jsonb_wire;
 mod lock;
 pub mod messages;
 mod mvcc;
+mod pg_enum;
 pub mod pg_fk;
 pub mod pg_key;
 pub mod pg_types;

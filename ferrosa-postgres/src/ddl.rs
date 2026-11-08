@@ -293,11 +293,141 @@ async fn dispatch_ddl(env: DdlEnv<'_>, stmt: ferrosa_sql::Statement) -> Vec<Back
         Statement::DropTable(drop) => execute_drop_table(env, &drop).await,
         Statement::AlterTable(alter) => execute_alter_table(env, &alter).await,
         Statement::Comment(comment) => execute_comment(env, *comment).await,
+        Statement::CreateType(create) => execute_create_type(env, *create).await,
+        Statement::AlterType(alter) => execute_alter_type(env, *alter).await,
         other => refuse(
             "XX000",
             &format!("internal: {other:?} is not a DDL statement"),
         ),
     }
+}
+
+/// `CREATE TYPE [schema.]name AS ENUM (...)`: create the keyspace's hidden metadata table
+/// if this is its first enum, then record the type in it (see [`crate::pg_enum`]). Both are
+/// schema changes through the executor, so the statement is transactional DDL.
+async fn execute_create_type(
+    env: DdlEnv<'_>,
+    stmt: ferrosa_sql::CreateTypeStmt,
+) -> Vec<BackendMessage> {
+    let Some(executor) = env.executor else {
+        return refuse(
+            "0A000",
+            "CREATE TYPE is not available: this server has no schema-change path",
+        );
+    };
+    let keyspace = stmt.name.schema.as_deref().unwrap_or(env.default_schema);
+    let name = stmt.name.table;
+    if !env.view.keyspaces.contains_key(keyspace) {
+        return refuse("3F000", &format!("schema \"{keyspace}\" does not exist"));
+    }
+    match crate::pg_enum::lookup(&env.view, keyspace, &name) {
+        Ok(None) => {}
+        Ok(Some(_)) => return refuse("42710", &format!("type \"{name}\" already exists")),
+        Err(error) => return vec![error],
+    }
+    let ty = match crate::pg_enum::EnumType::create(stmt.labels) {
+        Ok(ty) => ty,
+        Err(error) => return vec![error],
+    };
+    let meta_key = (keyspace.to_string(), crate::pg_enum::META_TABLE.to_string());
+    if !env.view.tables.contains_key(&meta_key) {
+        if let Err(error) = executor
+            .create_table(crate::pg_enum::meta_table(keyspace))
+            .await
+        {
+            return refuse("58000", &format!("CREATE TYPE failed: {error}"));
+        }
+    }
+    store_enum(executor, keyspace, &name, &ty, "CREATE TYPE").await
+}
+
+/// `ALTER TYPE [schema.]name ADD VALUE [IF NOT EXISTS] 'label'`.
+async fn execute_alter_type(
+    env: DdlEnv<'_>,
+    stmt: ferrosa_sql::AlterTypeStmt,
+) -> Vec<BackendMessage> {
+    let Some(executor) = env.executor else {
+        return refuse(
+            "0A000",
+            "ALTER TYPE is not available: this server has no schema-change path",
+        );
+    };
+    let keyspace = stmt.name.schema.as_deref().unwrap_or(env.default_schema);
+    let name = stmt.name.table;
+    let ty = match crate::pg_enum::lookup(&env.view, keyspace, &name) {
+        Ok(Some(ty)) => ty,
+        Ok(None) => return refuse("42704", &format!("type \"{name}\" does not exist")),
+        Err(error) => return vec![error],
+    };
+    if ty.contains(&stmt.value) {
+        if stmt.if_not_exists {
+            return complete_with("ALTER TYPE"); // idempotent: nothing to change
+        }
+        return refuse(
+            "42710",
+            &format!("enum label \"{}\" already exists", stmt.value),
+        );
+    }
+    store_enum(
+        executor,
+        keyspace,
+        &name,
+        &ty.add_value(stmt.value),
+        "ALTER TYPE",
+    )
+    .await
+}
+
+async fn store_enum(
+    executor: &dyn DdlExecutor,
+    keyspace: &str,
+    name: &str,
+    ty: &crate::pg_enum::EnumType,
+    tag: &str,
+) -> Vec<BackendMessage> {
+    let updates = TableUpdates {
+        params: None,
+        add_columns: Vec::new(),
+        drop_columns: Vec::new(),
+        extensions: Some(crate::pg_enum::definition_extension(name, ty)),
+    };
+    match executor
+        .alter_table(keyspace, crate::pg_enum::META_TABLE, updates)
+        .await
+    {
+        Ok(()) => complete_with(tag),
+        Err(error) => refuse("58000", &format!("{tag} failed: {error}")),
+    }
+}
+
+/// The enum-column extensions for the user-typed columns of `columns`, or `42704` naming a
+/// type `view` does not define. Only enum types exist as user types.
+fn user_type_extensions(
+    view: &SchemaSnapshot,
+    keyspace: &str,
+    columns: &[ColumnDef],
+) -> Result<HashMap<String, String>, BackendMessage> {
+    let mut extensions = HashMap::new();
+    for def in columns {
+        let Some(user_type) = &def.user_type else {
+            continue;
+        };
+        let type_keyspace = user_type.schema.as_deref().unwrap_or(keyspace);
+        match crate::pg_enum::lookup(view, type_keyspace, &user_type.table)? {
+            Some(_) => {
+                let (key, value) =
+                    crate::pg_enum::column_extension(&def.name, type_keyspace, &user_type.table);
+                extensions.insert(key, value);
+            }
+            None => {
+                return Err(error_response(
+                    "42704",
+                    &format!("type \"{}\" does not exist", user_type.table),
+                ))
+            }
+        }
+    }
+    Ok(extensions)
 }
 
 /// `COMMENT ON TABLE t IS 'text' | NULL`: set (or clear) the table's comment extension,
@@ -422,6 +552,11 @@ pub(crate) async fn execute_alter_table(
                 Ok(t) => t,
                 Err(msg) => return vec![msg],
             };
+            let enum_column =
+                match user_type_extensions(&env.view, keyspace, std::slice::from_ref(def)) {
+                    Ok(extensions) => extensions,
+                    Err(refusal) => return vec![refusal],
+                };
             let updates = TableUpdates {
                 params: None,
                 add_columns: vec![ColumnMetadata {
@@ -435,7 +570,7 @@ pub(crate) async fn execute_alter_table(
                     mask: None,
                 }],
                 drop_columns: Vec::new(),
-                extensions: None,
+                extensions: (!enum_column.is_empty()).then_some(enum_column),
             };
             if let Err(error) = executor
                 .alter_table(keyspace, &stmt.table.table, updates)
@@ -726,10 +861,24 @@ pub(crate) async fn execute_create_table(
     if let Some(reply) = existing_table_reply(&env.view, keyspace, stmt) {
         return reply;
     }
-    let table = match plan_create_table(stmt, keyspace) {
+    if is_reserved_column_name(&stmt.name.table) {
+        return refuse(
+            "42939",
+            &format!(
+                "table name \"{}\" is reserved: the `_sys_` prefix belongs to ferrosa",
+                stmt.name.table
+            ),
+        );
+    }
+    let enum_columns = match user_type_extensions(&env.view, keyspace, &stmt.columns) {
+        Ok(extensions) => extensions,
+        Err(refusal) => return vec![refusal],
+    };
+    let mut table = match plan_create_table(stmt, keyspace) {
         Ok(table) => table,
         Err(refusal) => return vec![refusal],
     };
+    table.extensions.extend(enum_columns);
     if let Err(error) = env.schema.check_create_table_jsonb(&table) {
         return vec![schema_refusal(&error)];
     }
@@ -860,6 +1009,7 @@ pub(crate) fn plan_create_table(
                 ty: PgType::Uuid,
                 not_null: true,
                 primary_key: true,
+                user_type: None,
             },
         );
         primary_key = vec![SYNTHETIC_KEY_COLUMN.to_string()];
