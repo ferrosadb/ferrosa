@@ -54,6 +54,8 @@ pub enum PreparedKind {
     Insert(Box<InsertStmt>),
     Update(Box<UpdateStmt>),
     Delete(Box<DeleteStmt>),
+    /// A general `UPDATE`/`DELETE` (`FROM`, `WITH`, a general `WHERE`, `RETURNING`).
+    Dml(Box<ferrosa_sql::DmlStmt>),
 }
 
 /// A prepared statement: the parsed query plus the client-declared parameter
@@ -564,6 +566,7 @@ impl Session {
             Ok(Statement::Insert(ins)) => PreparedKind::Insert(ins),
             Ok(Statement::Update(upd)) => PreparedKind::Update(upd),
             Ok(Statement::Delete(del)) => PreparedKind::Delete(del),
+            Ok(Statement::Dml(d)) => PreparedKind::Dml(d),
             Ok(_) => {
                 // BEGIN/COMMIT/ROLLBACK/SET reach the backend via simple Query.
                 self.mark_error();

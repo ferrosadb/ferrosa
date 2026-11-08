@@ -1062,7 +1062,8 @@ pub(crate) fn parse_error_sqlstate(error: &ferrosa_sql::ParseError) -> &'static 
         | ParseError::UnsupportedSelectExpr(_)
         | ParseError::UnsupportedCast(_)
         | ParseError::UnsupportedCastExpr
-        | ParseError::UnsupportedAggregate(_) => "0A000",
+        | ParseError::UnsupportedAggregate(_)
+        | ParseError::UnsupportedDml(_) => "0A000",
         ParseError::UnknownType(_) => "42704",
         ParseError::DuplicateColumn(_) => "42701",
         ParseError::MultiplePrimaryKeys => "42P16",
@@ -1674,6 +1675,10 @@ async fn execute_statement(
         Statement::Select(_) => vec![error_response(
             "XX000",
             "internal error: a table SELECT reached the non-streaming path",
+        )],
+        Statement::Dml(_) => vec![error_response(
+            "0A000",
+            "general UPDATE/DELETE is not executed yet",
         )],
         // No-`FROM` expression query: `SELECT 1`, `SELECT version()`,
         // `SELECT (SELECT count(*) FROM t)`, etc.

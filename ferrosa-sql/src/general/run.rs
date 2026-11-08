@@ -172,6 +172,9 @@ fn open(
             }));
         }
     }
+    if q.first_per_key > 0 {
+        rows = first_per_key(rows, q.first_per_key);
+    }
     let offset = match q.offset_param {
         Some(n) => bound_param(rt, n, "OFFSET", "2201X")?,
         None => q.offset,
@@ -183,6 +186,27 @@ fn open(
     }
     .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
     Ok(limit_offset(rows, offset, limit))
+}
+
+/// Keep the first row of each run of rows equal on their first `n` values
+/// (`Dml.lean`, `firstPerRun`). The input is sorted on those values by a stable
+/// sort, so the kept row is the first in arrival order. Only the current key is
+/// held: memory is one key, whatever the input size.
+fn first_per_key(rows: TryRowStream<'static>, n: usize) -> TryRowStream<'static> {
+    debug_assert!(n > 0, "a zero-width key would keep one row");
+    let mut prev: Option<Vec<Value>> = None;
+    Box::new(rows.filter_map(move |r| {
+        let row = match r {
+            Ok(row) => row,
+            Err(e) => return Some(Err(e)),
+        };
+        let key = &row.0[..n.min(row.0.len())];
+        if prev.as_deref() == Some(key) {
+            return None;
+        }
+        prev = Some(key.to_vec());
+        Some(Ok(row))
+    }))
 }
 
 /// Resolve a `LIMIT $n` / `OFFSET $n` value (`Limit.lean` `resolve`): NULL is no

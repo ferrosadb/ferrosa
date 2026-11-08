@@ -19,8 +19,11 @@
 //! is genuinely duplicated (a join emitting one left row against several right
 //! rows).
 
+mod dml;
 mod eval;
 pub(crate) mod run;
+
+pub(crate) use dml::{compile_dml, infer_dml_params};
 
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
@@ -62,6 +65,11 @@ pub(crate) struct Query {
     /// Whether this query (or a subquery inside it) reads an enclosing query's
     /// row. An uncorrelated subquery has one value per statement and is run once.
     correlated: bool,
+    /// When non-zero, the output is sorted on its first `first_per_key` columns
+    /// and only the first row of each run of equal values is kept: a DML read
+    /// over `UPDATE … FROM` writes each target row once, with its first match
+    /// (`Dml.lean`, `firstPerRun_*`).
+    first_per_key: usize,
 }
 
 #[derive(Debug)]
@@ -195,13 +203,7 @@ pub(crate) fn compile(
     catalog: &dyn Catalog,
     default_schema: &str,
 ) -> Result<Arc<Query>, ExecError> {
-    let compiler = Compiler {
-        catalog,
-        default_schema,
-        params: RefCell::new(Vec::new()),
-        max_param: Cell::new(0),
-        refs: RefCell::new(Vec::new()),
-    };
+    let compiler = Compiler::new(catalog, default_schema);
     let mut q = compiler.query(stmt, None, &[])?;
     q.params_needed = compiler.max_param.get();
     Ok(Arc::new(q))
@@ -218,20 +220,9 @@ pub(crate) fn infer_params(
     catalog: &dyn Catalog,
     default_schema: &str,
 ) -> Result<Vec<ColumnType>, ExecError> {
-    let compiler = Compiler {
-        catalog,
-        default_schema,
-        params: RefCell::new(Vec::new()),
-        max_param: Cell::new(0),
-        refs: RefCell::new(Vec::new()),
-    };
+    let compiler = Compiler::new(catalog, default_schema);
     compiler.query(stmt, None, &[])?;
-    Ok(compiler
-        .params
-        .into_inner()
-        .into_iter()
-        .map(|t| t.unwrap_or(ColumnType::Text))
-        .collect())
+    Ok(compiler.inferred_params())
 }
 
 struct Compiler<'c> {
@@ -245,11 +236,53 @@ struct Compiler<'c> {
     refs: RefCell<Vec<usize>>,
 }
 
+impl<'c> Compiler<'c> {
+    fn new(catalog: &'c dyn Catalog, default_schema: &'c str) -> Self {
+        Compiler {
+            catalog,
+            default_schema,
+            params: RefCell::new(Vec::new()),
+            max_param: Cell::new(0),
+            refs: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Each `$n`'s inferred type, `$1` first; a parameter no context typed is
+    /// `text`, as PostgreSQL treats an unknown.
+    fn inferred_params(&self) -> Vec<ColumnType> {
+        let mut types: Vec<ColumnType> = self
+            .params
+            .borrow()
+            .iter()
+            .map(|t| t.unwrap_or(ColumnType::Text))
+            .collect();
+        if types.len() < self.max_param.get() {
+            types.resize(self.max_param.get(), ColumnType::Text);
+        }
+        types
+    }
+}
+
 /// One relation visible to column references.
 struct Binding {
     name: String,
     schema: RelSchema,
     base: usize,
+    /// Per-column slot overrides; empty means column `i` is slot `base + i`. A
+    /// DML read routes an assigned target column to its `SET` value this way, so
+    /// `RETURNING` reads the new row (`Dml.lean`, `returning_sees_new_row`).
+    remap: Vec<Option<usize>>,
+}
+
+impl Binding {
+    /// The row slot of local column `local`.
+    fn slot(&self, local: usize) -> usize {
+        self.remap
+            .get(local)
+            .copied()
+            .flatten()
+            .unwrap_or(self.base + local)
+    }
 }
 
 /// The names a query's expressions resolve against, and the enclosing query's.
@@ -407,6 +440,7 @@ impl Compiler<'_> {
             needs_frame,
             params_needed: 0,
             correlated: false,
+            first_per_key: 0,
         };
         if aggregate {
             self.aggregate(stmt, &scope, &ctes, items, &mut q)?;
@@ -471,7 +505,12 @@ impl Compiler<'_> {
             .bindings
             .last()
             .map_or(0, |b| b.base + b.schema.width());
-        scope.bindings.push(Binding { name, schema, base });
+        scope.bindings.push(Binding {
+            name,
+            schema,
+            base,
+            remap: Vec::new(),
+        });
         Ok(())
     }
 
@@ -1029,7 +1068,7 @@ fn local_column(scope: &Scope<'_>, col: &ColumnRef) -> Result<(usize, ColumnType
             if found.is_some() {
                 return Err(ExecError::AmbiguousColumn(col.qualified_name()));
             }
-            found = Some((b.base + local, b.schema.columns[local].ty));
+            found = Some((b.slot(local), b.schema.columns[local].ty));
         }
     }
     if found.is_none() {
@@ -1250,10 +1289,7 @@ pub(crate) fn is_utc(zone: &str) -> bool {
 /// is not a valid value of it is an error at plan time), and two typed operands
 /// from different type families are refused (42883) rather than compared as
 /// UNKNOWN, which would silently drop every row.
-fn comparable(
-    (l, lt): Typed,
-    (r, rt): Typed,
-) -> Result<(Typed, Typed), ExecError> {
+fn comparable((l, lt): Typed, (r, rt): Typed) -> Result<(Typed, Typed), ExecError> {
     let (l, lt) = coerce_literal(l, lt, rt)?;
     let (r, rt) = coerce_literal(r, rt, lt)?;
     if let (Some(a), Some(b)) = (lt, rt) {

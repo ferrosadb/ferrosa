@@ -72,6 +72,8 @@ pub enum ParseError {
     /// bound a client-chosen depth overflows the parsing thread's stack and
     /// aborts the process.
     TooDeep,
+    /// An `UPDATE`/`DELETE` form outside the supported subset, named.
+    UnsupportedDml(&'static str),
 }
 
 /// Deepest expression nesting the parser accepts: far beyond any real
@@ -125,6 +127,9 @@ impl fmt::Display for ParseError {
             ParseError::TooDeep => {
                 write!(f, "expression nests deeper than {MAX_EXPR_DEPTH} levels")
             }
+            ParseError::UnsupportedDml(form) => {
+                write!(f, "{form} is not supported in UPDATE/DELETE")
+            }
         }
     }
 }
@@ -176,11 +181,7 @@ pub fn parse_statement(sql: &str) -> Result<Statement, ParseError> {
             }
         }
         Some(Tok::Ident(w)) => match w.to_ascii_uppercase().as_str() {
-            "WITH" => {
-                let stmt = p.parse_with_select()?;
-                p.expect_end()?;
-                Ok(Statement::Select(Box::new(stmt)))
-            }
+            "WITH" => p.parse_with_statement(),
             // Transaction control: `BEGIN` / `START TRANSACTION` preserve an
             // explicit isolation level for the session layer.
             "BEGIN" | "START" => p.parse_begin(),
@@ -189,8 +190,8 @@ pub fn parse_statement(sql: &str) -> Result<Statement, ParseError> {
             "SET" => p.parse_set(),
             "RESET" => p.parse_reset(),
             "INSERT" => p.parse_insert(),
-            "UPDATE" => p.parse_update(),
-            "DELETE" => p.parse_delete(),
+            "UPDATE" => p.parse_update_statement(Vec::new()),
+            "DELETE" => p.parse_delete_statement(Vec::new()),
             "CREATE" => p.parse_create(),
             "COPY" => p.parse_copy(),
             "ALTER" => p.parse_alter_table(),
@@ -775,8 +776,12 @@ impl Parser {
         // Each may be a literal count, a `$n` parameter, or (LIMIT) `ALL`.
         let (mut limit, mut limit_param, mut seen_limit) = (None, None, false);
         let (mut offset, mut offset_param, mut seen_offset) = (None, None, false);
+        let mut lock = None;
         loop {
             match self.peek() {
+                Some(Tok::Ident(w)) if lock.is_none() && w.eq_ignore_ascii_case("FOR") => {
+                    lock = Some(self.parse_row_lock()?);
+                }
                 Some(Tok::Limit) if !seen_limit => {
                     self.next();
                     seen_limit = true;
@@ -817,6 +822,7 @@ impl Parser {
             offset,
             limit_param,
             offset_param,
+            lock,
         })
     }
 
@@ -1010,7 +1016,7 @@ impl Parser {
     }
 
     /// Error unless all tokens are consumed (statement fully parsed).
-    fn expect_end(&self) -> Result<(), ParseError> {
+    pub(crate) fn expect_end(&self) -> Result<(), ParseError> {
         match self.peek() {
             None => Ok(()),
             Some(t) => Err(ParseError::Unexpected {
@@ -1180,7 +1186,7 @@ impl Parser {
     /// [`SetExpr`] — a constant, or an arithmetic read-modify-write
     /// (`c = c + 1`, `c = (c + 1) * 2`). `WHERE` stays equality-only
     /// (the key columns identify the row, Cassandra-style upsert).
-    fn parse_update(&mut self) -> Result<Statement, ParseError> {
+    pub(crate) fn parse_update(&mut self) -> Result<Statement, ParseError> {
         self.next(); // UPDATE
         let table = self.parse_qualified_table()?;
 
@@ -1210,7 +1216,7 @@ impl Parser {
 
     /// `DELETE FROM [schema.]table WHERE col = val [AND ...]`. Assumes `self.pos`
     /// is at the `DELETE` ident. `WHERE` is equality-only on key columns.
-    fn parse_delete(&mut self) -> Result<Statement, ParseError> {
+    pub(crate) fn parse_delete(&mut self) -> Result<Statement, ParseError> {
         self.next(); // DELETE
         self.expect(&Tok::From, "FROM")?;
         let table = self.parse_qualified_table()?;
@@ -1477,7 +1483,7 @@ impl Parser {
         }
     }
 
-    fn parse_table_ref(&mut self) -> Result<TableRef, ParseError> {
+    pub(crate) fn parse_table_ref(&mut self) -> Result<TableRef, ParseError> {
         let first = self.ident()?;
         let (schema, table) = if matches!(self.peek(), Some(Tok::Dot)) {
             self.next();
@@ -1556,8 +1562,8 @@ impl Parser {
         Ok((None, joins))
     }
 
-    /// `WITH name AS (SELECT ...) [, ...] SELECT ...`.
-    fn parse_with_select(&mut self) -> Result<SelectStmt, ParseError> {
+    /// `WITH name AS (SELECT ...) [, ...]`: the CTE list, cursor after it.
+    pub(crate) fn parse_ctes(&mut self) -> Result<Vec<Cte>, ParseError> {
         self.expect_word("WITH")?;
         let mut ctes = Vec::new();
         loop {
@@ -1566,12 +1572,24 @@ impl Parser {
             let query = Box::new(self.parenthesised_select()?);
             ctes.push(Cte { name, query });
             if !self.eat(&Tok::Comma) {
-                break;
+                return Ok(ctes);
             }
+        }
+    }
+
+    /// `WITH … SELECT …`, `WITH … UPDATE …` or `WITH … DELETE …`.
+    fn parse_with_statement(&mut self) -> Result<Statement, ParseError> {
+        let ctes = self.parse_ctes()?;
+        if self.peek_word("UPDATE") {
+            return self.parse_update_statement(ctes);
+        }
+        if self.peek_word("DELETE") {
+            return self.parse_delete_statement(ctes);
         }
         let mut stmt = self.parse_select_stmt()?;
         stmt.ctes = ctes;
-        Ok(stmt)
+        self.expect_end()?;
+        Ok(Statement::Select(Box::new(stmt)))
     }
 
     /// Boolean expression grammar with precedence
@@ -2848,30 +2866,27 @@ mod tests {
         }
     }
 
+    /// `RETURNING` on an UPDATE or DELETE is the general statement's: the
+    /// keyed legacy executors cannot return rows.
     #[test]
     fn parse_statement_update_delete_returning() {
+        use crate::ast::{DmlAction, Projection};
         let upd = parse_statement("UPDATE t SET v = $1 WHERE id = $2 RETURNING id").unwrap();
         match upd {
-            Statement::Update(u) => {
-                assert_eq!(
-                    u.assignments,
-                    vec![("v".to_string(), SetExpr::Value(ScalarValue::Param(1)))]
-                );
-                assert_eq!(u.where_eq, vec![("id".to_string(), ScalarValue::Param(2))]);
-                assert_eq!(
-                    u.returning,
-                    Some(Returning::Columns(vec!["id".to_string()]))
-                );
+            Statement::Dml(d) => {
+                assert!(matches!(&d.action, DmlAction::Update(sets) if sets.len() == 1));
+                assert!(d.filter.is_some());
+                assert!(matches!(&d.returning, Some(Projection::Items(items)) if items.len() == 1));
             }
-            other => panic!("expected Update, got {other:?}"),
+            other => panic!("expected Dml, got {other:?}"),
         }
         let del = parse_statement("DELETE FROM t WHERE id = $1 RETURNING *").unwrap();
         match del {
-            Statement::Delete(d) => {
-                assert_eq!(d.where_eq, vec![("id".to_string(), ScalarValue::Param(1))]);
-                assert_eq!(d.returning, Some(Returning::Star));
+            Statement::Dml(d) => {
+                assert_eq!(d.action, DmlAction::Delete);
+                assert_eq!(d.returning, Some(Projection::Star));
             }
-            other => panic!("expected Delete, got {other:?}"),
+            other => panic!("expected Dml, got {other:?}"),
         }
     }
 

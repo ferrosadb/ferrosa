@@ -1564,6 +1564,10 @@ async fn describe(
                 return vec![session.fail(denied)];
             }
             match parsed {
+                PreparedKind::Dml(_) => vec![session.fail(query::error_response(
+                    "0A000",
+                    "general UPDATE/DELETE is not executed yet",
+                ))],
                 PreparedKind::Select(select) => {
                     // ParameterDescription: a driver (e.g. tokio-postgres) relies
                     // on this to serialize bound parameters. Use the
@@ -1690,6 +1694,10 @@ async fn describe(
                 return vec![session.fail(denied)];
             }
             match parsed {
+                PreparedKind::Dml(_) => vec![session.fail(query::error_response(
+                    "0A000",
+                    "general UPDATE/DELETE is not executed yet",
+                ))],
                 PreparedKind::Select(select) => {
                     match describe_columns(ctx, session, &select).await {
                         Ok(columns) => {
@@ -1922,7 +1930,8 @@ fn portal_select(
         PreparedKind::Exprs(_)
         | PreparedKind::Insert(_)
         | PreparedKind::Update(_)
-        | PreparedKind::Delete(_) => None,
+        | PreparedKind::Delete(_)
+        | PreparedKind::Dml(_) => None,
     }
 }
 
@@ -2085,6 +2094,10 @@ async fn execute_portal_inner(
 
     let timestamp_micros = session.timestamp_micros();
     match parsed {
+        PreparedKind::Dml(_) => vec![session.fail(query::error_response(
+            "0A000",
+            "general UPDATE/DELETE is not executed yet",
+        ))],
         // Routed to `execute_select_portal` before this point.
         PreparedKind::Select(_) => vec![session.fail(query::error_response(
             "XX000",
