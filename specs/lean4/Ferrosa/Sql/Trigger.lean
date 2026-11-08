@@ -115,4 +115,64 @@ theorem trigger_effect_shares_the_decision (store ws : List Write) (rows : List 
     simp only [iff_true]
     exact commit_keeps_trigger_effects store ws rows fires r hq
 
+/-! ## Cascades are bounded
+
+A trigger's write can fire a trigger. The implementation refuses a cascade deeper than
+`MAX_TRIGGER_DEPTH` with `54001`, and that bound — not the machine's stack — must be what ends
+a self-firing trigger (found while building: at depth 16 the stack ran out first). The model:
+each level either stops (the function writes nothing that fires) or fires one more level. -/
+
+/-- How a cascade ends: it completed after `n` nested levels, or the bound refused it. -/
+inductive Cascade where
+  | done (levels : Nat)
+  | refused
+  deriving DecidableEq, Repr
+
+/-- Run a cascade from `depth`; `refires d` says whether level `d`'s write fires again. -/
+def cascade (bound : Nat) (refires : Nat → Bool) : Nat → Nat → Cascade
+  | depth, 0 => if depth ≥ bound then .refused else .done depth
+  | depth, fuel + 1 =>
+      if depth ≥ bound then .refused
+      else if refires depth then cascade bound refires (depth + 1) fuel
+      else .done (depth + 1)
+
+/-- **A self-firing trigger is refused, never unbounded.** With fuel past the bound, a trigger
+    that always fires itself ends in `refused`. -/
+theorem self_firing_cascade_is_refused (bound : Nat) :
+    cascade bound (fun _ => true) 0 (bound + 1) = .refused := by
+  suffices h : ∀ k d, d + k = bound → cascade bound (fun _ => true) d (k + 1) = .refused by
+    simpa using h bound 0 (by omega)
+  intro k
+  induction k with
+  | zero =>
+    intro d hd
+    have hb : d ≥ bound := by omega
+    simp [cascade, hb]
+  | succ k ih =>
+    intro d hd
+    have hlt : ¬ d ≥ bound := by omega
+    simp only [cascade, hlt, ite_false, ite_true]
+    exact ih (d + 1) (by omega)
+
+/-- **A completed cascade never went deeper than the bound.** -/
+theorem completed_cascade_respects_the_bound (bound : Nat) (refires : Nat → Bool) :
+    ∀ fuel depth levels, cascade bound refires depth fuel = .done levels → levels ≤ bound := by
+  intro fuel
+  induction fuel with
+  | zero =>
+    intro depth levels h
+    simp only [cascade] at h
+    split at h
+    · exact absurd h (by simp)
+    · rename_i hb; injection h with h; omega
+  | succ fuel ih =>
+    intro depth levels h
+    simp only [cascade] at h
+    split at h
+    · exact absurd h (by simp)
+    · rename_i hb
+      split at h
+      · exact ih (depth + 1) levels h
+      · injection h with h; omega
+
 end Ferrosa.Sql.Trigger

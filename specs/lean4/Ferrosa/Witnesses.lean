@@ -188,6 +188,8 @@ import Ferrosa.Sql.Dml
 #check Ferrosa.Sql.Trigger.rollback_discards_trigger_effects
 #check Ferrosa.Sql.Trigger.commit_keeps_trigger_effects
 #check Ferrosa.Sql.Trigger.trigger_effect_shares_the_decision
+#check Ferrosa.Sql.Trigger.self_firing_cascade_is_refused
+#check Ferrosa.Sql.Trigger.completed_cascade_respects_the_bound
 -- Transactional DDL, enum types and serial ids on the PostgreSQL front end (`Ferrosa/Sql/`).
 #check Ferrosa.Sql.Ddl.buffered_statement_is_visible
 #check Ferrosa.Sql.Ddl.rollback_applies_nothing
