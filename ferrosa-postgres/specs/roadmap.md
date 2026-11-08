@@ -469,3 +469,13 @@ Binding a replacement lazily reclaims only retired-incarnation MVCC heads and sc
 - t_cc11529a: implement positive lock_timeout with SET/RESET/SHOW and per-acquisition
   timing tests. t_b254fd86: implement native CancelRequest and bounded transport
   observation of EOF/Terminate while executing. Neither is claimed by drop tests.
+
+## D13 follow-ups
+
+- Cross-node NOTIFY delivery through the Accord apply observer (design in README); lift the
+  cluster LISTEN refusal when it lands.
+- Transactional function/trigger DDL with W3's buffered DDL (today 25001 inside a block).
+- Calling PL/pgSQL functions from SQL expressions (needs a user-function hook in the engine).
+- DELETE and statement-level triggers; BEFORE triggers.
+- `BackendKeyData` pid and the notification pid agree once cancellation is wired.
+

@@ -303,6 +303,7 @@ impl PublishGuard {
                 ListenAction::Listen(channel) => {
                     let l = listener.get_or_insert_with(|| new_listener(&self.hub, pid));
                     if l.channels.insert(Arc::clone(&channel)) {
+                        // A second handle on the session's queue sender, one per channel listened to.
                         map.entry(channel).or_default().push((pid, l.tx.clone()));
                         // mpsc sender handle: one per subscribed channel
                     }

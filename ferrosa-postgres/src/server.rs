@@ -1759,6 +1759,7 @@ async fn describe(
                 }
                 PreparedKind::Utility(statement) => {
                     let param_oids = crate::procedural::param_oids(&statement, &declared);
+                    // Stored on the statement and also described to the client.
                     session.set_param_oids(name, param_oids.clone());
                     vec![
                         extended::parameter_description(&param_oids),
@@ -2170,6 +2171,7 @@ pub(crate) fn writes_triggered_table(
     ctx.schema
         .snapshot()
         .tables
+        // The schema map is keyed by owned names.
         .get(&(keyspace.to_string(), table.table.clone()))
         .is_some_and(crate::procedural::triggers::has_triggers)
 }

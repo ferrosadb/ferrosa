@@ -292,6 +292,7 @@ impl<'a> Parser<'a> {
         if self.peek_op(";") {
             self.pos += 1;
         }
+        // The name is kept twice: as the slot's display name and as its scope key.
         let var = self.push_var(name.clone(), VarKind::Local, Some(oid));
         self.scope.push((name, var));
         Ok(Declaration { var, default })
@@ -539,7 +540,7 @@ impl<'a> Parser<'a> {
         if range.is_empty() {
             return Err(PlError::syntax("PERFORM needs an expression"));
         }
-        if let Some((channel, payload)) = self.pg_notify_args(range.clone()) {
+        if let Some((channel, payload)) = self.pg_notify_args(range.start..range.end) {
             let channel = self.lower(channel, Subst::Expression)?;
             let payload = self.lower(payload, Subst::Expression)?;
             return Ok(Stmt::Notify { channel, payload });
@@ -582,7 +583,7 @@ impl<'a> Parser<'a> {
     fn select_into(&mut self) -> Result<Stmt, PlError> {
         let range = self.until_semicolon()?;
         self.expect_op(";")?;
-        let Some(into) = self.depth0_word(range.clone(), "into") else {
+        let Some(into) = self.depth0_word(range.start..range.end, "into") else {
             return Err(PlError::syntax(
                 "query has no destination for result data: use PERFORM or SELECT … INTO",
             ));
@@ -641,7 +642,7 @@ impl<'a> Parser<'a> {
         let range = self.until_semicolon()?;
         self.expect_op(";")?;
         if subst == Subst::Dml {
-            if let Some(ret) = self.depth0_word(range.clone(), "returning") {
+            if let Some(ret) = self.depth0_word(range.start..range.end, "returning") {
                 if self.depth0_word(ret..range.end, "into").is_some() {
                     return Err(PlError::unsupported("RETURNING … INTO"));
                 }

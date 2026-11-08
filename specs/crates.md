@@ -16,14 +16,15 @@
 | Crate | Purpose | Runtime deps | Docs |
 |-------|---------|--------------|------|
 | `ferrosa-cql` | CQL native-protocol v4/v5 server — parse, route, LWT/Accord, prepared, SUBSCRIBE | ferrosa-cdc, ferrosa-cluster, ferrosa-common, ferrosa-index, ferrosa-net, ferrosa-row-bridge, ferrosa-schema, ferrosa-session, ferrosa-sstable, ferrosa-storage, ferrosa-udf | [README](../ferrosa-cql/README.md) · [specs](../ferrosa-cql/specs/) |
-| `ferrosa-postgres` | PostgreSQL v3 wire front-end (preview) — SELECT/DML/transactions, SCRAM | ferrosa-common, ferrosa-row-bridge, ferrosa-schema, ferrosa-sql, ferrosa-sstable, ferrosa-storage | [README](../ferrosa-postgres/README.md) · [specs](../ferrosa-postgres/specs/) |
+| `ferrosa-postgres` | PostgreSQL v3 wire front-end (preview) — SELECT/DML/transactions, SCRAM, LISTEN/NOTIFY, DO, PL/pgSQL functions and triggers | ferrosa-common, ferrosa-plpgsql, ferrosa-row-bridge, ferrosa-schema, ferrosa-sql, ferrosa-sstable, ferrosa-storage, ferrosa-udf | [README](../ferrosa-postgres/README.md) · [specs](../ferrosa-postgres/specs/) |
 | `ferrosa-flight` | Apache Arrow Flight gRPC endpoint — CQL SELECT -> Arrow batches, bearer auth | ferrosa-cluster, ferrosa-common, ferrosa-cql, ferrosa-schema | [README](../ferrosa-flight/README.md) · [specs](../ferrosa-flight/specs/) |
 | `ferrosa-graph` | Property-graph engine — Cypher, Bolt v5, HTTP, adjacency index | ferrosa-cluster, ferrosa-common, ferrosa-schema, ferrosa-sstable, ferrosa-storage | [README](../ferrosa-graph/README.md) · [specs](../ferrosa-graph/specs/) |
 | `ferrosa-sparql` | SPARQL 1.1 endpoint (Query + Update, RDF*, property paths) | ferrosa-cluster, ferrosa-common, ferrosa-index, ferrosa-schema, ferrosa-sstable, ferrosa-storage | [README](../ferrosa-sparql/README.md) · [specs](../ferrosa-sparql/specs/) |
 | `ferrosa-sql` | Bespoke relational engine (D3, no DataFusion) backing the Postgres front-end | ferrosa-storage (external merge sort for the blocking operators' spill) | [README](../ferrosa-sql/README.md) · [specs](../ferrosa-sql/specs/) |
 | `ferrosa-jsonb` | jsonb value model — tunable ingest `Limits`, compiled read `HardCeilings`, typed errors (leaf crate, arrow-free) | none (bytes, num-bigint, thiserror) | [README](../ferrosa-jsonb/README.md) · [specs](../ferrosa-jsonb/specs/) |
 | `ferrosa-jsonb-conformance` | Dev-only, `publish = false`: differential oracle of ferrosa-jsonb against arrow-rs `parquet-variant` (tests only, no `[lib]`, no consumers; standalone workspace excluded from the root, see its README) | none (dev: ferrosa-jsonb, parquet-variant =60.0.0, proptest) | [README](../ferrosa-jsonb-conformance/README.md) · [specs](../ferrosa-jsonb-conformance/specs/) |
-| `ferrosa-udf` | User-defined functions — Wasmtime sandbox, fuel/epoch limits, AssemblyScript | ferrosa-common | [README](../ferrosa-udf/README.md) · [specs](../ferrosa-udf/specs/) |
+| `ferrosa-udf` | User-defined functions — Wasmtime sandbox, fuel/epoch limits, AssemblyScript, compiled PL/pgSQL (`routine` world) | ferrosa-common, ferrosa-plpgsql |
+| `ferrosa-plpgsql` | PL/pgSQL subset (D13) — parser, interpreter, AssemblyScript converter, host trait | — | [README](../ferrosa-plpgsql/README.md) · [specs](../ferrosa-plpgsql/specs/) | [README](../ferrosa-udf/README.md) · [specs](../ferrosa-udf/specs/) |
 | `ferrosa-row-bridge` | The single canonical CQL row codec shared by both front-ends (D10) | ferrosa-common, ferrosa-schema, ferrosa-sstable | [README](../ferrosa-row-bridge/README.md) · [specs](../ferrosa-row-bridge/specs/) |
 
 ### Consensus & cluster
