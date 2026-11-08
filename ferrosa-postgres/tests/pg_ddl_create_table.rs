@@ -696,10 +696,8 @@ async fn pg_ddl_create_table_named_refusals_survive_end_to_end() {
     let cases = [
         // (sql, expected sqlstate)
         ("CREATE TABLE t (id int PRIMARY KEY, v int UNIQUE)", "0A000"),
-        (
-            "CREATE TABLE t (id int PRIMARY KEY, v int DEFAULT 1)",
-            "0A000",
-        ),
+        // `DEFAULT` is no longer refused: it is recorded for the INSERT path
+        // (`pg_default`, Oban W3).
         (
             "CREATE TABLE t (id int PRIMARY KEY, v int CHECK (v > 0))",
             "0A000",
@@ -740,14 +738,15 @@ async fn pg_ddl_create_table_without_the_keyspace_is_3f000() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_ddl_create_table_inside_a_transaction_block_is_refused() {
+async fn pg_ddl_create_table_inside_a_transaction_block_is_buffered_and_rolled_back() {
+    // DDL inside BEGIN is transactional (`ddl_txn`): accepted and buffered, so ROLLBACK
+    // leaves no table behind. (It used to be refused with 25001.)
     let fx = start().await;
     fx.client.batch_execute("BEGIN").await.expect("BEGIN");
-    let result = fx
-        .client
+    fx.client
         .batch_execute("CREATE TABLE t (id int PRIMARY KEY)")
-        .await;
-    assert_eq!(sqlstate(result), "25001");
+        .await
+        .expect("CREATE TABLE inside a transaction block is buffered");
     fx.client.batch_execute("ROLLBACK").await.expect("ROLLBACK");
     assert!(!fx
         .schema

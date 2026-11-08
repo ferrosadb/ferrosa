@@ -1504,6 +1504,17 @@ fn function(name: &str, args: &[Ty]) -> Result<(Func, Ty), ExecError> {
             }
             (Func::JsonBuildObject, Some(ColumnType::Json))
         }
+        // D15: there are no sequences — a bigserial column gets a unique server-generated
+        // id instead — so the sequence functions are a refused feature, not unknown names.
+        "nextval" | "setval" | "currval" | "lastval" => {
+            return Err(ExecError::eval(
+                "0A000",
+                format!(
+                    "{name}() is not supported: there are no sequences; bigserial columns \
+                     get unique server-generated ids (D15)"
+                ),
+            ))
+        }
         _ => {
             return Err(ExecError::eval(
                 "42883",

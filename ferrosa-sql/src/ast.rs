@@ -79,6 +79,63 @@ pub enum Statement {
     /// `ANALYZE [table]` (see [`AnalyzeStmt`]). Accepted and answered as a
     /// successful no-op: no statistics are collected.
     Analyze(AnalyzeStmt),
+    /// `LOCK [TABLE] [ONLY] t [, ...] [IN <mode> MODE]` (see [`LockStmt`]).
+    Lock(LockStmt),
+    /// `COMMENT ON TABLE t IS 'text' | NULL` (see [`CommentStmt`]).
+    Comment(Box<CommentStmt>),
+    /// `CREATE TYPE [schema.]name AS ENUM ('label', ...)` (see [`CreateTypeStmt`]).
+    CreateType(Box<CreateTypeStmt>),
+    /// `ALTER TYPE [schema.]name ADD VALUE [IF NOT EXISTS] 'label'` (see [`AlterTypeStmt`]).
+    AlterType(Box<AlterTypeStmt>),
+}
+
+/// `CREATE TYPE [schema.]name AS ENUM ('label', ...)`. Only enum types are accepted; the
+/// labels are kept in declaration order (duplicates are the front end's refusal).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTypeStmt {
+    pub name: TableRef,
+    pub labels: Vec<String>,
+}
+
+/// `ALTER TYPE [schema.]name ADD VALUE [IF NOT EXISTS] 'label'`. `BEFORE`/`AFTER` placement
+/// and every other `ALTER TYPE` form are refused at parse time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlterTypeStmt {
+    pub name: TableRef,
+    pub value: String,
+    pub if_not_exists: bool,
+}
+
+/// `COMMENT ON TABLE t IS 'text' | NULL`. `comment` is `None` for `IS NULL`, which removes
+/// the comment (as does an empty string, in PostgreSQL). Other object kinds are refused at
+/// parse time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentStmt {
+    pub table: TableRef,
+    pub comment: Option<String>,
+}
+
+/// `LOCK [TABLE] [ONLY] name [, ...] [IN <mode> MODE]`.
+///
+/// The front end gives it real semantics (it is never a no-op): see `ferrosa-postgres`'s
+/// `lock` module. `NOWAIT` is refused at parse time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockStmt {
+    pub tables: Vec<TableRef>,
+    pub mode: LockMode,
+}
+
+/// PostgreSQL's eight table lock modes, as written. `ACCESS EXCLUSIVE` is the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockMode {
+    AccessShare,
+    RowShare,
+    RowExclusive,
+    ShareUpdateExclusive,
+    Share,
+    ShareRowExclusive,
+    Exclusive,
+    AccessExclusive,
 }
 
 /// `TRUNCATE [TABLE] a [, b, ...]`. `tables` is non-empty; every entry names a
@@ -196,7 +253,11 @@ pub struct ForeignKeyConstraint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlterTableStmt {
     pub table: TableRef,
+    /// The first action.
     pub operation: AlterOperation,
+    /// Further comma-separated actions (`ADD COLUMN a …, ADD COLUMN b …`), in order. The
+    /// front end applies a statement's actions together or not at all.
+    pub rest: Vec<AlterOperation>,
 }
 
 /// What an `ALTER TABLE` changes.
@@ -215,6 +276,33 @@ pub enum AlterOperation {
     AddPrimaryKey(Vec<String>),
     /// `ADD [COLUMN] <name> <type> [NOT NULL]`.
     AddColumn(ColumnDef),
+    /// `ADD [COLUMN] IF NOT EXISTS <name> <type> …`: a no-op when the column exists.
+    AddColumnIfNotExists(ColumnDef),
+    /// `ALTER [COLUMN] c [SET DATA] TYPE <type>`. Only a change to the column's current type
+    /// (a no-op) can be applied; the front end refuses a real type change by name.
+    AlterColumnType {
+        column: String,
+        ty: PgType,
+        user_type: Option<TableRef>,
+    },
+    /// `ALTER [COLUMN] c SET DEFAULT <expr>`, the expression as canonical SQL text.
+    SetDefault { column: String, sql: String },
+    /// `ALTER [COLUMN] c DROP DEFAULT`.
+    DropDefault { column: String },
+    /// `ALTER [COLUMN] c SET NOT NULL` (validated against existing rows).
+    SetNotNull { column: String },
+    /// `ALTER [COLUMN] c DROP NOT NULL`.
+    DropNotNull { column: String },
+    /// `ADD [CONSTRAINT name] CHECK (<expr>) [NOT VALID]`, the expression as canonical SQL.
+    AddCheck {
+        name: Option<String>,
+        sql: String,
+        not_valid: bool,
+    },
+    /// `DROP CONSTRAINT [IF EXISTS] name`.
+    DropConstraint { name: String, if_exists: bool },
+    /// `SET UNLOGGED` (`true`) / `SET LOGGED` (`false`).
+    SetLogged(bool),
     /// `DROP [COLUMN] <name>`.
     DropColumn(String),
     /// `ADD [CONSTRAINT <name>] FOREIGN KEY (<cols>) REFERENCES <parent> [(<pcols>)]`.
@@ -262,6 +350,18 @@ pub struct ColumnDef {
     pub not_null: bool,
     /// True when the column is part of the table's primary key.
     pub primary_key: bool,
+    /// A user-defined type named as the column type (`"public".oban_job_state`), as
+    /// written. `ty` is then [`PgType::Text`], the storage of an enum; the front end
+    /// resolves the name and refuses one that is not a known type.
+    pub user_type: Option<TableRef>,
+    /// `DEFAULT <expr>`, as canonical SQL text rendered from the parsed tokens (parsed
+    /// with the general scalar grammar, so it is syntactically valid; never compare it
+    /// byte-for-byte with what the client sent).
+    pub default: Option<String>,
+    /// `bigserial` / `serial8`: `ty` is [`PgType::BigInt`] and the column's value, when an
+    /// INSERT omits it, is a server-generated unique id (D15). `serial`/`smallserial` are
+    /// refused at parse time (an id does not fit).
+    pub serial: bool,
 }
 
 /// A PostgreSQL column type accepted by `CREATE TABLE`, as written (aliases
@@ -344,7 +444,10 @@ impl UnsupportedClause {
     pub fn name(self) -> &'static str {
         match self {
             UnsupportedClause::Check => "CHECK",
-            UnsupportedClause::Serial => "SERIAL",
+            UnsupportedClause::Serial => {
+                "SERIAL/SMALLSERIAL (a server-generated id needs 64 bits: use bigserial; there \
+                 are no sequences, D15)"
+            }
             UnsupportedClause::DefaultExpr => "DEFAULT",
             UnsupportedClause::ForeignSchema => "schema other than public",
             UnsupportedClause::Unique => "UNIQUE",

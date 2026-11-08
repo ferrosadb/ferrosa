@@ -25,15 +25,11 @@ pub(crate) const SERIAL_PREFIX: &str = "pg.column_serial.";
 pub(crate) const BIGSERIAL: &str = "bigserial";
 
 /// The extension recording `sql_text` as `column`'s DEFAULT (`""` clears it).
-// Written by DDL (CREATE/ALTER TABLE, next W3 commits); here only by tests so far.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn default_extension(column: &str, sql_text: &str) -> (String, String) {
     (format!("{DEFAULT_PREFIX}{column}"), sql_text.to_string())
 }
 
 /// The extension marking `column` as `bigserial`.
-// Written by DDL (CREATE/ALTER TABLE, next W3 commits); here only by tests so far.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn serial_extension(column: &str) -> (String, String) {
     (format!("{SERIAL_PREFIX}{column}"), BIGSERIAL.to_string())
 }

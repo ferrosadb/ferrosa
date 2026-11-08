@@ -30,6 +30,7 @@ pub use ast::{
     ScalarExpr, ScalarItem, ScalarValue, SelectItem, SetExpr, Statement, Term, TruncateStatement,
     TypeName, UnaryOp, UnsupportedClause, UpdateStmt, VacuumStmt,
 };
+pub use ast::{AlterTypeStmt, CommentStmt, CreateTypeStmt, LockMode, LockStmt};
 pub use catalog::{Catalog, MapCatalog, SharedTable};
 pub use exec::{
     dedup, fallible, filter, hash_aggregate, hash_join, limit_offset, project, seq_scan, sort,

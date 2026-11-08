@@ -129,6 +129,39 @@ pub(crate) fn statement_permissions(
         // rows, so they need no table permission — the same treatment a session
         // statement gets.
         Statement::Vacuum(_) | Statement::Analyze(_) => Vec::new(),
+        // A type is a keyspace object: CREATE / ALTER on the keyspace, as for tables.
+        Statement::CreateType(create) => vec![(
+            Permission::Create,
+            Resource::Keyspace(
+                create
+                    .name
+                    .schema
+                    .as_deref()
+                    .unwrap_or(default_schema)
+                    .to_string(),
+            ),
+        )],
+        Statement::AlterType(alter) => vec![(
+            Permission::Alter,
+            Resource::Keyspace(
+                alter
+                    .name
+                    .schema
+                    .as_deref()
+                    .unwrap_or(default_schema)
+                    .to_string(),
+            ),
+        )],
+        // A comment is part of the table's definition: ALTER, as for ALTER TABLE.
+        Statement::Comment(comment) => {
+            vec![(Permission::Alter, table(&comment.table, default_schema))]
+        }
+        // LOCK holds off the table's writers, so it needs the permission a writer needs.
+        Statement::Lock(lock) => lock
+            .tables
+            .iter()
+            .map(|t| (Permission::Modify, table(t, default_schema)))
+            .collect(),
         Statement::SelectExprs(_)
         | Statement::Begin { .. }
         | Statement::Commit
@@ -150,6 +183,7 @@ pub(crate) fn prepared_permissions(
         PreparedKind::Delete(del) => dml(&del.table, del.returning.is_some(), default_schema),
         PreparedKind::Dml(d) => general_dml(d, default_schema),
         PreparedKind::Exprs(_) => Vec::new(),
+        PreparedKind::Utility(stmt) => statement_permissions(stmt, default_schema),
     }
 }
 

@@ -14,6 +14,7 @@
 
 pub(crate) mod authz;
 pub mod catalog;
+mod catalog_stream;
 pub mod cluster_read;
 pub mod codec;
 pub mod connection;
@@ -23,12 +24,17 @@ pub mod ddl;
 mod dml_general;
 #[cfg(test)]
 mod dml_general_tests;
+mod ddl_alter;
+mod ddl_txn;
 pub mod extended;
 pub mod handshake;
 pub mod jsonb_wire;
+mod lock;
 pub mod messages;
 mod mvcc;
+mod pg_constraint;
 mod pg_default;
+mod pg_enum;
 pub mod pg_fk;
 pub mod pg_key;
 pub mod pg_types;
