@@ -76,6 +76,8 @@ struct Source {
 enum SourceTable {
     Table(SharedTable),
     Cte(Arc<Query>),
+    /// A select with no FROM: exactly one row with no columns.
+    OneRow,
 }
 
 impl std::fmt::Debug for SourceTable {
@@ -83,6 +85,7 @@ impl std::fmt::Debug for SourceTable {
         match self {
             SourceTable::Table(t) => f.debug_tuple("Table").field(t.schema()).finish(),
             SourceTable::Cte(q) => f.debug_tuple("Cte").field(q).finish(),
+            SourceTable::OneRow => f.write_str("OneRow"),
         }
     }
 }
@@ -182,6 +185,9 @@ pub(crate) enum Func {
 /// Plan-time type of an expression. `None` is an untyped NULL or parameter,
 /// which takes its type from context.
 type Ty = Option<ColumnType>;
+
+/// A compiled expression with its plan-time type.
+type Typed = (CExpr, Ty);
 
 /// Compile `stmt` against `catalog`.
 pub(crate) fn compile(
@@ -373,6 +379,12 @@ impl Compiler<'_> {
             None => None,
         };
 
+        if stmt.from.is_no_relation() && matches!(stmt.projection, Projection::Star) {
+            return Err(ExecError::eval(
+                "42601",
+                "SELECT * with no tables specified is not valid",
+            ));
+        }
         let items = self.items(stmt, &scope);
         needs_frame |= items.iter().any(|(e, _)| has_subquery(e));
         let aggregate = !stmt.group_by.is_empty()
@@ -421,6 +433,9 @@ impl Compiler<'_> {
     }
 
     fn source(&self, table: &TableRef, ctes: &Ctes) -> Result<(SourceTable, RelSchema), ExecError> {
+        if table.is_no_relation() {
+            return Ok((SourceTable::OneRow, RelSchema::new(Vec::new())));
+        }
         if table.schema.is_none() {
             if let Some((_, q)) = ctes.iter().rev().find(|(n, _)| *n == table.table) {
                 let schema = RelSchema::new(q.columns.clone());
@@ -661,6 +676,11 @@ impl Compiler<'_> {
                     self.max_param.set(self.max_param.get().max(n));
                 }
                 self.record(&r, lt);
+                let rt = match &r {
+                    CExpr::Lit(v) => literal_type(v),
+                    _ => None,
+                };
+                let ((l, _), (r, _)) = comparable((l, lt), (r, rt))?;
                 CExpr::Cmp(*op, Box::new(l), Box::new(r))
             }
         })
@@ -724,7 +744,12 @@ impl Compiler<'_> {
                     self.record(&l, rt);
                     self.record(&r, lt);
                 }
-                binary(*op, l, lt, r, rt)?
+                if let BinOp::Cmp(_) = op {
+                    let ((l, lt), (r, rt)) = comparable((l, lt), (r, rt))?;
+                    binary(*op, l, lt, r, rt)?
+                } else {
+                    binary(*op, l, lt, r, rt)?
+                }
             }
             ScalarExpr::IsNull { expr, negated } => (
                 CExpr::IsNull(Box::new(sub(expr, ctx)?.0), *negated),
@@ -741,6 +766,7 @@ impl Compiler<'_> {
                     let (c, ct) = sub(x, ctx)?;
                     self.record(&c, et);
                     self.record(&e, ct);
+                    let (_, (c, _)) = comparable((CExpr::Lit(Value::Null), et), (c, ct))?;
                     items.push(c);
                 }
                 let list = items;
@@ -762,6 +788,8 @@ impl Compiler<'_> {
                 let (e, et) = sub(expr, ctx)?;
                 let (lo, lot) = sub(low, ctx)?;
                 let (hi, hit) = sub(high, ctx)?;
+                let (_, (lo, lot)) = comparable((CExpr::Lit(Value::Null), et), (lo, lot))?;
+                let (_, (hi, hit)) = comparable((CExpr::Lit(Value::Null), et), (hi, hit))?;
                 self.record(&lo, et);
                 self.record(&hi, et);
                 self.record(&e, lot.or(hit));
@@ -1215,6 +1243,89 @@ pub(crate) fn is_utc(zone: &str) -> bool {
         zone.to_ascii_uppercase().as_str(),
         "UTC" | "ETC/UTC" | "Z" | "ZULU" | "GMT"
     )
+}
+
+/// Make two operands of a comparison comparable, as PostgreSQL resolves them:
+/// a string literal facing a typed operand is read as that type (a literal that
+/// is not a valid value of it is an error at plan time), and two typed operands
+/// from different type families are refused (42883) rather than compared as
+/// UNKNOWN, which would silently drop every row.
+fn comparable(
+    (l, lt): Typed,
+    (r, rt): Typed,
+) -> Result<(Typed, Typed), ExecError> {
+    let (l, lt) = coerce_literal(l, lt, rt)?;
+    let (r, rt) = coerce_literal(r, rt, lt)?;
+    if let (Some(a), Some(b)) = (lt, rt) {
+        if family(a) != family(b) {
+            return Err(ExecError::eval(
+                "42883",
+                format!("operator does not exist: {a:?} compared with {b:?}"),
+            ));
+        }
+    }
+    Ok(((l, lt), (r, rt)))
+}
+
+/// The legacy `column <op> literal` form, resolved as [`comparable`] does: the
+/// literal read as the column's type when it is a string (`Some(value)`),
+/// unchanged when the families already agree (`None`), refused otherwise.
+pub(crate) fn coerce_legacy_literal(
+    literal: &Value,
+    column: ColumnType,
+) -> Result<Option<Value>, ExecError> {
+    let lit_ty = literal_type(literal);
+    let (coerced, ty) = coerce_literal(CExpr::Lit(literal.clone()), lit_ty, Some(column))?;
+    match (coerced, ty) {
+        (_, Some(t)) if family(t) != family(column) => Err(ExecError::eval(
+            "42883",
+            format!("operator does not exist: {column:?} compared with {t:?}"),
+        )),
+        (CExpr::Lit(v), Some(t)) if Some(t) != lit_ty => Ok(Some(v)),
+        _ => Ok(None),
+    }
+}
+
+/// A string literal facing an operand of another type, read as that type.
+fn coerce_literal(e: CExpr, ty: Ty, other: Ty) -> Result<(CExpr, Ty), ExecError> {
+    match (e, other) {
+        (CExpr::Lit(v @ Value::Text(_)), Some(t)) if family(t) != family(ColumnType::Text) => {
+            Ok((CExpr::Lit(eval::cast(v, t)?), Some(t)))
+        }
+        (e, _) => Ok((e, ty)),
+    }
+}
+
+/// Types that compare with each other.
+#[derive(PartialEq, Eq)]
+enum Family {
+    Number,
+    Time,
+    Text,
+    Json,
+    Array(u8),
+    Other(ColumnType),
+}
+
+fn family(t: ColumnType) -> Family {
+    match t {
+        ColumnType::Int
+        | ColumnType::BigInt
+        | ColumnType::Numeric
+        | ColumnType::Float
+        | ColumnType::Oid => Family::Number,
+        ColumnType::Timestamp | ColumnType::TimestampTz => Family::Time,
+        ColumnType::Text => Family::Text,
+        ColumnType::Json | ColumnType::Jsonb => Family::Json,
+        ColumnType::Array(e) => Family::Array(match family(elem_type(e)) {
+            Family::Number => 0,
+            Family::Time => 1,
+            Family::Text => 2,
+            Family::Json => 3,
+            _ => 4 + e as u8,
+        }),
+        other => Family::Other(other),
+    }
 }
 
 /// Combine two typed operands.

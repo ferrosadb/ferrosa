@@ -232,6 +232,51 @@ fn eval_kleene(
     }
 }
 
+/// A copy of `stmt` whose WHERE literals are read as their columns' types, or
+/// `None` when no literal needs it. A literal of another type family is refused.
+fn coerce_filter_literals(
+    stmt: &SelectStmt,
+    scope: &[Bound],
+    schema: &RelSchema,
+) -> Result<Option<SelectStmt>, ExecError> {
+    let Some(filter) = &stmt.filter else {
+        return Ok(None);
+    };
+    let mut filter = filter.clone();
+    if !coerce_terms(&mut filter, scope, schema)? {
+        return Ok(None);
+    }
+    let mut copy = stmt.clone();
+    copy.filter = Some(filter);
+    Ok(Some(copy))
+}
+
+/// Coerce every `column <op> literal` leaf in place; whether any changed.
+fn coerce_terms(expr: &mut Expr, scope: &[Bound], schema: &RelSchema) -> Result<bool, ExecError> {
+    match expr {
+        Expr::And(l, r) | Expr::Or(l, r) => {
+            let a = coerce_terms(l, scope, schema)?;
+            Ok(coerce_terms(r, scope, schema)? || a)
+        }
+        Expr::Not(inner) => coerce_terms(inner, scope, schema),
+        Expr::Compare {
+            left: Operand::Column(col),
+            value: Term::Literal(v),
+            ..
+        } => {
+            let ty = schema.columns[resolve_column(scope, col)?].ty;
+            match crate::general::coerce_legacy_literal(v, ty)? {
+                Some(new) => {
+                    *v = new;
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        }
+        Expr::Compare { .. } | Expr::Scalar(_) => Ok(false),
+    }
+}
+
 /// Validate that every `$N` parameter referenced anywhere in a boolean
 /// expression has a bound value in `params`. Fail-loud entry point so a missing
 /// parameter is reported before any row is evaluated.
@@ -418,6 +463,10 @@ pub fn open_cursor(
         validate_params(h, params)?;
     }
     let (scope, combined_schema) = resolve_scope(stmt, catalog, default_schema)?;
+    // `ts_col > '2020-01-01'`: read each literal as its column's type, so a
+    // comparison never silently turns UNKNOWN on a type mismatch.
+    let coerced = coerce_filter_literals(stmt, &scope, &combined_schema)?;
+    let stmt = coerced.as_ref().unwrap_or(stmt);
 
     let from = resolve_table(catalog, &stmt.from, default_schema)?;
     if count_all_shape(stmt) {

@@ -728,3 +728,192 @@ fn a_correlated_subquery_still_sees_each_outer_row() {
         ]
     );
 }
+
+// -- SELECT without FROM: the general planner over one empty row ----------------
+
+#[test]
+fn a_select_without_from_evaluates_general_expressions() {
+    let cat = catalog();
+    assert_eq!(
+        select_in(
+            &cat,
+            "public",
+            "SELECT coalesce($1, 0) + 1, json_build_object('q', $2)::text",
+            &[Value::Null, text("a")]
+        ),
+        vec![vec![int(1), text(r#"{"q": "a"}"#)]]
+    );
+    assert_eq!(
+        select_in(
+            &cat,
+            "public",
+            "SELECT EXISTS (SELECT 1 FROM t WHERE id = 3)",
+            &[]
+        ),
+        vec![vec![Value::Bool(true)]]
+    );
+}
+
+#[test]
+fn a_plain_select_without_from_keeps_the_scalar_path() {
+    assert!(matches!(
+        parse_statement("SELECT 1").unwrap(),
+        Statement::SelectExprs(_)
+    ));
+    assert!(matches!(
+        parse_statement("SELECT version()").unwrap(),
+        Statement::SelectExprs(_)
+    ));
+    assert!(matches!(
+        parse_statement("SELECT coalesce(1, 2)").unwrap(),
+        Statement::Select(_)
+    ));
+}
+
+/// The statements the PL/pgSQL layer (W4) sends for each expression it
+/// evaluates, verbatim, with NEW/OLD/TG_OP already bound as parameters.
+#[test]
+fn plpgsql_expression_statements_evaluate() {
+    let cat = catalog();
+    let one = |sql: &str, params: &[Value]| -> Value {
+        let Statement::Select(stmt) =
+            parse_statement(sql).unwrap_or_else(|e| panic!("parse {sql}: {e}"))
+        else {
+            panic!("{sql}: expected a general select");
+        };
+        let mut rows = execute(&stmt, &cat, "public", params)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .rows;
+        assert_eq!(rows.len(), 1, "{sql}");
+        rows.remove(0).0.remove(0)
+    };
+    let t = Value::Bool(true);
+    assert_eq!(one("SELECT ($1 = 'INSERT')", &[text("INSERT")]), t);
+    assert_eq!(
+        one("SELECT $1 = 'available'", &[text("scheduled")]),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        one(
+            "SELECT json_build_object('queue', $1, 'state', $2)::text",
+            &[text("default"), text("available")]
+        ),
+        text(r#"{"queue": "default", "state": "available"}"#)
+    );
+    assert_eq!(
+        one(
+            "SELECT json_build_object('queue', $1, 'new_state', $2, 'old_state', $3)::text",
+            &[text("q"), text("a"), Value::Null]
+        ),
+        text(r#"{"queue": "q", "new_state": "a", "old_state": null}"#)
+    );
+    // A job scheduled in the past is not "in the future".
+    assert_eq!(
+        one(
+            "SELECT $1 IS NOT NULL AND $1 > now() AT TIME ZONE 'utc'",
+            &[Value::Timestamp(0)]
+        ),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        one(
+            "SELECT $1 IS NOT NULL AND $1 > now() AT TIME ZONE 'utc'",
+            &[Value::Null]
+        ),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        one(
+            "SELECT (CASE WHEN $1 > 2147483647 THEN mod($1, 2147483647) ELSE $1 END)::int",
+            &[int(2147483650)]
+        ),
+        int(3)
+    );
+    assert_eq!(
+        one(
+            "SELECT (CASE WHEN $1 > 2147483647 THEN mod($1, 2147483647) ELSE $1 END)::int",
+            &[int(5)]
+        ),
+        int(5)
+    );
+    // These three stay on the scalar path the front end already serves.
+    for sql in ["SELECT 'public.oban_insert'", "SELECT NULL"] {
+        assert!(
+            matches!(parse_statement(sql).unwrap(), Statement::SelectExprs(_)),
+            "{sql}"
+        );
+    }
+    let s = parse_statement("SELECT $1::text").unwrap();
+    match s {
+        Statement::Select(_) => assert_eq!(one("SELECT $1::text", &[int(7)]), text("7")),
+        Statement::SelectExprs(_) => {}
+        other => panic!("{other:?}"),
+    }
+}
+
+// -- untyped literals take the other side's type; typed mismatches are errors ----
+
+fn events() -> MapCatalog {
+    use ColumnType::*;
+    let e = table(
+        &[("id", Int), ("at", Timestamp), ("u", Uuid)],
+        vec![
+            vec![int(1), Value::Timestamp(0), Value::Uuid(uuid::Uuid::nil())],
+            // 2020-01-02 00:00:00 UTC
+            vec![
+                int(2),
+                Value::Timestamp(1_577_923_200_000_000),
+                Value::Uuid(uuid::Uuid::max()),
+            ],
+        ],
+    );
+    MapCatalog::new().with_table("public", "e", e)
+}
+
+#[test]
+fn a_string_literal_compared_with_a_timestamp_is_read_as_a_timestamp() {
+    let cat = events();
+    assert_eq!(
+        select_in(
+            &cat,
+            "public",
+            "SELECT id FROM e WHERE at > '2020-01-01' AND id IN (1, 2)",
+            &[]
+        ),
+        vec![vec![int(2)]]
+    );
+    assert_eq!(
+        select_in(
+            &cat,
+            "public",
+            "SELECT id FROM e WHERE at = '2020-01-02 00:00:00'",
+            &[]
+        ),
+        vec![vec![int(2)]]
+    );
+    assert_eq!(
+        select_in(
+            &cat,
+            "public",
+            "SELECT id FROM e WHERE u = '00000000-0000-0000-0000-000000000000'",
+            &[]
+        ),
+        vec![vec![int(1)]]
+    );
+}
+
+#[test]
+fn a_literal_that_cannot_be_the_other_type_is_an_error_not_unknown() {
+    let Statement::Select(stmt) = parse_statement("SELECT id FROM e WHERE at > 'soon'").unwrap()
+    else {
+        panic!()
+    };
+    let err = execute(&stmt, &events(), "public", &[]).expect_err("bad timestamp literal");
+    assert_eq!(sqlstate(&err), "22007", "{err}");
+}
+
+#[test]
+fn comparing_two_typed_values_of_different_types_is_an_error_not_unknown() {
+    let err = select_err("SELECT id FROM t WHERE s = a", &[]);
+    assert_eq!(sqlstate(&err), "42883", "{err}");
+}

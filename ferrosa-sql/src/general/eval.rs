@@ -76,7 +76,7 @@ fn eval_node(e: &CExpr, env: &Env<'_>) -> R<Value> {
             right,
             ty,
         } => arith(*op, eval(left, env)?, eval(right, env)?, *ty),
-        CExpr::Cmp(op, l, r) => Ok(tv(compare(*op, &eval(l, env)?, &eval(r, env)?))),
+        CExpr::Cmp(op, l, r) => Ok(tv(compare(*op, &eval(l, env)?, &eval(r, env)?)?)),
         CExpr::And(l, r) => {
             // FALSE dominates, so the right side is not evaluated after a FALSE.
             let a = truth(&eval(l, env)?)?;
@@ -101,7 +101,7 @@ fn eval_node(e: &CExpr, env: &Env<'_>) -> R<Value> {
             let x = eval(expr, env)?;
             let mut acc = Some(false);
             for item in list {
-                acc = kleene_or(acc, compare(CmpOp::Eq, &x, &eval(item, env)?));
+                acc = kleene_or(acc, compare(CmpOp::Eq, &x, &eval(item, env)?)?);
                 if acc == Some(true) {
                     break;
                 }
@@ -115,8 +115,8 @@ fn eval_node(e: &CExpr, env: &Env<'_>) -> R<Value> {
             negated,
         } => {
             let x = eval(expr, env)?;
-            let lo = compare(CmpOp::Ge, &x, &eval(low, env)?);
-            let hi = compare(CmpOp::Le, &x, &eval(high, env)?);
+            let lo = compare(CmpOp::Ge, &x, &eval(low, env)?)?;
+            let hi = compare(CmpOp::Le, &x, &eval(high, env)?)?;
             let t = kleene_and(lo, hi);
             Ok(tv(if *negated { t.map(|b| !b) } else { t }))
         }
@@ -242,16 +242,48 @@ pub(crate) fn order(a: &Value, b: &Value) -> Option<Ordering> {
     }
 }
 
-pub(crate) fn compare(op: CmpOp, a: &Value, b: &Value) -> Option<bool> {
-    let ord = order(a, b)?;
-    Some(match op {
+/// Compare two values: UNKNOWN (`Ok(None)`) when either is NULL or a float is
+/// NaN; an error when two non-NULL values of different types meet, exactly as
+/// PostgreSQL refuses `text = integer`. A mismatch is never folded into UNKNOWN,
+/// which would silently drop rows (`Expr.lean` `strict_compare_*`).
+pub(crate) fn compare(op: CmpOp, a: &Value, b: &Value) -> R<Option<bool>> {
+    if a.is_null() || b.is_null() {
+        return Ok(None);
+    }
+    let Some(ord) = order(a, b) else {
+        let nan = |v: &Value| matches!(v, Value::Float(x) if x.0.is_nan());
+        if nan(a) || nan(b) {
+            return Ok(None);
+        }
+        return Err(ExecError::eval(
+            "42883",
+            format!(
+                "operator does not exist: {} {} {}",
+                type_name(a),
+                cmp_symbol(op),
+                type_name(b)
+            ),
+        ));
+    };
+    Ok(Some(match op {
         CmpOp::Eq => ord == Ordering::Equal,
         CmpOp::Ne => ord != Ordering::Equal,
         CmpOp::Lt => ord == Ordering::Less,
         CmpOp::Le => ord != Ordering::Greater,
         CmpOp::Gt => ord == Ordering::Greater,
         CmpOp::Ge => ord != Ordering::Less,
-    })
+    }))
+}
+
+fn cmp_symbol(op: CmpOp) -> &'static str {
+    match op {
+        CmpOp::Eq => "=",
+        CmpOp::Ne => "<>",
+        CmpOp::Lt => "<",
+        CmpOp::Le => "<=",
+        CmpOp::Gt => ">",
+        CmpOp::Ge => ">=",
+    }
 }
 
 /// `x <op> ANY(array)`: TRUE if some element satisfies it, else UNKNOWN if `x`
@@ -272,7 +304,7 @@ fn any(op: CmpOp, x: &Value, arr: &Value) -> R<Value> {
     };
     let mut acc = Some(false);
     for item in items {
-        acc = kleene_or(acc, compare(op, x, item));
+        acc = kleene_or(acc, compare(op, x, item)?);
         if acc == Some(true) {
             break;
         }
@@ -293,7 +325,7 @@ fn case(
     for (when, then) in whens {
         let w = eval(when, env)?;
         let hit = match &subject {
-            Some(s) => compare(CmpOp::Eq, s, &w) == Some(true),
+            Some(s) => compare(CmpOp::Eq, s, &w)? == Some(true),
             None => truth(&w)? == Some(true),
         };
         if hit {
@@ -317,7 +349,7 @@ fn function(f: Func, args: &[CExpr], env: &Env<'_>) -> R<Value> {
         Func::NullIf => {
             let a = eval(&args[0], env)?;
             let b = eval(&args[1], env)?;
-            Ok(if compare(CmpOp::Eq, &a, &b) == Some(true) {
+            Ok(if compare(CmpOp::Eq, &a, &b)? == Some(true) {
                 Value::Null
             } else {
                 a
@@ -607,6 +639,7 @@ pub(crate) fn cast(v: Value, ty: ColumnType) -> R<Value> {
         },
         ColumnType::Timestamp | ColumnType::TimestampTz => match v {
             Value::Timestamp(_) => Ok(v),
+            Value::Text(t) => parse_timestamp(t.as_str()).map(Value::Timestamp),
             Value::Date(d) => Ok(Value::Timestamp(i64::from(d) * 86_400_000_000)),
             other => Err(cannot_cast(&other, ty)),
         },
@@ -619,6 +652,101 @@ pub(crate) fn cast(v: Value, ty: ColumnType) -> R<Value> {
             }
         }
     }
+}
+
+/// `YYYY-MM-DD[( |T)HH:MM[:SS[.ffffff]]][Z|+00[:00]]` as microseconds since the
+/// Unix epoch. Only a zero UTC offset is accepted; any other offset needs a zone
+/// database and is refused (0A000), never silently ignored.
+fn parse_timestamp(input: &str) -> R<i64> {
+    let bad = || {
+        ExecError::eval(
+            "22007",
+            format!("invalid input syntax for type timestamp: \"{input}\""),
+        )
+    };
+    let s = input.trim();
+    let s = s
+        .strip_suffix('Z')
+        .or_else(|| s.strip_suffix("+00:00"))
+        .or_else(|| s.strip_suffix("+00"))
+        .unwrap_or(s);
+    if s.len() > 10 && (s[10..].contains('+') || s[11..].contains('-')) {
+        return Err(ExecError::Unsupported(format!(
+            "a timestamp with a non-UTC offset: {input:?}"
+        )));
+    }
+    let (date, time) = match s.split_once([' ', 'T']) {
+        Some((d, t)) => (d, Some(t)),
+        None => (s, None),
+    };
+    let days = parse_date_days(date).ok_or_else(bad)?;
+    let micros_of_day = match time {
+        None => 0,
+        Some(t) => parse_time_micros(t).ok_or_else(bad)?,
+    };
+    days.checked_mul(86_400_000_000)
+        .and_then(|d| d.checked_add(micros_of_day))
+        .ok_or_else(bad)
+}
+
+fn parse_date_days(d: &str) -> Option<i64> {
+    let mut parts = d.splitn(3, '-');
+    let y: i64 = parts.next()?.parse().ok()?;
+    let m: i64 = parts.next()?.parse().ok()?;
+    let day: i64 = parts.next()?.parse().ok()?;
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let month_len = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    if !(1..=12).contains(&m) || day < 1 || day > month_len[(m - 1) as usize] {
+        return None;
+    }
+    Some(days_from_civil(y, m, day))
+}
+
+fn parse_time_micros(t: &str) -> Option<i64> {
+    let (hms, frac) = t.split_once('.').unwrap_or((t, ""));
+    let mut parts = hms.split(':');
+    let h: i64 = parts.next()?.parse().ok()?;
+    let m: i64 = parts.next()?.parse().ok()?;
+    let sec: i64 = match parts.next() {
+        Some(x) => x.parse().ok()?,
+        None => 0,
+    };
+    if parts.next().is_some() || h > 23 || m > 59 || sec > 59 || frac.len() > 6 {
+        return None;
+    }
+    if !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let frac_micros: i64 = if frac.is_empty() {
+        0
+    } else {
+        format!("{frac:0<6}").parse().ok()?
+    };
+    Some(((h * 60 + m) * 60 + sec) * 1_000_000 + frac_micros)
+}
+
+/// Howard Hinnant's civil-to-days algorithm, the inverse of `civil_from_days`.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 fn cast_array(v: Value, elem: ArrayElem) -> R<Value> {
@@ -884,6 +1012,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn timestamp_text_round_trips_through_parse() {
+        for micros in [0, 951_827_696_500_000, -1, 1_577_923_200_000_000] {
+            assert_eq!(parse_timestamp(&timestamp_text(micros)), Ok(micros));
+        }
+        assert_eq!(parse_timestamp("2020-01-02"), Ok(1_577_923_200_000_000));
+        assert_eq!(
+            parse_timestamp("2020-01-02T00:00:00Z"),
+            Ok(1_577_923_200_000_000)
+        );
+        assert!(parse_timestamp("2021-02-29").is_err(), "not a leap year");
+        assert!(matches!(
+            parse_timestamp("2020-01-02 00:00:00+05"),
+            Err(ExecError::Unsupported(_))
+        ));
+    }
+
+    #[test]
     fn timestamp_text_is_postgres_iso() {
         assert_eq!(timestamp_text(0), "1970-01-01 00:00:00");
         // 2000-02-29 12:34:56.5 UTC: a leap day, fractional seconds trimmed.
@@ -955,7 +1100,7 @@ mod tests {
         let one_point_oh = Value::numeric(BigInt::from(10), 1);
         assert_eq!(
             compare(CmpOp::Eq, &Value::Int(1), &one_point_oh),
-            Some(true)
+            Ok(Some(true))
         );
     }
 }

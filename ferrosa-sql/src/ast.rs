@@ -878,7 +878,9 @@ impl SelectStmt {
         let mut out = Vec::new();
         self.collect_tables(&mut out);
         let ctes: Vec<&str> = self.ctes.iter().map(|c| c.name.as_str()).collect();
-        out.retain(|t| t.schema.is_some() || !ctes.contains(&t.table.as_str()));
+        out.retain(|t| {
+            !t.is_no_relation() && (t.schema.is_some() || !ctes.contains(&t.table.as_str()))
+        });
         out
     }
 
@@ -917,6 +919,7 @@ impl SelectStmt {
             || self.having.as_ref().is_some_and(Expr::has_scalar)
             || self.limit_param.is_some()
             || self.offset_param.is_some()
+            || self.from.is_no_relation()
     }
 }
 
@@ -1105,6 +1108,21 @@ pub struct TableRef {
 }
 
 impl TableRef {
+    /// The `FROM` of a select that has none: one row with no columns, as
+    /// PostgreSQL evaluates `SELECT coalesce($1, 0)`. Names no relation.
+    pub fn no_relation() -> Self {
+        TableRef {
+            schema: None,
+            table: String::new(),
+            alias: None,
+        }
+    }
+
+    /// Whether this is [`TableRef::no_relation`].
+    pub fn is_no_relation(&self) -> bool {
+        self.schema.is_none() && self.table.is_empty()
+    }
+
     /// The name a column qualifier must match: the alias if present, else the table.
     pub fn binding_name(&self) -> &str {
         self.alias.as_deref().unwrap_or(&self.table)

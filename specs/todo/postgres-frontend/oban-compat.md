@@ -193,3 +193,21 @@ against ferrosa.
   `anyLoop_is_anyEq` and `anyLoop_true_absorbs` (the evaluator's early-exit
   fold equals `anyEq`).
 * **`array_append` is missing** (census row 15). Open, W1/W2.
+* **A type mismatch in a comparison was silently UNKNOWN.** Fixed, in both the
+  legacy and the general planner. `WHERE ts > '2020-01-01'` compared a timestamp
+  with a string, got UNKNOWN on every row, and returned nothing.
+  * A string literal is now read as the type it faces, at plan time: timestamp,
+    uuid, integer and so on. An invalid literal is a 22007 or 22P02 error.
+  * Two typed operands of different families are refused (42883), at plan time
+    and at run time.
+  * Text-to-timestamp casts now parse ISO input. Only a zero UTC offset is
+    accepted; any other offset is 0A000.
+  * Lean: `strict_unknown_only_from_null`, `strict_agrees_on_same_type`,
+    `strict_refuses_mismatch`.
+  * Tests: `a_string_literal_compared_with_a_timestamp_is_read_as_a_timestamp`,
+    `a_literal_that_cannot_be_the_other_type_is_an_error_not_unknown`,
+    `comparing_two_typed_values_of_different_types_is_an_error_not_unknown`.
+* **A no-`FROM` select only had the narrow scalar grammar.** Fixed: what the
+  scalar path cannot read is a general select over one empty row. Covers
+  PL/pgSQL's `SELECT <expr>` with `$n` bindings (W4). Test:
+  `plpgsql_expression_statements_evaluate`.

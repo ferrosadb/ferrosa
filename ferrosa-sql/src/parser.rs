@@ -154,21 +154,21 @@ pub fn parse_statement(sql: &str) -> Result<Statement, ParseError> {
     match p.peek() {
         Some(Tok::Select) => {
             if p.is_expr_select() {
-                let items = p.parse_scalar_select()?;
-                // `SELECT 'a' || 'b' FROM t`: the expression select list parsed,
-                // but a `FROM` means the user meant a table query — and `||` over
-                // a relation is not evaluable (see `parse_select_item`). Name it
-                // instead of reporting a bare "expected end of statement".
-                if matches!(p.peek(), Some(Tok::From))
-                    && items
-                        .iter()
-                        .any(|item| matches!(item.value, ScalarValue::Concat { .. }))
-                {
-                    return Err(ParseError::UnsupportedSelectExpr(
-                        "`||` concatenation over a FROM relation",
-                    ));
+                // The scalar path first: it owns the session functions (`version()`,
+                // `current_setting(..)`) the front end evaluates. Anything it cannot
+                // read is a general expression select over one empty row.
+                let start = p.pos;
+                let scalar = p.parse_scalar_select().and_then(|items| {
+                    p.expect_end()?;
+                    Ok(items)
+                });
+                if scalar.is_err() {
+                    p.pos = start;
+                    if let Ok(stmt) = parse(trimmed) {
+                        return Ok(Statement::Select(Box::new(stmt)));
+                    }
                 }
-                p.expect_end()?;
+                let items = scalar?;
                 Ok(Statement::SelectExprs(items))
             } else {
                 // Table query: reuse the full SELECT grammar on the same SQL.
@@ -736,9 +736,15 @@ impl Parser {
             false
         };
         let projection = self.parse_projection()?;
-        self.expect(&Tok::From, "FROM")?;
-        let from = self.parse_table_ref()?;
-        let (join, joins) = self.parse_joins()?;
+        // No FROM: the general planner evaluates the items over one empty row.
+        let (from, join, joins) = if matches!(self.peek(), Some(Tok::From)) {
+            self.next();
+            let from = self.parse_table_ref()?;
+            let (join, joins) = self.parse_joins()?;
+            (from, join, joins)
+        } else {
+            (TableRef::no_relation(), None, Vec::new())
+        };
         let filter = if matches!(self.peek(), Some(Tok::Where)) {
             self.next();
             Some(self.parse_condition()?)
@@ -4211,14 +4217,13 @@ mod tests {
     }
 
     #[test]
-    fn a_parenthesised_scalar_that_is_not_a_select_is_still_refused() {
-        // Negative control: only `( SELECT ... )` becomes a subquery. An ordinary
-        // parenthesised scalar was unsupported before and stays so — this must
-        // never be silently accepted as something else.
-        for sql in ["SELECT (1)", "SELECT ('a')", "SELECT (version())"] {
+    fn a_parenthesised_scalar_is_a_general_expression_select() {
+        // `SELECT (1)` is valid PostgreSQL: the scalar path does not read it, so
+        // the general planner does (over one empty row), never something else.
+        for sql in ["SELECT (1)", "SELECT ('a')"] {
             assert!(
-                parse_statement(sql).is_err(),
-                "`{sql}` must still be refused: parenthesised scalars are not a subquery"
+                matches!(parse_statement(sql), Ok(Statement::Select(_))),
+                "`{sql}` is a general select"
             );
         }
     }
@@ -4226,12 +4231,10 @@ mod tests {
     #[test]
     fn a_malformed_scalar_subquery_is_refused() {
         // Negative control: a subquery that is not a well-formed `( SELECT ... )`
-        // fails loud — an unclosed paren, an extra paren, and an inner query with
-        // no `FROM` (the probe's shape needs a relation to count over).
+        // fails loud — an unclosed paren, an extra paren, a dangling operator.
         for sql in [
             "SELECT (SELECT count(*) FROM t",
             "SELECT (SELECT count(*) FROM t))",
-            "SELECT (SELECT 1)",
             "SELECT (SELECT count(*) FROM t) || ",
         ] {
             assert!(
@@ -4239,14 +4242,17 @@ mod tests {
                 "`{sql}` is malformed and must be refused"
             );
         }
+        // A FROM-less inner query is valid SQL and parses.
+        assert!(parse_statement("SELECT (SELECT 1)").is_ok());
     }
 
     #[test]
-    fn a_scalar_subquery_outside_the_select_list_is_refused() {
-        // The new grammar reaches only the select-list scalar primary. A subquery
-        // in WHERE stays unsupported (the WHERE grammar takes a column/aggregate
-        // operand or a literal/`$N` term), and is refused loudly, not ignored.
-        assert!(parse_statement("SELECT a FROM t WHERE k = (SELECT 1)").is_err());
+    fn a_scalar_subquery_in_where_is_a_general_condition() {
+        let Ok(Statement::Select(stmt)) = parse_statement("SELECT a FROM t WHERE k = (SELECT 1)")
+        else {
+            panic!("a subquery in WHERE parses");
+        };
+        assert!(matches!(stmt.filter, Some(Expr::Scalar(_))));
     }
 }
 
