@@ -187,3 +187,64 @@ async fn awaits_w3_a_do_block_creates_a_table() {
         .await
         .expect("the table exists");
 }
+
+#[tokio::test]
+async fn conditions_and_assignments_evaluate_through_the_sql_engine_with_bound_variables() {
+    let server = pg_server::start_server(0).await;
+    let client = pg_server::connect(server.port).await;
+    client
+        .batch_execute(
+            "DO $$ DECLARE op text := 'INSERT'; label text; BEGIN \
+               IF (op = 'INSERT') THEN label := 'is ' || op; ELSE label := 'no'; END IF; \
+               IF label = 'is INSERT' THEN \
+                 INSERT INTO ks.t (id, ck, name, score) VALUES ('w1', 1, label, 1); \
+               END IF; END $$",
+        )
+        .await
+        .expect("DO evaluates `$1 = 'INSERT'` and `'is ' || $1`");
+    let rows = client
+        .query("SELECT name FROM ks.t WHERE id = 'w1'", &[])
+        .await
+        .expect("read");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, String>(0), "is INSERT");
+}
+
+#[tokio::test]
+async fn json_build_object_over_a_variable_assigns_a_json_value() {
+    let server = pg_server::start_server(0).await;
+    let client = pg_server::connect(server.port).await;
+    client
+        .batch_execute(
+            "DO $$ DECLARE q text := 'default'; notice json; label text; BEGIN \
+               notice = json_build_object('queue', q); \
+               label = notice::text; \
+               INSERT INTO ks.t (id, ck, name, score) VALUES ('j', 1, label, 1); END $$",
+        )
+        .await
+        .expect("json_build_object evaluates");
+    let rows = client
+        .query("SELECT name FROM ks.t WHERE id = 'j'", &[])
+        .await
+        .expect("read");
+    assert_eq!(rows[0].get::<_, String>(0), "{\"queue\": \"default\"}");
+}
+
+/// Awaits W1/W3: the census DO block verbatim. Today its guard stops at
+/// `'public'::regnamespace` (`0A000`, cast not supported); after that it needs `CREATE TYPE …
+/// AS ENUM` (W3) and transactional DDL inside the block's transaction (W3).
+#[cfg(feature = "pending-workstreams")]
+#[tokio::test]
+async fn awaits_w1_w3_the_census_do_block_creates_the_enum() {
+    let server = pg_server::start_server_with_ddl().await;
+    let client = pg_server::connect(server.port).await;
+    let census = "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'oban_job_state' AND typnamespace = 'public'::regnamespace::oid) THEN CREATE TYPE \"public\".oban_job_state AS ENUM ( 'available', 'suspended', 'scheduled', 'executing', 'retryable', 'completed', 'discarded', 'cancelled' ); END IF; END$$;;";
+    client
+        .batch_execute(census)
+        .await
+        .expect("the census DO block runs");
+    client
+        .batch_execute(census)
+        .await
+        .expect("and is idempotent");
+}

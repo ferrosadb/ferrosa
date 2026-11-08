@@ -277,7 +277,10 @@ impl Served<'_> {
                     .await
                     .map_err(|e| sql_error(&e))?,
             ),
-            Statement::SelectExprs(items) => {
+            Statement::SelectExprs(mut items) => {
+                for item in &mut items {
+                    bind_scalar(&mut item.value, &params)?;
+                }
                 let result = crate::server::scalar_select(self.ctx, session, &items)
                     .await
                     .map_err(|e| sql_error(&e))?;
@@ -348,6 +351,28 @@ impl Served<'_> {
             None => Ok(tag_count(&messages)),
         }
     }
+}
+
+/// Bind `$n` in a no-`FROM` expression select to its value: the legacy scalar grammar the
+/// engine keeps for literal-only selects takes no parameters itself, so the host binds them
+/// here (this is substitution of a bound value, not evaluation).
+fn bind_scalar(value: &mut ferrosa_sql::ScalarValue, params: &[SqlValue]) -> Result<(), SqlError> {
+    use ferrosa_sql::ScalarValue;
+    match value {
+        ScalarValue::Param(n) => {
+            let bound = params.get(n.wrapping_sub(1)).ok_or_else(|| {
+                SqlError::new("08P01", format!("no value bound for parameter ${n}"))
+            })?;
+            *value = ScalarValue::Literal(bound.clone()); // a placeholder may appear more than once
+        }
+        ScalarValue::Concat { left, right } => {
+            bind_scalar(left, params)?;
+            bind_scalar(right, params)?;
+        }
+        ScalarValue::Cast { value, .. } => bind_scalar(value, params)?,
+        ScalarValue::Literal(_) | ScalarValue::Func(_) | ScalarValue::Subquery(_) => {}
+    }
+    Ok(())
 }
 
 fn authorize(ctx: &QueryContext, session: &Session, statement: &Statement) -> Result<(), SqlError> {
