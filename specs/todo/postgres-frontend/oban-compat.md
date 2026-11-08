@@ -146,7 +146,53 @@ Under `specs/lean4/Ferrosa/Sql/`, one model per feature, written before its code
 **Acceptance:** the Elixir probe (`Postgrex` → `Ecto.Migrator` → `Oban`) runs one job
 against ferrosa.
 
-## Found while building
+## Found while building W1
+
+* **OID columns are `int4`.** The `pg_catalog` projections type every OID column as
+  `ColumnType::Int` (`int4`, OID 23), but synthetic OIDs lie in `[16384, u32::MAX]`.
+  * Text results are correct.
+  * In binary results an OID at or above 2³¹ fails to encode, because `int4` is signed.
+  * Fix: an `oid` column type (OID 26, unsigned 4-byte binary).
+  * Status: on W1's work list. Under the owner's rule, a found bug is fixed with a
+    test and a Lean spec before the work is done.
+* **Operator chains escaped the depth limit.** Fixed (2cb904c3): a long
+  `AND`/`+`/`||` chain built a tree as deep as the chain, and every recursive walk
+  of it could overflow a worker stack. Each link now counts against
+  `MAX_EXPR_DEPTH`, and recursion grows the stack on demand. Lean:
+  `Expr.lean` `accepted_chain_depth_bounded`, `deepenLoop_refuses`. Tests:
+  `parser_depth.rs` `long_*_chain`.
+* **Unqualified catalog names.** Fixed: `pg_type` meant `public.pg_type`.
+  PostgreSQL searches `pg_catalog` first, so `catalog::parse_pg` now qualifies
+  catalog relations (a CTE of the same name still shadows them). Test:
+  `unqualified_catalog_relations_resolve_in_pg_catalog`.
+* **`pg_type` had only two columns and listed only used types.** Fixed:
+  * every built-in type is listed, with PostgreSQL's I/O function names,
+    `typelem`, `typrelid` and `typbasetype`;
+  * `pg_attribute` now has `attisdropped`.
+  * Postgrex picks its codecs from these columns.
+* **`LIMIT $n` was not parsed.** Fixed: `LIMIT`/`OFFSET` take `$n` (and `LIMIT ALL`); NULL is no bound, a negative value is 2201W/2201X. Lean: `Limit.lean`.
+* **A no-`FROM` select uses the narrow scalar grammar.**
+  * `SELECT coalesce($1, 0)` and `SELECT pg_notify(...)` fail to parse.
+  * Route them to the general planner over a single empty row.
+  * Open, W1.
+* **An uncorrelated subquery is re-run for every outer row.** Correct but slow.
+  Cache the result of a subquery that reads no outer column. Open, W1 (perf).
+* **Not implemented yet; each is refused loudly (0A000):**
+  * numeric division;
+  * `AT TIME ZONE` with a zone other than UTC;
+  * `obj_description` (it needs W3's `pg_description`);
+  * `json_build_object`.
+
+  Open, W1. Wire them up as the Oban statements need them.
+* **`x IN (SELECT …)` was read as a scalar subquery inside a list.** It failed
+  with 21000 once the subquery returned more than one row. Fixed: `IN (subquery)`
+  and `op ANY (subquery)` now lower to `op ANY (ARRAY(subquery))`, which is how
+  PostgreSQL defines them; `NOT IN` is the negation. Lean:
+  `anyLoop_is_anyEq` and `anyLoop_true_absorbs` (the evaluator's early-exit
+  fold equals `anyEq`).
+* **`array_append` is missing** (census row 15). Open, W1/W2.
+
+## Found while building W3
 
 Bugs found in existing Ferrosa code while building this programme. Each is fixed in the
 workstream that found it, with a failing test first and a Lean model; the row records the

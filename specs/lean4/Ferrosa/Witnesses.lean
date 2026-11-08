@@ -26,7 +26,23 @@ import Ferrosa.Codec.Audit
 import Ferrosa.Sql.Ddl
 import Ferrosa.Sql.Enum
 import Ferrosa.Sql.Serial
+import Ferrosa.Sql.Expr
+import Ferrosa.Sql.Limit
 
+#check Ferrosa.Sql.Expr.legacy_compare_agrees
+#check Ferrosa.Sql.Expr.any_true_iff
+#check Ferrosa.Sql.Expr.any_false_iff
+#check Ferrosa.Sql.Expr.not_in_with_null_never_true
+#check Ferrosa.Sql.Expr.coalesce_first_non_null
+#check Ferrosa.Sql.Expr.filter_keeps_only_true
+#check Ferrosa.Sql.Expr.andChain_depth
+#check Ferrosa.Sql.Expr.accepted_chain_depth_bounded
+#check Ferrosa.Sql.Expr.deepenLoop_refuses
+#check Ferrosa.Sql.Expr.anyLoop_is_anyEq
+#check Ferrosa.Sql.Expr.anyLoop_true_absorbs
+#check Ferrosa.Sql.Limit.param_matches_literal
+#check Ferrosa.Sql.Limit.negative_is_refused
+#check Ferrosa.Sql.Limit.limit_offset_is_a_slice
 #check Ferrosa.Topology.DcQuorum.dc_quorum_writes_share_a_replica
 #check Ferrosa.Topology.DcQuorum.no_partition_admits_two_dc_quorum_writes
 #check Ferrosa.Topology.DcQuorum.node_gate_forces_a_shared_replica

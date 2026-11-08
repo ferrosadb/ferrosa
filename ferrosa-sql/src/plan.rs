@@ -111,6 +111,25 @@ pub enum ExecError {
     /// range`, 22003). Never wrapped: a silently wrong total is the one
     /// unacceptable outcome (invariant I-EXACT).
     AggregateOutOfRange(String),
+    /// A scalar expression failed while evaluating a row: division by zero,
+    /// overflow, an invalid cast input, a subquery returning several rows. Carries
+    /// the PostgreSQL SQLSTATE the front end reports.
+    Eval {
+        sqlstate: &'static str,
+        message: String,
+    },
+    /// A construct the engine recognises but does not implement yet. SQLSTATE
+    /// 0A000; never approximated.
+    Unsupported(String),
+}
+
+impl ExecError {
+    pub(crate) fn eval(sqlstate: &'static str, message: impl Into<String>) -> Self {
+        ExecError::Eval {
+            sqlstate,
+            message: message.into(),
+        }
+    }
 }
 
 impl fmt::Display for ExecError {
@@ -147,6 +166,8 @@ impl fmt::Display for ExecError {
                 ty.name()
             ),
             ExecError::AggregateOutOfRange(m) => write!(f, "{m}"),
+            ExecError::Eval { message, .. } => write!(f, "{message}"),
+            ExecError::Unsupported(what) => write!(f, "{what} is not supported"),
         }
     }
 }
@@ -195,6 +216,9 @@ fn eval_kleene(
             row.0[idx].sql_cmp(rhs).map(|ord| apply_cmp(*op, ord))
         }
         Expr::Not(inner) => eval_kleene(inner, row, params, resolve).map(|b| !b),
+        // `SelectStmt::is_general` routes every statement holding one of these to
+        // `plan_general`, so the legacy evaluator never sees it.
+        Expr::Scalar(_) => unreachable!("general expression on the legacy plan path"),
         Expr::And(l, r) => {
             let a = eval_kleene(l, row, params, resolve);
             let b = eval_kleene(r, row, params, resolve);
@@ -214,6 +238,9 @@ fn eval_kleene(
 fn validate_params(expr: &Expr, params: &[Value]) -> Result<(), ExecError> {
     match expr {
         Expr::Compare { value, .. } => resolve_term(value, params).map(|_| ()),
+        Expr::Scalar(_) => Err(ExecError::Unsupported(
+            "a general expression on the legacy plan path".into(),
+        )),
         Expr::Not(inner) => validate_params(inner, params),
         Expr::And(l, r) | Expr::Or(l, r) => {
             validate_params(l, params)?;
@@ -322,6 +349,8 @@ pub fn execute_streaming(
 pub struct RowCursor {
     columns: Vec<Column>,
     rows: TryRowStream<'static>,
+    /// The general planner's expression-error fence (see `general::run`).
+    fence: Option<Arc<crate::general::Fence>>,
 }
 
 impl fmt::Debug for RowCursor {
@@ -345,7 +374,13 @@ impl RowCursor {
     /// A spill failure. The rows returned before it are an incomplete result;
     /// the caller MUST report the error rather than treat the stream as done.
     pub fn next_row(&mut self) -> Option<Result<Row, ExecError>> {
-        self.rows.next().map(|row| row.map_err(ExecError::Spill))
+        let fence = self.fence.as_deref();
+        self.rows.next().map(|row| {
+            row.map_err(|e| match fence {
+                Some(fence) => fence.lift(e),
+                None => ExecError::Spill(e),
+            })
+        })
     }
 }
 
@@ -366,6 +401,15 @@ pub fn open_cursor(
     params: &[Value],
     ctx: &SpillCtx,
 ) -> Result<RowCursor, ExecError> {
+    if stmt.is_general() {
+        let query = crate::general::compile(stmt, catalog, default_schema)?;
+        let (rows, fence) = crate::general::run::open_top(&query, params, ctx)?;
+        return Ok(RowCursor {
+            columns: crate::general::columns(&query).to_vec(),
+            rows,
+            fence: Some(fence),
+        });
+    }
     // Fail loud up front if a referenced `$N` has no bound value.
     if let Some(f) = &stmt.filter {
         validate_params(f, params)?;
@@ -383,6 +427,7 @@ pub fn open_cursor(
                 .map_err(|_| ExecError::AggregateOutOfRange("COUNT exceeds bigint range".into()))?;
             return Ok(RowCursor {
                 columns,
+                fence: None,
                 rows: limit_offset(
                     Box::new(std::iter::once(Ok(Row(vec![Value::Int(count)])))),
                     stmt.offset.unwrap_or(0) as usize,
@@ -401,7 +446,11 @@ pub fn open_cursor(
     };
     let params: Arc<[Value]> = params.into();
     let (columns, rows) = build_pipeline(stmt, &scope, &combined_schema, sources, params, ctx)?;
-    Ok(RowCursor { columns, rows })
+    Ok(RowCursor {
+        columns,
+        rows,
+        fence: None,
+    })
 }
 
 fn count_all_shape(stmt: &SelectStmt) -> bool {
@@ -569,6 +618,10 @@ pub fn describe(
     catalog: &dyn Catalog,
     default_schema: &str,
 ) -> Result<Vec<Column>, ExecError> {
+    if stmt.is_general() {
+        let query = crate::general::compile(stmt, catalog, default_schema)?;
+        return Ok(crate::general::columns(&query).to_vec());
+    }
     let (scope, combined_schema) = resolve_scope(stmt, catalog, default_schema)?;
 
     // Aggregate mode iff GROUP BY / HAVING present or any aggregate select item.
@@ -597,6 +650,9 @@ pub fn infer_param_types(
     catalog: &dyn Catalog,
     default_schema: &str,
 ) -> Result<Vec<ColumnType>, ExecError> {
+    if stmt.is_general() {
+        return crate::general::infer_params(stmt, catalog, default_schema);
+    }
     let (scope, combined_schema) = resolve_scope(stmt, catalog, default_schema)?;
     let mut inferred: Vec<Option<ColumnType>> = Vec::new();
 
@@ -654,6 +710,9 @@ fn infer_in_expr(
             Ok(())
         }
         Expr::Not(inner) => infer_in_expr(inner, scope, combined_schema, record),
+        Expr::Scalar(_) => Err(ExecError::Unsupported(
+            "a general expression on the legacy plan path".into(),
+        )),
         Expr::And(l, r) | Expr::Or(l, r) => {
             infer_in_expr(l, scope, combined_schema, record)?;
             infer_in_expr(r, scope, combined_schema, record)
@@ -707,6 +766,11 @@ fn simple_projection(
                     }
                     // Unreachable: an aggregate item forces aggregate mode.
                     SelectItem::Aggregate { .. } => unreachable!("aggregate in simple plan"),
+                    SelectItem::Expr { .. } => {
+                        return Err(ExecError::Unsupported(
+                            "a general expression on the legacy plan path".into(),
+                        ))
+                    }
                 }
                 // An output alias renames only the RESULT column: the cell read is
                 // unchanged, so it is applied after the source column is resolved.
@@ -820,6 +884,11 @@ fn plan_aggregate(
                 let agg_index = intern_agg(*func, arg_col, &mut agg_defs, &mut agg_keys);
                 slots.push(Slot::Agg(agg_index));
                 out_columns.push(aggregate_column(*func, arg_col, combined_schema));
+            }
+            SelectItem::Expr { .. } => {
+                return Err(ExecError::Unsupported(
+                    "a general expression on the legacy plan path".into(),
+                ))
             }
         }
         // An output alias renames the RESULT column only; the aggregate or group
@@ -965,6 +1034,11 @@ fn aggregate_output_columns(
             SelectItem::Aggregate { func, arg, .. } => {
                 let arg_col = resolve_agg_arg(arg, scope)?;
                 out_columns.push(aggregate_column(*func, arg_col, combined_schema));
+            }
+            SelectItem::Expr { .. } => {
+                return Err(ExecError::Unsupported(
+                    "a general expression on the legacy plan path".into(),
+                ))
             }
         }
         // `describe` must advertise the same names `execute` produces, so the alias
@@ -1124,6 +1198,7 @@ impl OperandKey {
 fn collect_operands<'a>(expr: &'a Expr, out: &mut Vec<&'a Operand>) {
     match expr {
         Expr::Compare { left, .. } => out.push(left),
+        Expr::Scalar(_) => unreachable!("general expression on the legacy plan path"),
         Expr::Not(inner) => collect_operands(inner, out),
         Expr::And(l, r) | Expr::Or(l, r) => {
             collect_operands(l, out);
