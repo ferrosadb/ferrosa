@@ -88,6 +88,7 @@ pub(crate) async fn execute_create_index(
     let Some(meta) = env
         .view
         .tables
+        // The table map is keyed by an owned pair, so a lookup needs one.
         .get(&(keyspace.to_string(), stmt.table.table.clone()))
     else {
         return vec![error_response(
@@ -110,6 +111,7 @@ pub(crate) async fn execute_create_index(
         || env
             .view
             .tables
+            // As above: an owned key for the lookup.
             .contains_key(&(keyspace.to_string(), stmt.name.clone()));
     if taken {
         if stmt.if_not_exists {

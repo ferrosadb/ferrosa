@@ -141,6 +141,7 @@ pub(crate) fn apply_step(snap: &mut SchemaSnapshot, step: &DdlStep) -> Result<()
             table,
             name,
         } => {
+            // The index map is keyed by an owned triple, so a lookup needs one.
             let key = (keyspace.clone(), table.clone(), name.clone());
             match snap.indexes.remove(&key) {
                 Some(_) => Ok(()),
