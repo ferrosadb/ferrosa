@@ -873,6 +873,12 @@ pub(crate) async fn execute_create_table(
         Err(refusal) => return vec![refusal],
     };
     table.extensions.extend(enum_columns);
+    table.extensions.extend(
+        stmt.columns
+            .iter()
+            .filter(|def| def.serial)
+            .map(|def| crate::pg_default::serial_extension(&def.name)),
+    );
     if let Err(error) = env.schema.check_create_table_jsonb(&table) {
         return vec![schema_refusal(&error)];
     }
@@ -1004,6 +1010,7 @@ pub(crate) fn plan_create_table(
                 not_null: true,
                 primary_key: true,
                 user_type: None,
+                serial: false,
             },
         );
         primary_key = vec![SYNTHETIC_KEY_COLUMN.to_string()];

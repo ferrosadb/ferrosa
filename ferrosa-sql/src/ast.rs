@@ -319,6 +319,10 @@ pub struct ColumnDef {
     /// written. `ty` is then [`PgType::Text`], the storage of an enum; the front end
     /// resolves the name and refuses one that is not a known type.
     pub user_type: Option<TableRef>,
+    /// `bigserial` / `serial8`: `ty` is [`PgType::BigInt`] and the column's value, when an
+    /// INSERT omits it, is a server-generated unique id (D15). `serial`/`smallserial` are
+    /// refused at parse time (an id does not fit).
+    pub serial: bool,
 }
 
 /// A PostgreSQL column type accepted by `CREATE TABLE`, as written (aliases
@@ -401,7 +405,10 @@ impl UnsupportedClause {
     pub fn name(self) -> &'static str {
         match self {
             UnsupportedClause::Check => "CHECK",
-            UnsupportedClause::Serial => "SERIAL",
+            UnsupportedClause::Serial => {
+                "SERIAL/SMALLSERIAL (a server-generated id needs 64 bits: use bigserial; there \
+                 are no sequences, D15)"
+            }
             UnsupportedClause::DefaultExpr => "DEFAULT",
             UnsupportedClause::ForeignSchema => "schema other than public",
             UnsupportedClause::Unique => "UNIQUE",

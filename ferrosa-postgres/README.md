@@ -896,6 +896,22 @@ ferrosa has no range types — because Postgrex's type bootstrap `LEFT JOIN`s it
   refused by the parser today (`UnsupportedCast`); their semantics are implemented as
   `pg_enum::cast_text_to_enum` and `catalog::resolve_regnamespace` for W1's cast evaluation.
 
+### `bigserial` (D15; `serial_id`, `pg_default`, Lean `Ferrosa.Sql.Serial`)
+
+A `bigserial`/`serial8` column is a `bigint` (implicitly `NOT NULL`) marked
+`pg.column_serial.<col>` = `bigserial`; an INSERT that omits it gets a server-generated id
+from `serial_id::next_id` (applied by the INSERT path, W2). The id is
+`millis << 22 | node << 12 | seq` (41/10/12 bits since 2025-01-01): unique across nodes
+with distinct node tags, never repeated on one node (the sequence borrows the next
+millisecond instead of waiting, and never goes back when the clock does), positive,
+**not dense and not ordered across nodes**. The node tag is `FERROSA_PG_SERIAL_NODE_TAG`
+(0–1023, the operator assigns distinct tags); unset, a random tag is used and a WARN says
+cross-node uniqueness is then probabilistic. `serial`/`smallserial` cannot hold an id and
+are `0A000`; `CREATE SEQUENCE`, `nextval`, `setval`, `currval` and `lastval` are `0A000`
+(through the general planner; a no-`FROM` `SELECT nextval(…)` still fails at parse in the
+narrow scalar grammar, a W1 item). Column DEFAULTs are recorded as
+`pg.column_default.<col>` (canonical SQL text) — the shared format of `pg_default`.
+
 ### Extended-protocol transaction boundary
 
 Extended-protocol pipelines stage DML until `Sync` and commit the group as one atomic batch. An error rolls back preceding writes in that group, disconnect discards staging, and an explicit `BEGIN` remains open across `Sync`. Commit failures are reported before `ReadyForQuery`. Tests: `server::txn_atomicity_tests::extended_pipeline_*`.

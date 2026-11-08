@@ -32,8 +32,6 @@ pub(crate) fn default_extension(column: &str, sql_text: &str) -> (String, String
 }
 
 /// The extension marking `column` as `bigserial`.
-// Written by DDL (CREATE/ALTER TABLE, next W3 commits); here only by tests so far.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn serial_extension(column: &str) -> (String, String) {
     (format!("{SERIAL_PREFIX}{column}"), BIGSERIAL.to_string())
 }

@@ -653,13 +653,20 @@ impl Parser {
         &mut self,
     ) -> Result<(ColumnDef, Option<ForeignKeyConstraint>), ParseError> {
         let name = self.ident()?;
-        let (ty, user_type) = self.parse_column_type()?;
+        let serial = self.parse_serial_type()?;
+        let (ty, user_type) = if serial {
+            (PgType::BigInt, None)
+        } else {
+            self.parse_column_type()?
+        };
         let mut def = ColumnDef {
             name,
             ty,
-            not_null: false,
+            // A serial column is implicitly NOT NULL, as in PostgreSQL.
+            not_null: serial,
             primary_key: false,
             user_type,
+            serial,
         };
         let mut reference = None;
         while let Some(tok) = self.peek() {
@@ -886,6 +893,25 @@ impl Parser {
                 found: format!("{t:?}"),
             }),
             None => Err(ParseError::UnexpectedEnd),
+        }
+    }
+
+    /// `bigserial`/`serial8` → `true` (consumed). `serial`, `serial4`, `smallserial` and
+    /// `serial2` are refused: a D15 id needs 63 bits. Anything else → `false` (untouched).
+    fn parse_serial_type(&mut self) -> Result<bool, ParseError> {
+        let word = match self.peek() {
+            Some(Tok::Ident(w)) => w.to_ascii_lowercase(),
+            _ => return Ok(false),
+        };
+        match word.as_str() {
+            "bigserial" | "serial8" => {
+                self.next();
+                Ok(true)
+            }
+            "serial" | "serial4" | "smallserial" | "serial2" => {
+                Err(ParseError::UnsupportedClause(UnsupportedClause::Serial))
+            }
+            _ => Ok(false),
         }
     }
 

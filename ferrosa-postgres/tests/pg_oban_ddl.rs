@@ -817,3 +817,71 @@ async fn enum_ddl_is_transactional() {
     assert!(!table_exists(&fx, "jobs"));
     assert_eq!(code(c.batch_execute(STATE_TABLE).await), "42704");
 }
+
+// ---------------------------------------------------------------------------
+// 7. bigserial per D15 (census statement 10's "id" bigserial)
+// ---------------------------------------------------------------------------
+
+fn extension(fx: &Fixture, table: &str, key: &str) -> Option<String> {
+    fx.schema
+        .snapshot()
+        .tables
+        .get(&("public".to_string(), table.to_string()))
+        .and_then(|meta| meta.extensions.get(key).cloned())
+}
+
+/// A `bigserial` column is a `bigint` marked for server-generated D15 ids (the INSERT
+/// side, which mints them, is W2's).
+#[tokio::test]
+async fn bigserial_column_is_a_marked_bigint() {
+    let fx = start().await;
+    fx.client
+        .execute(
+            "CREATE TABLE IF NOT EXISTS \"public\".\"serials\" (\"id\" bigserial, \
+             \"v\" text, PRIMARY KEY (\"id\"))",
+            &[],
+        )
+        .await
+        .expect("bigserial is accepted");
+    let snapshot = fx.schema.snapshot();
+    let meta = snapshot
+        .tables
+        .get(&("public".to_string(), "serials".to_string()))
+        .expect("table");
+    assert_eq!(meta.columns["id"].column_type, "bigint");
+    assert_eq!(
+        extension(&fx, "serials", "pg.column_serial.id").as_deref(),
+        Some("bigserial")
+    );
+    let prepared = fx.client.prepare("SELECT id FROM serials").await.unwrap();
+    assert_eq!(
+        prepared.columns()[0].type_(),
+        &tokio_postgres::types::Type::INT8
+    );
+}
+
+/// `serial` and `smallserial` cannot hold a D15 id, and there are no sequences.
+#[tokio::test]
+async fn narrow_serials_and_sequences_are_refused() {
+    let fx = start().await;
+    for sql in [
+        "CREATE TABLE s4 (id serial PRIMARY KEY)",
+        "CREATE TABLE s2 (id smallserial PRIMARY KEY)",
+        "CREATE SEQUENCE jobs_id_seq",
+    ] {
+        assert_eq!(code(fx.client.batch_execute(sql).await), "0A000", "{sql}");
+    }
+    // Through the general planner (a FROM clause). The no-FROM form still goes through the
+    // narrow scalar grammar and fails at parse (42601), a W1 open item.
+    fx.client
+        .batch_execute("CREATE TABLE one (id int PRIMARY KEY)")
+        .await
+        .unwrap();
+    for sql in [
+        "SELECT nextval('jobs_id_seq') FROM one",
+        "SELECT setval('jobs_id_seq', 5) FROM one",
+        "SELECT currval('jobs_id_seq') FROM one",
+    ] {
+        assert_eq!(code(fx.client.simple_query(sql).await), "0A000", "{sql}");
+    }
+}

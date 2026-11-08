@@ -3479,7 +3479,8 @@ mod tests {
 
     #[test]
     fn serial_types_are_refused_by_name() {
-        for ty in ["serial", "bigserial", "smallserial"] {
+        // `bigserial` is accepted (D15: a unique 64-bit id); the narrower forms cannot hold one.
+        for ty in ["serial", "smallserial", "serial4", "serial2"] {
             assert_eq!(
                 refused(&format!("CREATE TABLE t (id {ty} PRIMARY KEY)")),
                 UnsupportedClause::Serial,

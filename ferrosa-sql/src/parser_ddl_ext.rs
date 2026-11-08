@@ -23,6 +23,11 @@ impl Parser {
     pub(super) fn parse_create_any(&mut self) -> Result<Statement, ParseError> {
         match self.second_word().as_deref() {
             Some("TYPE") => self.parse_create_type(),
+            Some("SEQUENCE") => Err(ParseError::Unsupported(
+                "CREATE SEQUENCE (there are no sequences; bigserial columns get unique \
+                 server-generated ids, D15)"
+                    .into(),
+            )),
             _ => self.parse_create(),
         }
     }
