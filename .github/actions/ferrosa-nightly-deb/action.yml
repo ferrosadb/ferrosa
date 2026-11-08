@@ -90,8 +90,22 @@ runs:
       run: |
         set -euo pipefail
         mkdir -p tests
-        deb_path="tests/${{ steps.resolve.outputs.deb_name }}"
-        curl -fsSL -o "$deb_path" '${{ steps.resolve.outputs.deb_url }}'
+        repo='${{ github.repository }}'
+        deb_name='${{ steps.resolve.outputs.deb_name }}'
+        deb_path="tests/$deb_name"
+
+        # Download through the API asset endpoint, not browser_download_url.
+        # github.com/<repo>/releases/download/... answered HTTP 504 on the FIRST
+        # hop (no redirect issued) for every asset of this repo's releases, which
+        # failed run 42468495210 in "Download latest nightly .deb release" with
+        # `curl: (22) ... error: 504`. api.github.com served the same asset
+        # (HTTP 200, 33245268 bytes), so use it and keep the browser URL as the
+        # fallback for when the API path is degraded instead.
+        if ! gh release download "${{ steps.resolve.outputs.tag_name }}" \
+             --repo "$repo" --pattern "$deb_name" --dir tests --clobber; then
+          echo "::warning::API asset download failed — falling back to browser_download_url"
+          curl -fsSL -o "$deb_path" '${{ steps.resolve.outputs.deb_url }}'
+        fi
         ls -lh "$deb_path"
         dpkg-deb -I "$deb_path" | grep -E 'Package|Version|Architecture'
         echo "deb_path=$PWD/$deb_path" >> "$GITHUB_OUTPUT"
