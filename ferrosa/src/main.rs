@@ -3842,6 +3842,7 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
         // PostgreSQL transaction on a real cluster.
         let accord_core = shared_state.core.clone();
         let query_ctx = std::sync::Arc::new(ferrosa_postgres::QueryContext {
+            procedural: Default::default(),
             // A `SELECT` must consult the ring, not only this node's local
             // store: at a replication factor below the node count the local scan
             // returns a fraction of the committed rows, and an unreachable owner

@@ -951,3 +951,48 @@ Unfiltered `COUNT(*)` on tables with one partition-key column and no clustering/
 Scans consume each owned storage partition through the row bridge, retaining text/blob payload backing in CQL and SQL values. Own writes and MVCC images remain immutable value owners; cloning a text/blob value shares its payload. The direct row encoder borrows these values while appending protocol bytes to its reusable output buffer. The per-row bounded producer channel, MVCC key tracking, storage reconciliation and final wire serialization still have costs; this ownership change does not claim those waits or all scan bottlenecks are eliminated.
 
 The PostgreSQL consumer pulls owned rows lazily from `OwnedPartitionRows`, without collecting a second decoded partition buffer. A decoding failure terminates the iterator and records a statement failure; a streamed prefix never becomes a successful truncated result.
+
+## PL/pgSQL, triggers and LISTEN/NOTIFY (D13)
+
+Statements of this lane are recognised by `ferrosa_plpgsql::utility::parse_utility` before
+the SQL engine parses anything, on both protocols (`PreparedKind::Utility` on the extended
+path), and run by `procedural::execute`.
+
+### LISTEN / NOTIFY / pg_notify
+
+- `LISTEN ch`, `UNLISTEN ch | *`, `NOTIFY ch [, 'payload']`, `SELECT pg_notify(a, b)` with
+  literal or `$n` arguments (one `void` row), and `PERFORM pg_notify(…)` inside PL/pgSQL.
+- Inside a transaction block, notifications and LISTEN/UNLISTEN are queued in the session
+  (`Session::txn_notes`) and take effect only at commit; `end_txn` drops them, so ROLLBACK,
+  a failed COMMIT, a poisoned block or a cancelled statement notifies nobody. Outside a block
+  each statement is its own transaction and takes effect at once.
+- **Delivery** (`notify::NotifyHub`, one per listener, shared by every session of the node):
+  `commit_txn` takes the queued notes, takes the hub's publish lock, checks every listener
+  queue it would write to has room, commits, and publishes only if the commit answered
+  `COMMIT` — then releases the lock. A commit and its publication are one step, so sessions
+  see commit order (`specs/lean4/Ferrosa/Sql/Notify.lean`: `commit_order`,
+  `delivered_only_if_committed`, `delivered_at_most_once`). A repeated (channel, payload)
+  within one transaction is delivered once.
+- A listening session receives `NotificationResponse` (`A`) messages while idle (outside a
+  transaction block), as PostgreSQL does; the query loop waits on the listener queue alongside
+  the socket.
+- **Bounds and refusals:** each listener queue holds `LISTENER_QUEUE_DEPTH` (8192)
+  notifications; a COMMIT that would overflow one is refused with `54000` before anything is
+  applied. One transaction may queue `MAX_NOTES_PER_TXN` (65,536) distinct notifications. An
+  empty channel or a payload of 8000 bytes or more is `22023`.
+- The notification's process id is a per-session id from the hub. (`BackendKeyData` still
+  advertises `0`: the cancel protocol is a separate follow-up.)
+
+**Cluster status (precise):** delivery is **node-local**. A standalone node delivers to every
+session. On a cluster node (`AccordAccess::committer()` is `Some`), `LISTEN` is refused with
+`0A000` — a session that subscribed there would silently miss notifications committed on
+other nodes — while `NOTIFY`/`pg_notify` are accepted and, with no listener anywhere, deliver
+to nobody, which is exact. Cross-node delivery is designed (below) but not implemented.
+
+Design for cross-node delivery: a committed notifying transaction already passes through
+Accord, which gives it a cluster-wide commit order. The notification batch rides in the
+transaction's write set as rows of a per-node-unreplicated `system_pg.notifications` log
+keyed by Accord's execute timestamp; every node's apply observer (the same
+`PostgresMvccApplyObserver` the MVCC layer registers) publishes applied batches to its local
+hub in execute-timestamp order. Delivery is then at most once per node and in Accord commit
+order everywhere; a node that restarts resumes from its last published timestamp.

@@ -2710,6 +2710,7 @@ dependencies = [
  "ferrosa-common",
  "ferrosa-jsonb",
  "ferrosa-net",
+ "ferrosa-plpgsql",
  "ferrosa-row-bridge",
  "ferrosa-sched",
  "ferrosa-schema",

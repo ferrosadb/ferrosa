@@ -11,6 +11,8 @@ repository.workspace = true
 smallvec = "1.15"
 ferrosa-schema = { path = "../ferrosa-schema" }
 ferrosa-sql = { path = "../ferrosa-sql" }
+# PL/pgSQL (D13): DO blocks, functions, triggers and the LISTEN/NOTIFY statements.
+ferrosa-plpgsql = { path = "../ferrosa-plpgsql" }
 ferrosa-storage = { path = "../ferrosa-storage" }
 ferrosa-common = { path = "../ferrosa-common" }
 # Reuse the canonical SELECT partition->row decomposition
@@ -72,6 +74,10 @@ indexmap = "2"
 #   FERROSA_TEST_CONTAINERS=1 cargo test -p ferrosa-postgres \
 #     --features live-infra-tests --test differential_oracle -- --nocapture
 live-infra-tests = []
+# Tests that pin behaviour other workstreams (W1 expressions, W3 transactional DDL) are still
+# building. They are red until those land, so they are built only on request:
+#   cargo test -p ferrosa-postgres --features pending-workstreams
+pending-workstreams = []
 
 [dev-dependencies]
 indexmap = { version = "2", features = ["serde"] }

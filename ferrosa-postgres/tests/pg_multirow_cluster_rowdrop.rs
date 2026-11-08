@@ -367,6 +367,7 @@ async fn start_pg_on_node(
     let query_committer: Arc<dyn TransactionCommitter> = committer.clone();
 
     let ctx = Arc::new(QueryContext {
+        procedural: Default::default(),
         cluster_read: Default::default(),
         engine: node.engine.clone(),
         schema: Arc::new(create_schema(table_id)),

@@ -87,6 +87,17 @@ pub(crate) fn column_type_oid(ty: ColumnType) -> i32 {
 ///
 /// A value with no text rendering is a typed [`EncodeError`], never `None`: a
 /// `None` here would reach the client as SQL NULL.
+/// A value's PostgreSQL text form as a `String` (`None` for NULL): what crosses the PL/pgSQL
+/// host interface and what `pg_notify` receives.
+pub(crate) fn value_text(value: &SqlValue) -> Result<Option<String>, EncodeError> {
+    render_value(value)?
+        .map(|bytes| {
+            String::from_utf8(bytes)
+                .map_err(|_| EncodeError::from("value has no UTF-8 text form".to_string()))
+        })
+        .transpose()
+}
+
 fn render_value(value: &SqlValue) -> Result<Option<Vec<u8>>, EncodeError> {
     let text = match value {
         SqlValue::Null => return Ok(None),

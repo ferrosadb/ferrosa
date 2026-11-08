@@ -400,6 +400,7 @@ async fn start_with(with_public: bool) -> Fixture {
         engine: engine.clone(),
     }));
     let ctx = Arc::new(QueryContext {
+        procedural: Default::default(),
         cluster_read: Default::default(),
         engine: engine.clone(),
         schema: schema.clone(),

@@ -66,6 +66,8 @@ pub struct QueryContext {
     /// cluster. `ClusterRead::disabled()` keeps the local-only path for
     /// standalone nodes and unit tests, where local storage IS complete.
     pub cluster_read: crate::ClusterRead,
+    /// Node-wide procedural state (D13): the LISTEN/NOTIFY hub shared by every session.
+    pub procedural: Arc<crate::procedural::Procedural>,
 }
 
 /// An unpredictable, printable SCRAM server nonce (base64, so no comma — the one
@@ -397,8 +399,27 @@ where
                 // wait ends early when the longest-idle one expires.
                 let portal_deadline = session.next_expiry(idle_timeout);
                 let lifetime = session.idle_transaction_lifetime();
+                // D13: an idle session receives committed notifications as they arrive.
+                // PostgreSQL delivers only outside a transaction block.
+                let deliver = session.txn_status() == crate::messages::TransactionStatus::Idle;
+                if deliver && deliver_notifications(&mut session, &mut output) {
+                    flush_output(stream, &mut output).await?;
+                }
                 let n = tokio::select! {
                     biased;
+                    note = async {
+                        match session.listener_mut() {
+                            Some(listener) if deliver => listener.next().await,
+                            _ => std::future::pending().await,
+                        }
+                    } => {
+                        if let Some(note) = note {
+                            note.to_message().encode(&mut output);
+                            deliver_notifications(&mut session, &mut output);
+                            flush_output(stream, &mut output).await?;
+                        }
+                        continue;
+                    }
                     () = async {
                         match lifetime {
                             Some(lifetime) => lifetime.until_expired().await,
@@ -437,6 +458,26 @@ where
             }
         }
     }
+}
+
+/// The most notifications encoded per wake-up before the output is flushed.
+const NOTIFICATION_BATCH: usize = 256;
+
+/// Encode the session's queued notifications (at most [`NOTIFICATION_BATCH`]); `true` when any
+/// were encoded.
+fn deliver_notifications(session: &mut Session, output: &mut BytesMut) -> bool {
+    let Some(listener) = session.listener_mut() else {
+        return false;
+    };
+    let mut any = false;
+    for _ in 0..NOTIFICATION_BATCH {
+        let Some(note) = listener.try_next() else {
+            break;
+        };
+        note.to_message().encode(output);
+        any = true;
+    }
+    any
 }
 
 /// Handle one framed frontend message. Returns `Ok(true)` when the client asked
@@ -590,7 +631,7 @@ async fn finish_extended_pipeline(ctx: &QueryContext, session: &mut Session, out
     BackendMessage::ReadyForQuery(session.txn_status()).encode(out);
 }
 
-async fn begin_implicit_transaction(
+pub(crate) async fn begin_implicit_transaction(
     ctx: &QueryContext,
     session: &mut Session,
 ) -> Result<(), BackendMessage> {
@@ -790,6 +831,26 @@ async fn execute_simple_inner<O: ReplySink>(
     sql: &str,
     out: &mut O,
 ) -> std::io::Result<Vec<BackendMessage>> {
+    // D13: DO, PL/pgSQL functions and triggers, LISTEN/NOTIFY are recognised before the SQL
+    // engine sees the statement.
+    if let Some(parsed) = ferrosa_plpgsql::utility::parse_utility(sql) {
+        return Ok(match parsed {
+            Ok(statement) => {
+                crate::procedural::execute(
+                    ctx,
+                    session,
+                    statement,
+                    &[],
+                    crate::procedural::Protocol::Simple,
+                )
+                .await
+            }
+            Err(error) => {
+                session.mark_txn_failed();
+                vec![query::error_response(error.sqlstate, &error.message)]
+            }
+        });
+    }
     let stmt = match crate::catalog::parse_pg(sql) {
         Ok(s) => s,
         Err(e) => {
@@ -1153,7 +1214,26 @@ fn expired_transaction_error(ctx: &QueryContext, session: &Session) -> Option<Ba
 ///
 /// In every case the transaction is ended and the buffer dropped, so the server
 /// never acks a transaction it did not commit.
-async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMessage> {
+pub(crate) async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMessage> {
+    // Notifications and LISTENs queued by this transaction are taken before the commit ends
+    // it: published (under the hub's lock, so in commit order) only if it commits.
+    let notes = session.take_txn_notes();
+    if notes.is_empty() {
+        return commit_txn_core(ctx, session).await;
+    }
+    let publication = match crate::procedural::prepare_publication(ctx, session, notes).await {
+        Ok(publication) => publication,
+        Err(error) => {
+            session.end_txn();
+            return vec![error];
+        }
+    };
+    let messages = commit_txn_core(ctx, session).await;
+    publication.finish(session, &messages);
+    messages
+}
+
+async fn commit_txn_core(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMessage> {
     // A COMMIT on an aborted (poisoned) transaction never commits the partial
     // buffer — Postgres treats it as a ROLLBACK. Drop the buffer and report
     // ROLLBACK rather than committing an incomplete write-set.
@@ -1664,6 +1744,14 @@ async fn describe(
                         BackendMessage::NoData,
                     ]
                 }
+                PreparedKind::Utility(statement) => {
+                    let param_oids = crate::procedural::param_oids(&statement, &declared);
+                    session.set_param_oids(name, param_oids.clone());
+                    vec![
+                        extended::parameter_description(&param_oids),
+                        crate::procedural::describe(&statement),
+                    ]
+                }
             }
         }
         b'P' => {
@@ -1730,6 +1818,7 @@ async fn describe(
                 PreparedKind::Update(_) | PreparedKind::Delete(_) => {
                     vec![BackendMessage::NoData]
                 }
+                PreparedKind::Utility(statement) => vec![crate::procedural::describe(&statement)],
             }
         }
         _ => vec![session.fail(query::error_response(
@@ -1922,7 +2011,8 @@ fn portal_select(
         PreparedKind::Exprs(_)
         | PreparedKind::Insert(_)
         | PreparedKind::Update(_)
-        | PreparedKind::Delete(_) => None,
+        | PreparedKind::Delete(_)
+        | PreparedKind::Utility(_) => None,
     }
 }
 
@@ -1966,6 +2056,99 @@ async fn open_portal_stream(
         params,
     )
     .await
+}
+
+/// Start a `SELECT` inside the session's transaction, as a portal does (snapshot liveness,
+/// read-set tracking, read-your-own-writes), with `params` bound. The PL/pgSQL host's `query`.
+pub(crate) async fn open_session_select(
+    ctx: &QueryContext,
+    session: &mut Session,
+    select: ferrosa_sql::SelectStmt,
+    params: Vec<ferrosa_sql::Value>,
+) -> Result<ResultStream, BackendMessage> {
+    if let Some(error) = expired_transaction_error(ctx, session) {
+        session.mark_txn_failed();
+        return Err(error);
+    }
+    if let Err(error) = track_select_reads(ctx, session, &select) {
+        session.mark_txn_failed();
+        return Err(error);
+    }
+    let pending = session.materialized_txn_writes()?;
+    let snapshot = read_snapshot(ctx, session);
+    query::open_select_stream(
+        read_env(ctx, &snapshot),
+        select,
+        Some(pending.as_slice()),
+        params,
+    )
+    .await
+}
+
+/// Evaluate a no-`FROM` expression select in the session (its snapshot and own writes).
+pub(crate) async fn scalar_select(
+    ctx: &QueryContext,
+    session: &mut Session,
+    items: &[ferrosa_sql::ScalarItem],
+) -> Result<ferrosa_sql::QueryResult, BackendMessage> {
+    let snapshot = read_snapshot(ctx, session);
+    let pending = session.materialized_txn_writes()?;
+    let mut scalar_ctx = scalar_read_ctx(ctx, &snapshot, &pending);
+    scalar_ctx.timestamp_micros = session.timestamp_micros();
+    query::execute_scalar_select(items, scalar_ctx).await
+}
+
+/// Run a statement for its effect inside the session's open transaction, with `params` bound:
+/// the PL/pgSQL host's `execute`. DML takes its parameters as a portal's would; any other
+/// statement goes through the simple-query dispatch (so DDL meets the same rules it meets
+/// from a client).
+pub(crate) async fn execute_in_session(
+    ctx: &QueryContext,
+    session: &mut Session,
+    sql: &str,
+    statement: ferrosa_sql::Statement,
+    params: Vec<ferrosa_sql::Value>,
+    _depth: usize,
+) -> Vec<BackendMessage> {
+    use ferrosa_sql::Statement;
+    if let Some(error) = expired_transaction_error(ctx, session) {
+        session.mark_txn_failed();
+        return vec![error];
+    }
+    let timestamp_micros = session.timestamp_micros();
+    let txn = Some(session.txn_writes_mut());
+    let context = query::DmlContext {
+        timestamp_micros,
+        ..dml_context(ctx, txn)
+    };
+    match statement {
+        Statement::Insert(ins) => {
+            let opts = query::ReturningOpts {
+                with_row_description: false,
+                result_formats: &[],
+            };
+            query::execute_insert(context, &ins, &params, opts).await
+        }
+        Statement::Update(upd) => query::execute_update(context, &upd, &params).await,
+        Statement::Delete(del) => query::execute_delete(context, &del, &params).await,
+        other if params.is_empty() => {
+            let mut sink: Vec<BackendMessage> = Vec::new();
+            match run_data_statement(ctx, session, sql, &other, &mut sink).await {
+                Ok(mut tail) => {
+                    sink.append(&mut tail);
+                    sink
+                }
+                Err(error) => vec![query::error_response(
+                    "58000",
+                    &format!("in-memory reply sink failed: {error}"),
+                )],
+            }
+        }
+        _ => vec![query::error_response(
+            "0A000",
+            "parameters are bound only into SELECT, INSERT, UPDATE and DELETE",
+        )],
+    }
 }
 
 /// Execute a portal bound to a `SELECT`, resuming its suspended query if it has
@@ -2158,6 +2341,23 @@ async fn execute_portal_inner(
             )
             .await;
             execute_dml(session, msgs)
+        }
+        PreparedKind::Utility(statement) => {
+            let msgs = crate::procedural::execute(
+                ctx,
+                session,
+                *statement,
+                &params,
+                crate::procedural::Protocol::Extended,
+            )
+            .await;
+            if msgs
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. }))
+            {
+                session.mark_error();
+            }
+            msgs
         }
         PreparedKind::Delete(del) => {
             let txn = if session.in_txn() {
@@ -2427,6 +2627,7 @@ pub(crate) mod txn_atomicity_tests {
 
     pub(crate) fn ctx_with(engine: Arc<StorageEngine>, schema: Arc<Schema>) -> QueryContext {
         QueryContext {
+            procedural: Default::default(),
             cluster_read: Default::default(),
             engine,
             schema,

@@ -54,6 +54,10 @@ pub enum PreparedKind {
     Insert(Box<InsertStmt>),
     Update(Box<UpdateStmt>),
     Delete(Box<DeleteStmt>),
+    /// A statement of the procedural lane (D13): `DO`, PL/pgSQL function and trigger DDL,
+    /// `LISTEN`/`UNLISTEN`/`NOTIFY`, `SELECT pg_notify(…)`. Ecto sends these through the
+    /// extended protocol, so they must prepare like any other statement.
+    Utility(Box<ferrosa_plpgsql::utility::Utility>),
 }
 
 /// A prepared statement: the parsed query plus the client-declared parameter
@@ -122,6 +126,13 @@ pub struct Session {
     /// closed by the server. A portal absent here has not started. Dropping a
     /// suspended entry stops its executor and gives back its node slot.
     runs: HashMap<String, PortalRun>,
+    /// The open transaction's queued notifications and LISTEN actions (D13): published or
+    /// applied only when it commits, and dropped by every path that ends it otherwise.
+    txn_notes: crate::notify::TxnNotes,
+    /// This session's subscription, created by its first committed LISTEN.
+    listener: Option<crate::notify::Listener>,
+    /// The process id this session's notifications carry, allocated on first use.
+    notify_pid: Option<i32>,
 }
 
 /// A query suspended by `max_rows`, waiting for the next `Execute`.
@@ -174,6 +185,9 @@ impl Session {
             txn_read_rows: RowReadSet::default(),
             txn_writes: TxnWriteSet::default(),
             runs: HashMap::new(),
+            txn_notes: crate::notify::TxnNotes::default(),
+            listener: None,
+            notify_pid: None,
         }
     }
 
@@ -408,6 +422,29 @@ impl Session {
         // Drop the whole staged write-set (resident prefix and spill) so a
         // committed or rolled-back transaction leaves nothing behind.
         self.txn_writes = TxnWriteSet::default();
+        // A transaction that ends without its notifications having been taken for
+        // publication (rollback, failure, cancellation) notifies nobody.
+        self.txn_notes = crate::notify::TxnNotes::default();
+    }
+
+    /// The open transaction's queued notifications and LISTEN actions.
+    pub(crate) fn txn_notes_mut(&mut self) -> &mut crate::notify::TxnNotes {
+        &mut self.txn_notes
+    }
+
+    /// Take the queued notifications for publication at commit.
+    pub(crate) fn take_txn_notes(&mut self) -> crate::notify::TxnNotes {
+        std::mem::take(&mut self.txn_notes)
+    }
+
+    /// This session's subscription, if it has one.
+    pub(crate) fn listener_mut(&mut self) -> &mut Option<crate::notify::Listener> {
+        &mut self.listener
+    }
+
+    /// The process id this session's notifications carry.
+    pub(crate) fn notify_pid(&mut self, hub: &crate::notify::NotifyHub) -> i32 {
+        *self.notify_pid.get_or_insert_with(|| hub.allocate_pid())
     }
 
     pub(crate) fn start_statement(&mut self) {
@@ -539,6 +576,23 @@ impl Session {
         query: &str,
         param_types: Vec<i32>,
     ) -> BackendMessage {
+        if let Some(utility) = ferrosa_plpgsql::utility::parse_utility(query) {
+            let parsed = match utility {
+                Ok(statement) => PreparedKind::Utility(Box::new(statement)),
+                Err(error) => {
+                    self.mark_error();
+                    return error_response(error.sqlstate, &error.message);
+                }
+            };
+            self.statements.insert(
+                stmt_name,
+                PreparedStatement {
+                    parsed,
+                    param_oids: param_types,
+                },
+            );
+            return BackendMessage::ParseComplete;
+        }
         let parsed = match crate::catalog::parse_pg(query) {
             Ok(Statement::Select(select)) => PreparedKind::Select(select),
             Ok(Statement::SelectExprs(items)) => {

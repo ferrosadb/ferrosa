@@ -264,6 +264,7 @@ async fn start_server_configured(
     ));
     let portals = Arc::new(ferrosa_postgres::SuspendedPortals::new(limits));
     let ctx = Arc::new(QueryContext {
+        procedural: Default::default(),
         cluster_read: Default::default(),
         engine: Arc::clone(&engine),
         schema: Arc::clone(&schema),

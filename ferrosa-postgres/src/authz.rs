@@ -139,6 +139,9 @@ pub(crate) fn prepared_permissions(
         PreparedKind::Update(upd) => dml(&upd.table, upd.returning.is_some(), default_schema),
         PreparedKind::Delete(del) => dml(&del.table, del.returning.is_some(), default_schema),
         PreparedKind::Exprs(_) => Vec::new(),
+        // The procedural lane authorizes each statement a DO block or function runs as it runs
+        // it, and its DDL against the object it creates (`procedural`).
+        PreparedKind::Utility(_) => Vec::new(),
     }
 }
 

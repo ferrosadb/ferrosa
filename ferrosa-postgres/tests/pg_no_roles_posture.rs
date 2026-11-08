@@ -100,6 +100,7 @@ async fn start_unowned_node() -> Listener {
         "precondition: an auth-disabled node holds no login role"
     );
     let ctx = Arc::new(QueryContext {
+        procedural: Default::default(),
         cluster_read: Default::default(),
         engine: Arc::clone(&engine),
         schema: Arc::clone(&schema),
