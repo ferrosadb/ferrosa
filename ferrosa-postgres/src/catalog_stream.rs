@@ -62,8 +62,8 @@ impl PgDescription {
         commented.sort();
         Self {
             schema: RelSchema::new(vec![
-                Column::new("objoid", ColumnType::Int),
-                Column::new("classoid", ColumnType::Int),
+                Column::new("objoid", ColumnType::Oid),
+                Column::new("classoid", ColumnType::Oid),
                 Column::new("objsubid", ColumnType::Int),
                 Column::new("description", ColumnType::Text),
             ]),
@@ -124,11 +124,11 @@ impl PgRange {
     fn new() -> Self {
         Self {
             schema: RelSchema::new(vec![
-                Column::new("rngtypid", ColumnType::Int),
-                Column::new("rngsubtype", ColumnType::Int),
-                Column::new("rngmultitypid", ColumnType::Int),
-                Column::new("rngcollation", ColumnType::Int),
-                Column::new("rngsubopc", ColumnType::Int),
+                Column::new("rngtypid", ColumnType::Oid),
+                Column::new("rngsubtype", ColumnType::Oid),
+                Column::new("rngmultitypid", ColumnType::Oid),
+                Column::new("rngcollation", ColumnType::Oid),
+                Column::new("rngsubopc", ColumnType::Oid),
                 Column::new("rngcanonical", ColumnType::Text),
                 Column::new("rngsubdiff", ColumnType::Text),
             ]),

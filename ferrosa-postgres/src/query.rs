@@ -414,8 +414,9 @@ impl ParamError {
 
 /// Parameter type OIDs the decoder maps. Anything else (except `0`,
 /// unspecified) is refused rather than decoded as text.
-const SUPPORTED_PARAM_OIDS: [i32; 19] = [
-    16, 17, 19, 20, 21, 23, 25, 114, 700, 701, 869, 1043, 1082, 1083, 1114, 1184, 1700, 2950, 3802,
+const SUPPORTED_PARAM_OIDS: [i32; 20] = [
+    16, 17, 19, 20, 21, 23, 25, 26, 114, 700, 701, 869, 1043, 1082, 1083, 1114, 1184, 1700, 2950,
+    3802,
 ];
 
 /// `json` (D11: stored as jsonb) and `jsonb` parameter OIDs.
@@ -505,6 +506,12 @@ fn decode_param_text(type_oid: i32, raw: &[u8]) -> Result<SqlValue, ParamError> 
                 Err(bad("integer out of range"))
             }
         }
+        // oid: an unsigned decimal in [0, 2^32).
+        26 => s
+            .trim()
+            .parse::<u32>()
+            .map(|n| SqlValue::Int(i64::from(n)))
+            .map_err(|_| bad("not an oid")),
         // text / varchar / name; OID 0 (unspecified) is text too.
         0 | 25 | 1043 | 19 => Ok(SqlValue::Text(s.to_string().into())),
         16 => decode_bool_text(s).ok_or_else(|| bad("not a boolean")),
@@ -679,6 +686,10 @@ fn decode_param_binary(type_oid: i32, raw: &[u8]) -> Result<SqlValue, ParamError
     match type_oid {
         23 => int(4).map(SqlValue::Int),
         20 => int(8).map(SqlValue::Int),
+        // oid: an UNSIGNED big-endian u32.
+        26 => <[u8; 4]>::try_from(raw)
+            .map(|b| SqlValue::Int(i64::from(u32::from_be_bytes(b))))
+            .map_err(|_| bad("wrong length")),
         21 => int(2).map(SqlValue::Int),
         // text / varchar / name; OID 0 (unspecified) is text too.
         0 | 25 | 1043 | 19 => std::str::from_utf8(raw)
@@ -904,6 +915,10 @@ fn encode_int_binary(col_type: ColumnType, i: i64) -> Result<Vec<u8>, String> {
             .map(|value| value.to_be_bytes().to_vec())
             .map_err(|_| format!("integer {i} is outside the PostgreSQL int4 range")),
         ColumnType::BigInt => Ok(i.to_be_bytes().to_vec()),
+        // oid: UNSIGNED 4 bytes; outside [0, 2^32) is refused, never wrapped.
+        ColumnType::Oid => u32::try_from(i)
+            .map(|value| value.to_be_bytes().to_vec())
+            .map_err(|_| format!("{i} is outside the PostgreSQL oid range")),
         _ => Ok(i.to_be_bytes().to_vec()),
     }
 }
@@ -5834,6 +5849,25 @@ mod tests {
         assert_eq!(&*cache.key_for("ks", "a").1, "a");
         assert_eq!(&*cache.key_for("ks", "b").1, "b");
         assert_eq!(&*cache.key_for("other", "b").0, "other");
+    }
+
+    /// Synthetic catalog OIDs lie in [16384, 2^32). An `oid` column (OID 26) is an
+    /// UNSIGNED 4-byte value: one at or above 2^31 must encode, not fail as an
+    /// int4 would, and must round-trip through Bind (Lean: `Pg/Oid.lean`).
+    #[test]
+    fn an_oid_above_two_to_the_31_encodes_and_decodes_as_unsigned() {
+        let big = SqlValue::Int(i64::from(u32::MAX) - 5);
+        assert_eq!(column_type_oid(ColumnType::Oid), 26);
+        let bytes = encode_value(1, ColumnType::Oid, &big).expect("binary oid");
+        assert_eq!(bytes, (u32::MAX - 5).to_be_bytes().to_vec());
+        assert_eq!(decode_param(1, 26, Some(&bytes)), big);
+        assert_eq!(
+            encode_value(0, ColumnType::Oid, &big),
+            Some((u32::MAX - 5).to_string().into_bytes())
+        );
+        // Outside [0, 2^32) is not an oid: refused, never wrapped.
+        assert!(super::encode_value(1, ColumnType::Oid, &SqlValue::Int(-1)).is_err());
+        assert!(super::encode_value(1, ColumnType::Oid, &SqlValue::Int(1 << 32)).is_err());
     }
 
     fn encode_value(format: i16, col_type: ColumnType, value: &SqlValue) -> Option<Vec<u8>> {

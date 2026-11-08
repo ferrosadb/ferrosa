@@ -28,6 +28,7 @@ import Ferrosa.Sql.Enum
 import Ferrosa.Sql.Serial
 import Ferrosa.Sql.Expr
 import Ferrosa.Sql.Limit
+import Ferrosa.Sql.Oid
 
 #check Ferrosa.Sql.Expr.legacy_compare_agrees
 #check Ferrosa.Sql.Expr.any_true_iff
@@ -43,6 +44,9 @@ import Ferrosa.Sql.Limit
 #check Ferrosa.Sql.Limit.param_matches_literal
 #check Ferrosa.Sql.Limit.negative_is_refused
 #check Ferrosa.Sql.Limit.limit_offset_is_a_slice
+#check Ferrosa.Sql.Oid.int4_cannot_carry_high_oids
+#check Ferrosa.Sql.Oid.oid_round_trips
+#check Ferrosa.Sql.Oid.oid_refuses_outside_range
 #check Ferrosa.Topology.DcQuorum.dc_quorum_writes_share_a_replica
 #check Ferrosa.Topology.DcQuorum.no_partition_admits_two_dc_quorum_writes
 #check Ferrosa.Topology.DcQuorum.node_gate_forces_a_shared_replica

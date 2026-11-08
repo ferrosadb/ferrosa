@@ -147,6 +147,7 @@ fn attnum_vector(attnums: &[i64]) -> Value {
 
 /// OID column value — see the module-level OID-scheme note on the `Int` choice.
 fn oid_val(oid: u32) -> Value {
+    // Carried as Value::Int in [0, 2^32); the column type is ColumnType::Oid.
     Value::Int(i64::from(oid))
 }
 
@@ -182,7 +183,7 @@ const RESERVED_NAMESPACES: [&str; 2] = ["pg_catalog", "information_schema"];
 pub fn pg_namespace(schema: &Schema) -> InMemoryTable {
     let snapshot = schema.snapshot();
     let rel_schema = RelSchema::new(vec![
-        Column::new("oid", ColumnType::Int),
+        Column::new("oid", ColumnType::Oid),
         Column::new("nspname", ColumnType::Text),
     ]);
 
@@ -217,9 +218,9 @@ pub fn pg_namespace(schema: &Schema) -> InMemoryTable {
 pub fn pg_class(schema: &Schema) -> InMemoryTable {
     let snapshot = schema.snapshot();
     let rel_schema = RelSchema::new(vec![
-        Column::new("oid", ColumnType::Int),
+        Column::new("oid", ColumnType::Oid),
         Column::new("relname", ColumnType::Text),
-        Column::new("relnamespace", ColumnType::Int),
+        Column::new("relnamespace", ColumnType::Oid),
         Column::new("relkind", ColumnType::Text),
     ]);
 
@@ -265,9 +266,9 @@ pub fn pg_class(schema: &Schema) -> InMemoryTable {
 pub fn pg_attribute(schema: &Schema) -> Result<InMemoryTable, PgTypeError> {
     let snapshot = schema.snapshot();
     let rel_schema = RelSchema::new(vec![
-        Column::new("attrelid", ColumnType::Int),
+        Column::new("attrelid", ColumnType::Oid),
         Column::new("attname", ColumnType::Text),
-        Column::new("atttypid", ColumnType::Int),
+        Column::new("atttypid", ColumnType::Oid),
         Column::new("attnum", ColumnType::Int),
         Column::new("attisdropped", ColumnType::Bool),
     ]);
@@ -322,18 +323,18 @@ fn attribute_row(relid: u32, col: &ColumnMetadata, attnum: i64, pg: PgType) -> R
 pub fn pg_type(schema: &Schema) -> Result<InMemoryTable, PgTypeError> {
     let snapshot = schema.snapshot();
     let rel_schema = RelSchema::new(vec![
-        Column::new("oid", ColumnType::Int),
+        Column::new("oid", ColumnType::Oid),
         Column::new("typname", ColumnType::Text),
-        Column::new("typnamespace", ColumnType::Int),
+        Column::new("typnamespace", ColumnType::Oid),
         Column::new("typlen", ColumnType::Int),
         Column::new("typtype", ColumnType::Text),
         Column::new("typsend", ColumnType::Text),
         Column::new("typreceive", ColumnType::Text),
         Column::new("typoutput", ColumnType::Text),
         Column::new("typinput", ColumnType::Text),
-        Column::new("typelem", ColumnType::Int),
-        Column::new("typrelid", ColumnType::Int),
-        Column::new("typbasetype", ColumnType::Int),
+        Column::new("typelem", ColumnType::Oid),
+        Column::new("typrelid", ColumnType::Oid),
+        Column::new("typbasetype", ColumnType::Oid),
     ]);
 
     let mut types: Vec<(u32, &'static str, i16)> = crate::pg_types::ALL_PG_TYPES
@@ -341,8 +342,6 @@ pub fn pg_type(schema: &Schema) -> Result<InMemoryTable, PgTypeError> {
         .chain(crate::pg_types::ARRAY_PG_TYPES.iter())
         .map(|p| (p.oid, p.typname, p.typlen))
         .collect();
-    // `_oid`'s element type has no engine column type, but it is a real type.
-    types.push((PG_OID_OID, "oid", 4));
     for ((ks, name), table) in &snapshot.tables {
         // ferrosa's own `_sys_` tables (the enum metadata table) are not projected.
         if is_reserved_column_name(name) {
@@ -482,8 +481,8 @@ fn array_element_oid(typname: &str) -> Option<u32> {
 pub fn pg_index(schema: &Schema) -> InMemoryTable {
     let snapshot = schema.snapshot();
     let rel_schema = RelSchema::new(vec![
-        Column::new("indexrelid", ColumnType::Int),
-        Column::new("indrelid", ColumnType::Int),
+        Column::new("indexrelid", ColumnType::Oid),
+        Column::new("indrelid", ColumnType::Oid),
         Column::new("indisprimary", ColumnType::Bool),
         Column::new("indkey", ColumnType::TextArray),
     ]);
@@ -519,10 +518,10 @@ pub fn pg_index(schema: &Schema) -> InMemoryTable {
 pub fn pg_constraint(schema: &Schema) -> InMemoryTable {
     let snapshot = schema.snapshot();
     let rel_schema = RelSchema::new(vec![
-        Column::new("oid", ColumnType::Int),
+        Column::new("oid", ColumnType::Oid),
         Column::new("conname", ColumnType::Text),
         Column::new("contype", ColumnType::Text),
-        Column::new("conrelid", ColumnType::Int),
+        Column::new("conrelid", ColumnType::Oid),
         Column::new("conkey", ColumnType::TextArray),
     ]);
 
@@ -1236,6 +1235,42 @@ mod tests {
         let before = oids.len();
         oids.dedup();
         assert_eq!(before, oids.len(), "one row per type");
+    }
+
+    /// Every OID column of the catalog is typed `oid` (26), not `int4`: synthetic
+    /// relation OIDs reach 2^32 - 1, which an int4 cannot carry.
+    #[test]
+    fn catalog_oid_columns_are_typed_oid() {
+        let schema = schema_with_ks_tbl();
+        let tables = catalog_tables(&schema).expect("catalog projects");
+        let oid_columns = [
+            ("pg_namespace", "oid"),
+            ("pg_class", "oid"),
+            ("pg_class", "relnamespace"),
+            ("pg_attribute", "attrelid"),
+            ("pg_attribute", "atttypid"),
+            ("pg_type", "oid"),
+            ("pg_type", "typnamespace"),
+            ("pg_type", "typelem"),
+            ("pg_type", "typrelid"),
+            ("pg_type", "typbasetype"),
+            ("pg_index", "indexrelid"),
+            ("pg_index", "indrelid"),
+            ("pg_constraint", "oid"),
+            ("pg_constraint", "conrelid"),
+        ];
+        for (table, column) in oid_columns {
+            let (_, t) = tables.iter().find(|(n, _)| n == table).expect(table);
+            let i = t
+                .schema()
+                .index_of(column)
+                .unwrap_or_else(|| panic!("{table}.{column}"));
+            assert_eq!(
+                t.schema().columns[i].ty,
+                ColumnType::Oid,
+                "{table}.{column}"
+            );
+        }
     }
 
     #[test]

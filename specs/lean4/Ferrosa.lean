@@ -47,6 +47,7 @@ import Ferrosa.Storage.Format
 import Ferrosa.Sql.Semantics
 import Ferrosa.Sql.Expr
 import Ferrosa.Sql.Limit
+import Ferrosa.Sql.Oid
 import Ferrosa.Bolt.Session
 import Ferrosa.Sparql.Semantics
 import Ferrosa.Sql.Index
