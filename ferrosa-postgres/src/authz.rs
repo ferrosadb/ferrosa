@@ -10,6 +10,7 @@
 //! | `SELECT … FROM t [JOIN u]` | `SELECT` on each table read |
 //! | `INSERT` / `UPDATE` / `DELETE` on `t` | `MODIFY` on `t` |
 //! | … `RETURNING` | additionally `SELECT` on `t` (the row is read back) |
+//! | general `UPDATE`/`DELETE` (`FROM`, `WITH`, a general `WHERE`, `RETURNING`) | `MODIFY` on the target, `SELECT` on every relation read, target included |
 //! | `TRUNCATE [TABLE] t [, …]` | `MODIFY` on EACH `t` (the CQL router's rule) |
 //! | `VACUUM …`, `ANALYZE …` | nothing — a deliberate no-op touches no table |
 //! | `SELECT <exprs>` (no `FROM`), `BEGIN`/`COMMIT`/`ROLLBACK`, `SET`/`RESET` | nothing — no table is touched |
@@ -63,6 +64,14 @@ fn dml(target: &TableRef, returning: bool, default_schema: &str) -> Vec<(Permiss
     required
 }
 
+/// A general `UPDATE`/`DELETE`: MODIFY on the target, SELECT on every relation
+/// its read half reads (`DmlStmt::read_select`), the target included.
+fn general_dml(d: &ferrosa_sql::DmlStmt, default_schema: &str) -> Vec<(Permission, Resource)> {
+    let mut required = vec![(Permission::Modify, table(&d.target, default_schema))];
+    required.extend(select_reads(&d.read_select(), default_schema));
+    required
+}
+
 /// Permissions a simple-query statement needs.
 pub(crate) fn statement_permissions(
     stmt: &Statement,
@@ -73,6 +82,7 @@ pub(crate) fn statement_permissions(
         Statement::Insert(ins) => dml(&ins.table, ins.returning.is_some(), default_schema),
         Statement::Update(upd) => dml(&upd.table, upd.returning.is_some(), default_schema),
         Statement::Delete(del) => dml(&del.table, del.returning.is_some(), default_schema),
+        Statement::Dml(d) => general_dml(d, default_schema),
         // DDL (T-132a, t_d3930503): CREATE on the target keyspace, as the CQL
         // router requires for CREATE TABLE. Checked at dispatch, before the
         // executor looks at the schema, so a denial reveals nothing about
@@ -186,6 +196,7 @@ pub(crate) fn prepared_permissions(
         PreparedKind::Insert(ins) => dml(&ins.table, ins.returning.is_some(), default_schema),
         PreparedKind::Update(upd) => dml(&upd.table, upd.returning.is_some(), default_schema),
         PreparedKind::Delete(del) => dml(&del.table, del.returning.is_some(), default_schema),
+        PreparedKind::Dml(d) => general_dml(d, default_schema),
         PreparedKind::Exprs(_) => Vec::new(),
         PreparedKind::Utility(stmt) => statement_permissions(stmt, default_schema),
     }
@@ -261,6 +272,30 @@ mod tests {
             vec![
                 (Permission::Modify, t("public", "kv")),
                 (Permission::Select, t("public", "kv")),
+            ]
+        );
+    }
+
+    /// A general UPDATE/DELETE reads with a general SELECT, so it needs SELECT on
+    /// every relation that read touches (the target included, as PostgreSQL
+    /// requires for the columns a WHERE or RETURNING reads), plus MODIFY on the
+    /// target.
+    #[test]
+    fn general_dml_needs_modify_and_select_on_every_relation_read() {
+        assert_eq!(
+            perms("UPDATE kv AS x SET v = 'x' FROM other.o AS y WHERE x.k = y.k"),
+            vec![
+                (Permission::Modify, t("public", "kv")),
+                (Permission::Select, t("public", "kv")),
+                (Permission::Select, t("other", "o")),
+            ]
+        );
+        assert_eq!(
+            perms("DELETE FROM kv WHERE k IN (SELECT k FROM gone)"),
+            vec![
+                (Permission::Modify, t("public", "kv")),
+                (Permission::Select, t("public", "kv")),
+                (Permission::Select, t("public", "gone")),
             ]
         );
     }

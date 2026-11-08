@@ -1140,6 +1140,7 @@ pub(crate) fn parse_error_sqlstate(error: &ferrosa_sql::ParseError) -> &'static 
         | ParseError::UnsupportedCast(_)
         | ParseError::UnsupportedCastExpr
         | ParseError::UnsupportedAggregate(_)
+        | ParseError::UnsupportedDml(_)
         | ParseError::Unsupported(_) => "0A000",
         ParseError::UnknownType(_) => "42704",
         ParseError::DuplicateColumn(_) => "42701",
@@ -1198,6 +1199,14 @@ pub(crate) async fn execute_query_streaming<O: ReplySink>(
             )])
         }
     };
+    if let Statement::Dml(dml) = stmt {
+        let run = crate::dml_general::DmlRun {
+            env,
+            params: Vec::new(),
+            returning: ReturningOpts::simple(),
+        };
+        return crate::dml_general::execute_general_dml(run, &dml, txn, out).await;
+    }
     let Statement::Select(select) = stmt else {
         return Ok(execute_statement(env, stmt, txn).await);
     };
@@ -1897,6 +1906,7 @@ pub(crate) fn is_utility(stmt: &Statement) -> bool {
         | Statement::Insert(_)
         | Statement::Update(_)
         | Statement::Delete(_)
+        | Statement::Dml(_)
         | Statement::CopyFromStdin(_)
         | Statement::Truncate(_)
         | Statement::Vacuum(_)
@@ -1936,6 +1946,11 @@ async fn execute_statement(
         Statement::Select(_) => vec![error_response(
             "XX000",
             "internal error: a table SELECT reached the non-streaming path",
+        )],
+        // Routed to `dml_general` by `execute_query_streaming`.
+        Statement::Dml(_) => vec![error_response(
+            "XX000",
+            "internal error: a general UPDATE/DELETE reached the non-streaming path",
         )],
         // No-`FROM` expression query: `SELECT 1`, `SELECT version()`,
         // `SELECT (SELECT count(*) FROM t)`, etc.
@@ -2166,7 +2181,7 @@ async fn apply_or_buffer(
 /// per-transaction write-count refusal: the old `FERROSA_POSTGRES_MAX_TXN_WRITES`
 /// / SQLSTATE `53400` cap is gone (FMEA PG-12, PG-ACC-01). A write larger than
 /// the buffer SPILLS; it is never declined for being large.
-async fn apply_or_buffer_silent(
+pub(crate) async fn apply_or_buffer_silent(
     engine: &StorageEngine,
     schema: &Schema,
     mvcc: Option<&MvccManager>,
@@ -3339,6 +3354,18 @@ pub(crate) async fn execute_insert(
     // Every row's mutation, built and VALIDATED BEFORE any is applied — statement
     // atomicity (see the function doc).
     let mut mutations: Vec<PgWrite> = Vec::with_capacity(ins.rows.len());
+    // The omitted columns' bigserial ids and DEFAULTs, compiled once for every row.
+    let defaults = match crate::insert_defaults::InsertDefaults::compile(meta, &ins.columns) {
+        Ok(defaults) => defaults,
+        Err(error) => return vec![error],
+    };
+    let fill_ctx = crate::insert_defaults::FillCtx {
+        meta,
+        schema,
+        ks,
+        timestamp_micros,
+        jsonb_limits,
+    };
 
     for row_index in 0..ins.rows.len() {
         // Resolve THIS row's named columns (per CQL type), substituting bound params;
@@ -3374,8 +3401,27 @@ pub(crate) async fn execute_insert(
                     regular_cells.push((idx, value.clone()));
                 }
             }
+            // RETURNING reports the value as stored (a `timestamp` cell keeps
+            // milliseconds), not as supplied; NULL stays NULL.
+            let stored = if sql_value.is_null() {
+                sql_value
+            } else {
+                match crate::storage_provider::cql_to_value(&value) {
+                    Ok(stored) => stored,
+                    Err(e) => return vec![error_response("XX000", &e)],
+                }
+            };
             col_values.insert(col_name.clone(), value);
-            sql_values.insert(col_name.clone(), sql_value);
+            sql_values.insert(col_name.clone(), stored);
+        }
+        // Fill the omitted columns BEFORE the constraint check judges the row.
+        let mut fill = crate::insert_defaults::RowFill {
+            col_values: &mut col_values,
+            sql_values: &mut sql_values,
+            regular_cells: &mut regular_cells,
+        };
+        if let Err(error) = defaults.apply(&fill_ctx, &mut fill) {
+            return vec![error];
         }
         // Every NOT NULL column must have been given a non-NULL value (Lean
         // `Ferrosa.Sql.Constraint.admitted_writes_preserve_constraints`).
@@ -4112,7 +4158,7 @@ fn complete_tag(command: &str, rows: usize) -> Vec<BackendMessage> {
 }
 
 /// The current-micros timestamp a DML mutation is stamped with.
-fn dml_timestamp() -> i64 {
+pub(crate) fn dml_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
@@ -4488,7 +4534,7 @@ async fn delete_read_committed(
 
 /// Take local RC ownership before any property-dependent evaluation. Default
 /// lock waiting has no timeout; transaction lifetime is an independent bound.
-async fn own_row(
+pub(crate) async fn own_row(
     mvcc: Option<&MvccManager>,
     txn: Option<&mut TxnWriteSet>,
     id: uuid::Uuid,
@@ -4674,7 +4720,7 @@ async fn update_rows_by_predicate(
 }
 
 /// Build the storage mutation a resolved-row `DELETE` writes for ONE row.
-fn build_delete_mutation(
+pub(crate) fn build_delete_mutation(
     ks: &str,
     table: &str,
     pk_values: &[CqlValue],
@@ -5055,7 +5101,7 @@ pub(crate) async fn execute_update(
 /// The read is a normal point read of the row's storage, so the engine records it in
 /// the read set a serializable COMMIT validates — a concurrent writer of the same row
 /// fails that commit rather than silently losing this update.
-fn read_current_row_for_update(
+pub(crate) fn read_current_row_for_update(
     engine: &StorageEngine,
     schema: &Schema,
     ks: &str,

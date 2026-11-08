@@ -97,6 +97,24 @@ Size: roughly 4–6k lines.
 
 Size: roughly 2–3k lines.
 
+**Status (feat/pg-w2-dml).** Design in D16; Lean model in `Ferrosa/Sql/Dml.lean`.
+
+* Done, end to end through the front end:
+  * census rows 13, 14 and 15: the claim (CTE, `FOR UPDATE SKIP LOCKED`,
+    `UPDATE … FROM`, `RETURNING`), the ack (`= ANY`, timestamp equality), and the
+    plugins' `DELETE`/`UPDATE … WHERE id IN (SELECT … LIMIT n)`;
+  * `UPDATE`/`DELETE … RETURNING`;
+  * INSERT DEFAULTs and bigserial ids (row 12).
+  * Tests: `ferrosa-sql/tests/dml_parse.rs`, `dml_exec.rs`, `default_expr.rs`;
+    `ferrosa-postgres/src/dml_general_tests.rs`; the wire tests in
+    `tests/m1_join_live.rs`.
+* Proven verbatim: `tests/pg_oban_dml.rs` `the_census_dml_runs_verbatim`.
+  * The census table is built from the census's own DDL (lines 10–49, less the
+    PL/pgSQL).
+  * Census statements 54, 55, 57 and 58 then run as written over tokio-postgres, with
+    `text[]`/`jsonb[]` parameters and `= ANY($4)`.
+  * Array storage comes from W3.
+
 ### W3 — DDL and catalog
 
 * DDL over the extended protocol.
@@ -223,3 +241,42 @@ fixing commit.
 |---|---|---|
 | W3 | Enum `ADD VALUE` (as first built in W3, 18ec1c1a) rewrote the whole label list, so two concurrent adds of different labels lost one. Now one key per added label; test `pg_enum::tests::concurrent_add_values_both_survive`, Lean `Ferrosa.Sql.Enum.concurrent_adds_both_survive` | Fixed in 72a8ecfc |
 | W3 | `CREATE TABLE … col type NOT NULL` dropped the `NOT NULL` of every non-key column (T-132a), so a NULL was stored silently. Now recorded (`pg.not_null.<col>`) and enforced on INSERT (omitted or NULL) and UPDATE: `23502`. Test `not_null_on_a_regular_column_is_enforced`; Lean `Ferrosa.Sql.Constraint` (`unenforced_not_null_stores_a_null`, `admitted_writes_preserve_constraints`) | Fixed in 44224a7a |
+
+## Found while building W2
+
+* **`'…'::jsonb` was refused as an impossible cast.** The general engine's cast had no
+  arm for text → jsonb, so `'{}'::jsonb` and a text literal assigned to a jsonb column
+  (`SET meta = '{}'`, Oban's `meta` DEFAULT) failed with 42846.
+  * Fixed (7e3ad2fa): the cast parses the text under the engine's jsonb limits, and
+    malformed JSON is 22P02, never NULL.
+  * Test: `general::eval::tests::text_casts_to_jsonb_by_parsing_it`, and
+    `dml_exec.rs` `a_text_literal_is_assigned_to_a_timestamp_or_jsonb_column`.
+  * Lean: `Dml.lean` `assign_never_nulls`.
+* **`RETURNING` reported a timestamp at a precision the row is not stored with.**
+  * A `timestamp` cell keeps whole milliseconds (a CQL `timestamp`; documented in the
+    README).
+  * `INSERT … RETURNING` echoed the supplied microseconds, and a general
+    `UPDATE … RETURNING` reported the unstored SET value.
+  * Oban acknowledges a job with `attempted_at = $5`, where `$5` is the value the
+    claim's `RETURNING` gave it. That comparison against the stored millisecond
+    value matched nothing, so no job could be acknowledged.
+  * Found by `tests/pg_oban_dml.rs` (`oban_insert_claim_and_ack_one_job`) over a real
+    driver.
+  * Fixed: `RETURNING` reports the row as stored.
+    * INSERT round-trips each supplied value through its storage encoding.
+    * The DML read truncates a value assigned to a millisecond column exactly as the
+      storage does (`DmlSpec::store_millis`, toward zero).
+  * Tests: `dml_exec.rs` `a_millisecond_column_returns_its_value_as_stored`;
+    `dml_general_tests` `returning_reports_a_timestamp_as_stored`.
+  * Lean: `Dml.lean` `returning_reports_the_stored_value`,
+    `unstored_returning_can_miss`.
+  * Not changed: microsecond storage itself is the documented limitation it was.
+* **`obj_description(…)` came back as a column named `?column?`.** W1's rewrite (7309d7d7)
+  turns the call into a `pg_description` subquery, whose default output name is
+  `?column?`. PostgreSQL names the column `obj_description`.
+  * The same merge left W3's test pinning the old refusal of census statement 8, and that
+    test then failed.
+  * Fixed: the rewrite keeps the function's name as the item's alias.
+  * The test now asserts the real answer, `'12'` under `obj_description`:
+    `pg_oban_ddl.rs` `obj_description_reads_the_table_comment`.
+  * Lean: `Dml.lean` `rewrite_with_alias_keeps_name`, `rewrite_without_alias_renames`.

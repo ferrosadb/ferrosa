@@ -423,3 +423,40 @@ both committing an update to the same row: the loser gets `40001`.
 
 `nextval`, `setval`, `currval` and `CREATE SEQUENCE` remain unsupported and fail with
 `0A000` — there is no sequence to read.
+
+## D16 — A general `UPDATE`/`DELETE` reads, then writes by key; READ COMMITTED re-checks and fails rather than re-evaluating _(2026-11-08; lane W2)_
+
+**Decision:**
+
+* **Read then write.** A general `UPDATE`/`DELETE` runs as two steps.
+  * The read is one general `SELECT` over the target joined with `FROM`/`USING` and the
+    CTEs. It runs under the statement's snapshot with the transaction's own writes
+    overlaid, exactly as a `SELECT` does.
+  * Each matching row is then written by its storage key through the ordinary write path.
+  * The read's relations go into the transaction's read set.
+  * `specs/lean4/Ferrosa/Sql/Dml.lean`, `read_then_write_eq_declarative`, shows that this
+    is the declarative statement.
+* **The keyed fast path stays.** A statement the legacy keyed grammar carries whole, with
+  no `RETURNING`, keeps the legacy `UpdateStmt`/`DeleteStmt`, so pgbench is unchanged.
+  `legacy_where_agrees` and `legacy_set_agrees` show the two agree.
+  * One pre-existing divergence of that path is untouched: outside READ COMMITTED, a
+    keyed `UPDATE` of a missing row upserts.
+* **`UPDATE … FROM` with several matches for one target row.** The read is stably sorted
+  on the storage key, and only the first row of each run is kept. So the row is written
+  **once**, with its **first match in arrival order**: deterministic, never an error.
+  PostgreSQL also applies a single match, but leaves which one unspecified
+  (`firstPerRun_strict`, `firstPerRun_first`).
+* **READ COMMITTED.** The writer takes local ownership of each row, then re-reads it. If
+  the row differs from the one the read saw, the statement fails with **40001**. It does
+  not re-evaluate the `WHERE` against the new version, as PostgreSQL's EvalPlanQual would.
+  So two claimers of one job can never both claim it (`rc_no_double_claim`), and the
+  loser retries on its next poll, as under D14.
+* **`RETURNING`** is evaluated over the new row, and over the deleted row for `DELETE`.
+  Its rows are held in a spilling buffer and sent only after every write of the
+  statement succeeded. `RETURNING *` hides reserved `_sys_` columns, as `SELECT *` does.
+* **Assigning a storage-key column is refused** (0A000), as the keyed path refuses it.
+* **Authorization.** `MODIFY` on the target, plus `SELECT` on every relation the read
+  reads, the target included.
+
+**Consequences (accepted):** under contention a READ COMMITTED claimer gets 40001
+where PostgreSQL would have skipped or re-checked the row; Oban converges by retrying.

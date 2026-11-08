@@ -608,6 +608,21 @@ pub(crate) fn parse_pg(sql: &str) -> Result<ferrosa_sql::Statement, ferrosa_sql:
 fn rewrite_obj_description(
     select: &mut ferrosa_sql::SelectStmt,
 ) -> Result<(), ferrosa_sql::ParseError> {
+    // The rewrite turns the call into a subquery, whose default output name is
+    // `?column?`; PostgreSQL names the column after the function.
+    if let ferrosa_sql::Projection::Items(items) = &mut select.projection {
+        for item in items {
+            if let ferrosa_sql::SelectItem::Expr {
+                expr: ferrosa_sql::ScalarExpr::Func { name, .. },
+                alias: alias @ None,
+            } = item
+            {
+                if name.strip_prefix("pg_catalog.").unwrap_or(name) == "obj_description" {
+                    *alias = Some("obj_description".to_string());
+                }
+            }
+        }
+    }
     walk_scalars(select, &mut |e| rewrite_obj_description_in(e))
 }
 
@@ -711,6 +726,7 @@ fn description_lookup(
         offset: None,
         limit_param: None,
         offset_param: None,
+        lock: None,
     }
 }
 

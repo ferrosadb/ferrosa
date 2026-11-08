@@ -597,6 +597,41 @@ async fn comment_refusals_are_named() {
     );
 }
 
+/// Census statement 8 reads the comment with `obj_description(oid, 'pg_class')`, a function
+/// call in a projection plus a LEFT JOIN. W1's expression engine answers it: Ecto reads
+/// Oban's migration version ('12') from it, under PostgreSQL's output name
+/// `obj_description`.
+#[tokio::test]
+async fn obj_description_reads_the_table_comment() {
+    let fx = start().await;
+    create_jobs(&fx.client).await;
+    fx.client
+        .batch_execute("COMMENT ON TABLE oban_jobs IS '12'")
+        .await
+        .unwrap();
+    let census_8 = "SELECT pg_catalog.obj_description(pg_class.oid, 'pg_class') FROM pg_class \
+         LEFT JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace \
+         WHERE pg_class.relname = 'oban_jobs' AND pg_namespace.nspname = 'public'";
+    let messages = fx
+        .client
+        .simple_query(census_8)
+        .await
+        .expect("census statement 8 runs");
+    let mut names = Vec::new();
+    let mut values = Vec::new();
+    for message in messages {
+        match message {
+            SimpleQueryMessage::RowDescription(columns) => {
+                names.extend(columns.iter().map(|c| c.name().to_string()));
+            }
+            SimpleQueryMessage::Row(row) => values.push(row.get(0).map(str::to_string)),
+            _ => {}
+        }
+    }
+    assert_eq!(names, ["obj_description"], "PostgreSQL's output name");
+    assert_eq!(values, [Some("12".to_string())]);
+}
+
 // ---------------------------------------------------------------------------
 // 10. pg_range (Postgrex's type bootstrap joins it; census statements 1, 53, 56)
 // ---------------------------------------------------------------------------
@@ -1358,26 +1393,3 @@ async fn enum_and_regnamespace_casts_resolve_through_the_catalog() {
     );
 }
 
-/// Ecto's migration-version read: obj_description over pg_description, verbatim.
-#[tokio::test]
-async fn obj_description_reads_the_table_comment() {
-    let fx = start().await;
-    fx.client
-        .batch_execute("CREATE TABLE oban_jobs (id bigint PRIMARY KEY)")
-        .await
-        .expect("create");
-    fx.client
-        .batch_execute("COMMENT ON TABLE \"public\".oban_jobs IS '12'")
-        .await
-        .expect("comment");
-    assert_eq!(
-        rows(
-            &fx.client,
-            "SELECT pg_catalog.obj_description(pg_class.oid, 'pg_class') FROM pg_class \
-             LEFT JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace \
-             WHERE pg_class.relname = 'oban_jobs' AND pg_namespace.nspname = 'public'"
-        )
-        .await,
-        vec![vec![Some("12".to_string())]]
-    );
-}

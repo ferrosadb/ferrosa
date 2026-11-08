@@ -199,17 +199,37 @@ where
 {
     // Captured before `stmt` moves into the executor thread; needs no clone.
     let is_star = matches!(stmt.projection, ferrosa_sql::Projection::Star);
+    open_cursor_stream(catalog, failure, is_star, move |catalog: &C| {
+        ferrosa_sql::open_cursor(
+            &stmt,
+            catalog,
+            &default_schema,
+            &params,
+            &SpillCtx::default(),
+        )
+    })
+    .await
+}
+
+/// [`open_stream`] for any cursor `open` builds over `catalog`: a `SELECT`, or
+/// the read half of a general `UPDATE`/`DELETE`. `hide_reserved` drops a
+/// reserved `_sys_` column from the output (a `SELECT *`).
+pub(crate) async fn open_cursor_stream<C, F>(
+    catalog: C,
+    failure: ScanFailure,
+    hide_reserved: bool,
+    open: F,
+) -> Result<ResultStream, BackendMessage>
+where
+    C: Catalog + Send + 'static,
+    F: FnOnce(&C) -> Result<RowCursor, ExecError> + Send + 'static,
+{
+    let is_star = hide_reserved;
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = Arc::clone(&cancel);
     let (columns_tx, columns_rx) = tokio::sync::oneshot::channel();
     let handle = tokio::task::spawn_blocking(move || {
-        let cursor = match ferrosa_sql::open_cursor(
-            &stmt,
-            &catalog,
-            &default_schema,
-            &params,
-            &SpillCtx::default(),
-        ) {
+        let cursor = match open(&catalog) {
             Ok(cursor) => cursor,
             Err(error) => {
                 let _ = columns_tx.send(Err(error));

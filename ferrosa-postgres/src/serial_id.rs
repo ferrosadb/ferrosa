@@ -34,8 +34,6 @@
 use std::sync::{Mutex, OnceLock};
 
 /// The id epoch: 2025-01-01T00:00:00Z, in Unix milliseconds.
-// Consumed by INSERT's bigserial default (W2 lane, feat/pg-w2-dml); here only by tests.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const ID_EPOCH_MILLIS: u64 = 1_735_689_600_000;
 const NODE_BITS: u32 = 10;
 const SEQ_BITS: u32 = 12;
@@ -43,8 +41,6 @@ const MAX_NODE: u64 = (1 << NODE_BITS) - 1;
 const MAX_SEQ: u64 = (1 << SEQ_BITS) - 1;
 const MAX_MILLIS: u64 = (1 << 41) - 1;
 /// The environment variable naming this node's tag.
-// Consumed by INSERT's bigserial default (W2 lane, feat/pg-w2-dml); here only by tests.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const NODE_TAG_ENV: &str = "FERROSA_PG_SERIAL_NODE_TAG";
 
 /// `millis << 22 | node << 12 | seq`. The Lean model's `compose`.
@@ -103,14 +99,11 @@ impl SerialIdGenerator {
     }
 
     /// The next id at the current wall clock.
-    #[cfg_attr(not(test), allow(dead_code))] // see `next_id`
     pub(crate) fn next(&self) -> i64 {
         self.next_at(now_millis())
     }
 }
 
-// Consumed by INSERT's bigserial default (W2 lane, feat/pg-w2-dml); here only by tests.
-#[cfg_attr(not(test), allow(dead_code))]
 fn now_millis() -> u64 {
     let unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -123,8 +116,6 @@ fn now_millis() -> u64 {
 }
 
 /// This process's node tag: `FERROSA_PG_SERIAL_NODE_TAG`, else a random tag (logged).
-// Consumed by INSERT's bigserial default (W2 lane, feat/pg-w2-dml); here only by tests.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn node_tag() -> u16 {
     static TAG: OnceLock<u16> = OnceLock::new();
     *TAG.get_or_init(|| match std::env::var(NODE_TAG_ENV) {
@@ -145,8 +136,6 @@ pub(crate) fn node_tag() -> u16 {
 }
 
 /// The next `bigserial` id from this process's generator.
-// Consumed by INSERT's bigserial default (W2 lane, feat/pg-w2-dml); here only by tests.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn next_id() -> i64 {
     static GENERATOR: OnceLock<SerialIdGenerator> = OnceLock::new();
     GENERATOR

@@ -35,8 +35,6 @@ pub(crate) fn serial_extension(column: &str) -> (String, String) {
 }
 
 /// `column`'s DEFAULT expression text, if it has one.
-// Read by INSERT when applying defaults (W2 lane, feat/pg-w2-dml); here only by tests.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn column_default<'a>(meta: &'a TableMetadata, column: &str) -> Option<&'a str> {
     meta.extensions
         .get(&format!("{DEFAULT_PREFIX}{column}"))
@@ -45,8 +43,6 @@ pub(crate) fn column_default<'a>(meta: &'a TableMetadata, column: &str) -> Optio
 }
 
 /// Whether `column` is a `bigserial` column.
-// Read by INSERT when applying defaults (W2 lane, feat/pg-w2-dml); here only by tests.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn is_bigserial(meta: &TableMetadata, column: &str) -> bool {
     meta.extensions
         .get(&format!("{SERIAL_PREFIX}{column}"))
