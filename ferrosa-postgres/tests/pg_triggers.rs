@@ -324,15 +324,37 @@ async fn without_a_function_backend_create_function_is_refused() {
 }
 
 #[tokio::test]
-async fn function_ddl_inside_a_transaction_is_refused_like_other_ddl() {
+async fn function_and_trigger_ddl_commit_with_the_migration_transaction() {
+    // Ecto runs each migration inside BEGIN … COMMIT: the function and its trigger are buffered
+    // with the block's other DDL and applied at COMMIT.
     let server = server().await;
-    let c = pg_server::connect(server.port).await;
-    run(&c, &["BEGIN"]).await;
-    let error = c
-        .batch_execute(NOTIFY_NAME)
+    let (a, mut rx) = listener(server.port).await;
+    run(&a, &["LISTEN rows"]).await;
+    let b = pg_server::connect(server.port).await;
+    run(&b, &["BEGIN", NOTIFY_NAME, ON_INSERT, "COMMIT"]).await;
+    run(
+        &b,
+        &["INSERT INTO t (id, ck, name, score) VALUES ('m', 1, 'migrated', 1)"],
+    )
+    .await;
+    assert_eq!(next(&mut rx).await, "migrated");
+}
+
+#[tokio::test]
+async fn function_and_trigger_ddl_roll_back_with_the_transaction() {
+    let server = server().await;
+    let b = pg_server::connect(server.port).await;
+    run(&b, &["BEGIN", NOTIFY_NAME, ON_INSERT, "ROLLBACK"]).await;
+    let error = b
+        .batch_execute("DROP FUNCTION notify_name()")
         .await
-        .expect_err("in a transaction");
-    assert_eq!(code(&error), "25001");
+        .expect_err("the function was never created");
+    assert_eq!(code(&error), "42883");
+    run(
+        &b,
+        &["INSERT INTO t (id, ck, name, score) VALUES ('m', 1, 'x', 1)"],
+    )
+    .await;
 }
 
 /// Oban's v1 notify trigger, with `public` read as this server's schema and `state` a text

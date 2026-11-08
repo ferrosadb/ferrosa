@@ -137,12 +137,11 @@ pub(crate) fn stored(meta: &TableMetadata) -> Result<Vec<StoredTrigger>, Backend
 }
 
 fn table_meta(
-    ctx: &QueryContext,
+    snapshot: &ferrosa_schema::SchemaSnapshot,
     keyspace: &str,
     table: &str,
 ) -> Result<TableMetadata, BackendMessage> {
-    ctx.schema
-        .snapshot()
+    snapshot
         .tables
         .get(&(keyspace.to_string(), table.to_string()))
         .cloned() // copied out of the shared schema snapshot
@@ -156,11 +155,10 @@ fn table_meta(
 
 /// The first trigger (name, table) whose function is `(keyspace, name)`.
 pub(crate) fn dependent_trigger(
-    ctx: &QueryContext,
+    snapshot: &ferrosa_schema::SchemaSnapshot,
     keyspace: &str,
     function: &str,
 ) -> Result<Option<(String, String)>, BackendMessage> {
-    let snapshot = ctx.schema.snapshot();
     for meta in snapshot.tables.values() {
         for trigger in stored(meta)? {
             if trigger.function_schema == keyspace && trigger.function_name == function {
@@ -182,16 +180,6 @@ fn save(triggers: &[StoredTrigger]) -> Result<TableUpdates, BackendMessage> {
     })
 }
 
-fn refuse_in_txn(session: &Session, what: &str) -> Result<(), BackendMessage> {
-    if session.in_txn() {
-        return Err(error_response(
-            "25001",
-            &format!("{what} cannot run inside a transaction block: DDL is not transactional here"),
-        ));
-    }
-    Ok(())
-}
-
 fn authorize_alter(
     ctx: &QueryContext,
     session: &Session,
@@ -211,23 +199,14 @@ fn authorize_alter(
     )
 }
 
-fn executor(ctx: &QueryContext) -> Result<Arc<dyn crate::ddl::DdlExecutor>, BackendMessage> {
-    ctx.ddl.as_ref().map(Arc::clone).ok_or_else(|| {
-        error_response(
-            "0A000",
-            "trigger DDL is not available: this server has no schema-change path",
-        )
-    })
-}
-
 /// `CREATE TRIGGER`.
 pub(crate) async fn create(
     ctx: &QueryContext,
     session: &mut Session,
     statement: CreateTrigger,
 ) -> Result<Vec<BackendMessage>, BackendMessage> {
-    refuse_in_txn(session, "CREATE TRIGGER")?;
-    let ddl = executor(ctx)?;
+    super::ddl_available(ctx, "CREATE TRIGGER")?;
+    let view = super::ddl_view(ctx, session);
     let CreateTrigger {
         name,
         events,
@@ -236,10 +215,10 @@ pub(crate) async fn create(
     } = statement;
     let keyspace = super::functions::resolve_schema(ctx, &table);
     authorize_alter(ctx, session, &keyspace, &table.name)?;
-    let meta = table_meta(ctx, &keyspace, &table.name)?;
+    let meta = table_meta(&view, &keyspace, &table.name)?;
     let function_schema = super::functions::resolve_schema(ctx, &function);
     // The function must exist, be PL/pgSQL, take no arguments and return trigger.
-    super::functions::load_trigger_function(ctx, &function_schema, &function.name).await?;
+    super::functions::load_trigger_function(ctx, &view, &function_schema, &function.name).await?;
     let mut triggers = stored(&meta)?;
     if triggers.iter().any(|t| t.name == name) {
         return Err(error_response(
@@ -273,9 +252,12 @@ pub(crate) async fn create(
         function_name: function.name,
     });
     let updates = save(&triggers)?;
-    ddl.alter_table(&keyspace, &table.name, updates)
-        .await
-        .map_err(|e| error_response("58000", &format!("storing trigger: {e}")))?;
+    let op = super::DdlOp::AlterTable {
+        keyspace,
+        table: table.name,
+        updates,
+    };
+    super::apply_ddl(ctx, session, vec![op]).await?;
     Ok(vec![BackendMessage::CommandComplete {
         tag: "CREATE TRIGGER".into(),
     }])
@@ -296,8 +278,8 @@ pub(crate) async fn drop(
     name: String,
     table: QualifiedName,
 ) -> Result<Vec<BackendMessage>, BackendMessage> {
-    refuse_in_txn(session, "DROP TRIGGER")?;
-    let ddl = executor(ctx)?;
+    super::ddl_available(ctx, "DROP TRIGGER")?;
+    let view = super::ddl_view(ctx, session);
     let keyspace = super::functions::resolve_schema(ctx, &table);
     authorize_alter(ctx, session, &keyspace, &table.name)?;
     let done = || {
@@ -305,7 +287,7 @@ pub(crate) async fn drop(
             tag: "DROP TRIGGER".into(),
         }])
     };
-    let meta = match table_meta(ctx, &keyspace, &table.name) {
+    let meta = match table_meta(&view, &keyspace, &table.name) {
         Ok(meta) => meta,
         Err(_) if if_exists => return done(),
         Err(error) => return Err(error),
@@ -326,9 +308,12 @@ pub(crate) async fn drop(
         ));
     }
     let updates = save(&triggers)?;
-    ddl.alter_table(&keyspace, &table.name, updates)
-        .await
-        .map_err(|e| error_response("58000", &format!("dropping trigger: {e}")))?;
+    let op = super::DdlOp::AlterTable {
+        keyspace,
+        table: table.name,
+        updates,
+    };
+    super::apply_ddl(ctx, session, vec![op]).await?;
     done()
 }
 
@@ -362,11 +347,13 @@ pub(crate) async fn fire(
             &format!("trigger nesting exceeded {MAX_TRIGGER_DEPTH} levels"),
         ));
     }
+    let committed = ctx.schema.snapshot();
     for event in events.events {
-        let meta = table_meta(ctx, &event.keyspace, &event.table)?;
+        let meta = table_meta(&committed, &event.keyspace, &event.table)?;
         for trigger in stored(&meta)?.iter().filter(|t| t.fires_for(&event.op)) {
             let loaded = super::functions::load_trigger_function(
                 ctx,
+                &committed,
                 &trigger.function_schema,
                 &trigger.function_name,
             )

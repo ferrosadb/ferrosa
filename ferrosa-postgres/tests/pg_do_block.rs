@@ -230,21 +230,31 @@ async fn json_build_object_over_a_variable_assigns_a_json_value() {
     assert_eq!(rows[0].get::<_, String>(0), "{\"queue\": \"default\"}");
 }
 
-/// Awaits W1/W3: the census DO block verbatim. Today its guard stops at
-/// `'public'::regnamespace` (`0A000`, cast not supported); after that it needs `CREATE TYPE …
-/// AS ENUM` (W3) and transactional DDL inside the block's transaction (W3).
-#[cfg(feature = "pending-workstreams")]
+/// The census DO block verbatim (Oban migration v1): its guard reads `pg_type` through the
+/// `regnamespace` cast, and its CREATE TYPE runs inside the block's transaction. Run twice:
+/// the second run finds the type and does nothing.
 #[tokio::test]
-async fn awaits_w1_w3_the_census_do_block_creates_the_enum() {
-    let server = pg_server::start_server_with_ddl().await;
+async fn the_census_do_block_creates_the_enum_once() {
+    let server = pg_server::start_server_public(Default::default()).await;
     let client = pg_server::connect(server.port).await;
     let census = "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'oban_job_state' AND typnamespace = 'public'::regnamespace::oid) THEN CREATE TYPE \"public\".oban_job_state AS ENUM ( 'available', 'suspended', 'scheduled', 'executing', 'retryable', 'completed', 'discarded', 'cancelled' ); END IF; END$$;;";
     client
         .batch_execute(census)
         .await
         .expect("the census DO block runs");
+    // Ecto sends it over the extended protocol: the second run, idempotent, goes that way.
     client
-        .batch_execute(census)
+        .execute(census, &[])
         .await
-        .expect("and is idempotent");
+        .expect("and is idempotent over the extended protocol");
+    let rows: Vec<_> = client
+        .simple_query(
+            "SELECT 1 FROM pg_type WHERE typname = 'oban_job_state' AND typnamespace = 'public'::regnamespace::oid",
+        )
+        .await
+        .expect("pg_type query")
+        .into_iter()
+        .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
+        .collect();
+    assert_eq!(rows.len(), 1, "the enum exists exactly once");
 }

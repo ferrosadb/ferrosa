@@ -142,33 +142,14 @@ pub(crate) fn resolve_schema(ctx: &QueryContext, name: &QualifiedName) -> String
         .unwrap_or_else(|| ctx.default_schema.clone()) // owned keyspace name for the schema key
 }
 
-fn refuse_in_txn(session: &Session, what: &str) -> Result<(), BackendMessage> {
-    if session.in_txn() {
-        return Err(error_response(
-            "25001",
-            &format!("{what} cannot run inside a transaction block: DDL is not transactional here"),
-        ));
-    }
-    Ok(())
-}
-
-fn ddl(ctx: &QueryContext, what: &str) -> Result<Arc<dyn crate::ddl::DdlExecutor>, BackendMessage> {
-    ctx.ddl.as_ref().map(Arc::clone).ok_or_else(|| {
-        error_response(
-            "0A000",
-            &format!("{what} is not available: this server has no schema-change path"),
-        )
-    })
-}
-
 /// `CREATE [OR REPLACE] FUNCTION … LANGUAGE plpgsql`.
 pub(crate) async fn create(
     ctx: &QueryContext,
     session: &mut Session,
     statement: CreateFunction,
 ) -> Result<Vec<BackendMessage>, BackendMessage> {
-    refuse_in_txn(session, "CREATE FUNCTION")?;
-    let executor = ddl(ctx, "CREATE FUNCTION")?;
+    super::ddl_available(ctx, "CREATE FUNCTION")?;
+    let view = super::ddl_view(ctx, session);
     let CreateFunction {
         or_replace,
         name,
@@ -202,7 +183,10 @@ pub(crate) async fn create(
         .map_err(|e| error_response("XX000", &format!("encoding function body: {e}")))?;
     // Parse and compile before touching the schema: a refused body never replaces a function.
     load_envelope(ctx, &envelope).await?;
-    let existing = ctx.schema.get_function(&keyspace, &name.name, &arg_types);
+    // Owned key for the schema map lookup.
+    let existing = view
+        .functions
+        .get(&(keyspace.clone(), name.name.clone(), arg_types.clone()));
     if let Some(existing) = &existing {
         if !or_replace {
             return Err(error_response(
@@ -236,16 +220,16 @@ pub(crate) async fn create(
         language: LANGUAGE.into(),
         body: envelope,
     };
+    let mut ops = Vec::with_capacity(2);
     if existing.is_some() {
-        executor
-            .drop_function(&keyspace, &name.name, arg_types)
-            .await
-            .map_err(|e| error_response("58000", &format!("replacing function: {e}")))?;
+        ops.push(super::DdlOp::DropFunction {
+            keyspace,
+            name: name.name,
+            arg_types,
+        });
     }
-    executor
-        .create_function(metadata)
-        .await
-        .map_err(|e| error_response("58000", &format!("storing function: {e}")))?;
+    ops.push(super::DdlOp::CreateFunction(metadata));
+    super::apply_ddl(ctx, session, ops).await?;
     Ok(vec![BackendMessage::CommandComplete {
         tag: "CREATE FUNCTION".into(),
     }])
@@ -259,8 +243,8 @@ pub(crate) async fn drop(
     name: QualifiedName,
     arg_types: Option<Vec<String>>,
 ) -> Result<Vec<BackendMessage>, BackendMessage> {
-    refuse_in_txn(session, "DROP FUNCTION")?;
-    let executor = ddl(ctx, "DROP FUNCTION")?;
+    super::ddl_available(ctx, "DROP FUNCTION")?;
+    let view = super::ddl_view(ctx, session);
     let keyspace = resolve_schema(ctx, &name);
     let wanted = match arg_types {
         Some(types) => Some(
@@ -271,7 +255,7 @@ pub(crate) async fn drop(
         ),
         None => None,
     };
-    let Some(found) = find(ctx, &keyspace, &name.name, wanted.as_deref())? else {
+    let Some(found) = find(&view, &keyspace, &name.name, wanted.as_deref())? else {
         if if_exists {
             return Ok(vec![BackendMessage::CommandComplete {
                 tag: "DROP FUNCTION".into(),
@@ -299,7 +283,8 @@ pub(crate) async fn drop(
             ferrosa_schema::auth::permission::Resource::Keyspace(keyspace.clone()), // owned for the resource key
         )],
     )?;
-    if let Some((trigger, table)) = super::triggers::dependent_trigger(ctx, &keyspace, &name.name)?
+    if let Some((trigger, table)) =
+        super::triggers::dependent_trigger(&view, &keyspace, &name.name)?
     {
         return Err(error_response(
             "2BP01",
@@ -309,10 +294,12 @@ pub(crate) async fn drop(
             ),
         ));
     }
-    executor
-        .drop_function(&keyspace, &found.name, found.arg_types)
-        .await
-        .map_err(|e| error_response("58000", &format!("dropping function: {e}")))?;
+    let op = super::DdlOp::DropFunction {
+        keyspace,
+        name: found.name,
+        arg_types: found.arg_types,
+    };
+    super::apply_ddl(ctx, session, vec![op]).await?;
     Ok(vec![BackendMessage::CommandComplete {
         tag: "DROP FUNCTION".into(),
     }])
@@ -321,15 +308,16 @@ pub(crate) async fn drop(
 /// The function `(keyspace, name)` with these argument types, or the only one by that name
 /// when no types are given.
 fn find(
-    ctx: &QueryContext,
+    snapshot: &ferrosa_schema::SchemaSnapshot,
     keyspace: &str,
     name: &str,
     arg_types: Option<&[CqlType]>,
 ) -> Result<Option<UserFunctionMetadata>, BackendMessage> {
     if let Some(types) = arg_types {
-        return Ok(ctx.schema.get_function(keyspace, name, types));
+        // Owned key for the schema map lookup; the result is copied out of the snapshot.
+        let key = (keyspace.to_string(), name.to_string(), types.to_vec());
+        return Ok(snapshot.functions.get(&key).cloned());
     }
-    let snapshot = ctx.schema.snapshot();
     let mut matching = snapshot
         .functions
         .values()
@@ -347,10 +335,12 @@ fn find(
 /// Load a stored PL/pgSQL function `(keyspace, name)` taking no arguments (a trigger function).
 pub(crate) async fn load_trigger_function(
     ctx: &QueryContext,
+    snapshot: &ferrosa_schema::SchemaSnapshot,
     keyspace: &str,
     name: &str,
 ) -> Result<Arc<Loaded>, BackendMessage> {
-    let Some(function) = ctx.schema.get_function(keyspace, name, &[]) else {
+    let key = (keyspace.to_string(), name.to_string(), Vec::new());
+    let Some(function) = snapshot.functions.get(&key) else {
         return Err(error_response(
             "42883",
             &format!("function {keyspace}.{name}() does not exist"),

@@ -727,7 +727,15 @@ fn refuse_unknown_casts(
 
 fn cast_check(e: &mut ferrosa_sql::ScalarExpr) -> Result<(), ferrosa_sql::ParseError> {
     if let ferrosa_sql::ScalarExpr::Cast { ty, .. } = e {
-        if !ferrosa_sql::cast_type_supported(ty) {
+        // `regnamespace` and schema-qualified user types (enums) are resolved
+        // against the catalog when the statement runs; an unknown one is 42704.
+        let pg_catalog = ty
+            .schema
+            .as_deref()
+            .is_none_or(|s| s.eq_ignore_ascii_case("pg_catalog"));
+        let catalog_resolved = !ty.array
+            && ((pg_catalog && ty.name.eq_ignore_ascii_case("regnamespace")) || !pg_catalog);
+        if !catalog_resolved && !ferrosa_sql::cast_type_supported(ty) {
             let mut name = match &ty.schema {
                 Some(schema) => format!("{schema}.{}", ty.name),
                 None => ty.name.clone(),

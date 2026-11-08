@@ -81,6 +81,14 @@ pub(crate) enum DdlStep {
         table: String,
         name: String,
     },
+    /// D13: a PL/pgSQL function (boxed: the metadata is large).
+    CreateFunction(Box<ferrosa_schema::UserFunctionMetadata>),
+    /// D13: drop one function overload.
+    DropFunction {
+        keyspace: String,
+        name: String,
+        arg_types: Vec<ferrosa_common::cql_type::CqlType>,
+    },
 }
 
 impl DdlStep {
@@ -96,6 +104,10 @@ impl DdlStep {
                 format!("CREATE INDEX {keyspace}.{name}")
             }
             DdlStep::DropIndex { keyspace, name, .. } => format!("DROP INDEX {keyspace}.{name}"),
+            DdlStep::CreateFunction(f) => format!("CREATE FUNCTION {}.{}", f.keyspace, f.name),
+            DdlStep::DropFunction { keyspace, name, .. } => {
+                format!("DROP FUNCTION {keyspace}.{name}")
+            }
         }
     }
 }
@@ -141,6 +153,7 @@ pub(crate) fn apply_step(snap: &mut SchemaSnapshot, step: &DdlStep) -> Result<()
             table,
             name,
         } => {
+            // The index map is keyed by an owned triple, so a lookup needs one.
             let key = (keyspace.clone(), table.clone(), name.clone());
             match snap.indexes.remove(&key) {
                 Some(_) => Ok(()),
@@ -149,7 +162,44 @@ pub(crate) fn apply_step(snap: &mut SchemaSnapshot, step: &DdlStep) -> Result<()
                 ))),
             }
         }
+        DdlStep::CreateFunction(f) => apply_create_function(snap, f),
+        DdlStep::DropFunction {
+            keyspace,
+            name,
+            arg_types,
+        } => {
+            // The function map is keyed by an owned triple, so a lookup needs one.
+            let key = (keyspace.clone(), name.clone(), arg_types.clone());
+            match snap.functions.remove(&key) {
+                Some(_) => Ok(()),
+                None => Err(StepConflict(format!(
+                    "function {keyspace}.{name} does not exist"
+                ))),
+            }
+        }
     }
+}
+
+fn apply_create_function(
+    snap: &mut SchemaSnapshot,
+    f: &ferrosa_schema::UserFunctionMetadata,
+) -> Result<(), StepConflict> {
+    if !snap.keyspaces.contains_key(&f.keyspace) {
+        return Err(StepConflict(format!(
+            "schema {} does not exist",
+            f.keyspace
+        )));
+    }
+    // Owned key; the view keeps its own copy and the buffered step keeps the original.
+    let key = (f.keyspace.clone(), f.name.clone(), f.arg_types.clone());
+    if snap.functions.contains_key(&key) {
+        return Err(StepConflict(format!(
+            "function {}.{} already exists",
+            f.keyspace, f.name
+        )));
+    }
+    snap.functions.insert(key, f.clone()); // the view's copy; the step keeps the original
+    Ok(())
 }
 
 fn apply_create_table(snap: &mut SchemaSnapshot, meta: &TableMetadata) -> Result<(), StepConflict> {
@@ -375,6 +425,26 @@ impl DdlExecutor for Recorder<'_> {
             name: name.to_string(),
         })
     }
+
+    async fn create_function(
+        &self,
+        function: ferrosa_schema::UserFunctionMetadata,
+    ) -> Result<(), String> {
+        self.record(DdlStep::CreateFunction(Box::new(function)))
+    }
+
+    async fn drop_function(
+        &self,
+        keyspace: &str,
+        name: &str,
+        arg_types: Vec<ferrosa_common::cql_type::CqlType>,
+    ) -> Result<(), String> {
+        self.record(DdlStep::DropFunction {
+            keyspace: keyspace.to_string(),
+            name: name.to_string(),
+            arg_types,
+        })
+    }
 }
 
 /// Check that every step still applies, in order, to the schema as it is now. No schema
@@ -443,6 +513,12 @@ async fn exec_step(executor: &dyn DdlExecutor, step: DdlStep) -> Result<(), Stri
             table,
             name,
         } => executor.drop_index(&keyspace, &table, &name).await,
+        DdlStep::CreateFunction(f) => executor.create_function(*f).await,
+        DdlStep::DropFunction {
+            keyspace,
+            name,
+            arg_types,
+        } => executor.drop_function(&keyspace, &name, arg_types).await,
     }
 }
 

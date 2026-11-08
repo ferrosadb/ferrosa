@@ -201,6 +201,92 @@ pub(crate) async fn execute_nested(
     Box::pin(dispatch(ctx, session, statement, &[], Protocol::Extended)).await
 }
 
+/// The schema a procedural DDL statement plans against: the committed schema, or — inside a
+/// transaction block — the block's view with its buffered DDL applied (`ddl_txn`).
+pub(crate) fn ddl_view(
+    ctx: &QueryContext,
+    session: &mut Session,
+) -> Arc<ferrosa_schema::SchemaSnapshot> {
+    if session.in_txn() {
+        return session.txn_writes_mut().ddl_batch_mut().view(&ctx.schema);
+    }
+    ctx.schema.snapshot()
+}
+
+/// Refuse DDL on a server with no schema-change path (buffered DDL could not commit either).
+pub(crate) fn ddl_available(ctx: &QueryContext, what: &str) -> Result<(), BackendMessage> {
+    if ctx.ddl.is_some() {
+        return Ok(());
+    }
+    Err(error_response(
+        "0A000",
+        &format!("{what} is not available: this server has no schema-change path"),
+    ))
+}
+
+/// One schema change of the procedural lane.
+pub(crate) enum DdlOp {
+    CreateFunction(ferrosa_schema::UserFunctionMetadata),
+    DropFunction {
+        keyspace: String,
+        name: String,
+        arg_types: Vec<ferrosa_common::cql_type::CqlType>,
+    },
+    AlterTable {
+        keyspace: String,
+        table: String,
+        updates: ferrosa_schema::TableUpdates,
+    },
+}
+
+/// Apply schema changes: now through the schema-change path in autocommit, or buffered into
+/// the block's DDL batch inside a transaction (W3's `ddl_txn`), to be replayed at COMMIT with
+/// the block's other DDL and dropped by ROLLBACK.
+pub(crate) async fn apply_ddl(
+    ctx: &QueryContext,
+    session: &mut Session,
+    ops: Vec<DdlOp>,
+) -> Result<(), BackendMessage> {
+    let Some(executor) = ctx.ddl.as_ref() else {
+        return Err(error_response(
+            "0A000",
+            "this server has no schema-change path",
+        ));
+    };
+    if session.in_txn() {
+        let batch = session.txn_writes_mut().ddl_batch_mut();
+        let recorder = crate::ddl_txn::Recorder::new(batch, &ctx.schema);
+        return run_ops(&recorder, ops).await;
+    }
+    run_ops(executor.as_ref(), ops).await
+}
+
+async fn run_ops(
+    executor: &dyn crate::ddl::DdlExecutor,
+    ops: Vec<DdlOp>,
+) -> Result<(), BackendMessage> {
+    for op in ops {
+        let done = match op {
+            DdlOp::CreateFunction(f) => executor.create_function(f).await,
+            DdlOp::DropFunction {
+                keyspace,
+                name,
+                arg_types,
+            } => executor.drop_function(&keyspace, &name, arg_types).await,
+            DdlOp::AlterTable {
+                keyspace,
+                table,
+                updates,
+            } => executor.alter_table(&keyspace, &table, updates).await,
+        };
+        done.map_err(|e| {
+            tracing::error!(error = %e, "procedural DDL could not be applied");
+            error_response("58000", &format!("schema change failed: {e}"))
+        })?;
+    }
+    Ok(())
+}
+
 /// A PL/pgSQL parse refusal as an error response.
 pub(crate) fn pl_error(error: ferrosa_plpgsql::PlError) -> BackendMessage {
     error_response(error.sqlstate, &error.message)

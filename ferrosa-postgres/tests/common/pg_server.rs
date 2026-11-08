@@ -256,6 +256,36 @@ pub async fn start_server_with_procedural(
     .await
 }
 
+/// DDL, a chosen PL/pgSQL backend, and an empty `public` keyspace beside `ks` — the schema
+/// Oban's migrations address (`"public".oban_jobs`, `'public'::regnamespace`).
+pub async fn start_server_public(
+    procedural: ferrosa_postgres::procedural::Procedural,
+) -> TestServer {
+    let server = start_server_with_procedural(procedural).await;
+    let auth = AuthContext {
+        role: "cassandra".to_string(),
+        is_superuser: true,
+        must_change_password: false,
+    };
+    let mut options = HashMap::new();
+    options.insert("replication_factor".to_string(), "1".to_string());
+    server
+        .schema
+        .create_keyspace(
+            KeyspaceMetadata {
+                name: "public".to_string(),
+                durable_writes: true,
+                replication: ReplicationParams {
+                    strategy: "SimpleStrategy".to_string(),
+                    options,
+                },
+            },
+            &auth,
+        )
+        .expect("create the public keyspace");
+    server
+}
+
 async fn start_server_configured(
     rows: usize,
     limits: ferrosa_postgres::PortalLimits,
