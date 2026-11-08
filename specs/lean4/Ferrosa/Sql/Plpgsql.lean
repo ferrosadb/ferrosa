@@ -427,4 +427,54 @@ theorem exists_ignores_everything_after_the_first_row {σ : Type} (h₁ h₂ : H
     cases e1 : (h₁.query q.sql (bindNames env q) s).1 <;>
       cases e2 : (h₂.query q.sql (bindNames env q) s).1 <;> simp_all
 
+/-! ## The census capture: flattening a statement onto one line
+
+`ferrosa-postgres/tests/fixtures/oban_census.sql` stores one statement per line, so the capture
+replaced newlines with spaces. That is harmless for SQL except inside a `--` comment, which runs
+to the end of the *line*: flattened, it swallows the code that followed it. Oban's v1 notify
+function has such a comment, and its flattened body no longer parses (the census test in
+`ferrosa-plpgsql/tests/census.rs` found it). A `/* … */` comment ends at its delimiter, so it
+survives flattening; the fixture now uses that form, which PostgreSQL reads identically. -/
+
+/-- Replace each newline with a space, as the capture did. -/
+def flatten (s : List Char) : List Char := s.map (fun c => if c = '\n' then ' ' else c)
+
+mutual
+/-- Strip `--` comments (to the end of the line), keeping the newline. -/
+def lineCode : List Char → List Char
+  | '-' :: '-' :: rest => lineComment rest
+  | c :: rest => c :: lineCode rest
+  | [] => []
+
+def lineComment : List Char → List Char
+  | '\n' :: rest => '\n' :: lineCode rest
+  | _ :: rest => lineComment rest
+  | [] => []
+end
+
+mutual
+/-- Strip `/* … */` comments (unnested, enough for the census), leaving a space. -/
+def blockCode : List Char → List Char
+  | '/' :: '*' :: rest => ' ' :: blockComment rest
+  | c :: rest => c :: blockCode rest
+  | [] => []
+
+def blockComment : List Char → List Char
+  | '*' :: '/' :: rest => blockCode rest
+  | _ :: rest => blockComment rest
+  | [] => []
+end
+
+/-- **Flattening a line comment swallows the code after it**: the code a parser sees is not the
+    flattened form of the code the author wrote. -/
+theorem flattening_a_line_comment_swallows_code :
+    lineCode (flatten "x -- note\ny".toList) ≠ flatten (lineCode "x -- note\ny".toList) := by
+  decide
+
+/-- **A block comment survives flattening**: stripping it before or after flattening gives the
+    same code. -/
+theorem a_block_comment_survives_flattening :
+    blockCode (flatten "x /* note */\ny".toList) = flatten (blockCode "x /* note */\ny".toList) := by
+  decide
+
 end Ferrosa.Sql.Plpgsql

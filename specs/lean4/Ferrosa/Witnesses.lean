@@ -148,6 +148,8 @@ import Ferrosa.Sql.Oid
 #check Ferrosa.Sql.Plpgsql.compiled_returns_what_the_interpreter_returns
 #check Ferrosa.Sql.Plpgsql.exists_ignores_everything_after_the_first_row
 #check Ferrosa.Sql.Plpgsql.eval_agrees
+#check Ferrosa.Sql.Plpgsql.flattening_a_line_comment_swallows_code
+#check Ferrosa.Sql.Plpgsql.a_block_comment_survives_flattening
 -- LISTEN / NOTIFY (D13): at most once, only if committed, in commit order.
 #check Ferrosa.Sql.Notify.delivered_at_most_once
 #check Ferrosa.Sql.Notify.delivered_only_if_committed
