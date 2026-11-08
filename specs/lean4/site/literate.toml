@@ -109,7 +109,7 @@ favicon = "assets/favicon.svg"
   "Ferrosa.Cql.Aggregate", "Ferrosa.Cql.AggregateObligations", "Ferrosa.Cql.Lwt", "Ferrosa.Cql.Refine",
   "Ferrosa.Cql.Index", "Ferrosa.Cql.Subscribe",
 ]
-"Ferrosa.Sql" = ["Ferrosa.Sql.Semantics", "Ferrosa.Sql.Index", "Ferrosa.Sql.Txn", "Ferrosa.Sql.Consistency", "Ferrosa.Sql.Plpgsql", "Ferrosa.Sql.Notify"]
+"Ferrosa.Sql" = ["Ferrosa.Sql.Semantics", "Ferrosa.Sql.Index", "Ferrosa.Sql.Txn", "Ferrosa.Sql.Consistency", "Ferrosa.Sql.Plpgsql", "Ferrosa.Sql.Notify", "Ferrosa.Sql.Trigger"]
 "Ferrosa.Topology" = [
   "Ferrosa.Topology.Single", "Ferrosa.Topology.Pair", "Ferrosa.Topology.ThreeNode",
   "Ferrosa.Topology.FiveNode", "Ferrosa.Topology.TwoDc", "Ferrosa.Topology.ThreeDcRing",

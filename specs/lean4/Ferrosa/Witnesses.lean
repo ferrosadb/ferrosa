@@ -12,6 +12,7 @@
 import Ferrosa.Unimplemented
 import Ferrosa.Sql.Plpgsql
 import Ferrosa.Sql.Notify
+import Ferrosa.Sql.Trigger
 import Ferrosa.Cdc.Subscribe
 import Ferrosa.Commons.Hll
 import Ferrosa.Unsafe.Invariants
@@ -155,6 +156,14 @@ import Ferrosa.Sql.Oid
 #check Ferrosa.Sql.Notify.commit_appends_its_batch
 #check Ferrosa.Sql.Notify.commit_order
 #check Ferrosa.Sql.Notify.repeated_note_is_queued_once
+-- AFTER ROW triggers (D13): once per affected row, inside the transaction.
+#check Ferrosa.Sql.Trigger.fires_exactly_once
+#check Ferrosa.Sql.Trigger.never_fires_for_an_unaffected_row
+#check Ferrosa.Sql.Trigger.never_fires_when_the_event_does_not_match
+#check Ferrosa.Sql.Trigger.triggers_follow_the_statement
+#check Ferrosa.Sql.Trigger.rollback_discards_trigger_effects
+#check Ferrosa.Sql.Trigger.commit_keeps_trigger_effects
+#check Ferrosa.Sql.Trigger.trigger_effect_shares_the_decision
 #check Ferrosa.Sql.commit_is_not_atomic_across_statements
 #check Ferrosa.Sql.count_star_and_count_col_disagree
 #check Ferrosa.Sql.null_passes_a_naive_not_equal
