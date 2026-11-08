@@ -59,6 +59,9 @@ pub(crate) struct Query {
     needs_frame: bool,
     /// The highest `$n` the statement references (top level only).
     params_needed: usize,
+    /// Whether this query (or a subquery inside it) reads an enclosing query's
+    /// row. An uncorrelated subquery has one value per statement and is run once.
+    correlated: bool,
 }
 
 #[derive(Debug)]
@@ -191,6 +194,7 @@ pub(crate) fn compile(
         default_schema,
         params: RefCell::new(Vec::new()),
         max_param: Cell::new(0),
+        refs: RefCell::new(Vec::new()),
     };
     let mut q = compiler.query(stmt, None, &[])?;
     q.params_needed = compiler.max_param.get();
@@ -213,6 +217,7 @@ pub(crate) fn infer_params(
         default_schema,
         params: RefCell::new(Vec::new()),
         max_param: Cell::new(0),
+        refs: RefCell::new(Vec::new()),
     };
     compiler.query(stmt, None, &[])?;
     Ok(compiler
@@ -229,6 +234,9 @@ struct Compiler<'c> {
     /// Each `$n`'s type, as the first typed context it meets decides it.
     params: RefCell<Vec<Option<ColumnType>>>,
     max_param: Cell<usize>,
+    /// One entry per query being compiled (outermost first): the lowest query
+    /// level any column inside it reads. Below its own level means correlated.
+    refs: RefCell<Vec<usize>>,
 }
 
 /// One relation visible to column references.
@@ -284,6 +292,33 @@ type Ctes = [(String, Arc<Query>)];
 
 impl Compiler<'_> {
     fn query(
+        &self,
+        stmt: &SelectStmt,
+        parent: Option<&Scope<'_>>,
+        outer_ctes: &Ctes,
+    ) -> Result<Query, ExecError> {
+        let level = {
+            let mut refs = self.refs.borrow_mut();
+            refs.push(usize::MAX);
+            refs.len() - 1
+        };
+        let compiled = self.query_body(stmt, parent, outer_ctes);
+        let lowest = {
+            let mut refs = self.refs.borrow_mut();
+            let lowest = refs.pop().expect("pushed above");
+            debug_assert_eq!(refs.len(), level);
+            // What this query reads from further out, its parent reads too.
+            if let Some(parent_lowest) = refs.last_mut() {
+                *parent_lowest = (*parent_lowest).min(lowest);
+            }
+            lowest
+        };
+        let mut q = compiled?;
+        q.correlated = lowest < level;
+        Ok(q)
+    }
+
+    fn query_body(
         &self,
         stmt: &SelectStmt,
         parent: Option<&Scope<'_>>,
@@ -359,6 +394,7 @@ impl Compiler<'_> {
             offset_param: stmt.offset_param,
             needs_frame,
             params_needed: 0,
+            correlated: false,
         };
         if aggregate {
             self.aggregate(stmt, &scope, &ctes, items, &mut q)?;
@@ -910,6 +946,15 @@ impl Compiler<'_> {
         }
     }
 
+    /// A column `depth` queries out from the one being compiled was read.
+    fn note_reference(&self, depth: usize) {
+        let mut refs = self.refs.borrow_mut();
+        let current = refs.len() - 1;
+        if let Some(lowest) = refs.last_mut() {
+            *lowest = (*lowest).min(current.saturating_sub(depth));
+        }
+    }
+
     /// When `expr` is a bare `$n`, note `ty` as its type (first context wins).
     fn record(&self, expr: &CExpr, ty: Ty) {
         let (CExpr::Param(n), Some(ty)) = (expr, ty) else {
@@ -929,7 +974,10 @@ impl Compiler<'_> {
         let mut first_err = None;
         while let Some(s) = at {
             match local_column(s, col) {
-                Ok((idx, ty)) => return Ok((CExpr::Col { depth, idx }, Some(ty))),
+                Ok((idx, ty)) => {
+                    self.note_reference(depth);
+                    return Ok((CExpr::Col { depth, idx }, Some(ty)));
+                }
                 Err(e @ ExecError::AmbiguousColumn(_)) => return Err(e),
                 Err(e) => {
                     first_err.get_or_insert(e);

@@ -44,6 +44,10 @@ pub(crate) struct Rt {
     pub(crate) fence: Arc<Fence>,
     /// `now()`: the statement's start, one value for the whole statement.
     pub(crate) now_micros: i64,
+    /// The value of each uncorrelated subquery node, computed once. Keyed by the
+    /// node's address in the compiled query, which the statement holds alive;
+    /// bounded by the number of subquery nodes in the statement.
+    pub(crate) memo: Mutex<std::collections::HashMap<usize, Value>>,
 }
 
 /// Where an expression error waits while its placeholder flows downstream.
@@ -84,6 +88,7 @@ pub(crate) fn open_top(
         ctx: ctx.clone(),
         fence: Arc::clone(&fence),
         now_micros: now_micros(),
+        memo: Mutex::new(std::collections::HashMap::new()),
     });
     let rows = open(query, &rt, None)?;
     Ok((rows, fence))
@@ -102,10 +107,16 @@ pub(crate) fn subquery_rows(
     env: &Env<'_>,
     cap: usize,
 ) -> Result<Vec<Row>, ExecError> {
-    let frame = env
-        .frame
-        .ok_or_else(|| internal("a subquery ran without its outer row".into()))?;
-    let rows = open(q, env.rt, Some(Arc::clone(frame)))?;
+    // An uncorrelated subquery reads no outer row, so it is lent none.
+    let outer = if q.correlated {
+        let frame = env
+            .frame
+            .ok_or_else(|| internal("a subquery ran without its outer row".into()))?;
+        Some(Arc::clone(frame))
+    } else {
+        None
+    };
+    let rows = open(q, env.rt, outer)?;
     let mut out = Vec::new();
     for row in rows.take(cap) {
         out.push(row.map_err(|e| env.rt.fence.lift(e))?);

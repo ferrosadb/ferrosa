@@ -38,6 +38,8 @@ import Ferrosa.Sql.Oid
 #check Ferrosa.Sql.Expr.deepenLoop_refuses
 #check Ferrosa.Sql.Expr.anyLoop_is_anyEq
 #check Ferrosa.Sql.Expr.anyLoop_true_absorbs
+#check Ferrosa.Sql.Expr.memo_is_sound
+#check Ferrosa.Sql.Expr.uncorrelated_iff_no_outer_reference
 #check Ferrosa.Sql.Limit.param_matches_literal
 #check Ferrosa.Sql.Limit.negative_is_refused
 #check Ferrosa.Sql.Limit.limit_offset_is_a_slice

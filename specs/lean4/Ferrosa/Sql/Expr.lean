@@ -394,4 +394,39 @@ theorem deepenLoop_refuses (c n : Nat) (hn : 0 < n) (h : maxDepth < c + n) :
 theorem deepenLoop_refuses_past_limit : deepenLoop 0 (maxDepth + 1) = none :=
   deepenLoop_refuses 0 (maxDepth + 1) (by simp [maxDepth]) (by simp [maxDepth])
 
+/-! ## Uncorrelated subqueries run once (found while building W1)
+
+  A subquery that reads no enclosing row was re-run for every outer row: right
+  answer, wasted scans. The planner now marks a subquery correlated exactly when
+  some column inside it resolves to an enclosing query (`refs` below the
+  subquery's own level) and memoises the uncorrelated ones per statement. These
+  pin why that is sound.
+-/
+
+/-- A query level reads, for each column reference, the level it resolves to. -/
+def correlated (level : Nat) (refs : List Nat) : Bool := refs.any (· < level)
+
+/-- No reference below its own level: the subquery's value cannot depend on the
+    outer row, i.e. it is the same function of every outer row. -/
+def Uncorrelated {R : Type} (f : R → V) : Prop := ∀ r r', f r = f r'
+
+/-- Evaluate once on the first row and reuse the value for every row. -/
+def memoMap {R : Type} (f : R → V) : List R → List V
+  | [] => []
+  | r :: rs => let v := f r; v :: rs.map (fun _ => v)
+
+theorem memo_is_sound {R : Type} (f : R → V) (h : Uncorrelated f) (rows : List R) :
+    memoMap f rows = rows.map f := by
+  cases rows with
+  | nil => rfl
+  | cons r rs =>
+    simp only [memoMap, List.map_cons, List.cons.injEq, true_and]
+    apply List.map_congr_left
+    intro x _
+    exact h r x
+
+theorem uncorrelated_iff_no_outer_reference (level : Nat) (refs : List Nat) :
+    correlated level refs = false ↔ ∀ l ∈ refs, level ≤ l := by
+  simp [correlated, List.any_eq_false]
+
 end Ferrosa.Sql.Expr

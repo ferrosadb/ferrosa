@@ -174,8 +174,11 @@ against ferrosa.
   * `SELECT coalesce($1, 0)` and `SELECT pg_notify(...)` fail to parse.
   * Route them to the general planner over a single empty row.
   * Open, W1.
-* **An uncorrelated subquery is re-run for every outer row.** Correct but slow.
-  Cache the result of a subquery that reads no outer column. Open, W1 (perf).
+* **An uncorrelated subquery was re-run for every outer row.** Fixed: the planner
+  marks a subquery correlated exactly when a column inside it resolves to an
+  enclosing query, and memoises the uncorrelated ones per statement. Lean:
+  `memo_is_sound`, `uncorrelated_iff_no_outer_reference`. Test:
+  `an_uncorrelated_subquery_is_scanned_once_however_many_outer_rows`.
 * **Not implemented yet; each is refused loudly (0A000):**
   * numeric division;
   * `AT TIME ZONE` with a zone other than UTC;

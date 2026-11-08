@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 use ferrosa_sql::types::{Column, ColumnType, RelSchema, Row, Value};
 use ferrosa_sql::{
-    execute, parse_statement, ArrayElem, ArrayValue, Expr, InMemoryTable, MapCatalog, Statement,
+    execute, parse_statement, ArrayElem, ArrayValue, Catalog, Expr, InMemoryTable, MapCatalog,
+    Statement,
 };
 
 fn int(n: i64) -> Value {
@@ -663,4 +664,67 @@ fn json_build_object_builds_an_object_from_pairs() {
     );
     let err = select_err("SELECT json_build_object('odd') FROM t", &[]);
     assert_eq!(sqlstate(&err), "42883", "{err}");
+}
+
+// -- an uncorrelated subquery runs once per statement --------------------------
+
+struct CountingTable {
+    inner: InMemoryTable,
+    scans: std::sync::atomic::AtomicUsize,
+}
+
+impl ferrosa_sql::TableProvider for CountingTable {
+    fn schema(&self) -> &RelSchema {
+        self.inner.schema()
+    }
+    fn scan(&self) -> Box<dyn Iterator<Item = Row> + Send> {
+        self.scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.scan()
+    }
+}
+
+#[test]
+fn an_uncorrelated_subquery_is_scanned_once_however_many_outer_rows() {
+    use ferrosa_sql::TableProvider;
+    let u = Arc::new(CountingTable {
+        inner: InMemoryTable::new(
+            RelSchema::new(vec![Column::new("tid", ColumnType::Int)]),
+            vec![Row(vec![int(1)]), Row(vec![int(3)])],
+        ),
+        scans: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let t = catalog().resolve("public", "t").unwrap();
+    let cat = MapCatalog::new()
+        .with_table("public", "t", t)
+        .with_table("public", "u", u.clone());
+    let rows = select_in(
+        &cat,
+        "public",
+        "SELECT id, id IN (SELECT tid FROM u), EXISTS (SELECT 1 FROM u), \
+         (SELECT max(tid) FROM u) FROM t ORDER BY id",
+        &[],
+    );
+    assert_eq!(rows.len(), 3);
+    assert_eq!(
+        rows[1],
+        vec![int(2), Value::Bool(false), Value::Bool(true), int(3)]
+    );
+    // Three distinct uncorrelated subqueries, each scanned once — not once per row.
+    assert_eq!(u.scans.load(std::sync::atomic::Ordering::SeqCst), 3);
+    let _ = u.schema();
+}
+
+#[test]
+fn a_correlated_subquery_still_sees_each_outer_row() {
+    assert_eq!(
+        select(
+            "SELECT id, (SELECT count(*) FROM u WHERE u.tid = t.id) FROM t ORDER BY id",
+            &[]
+        ),
+        vec![
+            vec![int(1), int(2)],
+            vec![int(2), int(0)],
+            vec![int(3), int(1)]
+        ]
+    );
 }

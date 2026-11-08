@@ -127,11 +127,11 @@ fn eval_node(e: &CExpr, env: &Env<'_>) -> R<Value> {
             whens,
             otherwise,
         } => case(operand.as_deref(), whens, otherwise.as_deref(), env),
-        CExpr::Exists(q, negated) => {
+        CExpr::Exists(q, negated) => memoized(e, q, env, || {
             let found = run::subquery_rows(q, env, 1)?.into_iter().next().is_some();
             Ok(Value::Bool(found != *negated))
-        }
-        CExpr::Subquery(q) => {
+        }),
+        CExpr::Subquery(q) => memoized(e, q, env, || {
             let mut rows = run::subquery_rows(q, env, 2)?;
             match rows.len() {
                 0 => Ok(Value::Null),
@@ -141,12 +141,12 @@ fn eval_node(e: &CExpr, env: &Env<'_>) -> R<Value> {
                     "more than one row returned by a subquery used as an expression",
                 )),
             }
-        }
-        CExpr::ArraySubquery(q, elem) => {
+        }),
+        CExpr::ArraySubquery(q, elem) => memoized(e, q, env, || {
             let rows = run::subquery_rows(q, env, usize::MAX)?;
             let items = rows.into_iter().map(|mut r| r.0.swap_remove(0)).collect();
             Ok(Value::Array(ArrayValue::new(*elem, items)))
-        }
+        }),
         CExpr::Array(items, elem) => {
             let mut values = Vec::with_capacity(items.len());
             for i in items {
@@ -163,6 +163,33 @@ fn eval_node(e: &CExpr, env: &Env<'_>) -> R<Value> {
             )),
         },
     }
+}
+
+/// An uncorrelated subquery has one value for the whole statement: compute it
+/// once and reuse it (an array value is shared, not copied). A correlated one
+/// depends on the outer row and is computed every time.
+fn memoized(
+    node: &CExpr,
+    q: &super::Query,
+    env: &Env<'_>,
+    compute: impl FnOnce() -> R<Value>,
+) -> R<Value> {
+    if q.correlated {
+        return compute();
+    }
+    let key = std::ptr::from_ref(node) as usize;
+    let cached = memo_lock(env.rt).get(&key).cloned();
+    if let Some(v) = cached {
+        return Ok(v);
+    }
+    // Computed outside the lock: the subquery may itself hold memoised nodes.
+    let value = compute()?;
+    memo_lock(env.rt).insert(key, value.clone());
+    Ok(value)
+}
+
+fn memo_lock(rt: &Rt) -> std::sync::MutexGuard<'_, std::collections::HashMap<usize, Value>> {
+    rt.memo.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 fn column(depth: usize, idx: usize, env: &Env<'_>) -> R<Value> {
