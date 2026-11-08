@@ -29,16 +29,16 @@ executive_summary: >-
 
 | # | Statement shape | Needed by | Gap |
 |---|---|---|---|
-| 1 | Type bootstrap: `ARRAY(SELECT …)`, three-way `LEFT JOIN`, `coalesce`, `NOT EXISTS`, `OR` in a join condition, `pg_range` | Postgrex, every connect | Scalar subquery `ARRAY(…)`; more than one join; `NOT EXISTS`; `pg_range` projection |
-| 2 | `CREATE TABLE IF NOT EXISTS … ` over the **extended** protocol | Ecto | Extended-protocol `Parse` of DDL is refused |
-| 3 | DDL inside `BEGIN … COMMIT` | Ecto: every migration runs in a transaction | `25001` |
-| 4 | `LOCK TABLE t IN SHARE UPDATE EXCLUSIVE MODE` | Ecto migration lock | Not parsed |
-| 5 | `CREATE TYPE … AS ENUM`, `ALTER TYPE … ADD VALUE`, `'x'::schema.type` casts, `pg_type` rows for the enum and its array | Oban schema | No user types |
-| 6 | `bigserial`, `nextval`; `DEFAULT` expressions: literal, `ARRAY[]::jsonb[]`, `timezone('UTC', now())` | Oban schema and inserts | No sequences (`SERIAL` refused); defaults |
-| 7 | `jsonb[]`, `text[]` columns and array parameters (`'{a,b}'`) | Oban schema and runtime | Array column types |
-| 8 | `CREATE INDEX [IF NOT EXISTS] … [WHERE …] [USING gin]`, `DROP INDEX IF EXISTS` | Oban schema | Not parsed |
-| 9 | `ALTER TABLE … ADD COLUMN IF NOT EXISTS`, `ALTER COLUMN … TYPE / SET DEFAULT / SET NOT NULL`, `ADD/DROP CONSTRAINT … CHECK … [NOT VALID]`, `SET UNLOGGED` | Oban schema | `ALTER` not supported (T-132b) |
-| 10 | `COMMENT ON TABLE … IS '12'` and `pg_catalog.obj_description(oid, 'pg_class')` | Oban migration versioning | No comments, no `pg_description` |
+| 1 | Type bootstrap: `ARRAY(SELECT …)`, three-way `LEFT JOIN`, `coalesce`, `NOT EXISTS`, `OR` in a join condition, `pg_range` | Postgrex, every connect | Scalar subquery `ARRAY(…)`; more than one join; `NOT EXISTS` (W1); ~~`pg_range` projection~~ **Done (W3):** empty, streamed |
+| 2 | `CREATE TABLE IF NOT EXISTS … ` over the **extended** protocol | Ecto | ~~Extended-protocol `Parse` of DDL is refused~~ **Done (W3):** DDL prepares as `PreparedKind::Utility` |
+| 3 | DDL inside `BEGIN … COMMIT` | Ecto: every migration runs in a transaction | ~~`25001`~~ **Done (W3):** buffered, visible inside the block, replayed at `COMMIT` (`ddl_txn`; failure semantics in the crate README) |
+| 4 | `LOCK TABLE t IN SHARE UPDATE EXCLUSIVE MODE` | Ecto migration lock | ~~Not parsed~~ **Done (W3):** blocking on a standalone node, read-set conflict (`40001`) on a cluster (`lock`) |
+| 5 | `CREATE TYPE … AS ENUM`, `ALTER TYPE … ADD VALUE`, `'x'::schema.type` casts, `pg_type` rows for the enum and its array | Oban schema | ~~No user types~~ **Done (W3):** enum DDL, validated enum columns, `pg_type` rows; `::enum` / `::regnamespace` casts await W1's cast engine (resolvers provided) |
+| 6 | `bigserial`, `nextval`; `DEFAULT` expressions: literal, `ARRAY[]::jsonb[]`, `timezone('UTC', now())` | Oban schema and inserts | ~~No sequences (`SERIAL` refused)~~ **Done (W3):** `bigserial` recorded per D15, ids minted by `serial_id` (applied at INSERT by W2); defaults: see row 9 / W2 |
+| 7 | `jsonb[]`, `text[]` columns and array parameters (`'{a,b}'`) | Oban schema and runtime | ~~Array column types~~ **Done (W3):** frozen-list storage, text and binary array input; NULL elements refused |
+| 8 | `CREATE INDEX [IF NOT EXISTS] … [WHERE …] [USING gin]`, `DROP INDEX IF EXISTS` | Oban schema | ~~Not parsed~~ **Done (W3):** single-column btree/hash built; composite/partial/DESC/gin recorded, not used for planning |
+| 9 | `ALTER TABLE … ADD COLUMN IF NOT EXISTS`, `ALTER COLUMN … TYPE / SET DEFAULT / SET NOT NULL`, `ADD/DROP CONSTRAINT … CHECK … [NOT VALID]`, `SET UNLOGGED` | Oban schema | ~~`ALTER` not supported (T-132b)~~ **Done (W3):** all census forms; `CHECK` enforced via W1's engine; DEFAULTs recorded (applied at INSERT by W2) |
+| 10 | `COMMENT ON TABLE … IS '12'` and `pg_catalog.obj_description(oid, 'pg_class')` | Oban migration versioning | ~~No comments, no `pg_description`~~ **Done (W3):** `COMMENT ON TABLE`, streamed `pg_description`. `obj_description(...)` itself awaits W1 (function calls in projections) |
 | 11 | `DO $$ … $$`, `CREATE FUNCTION … LANGUAGE plpgsql`, `CREATE TRIGGER`, `DROP FUNCTION/TRIGGER` | Stock Oban migrations v1–v10; dropped again by v11 | No procedural language |
 | 12 | `INSERT … RETURNING "id"` with a sequence default, jsonb and enum and array parameters | `Oban.insert` | Sequence default; enum and array values |
 | 13 | `WITH s AS (SELECT … ORDER BY … LIMIT $n FOR UPDATE SKIP LOCKED) UPDATE t SET … FROM s WHERE t.id = s.id AND … RETURNING …` | Oban fetch (every poll) | CTE, `FOR UPDATE SKIP LOCKED`, `UPDATE … FROM`, `UPDATE … RETURNING`, non-key predicates |
@@ -211,3 +211,15 @@ against ferrosa.
   scalar path cannot read is a general select over one empty row. Covers
   PL/pgSQL's `SELECT <expr>` with `$n` bindings (W4). Test:
   `plpgsql_expression_statements_evaluate`.
+
+
+## Found while building W3
+
+Bugs found in existing Ferrosa code while building this programme. Each is fixed in the
+workstream that found it, with a failing test first and a Lean model; the row records the
+fixing commit.
+
+| Found by | Bug | Status |
+|---|---|---|
+| W3 | Enum `ADD VALUE` (as first built in W3, 18ec1c1a) rewrote the whole label list, so two concurrent adds of different labels lost one. Now one key per added label; test `pg_enum::tests::concurrent_add_values_both_survive`, Lean `Ferrosa.Sql.Enum.concurrent_adds_both_survive` | Fixed in 72a8ecfc |
+| W3 | `CREATE TABLE … col type NOT NULL` dropped the `NOT NULL` of every non-key column (T-132a), so a NULL was stored silently. Now recorded (`pg.not_null.<col>`) and enforced on INSERT (omitted or NULL) and UPDATE: `23502`. Test `not_null_on_a_regular_column_is_enforced`; Lean `Ferrosa.Sql.Constraint` (`unenforced_not_null_stores_a_null`, `admitted_writes_preserve_constraints`) | Fixed in 44224a7a |
