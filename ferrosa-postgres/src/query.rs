@@ -1569,6 +1569,41 @@ pub(crate) fn write_error_response(error: &ferrosa_common::Error) -> BackendMess
     }
 }
 
+/// Whether `stmt` is a utility statement the extended protocol may prepare: DDL, which
+/// takes no `$N` parameters and returns no rows. Exhaustive, so a new statement kind must
+/// be classified here before it compiles.
+pub(crate) fn is_utility(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::CreateTable(_) | Statement::DropTable(_) | Statement::AlterTable(_) => true,
+        Statement::Select(_)
+        | Statement::SelectExprs(_)
+        | Statement::Begin { .. }
+        | Statement::Commit
+        | Statement::Rollback
+        | Statement::Set { .. }
+        | Statement::Reset { .. }
+        | Statement::Insert(_)
+        | Statement::Update(_)
+        | Statement::Delete(_)
+        | Statement::CopyFromStdin(_)
+        | Statement::Truncate(_)
+        | Statement::Vacuum(_)
+        | Statement::Analyze(_) => false,
+    }
+}
+
+/// Execute a prepared utility statement (see [`is_utility`]) through the same executor the
+/// simple-query path uses, so a DDL statement means the same thing whichever protocol sent
+/// it. The statement is moved in; nothing is re-parsed.
+pub(crate) async fn execute_utility(
+    env: ReadEnv<'_>,
+    stmt: Statement,
+    txn: Option<&mut TxnWriteSet>,
+) -> Vec<BackendMessage> {
+    debug_assert!(is_utility(&stmt), "execute_utility called with {stmt:?}");
+    execute_statement(env, stmt, txn).await
+}
+
 async fn execute_statement(
     env: ReadEnv<'_>,
     stmt: Statement,

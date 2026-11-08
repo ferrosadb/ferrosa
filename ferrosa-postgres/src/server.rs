@@ -1665,6 +1665,10 @@ async fn describe(
                         BackendMessage::NoData,
                     ]
                 }
+                // DDL takes no parameters and returns no rows.
+                PreparedKind::Utility(_) => {
+                    vec![extended::parameter_description(&[]), BackendMessage::NoData]
+                }
             }
         }
         b'P' => {
@@ -1728,7 +1732,7 @@ async fn describe(
                         Err(err) => vec![session.fail(err)],
                     }
                 }
-                PreparedKind::Update(_) | PreparedKind::Delete(_) => {
+                PreparedKind::Update(_) | PreparedKind::Delete(_) | PreparedKind::Utility(_) => {
                     vec![BackendMessage::NoData]
                 }
             }
@@ -1923,7 +1927,8 @@ fn portal_select(
         PreparedKind::Exprs(_)
         | PreparedKind::Insert(_)
         | PreparedKind::Update(_)
-        | PreparedKind::Delete(_) => None,
+        | PreparedKind::Delete(_)
+        | PreparedKind::Utility(_) => None,
     }
 }
 
@@ -2175,6 +2180,23 @@ async fn execute_portal_inner(
                 &params,
             )
             .await;
+            execute_dml(session, msgs)
+        }
+        // DDL over the extended protocol: the simple-query executor, inside the open
+        // transaction when there is one. A failure poisons the transaction like DML's.
+        PreparedKind::Utility(stmt) => {
+            let snapshot = read_snapshot(ctx, session);
+            let mut env = read_env(ctx, &snapshot);
+            env.timestamp_micros = timestamp_micros;
+            // An implicit pipeline transaction is not a transaction block the client opened,
+            // so DDL in it is not refused as "inside a transaction block".
+            let explicit = session.in_txn() && !session.is_extended_implicit();
+            let txn = if explicit {
+                Some(session.txn_writes_mut())
+            } else {
+                None
+            };
+            let msgs = query::execute_utility(env, *stmt, txn).await;
             execute_dml(session, msgs)
         }
     }

@@ -30,7 +30,7 @@ executive_summary: >-
 | # | Statement shape | Needed by | Gap |
 |---|---|---|---|
 | 1 | Type bootstrap: `ARRAY(SELECT …)`, three-way `LEFT JOIN`, `coalesce`, `NOT EXISTS`, `OR` in a join condition, `pg_range` | Postgrex, every connect | Scalar subquery `ARRAY(…)`; more than one join; `NOT EXISTS`; `pg_range` projection |
-| 2 | `CREATE TABLE IF NOT EXISTS … ` over the **extended** protocol | Ecto | Extended-protocol `Parse` of DDL is refused |
+| 2 | `CREATE TABLE IF NOT EXISTS … ` over the **extended** protocol | Ecto | ~~Extended-protocol `Parse` of DDL is refused~~ **Done (W3):** DDL prepares as `PreparedKind::Utility` |
 | 3 | DDL inside `BEGIN … COMMIT` | Ecto: every migration runs in a transaction | `25001` |
 | 4 | `LOCK TABLE t IN SHARE UPDATE EXCLUSIVE MODE` | Ecto migration lock | Not parsed |
 | 5 | `CREATE TYPE … AS ENUM`, `ALTER TYPE … ADD VALUE`, `'x'::schema.type` casts, `pg_type` rows for the enum and its array | Oban schema | No user types |
@@ -145,3 +145,12 @@ Under `specs/lean4/Ferrosa/Sql/`, one model per feature, written before its code
 
 **Acceptance:** the Elixir probe (`Postgrex` → `Ecto.Migrator` → `Oban`) runs one job
 against ferrosa.
+
+## Found while building
+
+Bugs found in existing Ferrosa code while building this programme. Each is fixed in the
+workstream that found it, with a failing test first and a Lean model; the row records the
+fixing commit.
+
+| Found by | Bug | Status |
+|---|---|---|

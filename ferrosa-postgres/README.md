@@ -101,7 +101,13 @@ latest change have not yet been measured.
   result encodings, and Postgres error-skip-until-`Sync` semantics. `SELECT`,
   no-`FROM` expression selects (incl. scalar subqueries), AND parameterized
   `INSERT` / `UPDATE` / `DELETE` can be prepared. This is the path
-  `Ecto.Repo.insert/update/delete/all` drives.
+  `Ecto.Repo.insert/update/delete/all` drives. **DDL can be prepared too**
+  (`PreparedKind::Utility`, classified by `query::is_utility`): Ecto sends every
+  migration statement as an unnamed prepared statement. `Describe` answers an empty
+  `ParameterDescription` and `NoData`; `Execute` runs the simple-query executor on the
+  moved statement, so DDL means the same thing over either protocol. A `$N` in DDL is
+  a parse error (`42601`). Transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`) still goes
+  through a simple `Query`, which is what Postgrex does.
 - **Parameterized DML + `INSERT … RETURNING`** — `$N` placeholders in `INSERT`
   VALUES, `UPDATE` SET/WHERE, and `DELETE` WHERE are bound at `Bind` and
   substituted at `Execute` (fail-loud `08P01` if a `$N` has no bound value).

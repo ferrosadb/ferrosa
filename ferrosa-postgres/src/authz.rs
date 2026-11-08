@@ -138,6 +138,7 @@ pub(crate) fn prepared_permissions(
         PreparedKind::Update(upd) => dml(&upd.table, upd.returning.is_some(), default_schema),
         PreparedKind::Delete(del) => dml(&del.table, del.returning.is_some(), default_schema),
         PreparedKind::Exprs(_) => Vec::new(),
+        PreparedKind::Utility(stmt) => statement_permissions(stmt, default_schema),
     }
 }
 
