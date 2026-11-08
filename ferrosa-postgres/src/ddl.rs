@@ -338,7 +338,8 @@ async fn execute_create_type(
             return refuse("58000", &format!("CREATE TYPE failed: {error}"));
         }
     }
-    store_enum(executor, keyspace, &name, &ty, "CREATE TYPE").await
+    let extension = crate::pg_enum::definition_extension(&name, &ty);
+    store_enum(executor, keyspace, extension, "CREATE TYPE").await
 }
 
 /// `ALTER TYPE [schema.]name ADD VALUE [IF NOT EXISTS] 'label'`.
@@ -368,28 +369,21 @@ async fn execute_alter_type(
             &format!("enum label \"{}\" already exists", stmt.value),
         );
     }
-    store_enum(
-        executor,
-        keyspace,
-        &name,
-        &ty.add_value(stmt.value),
-        "ALTER TYPE",
-    )
-    .await
+    let extension = crate::pg_enum::add_value_extension(&name, &ty, stmt.value);
+    store_enum(executor, keyspace, extension, "ALTER TYPE").await
 }
 
 async fn store_enum(
     executor: &dyn DdlExecutor,
     keyspace: &str,
-    name: &str,
-    ty: &crate::pg_enum::EnumType,
+    extension: HashMap<String, String>,
     tag: &str,
 ) -> Vec<BackendMessage> {
     let updates = TableUpdates {
         params: None,
         add_columns: Vec::new(),
         drop_columns: Vec::new(),
-        extensions: Some(crate::pg_enum::definition_extension(name, ty)),
+        extensions: Some(extension),
     };
     match executor
         .alter_table(keyspace, crate::pg_enum::META_TABLE, updates)

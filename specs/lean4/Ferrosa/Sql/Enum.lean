@@ -145,6 +145,54 @@ theorem stored_labels_survive_add_value (e : EnumType) (l : String) (column : Li
     (hall : ∀ x ∈ column, x ∈ e.labels) : ∀ x ∈ column, x ∈ (addValue e l).labels :=
   fun x hx => addValue_keeps_labels e l x (hall x hx)
 
+/-! ## Concurrent `ADD VALUE`s do not lose each other
+
+The first design stored the whole label list in one schema entry, so two sessions adding different
+labels at the same moment each wrote "the list plus mine" and the later write erased the other's label —
+a lost update (`whole_list_rewrite_loses_a_label`). Each added label is now its own schema entry, keyed
+by the label: a write inserts one key and never rewrites another, so the two adds commute and both
+labels survive in either order (`per_label_adds_commute`, `concurrent_adds_both_survive`).
+
+-/
+
+/-- The schema entries holding added labels: a set of keys, written by insertion. -/
+def insertKey (keys : List String) (l : String) : List String :=
+  if l ∈ keys then keys else keys ++ [l]
+
+/-- The old design: each session rewrites the whole list it read. -/
+def rewriteList (_stored : List String) (readThenAdded : List String) : List String := readThenAdded
+
+/-- **The old design loses a label.**  Both sessions read `[a]`; one writes `[a, b]`, the other
+    `[a, c]`; whichever lands second erases the first's label. -/
+theorem whole_list_rewrite_loses_a_label :
+    let afterBoth := rewriteList (rewriteList ["a"] ["a", "b"]) ["a", "c"]
+    "b" ∉ afterBoth := by decide
+
+theorem mem_insertKey (keys : List String) (l x : String) :
+    x ∈ insertKey keys l ↔ x ∈ keys ∨ x = l := by
+  unfold insertKey
+  by_cases h : l ∈ keys
+  · simp only [h, ↓reduceIte]
+    constructor
+    · intro hx; exact Or.inl hx
+    · intro hx; cases hx with
+      | inl hx => exact hx
+      | inr hx => subst hx; exact h
+  · simp [h]
+
+/-- **Per-label entries commute**: the same keys result whichever add lands first. -/
+theorem per_label_adds_commute (keys : List String) (l1 l2 x : String) :
+    x ∈ insertKey (insertKey keys l1) l2 ↔ x ∈ insertKey (insertKey keys l2) l1 := by
+  simp only [mem_insertKey]
+  constructor
+  · intro h; rcases h with (h | h) | h <;> simp [h]
+  · intro h; rcases h with (h | h) | h <;> simp [h]
+
+/-- **Concurrent adds both survive**, in either order. -/
+theorem concurrent_adds_both_survive (keys : List String) (l1 l2 : String) :
+    l1 ∈ insertKey (insertKey keys l1) l2 ∧ l2 ∈ insertKey (insertKey keys l1) l2 := by
+  simp [mem_insertKey]
+
 /-! ## Oban's type, concretely -/
 
 /-- Oban's `oban_job_state` as its v1 migration declares it. -/

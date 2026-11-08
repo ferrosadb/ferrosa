@@ -130,6 +130,9 @@ import Ferrosa.Sql.Serial
 #check Ferrosa.Sql.Enum.validated_is_label
 #check Ferrosa.Sql.Enum.write_keeps_only_labels
 #check Ferrosa.Sql.Enum.stored_labels_survive_add_value
+#check Ferrosa.Sql.Enum.whole_list_rewrite_loses_a_label
+#check Ferrosa.Sql.Enum.per_label_adds_commute
+#check Ferrosa.Sql.Enum.concurrent_adds_both_survive
 #check Ferrosa.Sql.Serial.compose_injective
 #check Ferrosa.Sql.Serial.distinct_nodes_never_collide
 #check Ferrosa.Sql.Serial.fits_a_positive_bigint

@@ -19,10 +19,11 @@
 //! A column typed by an enum carries the table extension `pg.enum_column.<column>` =
 //! `<keyspace>.<type>`.
 //!
-//! Known limit, stated: `ADD VALUE` rewrites the whole label list. Two sessions adding
-//! different values to the same type at the same moment in autocommit can lose one of them
-//! (the later schema change wins). Inside a transaction block the COMMIT preflight does not
-//! catch it either, because an extension write always applies. Oban adds one value, once.
+//! `ADD VALUE` writes ONE extension key per added label (`pg.enum_value.["name","label"]`),
+//! never the whole list, so two sessions adding different labels at once both keep theirs
+//! (it used to rewrite the list, and the later write lost the other label; see
+//! `oban-compat.md` "Found while building"). The type is the declared labels followed by the
+//! added ones in the order they were added.
 //!
 //! Wire type: an enum column is described as `text` (OID 25) in `RowDescription` and
 //! `ParameterDescription`, while `pg_attribute.atttypid` and `pg_type` carry the enum's own
@@ -116,6 +117,45 @@ pub(crate) fn definition_extension(name: &str, ty: &EnumType) -> HashMap<String,
     HashMap::from([(definition_key(name), ty.encode())])
 }
 
+/// The table extension that records `ADD VALUE label` on enum `name`: ONE key per added
+/// label, so the write never rewrites another session's label (two concurrent adds of
+/// different labels both survive; Lean `concurrent_adds_both_survive`). The value orders
+/// added labels by the wall-clock microsecond of the statement (ties by label).
+pub(crate) fn add_value_extension(
+    name: &str,
+    current: &EnumType,
+    label: String,
+) -> HashMap<String, String> {
+    debug_assert!(!current.contains(&label), "ADD VALUE of an existing label");
+    let micros = crate::query::wall_clock_micros();
+    HashMap::from([(added_label_key(name, &label), format!("{micros:020}"))])
+}
+
+const ADDED_PREFIX: &str = "pg.enum_value.";
+
+/// The key of added label `label` of enum `name`: both parts JSON-encoded, so neither may
+/// contain a separator that confuses the decoding.
+fn added_label_key(name: &str, label: &str) -> String {
+    // A pair of strings always serializes; there is no error to lose here.
+    let pair = serde_json::to_string(&(name, label)).unwrap_or_default();
+    format!("{ADDED_PREFIX}{pair}")
+}
+
+/// The labels added to enum `name` by `ADD VALUE`, in the order they were added.
+fn added_labels(meta: &TableMetadata, name: &str) -> Vec<String> {
+    let mut added: Vec<(&str, String)> = meta
+        .extensions
+        .iter()
+        .filter_map(|(key, order)| {
+            let pair = key.strip_prefix(ADDED_PREFIX)?;
+            let (owner, label): (String, String) = serde_json::from_str(pair).ok()?;
+            (owner == name).then_some((order.as_str(), label))
+        })
+        .collect();
+    added.sort();
+    added.into_iter().map(|(_, label)| label).collect()
+}
+
 /// Enum `keyspace.name` as `view` defines it. A stored definition that does not decode is
 /// reported, not treated as absent.
 pub(crate) fn lookup(
@@ -132,13 +172,17 @@ pub(crate) fn lookup(
     let Some(text) = meta.extensions.get(&definition_key(name)) else {
         return Ok(None);
     };
-    EnumType::decode(text).map(Some).ok_or_else(|| {
+    let base = EnumType::decode(text).ok_or_else(|| {
         tracing::error!(keyspace, name, "stored enum definition does not decode");
         error_response(
             "XX001",
             &format!("the stored definition of enum {keyspace}.{name} is corrupt"),
         )
-    })
+    })?;
+    let full = added_labels(meta, name)
+        .into_iter()
+        .fold(base, EnumType::add_value);
+    Ok(Some(full))
 }
 
 /// Every enum `view` defines, as `(keyspace, name, type)`, in name order.
@@ -150,7 +194,10 @@ pub(crate) fn all(view: &SchemaSnapshot) -> Vec<(String, String, EnumType)> {
         .flat_map(|((keyspace, _), meta)| {
             meta.extensions.iter().filter_map(move |(key, text)| {
                 let name = key.strip_prefix(ENUM_PREFIX)?;
-                Some((keyspace.clone(), name.to_string(), EnumType::decode(text)?))
+                let ty = added_labels(meta, name)
+                    .into_iter()
+                    .fold(EnumType::decode(text)?, EnumType::add_value);
+                Some((keyspace.clone(), name.to_string(), ty))
             })
         })
         .collect();
@@ -370,6 +417,37 @@ mod tests {
         assert_eq!(
             code(cast_text_to_enum(&view, "public", "missing", "x")),
             "42704"
+        );
+    }
+
+    /// Two sessions add different labels to the same type from the same view; their schema
+    /// changes land one after the other. Both labels must survive (Lean:
+    /// `concurrent_adds_both_survive`) — the whole-list rewrite lost the first.
+    #[test]
+    fn concurrent_add_values_both_survive() {
+        let mut meta = meta_table("public");
+        let base = EnumType::create(labels(&["a"])).unwrap();
+        meta.extensions.extend(definition_extension("t", &base));
+        let seen = base.clone(); // both sessions planned against the same view
+        let first = add_value_extension("t", &seen, "b".into());
+        let second = add_value_extension("t", &seen, "c".into());
+        meta.extensions.extend(first);
+        meta.extensions.extend(second);
+        let mut view = ferrosa_schema::SchemaSnapshot::clone(
+            &crate::catalog::test_support::empty_schema().snapshot(),
+        );
+        view.tables
+            .insert(("public".into(), META_TABLE.into()), meta);
+        let ty = lookup(&view, "public", "t").unwrap().expect("defined");
+        assert!(
+            ty.contains("b"),
+            "the first concurrent add was lost: {ty:?}"
+        );
+        assert!(ty.contains("c"), "{ty:?}");
+        assert_eq!(
+            all(&view).len(),
+            1,
+            "added labels are not types of their own"
         );
     }
 

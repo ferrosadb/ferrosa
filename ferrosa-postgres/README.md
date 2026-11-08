@@ -890,8 +890,8 @@ ferrosa has no range types — because Postgrex's type bootstrap `LEFT JOIN`s it
 - **Divergences, stated.** On the wire (`RowDescription`/`ParameterDescription`) an enum
   column is described as `text` (25), not the enum OID; the values are exact, and carrying
   the enum OID needs an engine column type that holds a type OID (coordinate with W1).
-  `ADD VALUE` rewrites the label list, so two sessions adding different values to the same
-  type at the same instant can lose one (last schema change wins).
+  (`ADD VALUE` writes one extension key per added label, so concurrent adds of different
+  labels both survive — Lean `concurrent_adds_both_survive`.)
 - **Awaiting W1 (cast engine).** `'x'::schema.enum` and `'public'::regnamespace::oid` are
   refused by the parser today (`UnsupportedCast`); their semantics are implemented as
   `pg_enum::cast_text_to_enum` and `catalog::resolve_regnamespace` for W1's cast evaluation.
