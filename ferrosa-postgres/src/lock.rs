@@ -6,13 +6,16 @@
 //!
 //! * **Only inside a transaction block** (`25P01` otherwise, as PostgreSQL), and the table
 //!   must exist (`42P01`), checked before anything is taken.
-//! * **Standalone (Direct) node: a real, blocking lock.** The transaction takes local
-//!   writer ownership of every stripe of the table (`mvcc::writer_ownership`, the machinery
-//!   `UPDATE`/`DELETE`/`TRUNCATE` use), held until `COMMIT`/`ROLLBACK`. A second `LOCK` of the
-//!   table, and any writer of it, waits; a cycle is a deadlock (`40P01`). Every mode is
-//!   treated the same, which is **stronger** than PostgreSQL for the weaker modes:
-//!   `SHARE UPDATE EXCLUSIVE` does not block plain `INSERT`s there, and does here. Readers
-//!   are never blocked (reads take no ownership).
+//! * **Standalone (Direct) node: a real, blocking lock**, held until `COMMIT`/`ROLLBACK`
+//!   through the writer-ownership registry (`writer_ownership`, with its deadlock detection,
+//!   `40P01`). Every mode takes the table's *table-lock slot*, so a `LOCK` waits for every
+//!   other `LOCK` of the table (PostgreSQL lets some weak pairs share; never weaker here).
+//!   Only `SHARE` and stronger also take the table's writer stripes, so exactly those modes
+//!   block plain writers, as PostgreSQL's matrix says (`Sql/TableLock.lean`
+//!   `impl_blocks_writers_iff_pg`). `SHARE UPDATE EXCLUSIVE` therefore admits writers: Ecto
+//!   inserts its version row from another connection while holding it, and blocking that
+//!   deadlocked every migration run (found by the live Oban probe). Readers are never
+//!   blocked.
 //! * **Every node: the table enters the transaction's read set**, so a serializable
 //!   transaction — every transaction block on a cluster, which runs on Accord (D11) — fails
 //!   at `COMMIT` with `40001` if another transaction wrote the table after it began. On a
@@ -24,7 +27,7 @@
 //!
 //! Last revised: 2026-11-08
 
-use ferrosa_sql::LockStmt;
+use ferrosa_sql::{LockMode, LockStmt};
 
 use crate::extended::Session;
 use crate::messages::BackendMessage;
@@ -49,7 +52,7 @@ pub(crate) async fn lock_tables(
         Err(error) => return vec![error],
     };
     for (name, id) in targets {
-        if let Err(error) = lock_one(ctx, session, name, id).await {
+        if let Err(error) = lock_one(ctx, session, name, id, stmt.mode).await {
             return vec![error];
         }
     }
@@ -81,16 +84,40 @@ fn resolve(
         .collect()
 }
 
+/// Whether `mode` conflicts with plain writers (PostgreSQL's ROW EXCLUSIVE).
+fn blocks_writers(mode: LockMode) -> bool {
+    matches!(
+        mode,
+        LockMode::Share
+            | LockMode::ShareRowExclusive
+            | LockMode::Exclusive
+            | LockMode::AccessExclusive
+    )
+}
+
+/// The registry key of `table`'s table-lock slot: a key no row write ever takes, so
+/// only `LOCK` statements meet there.
+fn table_lock_key(table: uuid::Uuid) -> uuid::Uuid {
+    const TABLE_LOCK_MASK: u128 = 0x7461_626c_655f_6c6f_636b_5f73_6c6f_7400; // "table_lock_slot"
+    uuid::Uuid::from_u128(table.as_u128() ^ TABLE_LOCK_MASK)
+}
+
 async fn lock_one(
     ctx: &QueryContext,
     session: &mut Session,
     name: String,
     id: uuid::Uuid,
+    mode: LockMode,
 ) -> Result<(), BackendMessage> {
     if ctx.accord.committer().is_none() {
         let writers = &mut session.txn_writes_mut().writers;
-        for slot in 0..STRIPES {
-            writers.acquire(&ctx.mvcc.writers, id, slot).await?;
+        writers
+            .acquire(&ctx.mvcc.writers, table_lock_key(id), 0)
+            .await?;
+        if blocks_writers(mode) {
+            for slot in 0..STRIPES {
+                writers.acquire(&ctx.mvcc.writers, id, slot).await?;
+            }
         }
     }
     if let Some(snapshot) = session.txn_snapshot() {

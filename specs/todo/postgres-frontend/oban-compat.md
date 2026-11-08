@@ -319,3 +319,29 @@ fixing commit.
 | 2 | A trigger whose write fires itself overflowed the stack before the depth bound was reached: each nesting level lived on the stack. | Each level is boxed and the bound is 8 (16 still overflowed a 2 MiB debug stack once W2's DML path joined the chain), so the bound ends a cascade with 54001. Test: `a_trigger_that_fires_itself_stops_at_the_depth_bound`. Lean: `self_firing_cascade_is_refused`, `completed_cascade_respects_the_bound` | fixed in 49396d2f; bound lowered to 8 in 38e4af23 |
 | 3 | A multi-statement simple query (`BEGIN; NOTIFY …; COMMIT` in one `Query`) is refused with a parse error. PostgreSQL runs each statement. Postgrex and Ecto never send one. | Not fixed: this is the general simple-query dispatcher, which belongs to no W4 file. Needs a decision on who owns it | open: outside W4 |
 
+
+## Found at integration (live Oban probe)
+
+* **Ecto's migration lock deadlocked every migration run.** Fixed. `LOCK TABLE …
+  IN SHARE UPDATE EXCLUSIVE MODE` took writer ownership of the whole table in
+  every mode. Ecto inserts its version row from a second connection while
+  holding that lock, so the INSERT waited on the lock and the lock waited on the
+  INSERT.
+  * Every mode now takes a table-lock slot, so a LOCK still conflicts with every
+    other LOCK of the table.
+  * Only SHARE and stronger also take the writer stripes, exactly as
+    PostgreSQL's matrix has them conflict with ROW EXCLUSIVE.
+  * Lean (`Sql/TableLock.lean`):
+    * `impl_blocks_writers_iff_pg`, `sue_admits_writers` and `impl_never_weaker`
+      pin the lock modes.
+    * The deadlock itself is modelled as a wait-for graph:
+      * `old_ecto_deadlocks` reproduces the cycle, which runs through Ecto's
+        application-level wait, so no in-database detector could see it.
+      * `ecto_migration_no_deadlock` and `ecto_schedule_acyclic` show the cycle
+        is gone for every mode PostgreSQL lets writers through.
+      * `impl_deadlocks_only_where_pg_does` shows the implementation adds no
+        deadlock that PostgreSQL lacks.
+      * `guarded_wait_preserves_acyclic` shows the writer registry's 40P01 rule
+        keeps its own waits acyclic.
+  * Tests: `share_update_exclusive_admits_writers_from_another_connection`,
+    `share_mode_holds_off_writers_of_the_table`.

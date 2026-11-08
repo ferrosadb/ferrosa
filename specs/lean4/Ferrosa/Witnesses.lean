@@ -33,6 +33,7 @@ import Ferrosa.Sql.Constraint
 import Ferrosa.Sql.Expr
 import Ferrosa.Sql.Limit
 import Ferrosa.Sql.Oid
+import Ferrosa.Sql.TableLock
 import Ferrosa.Sql.Dml
 
 #check Ferrosa.Sql.Expr.legacy_compare_agrees
@@ -56,6 +57,13 @@ import Ferrosa.Sql.Dml
 #check Ferrosa.Sql.Oid.int4_cannot_carry_high_oids
 #check Ferrosa.Sql.Oid.oid_round_trips
 #check Ferrosa.Sql.Oid.oid_refuses_outside_range
+#check Ferrosa.Sql.TableLock.impl_blocks_writers_iff_pg
+#check Ferrosa.Sql.TableLock.sue_admits_writers
+#check Ferrosa.Sql.TableLock.impl_never_weaker
+#check Ferrosa.Sql.TableLock.guarded_wait_preserves_acyclic
+#check Ferrosa.Sql.TableLock.old_ecto_deadlocks
+#check Ferrosa.Sql.TableLock.ecto_migration_no_deadlock
+#check Ferrosa.Sql.TableLock.impl_deadlocks_only_where_pg_does
 #check Ferrosa.Sql.Dml.read_then_write_eq_declarative
 #check Ferrosa.Sql.Dml.delete_read_then_write_eq_declarative
 #check Ferrosa.Sql.Dml.returning_sees_new_row

@@ -441,22 +441,49 @@ async fn migration_lock_serializes_two_migrators() {
     second.batch_execute("COMMIT").await.unwrap();
 }
 
-/// While the lock is held, a writer of the locked table waits too — stronger than
-/// PostgreSQL's SHARE UPDATE EXCLUSIVE, which admits plain writers (documented).
+/// Ecto's own pattern: while the migration transaction holds SHARE UPDATE EXCLUSIVE, the
+/// migrator inserts the version row from ANOTHER connection. PostgreSQL admits it (the
+/// INSERT's ROW EXCLUSIVE does not conflict with SHARE UPDATE EXCLUSIVE); blocking it
+/// deadlocked every Ecto migration run against ferrosa (found by the live Oban probe).
 #[tokio::test]
-async fn migration_lock_holds_off_writers_of_the_table() {
+async fn share_update_exclusive_admits_writers_from_another_connection() {
     let fx = start().await;
     fx.client.batch_execute(SCHEMA_MIGRATIONS).await.unwrap();
     let writer = connect_to(&fx).await;
     fx.client.batch_execute("BEGIN").await.unwrap();
     fx.client.batch_execute(MIGRATION_LOCK).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        writer.batch_execute("INSERT INTO schema_migrations (version) VALUES (7)"),
+    )
+    .await
+    .expect("a plain writer is not blocked by SHARE UPDATE EXCLUSIVE")
+    .expect("insert succeeds");
+    fx.client.batch_execute("COMMIT").await.unwrap();
+}
+
+/// SHARE and stronger modes do conflict with writers (PostgreSQL's ROW EXCLUSIVE vs
+/// SHARE): the writer waits until the lock holder ends.
+#[tokio::test]
+async fn share_mode_holds_off_writers_of_the_table() {
+    let fx = start().await;
+    fx.client.batch_execute(SCHEMA_MIGRATIONS).await.unwrap();
+    let writer = connect_to(&fx).await;
+    fx.client.batch_execute("BEGIN").await.unwrap();
+    fx.client
+        .batch_execute("LOCK TABLE schema_migrations IN SHARE MODE")
+        .await
+        .unwrap();
     let insert = tokio::spawn(async move {
         writer
             .batch_execute("INSERT INTO schema_migrations (version) VALUES (7)")
             .await
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(!insert.is_finished(), "a writer waits for the lock holder");
+    assert!(
+        !insert.is_finished(),
+        "a writer waits for a SHARE lock holder"
+    );
     fx.client.batch_execute("ROLLBACK").await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), insert)
         .await
