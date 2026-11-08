@@ -68,6 +68,7 @@ import Ferrosa.Raft.Obligations
 import Ferrosa.SystemTables.Projection
 import Ferrosa.Sql.Consistency
 import Ferrosa.Sql.Plpgsql
+import Ferrosa.Sql.Notify
 import Ferrosa.Cdc.Subscribe
 import Ferrosa.Cql.Subscribe
 import Ferrosa.Flight.Subscribe

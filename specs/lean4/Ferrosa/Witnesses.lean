@@ -11,6 +11,7 @@
 -/
 import Ferrosa.Unimplemented
 import Ferrosa.Sql.Plpgsql
+import Ferrosa.Sql.Notify
 import Ferrosa.Cdc.Subscribe
 import Ferrosa.Commons.Hll
 import Ferrosa.Unsafe.Invariants
@@ -121,6 +122,15 @@ import Ferrosa.Codec.Audit
 #check Ferrosa.Sql.Plpgsql.convertList_agrees
 #check Ferrosa.Sql.Plpgsql.compiled_returns_what_the_interpreter_returns
 #check Ferrosa.Sql.Plpgsql.exists_ignores_everything_after_the_first_row
+#check Ferrosa.Sql.Plpgsql.eval_agrees
+-- LISTEN / NOTIFY (D13): at most once, only if committed, in commit order.
+#check Ferrosa.Sql.Notify.delivered_at_most_once
+#check Ferrosa.Sql.Notify.delivered_only_if_committed
+#check Ferrosa.Sql.Notify.rolled_back_delivers_nothing
+#check Ferrosa.Sql.Notify.delivery_is_append_only
+#check Ferrosa.Sql.Notify.commit_appends_its_batch
+#check Ferrosa.Sql.Notify.commit_order
+#check Ferrosa.Sql.Notify.repeated_note_is_queued_once
 #check Ferrosa.Sql.commit_is_not_atomic_across_statements
 #check Ferrosa.Sql.count_star_and_count_col_disagree
 #check Ferrosa.Sql.null_passes_a_naive_not_equal
