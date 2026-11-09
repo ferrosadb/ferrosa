@@ -185,11 +185,39 @@ pub fn row_id(i: usize) -> String {
 }
 
 /// Write row `i` (`score = i`) through the storage engine.
+///
+/// A host whose fsyncs fall more than the commit log's stall deadline (2 s) behind (a
+/// starved CPU, a contended disk) makes the engine refuse the write with
+/// `CommitLogNotDurable`: the write's outcome is unknown and it was not acknowledged. That
+/// refusal is the durability contract, not a test failure, and the contract's answer is to
+/// retry once the sync thread has drained its backlog. The retry is idempotent (same key,
+/// timestamp and values). A backlog that never drains still fails the test, after
+/// [`DRAIN_DEADLINE`], as does any other error.
 pub fn write_row(engine: &StorageEngine, i: usize) {
     let tid = TableId::new("ks", "t");
     let key = DecoratedKey::new(PartitionKey::new(row_id(i).into_bytes()));
     let ts = 1000 + i as i64;
-    let row = StorageRow {
+    for attempt in 1..=WRITE_ATTEMPTS {
+        match engine.write(&tid, &key, seeded_row(i, ts), ts) {
+            Ok(_) => return,
+            Err(ferrosa_common::Error::CommitLogNotDurable { reason }) => {
+                eprintln!("write row {i}: refused (attempt {attempt}): {reason}");
+                wait_for_commit_log_drain(engine);
+            }
+            Err(error) => panic!("write row {i}: {error:?}"),
+        }
+    }
+    panic!("write row {i}: refused {WRITE_ATTEMPTS} times though the commit log drained");
+}
+
+/// Attempts at one seeded write before a refusal is treated as a failure.
+const WRITE_ATTEMPTS: usize = 5;
+
+/// How long the commit log may take to drain a stalled backlog before the test fails.
+const DRAIN_DEADLINE: Duration = Duration::from_secs(30);
+
+fn seeded_row(i: usize, ts: i64) -> StorageRow {
+    StorageRow {
         clustering: 1i32.to_be_bytes().to_vec(),
         cells: vec![
             (0, CellValue::live(b"x".to_vec(), ts)),
@@ -197,8 +225,20 @@ pub fn write_row(engine: &StorageEngine, i: usize) {
         ],
         deletion: DeletionTime::LIVE,
         primary_key_liveness: LivenessInfo::with_timestamp(ts),
-    };
-    engine.write(&tid, &key, row, ts).expect("write row");
+    }
+}
+
+/// Wait until the commit log has no unsynced write, failing loudly past [`DRAIN_DEADLINE`].
+fn wait_for_commit_log_drain(engine: &StorageEngine) {
+    let started = std::time::Instant::now();
+    while engine.commit_log_sync_health().unsynced_for.is_some() {
+        assert!(
+            started.elapsed() < DRAIN_DEADLINE,
+            "the commit log never drained its backlog: {:?}",
+            engine.commit_log_sync_health()
+        );
+        std::thread::yield_now();
+    }
 }
 
 /// A running server: its port, its engine (for writes behind the PG layer's
