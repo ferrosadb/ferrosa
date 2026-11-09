@@ -60,6 +60,9 @@ pub struct TxnWriteSet {
     /// which a transaction that SCANNED the table reads (FMEA CL-72).
     tables: std::collections::BTreeSet<String>,
     incarnations: std::collections::HashMap<(String, String), uuid::Uuid>,
+    /// The block's buffered DDL (`ddl_txn`). Dropped with the write-set on ROLLBACK or
+    /// failure; taken and replayed by COMMIT before the row writes.
+    ddl: crate::ddl_txn::DdlBatch,
 }
 
 impl std::fmt::Debug for TxnWriteSet {
@@ -90,6 +93,7 @@ impl TxnWriteSet {
             count: 0,
             tables: std::collections::BTreeSet::new(),
             incarnations: std::collections::HashMap::new(),
+            ddl: Default::default(),
         }
     }
 
@@ -103,6 +107,7 @@ impl TxnWriteSet {
             count: 0,
             tables: Default::default(),
             incarnations: Default::default(),
+            ddl: Default::default(),
         }
     }
 
@@ -149,6 +154,16 @@ impl TxnWriteSet {
     #[must_use]
     pub(crate) fn written_tables(&self) -> Vec<String> {
         self.tables.iter().cloned().collect()
+    }
+
+    /// The block's buffered DDL, for a DDL statement to record into.
+    pub(crate) fn ddl_batch_mut(&mut self) -> &mut crate::ddl_txn::DdlBatch {
+        &mut self.ddl
+    }
+
+    /// Take the block's buffered DDL for COMMIT, leaving an empty batch.
+    pub(crate) fn take_ddl_batch(&mut self) -> crate::ddl_txn::DdlBatch {
+        std::mem::take(&mut self.ddl)
     }
 
     /// Number of writes staged so far.

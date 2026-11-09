@@ -3841,7 +3841,22 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
         // `None` for it forever, silently disabling Accord ordering for every
         // PostgreSQL transaction on a real cluster.
         let accord_core = shared_state.core.clone();
+        // D13: PL/pgSQL functions compile into the same UDF sandbox CQL functions use when
+        // the build carries the compiler; otherwise CREATE FUNCTION is refused (0A000) by
+        // name. DO blocks always run on the interpreter. The choice is logged at startup.
+        let procedural_backend = if cfg!(feature = "plpgsql-compile") {
+            ferrosa_postgres::procedural::FunctionBackend::Compiled(Arc::clone(
+                &shared_state.core.udf_executor,
+            ))
+        } else {
+            ferrosa_postgres::procedural::FunctionBackend::Unavailable(
+                "this ferrosa was built without the `plpgsql-compile` feature".into(),
+            )
+        };
         let query_ctx = std::sync::Arc::new(ferrosa_postgres::QueryContext {
+            procedural: Arc::new(ferrosa_postgres::procedural::Procedural::new(
+                procedural_backend,
+            )),
             // A `SELECT` must consult the ring, not only this node's local
             // store: at a replication factor below the node count the local scan
             // returns a fraction of the committed rows, and an unreachable owner

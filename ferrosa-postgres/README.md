@@ -101,7 +101,13 @@ latest change have not yet been measured.
   result encodings, and Postgres error-skip-until-`Sync` semantics. `SELECT`,
   no-`FROM` expression selects (incl. scalar subqueries), AND parameterized
   `INSERT` / `UPDATE` / `DELETE` can be prepared. This is the path
-  `Ecto.Repo.insert/update/delete/all` drives.
+  `Ecto.Repo.insert/update/delete/all` drives. **DDL can be prepared too**
+  (`PreparedKind::Utility`, classified by `query::is_utility`): Ecto sends every
+  migration statement as an unnamed prepared statement. `Describe` answers an empty
+  `ParameterDescription` and `NoData`; `Execute` runs the simple-query executor on the
+  moved statement, so DDL means the same thing over either protocol. A `$N` in DDL is
+  a parse error (`42601`). Transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`) still goes
+  through a simple `Query`, which is what Postgrex does.
 - **Parameterized DML + `INSERT … RETURNING`** — `$N` placeholders in `INSERT`
   VALUES, `UPDATE` SET/WHERE, and `DELETE` WHERE are bound at `Bind` and
   substituted at `Execute` (fail-loud `08P01` if a `$N` has no bound value).
@@ -784,6 +790,191 @@ a bad binary version byte answered `22P03` (Postgres: `XX000`; `08P01` for an
 empty value). There are no named divergences: `NAMED_DIVERGENCES` in the oracle is
 empty and fails if an entry stops differing.
 
+### Transactional DDL (`ddl_txn`, Lean `Ferrosa.Sql.Ddl`)
+
+Ecto runs every migration inside `BEGIN … COMMIT`, so DDL inside a transaction block is
+**buffered** and replayed at `COMMIT` rather than refused (`25001` is gone). The same
+holds for an extended-protocol pipeline's implicit transaction: its DDL applies at `Sync`.
+
+- **Visible inside the block.** Each DDL statement plans against the block's *view*: the
+  committed schema with the statements buffered so far applied (`DdlBatch::view`). So
+  `CREATE TABLE t …` followed by `ALTER TABLE t ADD COLUMN …` or `CREATE TABLE IF NOT
+  EXISTS t` works, and a second `CREATE TABLE t` is `42P07`. A statement the view refuses
+  is never buffered and aborts the block like any failed statement.
+- **Nothing before COMMIT.** The committed schema does not change until `COMMIT`.
+  `ROLLBACK` (and `COMMIT` of an aborted block) discards the batch with the rest of the
+  transaction.
+- **DML sees the committed schema.** Row statements inside the block run against the
+  committed schema, so an `INSERT` into a table created earlier in the same block is
+  `42P01`. (Ecto's migrations only write `schema_migrations`, which already exists.)
+- **COMMIT = preflight, then replay.** The batch is first re-applied in memory to the
+  schema as it is now (`ddl_txn::preflight`). If a concurrent session changed it so a
+  buffered step no longer applies (the table now exists, the altered table was dropped and
+  re-created), `COMMIT` fails with `40001` and **no** schema change is applied. Then the
+  steps are replayed in order through `DdlPath`, one replicated schema change each.
+- **Failure semantics (not atomic across steps).** Each step is an independent Raft entry,
+  so the replay is atomic only when every step succeeds. If step *k* of *n* fails at replay
+  (the schema-change path became unavailable, or a concurrent change landed between the
+  preflight and that step), steps 1…*k*-1 **stay applied** — compensating them would be a
+  second non-atomic sequence that could drop a table another session already writes into.
+  The client gets `58000` naming the applied steps, the failed step and its cause, and the
+  steps never run ("COMMIT applied 2 of 5 schema changes and then failed; the applied ones
+  are NOT rolled back …"); the same is logged at `error`. The block's row writes are then
+  not committed. Proved shape: `failed_commit_reports_the_exact_prefix`,
+  `third_of_five_fails_loudly`; tested by `ddl_txn::tests::third_of_five_reports_the_exact_prefix`.
+- **DDL before rows.** DDL replays before the row writes (they may target a new table). If
+  the row writes then fail to commit, the error message states that the schema changes
+  were applied and are not rolled back.
+- **Bound.** A block may buffer at most `MAX_BUFFERED_DDL` (4096) DDL statements.
+
+Tests: `tests/pg_oban_ddl.rs` (`ddl_inside_a_transaction_is_buffered_until_commit`,
+`rollback_discards_buffered_ddl`, `commit_refuses_a_batch_a_concurrent_change_invalidated`,
+…).
+
+### `LOCK TABLE` (`lock`)
+
+`LOCK [TABLE] [ONLY] t [, …] [IN <mode> MODE]` — Ecto's migration lock — has real
+semantics, never a no-op:
+
+- Only inside a transaction block (`25P01` otherwise); a missing table is `42P01` and takes
+  nothing; it needs `MODIFY` on each table; `NOWAIT` is refused (`0A000`).
+- **Standalone node: a blocking lock.** The transaction takes local writer ownership of
+  every stripe of the table (`mvcc::writer_ownership`), held until `COMMIT`/`ROLLBACK`.
+  Another `LOCK` of the table, and any writer of it, waits; a cycle is `40P01`. Every mode
+  is treated alike, which is **stronger** than PostgreSQL for the weak modes (`SHARE UPDATE
+  EXCLUSIVE` admits plain `INSERT`s in PostgreSQL and blocks them here). Readers never wait.
+- **Every node: the table joins the transaction's read set**, so a serializable
+  transaction — every transaction block on a cluster, where blocks run on Accord (D11) —
+  fails at `COMMIT` with `40001` if another transaction wrote the table after it began. On
+  a cluster that is the whole lock: optimistic, not blocking; of two concurrent migrators
+  the second to commit is refused. Writer ownership is node-local, so it is not taken there.
+
+Tests: `tests/pg_oban_ddl.rs` (`migration_lock_serializes_two_migrators`,
+`migration_lock_holds_off_writers_of_the_table`, …) and `tests/pg_lock_cluster.rs`.
+
+### `COMMENT ON TABLE` and `pg_description` (`catalog_stream`)
+
+`COMMENT ON TABLE t IS 'text' | NULL` sets the table's `pg.comment` extension through the
+schema-change path (so it is transactional DDL and needs `ALTER`); `IS NULL` and `IS ''`
+both remove it, as in PostgreSQL. Other object kinds (`COMMENT ON COLUMN` …) are `0A000`.
+`pg_catalog.pg_description` projects one row per commented table (`objoid`, `classoid` =
+1259, `objsubid` = 0, `description`) as a **streamed** catalog relation: the scan holds
+the shared schema snapshot and builds each row on pull. Oban reads its migration version
+with `obj_description(oid, 'pg_class')` over a `LEFT JOIN` (census statement 8); that form
+needs the expression engine (W1) and is refused loudly until then
+(`obj_description_awaits_the_expression_engine` pins the refusal). Catalog relations are
+resolved only when qualified `pg_catalog.` today; unqualified resolution is W1's.
+
+`pg_catalog.pg_range` exists with PostgreSQL's columns and **no rows** — correct, since
+ferrosa has no range types — because Postgrex's type bootstrap `LEFT JOIN`s it.
+
+### Enum types (`pg_enum`, Lean `Ferrosa.Sql.Enum`)
+
+- `CREATE TYPE [schema.]name AS ENUM ('a', …)` and `ALTER TYPE … ADD VALUE [IF NOT EXISTS]
+  'x'` (appended; `BEFORE`/`AFTER` and every other `CREATE`/`ALTER TYPE` form are `0A000`).
+  A repeated label or an existing type is `42710`; a missing type `42704`; `ADD VALUE IF NOT
+  EXISTS` of an existing label is a no-op (idempotent). Both are transactional DDL.
+- **Storage of the definition.** A keyspace's enums live as `pg.enum.<name>` extensions on a
+  hidden, row-less table `_sys_pg_types` in that keyspace, so creating a type and adding a
+  value are ordinary replicated `CREATE TABLE`/`ALTER TABLE` schema changes (the schema layer
+  has no replicated "alter type"). The table is hidden from the `pg_catalog` projections
+  (`_sys_` is ferrosa's reserved prefix; a user `CREATE TABLE _sys_…` is `42939`); CQL sees it.
+- **Columns.** A column typed by an enum (`"state" "public".oban_job_state`) is stored as
+  `text`, marked `pg.enum_column.<col>`; every `INSERT`/`UPDATE` value is validated against
+  the type's current labels and a non-label is `22P02` (both protocols). An unknown type name
+  in a column is `42704`.
+- **Catalog.** `pg_type` carries a row for each enum and its array type `_name`
+  (`pg_enum::enum_type_rows` also holds the bootstrap facts — `typtype` `e`/`b`,
+  `enum_send`/`array_send` …, `typelem` — for W1's `pg_type` columns), and
+  `pg_attribute.atttypid` of an enum column is the enum's OID.
+- **Divergences, stated.** On the wire (`RowDescription`/`ParameterDescription`) an enum
+  column is described as `text` (25), not the enum OID; the values are exact, and carrying
+  the enum OID needs an engine column type that holds a type OID (coordinate with W1).
+  (`ADD VALUE` writes one extension key per added label, so concurrent adds of different
+  labels both survive — Lean `concurrent_adds_both_survive`.)
+- **Awaiting W1 (cast engine).** `'x'::schema.enum` and `'public'::regnamespace::oid` are
+  refused by the parser today (`UnsupportedCast`); their semantics are implemented as
+  `pg_enum::cast_text_to_enum` and `catalog::resolve_regnamespace` for W1's cast evaluation.
+
+### `bigserial` (D15; `serial_id`, `pg_default`, Lean `Ferrosa.Sql.Serial`)
+
+A `bigserial`/`serial8` column is a `bigint` (implicitly `NOT NULL`) marked
+`pg.column_serial.<col>` = `bigserial`; an INSERT that omits it gets a server-generated id
+from `serial_id::next_id` (applied by the INSERT path, W2). The id is
+`millis << 22 | node << 12 | seq` (41/10/12 bits since 2025-01-01): unique across nodes
+with distinct node tags, never repeated on one node (the sequence borrows the next
+millisecond instead of waiting, and never goes back when the clock does), positive,
+**not dense and not ordered across nodes**. The node tag is `FERROSA_PG_SERIAL_NODE_TAG`
+(0–1023, the operator assigns distinct tags); unset, a random tag is used and a WARN says
+cross-node uniqueness is then probabilistic. `serial`/`smallserial` cannot hold an id and
+are `0A000`; `CREATE SEQUENCE`, `nextval`, `setval`, `currval` and `lastval` are `0A000`
+(through the general planner; a no-`FROM` `SELECT nextval(…)` still fails at parse in the
+narrow scalar grammar, a W1 item). Column DEFAULTs are recorded as
+`pg.column_default.<col>` (canonical SQL text) — the shared format of `pg_default`.
+
+### Enforced `NOT NULL` (`pg_constraint`, Lean `Ferrosa.Sql.Constraint`)
+
+A non-key column declared `NOT NULL` is recorded (`pg.not_null.<col>`) and enforced: an
+`INSERT` that omits it or writes NULL, and an `UPDATE` that sets it to NULL, are refused
+with `23502` and write nothing. (It used to be parsed and dropped; see `oban-compat.md`.)
+Key columns are NOT NULL by construction.
+
+### `ALTER TABLE` actions, `DEFAULT`s and enforced `CHECK`s (`ddl_alter`, `pg_constraint`)
+
+- **DEFAULT.** A column `DEFAULT <expr>` (in `CREATE TABLE`, `ADD COLUMN`, `ALTER COLUMN …
+  SET DEFAULT`) is parsed with the general scalar grammar (a malformed one is refused) and
+  recorded as canonical SQL in `pg.column_default.<col>` for the INSERT path (W2 applies
+  it). A string-literal default on an enum column must be a label (`22P02`), as PostgreSQL
+  checks. `DROP DEFAULT` clears it.
+- **Multi-action ALTER.** A statement's actions (`ADD COLUMN [IF NOT EXISTS]`, `DROP
+  COLUMN`, `ALTER COLUMN … TYPE / SET|DROP DEFAULT / SET|DROP NOT NULL`, `ADD [CONSTRAINT n]
+  CHECK (…) [NOT VALID]`, `DROP CONSTRAINT [IF EXISTS]`, `SET [UN]LOGGED`) are planned in
+  order and applied as ONE schema change: all or nothing. `ADD PRIMARY KEY` / `ADD FOREIGN
+  KEY` must stand alone.
+- **Type changes.** `ALTER COLUMN c TYPE` to the column's current type is a no-op; any real
+  change is `0A000` naming the column and its type (stored values would need rewriting).
+- **Existing rows.** `SET NOT NULL` is refused (`23502`) if a row is NULL, and a validated
+  `ADD CHECK` (`23514`) if a row violates it — checked with a streamed `SELECT 1 … WHERE …
+  LIMIT 1` probe; `NOT VALID` skips that. `ADD COLUMN` with a `DEFAULT` or `NOT NULL` on a
+  table that already has rows is `0A000`: PostgreSQL backfills, ferrosa does not. Inside a
+  block, a table created earlier in it has no rows to check.
+- **CHECK enforcement.** Every `INSERT`/`UPDATE` evaluates every CHECK on the complete new
+  row (an UPDATE reads the current row first when the table has a CHECK); false is
+  `23514`, NULL passes (Lean `Ferrosa.Sql.Constraint`). Evaluation compiles
+  `SELECT (<check>) FROM <one-row relation>` and streams it through W1's engine
+  (`ferrosa_sql::execute_streaming`). `pg_constraint::check_row` is the single entry point
+  for a write path (enum labels, `NOT NULL`, CHECKs) on the complete, typed new row.
+- **SET UNLOGGED** is recorded (`pg.unlogged`), not applied: the table stays durable, which
+  is stronger than requested. `DROP CONSTRAINT` of a key or foreign key is `0A000`.
+- A `CHECK` written inside `CREATE TABLE` is still refused by name (`0A000`); Oban adds its
+  checks with `ALTER TABLE`.
+
+### `CREATE INDEX` / `DROP INDEX` (`pg_index`)
+
+Ferrosa secondary indexes cover one column. A **single-column, non-partial, ascending
+`btree`/`hash` index** is a real secondary index (built through `DdlPath`; on pair/cluster
+index creation is still refused, the existing `t_9fba4678` readiness gap). A **composite,
+partial (`WHERE`), `DESC` or `USING gin` index is accepted and recorded but builds nothing
+and is never used for planning** — those queries scan. Every index is recorded as
+`pg.index.<name>` (JSON) on its table; names are unique per schema (`42P07`), `IF NOT
+EXISTS` is idempotent, `DROP INDEX [IF EXISTS]` removes the record and any physical index,
+a key/foreign-key index cannot be dropped (`0A000`), a missing one is `42704`. `UNIQUE`,
+expression keys, `CONCURRENTLY` and other methods are `0A000`. Recorded indexes are not
+yet projected into `pg_class`/`pg_index`. Both statements are transactional DDL.
+
+### Array columns (`pg_array`, on W1's `ArrayValue`)
+
+`text[]`, `jsonb[]` (and arrays of the other element types the engine carries) are
+one-dimensional array columns stored as a **frozen** CQL list, so the array is one cell and
+an empty array (`'{}'`) stays distinct from NULL. Input: PostgreSQL's array text form
+(`'{a,"b c"}'`, quoted elements, backslash escapes) for literals and text parameters, and
+`array_recv`'s binary form for `text[]`/`jsonb[]` parameters (OIDs 1009/3807). Output is
+W1's `array_out`/`array_send`; the binary header carries the column's element OID even for
+an empty array. Refused, never substituted: a NULL element (`0A000` — a CQL list cannot
+hold NULL), a multi-dimensional or size-bounded array type (`0A000`), a malformed literal
+(`22P02`). `ARRAY[...]` constructors in DML are W1/W2's (a DEFAULT of `ARRAY[]::jsonb[]` is
+recorded as SQL and applied by W2's INSERT).
+
 ### Extended-protocol transaction boundary
 
 Extended-protocol pipelines stage DML until `Sync` and commit the group as one atomic batch. An error rolls back preceding writes in that group, disconnect discards staging, and an explicit `BEGIN` remains open across `Sync`. Commit failures are reported before `ReadyForQuery`. Tests: `server::txn_atomicity_tests::extended_pipeline_*`.
@@ -951,3 +1142,101 @@ Unfiltered `COUNT(*)` on tables with one partition-key column and no clustering/
 Scans consume each owned storage partition through the row bridge, retaining text/blob payload backing in CQL and SQL values. Own writes and MVCC images remain immutable value owners; cloning a text/blob value shares its payload. The direct row encoder borrows these values while appending protocol bytes to its reusable output buffer. The per-row bounded producer channel, MVCC key tracking, storage reconciliation and final wire serialization still have costs; this ownership change does not claim those waits or all scan bottlenecks are eliminated.
 
 The PostgreSQL consumer pulls owned rows lazily from `OwnedPartitionRows`, without collecting a second decoded partition buffer. A decoding failure terminates the iterator and records a statement failure; a streamed prefix never becomes a successful truncated result.
+
+## PL/pgSQL, triggers and LISTEN/NOTIFY (D13)
+
+Statements of this lane are recognised by `ferrosa_plpgsql::utility::parse_utility` before
+the SQL engine parses anything, on both protocols (`PreparedKind::Utility` on the extended
+path), and run by `procedural::execute`.
+
+### LISTEN / NOTIFY / pg_notify
+
+- `LISTEN ch`, `UNLISTEN ch | *`, `NOTIFY ch [, 'payload']`, `SELECT pg_notify(a, b)` with
+  literal or `$n` arguments (one `void` row), and `PERFORM pg_notify(…)` inside PL/pgSQL.
+- Inside a transaction block, notifications and LISTEN/UNLISTEN are queued in the session
+  (`Session::txn_notes`) and take effect only at commit; `end_txn` drops them, so ROLLBACK,
+  a failed COMMIT, a poisoned block or a cancelled statement notifies nobody. Outside a block
+  each statement is its own transaction and takes effect at once.
+- **Delivery** (`notify::NotifyHub`, one per listener, shared by every session of the node):
+  `commit_txn` takes the queued notes, takes the hub's publish lock, checks every listener
+  queue it would write to has room, commits, and publishes only if the commit answered
+  `COMMIT` — then releases the lock. A commit and its publication are one step, so sessions
+  see commit order (`specs/lean4/Ferrosa/Sql/Notify.lean`: `commit_order`,
+  `delivered_only_if_committed`, `delivered_at_most_once`). A repeated (channel, payload)
+  within one transaction is delivered once.
+- A listening session receives `NotificationResponse` (`A`) messages while idle (outside a
+  transaction block), as PostgreSQL does; the query loop waits on the listener queue alongside
+  the socket.
+- **Bounds and refusals:** each listener queue holds `LISTENER_QUEUE_DEPTH` (8192)
+  notifications; a COMMIT that would overflow one is refused with `54000` before anything is
+  applied. One transaction may queue `MAX_NOTES_PER_TXN` (65,536) distinct notifications. An
+  empty channel or a payload of 8000 bytes or more is `22023`.
+- The notification's process id is a per-session id from the hub. (`BackendKeyData` still
+  advertises `0`: the cancel protocol is a separate follow-up.)
+
+### DO blocks
+
+`DO [LANGUAGE plpgsql] $$ … $$` is parsed by `ferrosa-plpgsql` (refusing constructs outside
+the subset with `0A000` before anything runs) and **interpreted** on a blocking thread whose
+host calls are served from the session (`procedural/host.rs`): `query` opens the portal read
+path (snapshot, read-set tracking, read-your-own-writes) and `fetch` pulls at most the
+requested rows; `execute` runs DML with parameters bound, or any other statement through the
+simple-query dispatch; `notify` queues in the transaction. Outside a transaction block the
+DO block is its own implicit transaction (all or nothing); inside one, a failure poisons the
+block (`25P02` afterwards). Expressions evaluate as `SELECT <expr>` through the SQL engine
+with variables bound as `$n` (a literal-only select on the legacy scalar grammar has its `$n`
+substituted by the host). DDL inside a DO block is buffered with the block's transaction (W3's
+`ddl_txn`) and commits or rolls back with it.
+
+### PL/pgSQL functions
+
+`CREATE [OR REPLACE] FUNCTION … LANGUAGE plpgsql` parses and compiles the body first (a
+refused body never replaces a function), then stores it through
+`DdlExecutor::create_function` → `DdlOperation::CreateFunction`, the path CQL functions take,
+as language `plpgsql` with a JSON body envelope (source + signature). `RETURNS trigger` /
+`void` are recorded as the marker types `pg_catalog.trigger` / `pg_catalog.void`. Each node
+compiles on first use and caches by the SHA-256 of the envelope (`CACHE_CAPACITY` 256).
+How functions run is the node's explicit `procedural::FunctionBackend`, logged at startup:
+`Compiled` (D13; `ferrosa` feature `plpgsql-compile`, part of `full`; needs
+`FERROSA_ASC_BUNDLE`), `Interpreted` (tests), or `Unavailable` (`CREATE FUNCTION` and trigger
+firing refuse with `0A000` naming the reason). `DROP FUNCTION [IF EXISTS] name[(types)]`
+refuses with `2BP01` while a trigger uses the function. SQLSTATEs: `42723` duplicate,
+`42P13` changed return type, `42883` missing, `42725` ambiguous name. Inside a transaction
+block, function and trigger DDL plan against the block's view and are buffered as
+`ddl_txn` steps (`CreateFunction`, `DropFunction`, the trigger's table ALTER), applied at
+COMMIT and dropped by ROLLBACK; triggers fire from the committed schema, as DML in a block
+reads it. Calling a PL/pgSQL function from a SQL
+expression (`SELECT f(1)`) is not wired: the expression engine has no user-function hook.
+
+### Triggers
+
+`CREATE TRIGGER name AFTER INSERT | UPDATE [OF col, …] [OR …] ON t FOR EACH ROW EXECUTE
+PROCEDURE|FUNCTION f()` stores the trigger in table extension `pg.triggers` (JSON) through
+`ALTER TABLE`'s schema-change path; `DROP TRIGGER [IF EXISTS] name ON t` removes it.
+Refused by name: BEFORE, INSTEAD OF, FOR EACH STATEMENT, DELETE/TRUNCATE events, WHEN,
+trigger arguments, constraint triggers. Firing: `DmlContext::row_events` makes INSERT and
+UPDATE record one event per written row of a table with triggers (`NEW`, `OLD`, the `SET`
+columns); `server::execute_dml_firing` then runs, before the statement returns and before
+any commit, every matching trigger once per event in row order then trigger-name order, with
+`NEW`/`OLD` fields bound with their column's type OID and `TG_OP`, through the same session —
+so trigger writes join the transaction. W2's general `UPDATE` (non-key `WHERE`,
+`RETURNING`, `UPDATE … FROM`) records the same events (`DmlRun::row_events`) and fires through
+`server::execute_general_dml_firing` (`specs/lean4/Ferrosa/Sql/Trigger.lean`). UPDATE OF
+fires when one of its columns is a SET target (PostgreSQL's rule). An UPDATE of a row that
+does not exist records no event. Bounds: `MAX_ROW_EVENTS` (100,000) events per statement
+(`54000`), trigger nesting `MAX_TRIGGER_DEPTH` (8, `54001`; each level is boxed, so the bound
+— not the stack — ends a cascade). A trigger error fails the statement.
+
+**Cluster status (precise):** delivery is **node-local**. A standalone node delivers to every
+session. On a cluster node (`AccordAccess::committer()` is `Some`), `LISTEN` is refused with
+`0A000` — a session that subscribed there would silently miss notifications committed on
+other nodes — while `NOTIFY`/`pg_notify` are accepted and, with no listener anywhere, deliver
+to nobody, which is exact. Cross-node delivery is designed (below) but not implemented.
+
+Design for cross-node delivery: a committed notifying transaction already passes through
+Accord, which gives it a cluster-wide commit order. The notification batch rides in the
+transaction's write set as rows of a per-node-unreplicated `system_pg.notifications` log
+keyed by Accord's execute timestamp; every node's apply observer (the same
+`PostgresMvccApplyObserver` the MVCC layer registers) publishes applied batches to its local
+hub in execute-timestamp order. Delivery is then at most once per node and in Accord commit
+order everywhere; a node that restarts resumes from its last published timestamp.

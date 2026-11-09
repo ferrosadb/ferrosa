@@ -228,6 +228,7 @@ async fn fixture_with(outcome: BuildOutcome) -> Fixture {
         engine: Arc::clone(&engine),
     }));
     let context = Arc::new(QueryContext {
+        procedural: Default::default(),
         cluster_read: Default::default(),
         engine: Arc::clone(&engine),
         schema,

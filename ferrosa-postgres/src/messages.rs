@@ -128,6 +128,13 @@ pub enum BackendMessage {
     /// `s` — PortalSuspended: an `Execute` stopped at its `max_rows` limit with
     /// rows remaining; the next `Execute` on the portal resumes from there.
     PortalSuspended,
+    /// `A` — NotificationResponse: a committed `NOTIFY` on a channel this session listens to.
+    /// Channel and payload are shared with every other listener of the same notification.
+    NotificationResponse {
+        process_id: i32,
+        channel: std::sync::Arc<str>,
+        payload: std::sync::Arc<str>,
+    },
 }
 
 impl BackendMessage {
@@ -153,6 +160,7 @@ impl BackendMessage {
             BackendMessage::NoData => b'n',
             BackendMessage::EmptyQueryResponse => b'I',
             BackendMessage::PortalSuspended => b's',
+            BackendMessage::NotificationResponse { .. } => b'A',
         }
     }
 
@@ -241,6 +249,15 @@ impl BackendMessage {
                 for oid in type_oids {
                     body.put_i32(*oid);
                 }
+            }
+            BackendMessage::NotificationResponse {
+                process_id,
+                channel,
+                payload,
+            } => {
+                body.put_i32(*process_id);
+                put_cstring(body, channel);
+                put_cstring(body, payload);
             }
         }
     }

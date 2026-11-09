@@ -1,0 +1,48 @@
+package ferrosa:plpgsql@0.1.0;
+
+/// Values cross as PostgreSQL's text form with their type OID: lossless, and PL/pgSQL never
+/// looks inside a value except to ask whether it is boolean `true`.
+interface types {
+    record value {
+        type-oid: u32,
+        /// `none` is SQL NULL.
+        text: option<string>,
+    }
+
+    record sql-error {
+        sqlstate: string,
+        message: string,
+    }
+
+    /// A trigger call: `TG_OP`, and the values of the `NEW` / `OLD` fields the function
+    /// references, in the order the converter assigned them slots.
+    record trigger-data {
+        op: string,
+        new-row: option<list<value>>,
+        old-row: option<list<value>>,
+    }
+}
+
+/// The database, inside the calling transaction.
+interface host {
+    use types.{value, sql-error};
+
+    /// Start a query with `params` bound as `$1 … $n`; returns a cursor.
+    query: func(sql: string, params: list<value>) -> result<u32, sql-error>;
+    /// At most `max` more rows; an empty list means the query is exhausted.
+    fetch: func(cursor: u32, max: u32) -> result<list<list<value>>, sql-error>;
+    /// Stop a query early.
+    close: func(cursor: u32);
+    /// Run a statement for its effect; the affected-row count.
+    execute: func(sql: string, params: list<value>) -> result<u64, sql-error>;
+    /// Queue a notification, delivered only if the calling transaction commits.
+    notify: func(channel: string, payload: string) -> result<_, sql-error>;
+}
+
+/// A compiled PL/pgSQL function.
+world routine {
+    use types.{value, sql-error, trigger-data};
+    import host;
+
+    export call: func(args: list<value>, trigger: option<trigger-data>) -> result<option<value>, sql-error>;
+}

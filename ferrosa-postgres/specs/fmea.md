@@ -320,3 +320,18 @@ Remaining: positive lock_timeout SET/RESET/SHOW (t_cc11529a), native CancelReque
 and prompt blocked EOF/Terminate (t_b254fd86), distributed RC (t_b6306006), and early
 COPY contention semantics (t_4c825e03). Snapshot maximum age is a Ferrosa resource
 policy, not native PostgreSQL default transaction-timeout parity.
+
+## D13 PL/pgSQL, triggers, LISTEN/NOTIFY
+
+| Failure mode | Effect | Mitigation |
+|---|---|---|
+| Notification of a rolled-back transaction delivered | Listeners act on work that never happened | Notes live in the session's transaction state and are dropped by `end_txn`; published only when the commit answered `COMMIT` (`a_rolled_back_transaction_notifies_nobody`) |
+| Two commits publish out of order | Listener sees a later state first | Publish lock held across commit and publication (`notifications_arrive_in_commit_order`; Lean `commit_order`) |
+| Slow listener's queue fills | Memory growth or lost notifications | Bounded queue; the notifying COMMIT is refused with 54000 before applying |
+| LISTEN on a cluster node misses other nodes' commits | Silent loss | LISTEN refused with 0A000 on a cluster node |
+| Trigger effect outside the statement's transaction | Rolled-back insert leaves an audit row | Trigger runs through the same session host (`trigger_writes_join_the_transaction_and_roll_back_with_it`) |
+| Trigger cascade | Stack overflow / hang | Depth 8 (54001), each level boxed; verified on a 2 MiB stack |
+| Unbounded trigger queue | Memory growth on a bulk statement | 100,000 events per statement (54000) |
+| PL/pgSQL query result gathered whole | Memory growth | Host `fetch` pulls at most the requested rows from the portal stream; EXISTS and scalar reads stop after one row |
+| Function compiled differently on two nodes | Divergent trigger behaviour | Cache keyed by the stored envelope's hash; same source, same compile |
+

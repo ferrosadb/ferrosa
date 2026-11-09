@@ -63,3 +63,22 @@ fn alternating_not_and_parentheses() {
         )
     });
 }
+
+// A left-deep operator chain recurses nowhere in the parser, but it builds a tree
+// as deep as the chain is long, and lowering, planning, evaluation and drop all
+// walk that tree recursively. Its length is bounded by the same limit.
+
+#[test]
+fn long_and_chain() {
+    check(|d| format!("SELECT a FROM t WHERE a = 1{}", " AND a = 1".repeat(d)));
+}
+
+#[test]
+fn long_arithmetic_chain_in_a_select_item() {
+    check(|d| format!("SELECT a{} FROM t", " + 1".repeat(d)));
+}
+
+#[test]
+fn long_concatenation_chain() {
+    check(|d| format!("SELECT s{} FROM t", " || 'x'".repeat(d)));
+}

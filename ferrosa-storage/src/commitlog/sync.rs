@@ -109,6 +109,10 @@ pub trait SyncStrategy: Send + Sync {
     /// The current health of the sync machinery.
     fn health(&self) -> SyncHealthSnapshot;
 
+    /// The live health record, for a sync made outside the strategy's own thread
+    /// (`CommitLog::force_sync`), which must account for it exactly as the thread does.
+    fn sync_health(&self) -> &SyncHealth;
+
     /// Replace a dead sync thread. `Ok(false)` when there was nothing to
     /// restart (healthy, stopped, or no thread at all).
     fn restart(&self) -> ferrosa_common::Result<bool>;
@@ -353,7 +357,13 @@ impl SyncHealth {
     /// failing -> healthy edge.
     pub(crate) fn sync_succeeded(&self, ticket: SyncTicket) -> bool {
         self.finish_attempt();
-        self.durable_seq.fetch_max(ticket.target, Ordering::SeqCst);
+        let previous = self.durable_seq.fetch_max(ticket.target, Ordering::SeqCst);
+        if previous > ticket.target {
+            // A newer sync (a forced one racing the thread, or the reverse) already made
+            // more durable and set the stall clock from its own ticket; this older ticket's
+            // instant would move the clock backwards and refuse writes that are durable.
+            return self.failing.swap(false, Ordering::AcqRel);
+        }
         // Writes numbered past the ticket are still unsynced, and none of them
         // started before the ticket was read, so the ticket's instant is a
         // conservative age for them. The second check catches a write that
@@ -374,6 +384,17 @@ impl SyncHealth {
             );
         }
         self.failing.swap(false, Ordering::AcqRel)
+    }
+
+    /// A forced sync (`CommitLog::force_sync`) failed. The attempt is over, but nothing became
+    /// durable, so the stall clock and the durable sequence are left exactly as they were:
+    /// the writes it covered keep ageing toward the stall deadline. The error is returned to
+    /// the forcing caller; the `failing` state stays the sync thread's to set.
+    pub(crate) fn forced_sync_failed(&self, error: &ferrosa_common::Error) {
+        self.finish_attempt();
+        self.sync_failures.fetch_add(1, Ordering::Relaxed);
+        self.last_failure
+            .store(Some(Arc::new(format!("forced fsync failed: {error}"))));
     }
 
     /// An fsync attempt failed. Returns `true` on the healthy -> failing edge.
@@ -576,6 +597,27 @@ fn report_sync_failure(strategy: &'static str, health: &SyncHealth, e: &ferrosa_
     }
 }
 
+/// Run `flush` as a sync of every write registered so far, accounted in `health` exactly as
+/// the sync thread accounts its own: the ticket is read before the flush, so a write that
+/// lands during it stays unsynced and keeps its age.
+pub(crate) fn forced_sync(
+    health: &SyncHealth,
+    flush: impl FnOnce() -> ferrosa_common::Result<()>,
+) -> ferrosa_common::Result<()> {
+    let ticket = health.begin_sync(Instant::now());
+    match flush() {
+        Ok(()) => {
+            report_sync_success("forced", health, ticket);
+            Ok(())
+        }
+        Err(error) => {
+            tracing::error!(%error, "forced commit-log fsync failed; the stall clock keeps running");
+            health.forced_sync_failed(&error);
+            Err(error)
+        }
+    }
+}
+
 fn report_sync_success(strategy: &'static str, health: &SyncHealth, ticket: SyncTicket) {
     if health.sync_succeeded(ticket) {
         tracing::warn!(
@@ -652,6 +694,10 @@ impl SyncStrategy for BatchSync {
 
     fn health(&self) -> SyncHealthSnapshot {
         self.health.snapshot(Instant::now(), false)
+    }
+
+    fn sync_health(&self) -> &SyncHealth {
+        &self.health
     }
 
     fn restart(&self) -> ferrosa_common::Result<bool> {
@@ -977,6 +1023,10 @@ impl SyncStrategy for PeriodicSync {
 
     fn health(&self) -> SyncHealthSnapshot {
         self.shared.health.snapshot(Instant::now(), true)
+    }
+
+    fn sync_health(&self) -> &SyncHealth {
+        &self.shared.health
     }
 
     fn restart(&self) -> ferrosa_common::Result<bool> {
@@ -1329,6 +1379,10 @@ impl SyncStrategy for GroupSync {
 
     fn health(&self) -> SyncHealthSnapshot {
         self.shared.health.snapshot(Instant::now(), true)
+    }
+
+    fn sync_health(&self) -> &SyncHealth {
+        &self.shared.health
     }
 
     fn restart(&self) -> ferrosa_common::Result<bool> {

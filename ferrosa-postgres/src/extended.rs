@@ -28,8 +28,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ferrosa_sql::{
-    parse_statement, DeleteStmt, InsertStmt, ScalarItem, SelectStmt, Statement, UpdateStmt,
-    Value as SqlValue,
+    DeleteStmt, InsertStmt, ScalarItem, SelectStmt, Statement, UpdateStmt, Value as SqlValue,
 };
 
 use crate::messages::{BackendMessage, TransactionStatus};
@@ -55,6 +54,17 @@ pub enum PreparedKind {
     Insert(Box<InsertStmt>),
     Update(Box<UpdateStmt>),
     Delete(Box<DeleteStmt>),
+    /// A general `UPDATE`/`DELETE` (`FROM`, `WITH`, a general `WHERE`, `RETURNING`).
+    Dml(Box<ferrosa_sql::DmlStmt>),
+    /// A parameterless utility statement (DDL): no `$N`, no result rows. Ecto sends every
+    /// migration statement as an unnamed prepared statement, so DDL has to be preparable;
+    /// executing it runs the same executor the simple-query path uses
+    /// (`query::execute_utility`). Which statements qualify is `query::is_utility`.
+    Utility(Box<Statement>),
+    /// A statement of the procedural lane (D13): `DO`, PL/pgSQL function and trigger DDL,
+    /// `LISTEN`/`UNLISTEN`/`NOTIFY`, `SELECT pg_notify(…)`. Ecto sends these through the
+    /// extended protocol, so they must prepare like any other statement.
+    Procedural(Box<ferrosa_plpgsql::utility::Utility>),
 }
 
 /// A prepared statement: the parsed query plus the client-declared parameter
@@ -123,6 +133,13 @@ pub struct Session {
     /// closed by the server. A portal absent here has not started. Dropping a
     /// suspended entry stops its executor and gives back its node slot.
     runs: HashMap<String, PortalRun>,
+    /// The open transaction's queued notifications and LISTEN actions (D13): published or
+    /// applied only when it commits, and dropped by every path that ends it otherwise.
+    txn_notes: crate::notify::TxnNotes,
+    /// This session's subscription, created by its first committed LISTEN.
+    listener: Option<crate::notify::Listener>,
+    /// The process id this session's notifications carry, allocated on first use.
+    notify_pid: Option<i32>,
 }
 
 /// A query suspended by `max_rows`, waiting for the next `Execute`.
@@ -175,6 +192,9 @@ impl Session {
             txn_read_rows: RowReadSet::default(),
             txn_writes: TxnWriteSet::default(),
             runs: HashMap::new(),
+            txn_notes: crate::notify::TxnNotes::default(),
+            listener: None,
+            notify_pid: None,
         }
     }
 
@@ -409,6 +429,29 @@ impl Session {
         // Drop the whole staged write-set (resident prefix and spill) so a
         // committed or rolled-back transaction leaves nothing behind.
         self.txn_writes = TxnWriteSet::default();
+        // A transaction that ends without its notifications having been taken for
+        // publication (rollback, failure, cancellation) notifies nobody.
+        self.txn_notes = crate::notify::TxnNotes::default();
+    }
+
+    /// The open transaction's queued notifications and LISTEN actions.
+    pub(crate) fn txn_notes_mut(&mut self) -> &mut crate::notify::TxnNotes {
+        &mut self.txn_notes
+    }
+
+    /// Take the queued notifications for publication at commit.
+    pub(crate) fn take_txn_notes(&mut self) -> crate::notify::TxnNotes {
+        std::mem::take(&mut self.txn_notes)
+    }
+
+    /// This session's subscription, if it has one.
+    pub(crate) fn listener_mut(&mut self) -> &mut Option<crate::notify::Listener> {
+        &mut self.listener
+    }
+
+    /// The process id this session's notifications carry.
+    pub(crate) fn notify_pid(&mut self, hub: &crate::notify::NotifyHub) -> i32 {
+        *self.notify_pid.get_or_insert_with(|| hub.allocate_pid())
     }
 
     pub(crate) fn start_statement(&mut self) {
@@ -540,7 +583,24 @@ impl Session {
         query: &str,
         param_types: Vec<i32>,
     ) -> BackendMessage {
-        let parsed = match parse_statement(query) {
+        if let Some(utility) = ferrosa_plpgsql::utility::parse_utility(query) {
+            let parsed = match utility {
+                Ok(statement) => PreparedKind::Procedural(Box::new(statement)),
+                Err(error) => {
+                    self.mark_error();
+                    return error_response(error.sqlstate, &error.message);
+                }
+            };
+            self.statements.insert(
+                stmt_name,
+                PreparedStatement {
+                    parsed,
+                    param_oids: param_types,
+                },
+            );
+            return BackendMessage::ParseComplete;
+        }
+        let parsed = match crate::catalog::parse_pg(query) {
             Ok(Statement::Select(select)) => PreparedKind::Select(select),
             Ok(Statement::SelectExprs(items)) => {
                 // Parameterized expression selects need $N type inference with no
@@ -565,13 +625,15 @@ impl Session {
             Ok(Statement::Insert(ins)) => PreparedKind::Insert(ins),
             Ok(Statement::Update(upd)) => PreparedKind::Update(upd),
             Ok(Statement::Delete(del)) => PreparedKind::Delete(del),
+            Ok(Statement::Dml(d)) => PreparedKind::Dml(d),
+            Ok(stmt) if crate::query::is_utility(&stmt) => PreparedKind::Utility(Box::new(stmt)),
             Ok(_) => {
                 // BEGIN/COMMIT/ROLLBACK/SET reach the backend via simple Query.
                 self.mark_error();
                 return error_response(
                     "0A000",
-                    "only SELECT and INSERT/UPDATE/DELETE statements can be prepared via the \
-                     extended-query protocol",
+                    "only SELECT, INSERT/UPDATE/DELETE and DDL statements can be prepared via \
+                     the extended-query protocol; transaction control goes through a simple Query",
                 );
             }
             Err(e) => {
@@ -961,7 +1023,7 @@ mod tests {
             "t",
             std::sync::Arc::new(InMemoryTable::new(schema, rows)),
         );
-        let Ok(Statement::Select(select)) = parse_statement("SELECT id FROM t") else {
+        let Ok(Statement::Select(select)) = ferrosa_sql::parse_statement("SELECT id FROM t") else {
             panic!("fixture query must parse to a SELECT");
         };
         crate::result_stream::open_stream(

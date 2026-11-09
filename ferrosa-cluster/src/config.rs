@@ -65,7 +65,11 @@ pub struct ClusterConfig {
     pub expected_cluster_size: usize,
     /// Require a shared S3 WAL archive before singleton pair QUORUM ACK.
     /// ONE remains local; RF2 ALL/TWO always require the follower.
-    #[serde(default)]
+    ///
+    /// Node-local: every node reads it from `FERROSA_PAIR_QUORUM_STRICT`. It
+    /// is not part of the replicated (bincode) encoding; see
+    /// `cluster_config_wire` for why and how 0.35.x records still decode.
+    #[serde(default, with = "cluster_config_wire::node_local_flag")]
     pub pair_quorum_strict: bool,
     /// CQL broadcast address (host:port) for system.peers.
     /// When set, overrides the internode address for native_address.
@@ -166,6 +170,127 @@ impl Default for ClusterConfig {
             raft_enable_pre_vote: false,
             raft_check_quorum_ratio: 0.75,
             per_dc_overrides: BTreeMap::new(),
+        }
+    }
+}
+
+/// The replicated encoding of [`ClusterConfig`], kept readable across releases.
+///
+/// `ClusterConfig` is bincode-encoded inside Raft log entries
+/// (`RaftOp::UpdateConfig`), state-machine snapshots and Raft RPCs. Bincode is
+/// positional: `#[serde(default)]` does nothing for it, so a field added in
+/// the middle shifts every byte after it. 0.35.0 did exactly that with
+/// `pair_quorum_strict`; every node upgraded from 0.30.x then failed to read
+/// its own snapshot and refused to start Raft (2026-11-06).
+///
+/// So the flag's binary encoding is empty, which is byte-for-byte the 0.30.x
+/// layout and stays readable by a node rolled back to it. Records written by
+/// 0.35.x DO carry the byte; [`decode_with_legacy_fallback`] retries a failed
+/// decode in that layout, says so loudly, and fails with the ORIGINAL error if
+/// neither layout reads. Human-readable formats (JSON, TOML) carry the field
+/// normally.
+pub(crate) mod cluster_config_wire {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::cell::Cell;
+
+    thread_local! {
+        static READ_V035_LAYOUT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Serde adapter for [`super::ClusterConfig::pair_quorum_strict`].
+    pub(crate) mod node_local_flag {
+        use super::*;
+
+        pub(crate) fn serialize<S: Serializer>(
+            value: &bool,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            if serializer.is_human_readable() {
+                serializer.serialize_bool(*value)
+            } else {
+                // Unit encodes as zero bytes in bincode: the 0.30.x layout.
+                serializer.serialize_unit()
+            }
+        }
+
+        pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<bool, D::Error> {
+            if deserializer.is_human_readable() || READ_V035_LAYOUT.with(Cell::get) {
+                bool::deserialize(deserializer)
+            } else {
+                <()>::deserialize(deserializer)?;
+                Ok(false)
+            }
+        }
+    }
+
+    /// `bincode::deserialize`'s exact wire options, plus a read limit of the
+    /// input's own length. A misaligned attempt (the first try of a record in
+    /// the other layout) reads garbage length prefixes; unbounded, one of them
+    /// asked for a 64 PiB allocation and aborted the process instead of
+    /// returning an error the fallback could act on.
+    fn bounded(len: usize) -> impl bincode::Options {
+        use bincode::Options as _;
+        bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .allow_trailing_bytes()
+            .with_limit(len as u64)
+    }
+
+    /// Decode `bytes` as `bincode::deserialize` would, never reading or
+    /// allocating more than `bytes.len()`.
+    pub(crate) fn deserialize_bounded<T: serde::de::DeserializeOwned>(
+        bytes: &[u8],
+    ) -> bincode::Result<T> {
+        use bincode::Options as _;
+        bounded(bytes.len()).deserialize(bytes)
+    }
+
+    /// Decode the first value from `cursor`, bounded by the bytes it holds.
+    pub(crate) fn deserialize_from_bounded<T: serde::de::DeserializeOwned>(
+        cursor: &mut std::io::Cursor<&[u8]>,
+    ) -> bincode::Result<T> {
+        use bincode::Options as _;
+        let len = cursor.get_ref().len();
+        bounded(len).deserialize_from(cursor)
+    }
+
+    /// Restores the previous layout flag even if `decode` panics.
+    struct LayoutGuard(bool);
+
+    impl Drop for LayoutGuard {
+        fn drop(&mut self) {
+            READ_V035_LAYOUT.with(|flag| flag.set(self.0));
+        }
+    }
+
+    /// Run `decode` in the current layout; if it fails, retry it reading the
+    /// 0.35.x layout. `what` names the record for the log line. The retry's
+    /// error is discarded: the current-layout error is the one to report.
+    pub(crate) fn decode_with_legacy_fallback<T, E: std::fmt::Display>(
+        what: &str,
+        decode: impl Fn() -> Result<T, E>,
+    ) -> Result<T, E> {
+        let current_err = match decode() {
+            Ok(value) => return Ok(value),
+            Err(e) => e,
+        };
+        let retried = {
+            let _guard = LayoutGuard(READ_V035_LAYOUT.with(|flag| flag.replace(true)));
+            decode()
+        };
+        match retried {
+            Ok(value) => {
+                tracing::warn!(
+                    record = what,
+                    current_layout_error = %current_err,
+                    "decoded a record written in the ferrosa 0.35.x ClusterConfig layout; \
+                     it is rewritten in the 0.30-compatible layout when next persisted"
+                );
+                Ok(value)
+            }
+            Err(_) => Err(current_err),
         }
     }
 }

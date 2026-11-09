@@ -43,7 +43,7 @@
 
 use std::net::SocketAddr;
 
-use ferrosa_cql::client::{CqlClient, QueryResult, ResultRow};
+use ferrosa_cql::client::{QueryResult, ResultRow};
 use ferrosa_cql::error::CqlError;
 
 /// The observability table the engine already publishes.
@@ -167,8 +167,12 @@ fn decode(result: &QueryResult) -> Result<Vec<IndexRow>, CqlError> {
 ///
 /// Propagates connection and query failures. A node without the observability
 /// table fails loudly rather than reporting an empty, healthy-looking list.
-pub async fn run_index_list(addr: SocketAddr, problems_only: bool) -> Result<(), CqlError> {
-    let mut client = CqlClient::connect(addr).await?;
+pub async fn run_index_list(
+    addr: SocketAddr,
+    problems_only: bool,
+    credentials: Option<&crate::credentials::Credentials>,
+) -> Result<(), CqlError> {
+    let mut client = crate::credentials::connect_cql(addr, credentials).await?;
     let result = client.query(SECONDARY_INDEXES).await?;
     let rows = decode(&result)?;
 
@@ -359,10 +363,10 @@ pub async fn run_index_rebuild(
     keyspace: &str,
     table: &str,
     index: &str,
+    credentials: Option<&crate::credentials::Credentials>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let url = rebuild_url(web_host, web_port, keyspace, table, index);
-    let resp = reqwest::Client::new()
-        .post(&url)
+    let resp = crate::credentials::authorize(reqwest::Client::new().post(&url), credentials)
         .json(&serde_json::json!({}))
         .send()
         .await?;

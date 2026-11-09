@@ -10,6 +10,7 @@
 //! | `SELECT … FROM t [JOIN u]` | `SELECT` on each table read |
 //! | `INSERT` / `UPDATE` / `DELETE` on `t` | `MODIFY` on `t` |
 //! | … `RETURNING` | additionally `SELECT` on `t` (the row is read back) |
+//! | general `UPDATE`/`DELETE` (`FROM`, `WITH`, a general `WHERE`, `RETURNING`) | `MODIFY` on the target, `SELECT` on every relation read, target included |
 //! | `TRUNCATE [TABLE] t [, …]` | `MODIFY` on EACH `t` (the CQL router's rule) |
 //! | `VACUUM …`, `ANALYZE …` | nothing — a deliberate no-op touches no table |
 //! | `SELECT <exprs>` (no `FROM`), `BEGIN`/`COMMIT`/`ROLLBACK`, `SET`/`RESET` | nothing — no table is touched |
@@ -46,11 +47,12 @@ fn table(table: &TableRef, default_schema: &str) -> Resource {
 }
 
 fn select_reads(select: &SelectStmt, default_schema: &str) -> Vec<(Permission, Resource)> {
-    let mut required = vec![(Permission::Select, table(&select.from, default_schema))];
-    if let Some(join) = &select.join {
-        required.push((Permission::Select, table(&join.table, default_schema)));
-    }
-    required
+    // Every relation read: joins, subqueries and CTE bodies need SELECT too.
+    select
+        .tables()
+        .into_iter()
+        .map(|t| (Permission::Select, table(t, default_schema)))
+        .collect()
 }
 
 fn dml(target: &TableRef, returning: bool, default_schema: &str) -> Vec<(Permission, Resource)> {
@@ -59,6 +61,14 @@ fn dml(target: &TableRef, returning: bool, default_schema: &str) -> Vec<(Permiss
     if returning {
         required.push((Permission::Select, resource));
     }
+    required
+}
+
+/// A general `UPDATE`/`DELETE`: MODIFY on the target, SELECT on every relation
+/// its read half reads (`DmlStmt::read_select`), the target included.
+fn general_dml(d: &ferrosa_sql::DmlStmt, default_schema: &str) -> Vec<(Permission, Resource)> {
+    let mut required = vec![(Permission::Modify, table(&d.target, default_schema))];
+    required.extend(select_reads(&d.read_select(), default_schema));
     required
 }
 
@@ -72,6 +82,7 @@ pub(crate) fn statement_permissions(
         Statement::Insert(ins) => dml(&ins.table, ins.returning.is_some(), default_schema),
         Statement::Update(upd) => dml(&upd.table, upd.returning.is_some(), default_schema),
         Statement::Delete(del) => dml(&del.table, del.returning.is_some(), default_schema),
+        Statement::Dml(d) => general_dml(d, default_schema),
         // DDL (T-132a, t_d3930503): CREATE on the target keyspace, as the CQL
         // router requires for CREATE TABLE. Checked at dispatch, before the
         // executor looks at the schema, so a denial reveals nothing about
@@ -118,6 +129,54 @@ pub(crate) fn statement_permissions(
         // rows, so they need no table permission — the same treatment a session
         // statement gets.
         Statement::Vacuum(_) | Statement::Analyze(_) => Vec::new(),
+        // A type is a keyspace object: CREATE / ALTER on the keyspace, as for tables.
+        Statement::CreateType(create) => vec![(
+            Permission::Create,
+            Resource::Keyspace(
+                create
+                    .name
+                    .schema
+                    .as_deref()
+                    .unwrap_or(default_schema)
+                    .to_string(),
+            ),
+        )],
+        Statement::AlterType(alter) => vec![(
+            Permission::Alter,
+            Resource::Keyspace(
+                alter
+                    .name
+                    .schema
+                    .as_deref()
+                    .unwrap_or(default_schema)
+                    .to_string(),
+            ),
+        )],
+        // An index changes its table's definition: ALTER on the table; a DROP INDEX names no
+        // table, so it needs ALTER on the keyspace.
+        Statement::CreateIndex(create) => {
+            vec![(Permission::Alter, table(&create.table, default_schema))]
+        }
+        Statement::DropIndex(drop) => drop
+            .names
+            .iter()
+            .map(|n| {
+                (
+                    Permission::Alter,
+                    Resource::Keyspace(n.schema.as_deref().unwrap_or(default_schema).to_string()),
+                )
+            })
+            .collect(),
+        // A comment is part of the table's definition: ALTER, as for ALTER TABLE.
+        Statement::Comment(comment) => {
+            vec![(Permission::Alter, table(&comment.table, default_schema))]
+        }
+        // LOCK holds off the table's writers, so it needs the permission a writer needs.
+        Statement::Lock(lock) => lock
+            .tables
+            .iter()
+            .map(|t| (Permission::Modify, table(t, default_schema)))
+            .collect(),
         Statement::SelectExprs(_)
         | Statement::Begin { .. }
         | Statement::Commit
@@ -137,7 +196,12 @@ pub(crate) fn prepared_permissions(
         PreparedKind::Insert(ins) => dml(&ins.table, ins.returning.is_some(), default_schema),
         PreparedKind::Update(upd) => dml(&upd.table, upd.returning.is_some(), default_schema),
         PreparedKind::Delete(del) => dml(&del.table, del.returning.is_some(), default_schema),
+        PreparedKind::Dml(d) => general_dml(d, default_schema),
         PreparedKind::Exprs(_) => Vec::new(),
+        PreparedKind::Utility(stmt) => statement_permissions(stmt, default_schema),
+        // The procedural lane authorizes each statement a DO block or function runs as it runs
+        // it, and its DDL against the object it creates (`procedural`).
+        PreparedKind::Procedural(_) => Vec::new(),
     }
 }
 
@@ -211,6 +275,30 @@ mod tests {
             vec![
                 (Permission::Modify, t("public", "kv")),
                 (Permission::Select, t("public", "kv")),
+            ]
+        );
+    }
+
+    /// A general UPDATE/DELETE reads with a general SELECT, so it needs SELECT on
+    /// every relation that read touches (the target included, as PostgreSQL
+    /// requires for the columns a WHERE or RETURNING reads), plus MODIFY on the
+    /// target.
+    #[test]
+    fn general_dml_needs_modify_and_select_on_every_relation_read() {
+        assert_eq!(
+            perms("UPDATE kv AS x SET v = 'x' FROM other.o AS y WHERE x.k = y.k"),
+            vec![
+                (Permission::Modify, t("public", "kv")),
+                (Permission::Select, t("public", "kv")),
+                (Permission::Select, t("other", "o")),
+            ]
+        );
+        assert_eq!(
+            perms("DELETE FROM kv WHERE k IN (SELECT k FROM gone)"),
+            vec![
+                (Permission::Modify, t("public", "kv")),
+                (Permission::Select, t("public", "kv")),
+                (Permission::Select, t("public", "gone")),
             ]
         );
     }

@@ -883,3 +883,52 @@ data at QUORUM can lose the verdict and keep the data
 (`all_does_not_prevent_write_skew`) — with ALL every replica agrees, on the state where the
 invariant is broken. A level chooses which replicas answer; only read-set validation chooses which
 versions are visible.
+
+## G20 — CQL v5: a buffered slice of a split request was never read
+
+Source: `ferrosa-cql/src/frame.rs` (`decode_v5_frame`), model `Ferrosa/Cql/V5Framing.lean`.
+
+A v5 message over 131 071 bytes travels as several non-self-contained segments. The decoder
+consumed one segment per call and returned `Ok(None)` while the message was incomplete — even when
+the next segment was already in the buffer. `tokio_util::codec::Framed` calls `decode` again only
+after another socket read, so when a client wrote the whole message at once, the tail sat unread,
+the request never ran and the client waited forever. Seen from a client as conditional `UPDATE`s
+around 128 KiB that never got a reply; intermittent because it depends on whether the tail lands in
+the same read.
+
+- **The violation** (`decode_old_strands_a_buffered_segment`, `framed_old_delivers_nothing`,
+  `decode_old_breaks_progress`): two slices buffered, `needMore` returned with one still there,
+  nothing delivered.
+- **The invariant** (`decode_new_progress`): `needMore` only when no complete segment is buffered.
+- **Correctness of the fix** (`decode_new_reassembles`): any split of any message into non-empty
+  slices, followed by anything, decodes to exactly that message and leaves exactly what followed.
+- **Delivery** (`framed_new_delivers_all`): any number of split messages buffered together are all
+  delivered, in order, without another read.
+
+Status: fixed on `fix/cql-lwt-lost-reply`; regression tests in `frame.rs` include a `Framed`
+reader over an in-memory pipe that times out on the old decoder.
+
+## G21 — commit log: a forced sync left the stall clock running
+
+Source: `ferrosa-storage/src/commitlog/mod.rs` (`CommitLog::force_sync`) and
+`ferrosa-storage/src/commitlog/sync.rs` (`SyncHealth`), model `Ferrosa/Storage/SyncHealth.lean`.
+
+`force_sync` flushed the active segment but never updated the sync health record. The data was
+durable, yet `unsynced_for` kept counting and `admit` refused durable writes "past the stall
+deadline" until the sync thread's own next fsync. With the production 10 ms interval the thread
+hides it; with a long interval (replay, catch-up, tests) the log refused writes it could have
+acknowledged.
+
+- **The violation** (`force_old_keeps_refusing`): one write, forced to disk, still refused.
+- **The fix** (`force_new_is_a_sync`): a forced sync reads a ticket before flushing and is
+  accounted exactly as the thread's fsync, so a completed sync of either kind clears the clock
+  (`completed_sync_clears_the_clock`, `forced_sync_admits`).
+- **Failure** (`failed_force_leaves_the_clock`): a failed forced sync changes nothing; the writes it
+  covered keep ageing toward the deadline.
+- **The race** (`superseded_ticket_changes_nothing`, `a_lost_race_keeps_the_clock_cleared`): a sync
+  whose ticket is older than what is already durable cannot move the clock back.
+
+Status: fixed on `feat/postgres-oban`; regression tests
+`a_forced_sync_clears_the_stall_clock_and_writes_are_admitted`,
+`a_failed_forced_sync_leaves_the_stall_clock_running` and
+`a_superseded_sync_does_not_reopen_the_stall_clock` in `commitlog/mod.rs`.

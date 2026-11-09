@@ -362,3 +362,101 @@ _Phase 0 (grill-me) complete: 10 questions asked across two rounds, 10 user deci
 handling (Q2 — now richer under multi-db), legacy bcrypt-role migration (Q3), SCRAM channel
 binding (Q4), CQL grant backward-compat at rollout (D8b), implicit-vs-explicit default-db
 listing (D8c)._
+
+---
+
+## D12 — Run Postgrex, Ecto and Oban unchanged _(2026-11-08; from the Oban census)_
+
+**Decision:** The front end grows what an Elixir application needs to run Oban 2.19 with its
+**stock** migrations (`Oban.Migration.up(version: 12)`) and execute jobs, as captured in
+`oban-compat.md` and `ferrosa-postgres/tests/fixtures/oban_census.sql`. Oban runs with
+`notifier: Oban.Notifiers.PG` and `peer: Oban.Peers.Global`. The acceptance test is the census
+replayed through a real Postgrex/Ecto/Oban client: migrations apply, a job is inserted, claimed,
+executed and acknowledged.
+
+## D13 — PL/pgSQL through the UDF substrate, with a host interface
+
+**Decision:**
+
+* **`CREATE FUNCTION … LANGUAGE plpgsql`** is parsed into a PL/pgSQL AST, converted to
+  AssemblyScript and compiled in process to a `ferrosa-udf` component. The component is
+  cached by the hash of its source, so it has the same sandbox (fuel, memory, epoch) and the
+  same replication as a CQL UDF.
+* **`DO $$ … $$`** is one-shot. It runs on an interpreter over the same AST rather than being
+  compiled.
+* **Host interface.** Both reach the database through a new WIT host interface:
+  * `query(sql, params) → rows`;
+  * `execute(sql, params) → count`;
+  * `notify(channel, payload)`.
+
+  It executes inside the **calling transaction**, so a `DO` block in a migration commits or
+  rolls back with it.
+* **Triggers.** `CREATE TRIGGER … AFTER INSERT|UPDATE [OF col] … FOR EACH ROW EXECUTE
+  PROCEDURE f()` is stored in the schema and **fires**, with `NEW`, `OLD` and `TG_OP` bound.
+  `DROP TRIGGER` / `DROP FUNCTION [IF EXISTS]` remove them.
+* **`pg_notify` / `NOTIFY` / `LISTEN`** are implemented, so a trigger that notifies is real
+  rather than accepted and ignored.
+* **Fail loudly.** A PL/pgSQL construct outside the supported subset is refused with
+  `0A000` naming it — never compiled to a no-op.
+
+## D14 — `FOR UPDATE [SKIP LOCKED | NOWAIT]` relies on Accord, not row locks
+
+**Decision:** Row-locking clauses are parsed and accepted, and take **no** row locks. Inside a
+transaction block (D11) Accord's strict serializability already prevents two transactions from
+both committing an update to the same row: the loser gets `40001`.
+
+**Consequences (accepted):**
+
+* Postgres would *skip* a locked row; here a concurrent claimer of the same row aborts with
+  `40001`, and a client that retries (Oban's next poll) converges.
+* No row is ever claimed twice.
+* Pickup under contention is slower than with real `SKIP LOCKED`.
+* The documentation and `oban-compat.md` state this difference; it is not silent.
+
+## D15 — `serial` / `bigserial` defaults are unique 64-bit ids, not sequences
+
+**Decision:** A `serial`-family column gets a server-generated **unique** 64-bit value:
+* HLC-derived, so unique across nodes without coordination;
+* not dense, and not ordered across nodes;
+* positive, and within the column's width (`smallserial` and `serial` are refused if the id
+  would not fit).
+
+`nextval`, `setval`, `currval` and `CREATE SEQUENCE` remain unsupported and fail with
+`0A000` — there is no sequence to read.
+
+## D16 — A general `UPDATE`/`DELETE` reads, then writes by key; READ COMMITTED re-checks and fails rather than re-evaluating _(2026-11-08; lane W2)_
+
+**Decision:**
+
+* **Read then write.** A general `UPDATE`/`DELETE` runs as two steps.
+  * The read is one general `SELECT` over the target joined with `FROM`/`USING` and the
+    CTEs. It runs under the statement's snapshot with the transaction's own writes
+    overlaid, exactly as a `SELECT` does.
+  * Each matching row is then written by its storage key through the ordinary write path.
+  * The read's relations go into the transaction's read set.
+  * `specs/lean4/Ferrosa/Sql/Dml.lean`, `read_then_write_eq_declarative`, shows that this
+    is the declarative statement.
+* **The keyed fast path stays.** A statement the legacy keyed grammar carries whole, with
+  no `RETURNING`, keeps the legacy `UpdateStmt`/`DeleteStmt`, so pgbench is unchanged.
+  `legacy_where_agrees` and `legacy_set_agrees` show the two agree.
+  * One pre-existing divergence of that path is untouched: outside READ COMMITTED, a
+    keyed `UPDATE` of a missing row upserts.
+* **`UPDATE … FROM` with several matches for one target row.** The read is stably sorted
+  on the storage key, and only the first row of each run is kept. So the row is written
+  **once**, with its **first match in arrival order**: deterministic, never an error.
+  PostgreSQL also applies a single match, but leaves which one unspecified
+  (`firstPerRun_strict`, `firstPerRun_first`).
+* **READ COMMITTED.** The writer takes local ownership of each row, then re-reads it. If
+  the row differs from the one the read saw, the statement fails with **40001**. It does
+  not re-evaluate the `WHERE` against the new version, as PostgreSQL's EvalPlanQual would.
+  So two claimers of one job can never both claim it (`rc_no_double_claim`), and the
+  loser retries on its next poll, as under D14.
+* **`RETURNING`** is evaluated over the new row, and over the deleted row for `DELETE`.
+  Its rows are held in a spilling buffer and sent only after every write of the
+  statement succeeded. `RETURNING *` hides reserved `_sys_` columns, as `SELECT *` does.
+* **Assigning a storage-key column is refused** (0A000), as the keyed path refuses it.
+* **Authorization.** `MODIFY` on the target, plus `SELECT` on every relation the read
+  reads, the target included.
+
+**Consequences (accepted):** under contention a READ COMMITTED claimer gets 40001
+where PostgreSQL would have skipped or re-checked the row; Oban converges by retrying.

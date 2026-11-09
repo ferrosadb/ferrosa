@@ -52,6 +52,10 @@ pub enum Statement {
     Update(Box<UpdateStmt>),
     /// `DELETE FROM t WHERE ...`. Boxed for size parity with `Select`.
     Delete(Box<DeleteStmt>),
+    /// An `UPDATE` or `DELETE` the keyed legacy forms cannot carry: an aliased
+    /// target, `FROM`/`USING`, `WITH`, a general `WHERE`, or `RETURNING`
+    /// expressions (see [`DmlStmt`]). Boxed for size parity with `Select`.
+    Dml(Box<DmlStmt>),
     /// `CREATE TABLE [IF NOT EXISTS] ...` (D10 Ecto-migration subset). Parse
     /// only: execution and schema creation are later packets. Boxed for size
     /// parity with `Select`.
@@ -75,6 +79,89 @@ pub enum Statement {
     /// `ANALYZE [table]` (see [`AnalyzeStmt`]). Accepted and answered as a
     /// successful no-op: no statistics are collected.
     Analyze(AnalyzeStmt),
+    /// `LOCK [TABLE] [ONLY] t [, ...] [IN <mode> MODE]` (see [`LockStmt`]).
+    Lock(LockStmt),
+    /// `COMMENT ON TABLE t IS 'text' | NULL` (see [`CommentStmt`]).
+    Comment(Box<CommentStmt>),
+    /// `CREATE TYPE [schema.]name AS ENUM ('label', ...)` (see [`CreateTypeStmt`]).
+    CreateType(Box<CreateTypeStmt>),
+    /// `ALTER TYPE [schema.]name ADD VALUE [IF NOT EXISTS] 'label'` (see [`AlterTypeStmt`]).
+    AlterType(Box<AlterTypeStmt>),
+    /// `CREATE INDEX [IF NOT EXISTS] name ON t [USING m] (cols) [WHERE pred]`.
+    CreateIndex(Box<CreateIndexStmt>),
+    /// `DROP INDEX [IF EXISTS] name [, ...]`.
+    DropIndex(Box<DropIndexStmt>),
+}
+
+/// `CREATE INDEX [IF NOT EXISTS] name ON t [USING method] (col [ASC|DESC], ...) [WHERE pred]`.
+/// `UNIQUE`, expression keys and other methods are refused at parse time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateIndexStmt {
+    pub name: String,
+    pub table: TableRef,
+    pub if_not_exists: bool,
+    /// `btree` (the default), `hash` or `gin`, lower-cased.
+    pub method: String,
+    /// `(column, descending)`, in key order.
+    pub columns: Vec<(String, bool)>,
+    /// A partial index's predicate, as canonical SQL.
+    pub predicate: Option<String>,
+}
+
+/// `DROP INDEX [IF EXISTS] [schema.]name [, ...]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropIndexStmt {
+    pub if_exists: bool,
+    pub names: Vec<TableRef>,
+}
+
+/// `CREATE TYPE [schema.]name AS ENUM ('label', ...)`. Only enum types are accepted; the
+/// labels are kept in declaration order (duplicates are the front end's refusal).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTypeStmt {
+    pub name: TableRef,
+    pub labels: Vec<String>,
+}
+
+/// `ALTER TYPE [schema.]name ADD VALUE [IF NOT EXISTS] 'label'`. `BEFORE`/`AFTER` placement
+/// and every other `ALTER TYPE` form are refused at parse time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlterTypeStmt {
+    pub name: TableRef,
+    pub value: String,
+    pub if_not_exists: bool,
+}
+
+/// `COMMENT ON TABLE t IS 'text' | NULL`. `comment` is `None` for `IS NULL`, which removes
+/// the comment (as does an empty string, in PostgreSQL). Other object kinds are refused at
+/// parse time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentStmt {
+    pub table: TableRef,
+    pub comment: Option<String>,
+}
+
+/// `LOCK [TABLE] [ONLY] name [, ...] [IN <mode> MODE]`.
+///
+/// The front end gives it real semantics (it is never a no-op): see `ferrosa-postgres`'s
+/// `lock` module. `NOWAIT` is refused at parse time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockStmt {
+    pub tables: Vec<TableRef>,
+    pub mode: LockMode,
+}
+
+/// PostgreSQL's eight table lock modes, as written. `ACCESS EXCLUSIVE` is the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockMode {
+    AccessShare,
+    RowShare,
+    RowExclusive,
+    ShareUpdateExclusive,
+    Share,
+    ShareRowExclusive,
+    Exclusive,
+    AccessExclusive,
 }
 
 /// `TRUNCATE [TABLE] a [, b, ...]`. `tables` is non-empty; every entry names a
@@ -192,7 +279,11 @@ pub struct ForeignKeyConstraint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlterTableStmt {
     pub table: TableRef,
+    /// The first action.
     pub operation: AlterOperation,
+    /// Further comma-separated actions (`ADD COLUMN a …, ADD COLUMN b …`), in order. The
+    /// front end applies a statement's actions together or not at all.
+    pub rest: Vec<AlterOperation>,
 }
 
 /// What an `ALTER TABLE` changes.
@@ -211,6 +302,35 @@ pub enum AlterOperation {
     AddPrimaryKey(Vec<String>),
     /// `ADD [COLUMN] <name> <type> [NOT NULL]`.
     AddColumn(ColumnDef),
+    /// `ADD [COLUMN] IF NOT EXISTS <name> <type> …`: a no-op when the column exists.
+    AddColumnIfNotExists(ColumnDef),
+    /// `ALTER [COLUMN] c [SET DATA] TYPE <type>`. Only a change to the column's current type
+    /// (a no-op) can be applied; the front end refuses a real type change by name.
+    AlterColumnType {
+        column: String,
+        ty: PgType,
+        user_type: Option<TableRef>,
+        /// `T[]`.
+        array: bool,
+    },
+    /// `ALTER [COLUMN] c SET DEFAULT <expr>`, the expression as canonical SQL text.
+    SetDefault { column: String, sql: String },
+    /// `ALTER [COLUMN] c DROP DEFAULT`.
+    DropDefault { column: String },
+    /// `ALTER [COLUMN] c SET NOT NULL` (validated against existing rows).
+    SetNotNull { column: String },
+    /// `ALTER [COLUMN] c DROP NOT NULL`.
+    DropNotNull { column: String },
+    /// `ADD [CONSTRAINT name] CHECK (<expr>) [NOT VALID]`, the expression as canonical SQL.
+    AddCheck {
+        name: Option<String>,
+        sql: String,
+        not_valid: bool,
+    },
+    /// `DROP CONSTRAINT [IF EXISTS] name`.
+    DropConstraint { name: String, if_exists: bool },
+    /// `SET UNLOGGED` (`true`) / `SET LOGGED` (`false`).
+    SetLogged(bool),
     /// `DROP [COLUMN] <name>`.
     DropColumn(String),
     /// `ADD [CONSTRAINT <name>] FOREIGN KEY (<cols>) REFERENCES <parent> [(<pcols>)]`.
@@ -258,6 +378,20 @@ pub struct ColumnDef {
     pub not_null: bool,
     /// True when the column is part of the table's primary key.
     pub primary_key: bool,
+    /// A user-defined type named as the column type (`"public".oban_job_state`), as
+    /// written. `ty` is then [`PgType::Text`], the storage of an enum; the front end
+    /// resolves the name and refuses one that is not a known type.
+    pub user_type: Option<TableRef>,
+    /// `DEFAULT <expr>`, as canonical SQL text rendered from the parsed tokens (parsed
+    /// with the general scalar grammar, so it is syntactically valid; never compare it
+    /// byte-for-byte with what the client sent).
+    pub default: Option<String>,
+    /// `T[]`: a one-dimensional array of `ty` (stored as a frozen CQL list).
+    pub array: bool,
+    /// `bigserial` / `serial8`: `ty` is [`PgType::BigInt`] and the column's value, when an
+    /// INSERT omits it, is a server-generated unique id (D15). `serial`/`smallserial` are
+    /// refused at parse time (an id does not fit).
+    pub serial: bool,
 }
 
 /// A PostgreSQL column type accepted by `CREATE TABLE`, as written (aliases
@@ -340,7 +474,10 @@ impl UnsupportedClause {
     pub fn name(self) -> &'static str {
         match self {
             UnsupportedClause::Check => "CHECK",
-            UnsupportedClause::Serial => "SERIAL",
+            UnsupportedClause::Serial => {
+                "SERIAL/SMALLSERIAL (a server-generated id needs 64 bits: use bigserial; there \
+                 are no sequences, D15)"
+            }
             UnsupportedClause::DefaultExpr => "DEFAULT",
             UnsupportedClause::ForeignSchema => "schema other than public",
             UnsupportedClause::Unique => "UNIQUE",
@@ -465,6 +602,105 @@ pub struct DeleteStmt {
     pub returning: Option<Returning>,
 }
 
+/// A general `UPDATE` or `DELETE`:
+///
+/// ```text
+/// [WITH …] UPDATE t [[AS] a] SET c = <expr>, … [FROM r, …] [WHERE <cond>] [RETURNING …]
+/// [WITH …] DELETE FROM t [[AS] a] [USING r, …] [WHERE <cond>] [RETURNING …]
+/// ```
+///
+/// The parser produces this only when the statement does not fit the keyed
+/// legacy [`UpdateStmt`] / [`DeleteStmt`], so pgbench's shapes keep their fast
+/// path (`specs/lean4/Ferrosa/Sql/Dml.lean`, `legacy_where_agrees` and
+/// `legacy_set_agrees`, are why that choice does not change a statement's
+/// meaning).
+///
+/// It runs as one general `SELECT` over the target joined with `from` (see
+/// [`DmlStmt::read_select`]) followed by one keyed write per matching row
+/// (`read_then_write_eq_declarative`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DmlStmt {
+    /// `WITH name AS (SELECT …), …`, visible to every clause.
+    pub ctes: Vec<Cte>,
+    /// The table written, with its alias if one was given.
+    pub target: TableRef,
+    pub action: DmlAction,
+    /// `UPDATE … FROM` / `DELETE … USING`: further relations, cross-joined with
+    /// the target and constrained by `filter`.
+    pub from: Vec<TableRef>,
+    pub filter: Option<Expr>,
+    /// `RETURNING *` or a list of expressions, evaluated over the new row (an
+    /// `UPDATE`) or the deleted row.
+    pub returning: Option<Projection>,
+}
+
+/// What a [`DmlStmt`] does to each matching target row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DmlAction {
+    /// `SET col = expr, …`: each expression is evaluated over the old row.
+    Update(Vec<(String, ScalarExpr)>),
+    /// Remove the row.
+    Delete,
+}
+
+impl DmlStmt {
+    /// The read half: `[WITH …] SELECT <set exprs, returning exprs> FROM target
+    /// [JOIN r ON TRUE …] [WHERE filter]`. Its [`SelectStmt::tables`] is every
+    /// relation the statement reads, which is what authorization, catalog
+    /// loading and the transaction's read set need.
+    pub fn read_select(&self) -> SelectStmt {
+        let mut items: Vec<SelectItem> = Vec::new();
+        if let DmlAction::Update(sets) = &self.action {
+            items.extend(sets.iter().map(|(_, e)| SelectItem::Expr {
+                expr: e.clone(),
+                alias: None,
+            }));
+        }
+        if let Some(Projection::Items(ret)) = &self.returning {
+            items.extend(ret.iter().cloned());
+        }
+        let projection = if items.is_empty() {
+            Projection::Star
+        } else {
+            Projection::Items(items)
+        };
+        let joins = self
+            .from
+            .iter()
+            .map(|t| JoinClause {
+                kind: JoinKind::Inner,
+                table: t.clone(),
+                on: ScalarExpr::Literal(Value::Bool(true)),
+            })
+            .collect();
+        SelectStmt {
+            ctes: self.ctes.clone(),
+            distinct: false,
+            projection,
+            from: self.target.clone(),
+            join: None,
+            joins,
+            filter: self.filter.clone(),
+            group_by: Vec::new(),
+            having: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            limit_param: None,
+            offset_param: None,
+            lock: None,
+        }
+    }
+
+    /// The command tag's verb.
+    pub fn verb(&self) -> &'static str {
+        match self.action {
+            DmlAction::Update(_) => "UPDATE",
+            DmlAction::Delete => "DELETE",
+        }
+    }
+}
+
 /// A `RETURNING` clause: either `RETURNING *` (all of the table's columns, in
 /// schema order — resolved at execute time) or an explicit list of column names.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -551,8 +787,20 @@ impl SelectStmt {
     /// Whether a `$N` parameter placeholder appears anywhere in this table
     /// select's `WHERE`/`HAVING` — the only clauses whose grammar admits one.
     pub fn references_param(&self) -> bool {
+        let items = match &self.projection {
+            Projection::Items(items) => items.as_slice(),
+            Projection::Star => &[],
+        };
         self.filter.as_ref().is_some_and(Expr::references_param)
             || self.having.as_ref().is_some_and(Expr::references_param)
+            || self.limit_param.is_some()
+            || self.offset_param.is_some()
+            || self.ctes.iter().any(|c| c.query.references_param())
+            || self.joins.iter().any(|j| j.on.references_param())
+            || items.iter().any(|i| match i {
+                SelectItem::Expr { expr, .. } => expr.references_param(),
+                _ => false,
+            })
     }
 }
 
@@ -565,6 +813,7 @@ impl Expr {
             }
             Expr::Not(inner) => inner.references_param(),
             Expr::Compare { value, .. } => value.references_param(),
+            Expr::Scalar(e) => e.references_param(),
         }
     }
 }
@@ -582,10 +831,18 @@ impl Term {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectStmt {
+    /// `WITH name AS (SELECT …), …` — non-recursive CTEs, visible to the
+    /// statement's FROM/JOIN as tables named `name`.
+    pub ctes: Vec<Cte>,
     pub distinct: bool,
     pub projection: Projection,
     pub from: TableRef,
+    /// The legacy single inner equi-join (`JOIN t ON a = b`), kept for the
+    /// hash-join fast path. A query with any other join shape uses `joins`.
     pub join: Option<Join>,
+    /// General joins (`[INNER | LEFT [OUTER]] JOIN t ON <expr>`), applied left to
+    /// right after `from`. Empty when the legacy `join` (or no join) is used.
+    pub joins: Vec<JoinClause>,
     /// `WHERE` boolean expression (operands must be plain columns).
     pub filter: Option<Expr>,
     pub group_by: Vec<ColumnRef>,
@@ -594,6 +851,42 @@ pub struct SelectStmt {
     pub order_by: Vec<OrderItem>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+    /// `LIMIT $n`: the count arrives as bound parameter `n` (Oban's `LIMIT $2`).
+    /// Resolved when the statement is opened (`Limit.lean`); `limit` is `None`.
+    pub limit_param: Option<usize>,
+    /// `OFFSET $n`, as `limit_param`.
+    pub offset_param: Option<usize>,
+    /// `FOR UPDATE [OF …] [NOWAIT | SKIP LOCKED]` and the weaker strengths.
+    /// Recorded and accepted, and takes no row locks (decision D14): inside a
+    /// transaction block Accord's serializability makes the losing writer fail
+    /// with 40001, and under READ COMMITTED a later write of the row re-checks
+    /// it (D16).
+    pub lock: Option<RowLock>,
+}
+
+/// A row-locking clause as written (see [`SelectStmt::lock`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowLock {
+    pub strength: LockStrength,
+    /// `OF t, …`: the relations named, or empty for all of them.
+    pub of: Vec<String>,
+    pub wait: LockWait,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockStrength {
+    Update,
+    NoKeyUpdate,
+    Share,
+    KeyShare,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockWait {
+    /// Neither `NOWAIT` nor `SKIP LOCKED`.
+    Wait,
+    NoWait,
+    SkipLocked,
 }
 
 /// The right-hand side of a comparison: either an inline literal or a bound
@@ -649,6 +942,12 @@ pub enum Expr {
     And(Box<Expr>, Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
     Not(Box<Expr>),
+    /// Any other boolean condition, evaluated by the general scalar evaluator
+    /// (`eval`): column-to-column comparisons, functions, `IN`, `IS NULL`,
+    /// `EXISTS`, subqueries. The parser lowers what fits the legacy shapes
+    /// (`Compare`, `And`/`Or`/`Not` of them) and keeps the rest here, so the
+    /// fast paths that pattern-match `Compare` see exactly what they did.
+    Scalar(Box<ScalarExpr>),
     /// A single comparison `<operand> <op> <term>`, where the term is a literal
     /// or a `$N` parameter placeholder.
     Compare {
@@ -690,14 +989,364 @@ pub enum SelectItem {
         arg: AggArg,
         alias: Option<String>,
     },
+    /// Any other projected expression (`a + 1`, `coalesce(n, 0)`, a subquery).
+    Expr {
+        expr: ScalarExpr,
+        alias: Option<String>,
+    },
 }
 
 impl SelectItem {
     /// The output alias, if the item names one.
     pub fn alias(&self) -> Option<&str> {
         match self {
-            SelectItem::Column { alias, .. } | SelectItem::Aggregate { alias, .. } => {
-                alias.as_deref()
+            SelectItem::Column { alias, .. }
+            | SelectItem::Aggregate { alias, .. }
+            | SelectItem::Expr { alias, .. } => alias.as_deref(),
+        }
+    }
+}
+
+/// A general scalar expression.
+///
+/// Evaluation follows SQL's three-valued logic (`specs/lean4/Ferrosa/Sql/Expr.lean`):
+/// a NULL operand makes a comparison UNKNOWN (carried as `Value::Null`), and a
+/// condition keeps a row only when it is TRUE.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScalarExpr {
+    Column(ColumnRef),
+    Literal(Value),
+    /// A `$N` placeholder (1-based).
+    Param(usize),
+    /// `expr::type` (and `CAST(expr AS type)`).
+    Cast {
+        expr: Box<ScalarExpr>,
+        ty: TypeName,
+    },
+    Unary {
+        op: UnaryOp,
+        expr: Box<ScalarExpr>,
+    },
+    Binary {
+        op: BinOp,
+        left: Box<ScalarExpr>,
+        right: Box<ScalarExpr>,
+    },
+    IsNull {
+        expr: Box<ScalarExpr>,
+        negated: bool,
+    },
+    InList {
+        expr: Box<ScalarExpr>,
+        list: Vec<ScalarExpr>,
+        negated: bool,
+    },
+    Between {
+        expr: Box<ScalarExpr>,
+        low: Box<ScalarExpr>,
+        high: Box<ScalarExpr>,
+        negated: bool,
+    },
+    /// `left <op> ANY(right)`, `right` an array.
+    Any {
+        left: Box<ScalarExpr>,
+        op: CmpOp,
+        right: Box<ScalarExpr>,
+    },
+    /// A function call (`coalesce(a, b)`, `pg_catalog.obj_description(x, y)`).
+    /// The name is lowercased, schema-qualified if written so.
+    Func {
+        name: String,
+        args: Vec<ScalarExpr>,
+    },
+    /// An aggregate inside an expression; legal only where aggregates are.
+    Aggregate {
+        func: AggFunc,
+        arg: AggArg,
+    },
+    Case {
+        operand: Option<Box<ScalarExpr>>,
+        whens: Vec<(ScalarExpr, ScalarExpr)>,
+        otherwise: Option<Box<ScalarExpr>>,
+    },
+    Exists {
+        query: Box<SelectStmt>,
+        negated: bool,
+    },
+    /// A scalar subquery: at most one row of one column; no row is NULL.
+    Subquery(Box<SelectStmt>),
+    /// `ARRAY(SELECT …)`: the query's single column, in order, as an array.
+    ArraySubquery(Box<SelectStmt>),
+    /// `ARRAY[a, b, …]`.
+    Array(Vec<ScalarExpr>),
+    /// `expr AT TIME ZONE zone`.
+    AtTimeZone {
+        expr: Box<ScalarExpr>,
+        zone: Box<ScalarExpr>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOp {
+    Neg,
+    Not,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Concat,
+    Cmp(CmpOp),
+    And,
+    Or,
+}
+
+/// A type as written in a cast: optional schema, name (lowercased unless
+/// quoted), and whether it is an array (`text[]`). Resolution to an engine type
+/// is the binder's job; an unknown name is an error there, never a no-op.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeName {
+    pub schema: Option<String>,
+    pub name: String,
+    pub array: bool,
+}
+
+/// `name AS (query)` in a `WITH` clause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cte {
+    pub name: String,
+    pub query: Box<SelectStmt>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    Left,
+}
+
+/// `[INNER | LEFT] JOIN table ON condition`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinClause {
+    pub kind: JoinKind,
+    pub table: TableRef,
+    pub on: ScalarExpr,
+}
+
+impl SelectStmt {
+    /// Every table this query reads, including the ones inside joins,
+    /// subqueries and CTE bodies (CTE names themselves are not tables). Used for
+    /// authorization and read sets: a subquery must not read a table the
+    /// caller may not.
+    pub fn tables(&self) -> Vec<&TableRef> {
+        let mut out = Vec::new();
+        self.collect_tables(&mut out);
+        let ctes: Vec<&str> = self.ctes.iter().map(|c| c.name.as_str()).collect();
+        out.retain(|t| {
+            !t.is_no_relation() && (t.schema.is_some() || !ctes.contains(&t.table.as_str()))
+        });
+        out
+    }
+
+    fn collect_tables<'a>(&'a self, out: &mut Vec<&'a TableRef>) {
+        for cte in &self.ctes {
+            cte.query.collect_tables(out);
+        }
+        out.push(&self.from);
+        if let Some(join) = &self.join {
+            out.push(&join.table);
+        }
+        for join in &self.joins {
+            out.push(&join.table);
+            join.on.collect_tables(out);
+        }
+        if let Projection::Items(items) = &self.projection {
+            for item in items {
+                if let SelectItem::Expr { expr, .. } = item {
+                    expr.collect_tables(out);
+                }
+            }
+        }
+        for expr in self.filter.iter().chain(self.having.iter()) {
+            expr.collect_tables(out);
+        }
+    }
+
+    /// Whether this query needs the general planner (anything the legacy
+    /// single-table / single-equi-join pipeline cannot run).
+    pub fn is_general(&self) -> bool {
+        !self.ctes.is_empty()
+            || !self.joins.is_empty()
+            || matches!(&self.projection, Projection::Items(items)
+                if items.iter().any(|i| matches!(i, SelectItem::Expr { .. })))
+            || self.filter.as_ref().is_some_and(Expr::has_scalar)
+            || self.having.as_ref().is_some_and(Expr::has_scalar)
+            || self.limit_param.is_some()
+            || self.offset_param.is_some()
+            || self.from.is_no_relation()
+    }
+}
+
+impl Expr {
+    fn collect_tables<'a>(&'a self, out: &mut Vec<&'a TableRef>) {
+        match self {
+            Expr::And(a, b) | Expr::Or(a, b) => {
+                a.collect_tables(out);
+                b.collect_tables(out);
+            }
+            Expr::Not(a) => a.collect_tables(out),
+            Expr::Scalar(e) => e.collect_tables(out),
+            Expr::Compare { .. } => {}
+        }
+    }
+
+    /// Whether any node needs the general evaluator.
+    pub fn has_scalar(&self) -> bool {
+        match self {
+            Expr::And(a, b) | Expr::Or(a, b) => a.has_scalar() || b.has_scalar(),
+            Expr::Not(a) => a.has_scalar(),
+            Expr::Scalar(_) => true,
+            Expr::Compare { .. } => false,
+        }
+    }
+}
+
+impl ScalarExpr {
+    fn collect_tables<'a>(&'a self, out: &mut Vec<&'a TableRef>) {
+        match self {
+            ScalarExpr::Exists { query, .. }
+            | ScalarExpr::Subquery(query)
+            | ScalarExpr::ArraySubquery(query) => query.collect_tables(out),
+            _ => self.for_each_child(|child| child.collect_tables(out)),
+        }
+    }
+
+    /// Whether a `$N` placeholder appears in this expression or any subquery in it.
+    pub fn references_param(&self) -> bool {
+        match self {
+            ScalarExpr::Param(_) => true,
+            ScalarExpr::Exists { query, .. }
+            | ScalarExpr::Subquery(query)
+            | ScalarExpr::ArraySubquery(query) => query.references_param(),
+            _ => {
+                let mut found = false;
+                self.for_each_child(|c| found = found || c.references_param());
+                found
+            }
+        }
+    }
+
+    /// Visit each direct child expression (not into subqueries).
+    pub fn for_each_child<'a>(&'a self, mut f: impl FnMut(&'a ScalarExpr)) {
+        match self {
+            ScalarExpr::Column(_)
+            | ScalarExpr::Literal(_)
+            | ScalarExpr::Param(_)
+            | ScalarExpr::Aggregate { .. }
+            | ScalarExpr::Exists { .. }
+            | ScalarExpr::Subquery(_)
+            | ScalarExpr::ArraySubquery(_) => {}
+            ScalarExpr::Cast { expr, .. }
+            | ScalarExpr::Unary { expr, .. }
+            | ScalarExpr::IsNull { expr, .. } => f(expr),
+            ScalarExpr::Binary { left, right, .. } | ScalarExpr::Any { left, right, .. } => {
+                f(left);
+                f(right);
+            }
+            ScalarExpr::AtTimeZone { expr, zone } => {
+                f(expr);
+                f(zone);
+            }
+            ScalarExpr::InList { expr, list, .. } => {
+                f(expr);
+                list.iter().for_each(f);
+            }
+            ScalarExpr::Between {
+                expr, low, high, ..
+            } => {
+                f(expr);
+                f(low);
+                f(high);
+            }
+            ScalarExpr::Func { args, .. } | ScalarExpr::Array(args) => args.iter().for_each(f),
+            ScalarExpr::Case {
+                operand,
+                whens,
+                otherwise,
+            } => {
+                if let Some(o) = operand {
+                    f(o);
+                }
+                for (w, t) in whens {
+                    f(w);
+                    f(t);
+                }
+                if let Some(o) = otherwise {
+                    f(o);
+                }
+            }
+        }
+    }
+
+    /// Visit each direct child expression mutably, and each subquery, stopping at
+    /// the first error. The front end rewrites casts in place through this.
+    pub fn try_for_each_child_mut<E>(
+        &mut self,
+        f: &mut dyn FnMut(&mut ScalarExpr) -> Result<(), E>,
+        q: &mut dyn FnMut(&mut SelectStmt) -> Result<(), E>,
+    ) -> Result<(), E> {
+        match self {
+            ScalarExpr::Column(_)
+            | ScalarExpr::Literal(_)
+            | ScalarExpr::Param(_)
+            | ScalarExpr::Aggregate { .. } => Ok(()),
+            ScalarExpr::Exists { query, .. }
+            | ScalarExpr::Subquery(query)
+            | ScalarExpr::ArraySubquery(query) => q(query),
+            ScalarExpr::Cast { expr, .. }
+            | ScalarExpr::Unary { expr, .. }
+            | ScalarExpr::IsNull { expr, .. } => f(expr),
+            ScalarExpr::Binary { left, right, .. } | ScalarExpr::Any { left, right, .. } => {
+                f(left)?;
+                f(right)
+            }
+            ScalarExpr::AtTimeZone { expr, zone } => {
+                f(expr)?;
+                f(zone)
+            }
+            ScalarExpr::InList { expr, list, .. } => {
+                f(expr)?;
+                list.iter_mut().try_for_each(f)
+            }
+            ScalarExpr::Between {
+                expr, low, high, ..
+            } => {
+                f(expr)?;
+                f(low)?;
+                f(high)
+            }
+            ScalarExpr::Func { args, .. } | ScalarExpr::Array(args) => {
+                args.iter_mut().try_for_each(f)
+            }
+            ScalarExpr::Case {
+                operand,
+                whens,
+                otherwise,
+            } => {
+                if let Some(o) = operand {
+                    f(o)?;
+                }
+                for (w, t) in whens {
+                    f(w)?;
+                    f(t)?;
+                }
+                match otherwise {
+                    Some(o) => f(o),
+                    None => Ok(()),
+                }
             }
         }
     }
@@ -726,6 +1375,21 @@ pub struct TableRef {
 }
 
 impl TableRef {
+    /// The `FROM` of a select that has none: one row with no columns, as
+    /// PostgreSQL evaluates `SELECT coalesce($1, 0)`. Names no relation.
+    pub fn no_relation() -> Self {
+        TableRef {
+            schema: None,
+            table: String::new(),
+            alias: None,
+        }
+    }
+
+    /// Whether this is [`TableRef::no_relation`].
+    pub fn is_no_relation(&self) -> bool {
+        self.schema.is_none() && self.table.is_empty()
+    }
+
     /// The name a column qualifier must match: the alias if present, else the table.
     pub fn binding_name(&self) -> &str {
         self.alias.as_deref().unwrap_or(&self.table)

@@ -2690,6 +2690,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrosa-plpgsql"
+version = "0.35.1"
+dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "ferrosa-postgres"
 version = "0.35.1"
 dependencies = [
@@ -2703,12 +2710,14 @@ dependencies = [
  "ferrosa-common",
  "ferrosa-jsonb",
  "ferrosa-net",
+ "ferrosa-plpgsql",
  "ferrosa-row-bridge",
  "ferrosa-sched",
  "ferrosa-schema",
  "ferrosa-sql",
  "ferrosa-sstable",
  "ferrosa-storage",
+ "ferrosa-udf",
  "futures",
  "hmac 0.12.1",
  "imbl",
@@ -2848,9 +2857,11 @@ dependencies = [
  "ferrosa-storage",
  "libc",
  "num-bigint",
+ "num-traits",
  "ordered-float",
  "serde",
  "serde_json",
+ "stacker",
  "tempfile",
  "tracing",
  "uuid",
@@ -2926,6 +2937,7 @@ dependencies = [
  "anyhow",
  "bumpalo",
  "ferrosa-common",
+ "ferrosa-plpgsql",
  "num-bigint",
  "rquickjs",
  "slotmap",

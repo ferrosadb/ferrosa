@@ -8,6 +8,9 @@ description = "WASM-sandboxed User-Defined Function execution for Ferrosa"
 
 [dependencies]
 ferrosa-common = { path = "../ferrosa-common" }
+# PL/pgSQL (D13): the host trait and value type the `routine` world binds to, and the
+# converter whose output `component::compile_plpgsql` builds.
+ferrosa-plpgsql = { path = "../ferrosa-plpgsql" }
 # Preserve Wasmtime 48 defaults except the unused on-disk compilation cache.
 # That feature pulls zstd 0.13; UdfExecutor uses its own in-memory registry/pool.
 wasmtime = { version = "48.0.8", default-features = false, features = [

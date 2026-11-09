@@ -126,7 +126,8 @@ fn schema_with_table() -> Schema {
     schema
 }
 
-fn engine_config(dir: &Path) -> StorageEngineConfig {
+/// The engine configuration every test server runs on.
+pub fn engine_config(dir: &Path) -> StorageEngineConfig {
     StorageEngineConfig {
         commit_log: CommitLogConfig {
             segment_size: 256 * 1024,
@@ -159,7 +160,8 @@ fn engine_config(dir: &Path) -> StorageEngineConfig {
     }
 }
 
-fn storage_schema() -> ferrosa_common::schema::TableSchema {
+/// The storage schema of the seeded table `ks.t`.
+pub fn storage_schema() -> ferrosa_common::schema::TableSchema {
     use ferrosa_common::schema::{ColumnDefinition, TableSchema};
     let col = |name: &str, ty: &str| ColumnDefinition {
         name: name.to_string(),
@@ -185,11 +187,58 @@ pub fn row_id(i: usize) -> String {
 }
 
 /// Write row `i` (`score = i`) through the storage engine.
+///
+/// A host whose fsyncs fall more than the commit log's stall deadline (2 s) behind (a
+/// starved CPU, a contended disk) makes the engine refuse the write with
+/// `CommitLogNotDurable`: the write's outcome is unknown and it was not acknowledged. That
+/// refusal is the durability contract, not a test failure, and the contract's answer is to
+/// retry once the sync thread has drained its backlog. The retry is idempotent (same key,
+/// timestamp and values). A backlog that never drains still fails the test, after
+/// [`DRAIN_DEADLINE`], as does any other error.
 pub fn write_row(engine: &StorageEngine, i: usize) {
+    write_row_with(engine, i, &mut |engine: &StorageEngine| {
+        wait_for_commit_log_drain(engine, deadline_after(DRAIN_DEADLINE));
+    });
+}
+
+/// [`write_row`] with the action taken on each `CommitLogNotDurable` refusal before the
+/// retry. Returns the refusals' reasons, each also logged to stderr.
+///
+/// # Panics
+///
+/// On any other error, or after [`WRITE_ATTEMPTS`] refusals.
+pub fn write_row_with(
+    engine: &StorageEngine,
+    i: usize,
+    on_refused: &mut dyn FnMut(&StorageEngine),
+) -> Vec<String> {
     let tid = TableId::new("ks", "t");
     let key = DecoratedKey::new(PartitionKey::new(row_id(i).into_bytes()));
     let ts = 1000 + i as i64;
-    let row = StorageRow {
+    let mut refusals = Vec::new();
+    for attempt in 1..=WRITE_ATTEMPTS {
+        match engine.write(&tid, &key, seeded_row(i, ts), ts) {
+            Ok(_) => return refusals,
+            Err(ferrosa_common::Error::CommitLogNotDurable { reason }) => {
+                eprintln!("write row {i}: refused (attempt {attempt}): {reason}");
+                refusals.push(reason);
+                on_refused(engine);
+            }
+            Err(error) => panic!("write row {i}: {error:?}"),
+        }
+    }
+    panic!("write row {i}: refused {WRITE_ATTEMPTS} times though the commit log drained");
+}
+
+/// Attempts at one seeded write before a refusal is treated as a failure.
+pub const WRITE_ATTEMPTS: usize = 5;
+
+/// How long the commit log may take to drain a stalled backlog before the test fails.
+pub const DRAIN_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The seeded row `i` at timestamp `ts`: `name = "x"`, `score = i`.
+pub fn seeded_row(i: usize, ts: i64) -> StorageRow {
+    StorageRow {
         clustering: 1i32.to_be_bytes().to_vec(),
         cells: vec![
             (0, CellValue::live(b"x".to_vec(), ts)),
@@ -197,8 +246,25 @@ pub fn write_row(engine: &StorageEngine, i: usize) {
         ],
         deletion: DeletionTime::LIVE,
         primary_key_liveness: LivenessInfo::with_timestamp(ts),
-    };
-    engine.write(&tid, &key, row, ts).expect("write row");
+    }
+}
+
+/// An expiry check that turns true once `deadline` of wall time has passed.
+pub fn deadline_after(deadline: Duration) -> impl FnMut() -> bool {
+    let started = std::time::Instant::now();
+    move || started.elapsed() >= deadline
+}
+
+/// Wait until the commit log has no unsynced write, failing loudly once `expired` says so.
+pub fn wait_for_commit_log_drain(engine: &StorageEngine, mut expired: impl FnMut() -> bool) {
+    while engine.commit_log_sync_health().unsynced_for.is_some() {
+        assert!(
+            !expired(),
+            "the commit log never drained its backlog: {:?}",
+            engine.commit_log_sync_health()
+        );
+        std::thread::yield_now();
+    }
 }
 
 /// A running server: its port, its engine (for writes behind the PG layer's
@@ -242,15 +308,74 @@ pub async fn start_server_with_ddl() -> TestServer {
     start_server_configured(0, Default::default(), AccordAccess::disabled(), true).await
 }
 
+/// DDL plus a chosen PL/pgSQL function backend (D13).
+pub async fn start_server_with_procedural(
+    procedural: ferrosa_postgres::procedural::Procedural,
+) -> TestServer {
+    start_server_full(
+        0,
+        Default::default(),
+        AccordAccess::disabled(),
+        true,
+        procedural,
+    )
+    .await
+}
+
+/// DDL, a chosen PL/pgSQL backend, and an empty `public` keyspace beside `ks` — the schema
+/// Oban's migrations address (`"public".oban_jobs`, `'public'::regnamespace`).
+pub async fn start_server_public(
+    procedural: ferrosa_postgres::procedural::Procedural,
+) -> TestServer {
+    let server = start_server_with_procedural(procedural).await;
+    let auth = AuthContext {
+        role: "cassandra".to_string(),
+        is_superuser: true,
+        must_change_password: false,
+    };
+    let mut options = HashMap::new();
+    options.insert("replication_factor".to_string(), "1".to_string());
+    server
+        .schema
+        .create_keyspace(
+            KeyspaceMetadata {
+                name: "public".to_string(),
+                durable_writes: true,
+                replication: ReplicationParams {
+                    strategy: "SimpleStrategy".to_string(),
+                    options,
+                },
+            },
+            &auth,
+        )
+        .expect("create the public keyspace");
+    server
+}
+
 async fn start_server_configured(
     rows: usize,
     limits: ferrosa_postgres::PortalLimits,
     accord: AccordAccess,
     enable_ddl: bool,
 ) -> TestServer {
+    start_server_full(rows, limits, accord, enable_ddl, Default::default()).await
+}
+
+async fn start_server_full(
+    rows: usize,
+    limits: ferrosa_postgres::PortalLimits,
+    accord: AccordAccess,
+    enable_ddl: bool,
+    procedural: ferrosa_postgres::procedural::Procedural,
+) -> TestServer {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = StorageEngine::new(engine_config(dir.path()), None).expect("engine");
     engine.register_table(storage_schema()).expect("register");
+    if enable_ddl {
+        // The schema-change path persists functions (and other DDL) into the system tables,
+        // as on a real node.
+        engine.register_system_tables().expect("system tables");
+    }
     for i in 0..rows {
         write_row(&engine, i);
     }
@@ -264,6 +389,7 @@ async fn start_server_configured(
     ));
     let portals = Arc::new(ferrosa_postgres::SuspendedPortals::new(limits));
     let ctx = Arc::new(QueryContext {
+        procedural: Arc::new(procedural),
         cluster_read: Default::default(),
         engine: Arc::clone(&engine),
         schema: Arc::clone(&schema),

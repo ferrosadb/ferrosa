@@ -12,7 +12,10 @@
 pub mod ast;
 pub mod catalog;
 pub mod exec;
+mod general;
 pub mod parser;
+mod parser_dml;
+mod parser_scalar;
 pub mod plan;
 pub mod provider;
 pub mod spill;
@@ -20,11 +23,15 @@ pub mod types;
 
 pub use ast::SelectStmt;
 pub use ast::{
-    AggArg, AlterOperation, AlterTableStmt, AnalyzeStmt, ArithOp, CastTarget, ColumnDef,
-    CopyFormatKind, CopyFromStdinStmt, CreateTableStmt, DeleteStmt, DropTableStatement, Expr,
-    ForeignKeyConstraint, InsertStmt, IsolationLevel, Operand, OrderItem, PgType, Projection,
-    Returning, ScalarItem, ScalarValue, SelectItem, SetExpr, Statement, Term, TruncateStatement,
-    UnsupportedClause, UpdateStmt, VacuumStmt,
+    AggArg, AlterOperation, AlterTableStmt, AnalyzeStmt, ArithOp, BinOp, CastTarget, ColumnDef,
+    CopyFormatKind, CopyFromStdinStmt, CreateTableStmt, Cte, DeleteStmt, DmlAction, DmlStmt,
+    DropTableStatement, Expr, ForeignKeyConstraint, InsertStmt, IsolationLevel, JoinClause,
+    JoinKind, LockStrength, LockWait, Operand, OrderItem, PgType, Projection, Returning, RowLock,
+    ScalarExpr, ScalarItem, ScalarValue, SelectItem, SetExpr, Statement, Term, TruncateStatement,
+    TypeName, UnaryOp, UnsupportedClause, UpdateStmt, VacuumStmt,
+};
+pub use ast::{
+    AlterTypeStmt, CommentStmt, CreateIndexStmt, CreateTypeStmt, DropIndexStmt, LockMode, LockStmt,
 };
 pub use catalog::{Catalog, MapCatalog, SharedTable};
 pub use exec::{
@@ -32,14 +39,16 @@ pub use exec::{
     try_filter, try_project, AggFunc, AggSpec, AggregateError, CmpOp, Predicate, RowStream,
     SortDir, SortKey, TryRowStream,
 };
+pub use general::{cast_type_supported, compile_default, DefaultExpr};
 pub use parser::{parse, parse_statement, ParseError, MAX_EXPR_DEPTH};
 pub use plan::{
-    describe, execute, execute_streaming, execute_with, infer_param_types, open_cursor, ExecError,
-    QueryResult, RowCursor, RowSink,
+    describe, describe_dml, execute, execute_streaming, execute_with, infer_dml_param_types,
+    infer_param_types, open_cursor, open_dml_cursor, DmlLayout, DmlSpec, ExecError, QueryResult,
+    RowCursor, RowSink,
 };
 pub use provider::{InMemoryTable, TableProvider};
 pub use spill::{
     default_temp_root, sweep_orphaned_temp_dirs, DirReserver, SpillCtx, SpillError, SpillReserver,
     SpillStats,
 };
-pub use types::{Column, ColumnType, RelSchema, Row, Value};
+pub use types::{ArrayElem, ArrayValue, Column, ColumnType, RelSchema, Row, Value};

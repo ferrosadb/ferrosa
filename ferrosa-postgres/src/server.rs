@@ -66,6 +66,8 @@ pub struct QueryContext {
     /// cluster. `ClusterRead::disabled()` keeps the local-only path for
     /// standalone nodes and unit tests, where local storage IS complete.
     pub cluster_read: crate::ClusterRead,
+    /// Node-wide procedural state (D13): the LISTEN/NOTIFY hub shared by every session.
+    pub procedural: Arc<crate::procedural::Procedural>,
 }
 
 /// An unpredictable, printable SCRAM server nonce (base64, so no comma — the one
@@ -397,8 +399,27 @@ where
                 // wait ends early when the longest-idle one expires.
                 let portal_deadline = session.next_expiry(idle_timeout);
                 let lifetime = session.idle_transaction_lifetime();
+                // D13: an idle session receives committed notifications as they arrive.
+                // PostgreSQL delivers only outside a transaction block.
+                let deliver = session.txn_status() == crate::messages::TransactionStatus::Idle;
+                if deliver && deliver_notifications(&mut session, &mut output) {
+                    flush_output(stream, &mut output).await?;
+                }
                 let n = tokio::select! {
                     biased;
+                    note = async {
+                        match session.listener_mut() {
+                            Some(listener) if deliver => listener.next().await,
+                            _ => std::future::pending().await,
+                        }
+                    } => {
+                        if let Some(note) = note {
+                            note.to_message().encode(&mut output);
+                            deliver_notifications(&mut session, &mut output);
+                            flush_output(stream, &mut output).await?;
+                        }
+                        continue;
+                    }
                     () = async {
                         match lifetime {
                             Some(lifetime) => lifetime.until_expired().await,
@@ -439,6 +460,26 @@ where
     }
 }
 
+/// The most notifications encoded per wake-up before the output is flushed.
+const NOTIFICATION_BATCH: usize = 256;
+
+/// Encode the session's queued notifications (at most [`NOTIFICATION_BATCH`]); `true` when any
+/// were encoded.
+fn deliver_notifications(session: &mut Session, output: &mut BytesMut) -> bool {
+    let Some(listener) = session.listener_mut() else {
+        return false;
+    };
+    let mut any = false;
+    for _ in 0..NOTIFICATION_BATCH {
+        let Some(note) = listener.try_next() else {
+            break;
+        };
+        note.to_message().encode(output);
+        any = true;
+    }
+    any
+}
+
 /// Handle one framed frontend message. Returns `Ok(true)` when the client asked
 /// to terminate. Encodes any backend replies and writes them to `stream`.
 ///
@@ -462,7 +503,7 @@ where
 
     match msg {
         FrontendMessage::Query(sql) => {
-            let msgs = execute_simple_to(
+            let msgs = execute_query_message(
                 ctx,
                 session,
                 &sql,
@@ -590,7 +631,7 @@ async fn finish_extended_pipeline(ctx: &QueryContext, session: &mut Session, out
     BackendMessage::ReadyForQuery(session.txn_status()).encode(out);
 }
 
-async fn begin_implicit_transaction(
+pub(crate) async fn begin_implicit_transaction(
     ctx: &QueryContext,
     session: &mut Session,
 ) -> Result<(), BackendMessage> {
@@ -711,6 +752,74 @@ impl Drop for StatementScope<'_> {
 /// ownership on Direct nodes, and Accord ordering in cluster mode.
 ///
 /// A `SELECT`'s rows are written to `out` as they are produced; the returned
+/// A simple `Query` message: one statement, or several separated by `;`.
+///
+/// Several statements outside a transaction block run in ONE implicit transaction,
+/// as PostgreSQL runs them: an error rolls back the statements before it and the
+/// rest do not run. A message that itself holds transaction control (`BEGIN`,
+/// `COMMIT`, ...) runs its statements in order instead, stopping at the first error.
+async fn execute_query_message<O: ReplySink>(
+    ctx: &QueryContext,
+    session: &mut Session,
+    sql: &str,
+    out: &mut O,
+) -> std::io::Result<Vec<BackendMessage>> {
+    let pieces = crate::simple_split::split_statements(sql);
+    if pieces.len() <= 1 {
+        return execute_simple_to(ctx, session, sql, out).await;
+    }
+    let implicit = !session.in_txn()
+        && !session.in_failed_txn()
+        && !pieces.iter().any(|p| is_transaction_control(p));
+    if implicit {
+        if let Err(error) = begin_implicit_transaction(ctx, session).await {
+            return Ok(vec![error]);
+        }
+    }
+    let mut messages = Vec::new();
+    for piece in pieces {
+        let reply = execute_simple_to(ctx, session, piece, out).await?;
+        let failed = reply
+            .iter()
+            .any(|m| matches!(m, BackendMessage::ErrorResponse { .. }));
+        messages.extend(reply);
+        if failed {
+            if implicit {
+                session.end_txn();
+            }
+            return Ok(messages);
+        }
+    }
+    if implicit {
+        let commit = commit_txn(ctx, session).await;
+        if let Some(error @ BackendMessage::ErrorResponse { .. }) = commit.into_iter().next() {
+            messages.push(error);
+        }
+    }
+    Ok(messages)
+}
+
+/// Whether a statement starts or ends a transaction block.
+fn is_transaction_control(statement: &str) -> bool {
+    let word = statement
+        .split(|c: char| c.is_whitespace() || c == ';')
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    matches!(
+        word.as_str(),
+        "BEGIN"
+            | "START"
+            | "COMMIT"
+            | "END"
+            | "ROLLBACK"
+            | "ABORT"
+            | "SAVEPOINT"
+            | "RELEASE"
+            | "PREPARE"
+    )
+}
+
 /// messages are the tail still to send (its `CommandComplete`, or the
 /// `ErrorResponse` that ended it).
 ///
@@ -743,6 +852,7 @@ async fn execute_simple_scoped<O: ReplySink>(
             | ferrosa_sql::Statement::Insert(_)
             | ferrosa_sql::Statement::Update(_)
             | ferrosa_sql::Statement::Delete(_)
+            | ferrosa_sql::Statement::Dml(_)
             // TRUNCATE is a replicated WRITE too. It MUST take this path, or an
             // autocommit TRUNCATE would bypass Accord entirely and write to LOCAL
             // storage only — a scope hole worse than the reserved key's RF subset.
@@ -790,7 +900,27 @@ async fn execute_simple_inner<O: ReplySink>(
     sql: &str,
     out: &mut O,
 ) -> std::io::Result<Vec<BackendMessage>> {
-    let stmt = match ferrosa_sql::parse_statement(sql) {
+    // D13: DO, PL/pgSQL functions and triggers, LISTEN/NOTIFY are recognised before the SQL
+    // engine sees the statement.
+    if let Some(parsed) = ferrosa_plpgsql::utility::parse_utility(sql) {
+        return Ok(match parsed {
+            Ok(statement) => {
+                crate::procedural::execute(
+                    ctx,
+                    session,
+                    statement,
+                    &[],
+                    crate::procedural::Protocol::Simple,
+                )
+                .await
+            }
+            Err(error) => {
+                session.mark_txn_failed();
+                vec![query::error_response(error.sqlstate, &error.message)]
+            }
+        });
+    }
+    let stmt = match crate::catalog::parse_pg(sql) {
         Ok(s) => s,
         Err(e) => {
             session.mark_txn_failed();
@@ -835,6 +965,17 @@ async fn execute_simple_inner<O: ReplySink>(
             Ok(vec![BackendMessage::CommandComplete {
                 tag: "ROLLBACK".to_string(),
             }])
+        }
+        // LOCK needs the session: it takes ownership held by the transaction.
+        ferrosa_sql::Statement::Lock(lock) => {
+            let msgs = crate::lock::lock_tables(ctx, session, &lock).await;
+            if msgs
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. }))
+            {
+                session.mark_txn_failed();
+            }
+            Ok(msgs)
         }
         // Data + session statements: delegate to the stateless executor. (It
         // re-parses; cheap, and keeps the executor self-contained.) In an open
@@ -935,17 +1076,14 @@ fn track_select_reads(
             })?;
         return Ok(());
     }
+    // Every relation the statement reads (joins, subqueries, CTE bodies) is in
+    // the read set; a conflict on any of them must abort the transaction.
     let read_tables = session.txn_read_tables_mut();
-    read_tables.insert(format!(
-        "{}.{}",
-        select.from.schema.as_deref().unwrap_or(&ctx.default_schema),
-        select.from.table
-    ));
-    if let Some(join) = &select.join {
+    for table in select.tables() {
         read_tables.insert(format!(
             "{}.{}",
-            join.table.schema.as_deref().unwrap_or(&ctx.default_schema),
-            join.table.table
+            table.schema.as_deref().unwrap_or(&ctx.default_schema),
+            table.table
         ));
     }
     Ok(())
@@ -996,7 +1134,9 @@ fn point_read_row_key(
     ctx: &QueryContext,
     select: &ferrosa_sql::SelectStmt,
 ) -> Option<crate::mvcc::RowKey> {
-    if select.join.is_some() {
+    // A point read names one row of ONE relation; anything that reads another
+    // relation (a join, a subquery, a CTE) stays table-granular.
+    if select.tables().len() != 1 {
         return None;
     }
     let ferrosa_sql::Expr::Compare { left, op, value } = select.filter.as_ref()? else {
@@ -1057,6 +1197,7 @@ pub(crate) fn dml_context<'a>(
         default_schema: &ctx.default_schema,
         txn,
         jsonb_limits: &ctx.jsonb_limits,
+        row_events: None,
     }
 }
 
@@ -1098,11 +1239,49 @@ async fn run_data_statement<O: ReplySink>(
         session.mark_txn_failed();
         return Ok(vec![error]);
     }
-    if let ferrosa_sql::Statement::Select(select) = stmt {
-        if let Err(error) = track_select_reads(ctx, session, select) {
+    let read = match stmt {
+        ferrosa_sql::Statement::Select(select) => Some(std::borrow::Cow::Borrowed(&**select)),
+        // A general UPDATE/DELETE reads every relation its read half reads.
+        ferrosa_sql::Statement::Dml(dml) => Some(std::borrow::Cow::Owned(dml.read_select())),
+        _ => None,
+    };
+    if let Some(read) = read {
+        if let Err(error) = track_select_reads(ctx, session, &read) {
             session.mark_txn_failed();
             return Ok(vec![error]);
         }
+    }
+    if let (true, ferrosa_sql::Statement::Dml(dml)) = (writes_triggered_table(ctx, stmt), stmt) {
+        let msgs = execute_general_dml_firing(
+            ctx,
+            session,
+            dml,
+            Vec::new(),
+            query::ReturningOpts::simple(),
+            out,
+            0,
+        )
+        .await?;
+        if session.in_txn()
+            && msgs
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. }))
+        {
+            session.mark_txn_failed();
+        }
+        return Ok(msgs);
+    }
+    if writes_triggered_table(ctx, stmt) {
+        let msgs =
+            execute_dml_firing(ctx, session, stmt, &[], query::ReturningOpts::simple(), 0).await;
+        if session.in_txn()
+            && msgs
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. }))
+        {
+            session.mark_txn_failed();
+        }
+        return Ok(msgs);
     }
     let snapshot = read_snapshot(ctx, session);
     let in_txn = session.in_txn();
@@ -1154,7 +1333,26 @@ fn expired_transaction_error(ctx: &QueryContext, session: &Session) -> Option<Ba
 ///
 /// In every case the transaction is ended and the buffer dropped, so the server
 /// never acks a transaction it did not commit.
-async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMessage> {
+pub(crate) async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMessage> {
+    // Notifications and LISTENs queued by this transaction are taken before the commit ends
+    // it: published (under the hub's lock, so in commit order) only if it commits.
+    let notes = session.take_txn_notes();
+    if notes.is_empty() {
+        return commit_txn_core(ctx, session).await;
+    }
+    let publication = match crate::procedural::prepare_publication(ctx, session, notes).await {
+        Ok(publication) => publication,
+        Err(error) => {
+            session.end_txn();
+            return vec![error];
+        }
+    };
+    let messages = commit_txn_core(ctx, session).await;
+    publication.finish(session, &messages);
+    messages
+}
+
+async fn commit_txn_core(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMessage> {
     // A COMMIT on an aborted (poisoned) transaction never commits the partial
     // buffer — Postgres treats it as a ROLLBACK. Drop the buffer and report
     // ROLLBACK rather than committing an incomplete write-set.
@@ -1165,6 +1363,63 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
         }];
     }
 
+    // Transactional DDL first: the row writes may target a table the batch creates. A
+    // refused or partially applied batch ends the transaction with its row writes unapplied.
+    let ddl_applied = match commit_ddl(ctx, session).await {
+        Ok(applied) => applied,
+        Err(error) => {
+            session.end_txn();
+            return vec![error];
+        }
+    };
+    let messages = commit_row_writes(ctx, session).await;
+    if ddl_applied > 0 {
+        return disclose_applied_ddl(messages, ddl_applied);
+    }
+    messages
+}
+
+/// Preflight and replay the block's buffered DDL (`ddl_txn::commit_batch`). Returns the
+/// number of schema changes applied.
+async fn commit_ddl(ctx: &QueryContext, session: &mut Session) -> Result<usize, BackendMessage> {
+    let batch = session.txn_writes_mut().take_ddl_batch();
+    if batch.is_empty() {
+        return Ok(0);
+    }
+    let Some(executor) = ctx.ddl.as_deref() else {
+        return Err(query::error_response(
+            "0A000",
+            "DDL is not available: this server has no schema-change path",
+        ));
+    };
+    crate::ddl_txn::commit_batch(executor, &ctx.schema, batch).await
+}
+
+/// The schema changes were applied before the row writes; if the row writes then failed,
+/// say that the schema changes stay applied rather than letting the error imply a full
+/// rollback.
+fn disclose_applied_ddl(mut messages: Vec<BackendMessage>, applied: usize) -> Vec<BackendMessage> {
+    for message in &mut messages {
+        if let BackendMessage::ErrorResponse { fields } = message {
+            for (kind, text) in fields.iter_mut() {
+                if *kind == b'M' {
+                    text.push_str(&format!(
+                        " (the transaction's {applied} schema change(s) WERE applied before its \
+                         row writes failed, and are not rolled back)"
+                    ));
+                }
+            }
+            tracing::error!(
+                applied,
+                "transaction row writes failed after its DDL was applied"
+            );
+        }
+    }
+    messages
+}
+
+/// Validate and commit the buffered row writes (the commit path before transactional DDL).
+async fn commit_row_writes(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMessage> {
     // The tables this transaction WROTE contribute a per-table WRITE WATERMARK to
     // the distributed commit, so a transaction that SCANNED one of them sees that
     // write even when the writer never read the table itself (FMEA CL-72). Read
@@ -1539,7 +1794,7 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
 /// `RowDescription`/`NoData`; for a portal (`P`), reply a `RowDescription`/
 /// `NoData` under the portal's result formats. On any error, set the skip flag
 /// and reply a single `ErrorResponse`.
-async fn describe(
+pub(crate) async fn describe(
     ctx: &QueryContext,
     session: &mut Session,
     kind: u8,
@@ -1565,6 +1820,21 @@ async fn describe(
                 return vec![session.fail(denied)];
             }
             match parsed {
+                PreparedKind::Dml(dml) => {
+                    match crate::dml_general::describe(ctx, &dml, &declared).await {
+                        Ok((param_oids, returning)) => {
+                            session.set_param_oids(name, param_oids.clone());
+                            vec![
+                                extended::parameter_description(&param_oids),
+                                match returning {
+                                    Some(columns) => extended::describe_statement_rows(&columns),
+                                    None => BackendMessage::NoData,
+                                },
+                            ]
+                        }
+                        Err(err) => vec![session.fail(err)],
+                    }
+                }
                 PreparedKind::Select(select) => {
                     // ParameterDescription: a driver (e.g. tokio-postgres) relies
                     // on this to serialize bound parameters. Use the
@@ -1665,6 +1935,19 @@ async fn describe(
                         BackendMessage::NoData,
                     ]
                 }
+                PreparedKind::Procedural(statement) => {
+                    let param_oids = crate::procedural::param_oids(&statement, &declared);
+                    // Stored on the statement and also described to the client.
+                    session.set_param_oids(name, param_oids.clone());
+                    vec![
+                        extended::parameter_description(&param_oids),
+                        crate::procedural::describe(&statement),
+                    ]
+                }
+                // DDL takes no parameters and returns no rows.
+                PreparedKind::Utility(_) => {
+                    vec![extended::parameter_description(&[]), BackendMessage::NoData]
+                }
             }
         }
         b'P' => {
@@ -1691,6 +1974,15 @@ async fn describe(
                 return vec![session.fail(denied)];
             }
             match parsed {
+                PreparedKind::Dml(dml) => {
+                    match crate::dml_general::describe(ctx, &dml, &[]).await {
+                        Ok((_, Some(columns))) => {
+                            vec![extended::describe_portal_rows(&columns, &result_formats)]
+                        }
+                        Ok((_, None)) => vec![BackendMessage::NoData],
+                        Err(err) => vec![session.fail(err)],
+                    }
+                }
                 PreparedKind::Select(select) => {
                     match describe_columns(ctx, session, &select).await {
                         Ok(columns) => {
@@ -1728,8 +2020,11 @@ async fn describe(
                         Err(err) => vec![session.fail(err)],
                     }
                 }
-                PreparedKind::Update(_) | PreparedKind::Delete(_) => {
+                PreparedKind::Update(_) | PreparedKind::Delete(_) | PreparedKind::Utility(_) => {
                     vec![BackendMessage::NoData]
+                }
+                PreparedKind::Procedural(statement) => {
+                    vec![crate::procedural::describe(&statement)]
                 }
             }
         }
@@ -1801,7 +2096,7 @@ async fn describe_columns(
 /// tail still to send (`CommandComplete`, `PortalSuspended`, or the
 /// `ErrorResponse` that ended a failed query). On any error, set the skip flag.
 /// (Does NOT emit `ReadyForQuery` — that follows `Sync`.)
-async fn execute_portal_to<O: ReplySink>(
+pub(crate) async fn execute_portal_to<O: ReplySink>(
     ctx: &QueryContext,
     session: &mut Session,
     portal_name: &str,
@@ -1839,6 +2134,7 @@ async fn execute_portal_scoped<O: ReplySink>(
                     | PreparedKind::Insert(_)
                     | PreparedKind::Update(_)
                     | PreparedKind::Delete(_)
+                    | PreparedKind::Dml(_)
             )
         });
     if session.in_txn() || ctx.accord.committer().is_none() || !is_data_statement {
@@ -1897,7 +2193,15 @@ async fn execute_portal_body<O: ReplySink>(
     if is_select {
         return execute_select_portal(ctx, session, portal_name, max_rows, out).await;
     }
-    let messages = execute_portal_inner(ctx, session, portal_name).await;
+    let general_dml = session
+        .portal(portal_name)
+        .and_then(|portal| session.statement(&portal.stmt_name))
+        .is_some_and(|stmt| matches!(&stmt.parsed, PreparedKind::Dml(_)));
+    let messages = if general_dml {
+        execute_dml_portal(ctx, session, portal_name, out).await?
+    } else {
+        execute_portal_inner(ctx, session, portal_name).await
+    };
     let succeeded = !messages
         .iter()
         .any(|m| matches!(m, BackendMessage::ErrorResponse { .. }));
@@ -1909,6 +2213,102 @@ async fn execute_portal_body<O: ReplySink>(
         session.finish(portal_name.to_string(), tag);
     }
     Ok(messages)
+}
+
+/// Execute a portal bound to a general `UPDATE`/`DELETE`: record its reads,
+/// then run it against the session's transaction. `RETURNING` rows stream to
+/// `out` after every write succeeded.
+async fn execute_dml_portal<O: ReplySink>(
+    ctx: &QueryContext,
+    session: &mut Session,
+    portal_name: &str,
+    out: &mut O,
+) -> std::io::Result<Vec<BackendMessage>> {
+    let Some(portal) = session.portal(portal_name) else {
+        return Ok(vec![session.fail(query::error_response(
+            "34000",
+            &format!("portal \"{portal_name}\" does not exist"),
+        ))]);
+    };
+    let (params, result_formats) = (portal.params.clone(), portal.result_formats.clone());
+    let parsed = session
+        .statement(&portal.stmt_name)
+        .map(|s| s.parsed.clone());
+    let Some(PreparedKind::Dml(dml)) = parsed else {
+        return Ok(vec![session.fail(query::error_response(
+            "26000",
+            "the portal's prepared statement is not a general UPDATE/DELETE",
+        ))]);
+    };
+    if let Err(denied) = authz::authorize(
+        &ctx.schema,
+        session.auth(),
+        &authz::prepared_permissions(&PreparedKind::Dml(dml.clone()), &ctx.default_schema),
+    ) {
+        session.mark_txn_failed();
+        return Ok(vec![session.fail(denied)]);
+    }
+    if let Some(error) = expired_transaction_error(ctx, session) {
+        session.mark_txn_failed();
+        return Ok(vec![session.fail(error)]);
+    }
+    if let Err(error) = track_select_reads(ctx, session, &dml.read_select()) {
+        session.mark_txn_failed();
+        return Ok(vec![session.fail(error)]);
+    }
+    let returning = query::ReturningOpts {
+        with_row_description: false,
+        result_formats: &result_formats,
+    };
+    let msgs = execute_general_dml_firing(ctx, session, &dml, params, returning, out, 0).await?;
+    Ok(execute_dml(session, msgs))
+}
+
+/// Run a general `UPDATE`/`DELETE` in the session's transaction, then fire the AFTER ROW
+/// triggers of the rows it updated (D13), before returning.
+pub(crate) async fn execute_general_dml_firing<O: ReplySink>(
+    ctx: &QueryContext,
+    session: &mut Session,
+    dml: &ferrosa_sql::DmlStmt,
+    params: Vec<ferrosa_sql::Value>,
+    returning: query::ReturningOpts<'_>,
+    out: &mut O,
+    depth: usize,
+) -> std::io::Result<Vec<BackendMessage>> {
+    let events = std::sync::Mutex::new(crate::procedural::triggers::RowEvents::default());
+    let snapshot = read_snapshot(ctx, session);
+    let mut env = read_env(ctx, &snapshot);
+    env.timestamp_micros = session.timestamp_micros();
+    let run = crate::dml_general::DmlRun {
+        env,
+        params,
+        returning,
+        row_events: Some(&events),
+    };
+    let txn = if session.in_txn() {
+        Some(session.txn_writes_mut())
+    } else {
+        None
+    };
+    let msgs = crate::dml_general::execute_general_dml(run, dml, txn, out).await?;
+    if msgs
+        .iter()
+        .any(|m| matches!(m, BackendMessage::ErrorResponse { .. }))
+    {
+        return Ok(msgs);
+    }
+    let Ok(events) = events.into_inner() else {
+        return Ok(vec![query::error_response(
+            "XX000",
+            "trigger event queue lock poisoned",
+        )]);
+    };
+    Ok(
+        match crate::procedural::triggers::fire(ctx, session, events, depth).await {
+            Ok(()) => msgs,
+            Err(error) => vec![error],
+        },
+    )
 }
 
 /// The `SELECT` a portal is bound to, with its bound parameters.
@@ -1923,7 +2323,10 @@ fn portal_select(
         PreparedKind::Exprs(_)
         | PreparedKind::Insert(_)
         | PreparedKind::Update(_)
-        | PreparedKind::Delete(_) => None,
+        | PreparedKind::Delete(_)
+        | PreparedKind::Dml(_)
+        | PreparedKind::Utility(_)
+        | PreparedKind::Procedural(_) => None,
     }
 }
 
@@ -1967,6 +2370,184 @@ async fn open_portal_stream(
         params,
     )
     .await
+}
+
+/// Start a `SELECT` inside the session's transaction, as a portal does (snapshot liveness,
+/// read-set tracking, read-your-own-writes), with `params` bound. The PL/pgSQL host's `query`.
+pub(crate) async fn open_session_select(
+    ctx: &QueryContext,
+    session: &mut Session,
+    select: ferrosa_sql::SelectStmt,
+    params: Vec<ferrosa_sql::Value>,
+) -> Result<ResultStream, BackendMessage> {
+    if let Some(error) = expired_transaction_error(ctx, session) {
+        session.mark_txn_failed();
+        return Err(error);
+    }
+    if let Err(error) = track_select_reads(ctx, session, &select) {
+        session.mark_txn_failed();
+        return Err(error);
+    }
+    let pending = session.materialized_txn_writes()?;
+    let snapshot = read_snapshot(ctx, session);
+    query::open_select_stream(
+        read_env(ctx, &snapshot),
+        select,
+        Some(pending.as_slice()),
+        params,
+    )
+    .await
+}
+
+/// Evaluate a no-`FROM` expression select in the session (its snapshot and own writes).
+pub(crate) async fn scalar_select(
+    ctx: &QueryContext,
+    session: &mut Session,
+    items: &[ferrosa_sql::ScalarItem],
+) -> Result<ferrosa_sql::QueryResult, BackendMessage> {
+    let snapshot = read_snapshot(ctx, session);
+    let pending = session.materialized_txn_writes()?;
+    let mut scalar_ctx = scalar_read_ctx(ctx, &snapshot, &pending);
+    scalar_ctx.timestamp_micros = session.timestamp_micros();
+    query::execute_scalar_select(items, scalar_ctx).await
+}
+
+/// Run a statement for its effect inside the session's open transaction, with `params` bound:
+/// the PL/pgSQL host's `execute`. DML takes its parameters as a portal's would; any other
+/// statement goes through the simple-query dispatch (so DDL meets the same rules it meets
+/// from a client).
+pub(crate) async fn execute_in_session(
+    ctx: &QueryContext,
+    session: &mut Session,
+    sql: &str,
+    statement: ferrosa_sql::Statement,
+    params: Vec<ferrosa_sql::Value>,
+    depth: usize,
+) -> Vec<BackendMessage> {
+    use ferrosa_sql::Statement;
+    if let Some(error) = expired_transaction_error(ctx, session) {
+        session.mark_txn_failed();
+        return vec![error];
+    }
+    match statement {
+        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
+            let opts = query::ReturningOpts {
+                with_row_description: false,
+                result_formats: &[],
+            };
+            execute_dml_firing(ctx, session, &statement, &params, opts, depth).await
+        }
+        Statement::Dml(dml) => {
+            let opts = query::ReturningOpts {
+                with_row_description: false,
+                result_formats: &[],
+            };
+            let mut sink: Vec<BackendMessage> = Vec::new();
+            match execute_general_dml_firing(ctx, session, &dml, params, opts, &mut sink, depth)
+                .await
+            {
+                Ok(mut tail) => {
+                    sink.append(&mut tail);
+                    sink
+                }
+                Err(error) => vec![query::error_response(
+                    "58000",
+                    &format!("in-memory reply sink failed: {error}"),
+                )],
+            }
+        }
+        other if params.is_empty() => {
+            let mut sink: Vec<BackendMessage> = Vec::new();
+            match run_data_statement(ctx, session, sql, &other, &mut sink).await {
+                Ok(mut tail) => {
+                    sink.append(&mut tail);
+                    sink
+                }
+                Err(error) => vec![query::error_response(
+                    "58000",
+                    &format!("in-memory reply sink failed: {error}"),
+                )],
+            }
+        }
+        _ => vec![query::error_response(
+            "0A000",
+            "parameters are bound only into SELECT, INSERT, UPDATE and DELETE",
+        )],
+    }
+}
+
+/// Whether a DML statement writes a table that has triggers (D13).
+pub(crate) fn writes_triggered_table(
+    ctx: &QueryContext,
+    statement: &ferrosa_sql::Statement,
+) -> bool {
+    let table = match statement {
+        ferrosa_sql::Statement::Insert(ins) => &ins.table,
+        ferrosa_sql::Statement::Update(upd) => &upd.table,
+        ferrosa_sql::Statement::Dml(dml) => &dml.target,
+        _ => return false,
+    };
+    let keyspace = table.schema.as_deref().unwrap_or(&ctx.default_schema);
+    ctx.schema
+        .snapshot()
+        .tables
+        // The schema map is keyed by owned names.
+        .get(&(keyspace.to_string(), table.table.clone()))
+        .is_some_and(crate::procedural::triggers::has_triggers)
+}
+
+/// Run INSERT/UPDATE/DELETE in the session's transaction, then fire the AFTER ROW triggers of
+/// the rows it wrote (D13), before returning. A trigger failure fails the statement.
+pub(crate) async fn execute_dml_firing(
+    ctx: &QueryContext,
+    session: &mut Session,
+    statement: &ferrosa_sql::Statement,
+    params: &[ferrosa_sql::Value],
+    opts: query::ReturningOpts<'_>,
+    depth: usize,
+) -> Vec<BackendMessage> {
+    let events = std::sync::Mutex::new(crate::procedural::triggers::RowEvents::default());
+    let timestamp_micros = session.timestamp_micros();
+    let txn = if session.in_txn() {
+        Some(session.txn_writes_mut())
+    } else {
+        None
+    };
+    let context = query::DmlContext {
+        timestamp_micros,
+        row_events: Some(&events),
+        ..dml_context(ctx, txn)
+    };
+    let messages = match statement {
+        ferrosa_sql::Statement::Insert(ins) => {
+            query::execute_insert(context, ins, params, opts).await
+        }
+        ferrosa_sql::Statement::Update(upd) => query::execute_update(context, upd, params).await,
+        ferrosa_sql::Statement::Delete(del) => query::execute_delete(context, del, params).await,
+        _ => vec![query::error_response(
+            "XX000",
+            "internal error: a non-DML statement reached the trigger path",
+        )],
+    };
+    if messages
+        .iter()
+        .any(|m| matches!(m, BackendMessage::ErrorResponse { .. }))
+    {
+        return messages;
+    }
+    let events = match events.into_inner() {
+        Ok(events) => events,
+        Err(_) => {
+            return vec![query::error_response(
+                "XX000",
+                "trigger event queue lock poisoned",
+            )]
+        }
+    };
+    match crate::procedural::triggers::fire(ctx, session, events, depth).await {
+        Ok(()) => messages,
+        Err(error) => vec![error],
+    }
 }
 
 /// Execute a portal bound to a `SELECT`, resuming its suspended query if it has
@@ -2086,6 +2667,11 @@ async fn execute_portal_inner(
 
     let timestamp_micros = session.timestamp_micros();
     match parsed {
+        // Routed to `execute_dml_portal` before this point.
+        PreparedKind::Dml(_) => vec![session.fail(query::error_response(
+            "XX000",
+            "internal error: a general UPDATE/DELETE portal reached the bounded path",
+        ))],
         // Routed to `execute_select_portal` before this point.
         PreparedKind::Select(_) => vec![session.fail(query::error_response(
             "XX000",
@@ -2120,45 +2706,43 @@ async fn execute_portal_inner(
         // poisons the transaction (`execute_dml`).
         PreparedKind::Insert(ins) => {
             // Extended Execute: no leading RowDescription for RETURNING (sent at
-            // Describe time); rows honor the portal's result formats.
+            // Describe time); rows honor the portal's result formats. AFTER ROW
+            // triggers (D13) fire before the result returns.
             let returning_opts = query::ReturningOpts {
                 with_row_description: false,
                 result_formats: &result_formats,
             };
-            let in_txn = session.in_txn();
-            let transaction_writes = if in_txn {
-                Some(session.txn_writes_mut())
-            } else {
-                None
-            };
-            let msgs = query::execute_insert(
-                query::DmlContext {
-                    timestamp_micros,
-                    ..dml_context(ctx, transaction_writes)
-                },
-                &ins,
-                &params,
-                returning_opts,
-            )
-            .await;
+            let statement = ferrosa_sql::Statement::Insert(ins);
+            let msgs =
+                execute_dml_firing(ctx, session, &statement, &params, returning_opts, 0).await;
             execute_dml(session, msgs)
         }
         PreparedKind::Update(upd) => {
-            let txn = if session.in_txn() {
-                Some(session.txn_writes_mut())
-            } else {
-                None
+            let returning_opts = query::ReturningOpts {
+                with_row_description: false,
+                result_formats: &result_formats,
             };
-            let msgs = query::execute_update(
-                query::DmlContext {
-                    timestamp_micros,
-                    ..dml_context(ctx, txn)
-                },
-                &upd,
+            let statement = ferrosa_sql::Statement::Update(upd);
+            let msgs =
+                execute_dml_firing(ctx, session, &statement, &params, returning_opts, 0).await;
+            execute_dml(session, msgs)
+        }
+        PreparedKind::Procedural(statement) => {
+            let msgs = crate::procedural::execute(
+                ctx,
+                session,
+                *statement,
                 &params,
+                crate::procedural::Protocol::Extended,
             )
             .await;
-            execute_dml(session, msgs)
+            if msgs
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. }))
+            {
+                session.mark_error();
+            }
+            msgs
         }
         PreparedKind::Delete(del) => {
             let txn = if session.in_txn() {
@@ -2175,6 +2759,26 @@ async fn execute_portal_inner(
                 &params,
             )
             .await;
+            execute_dml(session, msgs)
+        }
+        // DDL over the extended protocol: the simple-query executor, inside the open
+        // transaction when there is one. A failure poisons the transaction like DML's.
+        PreparedKind::Utility(stmt) => {
+            if let ferrosa_sql::Statement::Lock(lock) = stmt.as_ref() {
+                let msgs = crate::lock::lock_tables(ctx, session, lock).await;
+                return execute_dml(session, msgs);
+            }
+            let snapshot = read_snapshot(ctx, session);
+            let mut env = read_env(ctx, &snapshot);
+            env.timestamp_micros = timestamp_micros;
+            // Inside any transaction — an explicit block or the pipeline's implicit one — the
+            // DDL is buffered and replayed at COMMIT / Sync (`ddl_txn`).
+            let txn = if session.in_txn() {
+                Some(session.txn_writes_mut())
+            } else {
+                None
+            };
+            let msgs = query::execute_utility(env, *stmt, txn).await;
             execute_dml(session, msgs)
         }
     }
@@ -2428,6 +3032,7 @@ pub(crate) mod txn_atomicity_tests {
 
     pub(crate) fn ctx_with(engine: Arc<StorageEngine>, schema: Arc<Schema>) -> QueryContext {
         QueryContext {
+            procedural: Default::default(),
             cluster_read: Default::default(),
             engine,
             schema,
@@ -5095,22 +5700,23 @@ pub(crate) mod txn_atomicity_tests {
         ctx.engine.shutdown().unwrap();
     }
 
-    /// A cast to a type ferrosa does not implement is refused BY NAME at parse
-    /// time (never accepted and ignored): the type as written is in the message.
+    /// A cast to a type ferrosa does not implement is refused BY NAME when the
+    /// statement is prepared (never accepted and ignored): the type as written is
+    /// in the message. (`::text` is a real cast now; `::nowhere` is not.)
     #[tokio::test]
     async fn a_cast_to_an_unsupported_type_is_refused_by_name() {
         let (_dir, ctx) = make_ctx().await;
         let mut session = Session::new(superuser());
         let response = session.on_parse(
             "bad".to_string(),
-            "SELECT relkind FROM pg_catalog.pg_class WHERE oid = $1::text",
+            "SELECT relkind FROM pg_catalog.pg_class WHERE oid = $1::nowhere",
             vec![],
         );
         match response {
             BackendMessage::ErrorResponse { fields } => {
                 assert_eq!(fields[1], (b'C', "0A000".to_string()));
                 assert!(
-                    fields[2].1.contains('`') && fields[2].1.contains("text"),
+                    fields[2].1.contains("nowhere"),
                     "the refusal names the type: {fields:?}"
                 );
             }

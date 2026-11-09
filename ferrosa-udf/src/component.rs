@@ -248,19 +248,42 @@ pub fn compile_to_component(
 
 /// Wrap a canonical-ABI core module into a `udf`-world component.
 pub fn componentize(core_wasm: &[u8]) -> Result<Vec<u8>, AscError> {
+    componentize_world(core_wasm, UDF_WIT, "udf")
+}
+
+/// The `ferrosa:plpgsql` world (D13): the same contract the runner links its host against.
+const PLPGSQL_WIT: &str = include_str!("wit/plpgsql.wit");
+
+/// Convert a parsed PL/pgSQL program to AssemblyScript, compile it in process and wrap it
+/// into a `routine`-world component that [`crate::UdfExecutor::load_plpgsql`] accepts.
+pub fn compile_plpgsql(program: &ferrosa_plpgsql::Program) -> Result<Vec<u8>, AscError> {
+    let source = ferrosa_plpgsql::assemblyscript::convert(program);
+    let core = crate::asc::compile_assemblyscript(&source).map_err(|e| match e {
+        // The converter's output failing to compile is a converter bug: say which source.
+        AscError::Compile(msg) => AscError::Compile(format!(
+            "{msg}\n--- generated PL/pgSQL source ---\n{}",
+            ferrosa_plpgsql::assemblyscript::numbered(&source)
+        )),
+        other => other,
+    })?;
+    componentize_world(&core, PLPGSQL_WIT, "routine")
+}
+
+/// Embed `world`'s metadata into a canonical-ABI core module and encode the component.
+fn componentize_world(core_wasm: &[u8], wit: &str, world: &str) -> Result<Vec<u8>, AscError> {
     let mut resolve = wit_parser::Resolve::new();
     let pkg = resolve
-        .push_str("ferrosa-udf.wit", UDF_WIT)
-        .map_err(|e| AscError::Internal(format!("parsing udf WIT: {e}")))?;
-    let world = resolve
-        .select_world(&[pkg], Some("udf"))
-        .map_err(|e| AscError::Internal(format!("selecting udf world: {e}")))?;
+        .push_str(format!("{world}.wit"), wit)
+        .map_err(|e| AscError::Internal(format!("parsing {world} WIT: {e}")))?;
+    let world_id = resolve
+        .select_world(&[pkg], Some(world))
+        .map_err(|e| AscError::Internal(format!("selecting {world} world: {e}")))?;
 
     let mut module = core_wasm.to_vec();
     wit_component::embed_component_metadata(
         &mut module,
         &resolve,
-        world,
+        world_id,
         wit_component::StringEncoding::UTF8,
     )
     .map_err(|e| AscError::Internal(format!("embedding component metadata: {e}")))?;

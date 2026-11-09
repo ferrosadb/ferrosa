@@ -1,0 +1,524 @@
+/-
+  Ferrosa formal specification — SQL scalar expressions (W1 of the Oban work).
+  ==========================================================================
+
+  The PostgreSQL front end grows a general expression engine
+  (`ferrosa-sql`'s `ScalarExpr`): projected expressions, column-to-column
+  comparisons, functions, `IN`, `= ANY(array)`, `IS NULL`, `coalesce`, and
+  subqueries. Postgrex's type bootstrap and Oban's queries need all of it
+  (`specs/todo/postgres-frontend/oban-compat.md`).
+
+  SQL evaluates boolean conditions in three-valued logic: a comparison with a
+  NULL operand is UNKNOWN, and `WHERE` keeps a row only when its condition is
+  TRUE. This file pins the semantics the engine must implement, in the shape
+  the Rust evaluator has: values, a three-valued truth type, and an evaluator
+  over a row. The facts proved here are the ones the implementation leans on:
+
+  * The engine keeps its old fast path for `column <op> literal` (point reads,
+    Accord read sets). `legacy_compare_agrees` shows that path and the general
+    evaluator give the same truth value, so the fast path is an optimisation,
+    never a different meaning.
+  * `x = ANY(array)` is TRUE when some element equals `x`, otherwise UNKNOWN
+    when `x` or any element is NULL, otherwise FALSE (`any_true_iff`,
+    `any_false_iff`). Oban acknowledges a job with `state = ANY($4)`.
+  * `x NOT IN (… NULL …)` is never TRUE (`not_in_with_null_never_true`), the
+    classic trap an implementation that treats NULL as "not equal" falls into.
+  * `coalesce` returns its first non-NULL argument (`coalesce_first_non_null`).
+  * `WHERE` keeps exactly the rows whose condition is TRUE
+    (`filter_keeps_only_true`); UNKNOWN rows are dropped, not kept.
+  * The three-valued connectives satisfy De Morgan (`not_and`, `not_or`), which
+    the planner may use when it pushes a negation down.
+-/
+
+namespace Ferrosa.Sql.Expr
+
+/-! ## Values and truth
+
+The values the model needs and the three-valued truth type, with `AND`, `OR`, `NOT` and the
+comparisons as PostgreSQL defines them. A comparison with a NULL operand, or between values of
+different types, is UNKNOWN here. The last section of this file shows why the engine refuses the
+type mismatch instead.
+-/
+
+/-- The values this model needs: NULL, integers, booleans and strings. -/
+inductive V where
+  | null
+  | int (n : Int)
+  | bool (b : Bool)
+  | str (s : String)
+  deriving DecidableEq, Repr
+
+/-- SQL truth: `some true`, `some false`, or `none` (UNKNOWN). -/
+abbrev TV := Option Bool
+
+def tvAnd : TV → TV → TV
+  | some false, _ => some false
+  | _, some false => some false
+  | some true, some true => some true
+  | _, _ => none
+
+def tvOr : TV → TV → TV
+  | some true, _ => some true
+  | _, some true => some true
+  | some false, some false => some false
+  | _, _ => none
+
+def tvNot : TV → TV
+  | some b => some (!b)
+  | none => none
+
+/-- Equality of two values; UNKNOWN when either is NULL or the types differ. -/
+def veq : V → V → TV
+  | .null, _ => none
+  | _, .null => none
+  | .int a, .int b => some (a == b)
+  | .bool a, .bool b => some (a == b)
+  | .str a, .str b => some (a == b)
+  | _, _ => none
+
+/-- Strictly-less-than; UNKNOWN on NULL or mismatched types. -/
+def vlt : V → V → TV
+  | .int a, .int b => some (decide (a < b))
+  | .str a, .str b => some (decide (a < b))
+  | _, _ => none
+
+inductive Cmp where
+  | eq | ne | lt
+  deriving DecidableEq, Repr
+
+def vcmp : Cmp → V → V → TV
+  | .eq, a, b => veq a b
+  | .ne, a, b => tvNot (veq a b)
+  | .lt, a, b => vlt a b
+
+/-! ## Expressions and evaluation
+
+The fragment of `ScalarExpr` this file reasons about, and an evaluator shaped like the Rust one:
+every node yields a value, and a condition's truth is read back from that value. The legacy
+`column <op> literal` fast path is defined beside it so the two can be compared.
+-/
+
+/-- The fragment of `ScalarExpr` this file reasons about. -/
+inductive E where
+  | col (i : Nat)
+  | lit (v : V)
+  | cmp (op : Cmp) (a b : E)
+  | and (a b : E)
+  | or (a b : E)
+  | not (a : E)
+  | isNull (a : E)
+  deriving Repr
+
+abbrev Row := List V
+
+def colOf (r : Row) (i : Nat) : V := r.getD i .null
+
+def toV : TV → V
+  | some b => .bool b
+  | none => .null
+
+def toTV : V → TV
+  | .bool b => some b
+  | _ => none
+
+/-- The general evaluator, as the Rust `eval` does it: every node yields a value. -/
+def eval (r : Row) : E → V
+  | .col i => colOf r i
+  | .lit v => v
+  | .cmp op a b => toV (vcmp op (eval r a) (eval r b))
+  | .and a b => toV (tvAnd (toTV (eval r a)) (toTV (eval r b)))
+  | .or a b => toV (tvOr (toTV (eval r a)) (toTV (eval r b)))
+  | .not a => toV (tvNot (toTV (eval r a)))
+  | .isNull a => .bool (eval r a == .null)
+
+/-- A condition's truth over a row. -/
+def truth (r : Row) (e : E) : TV := toTV (eval r e)
+
+/-- The legacy fast path: `column <op> literal`, compared directly. -/
+def legacyCompare (r : Row) (i : Nat) (op : Cmp) (v : V) : TV :=
+  vcmp op (colOf r i) v
+
+/-- Turning a truth value into a SQL value and back gives the truth value unchanged: TRUE, FALSE
+    and UNKNOWN survive the round trip through `bool` and NULL. -/
+theorem toTV_toV (t : TV) : toTV (toV t) = t := by
+  cases t with
+  | none => rfl
+  | some b => rfl
+
+/-- The fast path and the general evaluator agree on every row. -/
+theorem legacy_compare_agrees (r : Row) (i : Nat) (op : Cmp) (v : V) :
+    legacyCompare r i op v = truth r (.cmp op (.col i) (.lit v)) := by
+  simp [legacyCompare, truth, eval, toTV_toV]
+
+/-- `IS NULL` is never UNKNOWN. -/
+theorem isNull_is_two_valued (r : Row) (e : E) : truth r (.isNull e) ≠ none := by
+  simp [truth, eval, toTV]
+
+/-! ## Three-valued connectives
+
+Algebraic laws of the three-valued connectives that the evaluator and the planner rely on:
+double negation, De Morgan, and the characterisations of when `OR` is TRUE or FALSE.
+-/
+
+/-- Double negation is the identity in three-valued logic, UNKNOWN included. -/
+theorem tvNot_tvNot (t : TV) : tvNot (tvNot t) = t := by
+  cases t with
+  | none => rfl
+  | some b => cases b <;> rfl
+
+/-- De Morgan for three-valued `AND`: `NOT (a AND b)` is `NOT a OR NOT b` for every combination
+    of TRUE, FALSE and UNKNOWN, so the planner may push a negation through a conjunction. -/
+theorem not_and (a b : TV) : tvNot (tvAnd a b) = tvOr (tvNot a) (tvNot b) := by
+  cases a with
+  | none => cases b with
+    | none => rfl
+    | some y => cases y <;> rfl
+  | some x => cases x <;> cases b with
+    | none => rfl
+    | some y => cases y <;> rfl
+
+/-- De Morgan for three-valued `OR`: `NOT (a OR b)` is `NOT a AND NOT b` for every combination
+    of TRUE, FALSE and UNKNOWN, so the planner may push a negation through a disjunction. -/
+theorem not_or (a b : TV) : tvNot (tvOr a b) = tvAnd (tvNot a) (tvNot b) := by
+  cases a with
+  | none => cases b with
+    | none => rfl
+    | some y => cases y <;> rfl
+  | some x => cases x <;> cases b with
+    | none => rfl
+    | some y => cases y <;> rfl
+
+/-! ## `= ANY(array)` and `NOT IN`
+
+`x = ANY(xs)` is the `OR` of `x = e` over the elements, starting from FALSE, and `x NOT IN (xs)`
+is its negation. The theorems pin when each is TRUE, FALSE or UNKNOWN, including the trap where
+a NULL in the list makes `NOT IN` never TRUE.
+-/
+
+/-- `x = ANY(xs)`: the OR of `x = e` over the elements, starting from FALSE. -/
+def anyEq (x : V) : List V → TV
+  | [] => some false
+  | e :: es => tvOr (veq x e) (anyEq x es)
+
+/-- `x NOT IN (xs)` is `NOT (x = ANY(xs))`. -/
+def notIn (x : V) (xs : List V) : TV := tvNot (anyEq x xs)
+
+/-- A three-valued `OR` is TRUE exactly when at least one side is TRUE. -/
+theorem tvOr_true_iff (a b : TV) : tvOr a b = some true ↔ a = some true ∨ b = some true := by
+  cases a with
+  | none => cases b with
+    | none => simp [tvOr]
+    | some y => cases y <;> simp [tvOr]
+  | some x => cases x <;> cases b with
+    | none => simp [tvOr]
+    | some y => cases y <;> simp [tvOr]
+
+/-- A three-valued `OR` is FALSE exactly when both sides are FALSE. One UNKNOWN side is enough
+    to keep it from being FALSE. -/
+theorem tvOr_false_iff (a b : TV) : tvOr a b = some false ↔ a = some false ∧ b = some false := by
+  cases a with
+  | none => cases b with
+    | none => simp [tvOr]
+    | some y => cases y <;> simp [tvOr]
+  | some x => cases x <;> cases b with
+    | none => simp [tvOr]
+    | some y => cases y <;> simp [tvOr]
+
+/-- TRUE exactly when some element compares equal. -/
+theorem any_true_iff (x : V) (xs : List V) :
+    anyEq x xs = some true ↔ ∃ e ∈ xs, veq x e = some true := by
+  induction xs with
+  | nil => simp [anyEq]
+  | cons e es ih => simp [anyEq, tvOr_true_iff, ih]
+
+/-- FALSE exactly when every element compares definitely unequal (so no NULL anywhere). -/
+theorem any_false_iff (x : V) (xs : List V) :
+    anyEq x xs = some false ↔ ∀ e ∈ xs, veq x e = some false := by
+  induction xs with
+  | nil => simp [anyEq]
+  | cons e es ih => simp [anyEq, tvOr_false_iff, ih]
+
+/-- Comparing any value with NULL is UNKNOWN, whatever the value is. -/
+theorem veq_null_right (x : V) : veq x .null = none := by
+  cases x <;> rfl
+
+/-- A NULL in the list makes `NOT IN` never TRUE. -/
+theorem not_in_with_null_never_true (x : V) (xs : List V) (h : V.null ∈ xs) :
+    notIn x xs ≠ some true := by
+  intro hnot
+  have hfalse : anyEq x xs = some false := by
+    unfold notIn at hnot
+    cases hq : anyEq x xs with
+    | none => simp [hq, tvNot] at hnot
+    | some b => cases b <;> simp_all [tvNot]
+  have := (any_false_iff x xs).mp hfalse .null h
+  simp [veq_null_right] at this
+
+/-! ### The evaluator's loop
+
+  The Rust evaluator computes `IN (…)`, `= ANY(array)` and `IN (subquery)` (which
+  the parser lowers to `= ANY(ARRAY(subquery))`, as PostgreSQL defines it) with a
+  left fold that starts at FALSE and stops at the first TRUE. These show that
+  loop is `anyEq`, and that stopping early never changes the answer.
+-/
+
+/-- The loop: `acc := acc OR (x = e)` over the elements, left to right. -/
+def anyLoop (x : V) (acc : TV) : List V → TV
+  | [] => acc
+  | e :: es => anyLoop x (tvOr acc (veq x e)) es
+
+/-- TRUE `OR` anything is TRUE, including TRUE `OR` UNKNOWN. -/
+theorem tvOr_true_left (b : TV) : tvOr (some true) b = some true := by
+  cases b <;> rfl
+
+/-- Once the accumulator is TRUE it stays TRUE, so breaking out is sound. -/
+theorem anyLoop_true_absorbs (x : V) (xs : List V) : anyLoop x (some true) xs = some true := by
+  induction xs with
+  | nil => rfl
+  | cons e es ih => simp [anyLoop, tvOr_true_left, ih]
+
+/-- Three-valued `OR` is associative, so folding it over a list left to right gives the same
+    answer as nesting it to the right. -/
+theorem tvOr_assoc (a b c : TV) : tvOr (tvOr a b) c = tvOr a (tvOr b c) := by
+  cases a with
+  | none => cases b with
+    | none => cases c with
+      | none => rfl
+      | some z => cases z <;> rfl
+    | some y => cases y <;> cases c <;> try rfl
+                all_goals (rename_i z; cases z <;> rfl)
+  | some x => cases x <;> cases b <;> try rfl
+              all_goals first
+                | (rename_i y; cases y <;> cases c <;> try rfl
+                   all_goals (rename_i z; cases z <;> rfl))
+                | (cases c <;> try rfl
+                   all_goals (rename_i z; cases z <;> rfl))
+
+/-- FALSE is the identity of three-valued `OR`, which is why the `= ANY` loop starts from FALSE. -/
+theorem tvOr_false_left (b : TV) : tvOr (some false) b = b := by
+  cases b with
+  | none => rfl
+  | some y => cases y <;> rfl
+
+/-- The evaluator's loop from any starting accumulator is that accumulator `OR`ed with `x =
+    ANY(xs)`. This generalisation is what lets the induction go through for `anyLoop_is_anyEq`. -/
+theorem anyLoop_acc (x : V) (acc : TV) (xs : List V) :
+    anyLoop x acc xs = tvOr acc (anyEq x xs) := by
+  induction xs generalizing acc with
+  | nil =>
+    cases acc with
+    | none => rfl
+    | some b => cases b <;> rfl
+  | cons e es ih => simp [anyLoop, anyEq, ih, tvOr_assoc]
+
+/-- The loop from FALSE is exactly `anyEq`. -/
+theorem anyLoop_is_anyEq (x : V) (xs : List V) : anyLoop x (some false) xs = anyEq x xs := by
+  rw [anyLoop_acc, tvOr_false_left]
+
+/-! ## `coalesce`
+
+`coalesce(a, b, …)` returns its first non-NULL argument, and NULL when all of them are NULL.
+Postgrex's type bootstrap and Oban's queries both use it.
+-/
+
+def coalesce : List V → V
+  | [] => .null
+  | .null :: rest => coalesce rest
+  | v :: _ => v
+
+/-- `coalesce` skips leading NULLs and returns the first non-NULL argument. -/
+theorem coalesce_first_non_null (nulls : List V) (v : V) (rest : List V)
+    (hn : ∀ n ∈ nulls, n = .null) (hv : v ≠ .null) :
+    coalesce (nulls ++ v :: rest) = v := by
+  induction nulls with
+  | nil =>
+    cases v with
+    | null => exact absurd rfl hv
+    | _ => rfl
+  | cons n ns ih =>
+    have : n = .null := hn n (by simp)
+    subst this
+    simp [coalesce, ih (fun m hm => hn m (by simp [hm]))]
+
+/-! ## `WHERE`
+
+`WHERE` keeps a row only when its condition is TRUE. A FALSE or UNKNOWN condition drops the row,
+so a comparison with NULL filters everything out rather than matching.
+-/
+
+def filterWhere (rows : List Row) (e : E) : List Row :=
+  rows.filter fun r => truth r e == some true
+
+/-- A row survives `WHERE` exactly when its condition is TRUE. -/
+theorem filter_keeps_only_true (rows : List Row) (e : E) (r : Row) :
+    r ∈ filterWhere rows e ↔ r ∈ rows ∧ truth r e = some true := by
+  simp [filterWhere]
+
+/-- An UNKNOWN condition drops the row: `WHERE NULL = 1` returns nothing. -/
+theorem unknown_rows_are_dropped (rows : List Row) :
+    filterWhere rows (.cmp .eq (.lit .null) (.lit (.int 1))) = [] := by
+  simp [filterWhere, truth, eval, vcmp, veq, toV, toTV]
+
+/-! ## Bounded depth (found while building W1)
+
+  A left-deep operator chain (`x AND x AND …`, `a + 1 + 1 …`) is built by a parser
+  loop, not by recursion, so the parser's nesting limit never saw it: a long chain
+  produced a tree as deep as the chain was long, and every later recursive walk
+  of that tree (lowering, planning, evaluation, drop) overflowed the stack. The
+  fix counts each link against the same limit (`Parser::deepen`). These theorems
+  show the counted loop bounds the tree: a chain the parser accepts is at most
+  `maxDepth` links deeper than its operand.
+-/
+
+def depth : E → Nat
+  | .col _ => 1
+  | .lit _ => 1
+  | .cmp _ a b => max (depth a) (depth b) + 1
+  | .and a b => max (depth a) (depth b) + 1
+  | .or a b => max (depth a) (depth b) + 1
+  | .not a => depth a + 1
+  | .isNull a => depth a + 1
+
+/-- `x AND x AND … AND x` with `n` links, left-deep as the parser's loop builds it. -/
+def andChain (x : E) : Nat → E
+  | 0 => x
+  | n + 1 => .and (andChain x n) x
+
+/-- Without a bound, depth grows with the chain: one level per link. -/
+theorem andChain_depth (x : E) (n : Nat) : depth (andChain x n) = depth x + n := by
+  induction n with
+  | zero => rfl
+  | succ n ih =>
+    simp only [andChain, depth, ih]
+    rw [Nat.max_eq_left (Nat.le_add_right _ _)]
+    omega
+
+/-- `MAX_EXPR_DEPTH`. -/
+def maxDepth : Nat := 256
+
+/-- The parser's chain loop from counter `c`: each link checks the counter, then
+    raises it (`Parser::deepen`). `none` is `ParseError::TooDeep`. -/
+def deepenLoop : Nat → Nat → Option Nat
+  | c, 0 => some c
+  | c, n + 1 => if maxDepth ≤ c then none else deepenLoop (c + 1) n
+
+/-- An accepted chain raised the counter by its length and never past the limit. -/
+theorem deepenLoop_accepts (c n r : Nat) (h : deepenLoop c n = some r) :
+    r = c + n ∧ (n = 0 ∨ c + n ≤ maxDepth) := by
+  induction n generalizing c with
+  | zero =>
+    simp [deepenLoop] at h
+    omega
+  | succ n ih =>
+    unfold deepenLoop at h
+    split at h
+    · exact absurd h (by simp)
+    · have := ih (c + 1) h
+      omega
+
+/-- Every chain the parser accepts at statement level has bounded depth, so the
+    recursive walks over it are bounded too. -/
+theorem accepted_chain_depth_bounded (x : E) (n r : Nat) (h : deepenLoop 0 n = some r) :
+    depth (andChain x n) ≤ depth x + maxDepth := by
+  rw [andChain_depth]
+  have := deepenLoop_accepts 0 n r h
+  simp [maxDepth] at this ⊢
+  omega
+
+/-- And the loop really refuses: any chain that would pass the limit is `TooDeep`. -/
+theorem deepenLoop_refuses (c n : Nat) (hn : 0 < n) (h : maxDepth < c + n) :
+    deepenLoop c n = none := by
+  induction n generalizing c with
+  | zero => omega
+  | succ n ih =>
+    unfold deepenLoop
+    split
+    · rfl
+    · exact ih (c + 1) (by simp [maxDepth] at *; omega) (by omega)
+
+/-- Concretely: a chain one link longer than `maxDepth`, started at depth zero, is refused as
+    `TooDeep`. -/
+theorem deepenLoop_refuses_past_limit : deepenLoop 0 (maxDepth + 1) = none :=
+  deepenLoop_refuses 0 (maxDepth + 1) (by simp [maxDepth]) (by simp [maxDepth])
+
+/-! ## Uncorrelated subqueries run once (found while building W1)
+
+  A subquery that reads no enclosing row was re-run for every outer row: right
+  answer, wasted scans. The planner now marks a subquery correlated exactly when
+  some column inside it resolves to an enclosing query (`refs` below the
+  subquery's own level) and memoises the uncorrelated ones per statement. These
+  pin why that is sound.
+-/
+
+/-- A query level reads, for each column reference, the level it resolves to. -/
+def correlated (level : Nat) (refs : List Nat) : Bool := refs.any (· < level)
+
+/-- No reference below its own level: the subquery's value cannot depend on the
+    outer row, i.e. it is the same function of every outer row. -/
+def Uncorrelated {R : Type} (f : R → V) : Prop := ∀ r r', f r = f r'
+
+/-- Evaluate once on the first row and reuse the value for every row. -/
+def memoMap {R : Type} (f : R → V) : List R → List V
+  | [] => []
+  | r :: rs => let v := f r; v :: rs.map (fun _ => v)
+
+/-- For a subquery whose value is the same for every outer row, evaluating it once and reusing
+    the value gives exactly the results of evaluating it per row. Memoising uncorrelated
+    subqueries changes cost, never answers. -/
+theorem memo_is_sound {R : Type} (f : R → V) (h : Uncorrelated f) (rows : List R) :
+    memoMap f rows = rows.map f := by
+  cases rows with
+  | nil => rfl
+  | cons r rs =>
+    simp only [memoMap, List.map_cons, List.cons.injEq, true_and]
+    apply List.map_congr_left
+    intro x _
+    exact h r x
+
+/-- The planner's `correlated` test is false exactly when every column reference inside the
+    subquery resolves at the subquery's own level or deeper. So a subquery is memoised only when
+    it reads nothing from an enclosing row. -/
+theorem uncorrelated_iff_no_outer_reference (level : Nat) (refs : List Nat) :
+    correlated level refs = false ↔ ∀ l ∈ refs, level ≤ l := by
+  simp [correlated, List.any_eq_false]
+
+/-! ## Mismatched types are errors, not UNKNOWN (found while building W1)
+
+  `veq` above folds a type mismatch into UNKNOWN. Used as the engine's
+  comparison that is a silent wrong answer: `WHERE ts > '2020-01-01'` compared a
+  timestamp with a string, got UNKNOWN on every row and returned nothing. The
+  engine now (1) reads a string literal as the type it faces, at plan time, and
+  (2) refuses two non-NULL values of different types (42883). `strictEq` is that
+  comparison; these theorems pin that it never invents UNKNOWN.
+-/
+
+/-- Same type family (the model's constructors). -/
+def sameType : V → V → Bool
+  | .int _, .int _ => true
+  | .bool _, .bool _ => true
+  | .str _, .str _ => true
+  | _, _ => false
+
+/-- The strict comparison: NULL is UNKNOWN, a mismatch is an error. -/
+def strictEq (a b : V) : Except Unit TV :=
+  match a, b with
+  | .null, _ => .ok none
+  | _, .null => .ok none
+  | a, b => if sameType a b then .ok (veq a b) else .error ()
+
+/-- UNKNOWN comes only from a NULL operand. -/
+theorem strict_unknown_only_from_null (a b : V) (h : strictEq a b = .ok none) :
+    a = .null ∨ b = .null := by
+  cases a <;> cases b <;> simp_all [strictEq, sameType, veq]
+
+/-- On values of one type the strict comparison is `veq`. -/
+theorem strict_agrees_on_same_type (a b : V) (h : sameType a b = true) :
+    strictEq a b = .ok (veq a b) := by
+  cases a <;> cases b <;> simp_all [strictEq, sameType]
+
+/-- Two non-NULL values of different types are refused. -/
+theorem strict_refuses_mismatch (a b : V) (ha : a ≠ .null) (hb : b ≠ .null)
+    (h : sameType a b = false) : strictEq a b = .error () := by
+  cases a <;> cases b <;> simp_all [strictEq, sameType]
+
+end Ferrosa.Sql.Expr

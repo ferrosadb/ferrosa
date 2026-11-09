@@ -40,9 +40,9 @@ use ferrosa_common::timeuuid::is_synthetic_key_column;
 use ferrosa_common::{CqlType, CqlValue};
 use ferrosa_schema::{ColumnKind, Schema};
 use ferrosa_sql::{
-    parse_statement, ArithOp, CastTarget, Column, ColumnType, DeleteStmt, ExecError, Expr,
-    InsertStmt, MapCatalog, QueryResult, Returning, Row, ScalarItem, ScalarValue, SelectStmt,
-    SetExpr, Statement, Term, UpdateStmt, Value as SqlValue,
+    ArithOp, CastTarget, Column, ColumnType, DeleteStmt, ExecError, Expr, InsertStmt, MapCatalog,
+    QueryResult, Returning, Row, ScalarItem, ScalarValue, SelectStmt, SetExpr, Statement, Term,
+    UpdateStmt, Value as SqlValue,
 };
 use ferrosa_storage::{Mutation, StorageEngine};
 
@@ -87,6 +87,17 @@ pub(crate) fn column_type_oid(ty: ColumnType) -> i32 {
 ///
 /// A value with no text rendering is a typed [`EncodeError`], never `None`: a
 /// `None` here would reach the client as SQL NULL.
+/// A value's PostgreSQL text form as a `String` (`None` for NULL): what crosses the PL/pgSQL
+/// host interface and what `pg_notify` receives.
+pub(crate) fn value_text(value: &SqlValue) -> Result<Option<String>, EncodeError> {
+    render_value(value)?
+        .map(|bytes| {
+            String::from_utf8(bytes)
+                .map_err(|_| EncodeError::from("value has no UTF-8 text form".to_string()))
+        })
+        .transpose()
+}
+
 fn render_value(value: &SqlValue) -> Result<Option<Vec<u8>>, EncodeError> {
     let text = match value {
         SqlValue::Null => return Ok(None),
@@ -116,6 +127,7 @@ fn render_value(value: &SqlValue) -> Result<Option<Vec<u8>>, EncodeError> {
         SqlValue::Numeric { unscaled, scale } => render_numeric_text(unscaled, *scale).into_bytes(),
         // PostgreSQL jsonb text (D26), or a typed error for a corrupt cell.
         SqlValue::Jsonb(doc) => crate::jsonb_wire::render_text(doc)?,
+        SqlValue::Array(array) => render_array_text(array)?,
         SqlValue::JsonPath(_) | SqlValue::TextArray(_) => {
             return Err(EncodeError::unsupported(
                 "result format for jsonpath and text[] values is not supported yet (T-161b)",
@@ -123,6 +135,95 @@ fn render_value(value: &SqlValue) -> Result<Option<Vec<u8>>, EncodeError> {
         }
     };
     Ok(Some(text))
+}
+
+/// PostgreSQL `array_out`: `{a,b,NULL}`. An element is double-quoted when it is
+/// empty, spells `NULL` (any case), or contains a delimiter, brace, quote,
+/// backslash or whitespace; inside quotes `"` and `\` are backslash-escaped.
+fn render_array_text(array: &ferrosa_sql::ArrayValue) -> Result<Vec<u8>, EncodeError> {
+    let mut out = Vec::with_capacity(2 + array.items.len() * 4);
+    out.push(b'{');
+    for (index, item) in array.items.iter().enumerate() {
+        if index > 0 {
+            out.push(b',');
+        }
+        match render_value(item)? {
+            None => out.extend_from_slice(b"NULL"),
+            Some(text) if array_text_needs_quotes(&text) => {
+                out.push(b'"');
+                for byte in text {
+                    if byte == b'"' || byte == b'\\' {
+                        out.push(b'\\');
+                    }
+                    out.push(byte);
+                }
+                out.push(b'"');
+            }
+            Some(text) => out.extend_from_slice(&text),
+        }
+    }
+    out.push(b'}');
+    Ok(out)
+}
+
+fn array_text_needs_quotes(text: &[u8]) -> bool {
+    text.is_empty()
+        || text.eq_ignore_ascii_case(b"NULL")
+        || text
+            .iter()
+            .any(|b| matches!(b, b'{' | b'}' | b',' | b'"' | b'\\') || b.is_ascii_whitespace())
+}
+
+/// PostgreSQL `array_send` for a one-dimensional array: ndim, has-null flag,
+/// element OID, then (length, lower bound 1), then each element as a 4-byte
+/// length (`-1` for NULL) and its own binary encoding.
+fn encode_array_binary(
+    array: &ferrosa_sql::ArrayValue,
+    col_type: ColumnType,
+) -> Result<Vec<u8>, EncodeError> {
+    // The column's element type wins: an empty array read from storage has no item to say
+    // what it holds, and the header must carry the element OID the client was told.
+    let elem = match col_type {
+        ColumnType::Array(elem) => elem,
+        _ => array.elem,
+    };
+    let elem_type = crate::pg_types::for_array_elem(elem);
+    let mut out = Vec::with_capacity(20 + array.items.len() * 8);
+    let ndim: i32 = if array.items.is_empty() { 0 } else { 1 };
+    let has_null = array.items.iter().any(SqlValue::is_null);
+    out.extend_from_slice(&ndim.to_be_bytes());
+    out.extend_from_slice(&i32::from(has_null).to_be_bytes());
+    out.extend_from_slice(&elem_type.oid.to_be_bytes());
+    if ndim == 1 {
+        let len = i32::try_from(array.items.len()).map_err(|_| {
+            EncodeError::from("array is too long for the PostgreSQL wire format".to_string())
+        })?;
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(&1i32.to_be_bytes());
+    }
+    for item in array.items.iter() {
+        let bytes = match (array.elem, item) {
+            // `oid` is unsigned: a synthetic OID can exceed i32::MAX.
+            (ferrosa_sql::ArrayElem::Oid, SqlValue::Int(oid)) => Some(
+                u32::try_from(*oid)
+                    .map_err(|_| EncodeError::from(format!("{oid} is not a valid oid")))?
+                    .to_be_bytes()
+                    .to_vec(),
+            ),
+            _ => encode_value(1, elem_type.column_type, item)?,
+        };
+        match bytes {
+            None => out.extend_from_slice(&(-1i32).to_be_bytes()),
+            Some(bytes) => {
+                let len = i32::try_from(bytes.len()).map_err(|_| {
+                    EncodeError::from("array element is too long for the wire format".to_string())
+                })?;
+                out.extend_from_slice(&len.to_be_bytes());
+                out.extend_from_slice(&bytes);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Postgres text spelling of an `f64`: shortest round-trip form, with the
@@ -333,9 +434,34 @@ impl ParamError {
 
 /// Parameter type OIDs the decoder maps. Anything else (except `0`,
 /// unspecified) is refused rather than decoded as text.
-const SUPPORTED_PARAM_OIDS: [i32; 19] = [
-    16, 17, 19, 20, 21, 23, 25, 114, 700, 701, 869, 1043, 1082, 1083, 1114, 1184, 1700, 2950, 3802,
+const SUPPORTED_PARAM_OIDS: [i32; 22] = [
+    16,
+    17,
+    19,
+    20,
+    21,
+    23,
+    25,
+    26,
+    114,
+    700,
+    701,
+    869,
+    1043,
+    1082,
+    1083,
+    1114,
+    1184,
+    1700,
+    2950,
+    3802,
+    PARAM_OID_TEXT_ARRAY,
+    PARAM_OID_JSONB_ARRAY,
 ];
+
+/// `text[]` and `jsonb[]` parameter OIDs (`pg_array`).
+const PARAM_OID_TEXT_ARRAY: i32 = 1009;
+const PARAM_OID_JSONB_ARRAY: i32 = 3807;
 
 /// `json` (D11: stored as jsonb) and `jsonb` parameter OIDs.
 const PARAM_OID_JSON: i32 = 114;
@@ -375,11 +501,55 @@ pub(crate) fn decode_param_checked(
     if matches!(type_oid, PARAM_OID_JSON | PARAM_OID_JSONB) {
         return decode_param_jsonb(format, type_oid, raw, jsonb_limits);
     }
+    if matches!(type_oid, PARAM_OID_TEXT_ARRAY | PARAM_OID_JSONB_ARRAY) {
+        return decode_param_array(format, raw);
+    }
     if format == 1 {
         decode_param_binary(type_oid, raw)
     } else {
         decode_param_text(type_oid, raw)
     }
+}
+
+/// A NULL element cannot be stored: an array column is a CQL list, and a CQL list holds no
+/// NULL. Refused rather than stored as something else.
+fn null_array_element() -> BackendMessage {
+    error_response(
+        "0A000",
+        "NULL array elements are not supported: an array column is stored as a CQL list, \
+         which cannot hold NULL",
+    )
+}
+
+/// `text[]`/`jsonb[]` parameter: binary is `array_recv`'s format; text is the array literal,
+/// kept as text and parsed against the target column (`pg_array::parse_text_array`).
+fn decode_param_array(format: i16, raw: &[u8]) -> Result<SqlValue, ParamError> {
+    let to_param = |m: BackendMessage| match m {
+        BackendMessage::ErrorResponse { fields } => {
+            let field = |k: u8| {
+                fields
+                    .iter()
+                    .find(|(f, _)| *f == k)
+                    .map(|(_, v)| v.clone()) // the parameter error owns its text
+                    .unwrap_or_default()
+            };
+            // `pg_array` refuses with exactly these codes.
+            let code: &'static str = match field(b'C').as_str() {
+                "22P02" => "22P02",
+                "0A000" => "0A000",
+                "22021" => "22021",
+                _ => "08P01",
+            };
+            ParamError::new(code, field(b'M'))
+        }
+        other => ParamError::new("XX000", format!("{other:?}")),
+    };
+    if format == 1 {
+        return crate::pg_array::decode_binary_array(raw).map_err(to_param);
+    }
+    std::str::from_utf8(raw)
+        .map(|text| SqlValue::Text(text.to_string().into()))
+        .map_err(|_| ParamError::new("22021", "array parameter is not valid UTF-8".to_string()))
 }
 
 /// jsonb / json parameter: parse under the configured limits (D14b).
@@ -424,6 +594,12 @@ fn decode_param_text(type_oid: i32, raw: &[u8]) -> Result<SqlValue, ParamError> 
                 Err(bad("integer out of range"))
             }
         }
+        // oid: an unsigned decimal in [0, 2^32).
+        26 => s
+            .trim()
+            .parse::<u32>()
+            .map(|n| SqlValue::Int(i64::from(n)))
+            .map_err(|_| bad("not an oid")),
         // text / varchar / name; OID 0 (unspecified) is text too.
         0 | 25 | 1043 | 19 => Ok(SqlValue::Text(s.to_string().into())),
         16 => decode_bool_text(s).ok_or_else(|| bad("not a boolean")),
@@ -598,6 +774,10 @@ fn decode_param_binary(type_oid: i32, raw: &[u8]) -> Result<SqlValue, ParamError
     match type_oid {
         23 => int(4).map(SqlValue::Int),
         20 => int(8).map(SqlValue::Int),
+        // oid: an UNSIGNED big-endian u32.
+        26 => <[u8; 4]>::try_from(raw)
+            .map(|b| SqlValue::Int(i64::from(u32::from_be_bytes(b))))
+            .map_err(|_| bad("wrong length")),
         21 => int(2).map(SqlValue::Int),
         // text / varchar / name; OID 0 (unspecified) is text too.
         0 | 25 | 1043 | 19 => std::str::from_utf8(raw)
@@ -806,6 +986,7 @@ pub fn encode_value(
         }
         // jsonb_send: version byte 0x01 then the PostgreSQL text form (D11, D26).
         SqlValue::Jsonb(doc) => Some(crate::jsonb_wire::render_binary(doc)?),
+        SqlValue::Array(array) => Some(encode_array_binary(array, col_type)?),
         SqlValue::JsonPath(_) | SqlValue::TextArray(_) => {
             return Err(EncodeError::unsupported(&format!(
                 "no binary codec for {col_type:?} (T-161b)"
@@ -822,6 +1003,10 @@ fn encode_int_binary(col_type: ColumnType, i: i64) -> Result<Vec<u8>, String> {
             .map(|value| value.to_be_bytes().to_vec())
             .map_err(|_| format!("integer {i} is outside the PostgreSQL int4 range")),
         ColumnType::BigInt => Ok(i.to_be_bytes().to_vec()),
+        // oid: UNSIGNED 4 bytes; outside [0, 2^32) is refused, never wrapped.
+        ColumnType::Oid => u32::try_from(i)
+            .map(|value| value.to_be_bytes().to_vec())
+            .map_err(|_| format!("{i} is outside the PostgreSQL oid range")),
         _ => Ok(i.to_be_bytes().to_vec()),
     }
 }
@@ -853,6 +1038,11 @@ pub(crate) fn exec_error_response(err: &ExecError) -> BackendMessage {
         // directly with an unresolved cast; refused as an unsupported feature
         // rather than compared as if the cast did nothing.
         ExecError::UnresolvedCast(_) => ("0A000", err.to_string()),
+        // A row-level expression failure carries PostgreSQL's own SQLSTATE
+        // (22012 division_by_zero, 22003 out of range, 22P02 bad input, 21000 a
+        // subquery returning several rows, ...).
+        ExecError::Eval { sqlstate, .. } => (*sqlstate, err.to_string()),
+        ExecError::Unsupported(_) => ("0A000", err.to_string()),
     };
     error_response(sqlstate, &message)
 }
@@ -960,7 +1150,9 @@ pub(crate) fn parse_error_sqlstate(error: &ferrosa_sql::ParseError) -> &'static 
         | ParseError::UnsupportedSelectExpr(_)
         | ParseError::UnsupportedCast(_)
         | ParseError::UnsupportedCastExpr
-        | ParseError::UnsupportedAggregate(_) => "0A000",
+        | ParseError::UnsupportedAggregate(_)
+        | ParseError::UnsupportedDml(_)
+        | ParseError::Unsupported(_) => "0A000",
         ParseError::UnknownType(_) => "42704",
         ParseError::DuplicateColumn(_) => "42701",
         ParseError::MultiplePrimaryKeys => "42P16",
@@ -1009,7 +1201,7 @@ pub(crate) async fn execute_query_streaming<O: ReplySink>(
     mut txn: Option<&mut TxnWriteSet>,
     out: &mut O,
 ) -> std::io::Result<Vec<BackendMessage>> {
-    let stmt = match parse_statement(sql) {
+    let stmt = match crate::catalog::parse_pg(sql) {
         Ok(stmt) => stmt,
         Err(e) => {
             return Ok(vec![error_response(
@@ -1018,6 +1210,17 @@ pub(crate) async fn execute_query_streaming<O: ReplySink>(
             )])
         }
     };
+    if let Statement::Dml(dml) = stmt {
+        // A triggered table's DML is routed to `server::execute_general_dml_firing` before
+        // reaching here, so this path records no trigger events.
+        let run = crate::dml_general::DmlRun {
+            env,
+            params: Vec::new(),
+            returning: ReturningOpts::simple(),
+            row_events: None,
+        };
+        return crate::dml_general::execute_general_dml(run, &dml, txn, out).await;
+    }
     let Statement::Select(select) = stmt else {
         return Ok(execute_statement(env, stmt, txn).await);
     };
@@ -1124,6 +1327,20 @@ fn resolve_casts(
     schema: &Schema,
     default_schema: &str,
 ) -> Result<(), BackendMessage> {
+    let on_query = |q: &mut SelectStmt| resolve_casts(q, params, schema, default_schema);
+    for cte in &mut select.ctes {
+        on_query(&mut cte.query)?;
+    }
+    for join in &mut select.joins {
+        resolve_casts_in_scalar(&mut join.on, params, schema, default_schema)?;
+    }
+    if let ferrosa_sql::Projection::Items(items) = &mut select.projection {
+        for item in items {
+            if let ferrosa_sql::SelectItem::Expr { expr, .. } = item {
+                resolve_casts_in_scalar(expr, params, schema, default_schema)?;
+            }
+        }
+    }
     if let Some(filter) = select.filter.as_mut() {
         resolve_casts_in_expr(filter, params, schema, default_schema)?;
     }
@@ -1131,6 +1348,131 @@ fn resolve_casts(
         resolve_casts_in_expr(having, params, schema, default_schema)?;
     }
     Ok(())
+}
+
+/// Resolve every `::regclass` cast inside a general expression (and its
+/// subqueries) to the literal OID, exactly as a legacy comparison term is.
+/// A regclass cast of a non-constant (a column) is refused: its value would have
+/// to be resolved per row against the catalog, which the engine does not do.
+fn resolve_casts_in_scalar(
+    expr: &mut ferrosa_sql::ScalarExpr,
+    params: &[SqlValue],
+    schema: &Schema,
+    default_schema: &str,
+) -> Result<(), BackendMessage> {
+    use ferrosa_sql::ScalarExpr;
+    if let ScalarExpr::Cast { expr: inner, ty } = expr {
+        let kind = catalog_cast_kind(ty);
+        if let Some(kind) = kind {
+            let value = constant_operand(inner, kind.label(), params, schema, default_schema)?;
+            *expr = ScalarExpr::Literal(apply_catalog_cast(&value, kind, schema, default_schema)?);
+            return Ok(());
+        }
+    }
+    expr.try_for_each_child_mut(
+        &mut |child| resolve_casts_in_scalar(child, params, schema, default_schema),
+        &mut |q| resolve_casts(q, params, schema, default_schema),
+    )
+}
+
+/// A cast whose meaning lives in the catalog, resolved here before planning.
+enum CatalogCast {
+    Regclass,
+    Regnamespace,
+    /// A user-defined type, `schema.name` (an enum, the only kind that exists).
+    UserType {
+        keyspace: String,
+        name: String,
+    },
+}
+
+impl CatalogCast {
+    fn label(&self) -> &str {
+        match self {
+            CatalogCast::Regclass => "regclass",
+            CatalogCast::Regnamespace => "regnamespace",
+            CatalogCast::UserType { name, .. } => name,
+        }
+    }
+}
+
+fn catalog_cast_kind(ty: &ferrosa_sql::TypeName) -> Option<CatalogCast> {
+    let pg_catalog = ty
+        .schema
+        .as_deref()
+        .is_none_or(|s| s.eq_ignore_ascii_case("pg_catalog"));
+    if ty.array {
+        return None;
+    }
+    if pg_catalog && ty.name.eq_ignore_ascii_case("regclass") {
+        return Some(CatalogCast::Regclass);
+    }
+    if pg_catalog && ty.name.eq_ignore_ascii_case("regnamespace") {
+        return Some(CatalogCast::Regnamespace);
+    }
+    match &ty.schema {
+        Some(ks) if !pg_catalog => Some(CatalogCast::UserType {
+            keyspace: ks.trim_matches('"').to_string(),
+            name: ty.name.trim_matches('"').to_string(),
+        }),
+        _ => None,
+    }
+}
+
+/// The constant a catalog cast applies to: a literal, a bound `$n`, or a nested
+/// cast that resolves to one. Anything per-row is refused (0A000).
+fn constant_operand(
+    inner: &mut ferrosa_sql::ScalarExpr,
+    label: &str,
+    params: &[SqlValue],
+    schema: &Schema,
+    default_schema: &str,
+) -> Result<SqlValue, BackendMessage> {
+    use ferrosa_sql::ScalarExpr;
+    match inner {
+        ScalarExpr::Literal(v) => Ok(v.clone()),
+        ScalarExpr::Param(n) => eval_cast_term(&Term::Param(*n), params, schema, default_schema),
+        other => {
+            resolve_casts_in_scalar(other, params, schema, default_schema)?;
+            match other {
+                ScalarExpr::Literal(v) => Ok(v.clone()),
+                _ => Err(error_response(
+                    "0A000",
+                    &format!("a ::{label} cast of a non-constant expression is not supported"),
+                )),
+            }
+        }
+    }
+}
+
+fn apply_catalog_cast(
+    value: &SqlValue,
+    kind: CatalogCast,
+    schema: &Schema,
+    default_schema: &str,
+) -> Result<SqlValue, BackendMessage> {
+    match (kind, value) {
+        (_, SqlValue::Null) => Ok(SqlValue::Null),
+        (CatalogCast::Regclass, _) => {
+            apply_cast(value, CastTarget::Regclass, schema, default_schema)
+        }
+        (CatalogCast::Regnamespace, SqlValue::Text(name)) => {
+            crate::catalog::resolve_regnamespace(schema, name)
+                .map(|oid| SqlValue::Int(i64::from(oid)))
+                .ok_or_else(|| {
+                    error_response("3F000", &format!("schema \"{name}\" does not exist"))
+                })
+        }
+        (CatalogCast::UserType { keyspace, name }, SqlValue::Text(text)) => {
+            // An enum value is stored and compared as its label text.
+            crate::pg_enum::cast_text_to_enum(&schema.snapshot(), &keyspace, &name, text)
+                .map(|label| SqlValue::Text(label.into()))
+        }
+        (kind, other) => Err(error_response(
+            "42846",
+            &format!("cannot cast {other:?} to {}", kind.label()),
+        )),
+    }
 }
 
 fn resolve_casts_in_expr(
@@ -1147,6 +1489,7 @@ fn resolve_casts_in_expr(
             Ok(())
         }
         Expr::Compare { .. } => Ok(()),
+        Expr::Scalar(e) => resolve_casts_in_scalar(e, params, schema, default_schema),
         Expr::Not(inner) => resolve_casts_in_expr(inner, params, schema, default_schema),
         Expr::And(left, right) | Expr::Or(left, right) => {
             resolve_casts_in_expr(left, params, schema, default_schema)?;
@@ -1232,12 +1575,90 @@ fn value_type_name(value: &SqlValue) -> &'static str {
         SqlValue::Jsonb(_) => "jsonb",
         SqlValue::JsonPath(_) => "jsonpath",
         SqlValue::TextArray(_) => "text[]",
+        SqlValue::Array(array) => match array.elem {
+            ferrosa_sql::ArrayElem::Int => "integer[]",
+            ferrosa_sql::ArrayElem::BigInt => "bigint[]",
+            ferrosa_sql::ArrayElem::Oid => "oid[]",
+            ferrosa_sql::ArrayElem::Text => "text[]",
+            ferrosa_sql::ArrayElem::Bool => "boolean[]",
+            ferrosa_sql::ArrayElem::Float => "double precision[]",
+            ferrosa_sql::ArrayElem::Uuid => "uuid[]",
+            ferrosa_sql::ArrayElem::Timestamp => "timestamp[]",
+            ferrosa_sql::ArrayElem::Numeric => "numeric[]",
+            ferrosa_sql::ArrayElem::Jsonb => "jsonb[]",
+        },
     }
 }
 
 /// Where a reply's messages go as they are produced. The server's sink writes
 /// them to the socket, so a streaming `SELECT` never accumulates its rows;
 /// `Vec<BackendMessage>` collects them for tests and tools.
+/// The [`crate::ddl_alter::RowProbe`] over a read environment: `SELECT 1 FROM t WHERE p
+/// LIMIT 1`, streamed into a sink that records only whether a row arrived.
+struct EnvProbe<'a> {
+    env: ReadEnv<'a>,
+}
+
+#[async_trait::async_trait]
+impl crate::ddl_alter::RowProbe for EnvProbe<'_> {
+    async fn any_row(
+        &self,
+        keyspace: &str,
+        table: &str,
+        predicate: &str,
+    ) -> Result<bool, BackendMessage> {
+        let sql = format!(
+            "SELECT 1 FROM \"{}\".\"{}\" WHERE {predicate} LIMIT 1",
+            keyspace.replace('"', "\"\""),
+            table.replace('"', "\"\"")
+        );
+        let mut sink = AnyRow::default();
+        let tail = execute_query_streaming(self.env, &sql, None, &mut sink)
+            .await
+            .map_err(|e| error_response("58000", &format!("validation read failed: {e}")))?;
+        if let Some(error) = sink.error.or_else(|| {
+            tail.into_iter()
+                .find(|m| matches!(m, BackendMessage::ErrorResponse { .. }))
+        }) {
+            return Err(error);
+        }
+        Ok(sink.found)
+    }
+}
+
+/// A sink that keeps nothing but whether a data row arrived (and the first error).
+#[derive(Default)]
+struct AnyRow {
+    found: bool,
+    error: Option<BackendMessage>,
+}
+
+impl ReplySink for AnyRow {
+    async fn send(&mut self, messages: Vec<BackendMessage>) -> std::io::Result<()> {
+        for message in messages {
+            match message {
+                BackendMessage::DataRow { .. } => self.found = true,
+                BackendMessage::ErrorResponse { .. } if self.error.is_none() => {
+                    self.error = Some(message)
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    async fn send_rows<I: Iterator<Item = Row>>(
+        &mut self,
+        mut rows: I,
+        _types: &[ColumnType],
+        _formats: &[i16],
+    ) -> std::io::Result<(usize, Option<BackendMessage>)> {
+        let found = rows.next().is_some();
+        self.found |= found;
+        Ok((usize::from(found), None))
+    }
+}
+
 pub(crate) trait ReplySink {
     /// Deliver `messages` in order. An error means the peer is gone.
     async fn send(&mut self, messages: Vec<BackendMessage>) -> std::io::Result<()>;
@@ -1475,6 +1896,50 @@ pub(crate) fn write_error_response(error: &ferrosa_common::Error) -> BackendMess
     }
 }
 
+/// Whether `stmt` is a utility statement the extended protocol may prepare: DDL, which
+/// takes no `$N` parameters and returns no rows. Exhaustive, so a new statement kind must
+/// be classified here before it compiles.
+pub(crate) fn is_utility(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::CreateTable(_)
+        | Statement::DropTable(_)
+        | Statement::AlterTable(_)
+        | Statement::Lock(_)
+        | Statement::Comment(_)
+        | Statement::CreateType(_)
+        | Statement::AlterType(_)
+        | Statement::CreateIndex(_)
+        | Statement::DropIndex(_) => true,
+        Statement::Select(_)
+        | Statement::SelectExprs(_)
+        | Statement::Begin { .. }
+        | Statement::Commit
+        | Statement::Rollback
+        | Statement::Set { .. }
+        | Statement::Reset { .. }
+        | Statement::Insert(_)
+        | Statement::Update(_)
+        | Statement::Delete(_)
+        | Statement::Dml(_)
+        | Statement::CopyFromStdin(_)
+        | Statement::Truncate(_)
+        | Statement::Vacuum(_)
+        | Statement::Analyze(_) => false,
+    }
+}
+
+/// Execute a prepared utility statement (see [`is_utility`]) through the same executor the
+/// simple-query path uses, so a DDL statement means the same thing whichever protocol sent
+/// it. The statement is moved in; nothing is re-parsed.
+pub(crate) async fn execute_utility(
+    env: ReadEnv<'_>,
+    stmt: Statement,
+    txn: Option<&mut TxnWriteSet>,
+) -> Vec<BackendMessage> {
+    debug_assert!(is_utility(&stmt), "execute_utility called with {stmt:?}");
+    execute_statement(env, stmt, txn).await
+}
+
 async fn execute_statement(
     env: ReadEnv<'_>,
     stmt: Statement,
@@ -1495,6 +1960,11 @@ async fn execute_statement(
         Statement::Select(_) => vec![error_response(
             "XX000",
             "internal error: a table SELECT reached the non-streaming path",
+        )],
+        // Routed to `dml_general` by `execute_query_streaming`.
+        Statement::Dml(_) => vec![error_response(
+            "XX000",
+            "internal error: a general UPDATE/DELETE reached the non-streaming path",
         )],
         // No-`FROM` expression query: `SELECT 1`, `SELECT version()`,
         // `SELECT (SELECT count(*) FROM t)`, etc.
@@ -1528,40 +1998,30 @@ async fn execute_statement(
         // reaches `dispatch` directly without session state, where there is no
         // transaction to begin or commit. Failing loud beats silently reporting
         // a COMMIT that buffered nothing.
-        Statement::Begin { .. } | Statement::Commit | Statement::Rollback => vec![error_response(
-            "0A000",
-            "transaction control requires a session; this path has no transaction state",
-        )],
+        Statement::Begin { .. } | Statement::Commit | Statement::Rollback | Statement::Lock(_) => {
+            vec![error_response(
+                "0A000",
+                "transaction control requires a session; this path has no transaction state",
+            )]
+        }
         // Session GUCs are not modeled yet.
         Statement::Set { .. } | Statement::Reset { .. } => vec![error_response(
             "0A000",
             "SET/RESET session statements are not yet implemented",
         )],
-        // DDL (T-132a): through the same schema-change path CQL DDL uses.
-        Statement::CreateTable(create) => {
-            crate::ddl::execute_create_table(
-                crate::ddl::DdlEnv {
-                    executor: ddl,
-                    schema,
-                    default_schema,
-                    in_txn: txn.is_some(),
-                },
-                &create,
-            )
-            .await
-        }
-        // DROP TABLE: pgbench -i's reset step. Same schema-change path.
-        Statement::DropTable(drop) => {
-            crate::ddl::execute_drop_table(
-                crate::ddl::DdlEnv {
-                    executor: ddl,
-                    schema,
-                    default_schema,
-                    in_txn: txn.is_some(),
-                },
-                &drop,
-            )
-            .await
+        // DDL (T-132a): through the same schema-change path CQL DDL uses — applied now in
+        // autocommit, buffered until COMMIT inside a transaction block (`ddl_txn`).
+        stmt @ (Statement::CreateTable(_)
+        | Statement::DropTable(_)
+        | Statement::AlterTable(_)
+        | Statement::Comment(_)
+        | Statement::CreateType(_)
+        | Statement::AlterType(_)
+        | Statement::CreateIndex(_)
+        | Statement::DropIndex(_)) => {
+            let probe = EnvProbe { env };
+            crate::ddl::execute_ddl_statement(ddl, schema, default_schema, stmt, txn, Some(&probe))
+                .await
         }
         // `COPY ... FROM STDIN` cannot be answered in one step: the payload arrives AFTER the
         // acknowledgement, as `CopyData` frames, so the connection loop drives it. Reaching here
@@ -1571,20 +2031,6 @@ async fn execute_statement(
             "0A000",
             "COPY FROM STDIN must be driven by the connection loop, not answered directly",
         )],
-        // ALTER TABLE: the step pgbench -i runs right after creating its tables without a key.
-        // Same schema-change path.
-        Statement::AlterTable(alter) => {
-            crate::ddl::execute_alter_table(
-                crate::ddl::DdlEnv {
-                    executor: ddl,
-                    schema,
-                    default_schema,
-                    in_txn: txn.is_some(),
-                },
-                &alter,
-            )
-            .await
-        }
         // TRUNCATE [TABLE] t [, ...]: a normal replicated WRITE of a table-level
         // tombstone (ferrosa_storage::table_tombstone), through the SAME seam as an
         // INSERT/UPDATE/DELETE. That makes the statement transactional — it buffers
@@ -1675,6 +2121,7 @@ async fn execute_statement(
                     default_schema,
                     txn,
                     jsonb_limits,
+                    row_events: None,
                 },
                 &ins,
                 &[],
@@ -1691,6 +2138,7 @@ async fn execute_statement(
                 default_schema,
                 txn,
                 jsonb_limits,
+                row_events: None,
             };
             execute_update(context, &upd, &[]).await
         }
@@ -1703,6 +2151,7 @@ async fn execute_statement(
                 default_schema,
                 txn,
                 jsonb_limits,
+                row_events: None,
             };
             execute_delete(context, &del, &[]).await
         }
@@ -1749,7 +2198,7 @@ async fn apply_or_buffer(
 /// per-transaction write-count refusal: the old `FERROSA_POSTGRES_MAX_TXN_WRITES`
 /// / SQLSTATE `53400` cap is gone (FMEA PG-12, PG-ACC-01). A write larger than
 /// the buffer SPILLS; it is never declined for being large.
-async fn apply_or_buffer_silent(
+pub(crate) async fn apply_or_buffer_silent(
     engine: &StorageEngine,
     schema: &Schema,
     mvcc: Option<&MvccManager>,
@@ -2594,7 +3043,7 @@ fn decimal_from_numeric_text(text: &str) -> Result<CqlValue, BackendMessage> {
 /// rather than guessed at, because a silently misread value is worse than a refusal. A value that
 /// has a text form but does not parse is refused `22P02`, matching PostgreSQL's
 /// `invalid_text_representation` — never defaulted to zero, empty, or NULL.
-fn text_to_sql_value(ty: &CqlType, text: &str) -> Result<SqlValue, BackendMessage> {
+pub(crate) fn text_to_sql_value(ty: &CqlType, text: &str) -> Result<SqlValue, BackendMessage> {
     let trimmed = text.trim();
     let bad = |what: &str| {
         Err(error_response(
@@ -2752,6 +3201,25 @@ pub(crate) fn value_to_cql(
                 .map_err(|e| error_response(e.sqlstate, &e.message))?;
             CqlValue::Jsonb(doc)
         }
+        (CqlType::List(inner), SqlValue::Array(array)) => CqlValue::List(
+            array
+                .items
+                .iter()
+                .map(|item| match item {
+                    SqlValue::Null => Err(null_array_element()),
+                    item => value_to_cql(item, inner, jsonb_limits),
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        (CqlType::List(inner), SqlValue::Text(text)) => CqlValue::List(
+            crate::pg_array::parse_text_array(text)?
+                .into_iter()
+                .map(|item| match item {
+                    Some(item) => value_to_cql(&SqlValue::Text(item.into()), inner, jsonb_limits),
+                    None => Err(null_array_element()),
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
         // A COPY payload carries NO TYPES: every field arrives as bytes, so the destination COLUMN
         // is the only thing that can say what a field means. PostgreSQL parses COPY input per the
         // target column's type for the same reason. Without this arm, `COPY t FROM STDIN` into any
@@ -2825,6 +3293,9 @@ pub(crate) struct DmlContext<'a> {
     pub txn: Option<&'a mut TxnWriteSet>,
     /// Tunable jsonb ingest limits (D14b) for text bound to jsonb columns.
     pub jsonb_limits: &'a ferrosa_jsonb::Limits,
+    /// Where a write to a table with triggers records its row event (D13); `None` when the
+    /// caller fires no triggers.
+    pub(crate) row_events: crate::procedural::triggers::EventSink<'a>,
 }
 
 impl ReturningOpts<'_> {
@@ -2879,6 +3350,7 @@ pub(crate) async fn execute_insert(
         default_schema,
         mut txn,
         jsonb_limits,
+        row_events,
     } = context;
 
     let ReturningOpts {
@@ -2903,7 +3375,21 @@ pub(crate) async fn execute_insert(
     // Every row's mutation, built and VALIDATED BEFORE any is applied — statement
     // atomicity (see the function doc).
     let mut mutations: Vec<PgWrite> = Vec::with_capacity(ins.rows.len());
+    // The omitted columns' bigserial ids and DEFAULTs, compiled once for every row.
+    let defaults = match crate::insert_defaults::InsertDefaults::compile(meta, &ins.columns) {
+        Ok(defaults) => defaults,
+        Err(error) => return vec![error],
+    };
+    let fill_ctx = crate::insert_defaults::FillCtx {
+        meta,
+        schema,
+        ks,
+        timestamp_micros,
+        jsonb_limits,
+    };
 
+    // D13: the column names every trigger image of this statement shares.
+    let column_names = crate::procedural::triggers::column_names(meta);
     for row_index in 0..ins.rows.len() {
         // Resolve THIS row's named columns (per CQL type), substituting bound params;
         // collect regular/static cells by storage index, the CQL values by name for key
@@ -2938,8 +3424,42 @@ pub(crate) async fn execute_insert(
                     regular_cells.push((idx, value.clone()));
                 }
             }
+            // RETURNING reports the value as stored (a `timestamp` cell keeps
+            // milliseconds), not as supplied; NULL stays NULL.
+            let stored = if sql_value.is_null() {
+                sql_value
+            } else {
+                match crate::storage_provider::cql_to_value(&value) {
+                    Ok(stored) => stored,
+                    Err(e) => return vec![error_response("XX000", &e)],
+                }
+            };
             col_values.insert(col_name.clone(), value);
-            sql_values.insert(col_name.clone(), sql_value);
+            sql_values.insert(col_name.clone(), stored);
+        }
+        // Fill the omitted columns BEFORE the constraint check judges the row.
+        let mut fill = crate::insert_defaults::RowFill {
+            col_values: &mut col_values,
+            sql_values: &mut sql_values,
+            regular_cells: &mut regular_cells,
+        };
+        if let Err(error) = defaults.apply(&fill_ctx, &mut fill) {
+            return vec![error];
+        }
+        // Every NOT NULL column must have been given a non-NULL value (Lean
+        // `Ferrosa.Sql.Constraint.admitted_writes_preserve_constraints`).
+        let typed: Result<HashMap<String, SqlValue>, BackendMessage> = col_values
+            .iter()
+            .map(|(name, value)| {
+                crate::storage_provider::cql_to_value(value)
+                    .map(|v| (name.clone(), v)) // the check row needs its own key
+                    .map_err(|e| error_response("XX000", &e))
+            })
+            .collect();
+        if let Err(violation) =
+            typed.and_then(|row| crate::pg_constraint::check_row(schema, meta, &row))
+        {
+            return vec![violation];
         }
 
         // Enforce every FOREIGN KEY on this table BEFORE the write. The check is a normal read
@@ -3020,6 +3540,18 @@ pub(crate) async fn execute_insert(
             ),
             meta.id,
         ));
+        // D13: a table with triggers queues this row's event for the statement's end.
+        if let Err(error) = crate::procedural::triggers::record(row_events, meta, || {
+            Ok(crate::procedural::triggers::RowEvent {
+                keyspace: ks.to_string(),
+                table: ins.table.table.clone(), // the event outlives the borrowed statement
+                op: crate::procedural::triggers::RowOp::Insert,
+                new: crate::procedural::triggers::shared_image(&column_names, sql_values)?,
+                old: None,
+            })
+        }) {
+            return vec![error];
+        }
 
         if let Some(result) = returning {
             match &mut combined_returning {
@@ -3417,6 +3949,10 @@ fn resolve_dml_value<'a>(
         ferrosa_row_bridge::parse_cql_type_in_keyspace(&col_meta.column_type, ks, schema)
             .map_err(|e| error_response("42704", &e.to_string()))?;
     let sql_value = substitute_param(sv, bound.params, bound.timestamp_micros)?;
+    crate::pg_constraint::check_column_value(meta, col_name, &sql_value)?;
+    if crate::pg_enum::column_enum(meta, col_name).is_some() {
+        crate::pg_enum::check_value(&schema.snapshot(), meta, col_name, &sql_value)?;
+    }
     let value = value_to_cql(&sql_value, &cql_type, bound.jsonb_limits)?;
     Ok((col_meta, sql_value, value))
 }
@@ -3453,6 +3989,9 @@ struct UpdateTarget<'a> {
     upd: &'a UpdateStmt,
     params: &'a [SqlValue],
     jsonb_limits: &'a ferrosa_jsonb::Limits,
+    row_events: crate::procedural::triggers::EventSink<'a>,
+    /// The column names this statement's trigger images share (empty without triggers).
+    column_names: &'a crate::procedural::triggers::ColumnNames,
 }
 
 /// The context a resolved-row `DELETE` write runs against.
@@ -3657,7 +4196,7 @@ fn complete_tag(command: &str, rows: usize) -> Vec<BackendMessage> {
 }
 
 /// The current-micros timestamp a DML mutation is stamped with.
-fn dml_timestamp() -> i64 {
+pub(crate) fn dml_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
@@ -3682,10 +4221,15 @@ fn collect_set_columns(expr: &SetExpr, out: &mut Vec<String>) {
 fn current_image_for_set(
     row: &ResolvedRow,
     upd: &UpdateStmt,
+    meta: &ferrosa_schema::TableMetadata,
 ) -> Result<std::collections::HashMap<String, SqlValue>, BackendMessage> {
     let mut referenced = Vec::new();
     for (_, expr) in &upd.assignments {
         collect_set_columns(expr, &mut referenced);
+    }
+    // A CHECK spans columns the SET may not name: it is evaluated on the complete new row.
+    if !crate::pg_constraint::checks(meta).is_empty() {
+        referenced = meta.columns.keys().cloned().collect();
     }
     let mut image = std::collections::HashMap::new();
     for name in referenced {
@@ -3701,6 +4245,25 @@ fn current_image_for_set(
     Ok(image)
 }
 
+/// A resolved row's whole image as SQL values (a trigger's `OLD`). The names are the
+/// statement's shared ones, so no string is copied.
+fn full_image(
+    row: &ResolvedRow,
+    names: &crate::procedural::triggers::ColumnNames,
+) -> Result<crate::procedural::triggers::RowImage, BackendMessage> {
+    let mut image = crate::procedural::triggers::RowImage::with_capacity(row.values.len());
+    for (name, cql) in &row.values {
+        let sql = crate::storage_provider::cql_to_value(cql).map_err(|error| {
+            error_response(
+                "58000",
+                &format!("UPDATE cannot represent stored column \"{name}\": {error}"),
+            )
+        })?;
+        image.insert(crate::procedural::triggers::shared_name(names, name)?, sql);
+    }
+    Ok(image)
+}
+
 /// Build the storage mutation a resolved-row `UPDATE` writes for ONE row. `current` is
 /// the row image the SET expressions evaluate against (the resolved row for the
 /// index/scan path, the committed row for the storage-key path).
@@ -3709,7 +4272,7 @@ fn build_update_mutation(
     pk_values: &[CqlValue],
     ck_values: &[CqlValue],
     current: Option<&std::collections::HashMap<String, SqlValue>>,
-) -> Result<Mutation, BackendMessage> {
+) -> Result<(Mutation, Vec<(String, SqlValue)>), BackendMessage> {
     let meta = ctx.meta;
     // SET assignments -> regular/static cells (by storage index).
     let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
@@ -3718,6 +4281,8 @@ fn build_update_mutation(
     // UPDATE does not touch keeps its already-valid old value and needs no check).
     let mut assigned: std::collections::HashMap<String, CqlValue> =
         std::collections::HashMap::new();
+    // The SQL values assigned, for a trigger's NEW (D13).
+    let mut assigned_sql: Vec<(String, SqlValue)> = Vec::with_capacity(ctx.upd.assignments.len());
     for (col_name, expr) in &ctx.upd.assignments {
         let col_meta = meta.columns.get(col_name).ok_or_else(|| {
             error_response(
@@ -3735,7 +4300,12 @@ fn build_update_mutation(
         )
         .map_err(|error| error_response("42704", &error.to_string()))?;
         let sql_value = eval_set_expr(expr, current, ctx.params, ctx.timestamp_micros)?;
+        crate::pg_constraint::check_column_value(meta, col_name, &sql_value)?;
+        if crate::pg_enum::column_enum(meta, col_name).is_some() {
+            crate::pg_enum::check_value(&ctx.schema.snapshot(), meta, col_name, &sql_value)?;
+        }
         let value = value_to_cql(&sql_value, &cql_type, ctx.jsonb_limits)?;
+        assigned_sql.push((col_name.clone(), sql_value)); // the column name is borrowed from the statement
         if !matches!(col_meta.kind, ColumnKind::Regular | ColumnKind::Static) {
             return Err(error_response(
                 "0A000",
@@ -3759,17 +4329,66 @@ fn build_update_mutation(
     {
         return Err(error_response(&code, &message));
     }
+    check_updated_row(ctx, current, &assigned)?;
     let timestamp = dml_timestamp();
     let key = ferrosa_row_bridge::build_decorated_key(pk_values, &[])
         .map_err(|error| error_response("22000", &error.to_string()))?;
     let row = ferrosa_row_bridge::build_row(&regular_cells, ck_values, timestamp, None);
-    Ok(Mutation::new(
+    let mutation = Mutation::new(
         ctx.ks.to_string(),
         ctx.table.to_string(),
         key,
         vec![row],
         timestamp,
-    ))
+    );
+    Ok((mutation, assigned_sql))
+}
+
+/// D13: queue an UPDATE's row event when the table has triggers. `old` is the full row before
+/// the update; `NEW` is `old` with the assigned values over it.
+fn record_update_event(
+    ctx: &UpdateTarget<'_>,
+    old: crate::procedural::triggers::RowImage,
+    assigned: Vec<(String, SqlValue)>,
+) -> Result<(), BackendMessage> {
+    crate::procedural::triggers::record(ctx.row_events, ctx.meta, || {
+        let mut new = old.clone(); // OLD and NEW are both bound: two images of the row
+        let mut set_columns = Vec::with_capacity(assigned.len());
+        for (column, value) in assigned {
+            new.insert(
+                crate::procedural::triggers::shared_name(ctx.column_names, &column)?,
+                value,
+            );
+            set_columns.push(column);
+        }
+        Ok(crate::procedural::triggers::RowEvent {
+            keyspace: ctx.ks.to_string(),
+            table: ctx.table.to_string(),
+            op: crate::procedural::triggers::RowOp::Update { set_columns },
+            new,
+            old: Some(old),
+        })
+    })
+}
+
+/// Evaluate the table's CHECKs on the complete new row: the current row image (which holds
+/// every column when the table has a CHECK) overlaid with the assigned values.
+fn check_updated_row(
+    ctx: &UpdateTarget<'_>,
+    current: Option<&std::collections::HashMap<String, SqlValue>>,
+    assigned: &std::collections::HashMap<String, CqlValue>,
+) -> Result<(), BackendMessage> {
+    if crate::pg_constraint::checks(ctx.meta).is_empty() {
+        return Ok(());
+    }
+    // The check needs its own row: the current image is still read by the caller.
+    let mut row = current.cloned().unwrap_or_default();
+    for (name, value) in assigned {
+        let value = crate::storage_provider::cql_to_value(value)
+            .map_err(|e| error_response("XX000", &e))?;
+        row.insert(name.clone(), value);
+    }
+    crate::pg_constraint::check_checks(ctx.schema, ctx.meta, &row)
 }
 
 /// Initial candidate selection is a statement snapshot plus own writes. The
@@ -4003,7 +4622,7 @@ async fn delete_read_committed(
 
 /// Take local RC ownership before any property-dependent evaluation. Default
 /// lock waiting has no timeout; transaction lifetime is an independent bound.
-async fn own_row(
+pub(crate) async fn own_row(
     mvcc: Option<&MvccManager>,
     txn: Option<&mut TxnWriteSet>,
     id: uuid::Uuid,
@@ -4086,9 +4705,14 @@ async fn apply_update_row(
     } else {
         row
     };
-    let image = current_image_for_set(row, ctx.upd).map_err(|message| vec![message])?;
-    let mutation = build_update_mutation(ctx, &row.pk_values, &row.ck_values, Some(&image))
-        .map_err(|message| vec![message])?;
+    let image = current_image_for_set(row, ctx.upd, ctx.meta).map_err(|message| vec![message])?;
+    let (mutation, assigned) =
+        build_update_mutation(ctx, &row.pk_values, &row.ck_values, Some(&image))
+            .map_err(|message| vec![message])?;
+    if ctx.row_events.is_some() && crate::procedural::triggers::has_triggers(ctx.meta) {
+        let old = full_image(row, ctx.column_names).map_err(|message| vec![message])?;
+        record_update_event(ctx, old, assigned).map_err(|message| vec![message])?;
+    }
     apply_or_buffer_silent(
         ctx.engine,
         ctx.schema,
@@ -4189,7 +4813,7 @@ async fn update_rows_by_predicate(
 }
 
 /// Build the storage mutation a resolved-row `DELETE` writes for ONE row.
-fn build_delete_mutation(
+pub(crate) fn build_delete_mutation(
     ks: &str,
     table: &str,
     pk_values: &[CqlValue],
@@ -4391,6 +5015,7 @@ pub(crate) async fn execute_update(
         default_schema,
         mut txn,
         jsonb_limits,
+        row_events,
     } = context;
 
     // UPDATE ... RETURNING is out of scope for this PR (only INSERT RETURNING is
@@ -4414,6 +5039,8 @@ pub(crate) async fn execute_update(
             )]
         }
     };
+    // D13: the column names every trigger image of this statement shares.
+    let column_names = crate::procedural::triggers::column_names(meta);
 
     // Resolve every WHERE equality to its CQL value FIRST: an arithmetic SET needs the
     // key before it can read the row it updates. A WHERE that does not name the storage
@@ -4453,6 +5080,8 @@ pub(crate) async fn execute_update(
             upd,
             params,
             jsonb_limits,
+            row_events,
+            column_names: &column_names,
         };
         return update_read_committed(&target, buffer, &where_values).await;
     }
@@ -4471,6 +5100,8 @@ pub(crate) async fn execute_update(
             upd,
             params,
             jsonb_limits,
+            row_events,
+            column_names: &column_names,
         };
         return update_rows_by_predicate(&target, txn, &where_values).await;
     }
@@ -4503,10 +5134,16 @@ pub(crate) async fn execute_update(
 
     // Does any SET value read a column of the row being updated? Only then is the
     // row read (a read-modify-write); a constant SET never touches storage here.
-    let needs_read = upd
-        .assignments
-        .iter()
-        .any(|(_, expr)| expr.references_column());
+    // A table with a CHECK is read too: a check spans columns the SET may not name, so it is
+    // evaluated on the complete new row (`pg_constraint`).
+    let has_checks = !crate::pg_constraint::checks(meta).is_empty();
+    let needs_read = has_checks
+        || upd
+            .assignments
+            .iter()
+            .any(|(_, expr)| expr.references_column())
+        // D13: a trigger needs the whole OLD row.
+        || (row_events.is_some() && crate::procedural::triggers::has_triggers(meta));
     let current: Option<HashMap<String, SqlValue>> = if needs_read {
         match read_current_row_for_update(
             engine,
@@ -4537,11 +5174,25 @@ pub(crate) async fn execute_update(
         upd,
         params,
         jsonb_limits,
+        row_events,
+        column_names: &column_names,
     };
-    let mutation = match build_update_mutation(&target, &pk_values, &ck_values, current.as_ref()) {
-        Ok(mutation) => mutation,
-        Err(msg) => return vec![msg],
-    };
+    let (mutation, assigned) =
+        match build_update_mutation(&target, &pk_values, &ck_values, current.as_ref()) {
+            Ok(built) => built,
+            Err(msg) => return vec![msg],
+        };
+    // A row that does not exist has no OLD and is not an affected row: no trigger event.
+    let fires = row_events.is_some() && crate::procedural::triggers::has_triggers(meta);
+    if let Some(old) = current.filter(|_| fires) {
+        let old = match crate::procedural::triggers::shared_image(&column_names, old) {
+            Ok(old) => old,
+            Err(error) => return vec![error],
+        };
+        if let Err(error) = record_update_event(&target, old, assigned) {
+            return vec![error];
+        }
+    }
     apply_or_buffer(
         engine,
         schema,
@@ -4566,7 +5217,7 @@ pub(crate) async fn execute_update(
 /// The read is a normal point read of the row's storage, so the engine records it in
 /// the read set a serializable COMMIT validates — a concurrent writer of the same row
 /// fails that commit rather than silently losing this update.
-fn read_current_row_for_update(
+pub(crate) fn read_current_row_for_update(
     engine: &StorageEngine,
     schema: &Schema,
     ks: &str,
@@ -4807,6 +5458,7 @@ pub(crate) async fn execute_delete(
         default_schema,
         mut txn,
         jsonb_limits,
+        row_events: _,
     } = context;
 
     // DELETE ... RETURNING is out of scope for this PR. Fail loud.
@@ -5172,6 +5824,7 @@ fn value_column_type(v: &SqlValue) -> ColumnType {
         SqlValue::Jsonb(_) => ColumnType::Jsonb,
         SqlValue::JsonPath(_) => ColumnType::JsonPath,
         SqlValue::TextArray(_) => ColumnType::TextArray,
+        SqlValue::Array(array) => ColumnType::Array(array.elem),
     }
 }
 
@@ -5234,7 +5887,8 @@ fn exact_point_lookup(
     limits: &ferrosa_jsonb::Limits,
 ) -> Option<crate::storage_provider::PointLookup> {
     use ferrosa_sql::{CmpOp, Expr, Operand, Term};
-    if select.join.is_some() {
+    // One relation only: a join, subquery or CTE reads others.
+    if select.tables().len() != 1 {
         return None;
     }
     let Expr::Compare {
@@ -5338,9 +5992,19 @@ pub(crate) async fn load_catalog_with_mvcc(
     // One slot per query: every provider records into it, and the query layer
     // takes it once after `execute` returns.
     let failure = ScanFailure::default();
-    let referenced: Vec<&ferrosa_sql::ast::TableRef> = std::iter::once(&stmt.from)
-        .chain(stmt.join.as_ref().map(|j| &j.table))
-        .collect();
+    // Every relation the statement reads, including joins, subqueries and CTE
+    // bodies, each once (a self-join names the same table twice).
+    let mut referenced: Vec<&ferrosa_sql::ast::TableRef> = Vec::new();
+    for t in stmt.tables() {
+        let same = |r: &&ferrosa_sql::ast::TableRef| {
+            r.table == t.table
+                && r.schema.as_deref().unwrap_or(default_schema)
+                    == t.schema.as_deref().unwrap_or(default_schema)
+        };
+        if !referenced.iter().any(same) {
+            referenced.push(t);
+        }
+    }
     // `pg_catalog.<relation>` is not stored: it is a projection built from the live
     // schema. Build the six catalog tables once when a referenced relation asks for
     // one, and serve each from that projection — an unresolvable column type is a
@@ -5359,6 +6023,12 @@ pub(crate) async fn load_catalog_with_mvcc(
     for table_ref in referenced {
         let keyspace = table_ref.schema.as_deref().unwrap_or(default_schema);
         if keyspace == PG_CATALOG {
+            if let Some(streamed) =
+                crate::catalog_stream::streamed_catalog_table(&table_ref.table, schema)
+            {
+                catalog = catalog.with_table(keyspace, &table_ref.table, streamed);
+                continue;
+            }
             let Some(table) = catalog_tables
                 .as_ref()
                 .and_then(|tables| tables.iter().find(|(name, _)| name == &table_ref.table))
@@ -5513,6 +6183,94 @@ pub(crate) fn render_execute_result(
 
 #[cfg(test)]
 mod tests {
+    // -- arrays on the wire ------------------------------------------------------
+
+    fn array(elem: ferrosa_sql::ArrayElem, items: Vec<SqlValue>) -> SqlValue {
+        SqlValue::Array(ferrosa_sql::ArrayValue::new(elem, items))
+    }
+
+    #[test]
+    fn array_text_output_quotes_like_array_out() {
+        use ferrosa_sql::ArrayElem::*;
+        let cases = [
+            (
+                array(
+                    BigInt,
+                    vec![SqlValue::Int(1), SqlValue::Null, SqlValue::Int(-3)],
+                ),
+                "{1,NULL,-3}",
+            ),
+            (array(Text, vec![]), "{}"),
+            (
+                array(
+                    Text,
+                    vec![
+                        SqlValue::Text("plain".into()),
+                        SqlValue::Text(String::new().into()),
+                        SqlValue::Text("null".into()),
+                        SqlValue::Text("a b".into()),
+                        SqlValue::Text("x,y".into()),
+                        SqlValue::Text("q\"\\".into()),
+                    ],
+                ),
+                r#"{plain,"","null","a b","x,y","q\"\\"}"#,
+            ),
+        ];
+        for (value, expected) in cases {
+            let text = super::render_value(&value)
+                .expect("renders")
+                .expect("not null");
+            assert_eq!(String::from_utf8(text).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn array_binary_output_is_array_send() {
+        use ferrosa_sql::ArrayElem::*;
+        let bytes = super::encode_value(
+            1,
+            ColumnType::Array(BigInt),
+            &array(BigInt, vec![SqlValue::Int(7), SqlValue::Null]),
+        )
+        .unwrap()
+        .unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&1i32.to_be_bytes()); // ndim
+        expected.extend_from_slice(&1i32.to_be_bytes()); // has a NULL
+        expected.extend_from_slice(&20u32.to_be_bytes()); // int8
+        expected.extend_from_slice(&2i32.to_be_bytes()); // length
+        expected.extend_from_slice(&1i32.to_be_bytes()); // lower bound
+        expected.extend_from_slice(&8i32.to_be_bytes());
+        expected.extend_from_slice(&7i64.to_be_bytes());
+        expected.extend_from_slice(&(-1i32).to_be_bytes());
+        assert_eq!(bytes, expected);
+
+        let empty = super::encode_value(1, ColumnType::Array(Text), &array(Text, vec![]))
+            .unwrap()
+            .unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&0i32.to_be_bytes());
+        expected.extend_from_slice(&0i32.to_be_bytes());
+        expected.extend_from_slice(&25u32.to_be_bytes());
+        assert_eq!(empty, expected, "an empty array has no dimensions");
+    }
+
+    #[test]
+    fn oid_array_elements_are_unsigned() {
+        // Synthetic OIDs live in [16384, u32::MAX]; one above i32::MAX must encode,
+        // as the 4 unsigned bytes PostgreSQL's oid_send produces.
+        let big = i64::from(u32::MAX - 5);
+        let bytes = super::encode_value(
+            1,
+            ColumnType::Array(ferrosa_sql::ArrayElem::Oid),
+            &array(ferrosa_sql::ArrayElem::Oid, vec![SqlValue::Int(big)]),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(&bytes[8..12], &26u32.to_be_bytes(), "element type is oid");
+        assert_eq!(&bytes[24..28], &(u32::MAX - 5).to_be_bytes());
+    }
+
     use super::*;
     use ferrosa_sql::Value as SqlValue;
 
@@ -5544,6 +6302,25 @@ mod tests {
         assert_eq!(&*cache.key_for("ks", "a").1, "a");
         assert_eq!(&*cache.key_for("ks", "b").1, "b");
         assert_eq!(&*cache.key_for("other", "b").0, "other");
+    }
+
+    /// Synthetic catalog OIDs lie in [16384, 2^32). An `oid` column (OID 26) is an
+    /// UNSIGNED 4-byte value: one at or above 2^31 must encode, not fail as an
+    /// int4 would, and must round-trip through Bind (Lean: `Pg/Oid.lean`).
+    #[test]
+    fn an_oid_above_two_to_the_31_encodes_and_decodes_as_unsigned() {
+        let big = SqlValue::Int(i64::from(u32::MAX) - 5);
+        assert_eq!(column_type_oid(ColumnType::Oid), 26);
+        let bytes = encode_value(1, ColumnType::Oid, &big).expect("binary oid");
+        assert_eq!(bytes, (u32::MAX - 5).to_be_bytes().to_vec());
+        assert_eq!(decode_param(1, 26, Some(&bytes)), big);
+        assert_eq!(
+            encode_value(0, ColumnType::Oid, &big),
+            Some((u32::MAX - 5).to_string().into_bytes())
+        );
+        // Outside [0, 2^32) is not an oid: refused, never wrapped.
+        assert!(super::encode_value(1, ColumnType::Oid, &SqlValue::Int(-1)).is_err());
+        assert!(super::encode_value(1, ColumnType::Oid, &SqlValue::Int(1 << 32)).is_err());
     }
 
     fn encode_value(format: i16, col_type: ColumnType, value: &SqlValue) -> Option<Vec<u8>> {
@@ -6529,7 +7306,7 @@ mod tests {
 
     /// Parse a no-`FROM` expression select the way the wire path does.
     fn parsed_scalar_items(sql: &str) -> Vec<ScalarItem> {
-        match parse_statement(sql) {
+        match ferrosa_sql::parse_statement(sql) {
             Ok(Statement::SelectExprs(items)) => items,
             other => panic!("`{sql}` must be an expression select, got {other:?}"),
         }
@@ -7286,7 +8063,7 @@ mod txn_buffer_tests {
     }
 
     fn alter(sql: &str) -> ferrosa_sql::AlterTableStmt {
-        match parse_statement(sql) {
+        match ferrosa_sql::parse_statement(sql) {
             Ok(Statement::AlterTable(a)) => *a,
             other => panic!("expected AlterTable, got {other:?}"),
         }
@@ -7299,8 +8076,9 @@ mod txn_buffer_tests {
             crate::ddl::DdlEnv {
                 executor: Some(ddl),
                 schema,
+                view: schema.snapshot(),
                 default_schema: "public",
-                in_txn: false,
+                probe: None,
             },
             &stmt,
         )
@@ -10071,6 +10849,108 @@ mod scalar_subquery_tests {
         })
     }
 
+    /// The DataRow cells of a reply, as text.
+    fn text_rows(messages: &[BackendMessage]) -> Vec<Vec<Option<String>>> {
+        messages
+            .iter()
+            .filter_map(|m| match m {
+                BackendMessage::DataRow { columns } => Some(
+                    columns
+                        .iter()
+                        .map(|c| c.as_ref().map(|b| String::from_utf8_lossy(b).into_owned()))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_general_select_runs_through_the_front_end() {
+        let (_dir, engine, schema) = new_engine();
+        seed(&engine, &schema, "pgbench_accounts", 3).await;
+        seed(&engine, &schema, "pgbench_tellers", 1).await;
+        let msgs = run(
+            &engine,
+            &schema,
+            "SELECT a.k, a.pad || '!', t.k FROM pgbench_accounts AS a \
+             LEFT JOIN pgbench_tellers AS t ON t.k = a.k \
+             WHERE a.k IN ('k0', 'k2') ORDER BY a.k",
+        )
+        .await;
+        assert_eq!(error_sqlstate(&msgs), None, "{msgs:?}");
+        let some = |s: &str| Some(s.to_string());
+        assert_eq!(
+            text_rows(&msgs),
+            vec![
+                vec![some("k0"), some("p!"), some("k0")],
+                vec![some("k2"), some("p!"), None],
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expression_error_reaches_the_client_with_its_sqlstate() {
+        let (_dir, engine, schema) = new_engine();
+        seed(&engine, &schema, "pgbench_accounts", 2).await;
+        let msgs = run(
+            &engine,
+            &schema,
+            "SELECT k FROM pgbench_accounts WHERE char_length(pad) / 0 > 1",
+        )
+        .await;
+        assert_eq!(error_sqlstate(&msgs).as_deref(), Some("22012"), "{msgs:?}");
+        let msgs = run(
+            &engine,
+            &schema,
+            "SELECT pad::nowhere FROM pgbench_accounts",
+        )
+        .await;
+        assert_eq!(error_sqlstate(&msgs).as_deref(), Some("0A000"), "{msgs:?}");
+    }
+
+    /// Postgrex's type bootstrap names `pg_type` and `pg_attribute` unqualified:
+    /// PostgreSQL searches `pg_catalog` first, and so must this front end.
+    #[tokio::test]
+    async fn unqualified_catalog_relations_resolve_in_pg_catalog() {
+        let (_dir, engine, schema) = new_engine();
+        let msgs = run(
+            &engine,
+            &schema,
+            "SELECT t.oid, t.typname, t.typsend, coalesce(d.typelem, t.typelem), ARRAY (
+               SELECT a.atttypid FROM pg_attribute AS a
+               WHERE a.attrelid = t.typrelid AND a.attnum > 0 AND NOT a.attisdropped
+               ORDER BY a.attnum)
+             FROM pg_type AS t LEFT JOIN pg_type AS d ON t.typbasetype = d.oid
+             WHERE (t.typrelid = 0)
+             AND (t.typelem = 0 OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_type s
+                  WHERE s.typrelid != 0 AND s.oid = t.typelem))
+             AND t.oid IN (23, 1007)",
+        )
+        .await;
+        assert_eq!(error_sqlstate(&msgs), None, "{msgs:?}");
+        let some = |s: &str| Some(s.to_string());
+        assert_eq!(
+            text_rows(&msgs),
+            vec![
+                vec![
+                    some("23"),
+                    some("int4"),
+                    some("int4send"),
+                    some("0"),
+                    some("{}")
+                ],
+                vec![
+                    some("1007"),
+                    some("_int4"),
+                    some("array_send"),
+                    some("23"),
+                    some("{}")
+                ],
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn pgbench_census_line_runs_end_to_end() {
         // The acceptance query: three `count(*)` scalar subqueries concatenated by
@@ -10122,7 +11002,7 @@ mod scalar_subquery_tests {
 
     /// Parse a single table `SELECT` for the agreement checks below.
     fn select_stmt(sql: &str) -> SelectStmt {
-        match parse_statement(sql).expect("parses") {
+        match ferrosa_sql::parse_statement(sql).expect("parses") {
             Statement::Select(stmt) => *stmt,
             other => panic!("expected a table SELECT, got {other:?}"),
         }

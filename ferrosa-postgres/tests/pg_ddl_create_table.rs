@@ -188,7 +188,9 @@ mod timestamp_regression {
         .await;
         assert_eq!(first.len(), 2);
         assert_eq!(first[0], first[1], "one transaction time for every row");
-        assert!((before_begin..=after_begin).contains(&first[0]));
+        // RETURNING reports the row as stored, and a `timestamp` cell keeps milliseconds.
+        assert!((before_begin / 1000 * 1000..=after_begin).contains(&first[0]));
+        assert_eq!(first[0] % 1000, 0, "RETURNING reports the stored precision");
         tokio::time::sleep(Duration::from_millis(30)).await;
         let second = timestamps(
             client,
@@ -204,7 +206,7 @@ mod timestamp_regression {
         client.batch_execute("COMMIT").await.unwrap();
         let stored = timestamps(client, "SELECT mtime FROM pgbench_history").await;
         assert_eq!(stored.len(), 3);
-        assert!(stored.iter().all(|value| *value == first[0] / 1000 * 1000));
+        assert!(stored.iter().all(|value| *value == first[0]));
     }
 
     #[tokio::test]
@@ -228,7 +230,8 @@ mod timestamp_regression {
         assert_eq!(row.columns()[0].type_(), &Type::TIMESTAMP);
         let first: SystemTime = row.get(0);
         let first_micros = first.duration_since(UNIX_EPOCH).unwrap().as_micros() as i64;
-        assert!((before_begin..=after_begin).contains(&first_micros));
+        // RETURNING reports the row as stored, and a `timestamp` cell keeps milliseconds.
+        assert!((before_begin / 1000 * 1000..=after_begin).contains(&first_micros));
         tokio::time::sleep(Duration::from_millis(30)).await;
         let current = timestamps(
             client,
@@ -400,6 +403,7 @@ async fn start_with(with_public: bool) -> Fixture {
         engine: engine.clone(),
     }));
     let ctx = Arc::new(QueryContext {
+        procedural: Default::default(),
         cluster_read: Default::default(),
         engine: engine.clone(),
         schema: schema.clone(),
@@ -696,10 +700,8 @@ async fn pg_ddl_create_table_named_refusals_survive_end_to_end() {
     let cases = [
         // (sql, expected sqlstate)
         ("CREATE TABLE t (id int PRIMARY KEY, v int UNIQUE)", "0A000"),
-        (
-            "CREATE TABLE t (id int PRIMARY KEY, v int DEFAULT 1)",
-            "0A000",
-        ),
+        // `DEFAULT` is no longer refused: it is recorded for the INSERT path
+        // (`pg_default`, Oban W3).
         (
             "CREATE TABLE t (id int PRIMARY KEY, v int CHECK (v > 0))",
             "0A000",
@@ -740,14 +742,15 @@ async fn pg_ddl_create_table_without_the_keyspace_is_3f000() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_ddl_create_table_inside_a_transaction_block_is_refused() {
+async fn pg_ddl_create_table_inside_a_transaction_block_is_buffered_and_rolled_back() {
+    // DDL inside BEGIN is transactional (`ddl_txn`): accepted and buffered, so ROLLBACK
+    // leaves no table behind. (It used to be refused with 25001.)
     let fx = start().await;
     fx.client.batch_execute("BEGIN").await.expect("BEGIN");
-    let result = fx
-        .client
+    fx.client
         .batch_execute("CREATE TABLE t (id int PRIMARY KEY)")
-        .await;
-    assert_eq!(sqlstate(result), "25001");
+        .await
+        .expect("CREATE TABLE inside a transaction block is buffered");
     fx.client.batch_execute("ROLLBACK").await.expect("ROLLBACK");
     assert!(!fx
         .schema

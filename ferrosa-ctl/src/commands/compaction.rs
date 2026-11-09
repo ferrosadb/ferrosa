@@ -3,7 +3,6 @@
 //! Last revised: 2026-09-27
 //! Last changed: Add compaction stop with optional table scope and HTTP Basic auth.
 
-use std::io::{BufRead, Read};
 use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
@@ -86,26 +85,9 @@ pub async fn stop(
     web_port: u16,
     keyspace: Option<&str>,
     table: Option<&str>,
-    username: Option<&str>,
-    password_stdin: bool,
+    credentials: Option<&crate::credentials::Credentials>,
 ) -> Result<(), WebError> {
-    let password = if username.is_some() {
-        if password_stdin {
-            let mut line = String::new();
-            // Passwords are one line; bound accidental file/pipe input as well.
-            let mut input = std::io::stdin().lock().take(4097);
-            input.read_line(&mut line)?;
-            if line.len() > 4096 {
-                return Err("password input exceeds 4096 bytes".into());
-            }
-            Some(line.trim_end_matches(['\r', '\n']).to_owned())
-        } else {
-            Some(crate::auth::prompt_password("Admin password: ")?)
-        }
-    } else {
-        None
-    };
-    let credentials = username.zip(password.as_deref());
+    let credentials = credentials.map(|c| (c.username.as_str(), c.password()));
     let report = send_stop(
         SocketAddr::new(cql_addr.ip(), web_port),
         keyspace,

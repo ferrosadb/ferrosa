@@ -13,9 +13,8 @@ use std::net::SocketAddr;
 use tabled::builder::Builder;
 use tabled::settings::Style;
 
-use ferrosa_cql::client::{CqlClient, QueryResult};
+use ferrosa_cql::client::QueryResult;
 use ferrosa_cql::error::CqlError;
-use std::io::{BufRead, Read};
 
 pub(crate) mod body;
 pub mod compaction;
@@ -76,8 +75,11 @@ pub fn print_empty(label: &str) {
 
 /// Show node status by querying `system_observability.connections` (row count
 /// gives a proxy for server health) and printing a brief summary.
-pub async fn run_status(addr: SocketAddr) -> Result<(), CqlError> {
-    let mut client = CqlClient::connect(addr).await?;
+pub async fn run_status(
+    addr: SocketAddr,
+    credentials: Option<&crate::credentials::Credentials>,
+) -> Result<(), CqlError> {
+    let mut client = crate::credentials::connect_cql(addr, credentials).await?;
     let result = client
         .query("SELECT * FROM system_observability.connections")
         .await?;
@@ -92,8 +94,12 @@ pub async fn run_status(addr: SocketAddr) -> Result<(), CqlError> {
 // ── connections ──────────────────────────────────────────────────────────────
 
 /// List active CQL connections, optionally sorting by a named column.
-pub async fn run_connections(addr: SocketAddr, sort: Option<&str>) -> Result<(), CqlError> {
-    let mut client = CqlClient::connect(addr).await?;
+pub async fn run_connections(
+    addr: SocketAddr,
+    sort: Option<&str>,
+    credentials: Option<&crate::credentials::Credentials>,
+) -> Result<(), CqlError> {
+    let mut client = crate::credentials::connect_cql(addr, credentials).await?;
     let mut result = client
         .query("SELECT * FROM system_observability.connections")
         .await?;
@@ -123,8 +129,12 @@ pub async fn run_connections(addr: SocketAddr, sort: Option<&str>) -> Result<(),
 
 /// List currently running queries; with `--long-running` flag, filter to
 /// queries that have been running longest (server determines threshold).
-pub async fn run_queries(addr: SocketAddr, long_running: bool) -> Result<(), CqlError> {
-    let mut client = CqlClient::connect(addr).await?;
+pub async fn run_queries(
+    addr: SocketAddr,
+    long_running: bool,
+    credentials: Option<&crate::credentials::Credentials>,
+) -> Result<(), CqlError> {
+    let mut client = crate::credentials::connect_cql(addr, credentials).await?;
     let mut result = client
         .query("SELECT * FROM system_observability.active_queries")
         .await?;
@@ -157,8 +167,11 @@ pub async fn run_queries(addr: SocketAddr, long_running: bool) -> Result<(), Cql
 // ── storage ──────────────────────────────────────────────────────────────────
 
 /// Show storage engine statistics from `system_observability.storage_stats`.
-pub async fn run_storage(addr: SocketAddr) -> Result<(), CqlError> {
-    let mut client = CqlClient::connect(addr).await?;
+pub async fn run_storage(
+    addr: SocketAddr,
+    credentials: Option<&crate::credentials::Credentials>,
+) -> Result<(), CqlError> {
+    let mut client = crate::credentials::connect_cql(addr, credentials).await?;
     let result = client
         .query("SELECT * FROM system_observability.storage_stats")
         .await?;
@@ -175,8 +188,11 @@ pub async fn run_storage(addr: SocketAddr) -> Result<(), CqlError> {
 
 /// Show ring topology. Queries a topology virtual table (placeholder until
 /// the cluster crate exposes one).
-pub async fn run_topology(addr: SocketAddr) -> Result<(), CqlError> {
-    let mut client = CqlClient::connect(addr).await?;
+pub async fn run_topology(
+    addr: SocketAddr,
+    credentials: Option<&crate::credentials::Credentials>,
+) -> Result<(), CqlError> {
+    let mut client = crate::credentials::connect_cql(addr, credentials).await?;
     // system.peers is the conventional Cassandra table; we mirror that.
     let result = client
         .query("SELECT peer, data_center, rack, tokens FROM system.peers")
@@ -193,8 +209,11 @@ pub async fn run_topology(addr: SocketAddr) -> Result<(), CqlError> {
 // ── peers ────────────────────────────────────────────────────────────────────
 
 /// List peer nodes from `system.peers`.
-pub async fn run_peers(addr: SocketAddr) -> Result<(), CqlError> {
-    let mut client = CqlClient::connect(addr).await?;
+pub async fn run_peers(
+    addr: SocketAddr,
+    credentials: Option<&crate::credentials::Credentials>,
+) -> Result<(), CqlError> {
+    let mut client = crate::credentials::connect_cql(addr, credentials).await?;
     let result = client
         .query("SELECT peer, data_center, rack, release_version FROM system.peers")
         .await?;
@@ -210,8 +229,12 @@ pub async fn run_peers(addr: SocketAddr) -> Result<(), CqlError> {
 // ── monitor ──────────────────────────────────────────────────────────────────
 
 /// Launch the interactive TUI monitor dashboard.
-pub async fn run_monitor(addr: SocketAddr, panel: Option<&str>) -> Result<(), CqlError> {
-    crate::tui::run(addr, panel.map(String::from))
+pub async fn run_monitor(
+    addr: SocketAddr,
+    panel: Option<&str>,
+    credentials: Option<&crate::credentials::Credentials>,
+) -> Result<(), CqlError> {
+    crate::tui::run(addr, panel.map(String::from), credentials)
         .await
         .map_err(|e| CqlError::Protocol(format!("TUI error: {e}")))?;
     Ok(())
@@ -303,11 +326,15 @@ pub type WebError = Box<dyn std::error::Error + Send + Sync>;
 /// Pre-approve a node for cluster join.
 ///
 /// Issues `POST /api/cluster/add-node` with a JSON body `{"host_id": …}`.
-pub async fn add_node(host: &str, web_port: u16, host_id: &str) -> Result<(), WebError> {
+pub async fn add_node(
+    host: &str,
+    web_port: u16,
+    host_id: &str,
+    credentials: Option<&crate::credentials::Credentials>,
+) -> Result<(), WebError> {
     let url = format!("http://{}:{}/api/cluster/add-node", host, web_port);
     let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
+    let resp = crate::credentials::authorize(client.post(&url), credentials)
         .json(&serde_json::json!({ "host_id": host_id }))
         .send()
         .await?;
@@ -337,14 +364,14 @@ pub async fn raft_transfer_leader(
     host: &str,
     web_port: u16,
     to_host_id: &str,
+    credentials: Option<&crate::credentials::Credentials>,
 ) -> Result<(), WebError> {
     let url = format!(
         "http://{}:{}/api/cluster/raft/transfer-leader",
         host, web_port
     );
     let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
+    let resp = crate::credentials::authorize(client.post(&url), credentials)
         .json(&serde_json::json!({ "to": to_host_id }))
         .send()
         .await?;
@@ -426,10 +453,13 @@ pub async fn cluster_downgrade_to_pair(
     host: &str,
     web_port: u16,
     peer: &str,
+    credentials: Option<&crate::credentials::Credentials>,
 ) -> Result<(), WebError> {
     let url = downgrade_to_pair_url(host, web_port, peer);
     let client = reqwest::Client::new();
-    let resp = client.post(&url).send().await?;
+    let resp = crate::credentials::authorize(client.post(&url), credentials)
+        .send()
+        .await?;
 
     let mut resp = resp;
     let status = resp.status();
@@ -461,11 +491,15 @@ pub async fn cluster_add_learner(
     host_id: &str,
     addr: &str,
     owns_tokens: bool,
+    credentials: Option<&crate::credentials::Credentials>,
 ) -> Result<(), WebError> {
     let url = add_learner_url(host, web_port);
     let body = add_learner_body(host_id, addr, owns_tokens);
     let client = reqwest::Client::new();
-    let resp = client.post(&url).json(&body).send().await?;
+    let resp = crate::credentials::authorize(client.post(&url), credentials)
+        .json(&body)
+        .send()
+        .await?;
 
     let mut resp = resp;
     let status = resp.status();
@@ -488,11 +522,15 @@ pub async fn cluster_promote_to_voter(
     host: &str,
     web_port: u16,
     host_id: &str,
+    credentials: Option<&crate::credentials::Credentials>,
 ) -> Result<(), WebError> {
     let url = promote_to_voter_url(host, web_port);
     let body = promote_to_voter_body(host_id);
     let client = reqwest::Client::new();
-    let resp = client.post(&url).json(&body).send().await?;
+    let resp = crate::credentials::authorize(client.post(&url), credentials)
+        .json(&body)
+        .send()
+        .await?;
 
     let mut resp = resp;
     let status = resp.status();
@@ -514,11 +552,15 @@ pub async fn cluster_demote_to_learner(
     host: &str,
     web_port: u16,
     host_id: &str,
+    credentials: Option<&crate::credentials::Credentials>,
 ) -> Result<(), WebError> {
     let url = demote_to_learner_url(host, web_port);
     let body = demote_to_learner_body(host_id);
     let client = reqwest::Client::new();
-    let resp = client.post(&url).json(&body).send().await?;
+    let resp = crate::credentials::authorize(client.post(&url), credentials)
+        .json(&body)
+        .send()
+        .await?;
 
     let mut resp = resp;
     let status = resp.status();
@@ -548,6 +590,7 @@ pub async fn decommission(
     host: &str,
     web_port: u16,
     host_id: Option<&str>,
+    credentials: Option<&crate::credentials::Credentials>,
 ) -> Result<(), WebError> {
     let url = format!("http://{}:{}/api/cluster/decommission", host, web_port);
     let client = reqwest::Client::new();
@@ -557,7 +600,10 @@ pub async fn decommission(
         None => serde_json::json!({}),
     };
 
-    let mut resp = client.post(&url).json(&body).send().await?;
+    let mut resp = crate::credentials::authorize(client.post(&url), credentials)
+        .json(&body)
+        .send()
+        .await?;
     if resp.status().is_success() {
         let verdict = match host_id {
             Some(id) => format!("Node {id} decommissioned."),
@@ -572,10 +618,16 @@ pub async fn decommission(
 /// Show token ring distribution.
 ///
 /// Issues `GET /api/cluster/ring` and renders the response as a table.
-pub async fn ring(host: &str, web_port: u16) -> Result<(), WebError> {
+pub async fn ring(
+    host: &str,
+    web_port: u16,
+    credentials: Option<&crate::credentials::Credentials>,
+) -> Result<(), WebError> {
     let url = format!("http://{}:{}/api/cluster/ring", host, web_port);
     let client = reqwest::Client::new();
-    let resp = client.get(&url).send().await?;
+    let resp = crate::credentials::authorize(client.get(&url), credentials)
+        .send()
+        .await?;
     if !resp.status().is_success() {
         return Err(body::error_from_body(resp, "ring failed").await);
     }
@@ -612,7 +664,7 @@ fn print_ring_stream(
         type Value = u64;
 
         fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("a JSON array of ring entries")
+            f.write_str("a JSON array of ring entries, or an object with a `nodes` array")
         }
 
         fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<u64, A::Error> {
@@ -643,13 +695,59 @@ fn print_ring_stream(
             }
             Ok(rows)
         }
+
+        /// The server's shape: `{"nodes": [...], "data_scatter_risk": [...]}`.
+        /// `nodes` streams through [`Self::visit_seq`]; a non-empty scatter
+        /// risk is printed after the table; other keys are ignored.
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<u64, A::Error> {
+            let out = self.out;
+            let mut rows = None;
+            let mut scatter: Option<serde_json::Value> = None;
+            while let Some(key) = map.next_key::<String>()? {
+                match key.as_str() {
+                    "nodes" => rows = Some(map.next_value_seed(NodeRows { out: &mut *out })?),
+                    "data_scatter_risk" => scatter = Some(map.next_value()?),
+                    _ => {
+                        map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+            }
+            let rows = rows.ok_or_else(|| A::Error::missing_field("nodes"))?;
+            let at_risk = scatter
+                .as_ref()
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|risk| !risk.is_empty());
+            if at_risk {
+                writeln!(
+                    out,
+                    "WARNING data scatter risk: {}",
+                    scatter.unwrap_or_default()
+                )
+                .map_err(A::Error::custom)?;
+            }
+            Ok(rows)
+        }
+    }
+
+    /// The `nodes` array of the object form; always a sequence.
+    struct NodeRows<'o> {
+        out: &'o mut dyn std::io::Write,
+    }
+
+    impl<'de> DeserializeSeed<'de> for NodeRows<'_> {
+        type Value = u64;
+
+        fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<u64, D::Error> {
+            d.deserialize_seq(RingRows { out: self.out })
+        }
     }
 
     impl<'de> DeserializeSeed<'de> for RingRows<'_> {
         type Value = u64;
 
         fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<u64, D::Error> {
-            d.deserialize_seq(self)
+            // A bare array (older servers and the tests) or the object form.
+            d.deserialize_any(self)
         }
     }
 
@@ -673,13 +771,13 @@ pub async fn repair(
     keyspace: &str,
     table: &str,
     rf: usize,
+    credentials: Option<&crate::credentials::Credentials>,
 ) -> Result<(), WebError> {
     let url = format!(
         "http://{host}:{web_port}/api/cluster/repair?keyspace={keyspace}&table={table}&rf={rf}"
     );
     let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
+    let resp = crate::credentials::authorize(client.post(&url), credentials)
         .json(&serde_json::json!({}))
         .send()
         .await?;
@@ -695,11 +793,14 @@ pub async fn repair(
 /// Rebalance token distribution across the cluster.
 ///
 /// Issues `POST /api/cluster/rebalance` with an empty body.
-pub async fn rebalance(host: &str, web_port: u16) -> Result<(), WebError> {
+pub async fn rebalance(
+    host: &str,
+    web_port: u16,
+    credentials: Option<&crate::credentials::Credentials>,
+) -> Result<(), WebError> {
     let url = format!("http://{}:{}/api/cluster/rebalance", host, web_port);
     let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
+    let resp = crate::credentials::authorize(client.post(&url), credentials)
         .json(&serde_json::json!({}))
         .send()
         .await?;
@@ -726,13 +827,17 @@ pub async fn snapshot_create(
     web_port: u16,
     name: &str,
     ttl_hours: Option<u64>,
+    credentials: Option<&crate::credentials::Credentials>,
 ) -> Result<(), WebError> {
     let url = format!("http://{host}:{web_port}/api/snapshots");
     let mut body = serde_json::json!({ "name": name });
     if let Some(ttl) = ttl_hours {
         body["ttl_hours"] = serde_json::json!(ttl);
     }
-    let mut resp = reqwest::Client::new().post(&url).json(&body).send().await?;
+    let mut resp = crate::credentials::authorize(reqwest::Client::new().post(&url), credentials)
+        .json(&body)
+        .send()
+        .await?;
     if resp.status().is_success() {
         body::print_with_body(&mut resp, &format!("Snapshot '{name}' created:")).await
     } else {
@@ -741,9 +846,15 @@ pub async fn snapshot_create(
 }
 
 /// List snapshots on the target node.
-pub async fn snapshot_list(host: &str, web_port: u16) -> Result<(), WebError> {
+pub async fn snapshot_list(
+    host: &str,
+    web_port: u16,
+    credentials: Option<&crate::credentials::Credentials>,
+) -> Result<(), WebError> {
     let url = format!("http://{host}:{web_port}/api/snapshots");
-    let mut resp = reqwest::Client::new().get(&url).send().await?;
+    let mut resp = crate::credentials::authorize(reqwest::Client::new().get(&url), credentials)
+        .send()
+        .await?;
     if resp.status().is_success() {
         body::copy_body(&mut resp, &mut std::io::stdout().lock()).await?;
         Ok(())
@@ -753,9 +864,16 @@ pub async fn snapshot_list(host: &str, web_port: u16) -> Result<(), WebError> {
 }
 
 /// Delete a snapshot on the target node.
-pub async fn snapshot_delete(host: &str, web_port: u16, name: &str) -> Result<(), WebError> {
+pub async fn snapshot_delete(
+    host: &str,
+    web_port: u16,
+    name: &str,
+    credentials: Option<&crate::credentials::Credentials>,
+) -> Result<(), WebError> {
     let url = format!("http://{host}:{web_port}/api/snapshots/{name}");
-    let mut resp = reqwest::Client::new().delete(&url).send().await?;
+    let mut resp = crate::credentials::authorize(reqwest::Client::new().delete(&url), credentials)
+        .send()
+        .await?;
     if resp.status().is_success() {
         body::print_with_body(&mut resp, &format!("Snapshot '{name}' deleted.")).await
     } else {
@@ -772,6 +890,7 @@ pub async fn restore(
     snapshot_name: &str,
     point_in_time: Option<&str>,
     force: bool,
+    credentials: Option<&crate::credentials::Credentials>,
 ) -> Result<(), WebError> {
     let url = format!("http://{host}:{web_port}/api/restore");
     let mut body = serde_json::json!({
@@ -781,7 +900,10 @@ pub async fn restore(
     if let Some(pit) = point_in_time {
         body["point_in_time"] = serde_json::json!(pit);
     }
-    let mut resp = reqwest::Client::new().post(&url).json(&body).send().await?;
+    let mut resp = crate::credentials::authorize(reqwest::Client::new().post(&url), credentials)
+        .json(&body)
+        .send()
+        .await?;
     if resp.status().is_success() {
         body::print_with_body(&mut resp, "Restore initiated:").await
     } else {
@@ -1027,16 +1149,13 @@ pub fn cluster_bootstrap_dc(
 /// Read one node's independently-reported schema version and host id.
 async fn fetch_reported_schema_version(
     endpoint: &str,
-    username: Option<&str>,
-    password: Option<&str>,
+    credentials: Option<&crate::credentials::Credentials>,
 ) -> Result<(uuid::Uuid, Option<uuid::Uuid>), WebError> {
     let url = format!("http://{endpoint}/admin/membership-snapshot");
     let client = reqwest::Client::new();
-    let mut req = client.get(&url);
-    if let Some(u) = username {
-        req = req.basic_auth(u, password);
-    }
-    let resp = req.send().await?;
+    let resp = crate::credentials::authorize(client.get(&url), credentials)
+        .send()
+        .await?;
     if !resp.status().is_success() {
         let what = format!(
             "{endpoint}: `/admin/*` is auth-protected; pass --username (and \
@@ -1109,35 +1228,13 @@ fn parse_membership_snapshot(
 /// bootstrap phase's own rule, so the gate and the phase cannot drift apart.
 pub async fn schema_check(
     nodes: &[String],
-    username: Option<&str>,
-    password_stdin: bool,
+    credentials: Option<&crate::credentials::Credentials>,
 ) -> Result<(), WebError> {
     use ferrosa_cluster::controller::bootstrap::replay_schema::{postcondition, ReplaySchemaState};
 
     if nodes.is_empty() {
         return Err("pass at least one node with --nodes <host:port,...>".into());
     }
-
-    // Same password resolution as `compaction stop`: stdin when asked (for
-    // scripting), otherwise an interactive no-echo prompt. `/admin/*` sits behind
-    // the auth middleware, so a check that cannot authenticate is not a check.
-    let password = if username.is_some() {
-        if password_stdin {
-            let mut line = String::new();
-            // Passwords are one line; bound accidental file/pipe input as well.
-            let mut input = std::io::stdin().lock().take(4097);
-            input.read_line(&mut line)?;
-            if line.len() > 4096 {
-                return Err("password input exceeds 4096 bytes".into());
-            }
-            Some(line.trim_end_matches(['\r', '\n']).to_owned())
-        } else {
-            Some(crate::auth::prompt_password("Admin password: ")?)
-        }
-    } else {
-        None
-    };
-    let password = password.as_deref();
 
     let mut versions: std::collections::BTreeMap<u64, uuid::Uuid> = Default::default();
     let mut labels: std::collections::BTreeMap<u64, (String, Option<uuid::Uuid>)> =
@@ -1150,7 +1247,7 @@ pub async fn schema_check(
         }
         let node_id = (i + 1) as u64;
         let (schema_version, host_id) =
-            fetch_reported_schema_version(endpoint, username, password).await?;
+            fetch_reported_schema_version(endpoint, credentials).await?;
 
         versions.insert(node_id, schema_version);
         labels.insert(node_id, (endpoint.to_string(), host_id));
@@ -1221,6 +1318,10 @@ pub async fn schema_check(
 }
 
 #[cfg(test)]
+#[path = "commands/web_auth_tests.rs"]
+mod web_auth_tests;
+
+#[cfg(test)]
 mod tests {
     use ferrosa_cql::client::{QueryResult, ResultRow};
 
@@ -1236,6 +1337,42 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "host_id  status  token\na  UP  1\nb  DOWN  NULL\n"
         );
+    }
+
+    /// The server answers `GET /api/cluster/ring` with an OBJECT, `{"nodes":
+    /// [...], "data_scatter_risk": [...]}`, in 0.30.7 and on main alike. The
+    /// client only accepted a bare array, so `ring` failed against every real
+    /// node ("expected a JSON array of ring entries"); a 401 hid it until
+    /// ferrosa-ctl sent credentials (2026-11-06).
+    #[test]
+    fn ring_prints_the_nodes_of_the_object_the_server_returns() {
+        let body = br#"{"data_scatter_risk":[],"nodes":[{"host_id":"a","state":"Normal"},{"host_id":"b","state":"Normal"}]}"#;
+        let mut out = Vec::new();
+        let rows = print_ring_stream(&mut body.as_slice(), &mut out).unwrap();
+        assert_eq!(rows, 2);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "host_id  state\na  Normal\nb  Normal\n"
+        );
+    }
+
+    /// A non-empty scatter-risk list is a warning the operator must see.
+    #[test]
+    fn ring_reports_a_data_scatter_risk() {
+        let body = br#"{"nodes":[{"host_id":"a"}],"data_scatter_risk":[{"table":"ks.t"}]}"#;
+        let mut out = Vec::new();
+        print_ring_stream(&mut body.as_slice(), &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("data scatter risk"), "{text}");
+        assert!(text.contains("ks.t"), "{text}");
+    }
+
+    /// An object without `nodes` must not print as an empty ring.
+    #[test]
+    fn ring_refuses_an_object_without_nodes() {
+        let err = print_ring_stream(&mut br#"{"error":"x"}"#.as_slice(), &mut Vec::new())
+            .expect_err("an object without nodes is refused");
+        assert!(err.to_string().starts_with("ring response:"), "{err}");
     }
 
     /// An array of non-objects would otherwise print as an empty ring.

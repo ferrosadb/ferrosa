@@ -359,12 +359,20 @@ fn encode_snapshot(data: &SnapshotData) -> bincode::Result<Vec<u8>> {
 /// dropping bootstrap records would let the promote pass refuse members that
 /// did complete, or worse, hide corruption.
 fn decode_snapshot(bytes: &[u8]) -> bincode::Result<SnapshotData> {
+    crate::config::cluster_config_wire::decode_with_legacy_fallback(
+        "state-machine snapshot",
+        || decode_snapshot_layout(bytes),
+    )
+}
+
+fn decode_snapshot_layout(bytes: &[u8]) -> bincode::Result<SnapshotData> {
+    use crate::config::cluster_config_wire::{deserialize_bounded, deserialize_from_bounded};
     let mut cursor = std::io::Cursor::new(bytes);
-    let mut data: SnapshotData = bincode::deserialize_from(&mut cursor)?;
+    let mut data: SnapshotData = deserialize_from_bounded(&mut cursor)?;
     let consumed = usize::try_from(cursor.position()).unwrap_or(bytes.len());
     let rest = &bytes[consumed.min(bytes.len())..];
     if !rest.is_empty() {
-        let ext: SnapshotExtension = bincode::deserialize(rest)?;
+        let ext: SnapshotExtension = deserialize_bounded(rest)?;
         data.state.bootstrap_complete = ext.bootstrap_complete;
     }
     Ok(data)
@@ -9861,3 +9869,7 @@ mod bootstrap_record_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "wire_compat/snapshot_tests.rs"]
+mod snapshot_wire_compat_tests;

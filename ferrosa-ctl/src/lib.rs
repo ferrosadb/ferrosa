@@ -7,4 +7,5 @@
 
 pub mod auth;
 pub mod commands;
+pub mod credentials;
 pub mod tui;
