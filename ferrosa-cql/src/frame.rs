@@ -299,142 +299,153 @@ impl CqlCodec {
         &mut self,
         src: &mut BytesMut,
     ) -> std::result::Result<Option<CqlFrame>, CqlError> {
-        // A compressed v5 connection uses a FIVE-byte header carrying the
-        // uncompressed length alongside the payload length; an uncompressed one
-        // uses THREE. The width is a property of the negotiation, not of the
-        // individual frame, so it must be read from the codec -- reading three
-        // bytes off a compressed stream lands the CRC24 check on the wrong
-        // bytes and every frame fails.
-        let compressed_framing = self.compression.is_some();
-        let header_len = if compressed_framing {
-            V5_COMPRESSED_HEADER_SIZE
-        } else {
-            V5_UNCOMPRESSED_HEADER_SIZE
-        };
-
-        if src.len() < header_len + V5_CRC24_SIZE {
-            return Ok(None);
-        }
-
-        // Header fields are little-endian across `header_len` bytes.
-        let mut header_bits: u64 = 0;
-        for (i, &byte) in src[..header_len].iter().enumerate() {
-            header_bits |= (byte as u64) << (8 * i);
-        }
-
-        let payload_len = (header_bits & 0x1FFFF) as usize; // bits 0-16
-        let (uncompressed_len, is_self_contained) = if compressed_framing {
-            // bits 17-33: uncompressed length (0 = this frame is not compressed)
-            let uncompressed = ((header_bits >> 17) & 0x1FFFF) as usize;
-            (uncompressed, (header_bits >> 34) & 1 == 1) // bit 34: flag
-        } else {
-            (0, (header_bits >> 17) & 1 == 1) // bit 17: flag
-        };
-
-        // Verify CRC24 over the whole header, whose width depends on framing.
-        let crc24_end = header_len + V5_CRC24_SIZE;
-        let expected_crc24 =
-            u32::from_le_bytes([src[header_len], src[header_len + 1], src[header_len + 2], 0]);
-        let actual_crc24 = crc24(&src[..header_len]);
-        if expected_crc24 != actual_crc24 {
-            return Err(CqlError::Protocol(format!(
-                "v5 frame header CRC24 mismatch: expected 0x{expected_crc24:06X}, \
-                 got 0x{actual_crc24:06X}"
-            )));
-        }
-
-        let total = crc24_end + payload_len + V5_CRC32_SIZE;
-        if src.len() < total {
-            src.reserve(total - src.len());
-            return Ok(None);
-        }
-
-        // Verify CRC32 of the encoded (possibly compressed) payload.
-        let payload_start = crc24_end;
-        let payload_end = payload_start + payload_len;
-        let crc32_start = payload_end;
-        let expected_crc32 = u32::from_le_bytes([
-            src[crc32_start],
-            src[crc32_start + 1],
-            src[crc32_start + 2],
-            src[crc32_start + 3],
-        ]);
-        let actual_crc32 = crc32_ieee_v5(&src[payload_start..payload_end]);
-        if expected_crc32 != actual_crc32 {
-            return Err(CqlError::Protocol(format!(
-                "v5 frame payload CRC32 mismatch: expected 0x{expected_crc32:08X}, \
-                 got 0x{actual_crc32:08X}"
-            )));
-        }
-
-        // Extract payload. In compressed framing the length prefix lives in the
-        // header, so the v4-style helpers need it prepended back.
-        src.advance(crc24_end);
-        let wire_payload = src.split_to(payload_len).freeze();
-        src.advance(V5_CRC32_SIZE); // skip CRC32
-
-        let payload = if uncompressed_len > 0 {
-            let compression = self
-                .compression
-                .expect("uncompressed_len implies negotiation");
-            let mut prefixed = Vec::with_capacity(4 + wire_payload.len());
-            prefixed.extend_from_slice(&(uncompressed_len as u32).to_be_bytes());
-            prefixed.extend_from_slice(&wire_payload);
-            let plain = match compression {
-                Compression::Lz4 => decompress_lz4(&prefixed)?,
-                Compression::Snappy => decompress_snappy(&prefixed)?,
+        // One segment per pass. A slice that leaves a split message incomplete
+        // goes round for the next buffered segment instead of returning.
+        loop {
+            // A compressed v5 connection uses a FIVE-byte header carrying the
+            // uncompressed length alongside the payload length; an uncompressed one
+            // uses THREE. The width is a property of the negotiation, not of the
+            // individual frame, so it must be read from the codec -- reading three
+            // bytes off a compressed stream lands the CRC24 check on the wrong
+            // bytes and every frame fails.
+            let compressed_framing = self.compression.is_some();
+            let header_len = if compressed_framing {
+                V5_COMPRESSED_HEADER_SIZE
+            } else {
+                V5_UNCOMPRESSED_HEADER_SIZE
             };
-            if plain.len() != uncompressed_len {
+
+            if src.len() < header_len + V5_CRC24_SIZE {
+                return Ok(None);
+            }
+
+            // Header fields are little-endian across `header_len` bytes.
+            let mut header_bits: u64 = 0;
+            for (i, &byte) in src[..header_len].iter().enumerate() {
+                header_bits |= (byte as u64) << (8 * i);
+            }
+
+            let payload_len = (header_bits & 0x1FFFF) as usize; // bits 0-16
+            let (uncompressed_len, is_self_contained) = if compressed_framing {
+                // bits 17-33: uncompressed length (0 = this frame is not compressed)
+                let uncompressed = ((header_bits >> 17) & 0x1FFFF) as usize;
+                (uncompressed, (header_bits >> 34) & 1 == 1) // bit 34: flag
+            } else {
+                (0, (header_bits >> 17) & 1 == 1) // bit 17: flag
+            };
+
+            // Verify CRC24 over the whole header, whose width depends on framing.
+            let crc24_end = header_len + V5_CRC24_SIZE;
+            let expected_crc24 =
+                u32::from_le_bytes([src[header_len], src[header_len + 1], src[header_len + 2], 0]);
+            let actual_crc24 = crc24(&src[..header_len]);
+            if expected_crc24 != actual_crc24 {
                 return Err(CqlError::Protocol(format!(
-                    "v5 frame decompressed to {} bytes, header declared {uncompressed_len}",
-                    plain.len()
+                    "v5 frame header CRC24 mismatch: expected 0x{expected_crc24:06X}, \
+                     got 0x{actual_crc24:06X}"
                 )));
             }
-            Bytes::from(plain)
-        } else {
-            wire_payload
-        };
 
-        if !is_self_contained {
-            // Slice of a large envelope. Per the v5 spec EVERY slice carries
-            // isSelfContained=0 — there is no self-contained terminator — so
-            // completion is determined by the envelope's own length field.
-            // Waiting for a self-contained frame here would buffer forever
-            // against any spec-compliant sender (the DataStax Java driver
-            // included).
-            self.v5_segment_buf.extend_from_slice(&payload);
-
-            let Some(target) = v5_reassembly_target(&self.v5_segment_buf) else {
-                return Ok(None); // envelope header not yet complete
-            };
-            if self.v5_segment_buf.len() < target {
-                return Ok(None); // more slices to come
+            let total = crc24_end + payload_len + V5_CRC32_SIZE;
+            if src.len() < total {
+                src.reserve(total - src.len());
+                return Ok(None);
             }
-            if self.v5_segment_buf.len() > target {
-                // Slices must reassemble to exactly one envelope. Anything
-                // else means the peer framed the stream in a way we cannot
-                // interpret; guessing would silently corrupt the response.
+
+            // Verify CRC32 of the encoded (possibly compressed) payload.
+            let payload_start = crc24_end;
+            let payload_end = payload_start + payload_len;
+            let crc32_start = payload_end;
+            let expected_crc32 = u32::from_le_bytes([
+                src[crc32_start],
+                src[crc32_start + 1],
+                src[crc32_start + 2],
+                src[crc32_start + 3],
+            ]);
+            let actual_crc32 = crc32_ieee_v5(&src[payload_start..payload_end]);
+            if expected_crc32 != actual_crc32 {
                 return Err(CqlError::Protocol(format!(
-                    "v5 segmented envelope overran its declared length: \
-                     accumulated {} bytes, envelope declares {target}",
-                    self.v5_segment_buf.len()
+                    "v5 frame payload CRC32 mismatch: expected 0x{expected_crc32:08X}, \
+                     got 0x{actual_crc32:08X}"
                 )));
             }
-            let envelope_data = self.v5_segment_buf.split().freeze();
+
+            // Extract payload. In compressed framing the length prefix lives in the
+            // header, so the v4-style helpers need it prepended back.
+            src.advance(crc24_end);
+            let wire_payload = src.split_to(payload_len).freeze();
+            src.advance(V5_CRC32_SIZE); // skip CRC32
+
+            let payload = if uncompressed_len > 0 {
+                let compression = self
+                    .compression
+                    .expect("uncompressed_len implies negotiation");
+                let mut prefixed = Vec::with_capacity(4 + wire_payload.len());
+                prefixed.extend_from_slice(&(uncompressed_len as u32).to_be_bytes());
+                prefixed.extend_from_slice(&wire_payload);
+                let plain = match compression {
+                    Compression::Lz4 => decompress_lz4(&prefixed)?,
+                    Compression::Snappy => decompress_snappy(&prefixed)?,
+                };
+                if plain.len() != uncompressed_len {
+                    return Err(CqlError::Protocol(format!(
+                        "v5 frame decompressed to {} bytes, header declared {uncompressed_len}",
+                        plain.len()
+                    )));
+                }
+                Bytes::from(plain)
+            } else {
+                wire_payload
+            };
+
+            if !is_self_contained {
+                // Slice of a large envelope. Per the v5 spec EVERY slice carries
+                // isSelfContained=0 — there is no self-contained terminator — so
+                // completion is determined by the envelope's own length field.
+                // Waiting for a self-contained frame here would buffer forever
+                // against any spec-compliant sender (the DataStax Java driver
+                // included).
+                self.v5_segment_buf.extend_from_slice(&payload);
+
+                // Not complete yet: the next slice may already be buffered. Returning
+                // `Ok(None)` here would strand it — `Framed` calls `decode` again only
+                // after another socket read, and a client that wrote the whole message
+                // at once sends nothing more, so the request would never run. Go round
+                // for the next segment; `Ok(None)` comes only from the checks above
+                // that find the buffer short (`decode_new_progress` in
+                // `specs/lean4/Ferrosa/Cql/V5Framing.lean`).
+                let Some(target) = v5_reassembly_target(&self.v5_segment_buf) else {
+                    continue; // envelope header not yet complete
+                };
+                if self.v5_segment_buf.len() < target {
+                    continue; // more slices to come
+                }
+                if self.v5_segment_buf.len() > target {
+                    // Slices must reassemble to exactly one envelope. Anything
+                    // else means the peer framed the stream in a way we cannot
+                    // interpret; guessing would silently corrupt the response.
+                    return Err(CqlError::Protocol(format!(
+                        "v5 segmented envelope overran its declared length: \
+                         accumulated {} bytes, envelope declares {target}",
+                        self.v5_segment_buf.len()
+                    )));
+                }
+                let envelope_data = self.v5_segment_buf.split().freeze();
+                return self.emit_envelopes(envelope_data);
+            }
+
+            // Self-contained frame. It may still be the tail of an accumulation
+            // from a peer that terminates with a self-contained slice; combining
+            // preserves that behavior.
+            let envelope_data = if self.v5_segment_buf.is_empty() {
+                payload
+            } else {
+                self.v5_segment_buf.extend_from_slice(&payload);
+                self.v5_segment_buf.split().freeze()
+            };
+
             return self.emit_envelopes(envelope_data);
         }
-
-        // Self-contained frame. It may still be the tail of an accumulation
-        // from a peer that terminates with a self-contained slice; combining
-        // preserves that behavior.
-        let envelope_data = if self.v5_segment_buf.is_empty() {
-            payload
-        } else {
-            self.v5_segment_buf.extend_from_slice(&payload);
-            self.v5_segment_buf.split().freeze()
-        };
-
-        self.emit_envelopes(envelope_data)
     }
 
     /// Parse every envelope out of a fully reassembled payload, return the
@@ -1729,6 +1740,154 @@ mod tests {
         out
     }
 
+    // -- Progress: a buffered slice is never stranded --------------------------------
+    //
+    // `tokio_util::codec::Framed` calls `decode` again only after another socket read
+    // (or after `decode` returned a frame). So `Ok(None)` is a promise: "the buffer
+    // does not hold the rest of anything I can use". A decoder that consumes one slice
+    // of a split v5 message and returns `Ok(None)` while the next slice is already
+    // buffered breaks that promise: if the client sent the whole message in one write,
+    // no further read ever comes, the request is never executed and the client waits
+    // forever. Seen in production as conditional writes whose payload crossed 128 KiB
+    // and never got a reply. The Lean model is `Ferrosa.Cql.V5Framing`.
+
+    fn request_header(body_len: usize, stream_id: i16) -> FrameHeader {
+        FrameHeader {
+            version: 0x05,
+            flags: 0,
+            stream_id,
+            opcode: Opcode::Query,
+            length: body_len as u32,
+        }
+    }
+
+    fn patterned(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn a_split_message_whose_slices_are_all_buffered_decodes_in_one_call() {
+        // Just over one segment: the second slice is tiny, the shape that hung.
+        for body_len in [
+            V5_MAX_PAYLOAD - HEADER_SIZE + 1,
+            V5_MAX_PAYLOAD + 40,
+            V5_MAX_PAYLOAD * 7 / 2,
+        ] {
+            let body = patterned(body_len);
+            let mut buf = BytesMut::new();
+            encode_v5_frame(&request_header(body.len(), 3), &body, &mut buf);
+
+            let mut codec = CqlCodec::new(DEFAULT_MAX_FRAME_SIZE);
+            codec.enable_v5_framing();
+
+            let frame = codec
+                .decode(&mut buf)
+                .expect("decode must not error")
+                .unwrap_or_else(|| {
+                    panic!("body {body_len}: every slice is buffered, yet decode returned None")
+                });
+            assert_eq!(&frame.body[..], &body[..]);
+            assert!(buf.is_empty(), "every slice must be consumed");
+        }
+    }
+
+    #[test]
+    fn a_split_compressed_message_whose_slices_are_all_buffered_decodes_in_one_call() {
+        let body = patterned(V5_MAX_PAYLOAD * 2 + 17);
+        let mut buf = BytesMut::new();
+        encode_v5_message_compressed(
+            &request_header(body.len(), 4),
+            &body,
+            Some(Compression::Lz4),
+            &mut buf,
+        );
+
+        let mut codec = CqlCodec::new(DEFAULT_MAX_FRAME_SIZE);
+        codec.set_compression(Compression::Lz4);
+        codec.enable_v5_framing();
+
+        let frame = codec
+            .decode(&mut buf)
+            .expect("decode must not error")
+            .expect("every compressed slice is buffered, yet decode returned None");
+        assert_eq!(&frame.body[..], &body[..]);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn a_request_pipelined_after_a_split_message_is_decoded_without_another_read() {
+        let big = patterned(V5_MAX_PAYLOAD + 100);
+        let small = patterned(32);
+        let mut buf = BytesMut::new();
+        encode_v5_frame(&request_header(big.len(), 5), &big, &mut buf);
+        encode_v5_frame(&request_header(small.len(), 6), &small, &mut buf);
+
+        let mut codec = CqlCodec::new(DEFAULT_MAX_FRAME_SIZE);
+        codec.enable_v5_framing();
+
+        let first = codec.decode(&mut buf).unwrap().expect("first message");
+        let second = codec
+            .decode(&mut buf)
+            .unwrap()
+            .expect("second message, already buffered");
+        assert_eq!(first.header.stream_id, 5);
+        assert_eq!(second.header.stream_id, 6);
+        assert_eq!(&second.body[..], &small[..]);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn a_split_message_arriving_a_byte_at_a_time_completes_on_its_last_byte() {
+        let body = patterned(V5_MAX_PAYLOAD + 300);
+        let mut wire = BytesMut::new();
+        encode_v5_frame(&request_header(body.len(), 8), &body, &mut wire);
+
+        let mut codec = CqlCodec::new(DEFAULT_MAX_FRAME_SIZE);
+        codec.enable_v5_framing();
+        let mut buf = BytesMut::new();
+        let mut got = None;
+        for (i, byte) in wire.iter().enumerate() {
+            buf.put_u8(*byte);
+            if let Some(f) = codec.decode(&mut buf).expect("decode must not error") {
+                assert_eq!(
+                    i,
+                    wire.len() - 1,
+                    "the message completes only on its last byte"
+                );
+                got = Some(f);
+            }
+        }
+        assert_eq!(&got.expect("decoded").body[..], &body[..]);
+    }
+
+    #[tokio::test]
+    async fn framed_reader_delivers_a_split_message_written_in_one_write() {
+        use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
+
+        let body = patterned(V5_MAX_PAYLOAD + 64);
+        let mut wire = BytesMut::new();
+        encode_v5_frame(&request_header(body.len(), 9), &body, &mut wire);
+
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        let mut codec = CqlCodec::new(DEFAULT_MAX_FRAME_SIZE);
+        codec.enable_v5_framing();
+        // A read buffer large enough that the first read takes the whole message,
+        // as a kernel socket does when the client wrote it in one go.
+        let mut framed = tokio_util::codec::Framed::with_capacity(server, codec, 1 << 20);
+
+        client.write_all(&wire).await.unwrap();
+        client.flush().await.unwrap();
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), framed.next())
+            .await
+            .expect("the server must not wait for bytes that are already buffered")
+            .expect("stream open")
+            .expect("decode ok");
+        assert_eq!(frame.header.stream_id, 9);
+        assert_eq!(&frame.body[..], &body[..]);
+    }
+
     fn big_header(body_len: usize) -> FrameHeader {
         FrameHeader {
             version: VERSION_RESPONSE,
@@ -1789,10 +1948,13 @@ mod tests {
         let mut codec = CqlCodec::new(DEFAULT_MAX_FRAME_SIZE);
         codec.enable_v5_framing();
 
-        // Intermediate slices legitimately decode to None, so drain the whole
-        // buffer rather than stopping at the first None.
-        let f = drain_one_envelope(&mut codec, &mut dst)
-            .expect("a complete envelope must be reassembled");
+        // Every slice is buffered, so ONE call must reassemble the envelope:
+        // `Framed` does not call again without another read.
+        let f = codec
+            .decode(&mut dst)
+            .expect("decode must not error")
+            .expect("a complete envelope must be reassembled in one call");
+        assert!(dst.is_empty());
         assert_eq!(f.header.stream_id, 7);
         assert_eq!(f.header.opcode, Opcode::Result);
         assert_eq!(f.body.len(), body.len());
