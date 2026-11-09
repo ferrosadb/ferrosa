@@ -39,12 +39,16 @@ def join : List (List C) → List C
   | [p] => p
   | p :: ps => p ++ semi :: join ps
 
+/-- Joining a piece in front of a non-empty list of pieces puts a separator between that piece
+    and the rest. -/
 theorem join_cons_ne (p : List C) (ps : List (List C)) (h : ps ≠ []) :
     join (p :: ps) = p ++ semi :: join ps := by
   cases ps with
   | nil => exact absurd rfl h
   | cons _ _ => rfl
 
+/-- The scanner always yields at least one piece, even for empty input; the piece in progress is
+    emitted at the end. -/
 theorem go_ne_nil (q : Bool) (cur xs : List C) : go q cur xs ≠ [] := by
   induction xs generalizing q cur with
   | nil => simp [go]
@@ -70,6 +74,8 @@ theorem go_rejoins (q : Bool) (cur xs : List C) : join (go q cur xs) = cur ++ xs
     | quote => simp [go, ih]
     | other => simp [go, ih]
 
+/-- Joining the pieces of a split with `;` gives the original message back: splitting loses
+    nothing and invents nothing. -/
 theorem split_rejoins (xs : List C) : join (split xs) = xs := by
   simp [split, go_rejoins]
 
@@ -86,6 +92,8 @@ def stateAfter : Bool → List C → Bool
   | q, quote :: rest => stateAfter (!q) rest
   | q, _ :: rest => stateAfter q rest
 
+/-- Scanning a concatenation for a top-level separator is scanning the first part, then scanning
+    the second part from the quote state the first part left. -/
 theorem topSemi_append (q : Bool) (a b : List C) :
     topSemi q (a ++ b) = (topSemi q a || topSemi (stateAfter q a) b) := by
   induction a generalizing q with
@@ -128,6 +136,9 @@ where
     | nil => rfl
     | cons c rest ih => cases c <;> simp [stateAfter, ih]
 
+/-- No piece of a split contains a `;` outside a quoted region. The splitter never cuts inside a
+    string, identifier, dollar-quoted body or comment, and never leaves a separator inside a
+    statement. -/
 theorem pieces_have_no_top_level_semicolon (xs : List C) :
     ∀ p ∈ split xs, topSemi false p = false :=
   go_pieces false [] xs (by simp [topSemi]) (by simp [stateAfter])

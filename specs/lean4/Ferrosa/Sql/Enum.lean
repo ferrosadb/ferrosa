@@ -168,6 +168,8 @@ theorem whole_list_rewrite_loses_a_label :
     let afterBoth := rewriteList (rewriteList ["a"] ["a", "b"]) ["a", "c"]
     "b" ∉ afterBoth := by decide
 
+/-- A label is among the keys after an insertion exactly when it was there before or is the
+    label just inserted. Inserting one key neither drops nor invents any other. -/
 theorem mem_insertKey (keys : List String) (l x : String) :
     x ∈ insertKey keys l ↔ x ∈ keys ∨ x = l := by
   unfold insertKey
@@ -193,7 +195,13 @@ theorem concurrent_adds_both_survive (keys : List String) (l1 l2 : String) :
     l1 ∈ insertKey (insertKey keys l1) l2 ∧ l2 ∈ insertKey (insertKey keys l1) l2 := by
   simp [mem_insertKey]
 
-/-! ## Oban's type, concretely -/
+/-! ## Oban's type, concretely
+
+The general results above, applied to the enum Oban actually creates. Oban's v1 migration
+declares `oban_job_state`, and a later migration runs `ALTER TYPE … ADD VALUE IF NOT EXISTS
+'cancelled'`, possibly more than once. Running it twice must equal running it once, and the new
+label must then validate while an unknown label is still refused.
+-/
 
 /-- Oban's `oban_job_state` as its v1 migration declares it. -/
 def obanJobState : EnumType :=

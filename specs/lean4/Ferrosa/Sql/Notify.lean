@@ -69,7 +69,12 @@ def step (s : State) : Event → State
 
 def run (es : List Event) : State := es.foldl step State.init
 
-/-! ## Deliveries only come from commits -/
+/-! ## Deliveries only come from commits
+
+The invariant every reachable state keeps: queues hold no duplicates, deliveries hold no
+duplicates, every delivery belongs to a closed transaction, and a closed transaction has nothing
+pending. Its first consequence is at-most-once delivery.
+-/
 
 /-- The invariant every reachable state keeps. -/
 structure Inv (s : State) : Prop where
@@ -78,6 +83,8 @@ structure Inv (s : State) : Prop where
   delivered_closed : ∀ p ∈ s.delivered, p.1 ∈ s.closed
   closed_empty : ∀ t ∈ s.closed, s.pending t = []
 
+/-- Queuing a notification keeps a transaction's queue free of duplicates: a pair already queued
+    is not added again. -/
 theorem addNote_nodup (ns : List Note) (n : Note) (h : ns.Nodup) : (addNote ns n).Nodup := by
   unfold addNote
   split
@@ -90,6 +97,7 @@ theorem addNote_nodup (ns : List Note) (n : Note) (h : ns.Nodup) : (addNote ns n
     subst hb; subst hab
     exact hn ha
 
+/-- A transaction's batch, tagged with its id, has no duplicates when its queue has none. -/
 theorem batch_nodup (s : State) (t : Txn) (h : (s.pending t).Nodup) : (batch s t).Nodup := by
   unfold batch
   refine List.Pairwise.map _ ?_ h
@@ -97,10 +105,14 @@ theorem batch_nodup (s : State) (t : Txn) (h : (s.pending t).Nodup) : (batch s t
   simp only [Prod.mk.injEq] at heq
   exact hab heq.2
 
+/-- The empty starting state satisfies the invariant: nothing is pending, closed or delivered. -/
 theorem init_inv : Inv State.init :=
   ⟨fun _ => List.nodup_nil, List.nodup_nil, fun _ h => by simp [State.init] at h,
     fun _ h => by simp [State.init] at h⟩
 
+/-- Every event preserves the invariant. Queues stay duplicate-free, a commit appends only its
+    own batch (which cannot collide with anything delivered before, since its transaction was
+    still open), and every delivery belongs to a transaction that has ended. -/
 theorem step_inv (s : State) (e : Event) (hs : Inv s) : Inv (step s e) := by
   cases e with
   | notify t n =>
@@ -173,11 +185,14 @@ theorem step_inv (s : State) (e : Event) (hs : Inv s) : Inv (step s e) := by
           | inl h => exact absurd h hne
           | inr h => exact hs.closed_empty u h
 
+/-- Folding any sequence of events over a state that satisfies the invariant yields a state that
+    satisfies it. -/
 theorem foldl_inv (es : List Event) (s : State) (hs : Inv s) : Inv (es.foldl step s) := by
   induction es generalizing s with
   | nil => exact hs
   | cons e rest ih => exact ih (step s e) (step_inv s e hs)
 
+/-- Every state reachable from the start by any event sequence satisfies the invariant. -/
 theorem run_inv (es : List Event) : Inv (run es) := foldl_inv es State.init init_inv
 
 /-- **At most once.** No notification of any transaction is ever delivered twice. -/
@@ -189,6 +204,9 @@ theorem delivered_at_most_once (es : List Event) : (run es).delivered.Nodup :=
 A delivery tagged `t` exists only if a `commit t` event occurred. In particular a transaction
 that aborted (and never committed) delivers nothing. -/
 
+/-- Starting from a state with nothing delivered, every notification delivered after a sequence
+    of events is tagged with a transaction whose `commit` event is in that sequence. This is the
+    general form behind `delivered_only_if_committed`. -/
 theorem delivered_only_on_commit_foldl (es : List Event) (s : State)
     (hs : ∀ p ∈ s.delivered, False) :
     ∀ p ∈ (es.foldl step s).delivered, Event.commit p.1 ∈ es := by
@@ -244,6 +262,8 @@ Delivery is append-only: whatever has been delivered stays a prefix of everythin
 later, and a commit appends its whole batch at the end. So if `t₁` commits before `t₂`, every
 notification of `t₁` precedes every notification of `t₂`. -/
 
+/-- One event never withdraws or reorders a delivery: what was delivered before the event is a
+    prefix of what is delivered after it. -/
 theorem step_extends (s : State) (e : Event) : s.delivered <+: (step s e).delivered := by
   cases e with
   | notify t n => simp only [step]; split <;> exact List.prefix_refl _
@@ -252,6 +272,8 @@ theorem step_extends (s : State) (e : Event) : s.delivered <+: (step s e).delive
                 · exact List.prefix_refl _
                 · exact List.prefix_append _ _
 
+/-- Any sequence of events only extends the delivered sequence: what was delivered at the start
+    stays a prefix of what is delivered at the end. -/
 theorem foldl_extends (es : List Event) (s : State) : s.delivered <+: (es.foldl step s).delivered := by
   induction es generalizing s with
   | nil => exact List.prefix_refl _
@@ -286,8 +308,15 @@ theorem commit_order (es mid : List Event) (t₁ t₂ : Txn)
   · rw [← commit_appends_its_batch es t₁ h₁]
     exact delivery_is_append_only _ mid
 
-/-! ## Duplicates within a transaction collapse -/
+/-! ## Duplicates within a transaction collapse
 
+Within one transaction PostgreSQL delivers a repeated `(channel, payload)` pair once. The queue
+collapses the repeat when it is raised, so the batch a commit delivers already holds each pair
+once.
+-/
+
+/-- Queuing a `(channel, payload)` pair that the transaction has already queued leaves its queue
+    unchanged, so the pair is delivered once, as PostgreSQL specifies. -/
 theorem repeated_note_is_queued_once (ns : List Note) (n : Note) (h : n ∈ ns) :
     addNote ns n = ns := by
   unfold addNote; simp [h]

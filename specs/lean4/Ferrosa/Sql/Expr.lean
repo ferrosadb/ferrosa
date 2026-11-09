@@ -32,7 +32,13 @@
 
 namespace Ferrosa.Sql.Expr
 
-/-! ## Values and truth -/
+/-! ## Values and truth
+
+The values the model needs and the three-valued truth type, with `AND`, `OR`, `NOT` and the
+comparisons as PostgreSQL defines them. A comparison with a NULL operand, or between values of
+different types, is UNKNOWN here. The last section of this file shows why the engine refuses the
+type mismatch instead.
+-/
 
 /-- The values this model needs: NULL, integers, booleans and strings. -/
 inductive V where
@@ -85,7 +91,12 @@ def vcmp : Cmp → V → V → TV
   | .ne, a, b => tvNot (veq a b)
   | .lt, a, b => vlt a b
 
-/-! ## Expressions and evaluation -/
+/-! ## Expressions and evaluation
+
+The fragment of `ScalarExpr` this file reasons about, and an evaluator shaped like the Rust one:
+every node yields a value, and a condition's truth is read back from that value. The legacy
+`column <op> literal` fast path is defined beside it so the two can be compared.
+-/
 
 /-- The fragment of `ScalarExpr` this file reasons about. -/
 inductive E where
@@ -127,6 +138,8 @@ def truth (r : Row) (e : E) : TV := toTV (eval r e)
 def legacyCompare (r : Row) (i : Nat) (op : Cmp) (v : V) : TV :=
   vcmp op (colOf r i) v
 
+/-- Turning a truth value into a SQL value and back gives the truth value unchanged: TRUE, FALSE
+    and UNKNOWN survive the round trip through `bool` and NULL. -/
 theorem toTV_toV (t : TV) : toTV (toV t) = t := by
   cases t with
   | none => rfl
@@ -141,13 +154,20 @@ theorem legacy_compare_agrees (r : Row) (i : Nat) (op : Cmp) (v : V) :
 theorem isNull_is_two_valued (r : Row) (e : E) : truth r (.isNull e) ≠ none := by
   simp [truth, eval, toTV]
 
-/-! ## Three-valued connectives -/
+/-! ## Three-valued connectives
 
+Algebraic laws of the three-valued connectives that the evaluator and the planner rely on:
+double negation, De Morgan, and the characterisations of when `OR` is TRUE or FALSE.
+-/
+
+/-- Double negation is the identity in three-valued logic, UNKNOWN included. -/
 theorem tvNot_tvNot (t : TV) : tvNot (tvNot t) = t := by
   cases t with
   | none => rfl
   | some b => cases b <;> rfl
 
+/-- De Morgan for three-valued `AND`: `NOT (a AND b)` is `NOT a OR NOT b` for every combination
+    of TRUE, FALSE and UNKNOWN, so the planner may push a negation through a conjunction. -/
 theorem not_and (a b : TV) : tvNot (tvAnd a b) = tvOr (tvNot a) (tvNot b) := by
   cases a with
   | none => cases b with
@@ -157,6 +177,8 @@ theorem not_and (a b : TV) : tvNot (tvAnd a b) = tvOr (tvNot a) (tvNot b) := by
     | none => rfl
     | some y => cases y <;> rfl
 
+/-- De Morgan for three-valued `OR`: `NOT (a OR b)` is `NOT a AND NOT b` for every combination
+    of TRUE, FALSE and UNKNOWN, so the planner may push a negation through a disjunction. -/
 theorem not_or (a b : TV) : tvNot (tvOr a b) = tvAnd (tvNot a) (tvNot b) := by
   cases a with
   | none => cases b with
@@ -166,7 +188,12 @@ theorem not_or (a b : TV) : tvNot (tvOr a b) = tvAnd (tvNot a) (tvNot b) := by
     | none => rfl
     | some y => cases y <;> rfl
 
-/-! ## `= ANY(array)` and `NOT IN` -/
+/-! ## `= ANY(array)` and `NOT IN`
+
+`x = ANY(xs)` is the `OR` of `x = e` over the elements, starting from FALSE, and `x NOT IN (xs)`
+is its negation. The theorems pin when each is TRUE, FALSE or UNKNOWN, including the trap where
+a NULL in the list makes `NOT IN` never TRUE.
+-/
 
 /-- `x = ANY(xs)`: the OR of `x = e` over the elements, starting from FALSE. -/
 def anyEq (x : V) : List V → TV
@@ -176,6 +203,7 @@ def anyEq (x : V) : List V → TV
 /-- `x NOT IN (xs)` is `NOT (x = ANY(xs))`. -/
 def notIn (x : V) (xs : List V) : TV := tvNot (anyEq x xs)
 
+/-- A three-valued `OR` is TRUE exactly when at least one side is TRUE. -/
 theorem tvOr_true_iff (a b : TV) : tvOr a b = some true ↔ a = some true ∨ b = some true := by
   cases a with
   | none => cases b with
@@ -185,6 +213,8 @@ theorem tvOr_true_iff (a b : TV) : tvOr a b = some true ↔ a = some true ∨ b 
     | none => simp [tvOr]
     | some y => cases y <;> simp [tvOr]
 
+/-- A three-valued `OR` is FALSE exactly when both sides are FALSE. One UNKNOWN side is enough
+    to keep it from being FALSE. -/
 theorem tvOr_false_iff (a b : TV) : tvOr a b = some false ↔ a = some false ∧ b = some false := by
   cases a with
   | none => cases b with
@@ -208,6 +238,7 @@ theorem any_false_iff (x : V) (xs : List V) :
   | nil => simp [anyEq]
   | cons e es ih => simp [anyEq, tvOr_false_iff, ih]
 
+/-- Comparing any value with NULL is UNKNOWN, whatever the value is. -/
 theorem veq_null_right (x : V) : veq x .null = none := by
   cases x <;> rfl
 
@@ -236,6 +267,7 @@ def anyLoop (x : V) (acc : TV) : List V → TV
   | [] => acc
   | e :: es => anyLoop x (tvOr acc (veq x e)) es
 
+/-- TRUE `OR` anything is TRUE, including TRUE `OR` UNKNOWN. -/
 theorem tvOr_true_left (b : TV) : tvOr (some true) b = some true := by
   cases b <;> rfl
 
@@ -245,6 +277,8 @@ theorem anyLoop_true_absorbs (x : V) (xs : List V) : anyLoop x (some true) xs = 
   | nil => rfl
   | cons e es ih => simp [anyLoop, tvOr_true_left, ih]
 
+/-- Three-valued `OR` is associative, so folding it over a list left to right gives the same
+    answer as nesting it to the right. -/
 theorem tvOr_assoc (a b c : TV) : tvOr (tvOr a b) c = tvOr a (tvOr b c) := by
   cases a with
   | none => cases b with
@@ -260,11 +294,14 @@ theorem tvOr_assoc (a b c : TV) : tvOr (tvOr a b) c = tvOr a (tvOr b c) := by
                 | (cases c <;> try rfl
                    all_goals (rename_i z; cases z <;> rfl))
 
+/-- FALSE is the identity of three-valued `OR`, which is why the `= ANY` loop starts from FALSE. -/
 theorem tvOr_false_left (b : TV) : tvOr (some false) b = b := by
   cases b with
   | none => rfl
   | some y => cases y <;> rfl
 
+/-- The evaluator's loop from any starting accumulator is that accumulator `OR`ed with `x =
+    ANY(xs)`. This generalisation is what lets the induction go through for `anyLoop_is_anyEq`. -/
 theorem anyLoop_acc (x : V) (acc : TV) (xs : List V) :
     anyLoop x acc xs = tvOr acc (anyEq x xs) := by
   induction xs generalizing acc with
@@ -278,7 +315,11 @@ theorem anyLoop_acc (x : V) (acc : TV) (xs : List V) :
 theorem anyLoop_is_anyEq (x : V) (xs : List V) : anyLoop x (some false) xs = anyEq x xs := by
   rw [anyLoop_acc, tvOr_false_left]
 
-/-! ## `coalesce` -/
+/-! ## `coalesce`
+
+`coalesce(a, b, …)` returns its first non-NULL argument, and NULL when all of them are NULL.
+Postgrex's type bootstrap and Oban's queries both use it.
+-/
 
 def coalesce : List V → V
   | [] => .null
@@ -299,7 +340,11 @@ theorem coalesce_first_non_null (nulls : List V) (v : V) (rest : List V)
     subst this
     simp [coalesce, ih (fun m hm => hn m (by simp [hm]))]
 
-/-! ## `WHERE` -/
+/-! ## `WHERE`
+
+`WHERE` keeps a row only when its condition is TRUE. A FALSE or UNKNOWN condition drops the row,
+so a comparison with NULL filters everything out rather than matching.
+-/
 
 def filterWhere (rows : List Row) (e : E) : List Row :=
   rows.filter fun r => truth r e == some true
@@ -391,6 +436,8 @@ theorem deepenLoop_refuses (c n : Nat) (hn : 0 < n) (h : maxDepth < c + n) :
     · rfl
     · exact ih (c + 1) (by simp [maxDepth] at *; omega) (by omega)
 
+/-- Concretely: a chain one link longer than `maxDepth`, started at depth zero, is refused as
+    `TooDeep`. -/
 theorem deepenLoop_refuses_past_limit : deepenLoop 0 (maxDepth + 1) = none :=
   deepenLoop_refuses 0 (maxDepth + 1) (by simp [maxDepth]) (by simp [maxDepth])
 
@@ -415,6 +462,9 @@ def memoMap {R : Type} (f : R → V) : List R → List V
   | [] => []
   | r :: rs => let v := f r; v :: rs.map (fun _ => v)
 
+/-- For a subquery whose value is the same for every outer row, evaluating it once and reusing
+    the value gives exactly the results of evaluating it per row. Memoising uncorrelated
+    subqueries changes cost, never answers. -/
 theorem memo_is_sound {R : Type} (f : R → V) (h : Uncorrelated f) (rows : List R) :
     memoMap f rows = rows.map f := by
   cases rows with
@@ -425,6 +475,9 @@ theorem memo_is_sound {R : Type} (f : R → V) (h : Uncorrelated f) (rows : List
     intro x _
     exact h r x
 
+/-- The planner's `correlated` test is false exactly when every column reference inside the
+    subquery resolves at the subquery's own level or deeper. So a subquery is memoised only when
+    it reads nothing from an enclosing row. -/
 theorem uncorrelated_iff_no_outer_reference (level : Nat) (refs : List Nat) :
     correlated level refs = false ↔ ∀ l ∈ refs, level ≤ l := by
   simp [correlated, List.any_eq_false]

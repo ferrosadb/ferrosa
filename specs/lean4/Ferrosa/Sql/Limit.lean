@@ -41,10 +41,14 @@ def apply {α : Type} (off : Option Nat) (lim : Option Nat) (rows : List α) : L
   | none => skipped
   | some n => skipped.take n
 
+/-- A NULL parameter resolves to no bound, and applying no offset and no limit returns every
+    row: `LIMIT NULL` is `LIMIT ALL`, as in PostgreSQL. -/
 theorem null_is_no_limit {α : Type} (rows : List α) :
     resolve .null = .ok none ∧ apply none none rows = rows := by
   simp [resolve, apply]
 
+/-- A negative parameter is an error, never clamped to zero, so `LIMIT -1` fails loudly instead
+    of quietly returning nothing. -/
 theorem negative_is_refused (n : Int) (h : n < 0) : resolve (.int n) = .error .negative := by
   simp [resolve, h]
 
@@ -54,6 +58,7 @@ theorem param_matches_literal {α : Type} (n : Nat) (off : Option Nat) (rows : L
       apply off (some n) rows = (rows.drop (off.getD 0)).take n := by
   simp [resolve, apply]
 
+/-- A limit of `n` never returns more than `n` rows, whatever the offset and the input. -/
 theorem limit_bounds_length {α : Type} (off : Option Nat) (n : Nat) (rows : List α) :
     (apply off (some n) rows).length ≤ n := by
   simp only [apply, List.length_take]

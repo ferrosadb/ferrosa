@@ -56,12 +56,19 @@ def implLockConflict (_ _ : Mode) : Bool := true
 /-- Plain DML (ROW EXCLUSIVE) waits exactly for a holder that took the stripes. -/
 def implBlocksWriters (m : Mode) : Bool := takesStripes m
 
+/-- A `LOCK TABLE` mode blocks plain DML in Ferrosa exactly when PostgreSQL's matrix says it
+    conflicts with ROW EXCLUSIVE, for all eight modes. -/
 theorem impl_blocks_writers_iff_pg (m : Mode) :
     implBlocksWriters m = pgConflict m rowExclusive := by
   cases m <;> rfl
 
+/-- SHARE UPDATE EXCLUSIVE, the mode Ecto's migrator takes, does not block writers, so the
+    version INSERT from the second connection proceeds. -/
 theorem sue_admits_writers : implBlocksWriters shareUpdateExclusive = false := rfl
 
+/-- Between two `LOCK TABLE` statements the implementation conflicts whenever PostgreSQL does.
+    It may conflict more often, never less, so every mutual exclusion PostgreSQL guarantees
+    between table locks still holds. -/
 theorem impl_never_weaker (a b : Mode) (_h : pgConflict a b = true) :
     implLockConflict a b = true := rfl
 
@@ -98,11 +105,15 @@ def Acyclic (g : Graph) : Prop := ∀ t, ¬ Path g t t
 /-- Reflexive-transitive reachability. -/
 def Reach (g : Graph) (a b : Txn) : Prop := a = b ∨ Path g a b
 
+/-- Wait-for paths compose: a path from `a` to `b` followed by a path from `b` to `c` is a path
+    from `a` to `c`. -/
 theorem Path.trans {g : Graph} {a b c : Txn} (h1 : Path g a b) (h2 : Path g b c) : Path g a c := by
   induction h1 with
   | edge h => exact Path.step h h2
   | step h _ ih => exact Path.step h (ih h2)
 
+/-- A wait-for path in a graph is still a path in any graph that contains all of its edges:
+    adding waits never removes a cycle. -/
 theorem Path.mono {g g' : Graph} (hsub : ∀ e, e ∈ g → e ∈ g') {a b : Txn} (h : Path g a b) :
     Path g' a b := by
   induction h with
@@ -146,7 +157,13 @@ theorem guarded_wait_preserves_acyclic (g : Graph) (a b : Txn) (hg : Acyclic g)
       · exact Or.inr hbt
       · exact Or.inr (Path.trans hbt hta)
 
-/-! ### Ecto's migration, transaction 1 = the migrator, 2 = its version INSERT -/
+/-! ### Ecto's migration, transaction 1 = the migrator, 2 = its version INSERT
+
+Ecto's migration as a wait-for graph. Transaction 1 is the migrator, which holds the table lock
+and waits in the application for transaction 2, the version INSERT on another connection.
+Whether transaction 2 waits for transaction 1 inside the database depends only on whether the
+held mode blocks writers, so that one bit decides whether the schedule has a cycle.
+-/
 
 /-- The edges of Ecto's schedule. The migrator (1) waits, in the application, for
     the INSERT (2). The INSERT waits in the registry for the lock holder exactly
@@ -168,6 +185,8 @@ theorem old_ecto_deadlocks : ¬ Acyclic (ectoGraph oldBlocksWriters shareUpdateE
     simp [ectoGraph, oldBlocksWriters]
   exact Path.step e12 (Path.edge e21)
 
+/-- In the graph whose only edge is the migrator waiting for the INSERT, nothing leads out of
+    the INSERT, so no path starts there. -/
 theorem path_from_two_absurd {a : Txn} : ¬ Path [(1, 2)] 2 a := by
   intro h
   cases h with
@@ -191,6 +210,8 @@ theorem ecto_schedule_acyclic (m : Mode) (h : pgConflict m rowExclusive = false)
     obtain ⟨rfl, rfl⟩ := he
     exact path_from_two_absurd hp
 
+/-- Ecto's migration schedule under SHARE UPDATE EXCLUSIVE has no cycle in the implementation:
+    the deadlock every Ecto migration hit is gone. -/
 theorem ecto_migration_no_deadlock :
     Acyclic (ectoGraph implBlocksWriters shareUpdateExclusive) :=
   ecto_schedule_acyclic shareUpdateExclusive rfl

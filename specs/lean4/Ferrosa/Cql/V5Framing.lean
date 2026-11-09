@@ -36,7 +36,12 @@
 
 namespace Ferrosa.Cql.V5Framing
 
-/-! ## Segments, decoder state, results -/
+/-! ## Segments, decoder state, results
+
+A segment as the decoder sees it after its header and CRC checks, what one call to `decode` can
+return, and what one segment does when it joins the accumulation. The shipped decoder and the
+fix are written over these, together with the `Framed` loop that drives them.
+-/
 
 /-- A fully received segment: its payload and the `isSelfContained` flag. -/
 structure Seg (α : Type) where
@@ -131,7 +136,12 @@ theorem framed_new_delivers_it :
     framed (decodeNew toyTarget) 10 [] toySegs = ([[3, 7, 8]], [], []) := by
   decide
 
-/-! ## Progress: `needMore` only when no buffered segment is left -/
+/-! ## Progress: `needMore` only when no buffered segment is left
+
+`Framed` reads the socket again only after `decode` returns `None`, so `None` must mean that no
+buffered segment is left. The fixed decoder keeps that promise for every input; the shipped one
+breaks it on the trace above.
+-/
 
 /-- The invariant `Framed` relies on, which the shipped decoder breaks. -/
 theorem decode_new_progress (target : List α → Option Nat) :
@@ -159,7 +169,12 @@ theorem decode_old_breaks_progress :
   have := h toySegs [] [3, 7] [⟨[8], false⟩] decode_old_strands_a_buffered_segment
   cases this
 
-/-! ## Reassembly: any split of any message -/
+/-! ## Reassembly: any split of any message
+
+Progress alone would let a decoder return the wrong message. This section shows that the fixed
+decoder reassembles exactly the message whose header declares its length, however the message
+was split into non-empty segments, and leaves whatever follows it in the buffer untouched.
+-/
 
 /-- `target` reads `e`'s header: on any proper prefix it is unknown or `e`'s length,
 and on `e` itself it is `e`'s length. -/
@@ -170,6 +185,9 @@ def Declares (target : List α → Option Nat) (e : List α) : Prop :=
 /-- A message split into non-empty, non-self-contained slices. -/
 def slices (cs : List (List α)) : List (Seg α) := cs.map fun c => ⟨c, false⟩
 
+/-- A list of non-empty slices whose concatenation is empty has no slices at all. The reassembly
+    proof uses it to show that once the accumulation reaches the declared length, no slice of
+    the message is left. -/
 theorem flatten_nil_of_nonempty :
     ∀ (cs : List (List α)), (∀ c ∈ cs, c ≠ []) → cs.flatten = [] → cs = []
   | [], _, _ => rfl
@@ -242,7 +260,12 @@ theorem decode_new_reassembles (target : List α → Option Nat) (e : List α)
         | nil => exact absurd rfl hne
         | cons _ _ => simp)
 
-/-! ## Delivery under `Framed`: every buffered message, in order -/
+/-! ## Delivery under `Framed`: every buffered message, in order
+
+Progress and reassembly composed under the `Framed` loop: whatever sequence of split messages a
+client writes in one go, every message is delivered, in order, from the buffer alone, without
+waiting for another read.
+-/
 
 /-- A buffered message: its bytes, the slices it was sent as, and a header that
 declares its length. -/

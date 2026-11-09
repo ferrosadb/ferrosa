@@ -186,6 +186,9 @@ variable (layout : Name → Nat)
 
 def lowerExpr (e : Expr) : CExpr := ⟨e.sql, e.refs.map layout⟩
 
+/-- Lowering an expression for the compiled program keeps its SQL text unchanged; only the
+    variable references are renumbered into slots. So both runtimes send the host the same
+    statement. -/
 @[simp] theorem lowerExpr_sql (e : Expr) : (lowerExpr layout e).sql = e.sql := rfl
 
 def lowerCond : Cond → CCond
@@ -312,6 +315,9 @@ theorem assign_agrees (layout : Name → Nat) (hinj : Injective layout)
   · have : layout y ≠ layout x := fun e => hy (hinj y x e)
     simp [hy, this, hag y]
 
+/-- When the interpreter's environment and the compiled program's store agree, a lowered
+    condition evaluates exactly as the source condition does, for a plain boolean expression and
+    for `[NOT] EXISTS (query)` alike. -/
 theorem cond_agrees {σ : Type} (h : Host σ) (layout : Name → Nat) (env : Name → Val)
     (store : Nat → Val) (hag : Agrees layout env store) (s : σ) (c : Cond) :
     runCond h store s (lowerCond layout c) = evalCond h env s c := by
@@ -414,6 +420,9 @@ theorem compiled_returns_what_the_interpreter_returns {σ : Type} (h : Host σ)
 `evalCond` on `.exists` consults only whether the first row is present, so the host may stop the
 query after one row: a second row can change nothing. -/
 
+/-- Two hosts that agree on whether a query returns a first row, and on the state they leave,
+    give the same `[NOT] EXISTS` result. Whatever rows come after the first cannot change the
+    answer, so the host may stop reading after one row. -/
 theorem exists_ignores_everything_after_the_first_row {σ : Type} (h₁ h₂ : Host σ)
     (env : Name → Val) (s : σ) (n : Bool) (q : Expr)
     (hfirst : ∀ sql ps s, ((h₁.query sql ps s).1.isSome = (h₂.query sql ps s).1.isSome) ∧

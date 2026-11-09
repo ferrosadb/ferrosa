@@ -32,15 +32,21 @@ def decodeOid (w : Nat) : Int := w
 theorem int4_cannot_carry_high_oids : encodeInt4 (two32 - 1) = none := by
   decide
 
+/-- The fix: every value in the OID range `[0, 2^32)` has a binary `oid` encoding, so no
+    relation's OID is refused on the wire. -/
 theorem oid_encodes_every_oid (n : Int) (h0 : 0 ≤ n) (h1 : n < two32) :
     (encodeOid n).isSome := by
   simp [encodeOid, h0, h1]
 
+/-- Encoding an OID and decoding the word gives the same OID back: the `oid` encoding is
+    lossless over its range. -/
 theorem oid_round_trips (n : Int) (h0 : 0 ≤ n) (h1 : n < two32) :
     (encodeOid n).map decodeOid = some n := by
   simp [encodeOid, h0, h1, decodeOid]
   omega
 
+/-- A value outside `[0, 2^32)` is refused rather than wrapped, so an out-of-range OID cannot
+    silently become a different, valid one. -/
 theorem oid_refuses_outside_range (n : Int) (h : n < 0 ∨ two32 ≤ n) : encodeOid n = none := by
   unfold encodeOid
   split

@@ -43,7 +43,13 @@ namespace Ferrosa.Sql.Dml
 
 open Ferrosa.Sql.Expr
 
-/-! ## 1. Read-then-write is the declarative statement -/
+/-! ## 1. Read-then-write is the declarative statement
+
+A general `UPDATE` or `DELETE` is run as one read that plans a keyed write per matching row,
+followed by those keyed writes. This section shows that, when storage keys are unique, the two
+steps produce exactly the table the declarative statement describes, for `UPDATE` and for
+`DELETE`.
+-/
 
 section ReadThenWrite
 
@@ -66,6 +72,8 @@ def applyPlan (key : R → K) (w : List (K × R)) (t : List R) : List R :=
 def declarative (p : R → Bool) (f : R → R) (t : List R) : List R :=
   t.map (fun r => if p r then f r else r)
 
+/-- A key that no row of the table carries is absent from the write plan: the read never invents
+    a write for a row that does not exist. -/
 theorem find_none_of_not_mem (key : R → K) (p : R → Bool) (f : R → R) (k : K) :
     ∀ t : List R, k ∉ t.map key → find k (plan key p f t) = none
   | [] => fun _ => rfl
@@ -80,6 +88,9 @@ theorem find_none_of_not_mem (key : R → K) (p : R → Bool) (f : R → R) (k :
     · simp [plan, List.filter, px] at ih ⊢
       exact ih
 
+/-- With unique keys, looking a row's key up in the plan gives its new image exactly when the
+    row matches the predicate, and nothing otherwise. This is the step that makes one keyed
+    write per planned row the same as updating the row in place. -/
 theorem find_plan (key : R → K) (p : R → Bool) (f : R → R) :
     ∀ t : List R, (t.map key).Nodup → ∀ r ∈ t,
       find (key r) (plan key p f t) = if p r then some (f r) else none
@@ -125,6 +136,8 @@ def applyDeletes (key : R → K) (ks : List K) (t : List R) : List R :=
   t.filter (fun r => !(decide (key r ∈ ks)))
 
 omit [DecidableEq K] in
+/-- With unique keys, a row's key is in the `DELETE` plan exactly when the row matches the
+    predicate, so a keyed tombstone removes that row and no other. -/
 theorem mem_deletePlan (key : R → K) (p : R → Bool) :
     ∀ t : List R, (t.map key).Nodup → ∀ r ∈ t, (key r ∈ deletePlan key p t ↔ p r = true)
   | [] => by intro _ r hr; cases hr
@@ -212,6 +225,9 @@ def Scoped (w : Nat) : X → Prop
   | .add a b => Scoped w a ∧ Scoped w b
   | .eq a b => Scoped w a ∧ Scoped w b
 
+/-- Evaluating an expression whose column references were renumbered through `slot` is
+    evaluating the original expression over the row read through `slot`. This is how a compiled
+    `RETURNING` expression is related back to the one the client wrote. -/
 theorem ev_remap (env : Nat → V) (slot : Nat → Nat) :
     ∀ e, ev env (remap slot e) = ev (fun i => env (slot i)) e
   | .col _ => rfl
@@ -219,6 +235,8 @@ theorem ev_remap (env : Nat → V) (slot : Nat → Nat) :
   | .add a b => by simp [ev, remap, ev_remap env slot a, ev_remap env slot b]
   | .eq a b => by simp [ev, remap, ev_remap env slot a, ev_remap env slot b]
 
+/-- Two rows that agree on every column below `w` give the same value for any expression that
+    reads only columns below `w`: what an expression does not read cannot change its result. -/
 theorem ev_congr (f g : Nat → V) (w : Nat) (h : ∀ i, i < w → f i = g i) :
     ∀ e, Scoped w e → ev f e = ev g e
   | .col i, hs => h i hs
@@ -238,6 +256,9 @@ def slot (w J : Nat) (asg : Nat → Option Nat) (i : Nat) : Nat :=
 def newRow (w : Nat) (asg : Nat → Option Nat) (joined vals : Nat → V) (i : Nat) : V :=
   if i < w then (match asg i with | some k => vals k | none => joined i) else joined i
 
+/-- Reading the extended row through the slot map gives the new row's value in every joined
+    column: an assigned target column yields its `SET` value, and any other column yields
+    itself. -/
 theorem slot_reads_new (w J : Nat) (asg : Nat → Option Nat)
     (joined vals : Nat → V) (i : Nat) (hi : i < J) :
     ext J joined vals (slot w J asg i) = newRow w asg joined vals i := by
@@ -258,7 +279,13 @@ theorem returning_sees_new_row (w J : Nat) (asg : Nat → Option Nat)
   rw [ev_remap]
   exact ev_congr _ _ J (fun i hi => slot_reads_new w J asg joined vals i hi) e hs
 
-/-! ## 3. `UPDATE … FROM`: each target row is written once, by its first match -/
+/-! ## 3. `UPDATE … FROM`: each target row is written once, by its first match
+
+A join in `UPDATE … FROM` can match one target row several times. The planned rows are stably
+sorted by key, and `firstPerRun` keeps the first row of each run of equal keys. The theorems
+below show that no key is written twice, that every matched key is written, and that the row
+kept is the first match in arrival order.
+-/
 
 /-- Keep the first row of each run of equal keys; `prev` is the key of the last kept row. -/
 def firstPerRun {α : Type} : Option Nat → List (Nat × α) → List (Nat × α)
@@ -273,6 +300,8 @@ def Sorted {α : Type} (l : List (Nat × α)) : Prop := l.Pairwise (fun a b => a
 def Above {α : Type} (prev : Option Nat) (l : List (Nat × α)) : Prop :=
   ∀ p ∈ l, ∀ k, prev = some k → k ≤ p.1
 
+/-- Every row `firstPerRun` keeps has a key strictly greater than the previously kept key, given
+    sorted input. This is the induction step behind `firstPerRun_strict`. -/
 theorem firstPerRun_above {α : Type} :
     ∀ (l : List (Nat × α)) (prev : Option Nat), Sorted l → Above prev l →
       ∀ q ∈ firstPerRun prev l, ∀ k, prev = some k → k < q.1
@@ -380,7 +409,13 @@ theorem firstPerRun_first {α : Type} :
         | head => show k0 ≠ q.1; omega
         | tail _ hm' => exact hpre p hm'
 
-/-! ## 4. The legacy keyed statement means what the general one means -/
+/-! ## 4. The legacy keyed statement means what the general one means
+
+The parser still produces the legacy keyed `UpdateStmt` for pgbench's statement shapes. This
+section shows that its equality conjunction and its `SET` arithmetic mean what the general
+three-valued form means, so the two code paths cannot disagree on which rows match or on what is
+written.
+-/
 
 /-- The legacy keyed `WHERE c = v AND …` (`predicate_matches`): NULL matches nothing. -/
 def legacyWhere (r : Row) : List (Nat × V) → Bool
@@ -392,6 +427,8 @@ def andChain : List (Nat × V) → E
   | [] => .lit (.bool true)
   | (i, v) :: rest => .and (.cmp .eq (.col i) (.lit v)) (andChain rest)
 
+/-- A three-valued `AND` is TRUE exactly when both sides are TRUE. A NULL side never makes the
+    conjunction TRUE. -/
 theorem tvAnd_true_iff (a b : TV) : tvAnd a b = some true ↔ a = some true ∧ b = some true := by
   cases a with
   | none => cases b with
@@ -401,6 +438,9 @@ theorem tvAnd_true_iff (a b : TV) : tvAnd a b = some true ↔ a = some true ∧ 
     | none => simp [tvAnd]
     | some y => cases y <;> simp [tvAnd]
 
+/-- Three-valued equality is TRUE exactly when the right side is not NULL and the two values are
+    equal. This is the legacy keyed predicate's rule, which treats a NULL comparand as matching
+    nothing. -/
 theorem veq_true_iff (x v : V) : veq x v = some true ↔ (v != .null && x == v) = true := by
   cases x <;> cases v <;> simp [veq]
 
@@ -434,26 +474,39 @@ def lowerSet : SetE → X
   | .col i => .col i
   | .add a b => .add (lowerSet a) (lowerSet b)
 
+/-- The legacy `SET` evaluator and the general expression evaluator give the same value for
+    every right-hand side the legacy parser accepts, NULL propagation included. So pgbench's
+    keyed `UPDATE` writes what the general `UPDATE` would. -/
 theorem legacy_set_agrees (r : Nat → V) : ∀ e, legacySet r e = ev r (lowerSet e)
   | .val _ => rfl
   | .col _ => rfl
   | .add a b => by simp [legacySet, ev, lowerSet, legacy_set_agrees r a, legacy_set_agrees r b]
 
-/-! ## 5. `INSERT` fills omitted columns from their defaults -/
+/-! ## 5. `INSERT` fills omitted columns from their defaults
+
+`INSERT (cols) VALUES (vals)` stores a written value where one is given, the column's DEFAULT
+where it is omitted and a default exists, and NULL otherwise. Oban's job inserts rely on all
+three cases.
+-/
 
 /-- The value `INSERT (cols) VALUES (vals)` stores in column `i`. -/
 def fill (cols : List Nat) (vals : Nat → V) (dflt : Nat → Option V) (i : Nat) : V :=
   if i ∈ cols then vals i else (dflt i).getD .null
 
+/-- A column named in `INSERT (cols)` stores the value written for it, whatever its DEFAULT
+    says. -/
 theorem explicit_value_wins (cols : List Nat) (vals : Nat → V) (dflt : Nat → Option V)
     (i : Nat) (h : i ∈ cols) : fill cols vals dflt i = vals i := by
   simp [fill, h]
 
+/-- A column left out of `INSERT (cols)` that has a DEFAULT stores that default. -/
 theorem omitted_column_takes_default (cols : List Nat) (vals : Nat → V)
     (dflt : Nat → Option V) (i : Nat) (h : i ∉ cols) (d : V) (hd : dflt i = some d) :
     fill cols vals dflt i = d := by
   simp [fill, h, hd]
 
+/-- A column left out of `INSERT (cols)` that has no DEFAULT stores NULL, as in PostgreSQL. The
+    column is neither refused nor left unwritten. -/
 theorem omitted_without_default_is_null (cols : List Nat) (vals : Nat → V)
     (dflt : Nat → Option V) (i : Nat) (h : i ∉ cols) (hd : dflt i = none) :
     fill cols vals dflt i = .null := by
@@ -473,9 +526,13 @@ def assignText {J : Type} (parse : String → Option J) : Option String → Exce
     | some j => .ok (some j)
     | none => .error ()
 
+/-- Assigning SQL NULL to a jsonb or timestamp column stores NULL; there is no text to parse. -/
 theorem assign_null_is_null {J : Type} (parse : String → Option J) :
     assignText parse none = .ok none := rfl
 
+/-- Assigning a non-NULL text value never stores NULL: the text either parses to a value of the
+    column's type or the statement fails. This pins the bug where a refused cast could otherwise
+    have degraded to a silent NULL. -/
 theorem assign_never_nulls {J : Type} (parse : String → Option J) (s : String) :
     assignText parse (some s) ≠ .ok none := by
   simp only [assignText]
@@ -496,6 +553,8 @@ idempotent (`returning_reports_the_stored_value`).
 /-- The millisecond store of a microsecond timestamp (Rust's `/` truncates toward zero). -/
 def storeMillis (m : Int) : Int := m.tdiv 1000 * 1000
 
+/-- Storing a timestamp that is already in whole milliseconds leaves it unchanged: the
+    millisecond store is idempotent. -/
 theorem storeMillis_idem (m : Int) : storeMillis (storeMillis m) = storeMillis m := by
   unfold storeMillis
   rw [Int.mul_tdiv_cancel _ (by decide : (1000 : Int) ≠ 0)]
@@ -508,7 +567,13 @@ theorem returning_reports_the_stored_value (m : Int) :
 /-- Reporting the unstored value can miss: a microsecond value is not its stored form. -/
 theorem unstored_returning_can_miss : storeMillis 1500 ≠ 1500 := by decide
 
-/-! ## 6. READ COMMITTED: re-check after ownership, fail on a concurrent change (D16) -/
+/-! ## 6. READ COMMITTED: re-check after ownership, fail on a concurrent change (D16)
+
+Under READ COMMITTED a writer first takes ownership of the row and then re-reads it. If the row
+has changed since the statement's snapshot, the write fails with 40001 instead of re-evaluating
+the predicate (decision D16). The theorems below show that an unchanged row is written as
+declared, and that two claimers of one row can never both write it.
+-/
 
 /-- Write `new` over a row read as `snap`, finding it now as `cur`: 40001 if it moved. -/
 def rcWrite (snap cur new : V) : Except Unit V :=
@@ -544,9 +609,13 @@ def defaultName : Item → String
 /-- The output name of an item with an optional alias. -/
 def outName (alias : Option String) (i : Item) : String := alias.getD (defaultName i)
 
+/-- Without an alias, the rewritten subquery is named `?column?` and the original call was named
+    `obj_description`, so a rewrite that does not pin the name renames the client's column. -/
 theorem rewrite_without_alias_renames :
     outName none .subquery ≠ outName none (.func "obj_description") := by decide
 
+/-- Aliasing the rewritten subquery with the original function's name gives it exactly the
+    output name the original call had, so the client sees the column it asked for. -/
 theorem rewrite_with_alias_keeps_name (n : String) :
     outName (some (defaultName (.func n))) .subquery = outName none (.func n) := rfl
 

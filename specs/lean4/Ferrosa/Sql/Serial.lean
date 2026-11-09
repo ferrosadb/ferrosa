@@ -46,14 +46,18 @@ argument: an id collision is a triple collision.
 
 -/
 
+/-- The low 12 bits of an id are its `seq` field, when `seq` and `node` fit their widths. -/
 theorem seq_of_compose (m n s : Nat) (_hn : n < 1024) (hs : s < 4096) :
     compose m n s % 4096 = s := by
   unfold compose; omega
 
+/-- The 10 bits above `seq` are the id's `node` field, when `seq` and `node` fit their widths. -/
 theorem node_of_compose (m n s : Nat) (hn : n < 1024) (hs : s < 4096) :
     compose m n s / 4096 % 1024 = n := by
   unfold compose; omega
 
+/-- The bits above `node` are the id's `millis` field, when `seq` and `node` fit their widths.
+    With the two theorems before it, this reads the whole triple back from the id. -/
 theorem millis_of_compose (m n s : Nat) (hn : n < 1024) (hs : s < 4096) :
     compose m n s / 4194304 = m := by
   unfold compose; omega
