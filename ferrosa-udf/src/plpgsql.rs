@@ -15,7 +15,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ferrosa_plpgsql::{Call, Host, SqlError, TriggerCall, Value};
-use wasmtime::component::{Component, Linker, LinkerInstance, Val};
+use wasmtime::component::types::ComponentFunc;
+use wasmtime::component::{Component, Linker, Val};
 use wasmtime::{Store, StoreContextMut, UpdateDeadline};
 
 use crate::sandbox::GuestState;
@@ -45,25 +46,35 @@ pub type BoxedHost = Box<dyn Host + Send>;
 struct CallState {
     guest: GuestState,
     host: BoxedHost,
+    /// Time spent inside host calls, subtracted from the guest-time limit.
     host_time: Duration,
+    /// When the call started, for the guest-time limit.
+    started: Instant,
+    /// The guest-time limit (`max_execution_time`).
+    limit: Duration,
 }
 
 impl CallState {
-    /// Run `f` against the host, counting its time as host time.
-    fn timed<T>(&mut self, f: impl FnOnce(&mut dyn Host) -> T) -> T {
-        let started = Instant::now();
-        let out = f(&mut *self.host);
+    /// Count the time since `started` as host time (the SQL a call ran, not the guest).
+    fn charge(&mut self, started: Instant) {
         self.host_time += started.elapsed();
-        out
     }
 }
 
+// The glue below is written without closures: each closure is an item the Aeneas extraction
+// cannot translate, so plain matches and named functions keep this file inside the gap
+// inventory instead of adding to it.
+
 // ---------------------------------------------------------------- WIT values <-> Val
+
+/// A value's text, lowered (ABI boundary: the canonical ABI lowers an owned String).
+fn text_to_val(text: Arc<str>) -> Box<Val> {
+    Box::new(Val::String(text.to_string()))
+}
 
 /// `record value { type-oid: u32, text: option<string> }`.
 fn value_to_val(value: Value) -> Val {
-    // ABI boundary: the canonical ABI lowers an owned String.
-    let text = value.text.map(|t| Box::new(Val::String(t.to_string())));
+    let text = value.text.map(text_to_val);
     Val::Record(vec![
         ("type-oid".to_string(), Val::U32(value.type_oid)),
         ("text".to_string(), Val::Option(text)),
@@ -71,7 +82,19 @@ fn value_to_val(value: Value) -> Val {
 }
 
 fn values_to_val(values: Vec<Value>) -> Val {
-    Val::List(values.into_iter().map(value_to_val).collect())
+    let mut items = Vec::with_capacity(values.len());
+    for value in values {
+        items.push(value_to_val(value));
+    }
+    Val::List(items)
+}
+
+/// `option<list<value>>`.
+fn row_to_val(row: Option<Vec<Value>>) -> Val {
+    match row {
+        Some(values) => Val::Option(Some(Box::new(values_to_val(values)))),
+        None => Val::Option(None),
+    }
 }
 
 /// `record sql-error { sqlstate: string, message: string }`.
@@ -82,12 +105,13 @@ fn error_to_val(error: SqlError) -> Val {
     ])
 }
 
-/// `result<T, sql-error>`, with `ok` lowering the success payload (`None` for `_`).
-fn result_to_val<T>(result: Result<T, SqlError>, ok: impl FnOnce(T) -> Option<Val>) -> Val {
-    Val::Result(match result {
-        Ok(value) => Ok(ok(value).map(Box::new)),
-        Err(error) => Err(Some(Box::new(error_to_val(error)))),
-    })
+/// `result<T, sql-error>` from an already lowered success payload (`None` for `_`).
+fn result_to_val(result: Result<Option<Val>, SqlError>) -> Val {
+    match result {
+        Ok(Some(value)) => Val::Result(Ok(Some(Box::new(value)))),
+        Ok(None) => Val::Result(Ok(None)),
+        Err(error) => Val::Result(Err(Some(Box::new(error_to_val(error))))),
+    }
 }
 
 /// A lifted value that does not have the WIT shape. Wasmtime type-checks the component
@@ -97,11 +121,14 @@ fn shape(expected: &str, got: &Val) -> wasmtime::Error {
 }
 
 fn field<'v>(fields: &'v [(String, Val)], name: &str) -> wasmtime::Result<&'v Val> {
-    fields
-        .iter()
-        .find(|(n, _)| n == name)
-        .map(|(_, v)| v)
-        .ok_or_else(|| wasmtime::Error::msg(format!("PL/pgSQL ABI: record lacks `{name}`")))
+    for (field_name, value) in fields {
+        if field_name == name {
+            return Ok(value);
+        }
+    }
+    Err(wasmtime::Error::msg(format!(
+        "PL/pgSQL ABI: record lacks `{name}`"
+    )))
 }
 
 fn val_string(val: &Val) -> wasmtime::Result<String> {
@@ -115,13 +142,6 @@ fn val_u32(val: &Val) -> wasmtime::Result<u32> {
     match val {
         Val::U32(n) => Ok(*n),
         other => Err(shape("u32", other)),
-    }
-}
-
-fn val_list(val: &Val) -> wasmtime::Result<&[Val]> {
-    match val {
-        Val::List(items) => Ok(items),
-        other => Err(shape("list", other)),
     }
 }
 
@@ -141,7 +161,14 @@ fn val_to_value(val: &Val) -> wasmtime::Result<Value> {
 }
 
 fn val_to_values(val: &Val) -> wasmtime::Result<Vec<Value>> {
-    val_list(val)?.iter().map(val_to_value).collect()
+    let Val::List(items) = val else {
+        return Err(shape("list<value>", val));
+    };
+    let mut values = Vec::with_capacity(items.len());
+    for item in items {
+        values.push(val_to_value(item)?);
+    }
+    Ok(values)
 }
 
 fn val_to_error(val: &Val) -> wasmtime::Result<SqlError> {
@@ -156,24 +183,19 @@ fn val_to_error(val: &Val) -> wasmtime::Result<SqlError> {
 
 /// `option<trigger-data>`.
 fn trigger_to_val(trigger: Option<TriggerCall>) -> Val {
-    Val::Option(trigger.map(|trigger| {
-        let TriggerCall {
-            op,
-            new_row,
-            old_row,
-        } = trigger;
-        Box::new(Val::Record(vec![
-            ("op".to_string(), Val::String(op)),
-            (
-                "new-row".to_string(),
-                Val::Option(new_row.map(|r| Box::new(values_to_val(r)))),
-            ),
-            (
-                "old-row".to_string(),
-                Val::Option(old_row.map(|r| Box::new(values_to_val(r)))),
-            ),
-        ]))
-    }))
+    let Some(TriggerCall {
+        op,
+        new_row,
+        old_row,
+    }) = trigger
+    else {
+        return Val::Option(None);
+    };
+    Val::Option(Some(Box::new(Val::Record(vec![
+        ("op".to_string(), Val::String(op)),
+        ("new-row".to_string(), row_to_val(new_row)),
+        ("old-row".to_string(), row_to_val(old_row)),
+    ]))))
 }
 
 /// The export's `result<option<value>, sql-error>`.
@@ -193,97 +215,158 @@ fn val_to_outcome(val: &Val) -> wasmtime::Result<Result<Option<Value>, SqlError>
 
 /// Store `val` as the single result of a host function.
 fn set_result(results: &mut [Val], val: Val) -> wasmtime::Result<()> {
-    let slot = results
-        .first_mut()
-        .ok_or_else(|| wasmtime::Error::msg("PL/pgSQL ABI: no result slot"))?;
-    *slot = val;
-    Ok(())
+    match results.first_mut() {
+        Some(slot) => {
+            *slot = val;
+            Ok(())
+        }
+        None => Err(wasmtime::Error::msg("PL/pgSQL ABI: no result slot")),
+    }
 }
 
 fn param(params: &[Val], index: usize) -> wasmtime::Result<&Val> {
-    params
-        .get(index)
-        .ok_or_else(|| wasmtime::Error::msg(format!("PL/pgSQL ABI: missing argument {index}")))
+    match params.get(index) {
+        Some(val) => Ok(val),
+        None => Err(wasmtime::Error::msg(format!(
+            "PL/pgSQL ABI: missing argument {index}"
+        ))),
+    }
 }
 
 /// `query: func(sql: string, params: list<value>) -> result<u32, sql-error>`.
 fn host_query(
     mut store: StoreContextMut<'_, CallState>,
+    _ty: ComponentFunc,
     params: &[Val],
     results: &mut [Val],
 ) -> wasmtime::Result<()> {
     let sql = val_string(param(params, 0)?)?;
     let args = val_to_values(param(params, 1)?)?;
-    let outcome = store.data_mut().timed(|h| h.query(&sql, &args));
-    set_result(
-        results,
-        result_to_val(outcome, |cursor| Some(Val::U32(cursor))),
-    )
+    let state = store.data_mut();
+    let started = Instant::now();
+    let outcome = state.host.query(&sql, &args);
+    state.charge(started);
+    let lowered = match outcome {
+        Ok(cursor) => Ok(Some(Val::U32(cursor))),
+        Err(error) => Err(error),
+    };
+    set_result(results, result_to_val(lowered))
 }
 
 /// `fetch: func(cursor: u32, max: u32) -> result<list<list<value>>, sql-error>`.
 fn host_fetch(
     mut store: StoreContextMut<'_, CallState>,
+    _ty: ComponentFunc,
     params: &[Val],
     results: &mut [Val],
 ) -> wasmtime::Result<()> {
     let cursor = val_u32(param(params, 0)?)?;
     let max = val_u32(param(params, 1)?)?;
-    let outcome = store.data_mut().timed(|h| h.fetch(cursor, max));
-    set_result(
-        results,
-        result_to_val(outcome, |rows| {
-            Some(Val::List(rows.into_iter().map(values_to_val).collect()))
-        }),
-    )
+    let state = store.data_mut();
+    let started = Instant::now();
+    let outcome = state.host.fetch(cursor, max);
+    state.charge(started);
+    let lowered = match outcome {
+        Ok(rows) => {
+            let mut items = Vec::with_capacity(rows.len());
+            for row in rows {
+                items.push(values_to_val(row));
+            }
+            Ok(Some(Val::List(items)))
+        }
+        Err(error) => Err(error),
+    };
+    set_result(results, result_to_val(lowered))
 }
 
 /// `close: func(cursor: u32)`.
 fn host_close(
     mut store: StoreContextMut<'_, CallState>,
+    _ty: ComponentFunc,
     params: &[Val],
     _results: &mut [Val],
 ) -> wasmtime::Result<()> {
     let cursor = val_u32(param(params, 0)?)?;
-    store.data_mut().timed(|h| h.close(cursor));
+    let state = store.data_mut();
+    let started = Instant::now();
+    state.host.close(cursor);
+    state.charge(started);
     Ok(())
 }
 
 /// `execute: func(sql: string, params: list<value>) -> result<u64, sql-error>`.
 fn host_execute(
     mut store: StoreContextMut<'_, CallState>,
+    _ty: ComponentFunc,
     params: &[Val],
     results: &mut [Val],
 ) -> wasmtime::Result<()> {
     let sql = val_string(param(params, 0)?)?;
     let args = val_to_values(param(params, 1)?)?;
-    let outcome = store.data_mut().timed(|h| h.execute(&sql, &args));
-    set_result(
-        results,
-        result_to_val(outcome, |count| Some(Val::U64(count))),
-    )
+    let state = store.data_mut();
+    let started = Instant::now();
+    let outcome = state.host.execute(&sql, &args);
+    state.charge(started);
+    let lowered = match outcome {
+        Ok(count) => Ok(Some(Val::U64(count))),
+        Err(error) => Err(error),
+    };
+    set_result(results, result_to_val(lowered))
 }
 
 /// `notify: func(channel: string, payload: string) -> result<_, sql-error>`.
 fn host_notify(
     mut store: StoreContextMut<'_, CallState>,
+    _ty: ComponentFunc,
     params: &[Val],
     results: &mut [Val],
 ) -> wasmtime::Result<()> {
     let channel = val_string(param(params, 0)?)?;
     let payload = val_string(param(params, 1)?)?;
-    let outcome = store.data_mut().timed(|h| h.notify(&channel, &payload));
-    set_result(results, result_to_val(outcome, |()| None))
+    let state = store.data_mut();
+    let started = Instant::now();
+    let outcome = state.host.notify(&channel, &payload);
+    state.charge(started);
+    let lowered = match outcome {
+        Ok(()) => Ok(None),
+        Err(error) => Err(error),
+    };
+    set_result(results, result_to_val(lowered))
 }
 
-/// Define the `host` interface's five functions in `instance`.
-fn add_host(instance: &mut LinkerInstance<'_, CallState>) -> wasmtime::Result<()> {
-    instance.func_new("query", |s, _ty, p, r| host_query(s, p, r))?;
-    instance.func_new("fetch", |s, _ty, p, r| host_fetch(s, p, r))?;
-    instance.func_new("close", |s, _ty, p, r| host_close(s, p, r))?;
-    instance.func_new("execute", |s, _ty, p, r| host_execute(s, p, r))?;
-    instance.func_new("notify", |s, _ty, p, r| host_notify(s, p, r))?;
+/// Define the `host` interface's five functions.
+fn add_host(linker: &mut Linker<CallState>) -> wasmtime::Result<()> {
+    let mut instance = linker.instance(HOST_INTERFACE)?;
+    instance.func_new("query", host_query)?;
+    instance.func_new("fetch", host_fetch)?;
+    instance.func_new("close", host_close)?;
+    instance.func_new("execute", host_execute)?;
+    instance.func_new("notify", host_notify)?;
     Ok(())
+}
+
+/// The store's resource limiter: the same guest limits a CQL UDF runs under.
+fn guest_limiter(state: &mut CallState) -> &mut dyn wasmtime::ResourceLimiter {
+    &mut state.guest
+}
+
+/// The epoch callback: stop the call once its **guest** time (wall time minus the time spent
+/// in host calls) passes the limit.
+fn guest_deadline(ctx: StoreContextMut<'_, CallState>) -> wasmtime::Result<UpdateDeadline> {
+    let state = ctx.data();
+    let guest_time = state.started.elapsed().saturating_sub(state.host_time);
+    if guest_time < state.limit {
+        return Ok(UpdateDeadline::Continue(1));
+    }
+    let limit = state.limit;
+    tracing::warn!(
+        ?guest_time,
+        ?limit,
+        "PL/pgSQL function exceeded its guest time limit"
+    );
+    Err(wasmtime::Error::msg(format!(
+        "PL/pgSQL function ran for {guest_time:?} of guest time, over the {limit:?} limit"
+    )))
 }
 
 impl UdfExecutor {
@@ -301,9 +384,12 @@ impl UdfExecutor {
                 max,
             });
         }
-        let component = Component::new(self.engine(), bytes)
-            .map_err(|e| UdfError::CompilationFailed(format!("PL/pgSQL component: {e:#}")))?;
-        Ok(Arc::new(PlpgsqlComponent { component }))
+        match Component::new(self.engine(), bytes) {
+            Ok(component) => Ok(Arc::new(PlpgsqlComponent { component })),
+            Err(e) => Err(UdfError::CompilationFailed(format!(
+                "PL/pgSQL component: {e:#}"
+            ))),
+        }
     }
 
     /// Call a compiled PL/pgSQL function with `host` as its database. The host is moved into
@@ -331,29 +417,16 @@ impl UdfExecutor {
             guest: GuestState::new(self.sandbox()),
             host,
             host_time: Duration::ZERO,
+            started: Instant::now(),
+            limit: self.sandbox().max_execution_time,
         };
         let mut store = Store::new(self.engine(), state);
-        store.limiter(|s| &mut s.guest);
+        store.limiter(guest_limiter);
         if let Err(e) = store.set_fuel(self.sandbox().max_fuel) {
             let host = store.into_data().host;
             return Err((SqlError::new("XX000", format!("setting fuel: {e}")), host));
         }
-        let limit = self.sandbox().max_execution_time;
-        let started = Instant::now();
-        store.epoch_deadline_callback(move |ctx| {
-            let guest_time = started.elapsed().saturating_sub(ctx.data().host_time);
-            if guest_time < limit {
-                return Ok(UpdateDeadline::Continue(1));
-            }
-            tracing::warn!(
-                ?guest_time,
-                ?limit,
-                "PL/pgSQL function exceeded its guest time limit"
-            );
-            Err(wasmtime::Error::msg(format!(
-                "PL/pgSQL function ran for {guest_time:?} of guest time, over the {limit:?} limit"
-            )))
-        });
+        store.epoch_deadline_callback(guest_deadline);
         store.set_epoch_deadline(1);
         Ok(store)
     }
@@ -365,22 +438,32 @@ fn run_call(
     call: Call,
 ) -> Result<Option<Value>, SqlError> {
     let mut linker: Linker<CallState> = Linker::new(store.engine());
-    linker
-        .instance(HOST_INTERFACE)
-        .and_then(|mut instance| add_host(&mut instance))
-        .map_err(|e| SqlError::new("XX000", format!("linking the PL/pgSQL host: {e:#}")))?;
-    let instance = linker
-        .instantiate(&mut *store, component)
-        .map_err(|e| trap_error(&e, "instantiating"))?;
-    let func = instance
-        .get_func(&mut *store, CALL_EXPORT)
-        .ok_or_else(|| SqlError::new("XX000", "PL/pgSQL component does not export `call`"))?;
+    if let Err(e) = add_host(&mut linker) {
+        return Err(SqlError::new(
+            "XX000",
+            format!("linking the PL/pgSQL host: {e:#}"),
+        ));
+    }
+    let instance = match linker.instantiate(&mut *store, component) {
+        Ok(instance) => instance,
+        Err(e) => return Err(trap_error(&e, "instantiating")),
+    };
+    let Some(func) = instance.get_func(&mut *store, CALL_EXPORT) else {
+        return Err(SqlError::new(
+            "XX000",
+            "PL/pgSQL component does not export `call`",
+        ));
+    };
     let Call { args, trigger } = call;
     let params = [values_to_val(args), trigger_to_val(trigger)];
     let mut results = [Val::Bool(false)]; // overwritten by the call's one result
-    func.call(&mut *store, &params, &mut results)
-        .map_err(|e| trap_error(&e, "running"))?;
-    val_to_outcome(&results[0]).map_err(|e| trap_error(&e, "reading the result"))?
+    if let Err(e) = func.call(&mut *store, &params, &mut results) {
+        return Err(trap_error(&e, "running"));
+    }
+    match val_to_outcome(&results[0]) {
+        Ok(outcome) => outcome,
+        Err(e) => Err(trap_error(&e, "reading the result")),
+    }
 }
 
 /// A trap as a SQL error: resource limits are `54000`, anything else `XX000`. Logged at the
