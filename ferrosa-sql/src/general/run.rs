@@ -101,12 +101,12 @@ fn now_micros() -> i64 {
     i64::try_from(since.as_micros()).unwrap_or(i64::MAX)
 }
 
-/// Run a subquery for the row `env` is evaluating, collecting at most `cap` rows.
-pub(crate) fn subquery_rows(
+/// Open a subquery's row stream for the row `env` is evaluating. The caller pulls only what
+/// its operator needs (`EXISTS` one row, a scalar subquery two), so nothing past that is read.
+pub(crate) fn subquery_stream<'e>(
     q: &Arc<Query>,
-    env: &Env<'_>,
-    cap: usize,
-) -> Result<Vec<Row>, ExecError> {
+    env: &Env<'e>,
+) -> Result<impl Iterator<Item = Result<Row, ExecError>> + 'e, ExecError> {
     // An uncorrelated subquery reads no outer row, so it is lent none.
     let outer = if q.correlated {
         let frame = env
@@ -117,11 +117,8 @@ pub(crate) fn subquery_rows(
         None
     };
     let rows = open(q, env.rt, outer)?;
-    let mut out = Vec::new();
-    for row in rows.take(cap) {
-        out.push(row.map_err(|e| env.rt.fence.lift(e))?);
-    }
-    Ok(out)
+    let rt: &'e Arc<Rt> = env.rt;
+    Ok(rows.map(move |row| row.map_err(|e| rt.fence.lift(e))))
 }
 
 /// Build `q`'s row stream. `outer` is the enclosing query's current row.

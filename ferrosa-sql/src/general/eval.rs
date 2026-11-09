@@ -128,23 +128,27 @@ fn eval_node(e: &CExpr, env: &Env<'_>) -> R<Value> {
             otherwise,
         } => case(operand.as_deref(), whens, otherwise.as_deref(), env),
         CExpr::Exists(q, negated) => memoized(e, q, env, || {
-            let found = run::subquery_rows(q, env, 1)?.into_iter().next().is_some();
+            let found = run::subquery_stream(q, env)?.next().transpose()?.is_some();
             Ok(Value::Bool(found != *negated))
         }),
         CExpr::Subquery(q) => memoized(e, q, env, || {
-            let mut rows = run::subquery_rows(q, env, 2)?;
-            match rows.len() {
-                0 => Ok(Value::Null),
-                1 => Ok(rows.pop().expect("one row").0.swap_remove(0)),
-                _ => Err(ExecError::eval(
+            let mut rows = run::subquery_stream(q, env)?;
+            let Some(first) = rows.next().transpose()? else {
+                return Ok(Value::Null);
+            };
+            if rows.next().transpose()?.is_some() {
+                return Err(ExecError::eval(
                     "21000",
                     "more than one row returned by a subquery used as an expression",
-                )),
+                ));
             }
+            first_column(first)
         }),
         CExpr::ArraySubquery(q, elem) => memoized(e, q, env, || {
-            let rows = run::subquery_rows(q, env, usize::MAX)?;
-            let items = rows.into_iter().map(|mut r| r.0.swap_remove(0)).collect();
+            // ARRAY(subquery) is one value holding every row, as in PostgreSQL.
+            let items = run::subquery_stream(q, env)?
+                .map(|row| row.and_then(first_column))
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(Value::Array(ArrayValue::new(*elem, items)))
         }),
         CExpr::Array(items, elem) => {
@@ -175,6 +179,15 @@ fn eval_node(e: &CExpr, env: &Env<'_>) -> R<Value> {
             ))),
         },
     }
+}
+
+/// A one-column subquery row's value. The planner admits only one-column subqueries here, so a
+/// row with no column is an engine fault, reported rather than read as NULL.
+fn first_column(row: Row) -> R<Value> {
+    row.0
+        .into_iter()
+        .next()
+        .ok_or_else(|| internal("a one-column subquery produced a row with no column".into()))
 }
 
 /// An uncorrelated subquery has one value for the whole statement: compute it
