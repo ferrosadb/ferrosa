@@ -251,7 +251,7 @@ pub fn componentize(core_wasm: &[u8]) -> Result<Vec<u8>, AscError> {
     componentize_world(core_wasm, UDF_WIT, "udf")
 }
 
-/// The `ferrosa:plpgsql` world (D13): the same file the runner's bindings are generated from.
+/// The `ferrosa:plpgsql` world (D13): the same contract the runner links its host against.
 const PLPGSQL_WIT: &str = include_str!("wit/plpgsql.wit");
 
 /// Convert a parsed PL/pgSQL program to AssemblyScript, compile it in process and wrap it

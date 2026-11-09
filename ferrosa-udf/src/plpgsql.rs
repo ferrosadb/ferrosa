@@ -15,20 +15,22 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ferrosa_plpgsql::{Call, Host, SqlError, TriggerCall, Value};
-use wasmtime::component::{Component, HasSelf, Linker};
-use wasmtime::{Store, UpdateDeadline};
+use wasmtime::component::{Component, Linker, LinkerInstance, Val};
+use wasmtime::{Store, StoreContextMut, UpdateDeadline};
 
 use crate::sandbox::GuestState;
 use crate::{UdfError, UdfExecutor};
 
-mod bindings {
-    wasmtime::component::bindgen!({
-        path: "src/wit/plpgsql.wit",
-        world: "routine",
-    });
-}
+// The `routine` world is lowered and lifted through the dynamic `Val` API, the way the
+// `udf` world's `cql-value` is (see `executor.rs`), rather than through
+// `wasmtime::component::bindgen!`: the generated bindings are a macro expansion over
+// wasmtime internals that nothing downstream can read or extract. The names below are the
+// WIT contract in `src/wit/plpgsql.wit`; a component that disagrees fails to link.
 
-use bindings::ferrosa::plpgsql::types as wit;
+/// The host interface the component imports.
+const HOST_INTERFACE: &str = "ferrosa:plpgsql/host@0.1.0";
+/// The world's one export.
+const CALL_EXPORT: &str = "call";
 
 /// A compiled PL/pgSQL component, ready to instantiate. Shared (`Arc`) across sessions: the
 /// front end caches one per function source hash.
@@ -56,73 +58,232 @@ impl CallState {
     }
 }
 
-fn to_wit(value: Value) -> wit::Value {
-    wit::Value {
-        type_oid: value.type_oid,
-        text: value.text.map(|t| t.to_string()), // ABI boundary: the canonical ABI lowers an owned String
+// ---------------------------------------------------------------- WIT values <-> Val
+
+/// `record value { type-oid: u32, text: option<string> }`.
+fn value_to_val(value: Value) -> Val {
+    // ABI boundary: the canonical ABI lowers an owned String.
+    let text = value.text.map(|t| Box::new(Val::String(t.to_string())));
+    Val::Record(vec![
+        ("type-oid".to_string(), Val::U32(value.type_oid)),
+        ("text".to_string(), Val::Option(text)),
+    ])
+}
+
+fn values_to_val(values: Vec<Value>) -> Val {
+    Val::List(values.into_iter().map(value_to_val).collect())
+}
+
+/// `record sql-error { sqlstate: string, message: string }`.
+fn error_to_val(error: SqlError) -> Val {
+    Val::Record(vec![
+        ("sqlstate".to_string(), Val::String(error.sqlstate)),
+        ("message".to_string(), Val::String(error.message)),
+    ])
+}
+
+/// `result<T, sql-error>`, with `ok` lowering the success payload (`None` for `_`).
+fn result_to_val<T>(result: Result<T, SqlError>, ok: impl FnOnce(T) -> Option<Val>) -> Val {
+    Val::Result(match result {
+        Ok(value) => Ok(ok(value).map(Box::new)),
+        Err(error) => Err(Some(Box::new(error_to_val(error)))),
+    })
+}
+
+/// A lifted value that does not have the WIT shape. Wasmtime type-checks the component
+/// against the import types, so this is a host/contract mismatch: it traps, loudly.
+fn shape(expected: &str, got: &Val) -> wasmtime::Error {
+    wasmtime::Error::msg(format!("PL/pgSQL ABI: expected {expected}, got {got:?}"))
+}
+
+fn field<'v>(fields: &'v [(String, Val)], name: &str) -> wasmtime::Result<&'v Val> {
+    fields
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, v)| v)
+        .ok_or_else(|| wasmtime::Error::msg(format!("PL/pgSQL ABI: record lacks `{name}`")))
+}
+
+fn val_string(val: &Val) -> wasmtime::Result<String> {
+    match val {
+        Val::String(s) => Ok(s.clone()), // lifted values are borrowed from the call frame
+        other => Err(shape("string", other)),
     }
 }
 
-fn from_wit(value: wit::Value) -> Value {
-    Value {
-        type_oid: value.type_oid,
-        text: value.text.map(Arc::from),
+fn val_u32(val: &Val) -> wasmtime::Result<u32> {
+    match val {
+        Val::U32(n) => Ok(*n),
+        other => Err(shape("u32", other)),
     }
 }
 
-fn err_to_wit(error: SqlError) -> wit::SqlError {
-    wit::SqlError {
-        sqlstate: error.sqlstate,
-        message: error.message,
+fn val_list(val: &Val) -> wasmtime::Result<&[Val]> {
+    match val {
+        Val::List(items) => Ok(items),
+        other => Err(shape("list", other)),
     }
 }
 
-fn params_from_wit(params: Vec<wit::Value>) -> Vec<Value> {
-    params.into_iter().map(from_wit).collect()
+fn val_to_value(val: &Val) -> wasmtime::Result<Value> {
+    let Val::Record(fields) = val else {
+        return Err(shape("record value", val));
+    };
+    let text = match field(fields, "text")? {
+        Val::Option(None) => None,
+        Val::Option(Some(inner)) => Some(Arc::from(val_string(inner)?)),
+        other => return Err(shape("option<string>", other)),
+    };
+    Ok(Value {
+        type_oid: val_u32(field(fields, "type-oid")?)?,
+        text,
+    })
 }
 
-impl bindings::ferrosa::plpgsql::types::Host for CallState {}
+fn val_to_values(val: &Val) -> wasmtime::Result<Vec<Value>> {
+    val_list(val)?.iter().map(val_to_value).collect()
+}
 
-impl bindings::ferrosa::plpgsql::host::Host for CallState {
-    fn query(&mut self, sql: String, params: Vec<wit::Value>) -> Result<u32, wit::SqlError> {
-        let params = params_from_wit(params);
-        self.timed(|h| h.query(&sql, &params)).map_err(err_to_wit)
-    }
+fn val_to_error(val: &Val) -> wasmtime::Result<SqlError> {
+    let Val::Record(fields) = val else {
+        return Err(shape("record sql-error", val));
+    };
+    Ok(SqlError::new(
+        &val_string(field(fields, "sqlstate")?)?,
+        val_string(field(fields, "message")?)?,
+    ))
+}
 
-    fn fetch(&mut self, cursor: u32, max: u32) -> Result<Vec<Vec<wit::Value>>, wit::SqlError> {
-        let rows = self.timed(|h| h.fetch(cursor, max)).map_err(err_to_wit)?;
-        Ok(rows
-            .into_iter()
-            .map(|row| row.into_iter().map(to_wit).collect())
-            .collect())
-    }
+/// `option<trigger-data>`.
+fn trigger_to_val(trigger: Option<TriggerCall>) -> Val {
+    Val::Option(trigger.map(|trigger| {
+        let TriggerCall {
+            op,
+            new_row,
+            old_row,
+        } = trigger;
+        Box::new(Val::Record(vec![
+            ("op".to_string(), Val::String(op)),
+            (
+                "new-row".to_string(),
+                Val::Option(new_row.map(|r| Box::new(values_to_val(r)))),
+            ),
+            (
+                "old-row".to_string(),
+                Val::Option(old_row.map(|r| Box::new(values_to_val(r)))),
+            ),
+        ]))
+    }))
+}
 
-    fn close(&mut self, cursor: u32) {
-        self.timed(|h| h.close(cursor));
-    }
-
-    fn execute(&mut self, sql: String, params: Vec<wit::Value>) -> Result<u64, wit::SqlError> {
-        let params = params_from_wit(params);
-        self.timed(|h| h.execute(&sql, &params)).map_err(err_to_wit)
-    }
-
-    fn notify(&mut self, channel: String, payload: String) -> Result<(), wit::SqlError> {
-        self.timed(|h| h.notify(&channel, &payload))
-            .map_err(err_to_wit)
+/// The export's `result<option<value>, sql-error>`.
+fn val_to_outcome(val: &Val) -> wasmtime::Result<Result<Option<Value>, SqlError>> {
+    match val {
+        Val::Result(Ok(Some(inner))) => match inner.as_ref() {
+            Val::Option(None) => Ok(Ok(None)),
+            Val::Option(Some(value)) => Ok(Ok(Some(val_to_value(value)?))),
+            other => Err(shape("option<value>", other)),
+        },
+        Val::Result(Err(Some(error))) => Ok(Err(val_to_error(error)?)),
+        other => Err(shape("result<option<value>, sql-error>", other)),
     }
 }
 
-fn trigger_to_wit(trigger: TriggerCall) -> wit::TriggerData {
-    let TriggerCall {
-        op,
-        new_row,
-        old_row,
-    } = trigger;
-    wit::TriggerData {
-        op,
-        new_row: new_row.map(|r| r.into_iter().map(to_wit).collect()),
-        old_row: old_row.map(|r| r.into_iter().map(to_wit).collect()),
-    }
+// ---------------------------------------------------------------- the host interface
+
+/// Store `val` as the single result of a host function.
+fn set_result(results: &mut [Val], val: Val) -> wasmtime::Result<()> {
+    let slot = results
+        .first_mut()
+        .ok_or_else(|| wasmtime::Error::msg("PL/pgSQL ABI: no result slot"))?;
+    *slot = val;
+    Ok(())
+}
+
+fn param(params: &[Val], index: usize) -> wasmtime::Result<&Val> {
+    params
+        .get(index)
+        .ok_or_else(|| wasmtime::Error::msg(format!("PL/pgSQL ABI: missing argument {index}")))
+}
+
+/// `query: func(sql: string, params: list<value>) -> result<u32, sql-error>`.
+fn host_query(
+    mut store: StoreContextMut<'_, CallState>,
+    params: &[Val],
+    results: &mut [Val],
+) -> wasmtime::Result<()> {
+    let sql = val_string(param(params, 0)?)?;
+    let args = val_to_values(param(params, 1)?)?;
+    let outcome = store.data_mut().timed(|h| h.query(&sql, &args));
+    set_result(
+        results,
+        result_to_val(outcome, |cursor| Some(Val::U32(cursor))),
+    )
+}
+
+/// `fetch: func(cursor: u32, max: u32) -> result<list<list<value>>, sql-error>`.
+fn host_fetch(
+    mut store: StoreContextMut<'_, CallState>,
+    params: &[Val],
+    results: &mut [Val],
+) -> wasmtime::Result<()> {
+    let cursor = val_u32(param(params, 0)?)?;
+    let max = val_u32(param(params, 1)?)?;
+    let outcome = store.data_mut().timed(|h| h.fetch(cursor, max));
+    set_result(
+        results,
+        result_to_val(outcome, |rows| {
+            Some(Val::List(rows.into_iter().map(values_to_val).collect()))
+        }),
+    )
+}
+
+/// `close: func(cursor: u32)`.
+fn host_close(
+    mut store: StoreContextMut<'_, CallState>,
+    params: &[Val],
+    _results: &mut [Val],
+) -> wasmtime::Result<()> {
+    let cursor = val_u32(param(params, 0)?)?;
+    store.data_mut().timed(|h| h.close(cursor));
+    Ok(())
+}
+
+/// `execute: func(sql: string, params: list<value>) -> result<u64, sql-error>`.
+fn host_execute(
+    mut store: StoreContextMut<'_, CallState>,
+    params: &[Val],
+    results: &mut [Val],
+) -> wasmtime::Result<()> {
+    let sql = val_string(param(params, 0)?)?;
+    let args = val_to_values(param(params, 1)?)?;
+    let outcome = store.data_mut().timed(|h| h.execute(&sql, &args));
+    set_result(
+        results,
+        result_to_val(outcome, |count| Some(Val::U64(count))),
+    )
+}
+
+/// `notify: func(channel: string, payload: string) -> result<_, sql-error>`.
+fn host_notify(
+    mut store: StoreContextMut<'_, CallState>,
+    params: &[Val],
+    results: &mut [Val],
+) -> wasmtime::Result<()> {
+    let channel = val_string(param(params, 0)?)?;
+    let payload = val_string(param(params, 1)?)?;
+    let outcome = store.data_mut().timed(|h| h.notify(&channel, &payload));
+    set_result(results, result_to_val(outcome, |()| None))
+}
+
+/// Define the `host` interface's five functions in `instance`.
+fn add_host(instance: &mut LinkerInstance<'_, CallState>) -> wasmtime::Result<()> {
+    instance.func_new("query", |s, _ty, p, r| host_query(s, p, r))?;
+    instance.func_new("fetch", |s, _ty, p, r| host_fetch(s, p, r))?;
+    instance.func_new("close", |s, _ty, p, r| host_close(s, p, r))?;
+    instance.func_new("execute", |s, _ty, p, r| host_execute(s, p, r))?;
+    instance.func_new("notify", |s, _ty, p, r| host_notify(s, p, r))?;
+    Ok(())
 }
 
 impl UdfExecutor {
@@ -204,19 +365,22 @@ fn run_call(
     call: Call,
 ) -> Result<Option<Value>, SqlError> {
     let mut linker: Linker<CallState> = Linker::new(store.engine());
-    bindings::Routine::add_to_linker::<CallState, HasSelf<CallState>>(&mut linker, |s| s)
+    linker
+        .instance(HOST_INTERFACE)
+        .and_then(|mut instance| add_host(&mut instance))
         .map_err(|e| SqlError::new("XX000", format!("linking the PL/pgSQL host: {e:#}")))?;
-    let routine = bindings::Routine::instantiate(&mut *store, component, &linker)
+    let instance = linker
+        .instantiate(&mut *store, component)
         .map_err(|e| trap_error(&e, "instantiating"))?;
+    let func = instance
+        .get_func(&mut *store, CALL_EXPORT)
+        .ok_or_else(|| SqlError::new("XX000", "PL/pgSQL component does not export `call`"))?;
     let Call { args, trigger } = call;
-    let args: Vec<wit::Value> = args.into_iter().map(to_wit).collect();
-    let trigger = trigger.map(trigger_to_wit);
-    let outcome = routine
-        .call_call(&mut *store, &args, trigger.as_ref())
+    let params = [values_to_val(args), trigger_to_val(trigger)];
+    let mut results = [Val::Bool(false)]; // overwritten by the call's one result
+    func.call(&mut *store, &params, &mut results)
         .map_err(|e| trap_error(&e, "running"))?;
-    outcome
-        .map(|value| value.map(from_wit))
-        .map_err(|e| SqlError::new(&e.sqlstate, e.message))
+    val_to_outcome(&results[0]).map_err(|e| trap_error(&e, "reading the result"))?
 }
 
 /// A trap as a SQL error: resource limits are `54000`, anything else `XX000`. Logged at the
