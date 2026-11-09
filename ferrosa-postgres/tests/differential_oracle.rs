@@ -1365,6 +1365,25 @@ fn corpus() -> Vec<Case> {
             "order_by_multi_key",
             "SELECT oid, uid FROM orders ORDER BY uid, oid",
         ),
+        // ── Grammar the general engine added (formerly in the reject list) ──
+        // Each used to be refused; now that ferrosa answers them, PostgreSQL is
+        // what their rows are checked against.
+        c(
+            "in_subquery",
+            "SELECT id FROM users WHERE id IN (SELECT uid FROM orders) ORDER BY id",
+        ),
+        c(
+            "cte",
+            "WITH e AS (SELECT id FROM users) SELECT id FROM e ORDER BY id",
+        ),
+        c(
+            "is_null",
+            "SELECT id FROM users WHERE email IS NULL ORDER BY id",
+        ),
+        c(
+            "is_not_null",
+            "SELECT id FROM users WHERE email IS NOT NULL ORDER BY id",
+        ),
     ]
 }
 
@@ -1462,28 +1481,16 @@ async fn differential_oracle_rejects_unsupported_queries() {
     let (fe_client, _ferrosa_dir) = start_ferrosa().await;
 
     // (label, sql) — each must error rather than return rows. NOTE: no-`FROM`
-    // expression selects (`SELECT 1`, `SELECT version()`) are now a SUPPORTED
-    // feature (handled by the SelectExprs path), so they are deliberately NOT in
-    // this list — they belong to the corpus, not the restricted-query oracle.
+    // expression selects (`SELECT 1`, `SELECT version()`), `IN (subquery)`, `WITH`
+    // and `IS [NOT] NULL` are SUPPORTED now, so they are deliberately NOT in this
+    // list — they belong to the corpus, where PostgreSQL checks their rows.
     let rejects = [
-        (
-            "subquery",
-            "SELECT id FROM users WHERE id IN (SELECT uid FROM orders)",
-        ),
         ("missing_table", "SELECT * FROM nonexistent_table"),
-        // Grammar ferrosa's M1 subset does not implement — each must surface a
-        // clean parse/feature error, never silently-wrong rows.
-        ("cte", "WITH e AS (SELECT id FROM users) SELECT id FROM e"),
+        // Grammar ferrosa does not implement — each must surface a clean
+        // parse/feature error, never silently-wrong rows.
         ("union", "SELECT id FROM users UNION SELECT uid FROM orders"),
         ("window_fn", "SELECT id, COUNT(*) OVER () FROM users"),
         ("missing_column", "SELECT no_such_col FROM users"),
-        // `IS [NOT] NULL` is not yet in the M1 grammar (tracked separately). It
-        // must fail loud, not silently match the `= NULL`/`!= NULL` paths.
-        ("is_null", "SELECT id FROM users WHERE email IS NULL"),
-        (
-            "is_not_null",
-            "SELECT id FROM users WHERE email IS NOT NULL",
-        ),
     ];
 
     for (label, sql) in rejects {
