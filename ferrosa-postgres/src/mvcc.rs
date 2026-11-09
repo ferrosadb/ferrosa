@@ -1352,7 +1352,7 @@ fn validate_snapshot(
 /// Estimated resident bytes of a `Value`'s heap payload (the inline slot is
 /// counted separately). Underestimates nothing that matters for a comparison
 /// and deliberately does NOT allocate: it is a walk, not a serialization.
-fn value_heap_bytes(value: &Value) -> usize {
+pub(crate) fn value_heap_bytes(value: &Value) -> usize {
     match value {
         Value::Array(array) => {
             array.items.len() * std::mem::size_of::<Value>()

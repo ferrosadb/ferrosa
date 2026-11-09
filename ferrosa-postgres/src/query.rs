@@ -3388,6 +3388,8 @@ pub(crate) async fn execute_insert(
         jsonb_limits,
     };
 
+    // D13: the column names every trigger image of this statement shares.
+    let column_names = crate::procedural::triggers::column_names(meta);
     for row_index in 0..ins.rows.len() {
         // Resolve THIS row's named columns (per CQL type), substituting bound params;
         // collect regular/static cells by storage index, the CQL values by name for key
@@ -3540,13 +3542,13 @@ pub(crate) async fn execute_insert(
         ));
         // D13: a table with triggers queues this row's event for the statement's end.
         if let Err(error) = crate::procedural::triggers::record(row_events, meta, || {
-            crate::procedural::triggers::RowEvent {
+            Ok(crate::procedural::triggers::RowEvent {
                 keyspace: ks.to_string(),
                 table: ins.table.table.clone(), // the event outlives the borrowed statement
                 op: crate::procedural::triggers::RowOp::Insert,
-                new: sql_values.into_iter().collect(),
+                new: crate::procedural::triggers::shared_image(&column_names, sql_values)?,
                 old: None,
-            }
+            })
         }) {
             return vec![error];
         }
@@ -3988,6 +3990,8 @@ struct UpdateTarget<'a> {
     params: &'a [SqlValue],
     jsonb_limits: &'a ferrosa_jsonb::Limits,
     row_events: crate::procedural::triggers::EventSink<'a>,
+    /// The column names this statement's trigger images share (empty without triggers).
+    column_names: &'a crate::procedural::triggers::ColumnNames,
 }
 
 /// The context a resolved-row `DELETE` write runs against.
@@ -4241,22 +4245,23 @@ fn current_image_for_set(
     Ok(image)
 }
 
-/// A resolved row's whole image as SQL values (a trigger's `OLD`).
+/// A resolved row's whole image as SQL values (a trigger's `OLD`). The names are the
+/// statement's shared ones, so no string is copied.
 fn full_image(
     row: &ResolvedRow,
-) -> Result<std::collections::HashMap<String, SqlValue>, BackendMessage> {
-    row.values
-        .iter()
-        .map(|(name, cql)| {
-            let sql = crate::storage_provider::cql_to_value(cql).map_err(|error| {
-                error_response(
-                    "58000",
-                    &format!("UPDATE cannot represent stored column \"{name}\": {error}"),
-                )
-            })?;
-            Ok((name.clone(), sql)) // the resolved row stays borrowed by the write that follows
-        })
-        .collect()
+    names: &crate::procedural::triggers::ColumnNames,
+) -> Result<crate::procedural::triggers::RowImage, BackendMessage> {
+    let mut image = crate::procedural::triggers::RowImage::with_capacity(row.values.len());
+    for (name, cql) in &row.values {
+        let sql = crate::storage_provider::cql_to_value(cql).map_err(|error| {
+            error_response(
+                "58000",
+                &format!("UPDATE cannot represent stored column \"{name}\": {error}"),
+            )
+        })?;
+        image.insert(crate::procedural::triggers::shared_name(names, name)?, sql);
+    }
+    Ok(image)
 }
 
 /// Build the storage mutation a resolved-row `UPDATE` writes for ONE row. `current` is
@@ -4343,20 +4348,26 @@ fn build_update_mutation(
 /// the update; `NEW` is `old` with the assigned values over it.
 fn record_update_event(
     ctx: &UpdateTarget<'_>,
-    old: std::collections::HashMap<String, SqlValue>,
+    old: crate::procedural::triggers::RowImage,
     assigned: Vec<(String, SqlValue)>,
 ) -> Result<(), BackendMessage> {
     crate::procedural::triggers::record(ctx.row_events, ctx.meta, || {
-        let set_columns = assigned.iter().map(|(c, _)| c.clone()).collect(); // names kept beside the values
         let mut new = old.clone(); // OLD and NEW are both bound: two images of the row
-        new.extend(assigned);
-        crate::procedural::triggers::RowEvent {
+        let mut set_columns = Vec::with_capacity(assigned.len());
+        for (column, value) in assigned {
+            new.insert(
+                crate::procedural::triggers::shared_name(ctx.column_names, &column)?,
+                value,
+            );
+            set_columns.push(column);
+        }
+        Ok(crate::procedural::triggers::RowEvent {
             keyspace: ctx.ks.to_string(),
             table: ctx.table.to_string(),
             op: crate::procedural::triggers::RowOp::Update { set_columns },
             new,
             old: Some(old),
-        }
+        })
     })
 }
 
@@ -4699,7 +4710,7 @@ async fn apply_update_row(
         build_update_mutation(ctx, &row.pk_values, &row.ck_values, Some(&image))
             .map_err(|message| vec![message])?;
     if ctx.row_events.is_some() && crate::procedural::triggers::has_triggers(ctx.meta) {
-        let old = full_image(row).map_err(|message| vec![message])?;
+        let old = full_image(row, ctx.column_names).map_err(|message| vec![message])?;
         record_update_event(ctx, old, assigned).map_err(|message| vec![message])?;
     }
     apply_or_buffer_silent(
@@ -5028,6 +5039,8 @@ pub(crate) async fn execute_update(
             )]
         }
     };
+    // D13: the column names every trigger image of this statement shares.
+    let column_names = crate::procedural::triggers::column_names(meta);
 
     // Resolve every WHERE equality to its CQL value FIRST: an arithmetic SET needs the
     // key before it can read the row it updates. A WHERE that does not name the storage
@@ -5068,6 +5081,7 @@ pub(crate) async fn execute_update(
             params,
             jsonb_limits,
             row_events,
+            column_names: &column_names,
         };
         return update_read_committed(&target, buffer, &where_values).await;
     }
@@ -5087,6 +5101,7 @@ pub(crate) async fn execute_update(
             params,
             jsonb_limits,
             row_events,
+            column_names: &column_names,
         };
         return update_rows_by_predicate(&target, txn, &where_values).await;
     }
@@ -5160,6 +5175,7 @@ pub(crate) async fn execute_update(
         params,
         jsonb_limits,
         row_events,
+        column_names: &column_names,
     };
     let (mutation, assigned) =
         match build_update_mutation(&target, &pk_values, &ck_values, current.as_ref()) {
@@ -5167,7 +5183,12 @@ pub(crate) async fn execute_update(
             Err(msg) => return vec![msg],
         };
     // A row that does not exist has no OLD and is not an affected row: no trigger event.
-    if let Some(old) = current {
+    let fires = row_events.is_some() && crate::procedural::triggers::has_triggers(meta);
+    if let Some(old) = current.filter(|_| fires) {
+        let old = match crate::procedural::triggers::shared_image(&column_names, old) {
+            Ok(old) => old,
+            Err(error) => return vec![error],
+        };
         if let Err(error) = record_update_event(&target, old, assigned) {
             return vec![error];
         }

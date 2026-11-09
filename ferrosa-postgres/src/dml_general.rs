@@ -261,6 +261,7 @@ async fn read_and_write(
         layout: &layout,
         update: matches!(dml.action, DmlAction::Update(_)),
         row_events: run.row_events,
+        column_names: crate::procedural::triggers::column_names(target.meta),
     };
     let mut count = 0usize;
     while let Some(row) = stream.next_row().await? {
@@ -341,6 +342,8 @@ struct Writer<'a> {
     layout: &'a DmlLayout,
     update: bool,
     row_events: crate::procedural::triggers::EventSink<'a>,
+    /// The column names this statement's trigger images share (empty without triggers).
+    column_names: crate::procedural::triggers::ColumnNames,
 }
 
 impl Writer<'_> {
@@ -495,16 +498,30 @@ impl Writer<'_> {
         old_values: &HashMap<String, SqlValue>,
     ) -> Result<(), BackendMessage> {
         crate::procedural::triggers::record(self.row_events, self.target.meta, || {
-            crate::procedural::triggers::RowEvent {
+            Ok(crate::procedural::triggers::RowEvent {
                 keyspace: self.target.ks.clone(), // the event outlives this statement's borrows
                 table: self.target.table.clone(), // the event outlives this statement's borrows
                 op: crate::procedural::triggers::RowOp::Update {
                     set_columns: assigned.keys().cloned().collect(), // names copied into the event
                 },
-                new: new_row.clone(), // the writer still needs its row for the mutation
-                old: Some(old_values.clone()), // the image is kept beside NEW
-            }
+                // The writer still needs its rows for the mutation; the images share names.
+                new: self.borrowed_image(new_row)?,
+                old: Some(self.borrowed_image(old_values)?),
+            })
         })
+    }
+
+    /// An image of a row the writer keeps: its values copied, its names shared.
+    fn borrowed_image(
+        &self,
+        row: &HashMap<String, SqlValue>,
+    ) -> Result<crate::procedural::triggers::RowImage, BackendMessage> {
+        let mut image = crate::procedural::triggers::RowImage::with_capacity(row.len());
+        for (name, value) in row {
+            let name = crate::procedural::triggers::shared_name(&self.column_names, name)?;
+            image.insert(name, value.clone());
+        }
+        Ok(image)
     }
 
     fn delete_mutation(
@@ -607,17 +624,20 @@ async fn emit<O: ReplySink>(
             )])
         }
     };
+    // Drains the whole RETURNING replay in fixed batches; the batch bounds what is held
+    // between two sends, never how many rows are returned.
     loop {
         let mut batch = Vec::with_capacity(RESULT_BATCH_ROWS);
-        for item in rows.by_ref().take(RESULT_BATCH_ROWS) {
-            match item {
-                Ok(seq_row) => batch.push(project(seq_row.row, &visible)),
-                Err(e) => {
+        while batch.len() < RESULT_BATCH_ROWS {
+            match rows.next() {
+                Some(Ok(seq_row)) => batch.push(project(seq_row.row, &visible)),
+                Some(Err(e)) => {
                     return Ok(vec![error_response(
                         "58000",
                         &format!("RETURNING replay: {e}"),
                     )])
                 }
+                None => break,
             }
         }
         if batch.is_empty() {

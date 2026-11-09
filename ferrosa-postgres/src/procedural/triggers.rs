@@ -30,8 +30,11 @@ use crate::server::QueryContext;
 
 /// The table extension holding a table's triggers.
 pub(crate) const TRIGGERS_KEY: &str = "pg.triggers";
-/// Row events one statement may queue (`54000` beyond): the trigger queue is bounded.
-pub(crate) const MAX_ROW_EVENTS: usize = 100_000;
+/// Estimated bytes of row events one statement may queue (`54000` beyond). The queue is
+/// bounded by memory, not by a row count: 256 MiB holds the 100 000 events of the former
+/// count bound at a typical eight-column row with both images, and a statement past it is
+/// refused and rolled back, never truncated.
+pub(crate) const TRIGGER_QUEUE_BYTES: usize = 256 * 1024 * 1024;
 /// Nested trigger firing (a trigger's write firing a trigger), PostgreSQL's
 /// `max_stack_depth` analogue (`54001` beyond). Each level's future is boxed, but polling
 /// still nests one call chain per level, so the bound is set below what a 2 MiB tokio worker
@@ -49,6 +52,56 @@ pub(crate) struct StoredTrigger {
     pub(crate) function_name: String,
 }
 
+/// A row image by column name. The names are shared with the statement's [`ColumnNames`]
+/// (or moved in from the writer), so building an image copies no strings.
+pub(crate) type RowImage = HashMap<Arc<str>, SqlValue>;
+
+/// A table's column names, shared by every image one statement builds.
+pub(crate) type ColumnNames = std::collections::HashSet<Arc<str>>;
+
+/// The column names of `meta` when it has triggers, built once per statement; empty when it
+/// has none, since no image is then built.
+pub(crate) fn column_names(meta: &TableMetadata) -> ColumnNames {
+    if !has_triggers(meta) {
+        return ColumnNames::new();
+    }
+    meta.columns
+        .keys()
+        .map(|name| Arc::<str>::from(name.as_str()))
+        .collect()
+}
+
+/// `name` as the statement's shared column name.
+///
+/// # Errors
+///
+/// `XX000` when `name` is not a column of the table: an image naming a column the table
+/// does not have is an engine fault, not a value to bind.
+pub(crate) fn shared_name(names: &ColumnNames, name: &str) -> Result<Arc<str>, BackendMessage> {
+    names.get(name).map(Arc::clone).ok_or_else(|| {
+        error_response(
+            "XX000",
+            &format!("trigger image names \"{name}\", which is not a column of the table"),
+        )
+    })
+}
+
+/// An owned row's image, its values moved and its names shared.
+///
+/// # Errors
+///
+/// As [`shared_name`].
+pub(crate) fn shared_image(
+    names: &ColumnNames,
+    row: HashMap<String, SqlValue>,
+) -> Result<RowImage, BackendMessage> {
+    let mut image = RowImage::with_capacity(row.len());
+    for (name, value) in row {
+        image.insert(shared_name(names, &name)?, value);
+    }
+    Ok(image)
+}
+
 /// What happened to a row.
 #[derive(Debug)]
 pub(crate) enum RowOp {
@@ -63,15 +116,47 @@ pub(crate) struct RowEvent {
     pub(crate) table: String,
     pub(crate) op: RowOp,
     /// `NEW`: the row's values by column (a column absent here is NULL).
-    pub(crate) new: HashMap<String, SqlValue>,
+    pub(crate) new: RowImage,
     /// `OLD`: the row before an UPDATE.
-    pub(crate) old: Option<HashMap<String, SqlValue>>,
+    pub(crate) old: Option<RowImage>,
+}
+
+impl RowEvent {
+    /// Estimated resident bytes of this event: its inline size, its strings and both images.
+    /// A shared name or value is counted in every event that holds it, so the estimate errs
+    /// high, toward refusing early rather than holding more than the budget.
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        let set_columns = match &self.op {
+            RowOp::Insert => 0,
+            RowOp::Update { set_columns } => set_columns
+                .iter()
+                .map(|c| std::mem::size_of::<String>() + c.len())
+                .sum(),
+        };
+        std::mem::size_of::<Self>()
+            + self.keyspace.len()
+            + self.table.len()
+            + set_columns
+            + image_bytes(&self.new)
+            + self.old.as_ref().map_or(0, image_bytes)
+    }
+}
+
+/// Estimated resident bytes of an image: its table slots and each entry's heap payload.
+fn image_bytes(image: &RowImage) -> usize {
+    image.capacity() * std::mem::size_of::<(Arc<str>, SqlValue)>()
+        + image
+            .iter()
+            .map(|(name, value)| name.len() + crate::mvcc::value_heap_bytes(value))
+            .sum::<usize>()
 }
 
 /// The statement's trigger queue.
 #[derive(Debug, Default)]
 pub(crate) struct RowEvents {
     events: Vec<RowEvent>,
+    /// The queued events' estimated bytes, held at or below [`TRIGGER_QUEUE_BYTES`].
+    bytes: usize,
 }
 
 /// The shared handle the DML executor records through.
@@ -84,14 +169,21 @@ impl RowEvents {
     ///
     /// # Errors
     ///
-    /// `54000` past [`MAX_ROW_EVENTS`].
+    /// `54000` when the event would take the queue past [`TRIGGER_QUEUE_BYTES`]; the event
+    /// is not queued and the statement fails, so no trigger event is ever silently dropped.
     pub(crate) fn push(&mut self, event: RowEvent) -> Result<(), BackendMessage> {
-        if self.events.len() >= MAX_ROW_EVENTS {
+        let bytes = self.bytes.saturating_add(event.estimated_bytes());
+        if bytes > TRIGGER_QUEUE_BYTES {
             return Err(error_response(
                 "54000",
-                &format!("a statement queued more than {MAX_ROW_EVENTS} trigger events"),
+                &format!(
+                    "a statement's AFTER ROW trigger events exceeded {TRIGGER_QUEUE_BYTES} bytes \
+                     after {} events",
+                    self.events.len()
+                ),
             ));
         }
+        self.bytes = bytes;
         self.events.push(event);
         Ok(())
     }
@@ -105,11 +197,11 @@ impl RowEvents {
 pub(crate) fn record(
     sink: EventSink<'_>,
     meta: &TableMetadata,
-    make: impl FnOnce() -> RowEvent,
+    make: impl FnOnce() -> Result<RowEvent, BackendMessage>,
 ) -> Result<(), BackendMessage> {
     match sink {
         Some(sink) if has_triggers(meta) => match sink.lock() {
-            Ok(mut events) => events.push(make()),
+            Ok(mut events) => events.push(make()?),
             Err(_) => Err(error_response("XX000", "trigger event queue lock poisoned")),
         },
         _ => Ok(()),
@@ -408,7 +500,7 @@ fn trigger_call(
 fn fields(
     ctx: &QueryContext,
     meta: &TableMetadata,
-    row: &HashMap<String, SqlValue>,
+    row: &RowImage,
     names: &[&str],
     record: &str,
 ) -> Result<Vec<Value>, BackendMessage> {
@@ -438,4 +530,91 @@ fn fields(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sqlstate(message: &BackendMessage) -> Option<&str> {
+        match message {
+            BackendMessage::ErrorResponse { fields } => fields
+                .iter()
+                .find(|(code, _)| *code == b'C')
+                .map(|(_, state)| state.as_str()),
+            _ => None,
+        }
+    }
+
+    /// An UPDATE event of a typical eight-column row: four ints and four short texts,
+    /// with both images bound.
+    fn typical_update(names: &ColumnNames) -> RowEvent {
+        let image: RowImage = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let value = if i % 2 == 0 {
+                    SqlValue::Int(i as i64)
+                } else {
+                    SqlValue::Text(format!("value-{i:04}").into())
+                };
+                (Arc::clone(name), value)
+            })
+            .collect();
+        RowEvent {
+            keyspace: "public".into(),
+            table: "jobs".into(),
+            op: RowOp::Update {
+                set_columns: vec!["state".into()],
+            },
+            new: image.clone(),
+            old: Some(image),
+        }
+    }
+
+    fn eight_columns() -> ColumnNames {
+        [
+            "id", "state", "queue", "worker", "attempt", "args", "errors", "tags",
+        ]
+        .into_iter()
+        .map(Arc::<str>::from)
+        .collect()
+    }
+
+    #[test]
+    fn the_byte_budget_holds_what_the_old_event_count_held_at_typical_rows() {
+        let names = eight_columns();
+        let one = typical_update(&names).estimated_bytes();
+        assert!(one > 0);
+        assert!(
+            one * 100_000 <= TRIGGER_QUEUE_BYTES,
+            "100000 typical events ({one} bytes each) must fit in {TRIGGER_QUEUE_BYTES}"
+        );
+    }
+
+    #[test]
+    fn crossing_the_byte_budget_is_refused_with_54000_and_nothing_is_dropped() {
+        let big = SqlValue::Text("x".repeat(1 << 20).into());
+        let make = || RowEvent {
+            keyspace: "public".into(),
+            table: "blobs".into(),
+            op: RowOp::Insert,
+            new: [(Arc::<str>::from("body"), big.clone())]
+                .into_iter()
+                .collect(),
+            old: None,
+        };
+        let per_event = make().estimated_bytes();
+        let fits = TRIGGER_QUEUE_BYTES / per_event;
+        let mut events = RowEvents::default();
+        for _ in 0..fits {
+            events.push(make()).expect("within the budget");
+        }
+        let refused = events.push(make()).expect_err("past the budget");
+        assert_eq!(sqlstate(&refused), Some("54000"));
+        // Refusal, not truncation: every accepted event is still queued, and the refused
+        // one was not.
+        assert_eq!(events.events.len(), fits);
+        assert!(events.bytes <= TRIGGER_QUEUE_BYTES);
+    }
 }
