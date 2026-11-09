@@ -62,6 +62,7 @@ import Ferrosa.Sql.Serial
 import Ferrosa.Sql.Constraint
 import Ferrosa.Storage.Mvcc
 import Ferrosa.Storage.Streaming
+import Ferrosa.Storage.SyncHealth
 import Ferrosa.Ownership.Machine
 import Ferrosa.Ownership.Audit
 import Ferrosa.Ownership.Obligations

@@ -908,3 +908,27 @@ the same read.
 Status: fixed on `fix/cql-lwt-lost-reply`; regression tests in `frame.rs` include a `Framed`
 reader over an in-memory pipe that times out on the old decoder.
 
+## G21 — commit log: a forced sync left the stall clock running
+
+Source: `ferrosa-storage/src/commitlog/mod.rs` (`CommitLog::force_sync`) and
+`ferrosa-storage/src/commitlog/sync.rs` (`SyncHealth`), model `Ferrosa/Storage/SyncHealth.lean`.
+
+`force_sync` flushed the active segment but never updated the sync health record. The data was
+durable, yet `unsynced_for` kept counting and `admit` refused durable writes "past the stall
+deadline" until the sync thread's own next fsync. With the production 10 ms interval the thread
+hides it; with a long interval (replay, catch-up, tests) the log refused writes it could have
+acknowledged.
+
+- **The violation** (`force_old_keeps_refusing`): one write, forced to disk, still refused.
+- **The fix** (`force_new_is_a_sync`): a forced sync reads a ticket before flushing and is
+  accounted exactly as the thread's fsync, so a completed sync of either kind clears the clock
+  (`completed_sync_clears_the_clock`, `forced_sync_admits`).
+- **Failure** (`failed_force_leaves_the_clock`): a failed forced sync changes nothing; the writes it
+  covered keep ageing toward the deadline.
+- **The race** (`superseded_ticket_changes_nothing`, `a_lost_race_keeps_the_clock_cleared`): a sync
+  whose ticket is older than what is already durable cannot move the clock back.
+
+Status: fixed on `feat/postgres-oban`; regression tests
+`a_forced_sync_clears_the_stall_clock_and_writes_are_admitted`,
+`a_failed_forced_sync_leaves_the_stall_clock_running` and
+`a_superseded_sync_does_not_reopen_the_stall_clock` in `commitlog/mod.rs`.

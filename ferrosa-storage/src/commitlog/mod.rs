@@ -1608,8 +1608,11 @@ impl CommitLog {
     pub fn force_sync(&self) -> ferrosa_common::Result<()> {
         // Every flush closes its section (reserve-ahead; see the segment
         // module docs), so a forced sync is an ordinary flush. No marker that
-        // is already on disk is ever rewritten.
-        self.active.load().flush_to_disk()
+        // is already on disk is ever rewritten. It is accounted in the sync
+        // health like the thread's own fsync, so a completed one clears the
+        // stall clock and a failed one leaves it running.
+        let active = self.active.load();
+        sync::forced_sync(self.sync_strategy.sync_health(), || active.flush_to_disk())
     }
 
     /// Health of the sync machinery, for the node supervisor and metrics.
@@ -3666,5 +3669,128 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    // -- A forced sync is a sync: it clears the stall clock ------------------
+
+    /// A commit log whose sync thread never syncs on its own (hour-long interval and batch
+    /// window, unreachable byte target), with a 1 ms stall deadline.
+    fn log_that_syncs_only_when_forced(dir: &std::path::Path) -> CommitLog {
+        let never = std::time::Duration::from_secs(3600);
+        let config = CommitLogConfig {
+            segment_size: 1024 * 1024,
+            sync_strategy: SyncStrategyConfig::Periodic {
+                sync_interval: never,
+            },
+            batch: CommitLogBatchConfig {
+                target_bytes: u64::MAX,
+                max_delay: never,
+                sync_stall_deadline: std::time::Duration::from_millis(1),
+                ..CommitLogBatchConfig::with_max_delay(never)
+            },
+            ..CommitLogConfig::test_config(dir)
+        };
+        CommitLog::new(config).unwrap()
+    }
+
+    /// Append one write and let it age past the 1 ms stall deadline unsynced.
+    fn age_one_write_past_the_deadline(cl: &CommitLog) {
+        cl.append(&simple_mutation())
+            .expect("younger than the deadline");
+        let started = std::time::Instant::now();
+        loop {
+            match cl.sync_health().unsynced_for {
+                Some(age) if age > std::time::Duration::from_millis(1) => return,
+                Some(_) => assert!(
+                    started.elapsed() < std::time::Duration::from_secs(10),
+                    "the unsynced write never aged"
+                ),
+                None => panic!("the log synced on its own; the setup is not stalled"),
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    /// `force_sync` makes every registered write durable, so it must clear the stall clock
+    /// exactly as the sync thread's own fsync does. It did not: the data was on disk, the
+    /// health still reported it unsynced, and writes were refused "past the stall deadline"
+    /// until the thread's next timer.
+    #[test]
+    fn a_forced_sync_clears_the_stall_clock_and_writes_are_admitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let cl = log_that_syncs_only_when_forced(dir.path());
+        age_one_write_past_the_deadline(&cl);
+        assert!(
+            matches!(
+                cl.append(&simple_mutation()),
+                Err(ferrosa_common::Error::CommitLogNotDurable { .. })
+            ),
+            "the premise: a stalled log refuses"
+        );
+
+        cl.force_sync().expect("forced sync");
+
+        assert_eq!(
+            cl.sync_health().unsynced_for,
+            None,
+            "a completed forced sync clears the stall clock: {:?}",
+            cl.sync_health()
+        );
+        cl.append(&simple_mutation())
+            .expect("a write after a completed forced sync is admitted");
+    }
+
+    /// A forced sync whose flush fails leaves the stall clock running and the writes it
+    /// covered not durable; the caller gets the error.
+    #[test]
+    fn a_failed_forced_sync_leaves_the_stall_clock_running() {
+        let health = sync::SyncHealth::new(std::time::Duration::from_millis(1));
+        let seq = health.note_write(std::time::Instant::now());
+        let error = sync::forced_sync(&health, || {
+            Err(ferrosa_common::Error::Io(std::io::Error::other(
+                "injected flush failure",
+            )))
+        })
+        .expect_err("the flush failure reaches the caller");
+        assert!(
+            error.to_string().contains("injected flush failure"),
+            "{error}"
+        );
+        let snapshot = health.snapshot(std::time::Instant::now(), true);
+        assert!(
+            snapshot.unsynced_for.is_some(),
+            "still unsynced: {snapshot:?}"
+        );
+        assert!(!health.durable_through(seq), "nothing became durable");
+        assert!(
+            !snapshot.failing,
+            "the failing state stays the sync thread's to set"
+        );
+        assert_eq!(snapshot.attempts_started, snapshot.attempts_completed);
+    }
+
+    /// An older sync completing after a newer one must not move the stall clock back.
+    #[test]
+    fn a_superseded_sync_does_not_reopen_the_stall_clock() {
+        let health = sync::SyncHealth::new(std::time::Duration::from_secs(2));
+        health.note_write(std::time::Instant::now());
+        let older = health.begin_sync(std::time::Instant::now());
+        health.note_write(std::time::Instant::now());
+        sync::forced_sync(&health, || Ok(())).expect("newer sync");
+        assert!(health.all_durable());
+        assert_eq!(
+            health
+                .snapshot(std::time::Instant::now(), true)
+                .unsynced_for,
+            None
+        );
+        health.sync_succeeded(older);
+        assert_eq!(
+            health
+                .snapshot(std::time::Instant::now(), true)
+                .unsynced_for,
+            None,
+            "the superseded ticket left the clock cleared"
+        );
     }
 }

@@ -37,6 +37,7 @@ import Ferrosa.Sql.TableLock
 import Ferrosa.Sql.SimpleSplit
 import Ferrosa.Sql.Dml
 import Ferrosa.Cql.V5Framing
+import Ferrosa.Storage.SyncHealth
 
 #check Ferrosa.Sql.Expr.legacy_compare_agrees
 #check Ferrosa.Sql.Expr.any_true_iff
@@ -91,6 +92,13 @@ import Ferrosa.Cql.V5Framing
 #check Ferrosa.Cql.V5Framing.decode_new_progress
 #check Ferrosa.Cql.V5Framing.decode_new_reassembles
 #check Ferrosa.Cql.V5Framing.framed_new_delivers_all
+#check Ferrosa.Storage.SyncHealth.force_old_keeps_refusing
+#check Ferrosa.Storage.SyncHealth.force_new_is_a_sync
+#check Ferrosa.Storage.SyncHealth.completed_sync_clears_the_clock
+#check Ferrosa.Storage.SyncHealth.forced_sync_admits
+#check Ferrosa.Storage.SyncHealth.failed_force_leaves_the_clock
+#check Ferrosa.Storage.SyncHealth.superseded_ticket_changes_nothing
+#check Ferrosa.Storage.SyncHealth.a_lost_race_keeps_the_clock_cleared
 #check Ferrosa.Topology.DcQuorum.dc_quorum_writes_share_a_replica
 #check Ferrosa.Topology.DcQuorum.no_partition_admits_two_dc_quorum_writes
 #check Ferrosa.Topology.DcQuorum.node_gate_forces_a_shared_replica
