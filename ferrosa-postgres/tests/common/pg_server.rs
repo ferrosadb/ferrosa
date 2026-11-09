@@ -126,7 +126,8 @@ fn schema_with_table() -> Schema {
     schema
 }
 
-fn engine_config(dir: &Path) -> StorageEngineConfig {
+/// The engine configuration every test server runs on.
+pub fn engine_config(dir: &Path) -> StorageEngineConfig {
     StorageEngineConfig {
         commit_log: CommitLogConfig {
             segment_size: 256 * 1024,
@@ -159,7 +160,8 @@ fn engine_config(dir: &Path) -> StorageEngineConfig {
     }
 }
 
-fn storage_schema() -> ferrosa_common::schema::TableSchema {
+/// The storage schema of the seeded table `ks.t`.
+pub fn storage_schema() -> ferrosa_common::schema::TableSchema {
     use ferrosa_common::schema::{ColumnDefinition, TableSchema};
     let col = |name: &str, ty: &str| ColumnDefinition {
         name: name.to_string(),
@@ -194,15 +196,33 @@ pub fn row_id(i: usize) -> String {
 /// timestamp and values). A backlog that never drains still fails the test, after
 /// [`DRAIN_DEADLINE`], as does any other error.
 pub fn write_row(engine: &StorageEngine, i: usize) {
+    write_row_with(engine, i, &mut |engine: &StorageEngine| {
+        wait_for_commit_log_drain(engine, deadline_after(DRAIN_DEADLINE));
+    });
+}
+
+/// [`write_row`] with the action taken on each `CommitLogNotDurable` refusal before the
+/// retry. Returns the refusals' reasons, each also logged to stderr.
+///
+/// # Panics
+///
+/// On any other error, or after [`WRITE_ATTEMPTS`] refusals.
+pub fn write_row_with(
+    engine: &StorageEngine,
+    i: usize,
+    on_refused: &mut dyn FnMut(&StorageEngine),
+) -> Vec<String> {
     let tid = TableId::new("ks", "t");
     let key = DecoratedKey::new(PartitionKey::new(row_id(i).into_bytes()));
     let ts = 1000 + i as i64;
+    let mut refusals = Vec::new();
     for attempt in 1..=WRITE_ATTEMPTS {
         match engine.write(&tid, &key, seeded_row(i, ts), ts) {
-            Ok(_) => return,
+            Ok(_) => return refusals,
             Err(ferrosa_common::Error::CommitLogNotDurable { reason }) => {
                 eprintln!("write row {i}: refused (attempt {attempt}): {reason}");
-                wait_for_commit_log_drain(engine);
+                refusals.push(reason);
+                on_refused(engine);
             }
             Err(error) => panic!("write row {i}: {error:?}"),
         }
@@ -211,12 +231,13 @@ pub fn write_row(engine: &StorageEngine, i: usize) {
 }
 
 /// Attempts at one seeded write before a refusal is treated as a failure.
-const WRITE_ATTEMPTS: usize = 5;
+pub const WRITE_ATTEMPTS: usize = 5;
 
 /// How long the commit log may take to drain a stalled backlog before the test fails.
-const DRAIN_DEADLINE: Duration = Duration::from_secs(30);
+pub const DRAIN_DEADLINE: Duration = Duration::from_secs(30);
 
-fn seeded_row(i: usize, ts: i64) -> StorageRow {
+/// The seeded row `i` at timestamp `ts`: `name = "x"`, `score = i`.
+pub fn seeded_row(i: usize, ts: i64) -> StorageRow {
     StorageRow {
         clustering: 1i32.to_be_bytes().to_vec(),
         cells: vec![
@@ -228,12 +249,17 @@ fn seeded_row(i: usize, ts: i64) -> StorageRow {
     }
 }
 
-/// Wait until the commit log has no unsynced write, failing loudly past [`DRAIN_DEADLINE`].
-fn wait_for_commit_log_drain(engine: &StorageEngine) {
+/// An expiry check that turns true once `deadline` of wall time has passed.
+pub fn deadline_after(deadline: Duration) -> impl FnMut() -> bool {
     let started = std::time::Instant::now();
+    move || started.elapsed() >= deadline
+}
+
+/// Wait until the commit log has no unsynced write, failing loudly once `expired` says so.
+pub fn wait_for_commit_log_drain(engine: &StorageEngine, mut expired: impl FnMut() -> bool) {
     while engine.commit_log_sync_health().unsynced_for.is_some() {
         assert!(
-            started.elapsed() < DRAIN_DEADLINE,
+            !expired(),
             "the commit log never drained its backlog: {:?}",
             engine.commit_log_sync_health()
         );
