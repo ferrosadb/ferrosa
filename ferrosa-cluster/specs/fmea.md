@@ -224,6 +224,7 @@ cluster-wide and severities run high. Several entries are *evidence* gaps
 | CL-76 | **A data center whose own Raft group is smaller than `FERROSA_EXPECTED_CLUSTER_SIZE` can never accept native-protocol connections, so a multi-DC deployment must size EVERY DC to `expected`, not just the cluster.** `ModeController::accepts_cql_connections` compares `expected_cluster_size` against the node's LOCAL group's `metrics.membership_config.membership().voter_ids().count()`, and Raft groups are per-DC (`partition_peers_by_dc` excludes cross-DC peers from the local ring). Verified against two live processes declared `expected=1` in `us-west-2` / `eu-west-1`: `/readyz` passes at once (each node is `Standalone`), then the peer connection logs `mode transition: -> pair` and `reverse connection established`, the Bulk/Data lanes are torn down, and a client that connects during the transition gets `CQL handshake: Protocol("unexpected startup response: Error")`. `declared_topology_is_ready` additionally maps `expected == 2` to Pair + Primary, so a two-node cluster is the pair path BY DESIGN and is a different replication model. | The smallest two-DC cluster in which BOTH DCs answer CQL is `2 x expected_cluster_size` nodes — six at the default three. A deployment that sizes the cluster but not each DC gets a DC that accepts internode work (including a relayed DDL) and refuses every client. This is NOT a defect in the cross-DC relay above it, which never touches CQL; it is the reason the end-to-end two-DC acceptance proof needs six processes. | 7 | 4 | 5 | 140 | **Topology constraint remains.** The active acceptance proof in `ferrosa/tests/data_center_process.rs` runs six real processes, three voters per DC. Its wide-run failure exposed the separate DDL publication race documented in CL-77; the relay and per-DC groups have lower-level coverage in `tests/cross_dc_ddl_relay.rs`. A two-node deployment still exercises pair mode rather than this topology. |
 | CL-77 | DDL acknowledged on Direct before Cluster path publication | Local replay reaches only its own DC; the remote DC never receives the acknowledged schema. | 8 | 4 | 3 | 96 | Mitigated: keep Forming DDL until Cluster publication, gate declared admission and readiness, and verify real transition/admission/HTTP controls plus the active six-process cross-DC proof. Prior divergent schema and old queued replay/WAN repair remain outside this change (`t_9a8b88de`). |
 | CL-78 | A refused ring admission was dropped during formation | The initial voter topology never published token ownership, so the node stayed `Forming` with no Cluster DDL path and readiness waited on `ddl_path` for good. | 8 | 3 | 4 | 96 | Fixed: ring admission is owned by the Raft leader (forwarded admissions are refused by the leader's membership-control guard, so forwarding was ineffective). Neither formation deadline ends the wait any more: each is reported once, a late leader completes formation and admits itself, and the leader re-proposes every voter missing from its ring. Details and residuals are in the CL-78 section below (`t_9c219a2b`). |
+| CL-79 | A released build cannot read its predecessor's Raft state | 0.35.0 inserted `ClusterConfig::pair_quorum_strict` mid-struct; bincode is positional, so every node upgraded from 0.30.x failed to decode its snapshot and refused Raft startup (no schema, no DDL). | 9 | 4 | 3 | 108 | Fixed: the node-local flag is out of the binary encoding (0.30-compatible bytes) and a failed snapshot, log-entry or Raft RPC decode is retried in the 0.35 layout, bounded by input length. Golden fixtures from both releases gate it. Details in the CL-79 section below. |
 
 ## CL-77 — acknowledged DDL before Raft path publication
 
@@ -323,3 +324,35 @@ PostgreSQL replica apply acquires each MVCC observer's lifecycle lease before pr
 Raft restore retires physical rows when authoritative incoming schema names a different UUID, then installs the replacement; storage/schema reconciliation errors propagate instead of reporting a successful snapshot. Direct DDL and pair catch-up retain one write fence across registry and storage transitions. The all-serving TRUNCATE fan-out is a separate raw-marker path and is not covered by the MVCC observer lease.
 
 Storage schemas now persist the authoritative UUID in the reserved `ferrosa.table_id` extension (overwriting caller-supplied values). Restore prefers that provenance, with the local schema registry supplying legacy provenance when available. Unidentified data or malformed UUID metadata is refused before any table is retired; recoverable data is preserved for explicit repair. Empty registrations can adopt the incoming schema.
+
+## CL-79 — a released build cannot read its predecessor's Raft state (2026-11-06)
+
+**Failure mode.** 0.35.0 inserted `ClusterConfig::pair_quorum_strict` in the
+middle of the struct with `#[serde(default)]`. `ClusterConfig` is bincode-encoded
+inside the state-machine snapshot, `RaftOp::UpdateConfig` log entries and Raft
+RPCs; bincode is positional and ignores `serde(default)`. Every node upgraded
+from 0.30.7 failed to decode its own snapshot ("tag for enum is not valid,
+found 44"), refused Raft startup, and served no schema. CI passed because the
+log-entry golden gate never contained an `UpdateConfig` entry and no golden
+gate existed for the snapshot.
+
+**Control.** The flag is node-local (`FERROSA_PAIR_QUORUM_STRICT`) and is no
+longer part of the binary encoding: it serializes to zero bytes, byte-identical
+to 0.30.x, so a node rolled back can read what this build writes.
+`config::cluster_config_wire::decode_with_legacy_fallback` retries a failed
+snapshot, log-entry or Raft RPC decode in the 0.35.x layout, logs a warning
+when it does, and returns the original error if neither layout reads. Decodes
+are bounded by the input length: a misaligned first attempt otherwise read a
+garbage length prefix and aborted the process on a 64 PiB allocation.
+
+**Tests.** Golden fixtures written by the 0.30.7 and 0.35.1 sources
+(`tests/fixtures/state_machine_snapshot_v0_30_7.bin`, `..._v0_35_1.bin`,
+`update_config_entry_v0_30_7.bin`, `..._v0_35_1.bin`):
+`a_snapshot_written_by_0_30_7_restores`, `a_snapshot_written_by_0_35_1_restores`,
+`an_update_config_entry_written_by_0_30_7_decodes`,
+`an_update_config_entry_written_by_0_35_1_decodes`,
+`an_update_config_entry_is_written_in_the_layout_0_30_7_reads`.
+
+**Rule.** Never regenerate these fixtures to make a test pass; a new field in
+any bincode-encoded Raft type goes in a trailing extension (as
+`SnapshotExtension` does) or out of the encoding.

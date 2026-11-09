@@ -27,6 +27,7 @@ use clap::{Parser, Subcommand};
 
 mod auth;
 mod commands;
+mod credentials;
 mod tui;
 
 /// Administration and observability CLI for Ferrosa.
@@ -45,6 +46,16 @@ struct Cli {
     #[arg(long, default_value_t = 9090)]
     web_port: u16,
 
+    /// User to authenticate as, for CQL and the web admin API. Falls back to
+    /// FERROSA_CTL_USERNAME; with neither, connects anonymously.
+    #[arg(long, global = true)]
+    username: Option<String>,
+
+    /// Read the password from one line of standard input. Otherwise
+    /// FERROSA_CTL_PASSWORD is used, else an interactive prompt.
+    #[arg(long, global = true)]
+    password_stdin: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -57,12 +68,6 @@ enum CompactionAction {
         keyspace: Option<String>,
         #[arg(long, requires = "keyspace")]
         table: Option<String>,
-        /// Admin/operator username. Prompts for its password unless --password-stdin is set.
-        #[arg(long)]
-        username: Option<String>,
-        /// Read the password from one line of standard input.
-        #[arg(long, requires = "username")]
-        password_stdin: bool,
     },
 }
 
@@ -652,14 +657,6 @@ enum SchemaAction {
         /// `10.0.0.1:9090,10.0.0.2:9090,10.0.0.3:9090`. Each must be reachable.
         #[arg(long = "nodes", value_delimiter = ',')]
         nodes: Vec<String>,
-
-        /// Admin/operator username. Prompts for its password unless --password-stdin is set.
-        #[arg(long)]
-        username: Option<String>,
-
-        /// Read the password from one line of standard input.
-        #[arg(long, requires = "username")]
-        password_stdin: bool,
     },
 }
 
@@ -703,57 +700,57 @@ async fn main() {
     let web_host = addr.ip().to_string();
     let web_port = cli.web_port;
 
+    // One credential source for every CQL and web call (see credentials.rs).
+    let credentials =
+        credentials::resolve_from_process(cli.username.as_deref(), cli.password_stdin)
+            .unwrap_or_else(|e| {
+                eprintln!("error: {e}");
+                process::exit(1);
+            });
+    let creds = credentials.as_ref();
+
     let result: Result<(), MainError> = match cli.command {
-        Commands::Status => commands::run_status(addr).await.map_err(Into::into),
-        Commands::Connections { sort } => commands::run_connections(addr, sort.as_deref())
+        Commands::Status => commands::run_status(addr, creds).await.map_err(Into::into),
+        Commands::Connections { sort } => commands::run_connections(addr, sort.as_deref(), creds)
             .await
             .map_err(Into::into),
-        Commands::Queries { long_running } => commands::run_queries(addr, long_running)
+        Commands::Queries { long_running } => commands::run_queries(addr, long_running, creds)
             .await
             .map_err(Into::into),
         Commands::Compaction {
-            action:
-                CompactionAction::Stop {
-                    keyspace,
-                    table,
-                    username,
-                    password_stdin,
-                },
+            action: CompactionAction::Stop { keyspace, table },
         } => {
-            commands::compaction::stop(
-                addr,
-                web_port,
-                keyspace.as_deref(),
-                table.as_deref(),
-                username.as_deref(),
-                password_stdin,
-            )
-            .await
+            commands::compaction::stop(addr, web_port, keyspace.as_deref(), table.as_deref(), creds)
+                .await
         }
-        Commands::Storage => commands::run_storage(addr).await.map_err(Into::into),
-        Commands::Topology => commands::run_topology(addr).await.map_err(Into::into),
-        Commands::Peers => commands::run_peers(addr).await.map_err(Into::into),
-        Commands::Monitor { panel } => commands::run_monitor(addr, panel.as_deref())
+        Commands::Storage => commands::run_storage(addr, creds).await.map_err(Into::into),
+        Commands::Topology => commands::run_topology(addr, creds)
             .await
             .map_err(Into::into),
-        Commands::AddNode { host_id } => commands::add_node(&web_host, web_port, &host_id).await,
-        Commands::Decommission { host_id } => {
-            commands::decommission(&web_host, web_port, host_id.as_deref()).await
+        Commands::Peers => commands::run_peers(addr, creds).await.map_err(Into::into),
+        Commands::Monitor { panel } => commands::run_monitor(addr, panel.as_deref(), creds)
+            .await
+            .map_err(Into::into),
+        Commands::AddNode { host_id } => {
+            commands::add_node(&web_host, web_port, &host_id, creds).await
         }
-        Commands::Ring => commands::ring(&web_host, web_port).await,
-        Commands::Rebalance => commands::rebalance(&web_host, web_port).await,
+        Commands::Decommission { host_id } => {
+            commands::decommission(&web_host, web_port, host_id.as_deref(), creds).await
+        }
+        Commands::Ring => commands::ring(&web_host, web_port, creds).await,
+        Commands::Rebalance => commands::rebalance(&web_host, web_port, creds).await,
         Commands::Repair {
             keyspace,
             table,
             rf,
-        } => commands::repair(&web_host, web_port, &keyspace, &table, rf).await,
+        } => commands::repair(&web_host, web_port, &keyspace, &table, rf, creds).await,
         Commands::Snapshot { action } => match action {
             SnapshotAction::Create { name, ttl_hours } => {
-                commands::snapshot_create(&web_host, web_port, &name, ttl_hours).await
+                commands::snapshot_create(&web_host, web_port, &name, ttl_hours, creds).await
             }
-            SnapshotAction::List => commands::snapshot_list(&web_host, web_port).await,
+            SnapshotAction::List => commands::snapshot_list(&web_host, web_port, creds).await,
             SnapshotAction::Delete { name } => {
-                commands::snapshot_delete(&web_host, web_port, &name).await
+                commands::snapshot_delete(&web_host, web_port, &name, creds).await
             }
         },
         Commands::Auth { action } => match action {
@@ -794,7 +791,7 @@ async fn main() {
                 yes,
             } => commands::raft_log_truncate(&data_dir, from, dry_run, yes),
             RaftAction::TransferLeader { to } => {
-                commands::raft_transfer_leader(&web_host, web_port, &to).await
+                commands::raft_transfer_leader(&web_host, web_port, &to, creds).await
             }
         },
         Commands::Cluster { action } => match action {
@@ -804,17 +801,24 @@ async fn main() {
                 addr,
                 owns_tokens,
             } => {
-                commands::cluster_add_learner(&web_host, web_port, &host_id, &addr, owns_tokens)
-                    .await
+                commands::cluster_add_learner(
+                    &web_host,
+                    web_port,
+                    &host_id,
+                    &addr,
+                    owns_tokens,
+                    creds,
+                )
+                .await
             }
             ClusterAction::PromoteToVoter { host_id } => {
-                commands::cluster_promote_to_voter(&web_host, web_port, &host_id).await
+                commands::cluster_promote_to_voter(&web_host, web_port, &host_id, creds).await
             }
             ClusterAction::DemoteToLearner { host_id } => {
-                commands::cluster_demote_to_learner(&web_host, web_port, &host_id).await
+                commands::cluster_demote_to_learner(&web_host, web_port, &host_id, creds).await
             }
             ClusterAction::DowngradeToPair { peer } => {
-                commands::cluster_downgrade_to_pair(&web_host, web_port, &peer).await
+                commands::cluster_downgrade_to_pair(&web_host, web_port, &peer, creds).await
             }
         },
         Commands::Restore {
@@ -828,20 +832,25 @@ async fn main() {
                 &snapshot_name,
                 point_in_time.as_deref(),
                 force,
+                creds,
             )
             .await
         }
         Commands::Index { action } => match action {
-            IndexAction::List { problems } => commands::index::run_index_list(addr, problems)
-                .await
-                .map_err(Into::into),
+            IndexAction::List { problems } => {
+                commands::index::run_index_list(addr, problems, creds)
+                    .await
+                    .map_err(Into::into)
+            }
             IndexAction::Rebuild {
                 keyspace,
                 table,
                 index,
             } => {
-                commands::index::run_index_rebuild(&web_host, web_port, &keyspace, &table, &index)
-                    .await
+                commands::index::run_index_rebuild(
+                    &web_host, web_port, &keyspace, &table, &index, creds,
+                )
+                .await
             }
         },
         Commands::Commitlog { action } => match action {
@@ -912,11 +921,7 @@ async fn main() {
             ),
         },
         Commands::Schema { action } => match action {
-            SchemaAction::Check {
-                nodes,
-                username,
-                password_stdin,
-            } => commands::schema_check(&nodes, username.as_deref(), password_stdin).await,
+            SchemaAction::Check { nodes } => commands::schema_check(&nodes, creds).await,
         },
     };
 
@@ -957,40 +962,41 @@ mod tests {
             "ferrosa_admin",
         ])
         .unwrap();
+        assert_eq!(cli.username.as_deref(), Some("ferrosa_admin"));
+        assert!(!cli.password_stdin);
         match cli.command {
             Commands::Schema {
-                action:
-                    SchemaAction::Check {
-                        nodes,
-                        username,
-                        password_stdin,
-                    },
-            } => {
-                assert_eq!(nodes, vec!["10.0.0.1:9090", "10.0.0.2:9090"]);
-                assert_eq!(username.as_deref(), Some("ferrosa_admin"));
-                assert!(!password_stdin);
-            }
+                action: SchemaAction::Check { nodes },
+            } => assert_eq!(nodes, vec!["10.0.0.1:9090", "10.0.0.2:9090"]),
             other => panic!("unexpected: {other:?}"),
         }
     }
 
-    /// `--password-stdin` without a username is rejected: there would be nobody to
-    /// authenticate as, and silently ignoring it would produce a confusing 401.
+    /// The credentials are global: accepted before or after the subcommand, and
+    /// the same for every command (2026-11-06: only `compaction stop` and
+    /// `schema check` took them, so `repair`, `ring` and `status` could not
+    /// authenticate at all). `--password-stdin` without a username parses; the
+    /// refusal happens in `credentials::resolve`, which also sees
+    /// FERROSA_CTL_USERNAME.
     #[test]
-    fn schema_check_password_stdin_requires_username() {
-        let err = Cli::try_parse_from([
+    fn credentials_are_global_flags() {
+        let before = Cli::try_parse_from([
             "ferrosa-ctl",
-            "schema",
-            "check",
-            "--nodes",
-            "10.0.0.1:9090",
+            "--username",
+            "operator",
             "--password-stdin",
+            "repair",
+            "--keyspace",
+            "ks",
+            "--table",
+            "t",
         ])
-        .expect_err("password-stdin without username must be rejected");
-        assert!(
-            err.to_string().contains("username"),
-            "error should point at the missing username, got: {err}"
-        );
+        .unwrap();
+        assert_eq!(before.username.as_deref(), Some("operator"));
+        assert!(before.password_stdin);
+        let after = Cli::try_parse_from(["ferrosa-ctl", "ring", "--username", "operator"]).unwrap();
+        assert_eq!(after.username.as_deref(), Some("operator"));
+        assert!(Cli::try_parse_from(["ferrosa-ctl", "status", "--password-stdin"]).is_ok());
     }
 
     /// `cluster downgrade-to-pair` must be reachable from the CLI.
@@ -1073,8 +1079,6 @@ mod tests {
                 action: CompactionAction::Stop {
                     keyspace: None,
                     table: None,
-                    username: None,
-                    password_stdin: false
                 }
             }
         ));
@@ -1097,8 +1101,6 @@ mod tests {
                 action: CompactionAction::Stop {
                     keyspace: Some(_),
                     table: Some(_),
-                    username: Some(_),
-                    password_stdin: true
                 }
             }
         ));
@@ -1112,8 +1114,12 @@ mod tests {
             ])
             .is_err());
         }
+        // `--password-stdin` with no `--username` parses: the user may come from
+        // FERROSA_CTL_USERNAME, which clap cannot see. `credentials::resolve`
+        // refuses it when neither names a user
+        // (`password_stdin_without_username_fails_loud`).
         assert!(
-            Cli::try_parse_from(["ferrosa-ctl", "compaction", "stop", "--password-stdin"]).is_err()
+            Cli::try_parse_from(["ferrosa-ctl", "compaction", "stop", "--password-stdin"]).is_ok()
         );
     }
 
