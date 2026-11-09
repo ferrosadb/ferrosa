@@ -225,14 +225,14 @@
       }
     },
     "ferrosa-udf": {
-      "fingerprint": "05db761c2f536c55",
-      "measured_at": "2026-11-01T05:57:04+00:00",
+      "fingerprint": "8ed539b2f21cecf2",
+      "measured_at": "2026-11-09T01:15:39+00:00",
       "measurement": {
         "stage": "aeneas",
         "translation_errors": 0,
         "lean_errors": 62,
-        "sorry": 264,
-        "seconds": 38,
+        "sorry": 297,
+        "seconds": 23,
         "scope": "crate"
       }
     },
@@ -357,14 +357,14 @@
       }
     },
     "ferrosa-postgres": {
-      "fingerprint": "b61297440158eade",
-      "measured_at": "2026-11-01T06:03:23+00:00",
+      "fingerprint": "3244fbd19e9ff86a",
+      "measured_at": "2026-11-09T01:21:49+00:00",
       "measurement": {
         "stage": "aeneas",
         "translation_errors": 0,
-        "lean_errors": 72,
-        "sorry": 777,
-        "seconds": 132,
+        "lean_errors": 73,
+        "sorry": 893,
+        "seconds": 83,
         "scope": "crate"
       }
     },
@@ -416,5 +416,5 @@
       }
     }
   },
-  "updated_at": "2026-11-01T06:52:28+00:00"
+  "updated_at": "2026-11-09T01:21:49+00:00"
 }

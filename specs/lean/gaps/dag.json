@@ -12,6 +12,7 @@
     "ferrosa-sched",
     "ferrosa-storage",
     "ferrosa-cluster",
+    "ferrosa-plpgsql",
     "ferrosa-udf",
     "ferrosa-session",
     "ferrosa-cql",
@@ -78,8 +79,10 @@
       "ferrosa-sstable",
       "ferrosa-storage"
     ],
+    "ferrosa-plpgsql": [],
     "ferrosa-udf": [
-      "ferrosa-common"
+      "ferrosa-common",
+      "ferrosa-plpgsql"
     ],
     "ferrosa-session": [
       "ferrosa-cluster",
@@ -160,12 +163,14 @@
       "ferrosa-common",
       "ferrosa-jsonb",
       "ferrosa-net",
+      "ferrosa-plpgsql",
       "ferrosa-row-bridge",
       "ferrosa-sched",
       "ferrosa-schema",
       "ferrosa-sql",
       "ferrosa-sstable",
-      "ferrosa-storage"
+      "ferrosa-storage",
+      "ferrosa-udf"
     ],
     "ferrosa-sparql": [
       "ferrosa-cluster",

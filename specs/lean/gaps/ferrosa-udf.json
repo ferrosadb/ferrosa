@@ -1,7 +1,7 @@
 {
   "stage": "aeneas",
-  "llbc": "/home/bkearns/.hermes/cache/scratch/ferrosa-ratchet/ferrosa_udf.llbc",
-  "lean": "/home/bkearns/.hermes/cache/scratch/leangap-ferrosa-udf-x12j4hpp/FerrosaUdf.lean",
+  "llbc": "/home/bkearns/src/ferrosa-suite/ferrosa-wt-pg-oban/ferrosa_udf.llbc",
+  "lean": "/tmp/leangap-ferrosa-udf-idmp1omq/FerrosaUdf.lean",
   "translation_errors": 0,
   "translation_unique_reported": null,
   "translation_messages": [],
@@ -9,325 +9,325 @@
   "lean_errors": 62,
   "errors": [
     {
-      "location": "FerrosaUdf.lean:3989:8",
+      "location": "FerrosaUdf.lean:4586:8",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown constant `ferrosa_udf.convert.WitCqlValue.Insts.CoreFmtDebug`"
     },
     {
-      "location": "FerrosaUdf.lean:3994:8",
+      "location": "FerrosaUdf.lean:4591:8",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown constant `ferrosa_udf.convert.WitCqlValue.Insts.CoreFmtDebug`"
     },
     {
-      "location": "FerrosaUdf.lean:3999:33",
+      "location": "FerrosaUdf.lean:4596:33",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown constant `ferrosa_udf.convert.WitCqlValue.Insts.CoreFmtDebug`"
     },
     {
-      "location": "FerrosaUdf.lean:4000:8",
+      "location": "FerrosaUdf.lean:4597:8",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown constant `ferrosa_udf.convert.WitCqlValue.Insts.CoreFmtDebug`"
     },
     {
-      "location": "FerrosaUdf.lean:4005:8",
+      "location": "FerrosaUdf.lean:4602:8",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown constant `ferrosa_udf.convert.WitCqlValue.Insts.CoreFmtDebug`"
     },
     {
-      "location": "FerrosaUdf.lean:4011:8",
+      "location": "FerrosaUdf.lean:4608:8",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown constant `ferrosa_udf.convert.WitCqlValue.Insts.CoreFmtDebug`"
     },
     {
-      "location": "FerrosaUdf.lean:4095:31",
+      "location": "FerrosaUdf.lean:4692:31",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown constant `ferrosa_udf.convert.WitCqlValue.Insts.CoreCloneClone`"
     },
     {
-      "location": "FerrosaUdf.lean:4100:31",
+      "location": "FerrosaUdf.lean:4697:31",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown constant `ferrosa_udf.convert.WitCqlValue.Insts.CoreCloneClone`"
     },
     {
-      "location": "FerrosaUdf.lean:4110:31",
+      "location": "FerrosaUdf.lean:4707:31",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown constant `ferrosa_udf.convert.WitCqlValue.Insts.CoreCloneClone`"
     },
     {
-      "location": "FerrosaUdf.lean:4739:10",
+      "location": "FerrosaUdf.lean:5336:10",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown constant `ferrosa_udf.convert.WitCqlValue.Insts.CoreCmpPartialEqWitCqlValue`"
     },
     {
-      "location": "FerrosaUdf.lean:4771:10",
+      "location": "FerrosaUdf.lean:5368:10",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown constant `ferrosa_udf.convert.WitCqlValue.Insts.CoreCmpPartialEqWitCqlValue`"
     },
     {
-      "location": "FerrosaUdf.lean:4803:10",
+      "location": "FerrosaUdf.lean:5400:10",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown constant `ferrosa_udf.convert.WitCqlValue.Insts.CoreCmpPartialEqWitCqlValue`"
     },
     {
-      "location": "FerrosaUdf.lean:4804:10",
+      "location": "FerrosaUdf.lean:5401:10",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown constant `ferrosa_udf.convert.WitCqlValue.Insts.CoreCmpPartialEqWitCqlValue`"
     },
     {
-      "location": "FerrosaUdf.lean:4836:10",
+      "location": "FerrosaUdf.lean:5433:10",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown constant `ferrosa_udf.convert.WitCqlValue.Insts.CoreCmpPartialEqWitCqlValue`"
     },
     {
-      "location": "FerrosaUdf.lean:4869:10",
+      "location": "FerrosaUdf.lean:5466:10",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown constant `ferrosa_udf.convert.WitCqlValue.Insts.CoreCmpPartialEqWitCqlValue`"
     },
     {
-      "location": "FerrosaUdf.lean:5035:51",
+      "location": "FerrosaUdf.lean:5632:51",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5049:20",
+      "location": "FerrosaUdf.lean:5646:20",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5063:20",
+      "location": "FerrosaUdf.lean:5660:20",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5070:73",
+      "location": "FerrosaUdf.lean:5667:73",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5077:77",
+      "location": "FerrosaUdf.lean:5674:77",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5099:26",
+      "location": "FerrosaUdf.lean:5696:26",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5107:26",
+      "location": "FerrosaUdf.lean:5704:26",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5149:26",
+      "location": "FerrosaUdf.lean:5746:26",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5209:75",
+      "location": "FerrosaUdf.lean:5806:75",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5246:30",
+      "location": "FerrosaUdf.lean:5843:30",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5279:29",
+      "location": "FerrosaUdf.lean:5876:29",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5287:29",
+      "location": "FerrosaUdf.lean:5884:29",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5302:78",
+      "location": "FerrosaUdf.lean:5899:78",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5318:5",
+      "location": "FerrosaUdf.lean:5915:5",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5333:40",
+      "location": "FerrosaUdf.lean:5930:40",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5346:76",
+      "location": "FerrosaUdf.lean:5943:76",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5361:61",
+      "location": "FerrosaUdf.lean:5958:61",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5376:61",
+      "location": "FerrosaUdf.lean:5973:61",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5413:12",
+      "location": "FerrosaUdf.lean:6010:12",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5434:27",
+      "location": "FerrosaUdf.lean:6031:27",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5454:61",
+      "location": "FerrosaUdf.lean:6051:61",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5469:77",
+      "location": "FerrosaUdf.lean:6066:77",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5497:61",
+      "location": "FerrosaUdf.lean:6094:61",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5511:20",
+      "location": "FerrosaUdf.lean:6108:20",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5525:20",
+      "location": "FerrosaUdf.lean:6122:20",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5549:20",
+      "location": "FerrosaUdf.lean:6146:20",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5565:5",
+      "location": "FerrosaUdf.lean:6162:5",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5581:21",
+      "location": "FerrosaUdf.lean:6178:21",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5610:21",
+      "location": "FerrosaUdf.lean:6207:21",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5637:43",
+      "location": "FerrosaUdf.lean:6234:43",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5673:20",
+      "location": "FerrosaUdf.lean:6270:20",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5688:61",
+      "location": "FerrosaUdf.lean:6285:61",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5703:20",
+      "location": "FerrosaUdf.lean:6300:20",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5718:61",
+      "location": "FerrosaUdf.lean:6315:61",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5735:30",
+      "location": "FerrosaUdf.lean:6332:30",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5749:20",
+      "location": "FerrosaUdf.lean:6346:20",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5764:25",
+      "location": "FerrosaUdf.lean:6361:25",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5779:61",
+      "location": "FerrosaUdf.lean:6376:61",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5794:25",
+      "location": "FerrosaUdf.lean:6391:25",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5820:5",
+      "location": "FerrosaUdf.lean:6417:5",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5835:5",
+      "location": "FerrosaUdf.lean:6432:5",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5849:25",
+      "location": "FerrosaUdf.lean:6446:25",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5857:27",
+      "location": "FerrosaUdf.lean:6454:27",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5881:19",
+      "location": "FerrosaUdf.lean:6478:19",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown constant `ferrosa_udf.executor.FunctionKind.Insts.CoreCmpPartialEqFunctionKind`"
     },
     {
-      "location": "FerrosaUdf.lean:5890:27",
+      "location": "FerrosaUdf.lean:6503:27",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5898:27",
+      "location": "FerrosaUdf.lean:6511:27",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaUdf.lean:5906:27",
+      "location": "FerrosaUdf.lean:6519:27",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     }
   ],
-  "sorry_declarations": 264,
+  "sorry_declarations": 297,
   "compiled": false,
   "crate": "ferrosa-udf",
   "prefix": "ferrosa_udf::*",
-  "generated_at": "2026-11-01T05:56:26+00:00",
-  "memory_max": "18G",
+  "generated_at": "2026-11-09T01:15:16+00:00",
+  "memory_max": "14G",
   "toolchain": {
     "charon": "/home/bkearns/src/aeneas/charon/bin/charon",
-    "aeneas": "/home/bkearns/.hermes/cache/scratch/aeneas-pin/src/_build/default/main.exe",
-    "lean_pkg": "/home/bkearns/.local/aeneas/backends/lean"
+    "aeneas": "/home/bkearns/ssd/aeneas-pin/src/_build/default/main.exe",
+    "lean_pkg": "/home/bkearns/ssd/aeneas-pin/backends/lean"
   }
 }
