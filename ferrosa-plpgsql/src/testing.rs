@@ -1,4 +1,4 @@
-//! A scripted [`Host`](crate::Host) that records every call: the test double both runtimes
+//! A scripted [`Host`] that records every call: the test double both runtimes
 //! are checked against (and the differential test in `ferrosa-udf` replays).
 
 use std::collections::HashMap;

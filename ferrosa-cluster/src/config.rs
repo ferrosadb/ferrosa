@@ -68,7 +68,7 @@ pub struct ClusterConfig {
     ///
     /// Node-local: every node reads it from `FERROSA_PAIR_QUORUM_STRICT`. It
     /// is not part of the replicated (bincode) encoding; see
-    /// [`cluster_config_wire`] for why and how 0.35.x records still decode.
+    /// `cluster_config_wire` for why and how 0.35.x records still decode.
     #[serde(default, with = "cluster_config_wire::node_local_flag")]
     pub pair_quorum_strict: bool,
     /// CQL broadcast address (host:port) for system.peers.

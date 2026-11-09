@@ -59,7 +59,7 @@ pub enum PreparedKind {
     /// A parameterless utility statement (DDL): no `$N`, no result rows. Ecto sends every
     /// migration statement as an unnamed prepared statement, so DDL has to be preparable;
     /// executing it runs the same executor the simple-query path uses
-    /// (`query::execute_utility`). Which statements qualify is [`crate::query::is_utility`].
+    /// (`query::execute_utility`). Which statements qualify is `query::is_utility`.
     Utility(Box<Statement>),
     /// A statement of the procedural lane (D13): `DO`, PL/pgSQL function and trigger DDL,
     /// `LISTEN`/`UNLISTEN`/`NOTIFY`, `SELECT pg_notify(…)`. Ecto sends these through the

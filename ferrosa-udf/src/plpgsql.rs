@@ -7,7 +7,7 @@
 //! boundary only (`Arc<str>` text to the owned `String` the canonical ABI lifts into).
 //!
 //! Sandbox: the executor's engine (fuel, epoch interruption), `[udf] max_memory_bytes` via the
-//! same [`GuestState`] limiter, and per-call fuel `max_fuel`. The wall-clock limit counts
+//! same [`GuestState`](crate::sandbox::GuestState) limiter, and per-call fuel `max_fuel`. The wall-clock limit counts
 //! **guest** time only: the time spent inside host calls (the SQL the function runs) is
 //! subtracted, so a slow query is not mistaken for a runaway function.
 

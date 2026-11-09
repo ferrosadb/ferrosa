@@ -2,7 +2,7 @@
 //! `DO` blocks, PL/pgSQL functions and triggers.
 //!
 //! Statements are recognised by [`ferrosa_plpgsql::utility::parse_utility`] before the SQL
-//! engine sees them; [`execute`] runs them against the session.
+//! engine sees them; `execute` runs them against the session.
 
 pub mod functions;
 mod host;
