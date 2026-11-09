@@ -113,6 +113,13 @@ owner = "bkearns"
 date = "2026-11-04"
 
 [[crate]]
+name = "ferrosa-plpgsql"
+kind = "own"
+reason = "PL/pgSQL subset: parser, interpreter and AssemblyScript converter, whose agreement Ferrosa/Sql/Plpgsql.lean states"
+owner = "bkearns"
+date = "2026-11-09"
+
+[[crate]]
 name = "ferrosa-postgres"
 kind = "own"
 reason = "PostgreSQL wire front end and its planner"
