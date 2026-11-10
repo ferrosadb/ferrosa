@@ -89,6 +89,22 @@ jobs:
     name: Ignored (slow) tests
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      # Line-tables-only debuginfo for test binaries, exactly as PR CI's
+      # `test` job sets it (ci.yml): full DWARF is the dominant disk cost of
+      # a `--all-targets --all-features` test build, and this job links every
+      # test target in the workspace (268 of them) at once. At full DWARF that
+      # set no longer fits a hosted runner's ~114 GB of free space: the
+      # 2026-11-09 run died with the runner's own "No space left on device",
+      # and 2026-11-10 died linking `ferrosa-storage`'s
+      # `timeseries_materialization` with
+      # `collect2: fatal error: ld terminated with signal 7 [Bus error]` from
+      # rust-lld — an mmap'd output file the full filesystem could not extend.
+      # Measured on this tree: one test binary is 958 MiB with full DWARF
+      # (.debug_* = 811 MiB, of which .debug_line is 52 MiB) and ~200 MiB at
+      # line-tables-only, so panic backtraces keep file:line. Setting it at
+      # job level (not step level) so rust-cache hashes it into the cache key.
+      CARGO_PROFILE_DEV_DEBUG: "1"
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
