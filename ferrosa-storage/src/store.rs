@@ -849,6 +849,9 @@ pub struct TableStore<F: FlushTarget> {
 /// deadlocked a node.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct IndexCatalog {
+    /// Canonical cell identities captured at registration, shared across rotations.
+    /// An ordinal alone cannot survive a schema that temporarily lacks its column.
+    column_names: HashMap<String, Arc<IndexColumnNames>>,
     /// Secondary index declarations: `(index_name, column_position)` pairs.
     /// Column position is the index into `Row.cells` by column ordinal
     /// (matching the `u16` tag in each cell tuple).
@@ -888,14 +891,89 @@ pub(crate) struct IndexCatalog {
     vector_index_methods: HashMap<String, VectorIndexMethod>,
 }
 
+#[derive(Debug)]
+struct IndexColumnNames {
+    target: Option<String>,
+    predicate: Vec<Option<String>>,
+}
+
 impl IndexCatalog {
     /// A catalog declaring only the given cell-column indexes, each BTree.
-    fn with_indexed_columns(indexed_columns: Vec<(String, usize)>) -> Self {
-        Self {
+    fn with_indexed_columns(indexed_columns: Vec<(String, usize)>, schema: &TableSchema) -> Self {
+        let mut catalog = Self {
             index_types: default_index_types(&indexed_columns),
             indexed_columns,
             ..Self::default()
+        };
+        catalog.capture_column_names(schema);
+        catalog
+    }
+
+    /// Bind only new declarations while their registration schema is current.
+    /// Never infer an existing target from a later, possibly historical ordinal.
+    fn capture_column_names(&mut self, schema: &TableSchema) {
+        let column_name = |position: usize| {
+            u16::try_from(position)
+                .ok()
+                .and_then(|ordinal| schema.column_at_ordinal(ordinal))
+                .map(|column| column.name.clone())
+        };
+        for (name, position) in self
+            .indexed_columns
+            .iter()
+            .chain(self.fulltext_indexes.iter())
+            .map(|(name, position)| (name, *position))
+            .chain(
+                self.vector_index_configs
+                    .iter()
+                    .map(|cfg| (&cfg.index_name, cfg.column_position)),
+            )
+        {
+            if !self.column_names.contains_key(name) {
+                let names = IndexColumnNames {
+                    target: column_name(position),
+                    predicate: self.index_filter_predicates.get(name).map_or_else(
+                        Vec::new,
+                        |pred| {
+                            pred.clauses
+                                .iter()
+                                .map(|clause| column_name(clause.column_position))
+                                .collect()
+                        },
+                    ),
+                };
+                self.column_names.insert(name.clone(), Arc::new(names));
+            }
         }
+    }
+
+    fn is_resolved(&self, index_name: &str) -> bool {
+        !self
+            .indexed_columns
+            .iter()
+            .chain(self.fulltext_indexes.iter())
+            .any(|(name, position)| name == index_name && *position == usize::MAX)
+            && !self
+                .vector_index_configs
+                .iter()
+                .any(|cfg| cfg.index_name == index_name && cfg.column_position == usize::MAX)
+            && !self
+                .index_filter_predicates
+                .get(index_name)
+                .is_some_and(|pred| {
+                    pred.clauses
+                        .iter()
+                        .any(|clause| clause.column_position == usize::MAX)
+                })
+    }
+
+    fn require_resolved(&self, index_name: &str) -> Result<()> {
+        if !self.is_resolved(index_name) {
+            return Err(ferrosa_common::Error::InvalidData(format!(
+                "index '{index_name}' has an unresolved column in the current schema; refusing index access"
+            )));
+        }
+        Ok(())
     }
 
     /// The declared type of `index_name`; BTree when undeclared.
@@ -915,65 +993,60 @@ impl IndexCatalog {
             .unwrap_or(VectorIndexMethod::Hnsw)
     }
 
-    /// This catalog with every column ordinal remapped from `old_schema`'s
-    /// flat static-plus-regular column layout onto `new_schema`'s.
-    ///
-    /// Regular columns are ordered by Cassandra's column-name comparator, so
-    /// `ALTER TABLE ADD` of a column that sorts before an indexed column
-    /// shifts the indexed column's ordinal (the `u16` cell tag). Index
-    /// declarations store ordinals, not names — left stale, every subsequent
-    /// write extracts the indexed value from the WRONG cell, and a
-    /// backfilled-Current index then serves false empty results (memory-suite
-    /// regression `fixed_phonetic_match`). So every positional declaration is
-    /// remapped through the old schema's column name.
-    fn remapped_onto(&self, old_schema: &TableSchema, new_schema: &TableSchema) -> Self {
+    /// Resolve every cell ordinal from its registration identity. Historical
+    /// replay can omit a target for several rotations; its canonical name must
+    /// survive until the column returns. An unresolved ordinal cannot match a
+    /// u16 cell tag and index access is refused until it resolves again.
+    fn remapped_onto(&self, _old_schema: &TableSchema, new_schema: &TableSchema) -> Self {
         let mut catalog = self.clone();
-        let remap = |index_name: &str, pos: &mut usize| {
-            let Some(old_col) = u16::try_from(*pos)
-                .ok()
-                .and_then(|ordinal| old_schema.column_at_ordinal(ordinal))
-            else {
-                tracing::error!(
-                    index = index_name,
-                    position = *pos,
-                    "index ordinal points past the pre-ALTER regular column \
-                     set — leaving it unchanged; index writes may be wrong"
-                );
-                return;
-            };
-            match new_schema.column_index(&old_col.name).map(usize::from) {
-                Some(new_pos) => {
-                    if new_pos != *pos {
-                        tracing::info!(
-                            index = index_name,
-                            column = %old_col.name,
-                            old_position = *pos,
-                            new_position = new_pos,
-                            "remapped index column ordinal after schema update"
-                        );
-                        *pos = new_pos;
-                    }
+        let remap = |index_name: &str, column_name: Option<&str>, pos: &mut usize| match column_name
+            .and_then(|name| new_schema.column_index(name))
+            .map(usize::from)
+        {
+            Some(new_pos) => {
+                if new_pos != *pos {
+                    tracing::info!(
+                        index = index_name,
+                        column = column_name,
+                        old_position = *pos,
+                        new_position = new_pos,
+                        "remapped index column ordinal after schema update"
+                    );
+                    *pos = new_pos;
                 }
-                None => tracing::error!(
-                    index = index_name,
-                    column = %old_col.name,
-                    "indexed column absent from post-ALTER schema — leaving \
-                     ordinal unchanged; index writes may be wrong"
-                ),
+            }
+            None => {
+                *pos = usize::MAX;
+                tracing::error!(index = index_name, column = column_name,
+                        "indexed column absent from post-ALTER schema; index unavailable until resolved");
             }
         };
+        let target = |name: &str| {
+            self.column_names
+                .get(name)
+                .and_then(|names| names.target.as_deref())
+        };
         for (name, pos) in &mut catalog.indexed_columns {
-            remap(name, pos);
+            remap(name, target(name), pos);
         }
         for (name, pos) in &mut catalog.fulltext_indexes {
-            remap(name, pos);
+            remap(name, target(name), pos);
         }
         for cfg in &mut catalog.vector_index_configs {
-            remap(&cfg.index_name.clone(), &mut cfg.column_position);
+            remap(
+                &cfg.index_name,
+                target(&cfg.index_name),
+                &mut cfg.column_position,
+            );
         }
         for (name, pred) in &mut catalog.index_filter_predicates {
-            for clause in &mut pred.clauses {
-                remap(name, &mut clause.column_position);
+            for (i, clause) in pred.clauses.iter_mut().enumerate() {
+                let column_name = self
+                    .column_names
+                    .get(name)
+                    .and_then(|names| names.predicate.get(i))
+                    .and_then(|name| name.as_deref());
+                remap(name, column_name, &mut clause.column_position);
             }
         }
         catalog
@@ -1025,6 +1098,7 @@ impl IndexCatalog {
         removed |= self.index_types.remove(index_name).is_some();
         removed |= self.index_filter_predicates.remove(index_name).is_some();
         removed |= self.vector_index_methods.remove(index_name).is_some();
+        removed |= self.column_names.remove(index_name).is_some();
         removed
     }
 
@@ -1503,7 +1577,10 @@ fn apply_rotation_changes(
         (Arc::clone(catalog), Arc::clone(schema)),
         |(catalog, schema), change| match change {
             RotationChange::Edit(edit) => match edit(&catalog) {
-                Some(edited) => (Arc::new(edited), schema),
+                Some(mut edited) => {
+                    edited.capture_column_names(&schema);
+                    (Arc::new(edited), schema)
+                }
                 None => (catalog, schema),
             },
             RotationChange::Schema(next) => {
@@ -3431,7 +3508,7 @@ impl<F: FlushTarget> TableStore<F> {
         let schema = Arc::new(schema);
         let (rotation_tx, rotation_rx) = crossbeam_channel::unbounded();
         let indexes = new_indexes(
-            Arc::new(IndexCatalog::with_indexed_columns(indexed_columns)),
+            Arc::new(IndexCatalog::with_indexed_columns(indexed_columns, &schema)),
             Arc::clone(&schema),
         );
         let initial_view = StoreView {
@@ -3607,7 +3684,7 @@ impl<F: FlushTarget> TableStore<F> {
         let schema = Arc::new(schema);
         let (rotation_tx, rotation_rx) = crossbeam_channel::unbounded();
         let indexes = new_indexes(
-            Arc::new(IndexCatalog::with_indexed_columns(indexed_columns)),
+            Arc::new(IndexCatalog::with_indexed_columns(indexed_columns, &schema)),
             Arc::clone(&schema),
         );
         let sidecar_count = initial_sstables.len();
@@ -3720,7 +3797,7 @@ impl<F: FlushTarget> TableStore<F> {
         let schema = Arc::new(schema);
         let (rotation_tx, rotation_rx) = crossbeam_channel::unbounded();
         let indexes = new_indexes(
-            Arc::new(IndexCatalog::with_indexed_columns(indexed_columns)),
+            Arc::new(IndexCatalog::with_indexed_columns(indexed_columns, &schema)),
             Arc::clone(&schema),
         );
         let sstable_count = descriptors.len();
@@ -8797,6 +8874,7 @@ impl<F: FlushTarget> TableStore<F> {
                  zero matching rows"
             )));
         }
+        self.catalog().require_resolved(index_name)?;
         let Some(lookup_key) = self.encode_index_lookup_key(index_name, key)? else {
             return Ok(());
         };
@@ -8995,6 +9073,7 @@ impl<F: FlushTarget> TableStore<F> {
         row: &Row,
     ) -> Result<bool> {
         let catalog = self.catalog();
+        catalog.require_resolved(index_name)?;
         let (family, position, kind, predicate) =
             catalog.scalar_definition(index_name).ok_or_else(|| {
                 ferrosa_common::Error::InvalidData(format!(
@@ -9148,6 +9227,7 @@ impl<F: FlushTarget> TableStore<F> {
             return Ok(Vec::new());
         }
 
+        self.catalog().require_resolved(index_name)?;
         let guard = self.view.load();
         let partition_token = DecoratedKey::new(ferrosa_common::key::PartitionKey::new(
             partition_key.to_vec(),
@@ -9279,6 +9359,7 @@ impl<F: FlushTarget> TableStore<F> {
             return Ok(Vec::new());
         }
 
+        self.catalog().require_resolved(index_name)?;
         let guard = self.view.load();
         self.refuse_index_read_over_quarantine(&guard, None, "read_by_index_cell_ranges")?;
 
@@ -9658,6 +9739,7 @@ impl<F: FlushTarget> TableStore<F> {
     /// sidecars are incomplete: answering would silently leave out its rows.
     /// The error is backpressure (retryable); the repair clears it.
     fn require_vector_generations_ready(&self, index_name: &str) -> Result<()> {
+        self.catalog().require_resolved(index_name)?;
         let pending = self.vector_generations_pending(index_name);
         if pending.is_empty() {
             return Ok(());
@@ -10306,6 +10388,23 @@ impl<F: FlushTarget> TableStore<F> {
         index_type: IndexType,
         filter_predicate: Option<FilterPredicate>,
     ) -> Result<FlushOutcome> {
+        let schema = self.schema.load();
+        for position in std::iter::once(column_position).chain(
+            filter_predicate
+                .iter()
+                .flat_map(|pred| pred.clauses.iter().map(|clause| clause.column_position)),
+        ) {
+            if u16::try_from(position)
+                .ok()
+                .and_then(|ordinal| schema.column_at_ordinal(ordinal))
+                .is_none()
+            {
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "index {index_name} column {position} does not resolve in the current schema"
+                )));
+            }
+        }
+        drop(schema);
         self.rotate_catalog(move |catalog| {
             let wanted = Some((0, column_position, index_type, filter_predicate.as_ref()));
             if catalog.scalar_definition(&index_name) == wanted {
@@ -10495,6 +10594,11 @@ impl<F: FlushTarget> TableStore<F> {
                 .any(|(name, _)| name == index_name)
     }
 
+    /// Whether every cell used by this index resolves in the current schema.
+    pub(crate) fn index_is_resolved(&self, index_name: &str) -> bool {
+        self.catalog().is_resolved(index_name)
+    }
+
     /// Returns the current secondary index declarations, as one snapshot.
     pub fn indexed_columns(&self) -> CatalogSlice<(String, usize)> {
         CatalogSlice {
@@ -10564,6 +10668,7 @@ impl<F: FlushTarget> TableStore<F> {
             ferrosa_common::Error::InvalidFormat(format!("fts_match query error: {e}"))
         })?;
 
+        self.catalog().require_resolved(index_name)?;
         let guard = self.view.load();
         // Reserve the term map up front: it is the largest allocation on this
         // path and otherwise rehashes as terms accumulate.

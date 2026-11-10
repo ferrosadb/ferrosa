@@ -396,6 +396,12 @@ build; the codec's own cost is its delta against `none`.
   `ddl_path` apply, and all three delegate to
   `StorageEngine::register_index_in_engine` — the resolver the restart reload
   uses — so the wiring cannot drift between the paths again.
+  Historical replay after persisted index reload is covered by
+  `persisted_scope_index_survives_historical_raft_schema_replay`: storage retains
+  canonical target names across temporary column absence, refuses unresolved
+  index reads, and resolves the returning column through the complete replay.
+  The fixture checks persisted row contents and genuine type/ordinal drift
+  rejection; it is an in-process recovery test, not a multi-node restart claim.
 - **A DDL proposal is bounded, and an unconfirmed one fails loud and
   retryable.** `ddl_path::execute_via_raft` awaits `raft.client_write` under the
   same 5 s `DDL_AGREEMENT_TIMEOUT` every other wait on that path uses. openraft

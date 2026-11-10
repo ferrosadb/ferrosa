@@ -10,6 +10,23 @@ Failure modes ranked by **RPN = Severity × Occurrence × Detection** (each 1–
 higher = worse). This crate is the entire client path, so most severities are
 high. Entries below reflect gaps found in the code, not hypotheticals.
 
+Scoped ANN previously pushed LIMIT into the storage scan before scoring, losing
+late nearest vectors and underfilling results when early rows had NULL vectors.
+**Fixed:** `safe_partition_key_filter_row_limit` rejects ANN pushdown as it does
+ordinary `ORDER BY`; all candidates in the selected partition/scope reach the
+ranker before final LIMIT. Regression:
+`scoped_ann_ranks_all_candidates_before_limit` covers entity and document-chunk
+vectors, NULL skipping, unbounded controls, and tenant/session isolation.
+The ranker now uses the owned `AnnTopK` selector: one heap allocation capped at
+`min(literal LIMIT, input rows)` for plain column projections, stable ties by
+encounter ordinal, prompt drops
+of rejected/evicted payloads, and allocation reuse for sorted output. The
+`ann_topk_alloc` regression measures selector construction, offers and output
+consumption with non-Clone payloads; it does not measure the whole route.
+**Residual:** upstream partitions/results are still materialized, and unbounded
+ANN retains all eligible rows, as do DISTINCT, aggregate and computed projections
+whose downstream behavior needs them. Validation/storage errors remain fail-loud.
+
 | ID | Failure mode | Effect | S | O | D | RPN | Mitigation / status |
 |----|--------------|--------|---|---|---|-----|---------------------|
 | CQL-29 | **A coordinator read timeout or unavailability reached clients as ServerError** (outage 2026-10-10, t_43f70b3a). `WritePath` flattened `ClusterError::{ReadTimeout, WriteTimeout, Unavailable}` into `ferrosa_common::Error::InvalidData("cluster: …")`, which `From<ferrosa_common::Error>` can only send as 0x0000. | The control listener saw `Internal server error … storage error: invalid data: cluster: read timeout: CL=LOCAL_QUORUM, received=1, required=2` 89 times; drivers' retry policies and ferrosa-memory's transient classifier (which keys on `DbError::ReadTimeout` / `Unavailable`) treated it as a permanent server bug. | 7 | 7 | 6 | 294 → 14 | **Fixed:** `ferrosa_common::Error` gains typed `ReadTimeout`, `WriteTimeout` and `Unavailable`; `WritePath` carries them typed; `CqlError::from` sends Read_timeout (0x1200), Write_timeout (0x1100, `SIMPLE`) and Unavailable (0x1000) with consistency, counts and data_present. Tests: `tests/cluster_error_frames.rs` runs a real coordinator read through `WritePath`, encodes the ERROR body and parses it with scylla-cql's own parser (`DbError::ReadTimeout { LocalQuorum, 1, 2, true }`, `DbError::Unavailable { LocalQuorum, 2, 1 }`); red before with the outage's exact message. |

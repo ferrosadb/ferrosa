@@ -73,6 +73,17 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   `route_batch` and the DDL/role handlers. Fast paths exist for prepared
   SELECT/INSERT. ORDER BY classification picks an inline vs. spillable temp-sort
   plan. Carries the security mitigations (M8 permissions, M12 batch cap).
+  Scoped `ANN OF` reads, like ordinary `ORDER BY`, receive no storage scan-prefix
+  `LIMIT`: all candidates within the selected partition/scope reach scoring before
+  the final result limit. NULL/non-vector values are skipped. The internal
+  `ann_topk` selector consumes owned rows, scores each eligible vector once, and
+  retains at most `min(LIMIT, input rows)` candidates for plain column projections
+  in one preallocated heap,
+  with stable distance ties by encounter ordinal. Heap sorting and its owning
+  output iterator reuse that allocation; output extends the original drained
+  rows buffer. Unbounded ANN, DISTINCT, aggregates and computed projections retain
+  all eligible rows to preserve their downstream behavior. Upstream partition/result
+  materialization remains; this does not make the whole request allocation-free.
   Standalone role create/alter/drop handlers also write the authoritative
   `system_auth.roles` row before acknowledging success, matching the
   pair/cluster persistence contract.

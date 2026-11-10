@@ -8,6 +8,15 @@ Failure modes are ranked by **RPN = Severity × Occurrence × Detection** (1–1
 each; higher = worse). This is the distribution layer, so safety failures are
 cluster-wide and severities run high. Several entries are *evidence* gaps
 (insufficient validation) rather than known-broken code — those are called out.
+
+Index replay regression: `persisted_scope_index_survives_historical_raft_schema_replay`
+flushes and reopens a real engine before applying historical DDL. It verifies
+that an index becomes unavailable while its target is absent, resolves by its
+retained column name when the target returns at a different ordinal, and
+preserves stored row values through the remaining ALTERs. Genuine registration
+type/ordinal conflicts still fail. This covers the replay mechanism in one
+engine; operational multi-node restart acceptance remains separate.
+
 | ID | Failure mode | Effect | S | O | D | RPN | Mitigation / status |
 |----|--------------|--------|---|---|---|-----|---------------------|
 | CL-61 (t_boot_lane) | **Consensus start was gated on the boot-time object-store work** (2026-10-10). `ferrosa/src/main.rs` awaited the object-store access check, CAS probe, pending-upload replay and cold-start bootstrap *before* binding the internode listener, and only then reached `transition_to_cluster`. | A restarting node could not be reached by its peers for up to `FERROSA_S3_REQUEST_TIMEOUT_SECS` (default 900 s); a brief leaderless spell could not re-form quorum and became a ~35-minute cluster outage. | 10 | 3 | 3 | 90 | **Fixed:** the boot-state consensus gate. `defer_consensus_until_boot_state()` is armed before the listener binds; `transition_to_cluster` / `transition_to_forming` record the requested transition and return while the gate is closed; `mark_boot_state_loaded()` opens the gate and re-drives the deferred transition on the Raft runtime. Consensus still starts only after the object-store work completes (the ordering the old code enforced by blocking the listener), while *reachability* is decoupled from object-store health. Default-open, so non-boot construction is unchanged. Tests: `boot_gate_defers_cluster_transition_until_state_loaded`, `cluster_transition_proceeds_when_boot_gate_is_open`, `mark_boot_state_loaded_opens_the_gate_and_redrives_the_deferred_transition`; real-process red `ferrosa/tests/boot_object_store_decouple.rs`. |

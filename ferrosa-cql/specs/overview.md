@@ -110,6 +110,22 @@ decomposes partitions to rows via the re-exported
 column mapping), applies projection/LIMIT/paging, and `result.rs` encodes the
 Rows RESULT frame (with `paging_state` when more pages remain).
 
+For scoped `ANN OF`, `safe_partition_key_filter_row_limit` refuses storage
+scan-prefix LIMIT pushdown, just as it does for ordinary `ORDER BY`. The selected
+partition/scope supplies all candidates. `apply_ann_of_ordering` drains owned
+rows into the internal generic `ann_topk::AnnTopK`, skipping NULL/non-vector
+values and computing distance once per eligible row. The max-heap compares
+`f64::total_cmp` then encounter ordinal, retaining stable nearest results in
+`min(literal LIMIT, input rows)` slots for plain column projections. DISTINCT,
+aggregates, computed projections and unbounded queries retain all eligible rows
+to preserve deduplication, aggregation and projection errors. Prepared
+LIMIT markers resolved to literals use the same path. Every eligible row is
+validated even if it will be rejected. Replacements move/drop payloads through
+`peek_mut`; `into_sorted_vec` and the owning row iterator reuse heap storage.
+Output extends the original emptied rows Vec, reusing its capacity. The selector
+adds no dependencies. Upstream partition/result materialization remains, and
+unbounded ANN still retains all eligible rows; validation/storage errors propagate.
+
 Scan-order full scans use raw partition/clustering continuation, including when
 `LIMIT` or `ALLOW FILTERING` is present. The limited cursor records the original
 limit and cumulative returned rows; the collector receives only the remaining

@@ -756,10 +756,12 @@ controls already passed before the fix (`tests/count_payload_alloc.rs`).
   CREATE INDEX therefore covers pre-existing unflushed rows without exposing
   an empty index to the query planner or collecting a temporary fallback scan.
   `update_schema` (the ALTER TABLE apply) remaps every positional index
-  declaration through the old schema's column name, because adding a column
-  that sorts before an indexed column shifts the indexed column's cell
-  ordinal (ST-16); a declaration that cannot be mapped fails loud instead of
-  silently indexing the wrong cell. It also flushes dirty pre-ALTER rows under
+  declaration through canonical column names captured at registration, because
+  adding a column that sorts before an indexed column shifts its cell ordinal
+  (ST-16). These names survive historical Raft replay schemas that temporarily
+  omit a target or filter column; the index stays unavailable and consults fail
+  loud until all its columns resolve again. Registration still rejects genuine
+  ordinal/type conflicts. This metadata is in memory; persisted formats are unchanged. It also flushes dirty pre-ALTER rows under
   the old schema before swapping layouts, so their SSTable serialization header
   preserves the write-time cell ordinals; reads and index backfills remap those
   physical ordinals through the per-SSTable header instead of interpreting old

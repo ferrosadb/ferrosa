@@ -15067,8 +15067,11 @@ impl StorageEngine {
     }
 
     pub fn index_is_current(&self, table_id: &TableId, index_name: &str) -> bool {
-        self.index_tracker
-            .is_current(table_id.keyspace(), table_id.table(), index_name)
+        self.table_state(table_id)
+            .is_some_and(|state| state.store.index_is_resolved(index_name))
+            && self
+                .index_tracker
+                .is_current(table_id.keyspace(), table_id.table(), index_name)
     }
 
     /// Returns the S3 object store and config, if S3 is configured.

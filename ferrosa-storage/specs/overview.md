@@ -179,8 +179,11 @@ volume or changing query results.
 7. **Schema updates preserve ordinal identity.** Regular columns are ordered by
    name, so `ALTER TABLE ADD` can shift a column's cell ordinal. `update_schema`
    remaps every positional index declaration (scalar, full-text, vector,
-   filtered-predicate clauses) through the old schema's column name, flushes
-   dirty pre-ALTER rows under their old serialization header and publishes the
+   filtered-predicate clauses) through canonical names captured at registration.
+   Names are shared across catalog rotations and survive historical schemas that
+   omit a column; unresolved ordinals cannot match cell tags, readiness is false,
+   and index consults fail loud until resolution. No persisted format changes.
+   The rotation flushes dirty pre-ALTER rows under their old serialization header and publishes the
    new schema in the same memtable rotation, and index backfills remap current
    column ordinals through each SSTable's stored header (ST-16).
 8. **Malformed data is quarantined, not dropped or crashed on.** A row that

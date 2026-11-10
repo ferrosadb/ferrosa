@@ -16,6 +16,7 @@
 //! access goes through `Arc<StorageEngine>`.
 
 pub mod accord_router;
+mod ann_topk;
 pub mod ast;
 pub mod auth;
 pub mod bridge;

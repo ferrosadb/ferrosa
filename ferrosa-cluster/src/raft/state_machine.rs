@@ -8101,6 +8101,255 @@ mod tests {
         assert_eq!(entry.get(&2u64), Some(&IndexNodeStatus::Building));
     }
 
+    #[tokio::test]
+    async fn persisted_scope_index_survives_historical_raft_schema_replay() {
+        use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+        use ferrosa_schema::metadata::table::TableUpdates;
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+
+        // Given a reduced Memory migration history: an ALTER before scope
+        // exists, ADD scope, CREATE INDEX, then three later columns sorting
+        // before scope. This models the pilot's historical 11/current 14
+        // ordinals without relying on its disk image or external services.
+        let dir = tempfile::tempdir().unwrap();
+        let tid = TableId::new("agent_memory", "entity_store");
+        let scope_position = |engine: &StorageEngine| {
+            engine
+                .table_schema(&tid)
+                .and_then(|schema| schema.column_index("scope"))
+                .map(usize::from)
+        };
+        let key = DecoratedKey::new(PartitionKey::new(Uuid::from_u128(42).as_bytes().to_vec()));
+        let scope_value = b"persisted-scope-through-complete-replay";
+        let decoy_value = b"properties-must-not-be-indexed-as-scope";
+        let assert_scope_read = |engine: &StorageEngine| {
+            let partition = engine
+                .read(&tid, &key)
+                .unwrap()
+                .expect("pre-reopen row must survive complete schema replay");
+            assert_eq!(partition.rows.len(), 1);
+            let ordinal = scope_position(engine).expect("scope must be in the schema") as u16;
+            let cell = partition.rows[0]
+                .cells
+                .iter()
+                .find(|(position, _)| *position == ordinal)
+                .expect("stored scope must read under its current ordinal");
+            assert_eq!(cell.1.value.as_deref(), Some(scope_value.as_slice()));
+        };
+        let column = |name: &str| ColumnMetadata {
+            name: name.into(),
+            kind: ColumnKind::Regular,
+            position: 0,
+            column_type: "text".into(),
+            clustering_order: ClusteringOrder::None,
+            mask: None,
+        };
+        let mut original = simple_table("agent_memory", "entity_store");
+        original.columns.shift_remove("value");
+        for name in [
+            "confidence",
+            "content_hash",
+            "context_snippet",
+            "created_at",
+            "description_embedding",
+            "entity_embedding",
+            "entity_name",
+            "entity_type",
+            "ingested_by_session",
+            "properties",
+        ] {
+            original.columns.insert(name.into(), column(name));
+        }
+        let alter = |name: &str| RaftOp::AlterTable {
+            keyspace: "agent_memory".into(),
+            table: "entity_store".into(),
+            updates: Box::new(TableUpdates {
+                params: None,
+                add_columns: vec![column(name)],
+                drop_columns: vec![],
+                extensions: None,
+            }),
+        };
+        let index = IndexMetadata {
+            keyspace: "agent_memory".into(),
+            table: "entity_store".into(),
+            name: "idx_entity_scope".into(),
+            index_type: ferrosa_index::IndexType::BTree,
+            target_columns: vec!["scope".into()],
+            filter_predicate: None,
+            options: HashMap::new(),
+        };
+        let history = vec![
+            make_entry(
+                1,
+                1,
+                RaftOp::CreateKeyspace(simple_keyspace("agent_memory")),
+            ),
+            make_entry(1, 2, RaftOp::CreateTable(Box::new(original))),
+            make_entry(1, 3, alter("description")),
+            make_entry(1, 4, alter("scope")),
+            make_entry(1, 5, RaftOp::CreateIndex(index.clone())),
+            make_entry(1, 6, alter("later_a")),
+            make_entry(1, 7, alter("later_b")),
+            make_entry(1, 8, alter("later_c")),
+        ];
+        {
+            let engine = test_engine(dir.path());
+            engine.register_system_tables().unwrap();
+            let mut live = FerrosStateMachine::with_side_effects(
+                Arc::new(test_schema_instance()),
+                Arc::clone(&engine),
+            );
+            for entry in &history {
+                let responses = live.apply(vec![entry.clone()]).await.unwrap();
+                assert!(matches!(responses.as_slice(), [RaftResponse::Ok]));
+                eprintln!(
+                    "live entry {}: scope ordinal {:?}",
+                    entry.log_id.index,
+                    scope_position(&engine)
+                );
+            }
+            assert_eq!(scope_position(&engine), Some(14));
+            let properties_position = engine
+                .table_schema(&tid)
+                .unwrap()
+                .column_index("properties")
+                .unwrap();
+            engine
+                .write(
+                    &tid,
+                    &key,
+                    Row {
+                        clustering: vec![],
+                        cells: vec![
+                            (
+                                properties_position,
+                                CellValue::live(decoy_value.to_vec(), 1),
+                            ),
+                            (14, CellValue::live(scope_value.to_vec(), 1)),
+                        ],
+                        deletion: DeletionTime::LIVE,
+                        primary_key_liveness: LivenessInfo::with_timestamp(1),
+                    },
+                    1,
+                )
+                .unwrap();
+            assert_scope_read(&engine);
+            // Persist via the real flush path, including the system index row.
+            engine.flush(&tid).unwrap();
+            engine
+                .flush(&TableId::new("system_schema", "indexes"))
+                .unwrap();
+        }
+
+        // When boot restores the latest engine schema and persisted indexes
+        // BEFORE replaying older committed Raft metadata, as main.rs does.
+        let (reopened, pending) = StorageEngine::open(
+            test_storage_config(dir.path(), ferrosa_storage::SyncStrategyConfig::Batch, 0),
+            None,
+        )
+        .unwrap();
+        reopened.register_system_tables().unwrap();
+        reopened.replay_mutations(pending).unwrap();
+        let engine = Arc::new(reopened);
+        assert_eq!(scope_position(&engine), Some(14));
+        assert!(!engine.declares_index(&tid, "idx_entity_scope"));
+        let restored = engine
+            .reload_indexes_from_system_schema(&ferrosa_storage::engine::PartitionKeyColumns::new())
+            .unwrap();
+        assert_eq!(restored.restored, 1);
+        assert_eq!(restored.skipped, 0);
+        assert!(engine.declares_index(&tid, "idx_entity_scope"));
+        crate::ddl_path::build_replicated_index(&engine, &index, &["id".into()], "cold control")
+            .unwrap();
+        // Let the real local backfill worker finish before testing schema
+        // unavailability, so pending work cannot explain the rejection.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !engine.index_is_current(&tid, &index.name) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let assert_scope_index = |ordinal: usize| {
+            assert_eq!(scope_position(&engine), Some(ordinal));
+            assert!(engine.declares_index(&tid, &index.name));
+            assert!(engine.index_is_current(&tid, &index.name));
+            engine.add_btree_index(&tid, &index.name, ordinal).unwrap();
+            assert!(engine
+                .read_by_index_exists(&tid, &index.name, scope_value)
+                .unwrap());
+            assert!(!engine
+                .read_by_index_exists(&tid, &index.name, decoy_value)
+                .unwrap());
+            assert_scope_read(&engine);
+        };
+        assert_scope_index(14);
+        eprintln!("cold reopen: persisted scope index restored at ordinal 14");
+
+        let mut replay = FerrosStateMachine::with_side_effects(
+            Arc::new(test_schema_instance()),
+            Arc::clone(&engine),
+        );
+        for entry in &history[..4] {
+            let responses = replay.apply(vec![entry.clone()]).await.unwrap();
+            assert!(matches!(responses.as_slice(), [RaftResponse::Ok]));
+            eprintln!(
+                "replay entry {}: scope ordinal {:?}",
+                entry.log_id.index,
+                scope_position(&engine)
+            );
+            if entry.log_id.index == 3 {
+                assert_eq!(scope_position(&engine), None);
+                assert!(engine.declares_index(&tid, &index.name));
+                assert!(
+                    !engine.index_is_current(&tid, &index.name),
+                    "a replayed index must be unavailable while scope is absent"
+                );
+                let error = engine
+                    .read_by_index_exists(&tid, &index.name, scope_value)
+                    .expect_err("an unresolved index consult must reject, not answer no rows");
+                let message = error.to_string();
+                assert!(message.contains(&index.name), "{message}");
+                assert!(message.contains("not current"), "{message}");
+                eprintln!("replay missing-scope interval: index not current; consult rejected");
+            }
+        }
+        assert_eq!(scope_position(&engine), Some(11));
+        let result = replay.apply(vec![history[4].clone()]).await;
+
+        // Then the same logical index must register cleanly under the
+        // historical layout; retain the fail-loud guard for actual drift.
+        assert!(
+            matches!(&result, Ok(responses) if matches!(responses.as_slice(), [RaftResponse::Ok])),
+            "persisted scope index must survive historical Raft CREATE/ALTER/INDEX replay: {result:?}"
+        );
+        assert_scope_index(11);
+        for (offset, entry) in history[5..].iter().enumerate() {
+            let responses = replay.apply(vec![entry.clone()]).await.unwrap();
+            assert!(matches!(responses.as_slice(), [RaftResponse::Ok]));
+            assert_scope_index(12 + offset);
+            eprintln!(
+                "replay entry {}: scope ordinal {:?}; index current; stored scope intact",
+                entry.log_id.index,
+                scope_position(&engine)
+            );
+        }
+        assert_eq!(
+            replay.last_applied,
+            history.last().map(|entry| entry.log_id)
+        );
+
+        // Actual same-name drift must still fail loudly after valid replay.
+        for (position, index_type) in [
+            (13, ferrosa_index::IndexType::BTree),
+            (14, ferrosa_index::IndexType::Hash),
+        ] {
+            let error = engine
+                .add_index(&tid, &index.name, position, index_type)
+                .expect_err("same-name ordinal/type mismatch must remain rejected");
+            assert!(error.to_string().contains("already registered"), "{error}");
+        }
+        assert_scope_index(14);
+    }
+
     /// A `CREATE INDEX` replicated through Raft must BUILD the index in the
     /// receiving node's storage engine, not only record it in schema.
     ///

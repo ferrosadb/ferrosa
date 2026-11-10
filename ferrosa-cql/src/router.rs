@@ -45,6 +45,7 @@ use ferrosa_storage::StorageEngine;
 use ferrosa_storage::TableId;
 use ferrosa_storage::FILTER_PREDICATE_OPTION_KEY;
 
+use crate::ann_topk::AnnTopK;
 use crate::ast::*;
 use crate::bridge;
 use crate::error::CqlError;
@@ -369,6 +370,7 @@ fn apply_ann_of_ordering(
     ann_query: &Term,
     all_col_names: &[String],
     all_col_types: &[CqlType],
+    limit: Option<usize>,
 ) -> Result<(), CqlError> {
     let col_idx = all_col_names
         .iter()
@@ -379,7 +381,7 @@ fn apply_ann_of_ordering(
     })?;
     let query_bits = vector_bits_from_term(ann_query, target_type)?;
 
-    let mut keyed_rows = Vec::with_capacity(rows.len());
+    let mut topk = AnnTopK::new(limit.unwrap_or(rows.len()).min(rows.len()));
     for (ordinal, row) in rows.drain(..).enumerate() {
         let value = row
             .get(col_idx)
@@ -392,20 +394,11 @@ fn apply_ann_of_ordering(
             continue;
         };
         let distance = squared_l2_distance(row_bits, &query_bits)?;
-        keyed_rows.push((distance, ordinal, row));
+        topk.offer(f64::from(distance), ordinal, row);
     }
 
-    keyed_rows.sort_by(
-        |(left_distance, left_ordinal, _), (right_distance, right_ordinal, _)| {
-            left_distance
-                .total_cmp(right_distance)
-                .then_with(|| left_ordinal.cmp(right_ordinal))
-        },
-    );
-
-    // Rebuild from the (filtered, ranked) rows — the result excludes any skipped
-    // un-embedded rows, so the cardinality may shrink.
-    *rows = keyed_rows.into_iter().map(|(_, _, row)| row).collect();
+    // Drain preserved the original buffer; at most its former length returns.
+    rows.extend(topk.into_sorted_rows());
     Ok(())
 }
 
@@ -647,7 +640,8 @@ fn safe_partition_key_filter_row_limit(
     table_meta: &TableMetadata,
     count_only_select: bool,
 ) -> Option<usize> {
-    if count_only_select || !s.order_by.is_empty() {
+    // Ordinary ORDER BY and ANN must rank candidates before LIMIT, never a scan prefix.
+    if count_only_select || !s.order_by.is_empty() || s.ann_of.is_some() {
         return None;
     }
     let limit = s.limit.as_ref()?.as_literal()? as usize;
@@ -8581,12 +8575,27 @@ async fn route_select_user_table_inner(
         rows
     } else if let Some((ann_col, ann_query)) = &s.ann_of {
         let mut sorted = rows;
+        // DISTINCT needs candidates beyond the first k raw rows. Aggregates
+        // and fallible computed projections must still see every ranked row.
+        let ann_limit = if !s.distinct
+            && s.columns
+                .iter()
+                .all(|column| matches!(column, SelectColumn::Star | SelectColumn::Column(_)))
+        {
+            s.limit
+                .as_ref()
+                .and_then(Limit::as_literal)
+                .map(|n| n as usize)
+        } else {
+            None
+        };
         apply_ann_of_ordering(
             &mut sorted,
             ann_col,
             ann_query,
             &all_col_names,
             &all_col_types,
+            ann_limit,
         )?;
         sorted
     } else if !s.order_by.is_empty() {
@@ -33344,7 +33353,15 @@ mod tests {
             ],
         ];
 
-        apply_ann_of_ordering(&mut rows, "vec", &query, &all_col_names, &all_col_types).unwrap();
+        apply_ann_of_ordering(
+            &mut rows,
+            "vec",
+            &query,
+            &all_col_names,
+            &all_col_types,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(rows[0][1], Some(CqlValue::Int(2)));
         assert_eq!(rows[1][1], Some(CqlValue::Int(1)));
@@ -33395,8 +33412,15 @@ mod tests {
             ],
         ];
 
-        apply_ann_of_ordering(&mut rows, "vec", &query, &all_col_names, &all_col_types)
-            .expect("a NULL-vector row must be skipped, not fail the whole query");
+        apply_ann_of_ordering(
+            &mut rows,
+            "vec",
+            &query,
+            &all_col_names,
+            &all_col_types,
+            None,
+        )
+        .expect("a NULL-vector row must be skipped, not fail the whole query");
 
         assert_eq!(
             rows.len(),
@@ -33489,6 +33513,147 @@ mod tests {
         assert!(
             scoped[0].score > 0.1,
             "CQL-created vector index must feed scoped storage ANN and exclude cross-prefix exact matches: {scoped:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_ann_ranks_all_candidates_before_limit() {
+        // Test list (one behavior, exercised for entity and document-chunk ANN):
+        // - Rank late UUID candidates before LIMIT, excluding early NULL vectors.
+        // - Keep closer vectors from other tenant/session scopes out of results.
+        // - Prove the candidates exist through uncapped native CQL controls.
+        async fn select_ids(
+            state: &SharedState,
+            ctx: &RequestContext<'_>,
+            cql: &str,
+        ) -> Vec<uuid::Uuid> {
+            let Statement::Select(select) = crate::parser::parse(cql).unwrap() else {
+                panic!("expected SELECT: {cql}");
+            };
+            // This is the native SELECT route and real storage engine, without
+            // client-side retrieval, scoring, sorting, or fallback.
+            let result = route_select_raw(state, ctx, &select)
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+            assert!(result.paging_state.is_none(), "control must be complete");
+            result
+                .rows
+                .into_iter()
+                .map(|row| match &row[0] {
+                    Some(CqlValue::Uuid(id)) => *id,
+                    value => panic!("expected UUID id from {cql}, got {value:?}"),
+                })
+                .collect()
+        }
+
+        // Keep this regression about CQL candidate selection, independent of
+        // background flush/replay behavior covered by separate storage tests.
+        let (state, _dir) = setup_with_engine_overrides(
+            ferrosa_storage::index::IndexBackendConfig::Local,
+            |config| config.flush_threshold_bytes = 1 << 30,
+        );
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        let run = |cql: String| {
+            let state = &state;
+            let ctx = &ctx;
+            async move {
+                route(state, ctx, crate::parser::parse(&cql).unwrap())
+                    .await
+                    .unwrap_or_else(|e| panic!("{cql}: {e:?}"))
+            }
+        };
+        run("CREATE KEYSPACE annred WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}".into()).await;
+        let null_id = uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000000").unwrap();
+        let nearest = uuid::Uuid::parse_str("ffffffff-0000-4000-8000-000000000000").unwrap();
+        let runner_up = uuid::Uuid::parse_str("eeeeeeee-0000-4000-8000-000000000000").unwrap();
+        let distractors: Vec<uuid::Uuid> = (1..=32)
+            .map(|n| uuid::Uuid::parse_str(&format!("00000000-0000-4000-8000-{n:012x}")).unwrap())
+            .collect();
+        let mut expected = vec![nearest, runner_up];
+        expected.extend_from_slice(&distractors[..18]);
+        let mut actual_by_table = Vec::new();
+
+        for (table, id_col, vector_col) in [
+            ("entities", "entity_id", "entity_embedding"),
+            ("document_chunks", "chunk_id", "chunk_embedding"),
+        ] {
+            // Given: 35 in-scope rows, with both nearest vectors after the
+            // first 20 clustering UUIDs, plus out-of-scope exact matches.
+            run(format!(
+                "CREATE TABLE annred.{table} (tenant_id text, session_id text, \
+                 {id_col} uuid, {vector_col} vector<float, 3>, \
+                 PRIMARY KEY ((tenant_id, session_id), {id_col}))"
+            ))
+            .await;
+            run(format!(
+                "CREATE INDEX {table}_ann ON annred.{table} ({vector_col}) USING 'vector'"
+            ))
+            .await;
+            run(format!(
+                "INSERT INTO annred.{table} (tenant_id, session_id, {id_col}) \
+                 VALUES ('tenant-a', 'session-1', {null_id})"
+            ))
+            .await;
+            for (n, id) in distractors.iter().enumerate() {
+                run(format!(
+                    "INSERT INTO annred.{table} (tenant_id, session_id, {id_col}, {vector_col}) \
+                     VALUES ('tenant-a', 'session-1', {id}, [0.0, 1.0, {:.2}])",
+                    (n + 1) as f32 / 100.0
+                ))
+                .await;
+            }
+            for (id, vector) in [
+                (runner_up, "[0.8, 0.2, 0.0]"),
+                (nearest, "[0.99, 0.01, 0.0]"),
+            ] {
+                run(format!(
+                    "INSERT INTO annred.{table} (tenant_id, session_id, {id_col}, {vector_col}) \
+                     VALUES ('tenant-a', 'session-1', {id}, {vector})"
+                ))
+                .await;
+            }
+            for (tenant, session) in [("tenant-b", "session-1"), ("tenant-a", "session-2")] {
+                run(format!(
+                    "INSERT INTO annred.{table} (tenant_id, session_id, {id_col}, {vector_col}) \
+                     VALUES ('{tenant}', '{session}', {null_id}, [1.0, 0.0, 0.0])"
+                ))
+                .await;
+            }
+
+            let scoped = format!(
+                "SELECT {id_col} FROM annred.{table} \
+                 WHERE tenant_id = 'tenant-a' AND session_id = 'session-1'"
+            );
+            let scan_ids = select_ids(&state, &ctx, &scoped).await;
+            assert_eq!(scan_ids.len(), 35, "all scoped rows must be stored");
+            assert_eq!(scan_ids[0], null_id, "NULL precedes embedded candidates");
+            assert!(scan_ids.iter().position(|id| *id == nearest).unwrap() >= 20);
+            assert!(scan_ids.iter().position(|id| *id == runner_up).unwrap() >= 20);
+
+            let ann = format!("{scoped} ORDER BY {vector_col} ANN OF [1.0, 0.0, 0.0]");
+            let uncapped_ids = select_ids(&state, &ctx, &ann).await;
+            assert_eq!(uncapped_ids.len(), 34, "NULL and other scopes excluded");
+            assert_eq!(
+                &uncapped_ids[..20],
+                expected.as_slice(),
+                "uncapped ANN control"
+            );
+            assert!(!uncapped_ids.contains(&null_id));
+
+            // When: only LIMIT changes. Record both table results before the
+            // single behavioral assertion, so entity and chunk paths run.
+            let limited_ids = select_ids(&state, &ctx, &format!("{ann} LIMIT 20")).await;
+            eprintln!("{table}: scan={scan_ids:?}; uncapped={uncapped_ids:?}; limited={limited_ids:?}; expected={expected:?}");
+            actual_by_table.push(limited_ids);
+        }
+
+        // Then: LIMIT must select the nearest 20 from all scoped non-NULL rows.
+        assert_eq!(
+            actual_by_table,
+            vec![expected.clone(), expected],
+            "native entity and document-chunk ANN must rank all scoped candidates before LIMIT 20"
         );
     }
 
