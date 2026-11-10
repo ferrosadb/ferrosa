@@ -13001,7 +13001,21 @@ mod tests {
     /// instead of a hardcoded `BTree`. Unknown indexes default to `BTree`.
     #[test]
     fn add_index_threads_declared_index_type() {
-        let store = test_store();
+        // Both registrations must resolve to real columns: the generic store
+        // fixture has only `val` at ordinal 0, so declare the vector at 1.
+        let mut schema = test_schema();
+        schema.regular_columns.push(ColumnDefinition {
+            name: "emb".to_string(),
+            type_name: "org.apache.cassandra.db.marshal.VectorType(FloatType,3)".to_string(),
+        });
+        let store = TableStore::new(
+            schema,
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
         assert_eq!(
             store.index_type_for("missing"),
             IndexType::BTree,
