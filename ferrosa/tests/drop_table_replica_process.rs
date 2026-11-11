@@ -1327,11 +1327,16 @@ fn a_node_exit_is_named_with_its_status_and_its_first_fatal_line() {
 #[test]
 fn a_node_alive_but_never_ready_fails_the_wait_naming_its_condition() {
     let mut alloc = PortAllocator::new();
-    let ports = alloc_ports(&mut alloc);
+    // Held for the whole test, from the moment it was proved free: the node can
+    // never bind it. Re-binding after `alloc.get()` dropped the probe failed once
+    // with `Address already in use` (pre-push gate, 2026-11-11; the holder was
+    // not identified, t_68b0a1df). Keeping the probe leaves no window at all.
+    let held_pg = common::ports::hold_collision_port(&mut alloc);
+    let ports = Ports {
+        pg: held_pg.local_addr().expect("held port address").port(),
+        ..alloc_ports(&mut alloc)
+    };
     let dir = tempfile::tempdir().expect("node data dir");
-    // Held for the whole test: the node can never bind it.
-    let _held_pg = std::net::TcpListener::bind(("127.0.0.1", ports.pg))
-        .expect("occupy the node's PostgreSQL port");
     let host_id = "11111111-1111-1111-1111-111111111111".to_string();
     let mut node = spawn_node_with_env(dir, ports, host_id, "alive-never-ready", None, &[]);
 
@@ -1501,10 +1506,13 @@ fn a_node_that_dies_at_startup_fails_the_readiness_wait_at_once() {
 #[test]
 fn a_port_taken_by_a_concurrent_process_is_redrawn_and_retried() {
     let mut alloc = PortAllocator::new();
-    let taken = alloc_ports(&mut alloc);
-    // Held for the whole test: the FIRST attempt's node can never bind it.
-    let _held = std::net::TcpListener::bind(("127.0.0.1", taken.pg))
-        .expect("occupy a port in the first attempt's band");
+    // Held for the whole test, from the moment it was proved free: the FIRST
+    // attempt's node can never bind it. See the never-ready fixture above.
+    let held = common::ports::hold_collision_port(&mut alloc);
+    let taken = Ports {
+        pg: held.local_addr().expect("held port address").port(),
+        ..alloc_ports(&mut alloc)
+    };
 
     let started = Instant::now();
     let mut allocations = 0usize;
