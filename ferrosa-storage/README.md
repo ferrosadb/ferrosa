@@ -220,7 +220,12 @@ controls already passed before the fix (`tests/count_payload_alloc.rs`).
   call it too, as a safety net for callers outside table startup). Because it
   runs while writers are live, it removes only staging entries another process
   left (`{pid}-…` names not this process's) and never a dir this process is
-  still staging into (FMEA ST-89).
+  still staging into (FMEA ST-89). Staged components and index sidecars are
+  likewise named with their owner (`{gen}-Data.db.{pid}.tmp`,
+  `.fti-{gen}-{index}.{pid}.tmp`), and the sweep leaves this process's own
+  alone: a compaction output dir is shared by every compaction of its table,
+  so one task's constructor used to quarantine another's publish in flight
+  (FMEA ST-106).
 
   **Digest verification on published bytes, unconditional (`publication-safety.md`
   M2 step 4 / M3, T-012, FMEA ST-32):** between the `.tmp` fsync and the
@@ -319,7 +324,20 @@ controls already passed before the fix (`tests/count_payload_alloc.rs`).
   and flushing memtables, via `Memtable::min_timestamp`). Otherwise dropping it would
   resurrect older data. `CompactionTask::purge` carries the policy, computed by
   `StorageEngine::purge_policy_for` at submission; a schema with no `gc_grace_seconds`
-  means no purge. Kill switch: `FERROSA_COMPACTION_PURGE_TOMBSTONES=0`. A pathless
+  means no purge. Kill switch: `FERROSA_COMPACTION_PURGE_TOMBSTONES=0`. **Expired TTL
+  data is purged the same way:** an expiring cell or an expiring row liveness (an
+  `INSERT ... USING TTL` row marker) whose expiry is past `gc_before` and whose
+  timestamp is below the guard is dropped (ST-105). It is dropped rather than rewritten
+  as a tombstone, because the reconcile order is expiry-blind and a tombstone would win
+  an equal-timestamp tie the expired cell loses. `compaction::purge::PurgedRow`
+  is a borrowed, copy-free per-row view of a read result without that data, which
+  the cluster read digest hashes one row at a time, and `repair_guard` plus
+  `Mutation::serialize_purged_rows` give read repair a per-target, copy-free write
+  without what the target can drop itself; `PurgeStats::newest_dropped` reports
+  the newest timestamp a purge removed, which a replica's stripped read response
+  carries to the coordinator (CL-82), so
+  replicas that compacted at different times agree
+  (`StorageEngine::read_purge_horizon`). A pathless
   collection tombstone is kept while element cells it shadows remain. **The
   reserved table-tombstone key is EXEMPT from purge** (see
  [Table tombstones](#table-tombstones-whole-table-truncate)): its marker is

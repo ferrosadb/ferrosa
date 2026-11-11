@@ -209,17 +209,16 @@ fn read_kernel_ephemeral_floor() -> u16 {
 /// BEFORE calling this, so the probe never lands on a port another test thread
 /// has been handed.
 pub fn port_is_free(port: u16) -> bool {
+    bind_if_free(port).is_some()
+}
+
+/// The probe of [`port_is_free`], keeping the listener it bound.
+fn bind_if_free(port: u16) -> Option<std::net::TcpListener> {
     // Complete the one-time host query before creating a transient listener.
     // A concurrent initializer may launch sysctl and inherit open descriptors.
     let _ = kernel_ephemeral_floor();
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    match std::net::TcpListener::bind(addr) {
-        Ok(listener) => {
-            drop(listener);
-            true
-        }
-        Err(_) => false,
-    }
+    std::net::TcpListener::bind(addr).ok()
 }
 
 /// The kernel's refusal when a listener cannot take its port.
@@ -300,6 +299,23 @@ impl PortAllocator {
 
     /// A band port nothing is listening on, reserved for this process.
     pub fn get(&mut self) -> u16 {
+        // The probe listener is dropped here; the node binds the port later.
+        self.draw().0
+    }
+
+    /// A band port reserved for this process AND held: the listener is the one
+    /// that proved the port free, never closed in between.
+    ///
+    /// Dropping the probe and binding again leaves a window in which anything
+    /// else may take the port, and a fixture's re-bind then fails with
+    /// `Address already in use` — seen once in the pre-push gate on 2026-11-11,
+    /// with the holder never identified. A fixture that wants the port occupied
+    /// keeps the probe instead, so there is no window.
+    pub fn get_held(&mut self) -> std::net::TcpListener {
+        self.draw().1
+    }
+
+    fn draw(&mut self) -> (u16, std::net::TcpListener) {
         assert!(
             BAND_END < kernel_ephemeral_floor(),
             "the test band {BAND_START}..={BAND_END} must sit entirely below the \
@@ -324,12 +340,12 @@ impl PortAllocator {
             if !reserve_in_process(port) {
                 continue;
             }
-            if !port_is_free(port) {
+            let Some(probe) = bind_if_free(port) else {
                 release_in_process(port);
                 continue;
-            }
+            };
             self.taken.insert(port);
-            return port;
+            return (port, probe);
         }
         panic!(
             "no free port in the {BAND_START}-{BAND_END} band: all {BAND_LEN} \
@@ -348,7 +364,8 @@ impl Default for PortAllocator {
 
 /// Hold an intentionally occupied port for a listener-collision fixture.
 /// The allocator owns the process slice and every intentional collision must use it.
+/// The listener is the allocator's own probe, so the port is never released
+/// between being proved free and being held (see [`PortAllocator::get_held`]).
 pub fn hold_collision_port(alloc: &mut PortAllocator) -> std::net::TcpListener {
-    let port = alloc.get();
-    std::net::TcpListener::bind(("127.0.0.1", port)).expect("hold an allocated collision port")
+    alloc.get_held()
 }

@@ -1,11 +1,17 @@
 //! Lane reconnect must outlive any outage (t_48d168ee).
 //!
 //! These tests run the lane actor against fake peers that come and go on a
-//! fixed loopback port while tokio's clock is paused, so an outage far longer
-//! than the whole fast-retry budget costs milliseconds of wall time. The clock
-//! is paused only after each connection is established. All of
-//! them touch the process-wide reconnect counters, so they share one serial
-//! key.
+//! fixed address while tokio's clock is paused, so an outage far longer than
+//! the whole fast-retry budget costs milliseconds of wall time. All of them
+//! touch the process-wide reconnect counters, so they share one serial key.
+//!
+//! The peers live on the in-memory network (`mem_net`), not on loopback. A
+//! paused clock jumps to the next timer whenever no task is runnable, and a
+//! task waiting on the kernel for a loopback byte is not runnable, so under
+//! CPU load a real dial lost to its own 5 s virtual timeout and the lane
+//! stayed Dormant after the peer returned (t_68b0a1df). In memory every wake
+//! is in-process, so a timeout fires only when the peer genuinely did not
+//! answer.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serial_test::serial;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio_util::codec::Framed;
 use tracing_subscriber::layer::{Context, SubscriberExt};
@@ -23,6 +30,7 @@ use crate::codec::{InternodeCodec, Lane};
 use crate::config::NetConfig;
 use crate::handshake::accept_handshake;
 use crate::lane_actor::{spawn_lane_actor, ActorReconnectContext, LaneHandle, LaneStatusReport};
+use crate::mem_net::{self, MemListener};
 use crate::reconnect::LaneState;
 use crate::rpc::client::RpcClient;
 use crate::task_pool::TaskPool;
@@ -41,6 +49,35 @@ pub(crate) struct FakePeer {
 impl FakePeer {
     pub(crate) fn accepted(&self) -> usize {
         self.accepted.load(Ordering::SeqCst)
+    }
+}
+
+/// A byte stream a fake peer accepted, from either network.
+trait PeerStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> PeerStream for T {}
+
+/// A fake peer's listener: in memory for a `mem_net` address, loopback TCP
+/// otherwise (the `peer.rs` outage tests still pair it with a real
+/// `RpcServer`).
+pub(crate) enum PeerListener {
+    Tcp(TcpListener),
+    Mem(MemListener),
+}
+
+impl PeerListener {
+    pub(crate) async fn bind(addr: SocketAddr) -> std::io::Result<Self> {
+        if mem_net::is_mem(addr) {
+            MemListener::bind(addr).map(Self::Mem)
+        } else {
+            TcpListener::bind(addr).await.map(Self::Tcp)
+        }
+    }
+
+    async fn accept(&mut self) -> std::io::Result<Box<dyn PeerStream>> {
+        match self {
+            Self::Tcp(l) => Ok(Box::new(l.accept().await?.0)),
+            Self::Mem(l) => Ok(Box::new(l.accept().await)),
+        }
     }
 }
 
@@ -64,7 +101,7 @@ pub(crate) fn spawn_fake_peer(
     let counter = Arc::clone(&accepted);
     tokio::spawn(async move {
         tokio::time::sleep(start_after).await;
-        let listener = TcpListener::bind(addr).await.expect("fake peer bind");
+        let listener = PeerListener::bind(addr).await.expect("fake peer bind");
         serve(listener, id, up_for, false, counter).await;
     });
     FakePeer { accepted }
@@ -85,13 +122,13 @@ pub(crate) fn spawn_blackhole(
     let counter = Arc::clone(&accepted);
     tokio::spawn(async move {
         tokio::time::sleep(start_after).await;
-        let listener = TcpListener::bind(addr).await.expect("blackhole bind");
+        let mut listener = PeerListener::bind(addr).await.expect("blackhole bind");
         let end = tokio::time::Instant::now() + (until - start_after);
         let mut held = Vec::new();
         loop {
             tokio::select! {
                 res = listener.accept() => {
-                    held.push(res.expect("blackhole accept").0);
+                    held.push(res.expect("blackhole accept"));
                     counter.fetch_add(1, Ordering::SeqCst);
                 }
                 () = tokio::time::sleep_until(end) => break,
@@ -103,7 +140,7 @@ pub(crate) fn spawn_blackhole(
 
 /// Like [`spawn_fake_peer`] but on an already-bound listener, so the first
 /// connection cannot race the bind.
-fn spawn_bound_fake_peer(listener: TcpListener, id: Uuid, up_for: Duration) -> FakePeer {
+fn spawn_bound_fake_peer(listener: PeerListener, id: Uuid, up_for: Duration) -> FakePeer {
     let accepted = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&accepted);
     tokio::spawn(serve(listener, id, Some(up_for), true, counter));
@@ -114,7 +151,7 @@ fn spawn_bound_fake_peer(listener: TcpListener, id: Uuid, up_for: Duration) -> F
 /// connection instead of at bind, so a paused clock cannot jump past it while
 /// the first client is still mid-connect.
 async fn serve(
-    listener: TcpListener,
+    mut listener: PeerListener,
     id: Uuid,
     up_for: Option<Duration>,
     arm_on_first_accept: bool,
@@ -130,11 +167,11 @@ async fn serve(
         let stream = match deadline {
             Some(deadline) => {
                 tokio::select! {
-                    res = listener.accept() => res.expect("fake peer accept").0,
+                    res = listener.accept() => res.expect("fake peer accept"),
                     () = tokio::time::sleep_until(deadline) => break,
                 }
             }
-            None => listener.accept().await.expect("fake peer accept").0,
+            None => listener.accept().await.expect("fake peer accept"),
         };
         if deadline.is_none() && arm_on_first_accept {
             deadline = up_for.map(|d| tokio::time::Instant::now() + d);
@@ -148,15 +185,29 @@ async fn serve(
 }
 
 // ---------------------------------------------------------------------------
-// Log capture: INFO and above from this crate.
+// Log capture: DEBUG and above from this crate. `lines` and `count` see only
+// INFO and above, which is what the log assertions are about; `trace` keeps
+// the DEBUG lines too, so a failed assertion can show every probe's outcome.
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<String>>>);
+/// Captured lines, each stamped with the virtual time since capture began, so
+/// a failure shows when every probe ran, not only that it did.
+#[derive(Clone)]
+struct Captured {
+    lines: Arc<Mutex<Vec<String>>>,
+    start: tokio::time::Instant,
+}
 
 impl Captured {
     fn lines(&self) -> Vec<String> {
-        self.0.lock().expect("log capture lock").clone()
+        self.trace()
+            .into_iter()
+            .filter(|l| !l.contains(" DEBUG "))
+            .collect()
+    }
+
+    fn trace(&self) -> Vec<String> {
+        self.lines.lock().expect("log capture lock").clone()
     }
 
     fn count(&self, needle: &str) -> usize {
@@ -177,20 +228,26 @@ impl tracing::field::Visit for FieldText {
 impl<S: tracing::Subscriber> Layer<S> for Captured {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
         let meta = event.metadata();
-        if *meta.level() > tracing::Level::INFO || !meta.target().starts_with("ferrosa_net") {
+        if *meta.level() > tracing::Level::DEBUG || !meta.target().starts_with("ferrosa_net") {
             return;
         }
         let mut text = FieldText(String::new());
         event.record(&mut text);
-        self.0
-            .lock()
-            .expect("log capture lock")
-            .push(format!("{} {}", meta.level(), text.0));
+        let at = tokio::time::Instant::now().duration_since(self.start);
+        self.lines.lock().expect("log capture lock").push(format!(
+            "[{:>8.1}s] {} {}",
+            at.as_secs_f64(),
+            meta.level(),
+            text.0
+        ));
     }
 }
 
 fn capture_logs() -> (tracing::subscriber::DefaultGuard, Captured) {
-    let captured = Captured::default();
+    let captured = Captured {
+        lines: Arc::default(),
+        start: tokio::time::Instant::now(),
+    };
     let subscriber = tracing_subscriber::registry().with(captured.clone());
     (tracing::subscriber::set_default(subscriber), captured)
 }
@@ -272,7 +329,7 @@ async fn status(handle: &LaneHandle) -> LaneStatusReport {
 /// Start a lane against a peer that drops it after one second; returns once
 /// the lane has noticed and left `Connected`.
 async fn lane_whose_peer_just_died(addr: SocketAddr, id: Uuid) -> LaneHandle {
-    let listener = TcpListener::bind(addr).await.expect("bind first peer");
+    let listener = PeerListener::bind(addr).await.expect("bind first peer");
     let first = spawn_bound_fake_peer(listener, id, Duration::from_secs(1));
     let handle = connected_lane(addr).await;
     // Freeze the clock only after the connect: a paused clock jumps forward
@@ -330,8 +387,8 @@ async fn dial_to_an_unroutable_address_is_bounded_by_connect_timeout() {
 #[tokio::test]
 #[serial(net_reconnect_counters)]
 async fn client_death_with_no_subscriber_is_visible_to_a_late_subscriber() {
-    let addr = free_addr();
-    let listener = TcpListener::bind(addr).await.expect("bind peer");
+    let addr = mem_net::free_addr();
+    let listener = PeerListener::bind(addr).await.expect("bind peer");
     let _peer = spawn_bound_fake_peer(listener, Uuid::new_v4(), Duration::from_secs(1));
     let client = RpcClient::connect_with_tls_on_pool(
         Arc::new(NetConfig::default()),
@@ -359,7 +416,7 @@ async fn client_death_with_no_subscriber_is_visible_to_a_late_subscriber() {
 #[tokio::test]
 #[serial(net_reconnect_counters)]
 async fn lane_reconnects_after_outage_longer_than_fast_budget() {
-    let addr = free_addr();
+    let addr = mem_net::free_addr();
     let peer_id = Uuid::new_v4();
     let handle = lane_whose_peer_just_died(addr, peer_id).await;
 
@@ -370,7 +427,7 @@ async fn lane_reconnects_after_outage_longer_than_fast_budget() {
     let counter = Arc::clone(&accepted);
     let returned = tokio::spawn(async move {
         peer_return.await.expect("release returning peer");
-        let listener = TcpListener::bind(addr).await.expect("returning peer bind");
+        let listener = PeerListener::bind(addr).await.expect("returning peer bind");
         serve(listener, peer_id, None, false, counter).await;
     });
 
@@ -395,7 +452,7 @@ async fn lane_reconnects_after_outage_longer_than_fast_budget() {
 #[serial(net_reconnect_counters)]
 async fn slow_retry_logs_the_drop_and_the_recovery_once_each() {
     let (_guard, logs) = capture_logs();
-    let addr = free_addr();
+    let addr = mem_net::free_addr();
     let peer_id = Uuid::new_v4();
     let handle = lane_whose_peer_just_died(addr, peer_id).await;
     // The node is up but never answers until minute 60, so each dial is counted
@@ -415,10 +472,16 @@ async fn slow_retry_logs_the_drop_and_the_recovery_once_each() {
     let slow_dials = dials.load(Ordering::SeqCst) - dials_at_13m;
     assert!(
         slow_dials >= 60,
-        "expected a probe about every 30 s over 45 minutes, saw {slow_dials}"
+        "expected a probe about every 30 s over 45 minutes, saw {slow_dials}; lane log: {:#?}",
+        logs.trace()
     );
     run_for(6 * MINUTE).await;
-    assert_eq!(status(&handle).await, LaneStatusReport::Connected);
+    assert_eq!(
+        status(&handle).await,
+        LaneStatusReport::Connected,
+        "lane did not reconnect within six minutes of the peer returning; lane log: {:#?}",
+        logs.trace()
+    );
 
     let lines = logs.lines();
     assert_eq!(
@@ -453,7 +516,7 @@ async fn slow_retry_logs_the_drop_and_the_recovery_once_each() {
 #[tokio::test]
 #[serial(net_reconnect_counters)]
 async fn shutdown_during_slow_retry_stops_attempts_and_leaks_no_task() {
-    let addr = free_addr();
+    let addr = mem_net::free_addr();
     let peer_id = Uuid::new_v4();
     // Binds five seconds after the shutdown below, so any dial the lane made
     // after being shut down would reach it and show in `accepted()`.
@@ -463,7 +526,7 @@ async fn shutdown_during_slow_retry_stops_attempts_and_leaks_no_task() {
     let tasks_before_lane = tokio::runtime::Handle::current()
         .metrics()
         .num_alive_tasks();
-    let first = TcpListener::bind(addr).await.expect("bind first peer");
+    let first = PeerListener::bind(addr).await.expect("bind first peer");
     // The late peer would collide with the first bind, so this test hands the
     // first peer the port and lets the late peer bind after it is released.
     let first = spawn_bound_fake_peer(first, peer_id, Duration::from_secs(1));
@@ -513,7 +576,7 @@ async fn shutdown_during_slow_retry_stops_attempts_and_leaks_no_task() {
 #[serial(net_reconnect_counters)]
 async fn reconnect_to_address_now_owned_by_another_node_is_refused() {
     let (_guard, logs) = capture_logs();
-    let addr = free_addr();
+    let addr = mem_net::free_addr();
     let peer_id = Uuid::new_v4();
     let handle = lane_whose_peer_just_died(addr, peer_id).await;
 

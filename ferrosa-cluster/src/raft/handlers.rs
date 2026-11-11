@@ -16,6 +16,7 @@
 //! | `RaftInstallSnapshot(bytes)`| [`RaftSnapshotHandler`]| `RaftAppendResponse(bytes)`|
 //! | `ReadRequest(bytes)`       | [`ReadRequestHandler`]| `ReadResponse(bytes)`    |
 //! | `PartitionSuffixReadRequest(bytes)` | [`ReadRequestHandler`] | `ReadResponse(bytes)` |
+//! | `PurgedReadRequest(bytes)` | [`ReadRequestHandler`] | `ReadResponse(bytes)` |
 //!
 //! # Serialization of Partition Data
 //!
@@ -598,6 +599,33 @@ pub struct PartitionSuffixReadRequestPayload {
     pub start_clustering: Vec<u8>,
 }
 
+/// Payload of a `PurgedReadRequest`: a whole-partition full read whose answer
+/// leaves out what the replica's own compaction would drop (CL-82).
+///
+/// A distinct message type, sent only to a peer advertising
+/// `ferrosa_net::handshake::CAP_PURGED_READ`, so a build that predates it is
+/// never asked. Only an unsliced read qualifies: dropping a whole row from a
+/// page would move the caller's resume point and its end-of-partition test.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PurgedReadRequestPayload {
+    /// Wire-schema version. The only supported value is 1.
+    pub version: u8,
+    /// A whole-partition full read: `digest_only` false, no page, no clustering.
+    pub request: ReadRequestPayload,
+}
+
+/// Reply to a `PurgedReadRequest`, carried in a `ReadResponse` frame.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PurgedReadResponsePayload {
+    /// The read, its `partition` without what this replica's compaction would
+    /// drop: what is past grace and below its own guard
+    /// (`compaction::purge::repair_guard`). `digest` is over the read before
+    /// that, the digest a digest-only read from this replica returns.
+    pub response: ReadResponsePayload,
+    /// The newest timestamp of anything left out, `None` when nothing was.
+    pub newest_left_out: Option<i64>,
+}
+
 /// Payload for a remote read response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadResponsePayload {
@@ -703,6 +731,84 @@ pub fn compute_partition_digest_streaming(partition: &Partition) -> Result<u32, 
     compute_partition_digest(partition)
 }
 
+/// The digest a QUORUM read compares between replicas: over `partition` without
+/// the data compaction may already have dropped on some replica
+/// ([`StorageEngine::read_purge_horizon`]). Two replicas that purged at different
+/// times hold the same visible data, and a raw digest called that a divergence,
+/// so read repair wrote the purged rows back on every read until both had
+/// compacted. A partition with nothing purgeable hashes exactly as
+/// [`compute_partition_digest`] does, so a node running this agrees with an older
+/// node on every such partition.
+pub fn read_digest(
+    storage: &StorageEngine,
+    table_id: &TableId,
+    partition: &Partition,
+) -> Result<u32, bincode::Error> {
+    match storage.read_purge_horizon(table_id) {
+        Some(gc_before) => purged_partition_digest(partition, gc_before),
+        None => compute_partition_digest(partition),
+    }
+}
+
+/// [`compute_partition_digest`] of `partition` as a purge at horizon
+/// `gc_before` with an open overlap guard would leave it, computed without
+/// copying the partition.
+pub fn purged_partition_digest(
+    partition: &Partition,
+    gc_before: i64,
+) -> Result<u32, bincode::Error> {
+    use ferrosa_storage::compaction::purge::{
+        purged_partition_deletion, read_view_policy, PurgedRow,
+    };
+    // Hash the purged form one borrowed row at a time: no row data is copied, so
+    // the digest's working set stays one row whatever the partition's size.
+    let policy = read_view_policy(gc_before);
+    let static_view = partition
+        .static_row
+        .as_ref()
+        .map(|row| PurgedRow::new(row, &policy))
+        .filter(|view| !view.removes_static_row());
+    let mut stream = PartitionDigestStream::new_with_static_view(
+        partition.key.token.0,
+        partition.key.key.as_bytes(),
+        purged_partition_deletion(partition.deletion, &policy),
+        static_view.as_ref(),
+    )?;
+    for row in &partition.rows {
+        let view = PurgedRow::new(row, &policy);
+        if !view.removes_row() {
+            stream.update_purged_row(&view)?;
+        }
+    }
+    stream.finalize()
+}
+
+/// [`serialize_row_borrowed`] over a purged view: the same byte layout, so a row
+/// with nothing purgeable hashes identically either way.
+fn serialize_purged_row<W: std::io::Write>(
+    writer: &mut W,
+    row: &ferrosa_storage::compaction::purge::PurgedRow<'_>,
+) -> Result<(), bincode::Error> {
+    bincode::serialize_into(&mut *writer, row.clustering())?;
+    let n_cells = row.cells().count() as u64;
+    bincode::serialize_into(&mut *writer, &n_cells)?;
+    for (idx, cell) in row.cells() {
+        bincode::serialize_into(&mut *writer, idx)?;
+        serialize_cell_wire_into(&mut *writer, cell)?;
+    }
+    let deletion = row.deletion();
+    serialize_deletion_time(
+        &mut *writer,
+        deletion.marked_for_delete_at,
+        deletion.local_deletion_time,
+    )?;
+    let liveness = row.liveness();
+    bincode::serialize_into(&mut *writer, &liveness.timestamp)?;
+    bincode::serialize_into(&mut *writer, &liveness.ttl)?;
+    bincode::serialize_into(&mut *writer, &liveness.local_deletion_time)?;
+    Ok(())
+}
+
 /// Emit a `Row` in `RowWire`'s on-wire byte layout without cloning
 /// any of its cell contents. `bincode::serialize_into(&mut writer,
 /// &row.clustering)` already passes the bytes of `row.clustering`
@@ -793,6 +899,55 @@ impl PartitionDigestStream {
             hasher,
             rows_so_far: 0,
         })
+    }
+
+    /// [`Self::new`] with the static row given as a purged view
+    /// ([`read_digest`]). Byte-identical to `new` with the row the view
+    /// describes; the static row is serialised by reference, not cloned.
+    pub fn new_with_static_view(
+        token: i64,
+        key_bytes: &[u8],
+        deletion: ferrosa_sstable::types::DeletionTime,
+        static_row: Option<&ferrosa_storage::compaction::purge::PurgedRow<'_>>,
+    ) -> Result<Self, bincode::Error> {
+        let mut hasher = crc32fast::Hasher::new();
+        {
+            let mut writer = CrcHashWriter {
+                hasher: &mut hasher,
+            };
+            bincode::serialize_into(&mut writer, &token)?;
+            bincode::serialize_into(&mut writer, key_bytes)?;
+            serialize_deletion_time(
+                &mut writer,
+                deletion.marked_for_delete_at,
+                deletion.local_deletion_time,
+            )?;
+            // bincode encodes `Option<T>` as a one-byte tag, then `T` when Some.
+            match static_row {
+                None => bincode::serialize_into(&mut writer, &0u8)?,
+                Some(view) => {
+                    bincode::serialize_into(&mut writer, &1u8)?;
+                    serialize_purged_row(&mut writer, view)?;
+                }
+            }
+        }
+        Ok(Self {
+            hasher,
+            rows_so_far: 0,
+        })
+    }
+
+    /// [`Self::update_row`] over a purged view of the row.
+    pub fn update_purged_row(
+        &mut self,
+        row: &ferrosa_storage::compaction::purge::PurgedRow<'_>,
+    ) -> Result<(), bincode::Error> {
+        let mut writer = CrcHashWriter {
+            hasher: &mut self.hasher,
+        };
+        serialize_purged_row(&mut writer, row)?;
+        self.rows_so_far += 1;
+        Ok(())
     }
 
     /// Fold a single clustered row into the running digest. Cells
@@ -1149,6 +1304,83 @@ impl ReadRequestHandler {
     pub fn new(storage: Arc<StorageEngine>) -> Self {
         Self { storage }
     }
+
+    /// Serve a [`PurgedReadRequestPayload`]: read the whole partition, take
+    /// the digest a digest-only read would report, then leave out what this
+    /// replica's own compaction would drop and report the newest timestamp left
+    /// out. Whether the coordinator may merge the stripped answer depends on
+    /// the other replicas, so that decision is the coordinator's (Lean:
+    /// `Tombstone.a_stripped_version_below_every_other_guard_leaves_the_read_unchanged`).
+    fn purged_full_read(&self, purged: PurgedReadRequestPayload) -> HandlerOutcome {
+        const HANDLER: &str = "ReadRequestHandler";
+        let req = purged.request;
+        if purged.version != 1
+            || req.digest_only
+            || req.page_size != 0
+            || !req.page_state.is_empty()
+            || !req.clustering.is_empty()
+        {
+            return HandlerOutcome::fail(
+                RemoteFailureKind::RequestDecodeFailed,
+                format!(
+                    "{HANDLER}: a purged read must be a whole-partition full read (version {})",
+                    purged.version
+                ),
+            );
+        }
+        let table_id = TableId::new(&req.keyspace, &req.table);
+        let key = DecoratedKey::new(PartitionKey::new(req.key));
+        let payload = match self.storage.read(&table_id, &key) {
+            Ok(Some(mut partition)) => {
+                let timestamp = newest_timestamp(&partition);
+                let digest = match read_digest(&self.storage, &table_id, &partition) {
+                    Ok(d) => Some(d),
+                    Err(e) => {
+                        tracing::warn!("{HANDLER}: digest computation failed: {e}");
+                        None
+                    }
+                };
+                let newest_left_out = match self.storage.read_purge_horizon(&table_id) {
+                    Some(gc_before) => {
+                        use ferrosa_storage::compaction::purge::{
+                            purge_partition, repair_guard, PurgePolicy,
+                        };
+                        let policy = PurgePolicy {
+                            gc_before,
+                            max_purgeable_timestamp: repair_guard(&partition, gc_before),
+                            table_delete: ferrosa_sstable::types::DeletionTime::LIVE,
+                        };
+                        purge_partition(&mut partition, &policy).newest_dropped
+                    }
+                    None => None,
+                };
+                PurgedReadResponsePayload {
+                    response: ReadResponsePayload {
+                        found: true,
+                        partition: Some(partition_to_wire(partition)),
+                        timestamp,
+                        digest,
+                        has_more: false,
+                        next_page_state: vec![],
+                    },
+                    newest_left_out,
+                }
+            }
+            Ok(None) => PurgedReadResponsePayload {
+                response: ReadResponsePayload {
+                    found: false,
+                    partition: None,
+                    timestamp: i64::MIN,
+                    digest: None,
+                    has_more: false,
+                    next_page_state: vec![],
+                },
+                newest_left_out: None,
+            },
+            Err(e) => return storage_failure(HANDLER, "storage read", e),
+        };
+        reply_outcome(HANDLER, &payload, Message::ReadResponse)
+    }
 }
 
 #[async_trait]
@@ -1160,6 +1392,12 @@ impl RpcHandler for ReadRequestHandler {
     async fn handle_outcome(&self, _from: PeerId, msg: Message) -> HandlerOutcome {
         const HANDLER: &str = "ReadRequestHandler";
         let (req, start_clustering) = match msg {
+            Message::PurgedReadRequest(bytes) => {
+                return match decode_request::<PurgedReadRequestPayload>(HANDLER, &bytes) {
+                    Ok(purged) => self.purged_full_read(purged),
+                    Err(failed) => *failed,
+                };
+            }
             Message::ReadRequest(bytes) => {
                 match decode_request::<ReadRequestPayload>(HANDLER, &bytes) {
                     Ok(req) => (req, None),
@@ -1249,7 +1487,7 @@ impl RpcHandler for ReadRequestHandler {
                 };
 
                 let ts = newest_timestamp(&partition);
-                let digest = match compute_partition_digest(&partition) {
+                let digest = match read_digest(&self.storage, &table_id, &partition) {
                     Ok(d) => Some(d),
                     Err(e) => {
                         tracing::warn!("ReadRequestHandler: digest computation failed: {e}");
@@ -2388,6 +2626,85 @@ mod tests {
         );
     }
 
+    /// A partition holding expired TTL rows, a dead static cell and an old
+    /// partition deletion, all past `gc_before`, beside live rows.
+    fn partition_with_purgeable_data(gc_before: i64) -> Partition {
+        let old_ldt = (gc_before - 100) as i32;
+        let mut p = make_partition(b"purge-view", 5_000);
+        p.deletion = DeletionTime {
+            marked_for_delete_at: 10,
+            local_deletion_time: old_ldt as u32,
+        };
+        p.static_row = Some(Row {
+            clustering: Vec::new(),
+            cells: vec![(1, CellValue::tombstone(20, old_ldt))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::NONE,
+        });
+        for i in 1..4u8 {
+            p.rows.push(Row {
+                clustering: vec![i],
+                cells: vec![(
+                    0,
+                    CellValue::expiring(b"offer".to_vec(), 4_000, 60, old_ldt),
+                )],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_ttl(4_000, 60, old_ldt),
+            });
+        }
+        p.rows.push(Row {
+            clustering: vec![9],
+            cells: vec![
+                (0, CellValue::live(b"keep".to_vec(), 5_000)),
+                (1, CellValue::tombstone(30, old_ldt)),
+            ],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(5_000),
+        });
+        p
+    }
+
+    #[test]
+    fn purged_digest_equals_the_raw_digest_when_nothing_is_purgeable() {
+        let mut p = make_partition(b"nothing-purgeable", 12_345);
+        p.static_row = Some(Row {
+            clustering: Vec::new(),
+            cells: vec![(1, CellValue::live(b"s".to_vec(), 12_000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::NONE,
+        });
+        assert_eq!(
+            super::purged_partition_digest(&p, 1_000).unwrap(),
+            compute_partition_digest(&p).unwrap(),
+            "a node on this build must agree with an older node on unpurgeable partitions"
+        );
+    }
+
+    #[test]
+    fn purged_digest_equals_the_digest_of_the_purged_partition() {
+        let gc_before = 1_000_000;
+        let p = partition_with_purgeable_data(gc_before);
+        let mut purged = p.clone();
+        ferrosa_storage::compaction::purge::purge_partition(
+            &mut purged,
+            &ferrosa_storage::compaction::purge::read_view_policy(gc_before),
+        );
+        assert_eq!(purged.rows.len(), 2, "fixture: three expired rows go");
+        assert!(
+            purged.static_row.is_none(),
+            "fixture: the static tombstone goes"
+        );
+        assert_eq!(
+            super::purged_partition_digest(&p, gc_before).unwrap(),
+            compute_partition_digest(&purged).unwrap(),
+        );
+        assert_ne!(
+            super::purged_partition_digest(&p, gc_before).unwrap(),
+            compute_partition_digest(&p).unwrap(),
+            "fixture must hold purgeable data"
+        );
+    }
+
     #[test]
     fn partition_digest_detects_value_difference() {
         let p1 = make_partition(b"abc", 999);
@@ -2775,6 +3092,43 @@ mod tests {
                  not silence or an empty answer; got {other:?}"
             ),
         }
+    }
+
+    /// A purged read drops whole rows, which would move a paged caller's resume
+    /// point and its end-of-partition test, so the handler serves only a
+    /// whole-partition read and refuses a page by name.
+    #[tokio::test]
+    async fn a_purged_read_of_a_page_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = ReadRequestHandler::new(test_storage(dir.path()));
+        let req = PurgedReadRequestPayload {
+            version: 1,
+            request: ReadRequestPayload {
+                keyspace: "test_ks".to_string(),
+                table: "test_tbl".to_string(),
+                key: b"k".to_vec(),
+                digest_only: false,
+                page_size: 5,
+                page_state: vec![],
+                clustering: vec![],
+            },
+        };
+        let outcome = handler
+            .handle_outcome(
+                make_peer_id(),
+                Message::PurgedReadRequest(Bytes::from(bincode::serialize(&req).unwrap())),
+            )
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                HandlerOutcome::Fail {
+                    kind: RemoteFailureKind::RequestDecodeFailed,
+                    ..
+                }
+            ),
+            "a paged purged read must be refused; got {outcome:?}"
+        );
     }
 
     #[tokio::test]

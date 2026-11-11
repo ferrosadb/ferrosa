@@ -27,4 +27,6 @@ pub mod task_pool;
 pub mod tls;
 
 #[cfg(test)]
+mod mem_net;
+#[cfg(test)]
 mod slow_retry_tests;

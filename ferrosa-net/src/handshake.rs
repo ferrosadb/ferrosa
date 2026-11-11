@@ -72,9 +72,19 @@ pub const CAP_RAFT_SCHEMA_CAPNP: u32 = 1 << 7;
 /// Versioned, peer-bound pair ownership transfer with receiver challenges.
 pub const CAP_PAIR_AUTHORITY: u32 = 1 << 8;
 
+/// The node serves `MsgType::PurgedReadRequest`: a whole-partition full read
+/// whose answer leaves out what the replica's own compaction would drop, and
+/// reports the newest timestamp it left out (CL-82). A coordinator sends it
+/// ONLY to a peer that advertised this bit; a peer without it is sent the
+/// plain `ReadRequest` and answers with everything it holds, which is always
+/// correct, only larger. An unknown type byte would otherwise drop the whole
+/// connection.
+pub const CAP_PURGED_READ: u32 = 1 << 9;
+
 /// Every capability this build understands, advertised in its Handshake and
 /// HandshakeAck.
 pub const LOCAL_CAPABILITIES: u32 = CAP_PAIR_AUTHORITY
+    | CAP_PURGED_READ
     | CAP_RPC_ERROR_REPLY
     | CAP_RESULT_CURSOR_PAGE
     | CAP_PAIR_DISSOLVE

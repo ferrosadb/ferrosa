@@ -2,9 +2,12 @@
 //! Correctness: Correct when replica selection satisfies the requested CL,
 //!   latency-sensitive reads and writes retain Data-lane capacity, and
 //!   unbounded scan traffic is isolated on the Bulk lane.
-//! Last revised: 2026-10-29
-//! Last changed: Enforce configured origin/DC quorum obligations on point and
-//!   keyed index responses, preserving digest reconciliation and pinned routing.
+//! Last revised: 2026-11-11
+//! Last changed: Read digests hash the purged view (CL-80); each read repair
+//!   target is sent only what it cannot drop itself, judged by its own
+//!   response's guard (CL-81); a remote whole-partition full read is answered
+//!   without what the replica would compact away, and re-read in full when that
+//!   could resurrect another replica's data (CL-82).
 //!
 //! # Two-Phase Digest Read Protocol
 //!
@@ -52,8 +55,8 @@ use crate::error::ClusterError;
 use crate::raft::handlers::{
     partition_from_wire, FulltextSearchRequestPayload, FulltextSearchResponsePayload,
     IndexReadInPartitionRequestPayload, IndexReadResponsePayload,
-    PartitionSuffixReadRequestPayload, RangeReadRequestPayload, RangeReadResponsePayload,
-    ReadRequestPayload, ReadResponsePayload,
+    PartitionSuffixReadRequestPayload, PurgedReadRequestPayload, PurgedReadResponsePayload,
+    RangeReadRequestPayload, RangeReadResponsePayload, ReadRequestPayload, ReadResponsePayload,
 };
 use crate::raft::IndexNodeStatus;
 
@@ -271,6 +274,9 @@ enum ReplicaRead {
         /// Host ID of the replica that served it (the local node's own host
         /// ID when the full read was local).
         host_id: Option<uuid::Uuid>,
+        /// Set when the replica answered without what its own compaction would
+        /// drop (CL-82); `None` for a read that carries everything it holds.
+        stripped: Option<StrippedRead>,
     },
     /// Digest + timestamp only (from digest-only replicas).
     Digest {
@@ -282,6 +288,17 @@ enum ReplicaRead {
     /// The replica did not respond or returned an error. Kept with its reason
     /// so a read that fails names every replica that failed it and why.
     Failed(ReplicaFailure),
+}
+
+/// What a replica reports with a full read it answered without what its own
+/// compaction would drop (CL-82).
+#[derive(Clone, Copy, Debug)]
+struct StrippedRead {
+    /// The replica's digest of its read BEFORE it left anything out: the digest
+    /// a digest-only read from it returns, compared against the others as is.
+    digest: Option<u32>,
+    /// The newest timestamp it left out, `None` when it left nothing out.
+    newest_left_out: Option<i64>,
 }
 
 /// One replica's failed read, as reported when the read cannot meet its CL.
@@ -429,7 +446,7 @@ async fn digest_read_attempt(
     {
         match read_local_partition(
             &storage,
-            table_id,
+            table_id.clone(),
             key,
             row_limit,
             clustering,
@@ -438,14 +455,13 @@ async fn digest_read_attempt(
         .await
         {
             Ok(Some(p)) => {
-                use crate::raft::handlers::compute_partition_digest;
                 let ts = p
                     .rows
                     .iter()
                     .flat_map(|r| r.cells.iter().map(|(_, c)| c.timestamp))
                     .max()
                     .unwrap_or(i64::MIN);
-                let digest = compute_partition_digest(&p).ok();
+                let digest = crate::raft::handlers::read_digest(&storage, &table_id, &p).ok();
                 ReplicaRead::Digest {
                     digest,
                     timestamp: ts,
@@ -512,19 +528,27 @@ async fn full_read_attempt(
         )
         .await
         {
-            Ok(partition) => ReplicaRead::Full { partition, host_id },
+            Ok(partition) => ReplicaRead::Full {
+                partition,
+                host_id,
+                stripped: None,
+            },
             Err(e) => ReplicaRead::failed(replica_id, true, format!("local storage read: {e}")),
         };
     }
+    let whole_partition = row_limit == 0 && clustering.is_none() && start_clustering.is_none();
     let payload = ReadRequestPayload {
-        keyspace: table_id.keyspace,
-        table: table_id.table,
+        keyspace: table_id.keyspace.clone(),
+        table: table_id.table.clone(),
         key: key.key.as_bytes().to_vec(),
         digest_only: false,
         page_size: row_limit.min(u32::MAX as usize) as u32,
         page_state: vec![],
         clustering: clustering.unwrap_or_default(),
     };
+    if whole_partition && purged_read_serves(coordinator, &table_id, host_id).await {
+        return purged_full_read(coordinator, replica_id, remote, payload).await;
+    }
     let message = encode_partition_read_request(payload, start_clustering);
     match remote_partition_read(coordinator, replica_id, remote, message).await {
         Ok((resp, hid)) => ReplicaRead::Full {
@@ -534,6 +558,65 @@ async fn full_read_attempt(
                 None
             },
             host_id: Some(hid),
+            stripped: None,
+        },
+        Err(reason) => ReplicaRead::failed(replica_id, true, reason),
+    }
+}
+
+/// Whether a whole-partition full read of `table_id` from `host_id` may ask
+/// the replica to leave out what its own compaction would drop: the table has
+/// a purge horizon and the peer advertised `CAP_PURGED_READ`. A peer whose
+/// capabilities are unknown is sent the plain read, which is always correct.
+async fn purged_read_serves(
+    coordinator: &ClusterCoordinator,
+    table_id: &TableId,
+    host_id: Option<uuid::Uuid>,
+) -> bool {
+    let Some(host_id) = host_id else {
+        return false;
+    };
+    if coordinator.storage.read_purge_horizon(table_id).is_none() {
+        return false;
+    }
+    coordinator
+        .peer_manager
+        .peer_capabilities(host_id)
+        .await
+        .is_some_and(|caps| caps & ferrosa_net::handshake::CAP_PURGED_READ != 0)
+}
+
+/// Send a whole-partition full read as a `PurgedReadRequest` (CL-82).
+async fn purged_full_read(
+    coordinator: &ClusterCoordinator,
+    replica_id: u64,
+    remote: Option<(uuid::Uuid, String)>,
+    request: ReadRequestPayload,
+) -> ReplicaRead {
+    let body = match bincode::serialize(&PurgedReadRequestPayload {
+        version: 1,
+        request,
+    }) {
+        Ok(body) => body,
+        Err(e) => {
+            return ReplicaRead::failed(replica_id, true, format!("encode purged read: {e}"));
+        }
+    };
+    let message = Message::PurgedReadRequest(Bytes::from(body));
+    match remote_read_reply::<PurgedReadResponsePayload>(coordinator, replica_id, remote, message)
+        .await
+    {
+        Ok((reply, hid)) => ReplicaRead::Full {
+            partition: if reply.response.found {
+                reply.response.partition.map(partition_from_wire)
+            } else {
+                None
+            },
+            host_id: Some(hid),
+            stripped: Some(StrippedRead {
+                digest: reply.response.digest,
+                newest_left_out: reply.newest_left_out,
+            }),
         },
         Err(reason) => ReplicaRead::failed(replica_id, true, reason),
     }
@@ -547,6 +630,17 @@ async fn remote_partition_read(
     remote: Option<(uuid::Uuid, String)>,
     message: Message,
 ) -> Result<(ReadResponsePayload, uuid::Uuid), String> {
+    remote_read_reply::<ReadResponsePayload>(coordinator, replica_id, remote, message).await
+}
+
+/// Send one read to a remote replica and decode its `ReadResponse` frame as
+/// `T`. Every way it can fail comes back as a reason string.
+async fn remote_read_reply<T: serde::de::DeserializeOwned>(
+    coordinator: &ClusterCoordinator,
+    replica_id: u64,
+    remote: Option<(uuid::Uuid, String)>,
+    message: Message,
+) -> Result<(T, uuid::Uuid), String> {
     let Some((hid, addr)) = remote else {
         return Err(format!("node {replica_id} is not in the ring"));
     };
@@ -554,9 +648,9 @@ async fn remote_partition_read(
         .send_remote_with_reconnect(hid, &addr, message, Lane::Data)
         .await
     {
-        Ok(Message::ReadResponse(b)) => decode_read_response(&b)
+        Ok(Message::ReadResponse(b)) => bincode::deserialize::<T>(&b)
             .map(|resp| (resp, hid))
-            .ok_or_else(|| format!("ReadResponse ({} bytes) does not decode", b.len())),
+            .map_err(|e| format!("ReadResponse ({} bytes) does not decode: {e}", b.len())),
         Ok(other) => Err(format!("expected ReadResponse, got {:?}", other.msg_type())),
         Err(e) => Err(format!("send to {addr}: {e}")),
     }
@@ -781,6 +875,9 @@ struct QuorumReads {
     full_partition: Option<Partition>,
     full_digest: Option<u32>,
     full_host_id: Option<uuid::Uuid>,
+    /// The newest timestamp the full-read replica left out of its answer
+    /// (CL-82), `None` when it left nothing out.
+    full_left_out: Option<i64>,
     digest_responses: Vec<(Option<u32>, i64, Option<uuid::Uuid>)>,
     received: usize,
 }
@@ -873,7 +970,13 @@ impl ClusterCoordinator {
             fan_out.push(self.launch_replica_read(false, candidate, table_id, key, &slice));
         }
 
-        let mut full: Option<(Option<Partition>, Option<u32>, Option<uuid::Uuid>)> = None;
+        type FullRead = (
+            Option<Partition>,
+            Option<u32>,
+            Option<uuid::Uuid>,
+            Option<i64>,
+        );
+        let mut full: Option<FullRead> = None;
         let mut digest_responses = Vec::new();
         let mut received = 0usize;
         let mut responders = std::collections::HashSet::new();
@@ -890,11 +993,22 @@ impl ClusterCoordinator {
         while let Some((replica_id, result)) = fan_out.next().await {
             let failed = matches!(&result, ReplicaRead::Failed(_));
             match result {
-                ReplicaRead::Full { partition, host_id } => {
-                    let digest = partition
-                        .as_ref()
-                        .and_then(|p| crate::raft::handlers::compute_partition_digest(p).ok());
-                    full = Some((partition, digest, host_id));
+                ReplicaRead::Full {
+                    partition,
+                    host_id,
+                    stripped,
+                } => {
+                    // A stripped answer is compared by the digest the replica
+                    // took before stripping, the digest every other replica
+                    // reports for the same data.
+                    let digest = match stripped {
+                        Some(stripped) => stripped.digest,
+                        None => partition.as_ref().and_then(|p| {
+                            crate::raft::handlers::read_digest(&self.storage, table_id, p).ok()
+                        }),
+                    };
+                    let left_out = stripped.and_then(|s| s.newest_left_out);
+                    full = Some((partition, digest, host_id, left_out));
                     full_in_flight = false;
                     responders.insert(replica_id);
                     received = responders.len();
@@ -931,11 +1045,14 @@ impl ClusterCoordinator {
 
         let certificate = progress(&responders);
         match full {
-            Some((full_partition, full_digest, full_host_id)) if certificate.satisfied() => {
+            Some((full_partition, full_digest, full_host_id, full_left_out))
+                if certificate.satisfied() =>
+            {
                 Ok(QuorumReads {
                     full_partition,
                     full_digest,
                     full_host_id,
+                    full_left_out,
                     digest_responses,
                     received,
                 })
@@ -1342,6 +1459,7 @@ impl ClusterCoordinator {
             full_partition,
             full_digest: full_d,
             full_host_id,
+            full_left_out,
             digest_responses,
             received,
         } = self
@@ -1371,14 +1489,31 @@ impl ClusterCoordinator {
         // Fetch every differing quorum response and merge with storage's exact
         // per-cell/deletion rules. Matching digests retain the fast path above.
         tracing::warn!(table = %table_id, "read repair needed: digest mismatch among replicas");
+        // Each target's repair guard comes from its OWN response, taken before
+        // the merge consumes it. A replica whose digest matched the full read
+        // agrees with it on everything not past grace, so it shares the full
+        // read's guard (Lean: `Tombstone.replicas_with_equal_digests_share_the_guard`).
+        // A replica that answered with nothing holds nothing to shadow.
+        let gc_before = self.storage.read_purge_horizon(table_id);
+        let guard_of = |partition: Option<&Partition>| match (gc_before, partition) {
+            (None, _) => i64::MIN,
+            (Some(_), None) => i64::MAX,
+            (Some(gc_before), Some(p)) => {
+                ferrosa_storage::compaction::purge::repair_guard(p, gc_before)
+            }
+        };
+        let full_guard = guard_of(full_partition.as_ref());
         let mut partitions: Vec<Partition> = full_partition.into_iter().collect();
-        let mut stale_host_ids: Vec<uuid::Uuid> = digest_responses
+        let mut targets: Vec<RepairTarget> = digest_responses
             .iter()
+            .filter(|(digest, _, _)| *digest == full_d)
             .filter_map(|(_, _, host)| *host)
+            .chain(full_host_id)
+            .map(|host_id| RepairTarget {
+                host_id,
+                guard: full_guard,
+            })
             .collect();
-        if let Some(host) = full_host_id {
-            stale_host_ids.push(host);
-        }
         for &(digest, timestamp, host) in &digest_responses {
             if digest == full_d {
                 continue;
@@ -1397,8 +1532,17 @@ impl ClusterCoordinator {
                 )
                 .await
             {
-                Ok(Some(partition)) => partitions.push(partition),
-                Ok(None) if timestamp == i64::MIN => {}
+                Ok(Some(partition)) => {
+                    targets.push(RepairTarget {
+                        host_id: host,
+                        guard: guard_of(Some(&partition)),
+                    });
+                    partitions.push(partition);
+                }
+                Ok(None) if timestamp == i64::MIN => targets.push(RepairTarget {
+                    host_id: host,
+                    guard: guard_of(None),
+                }),
                 Err(RefetchError::Malformed(reason)) => return Err(ClusterError::Internal(reason)),
                 Err(RefetchError::Unreachable(error)) => {
                     tracing::warn!(%host, %error, "cannot reconcile differing quorum response");
@@ -1419,6 +1563,61 @@ impl ClusterCoordinator {
                 }
             }
         }
+        // The full-read replica may have left out data past grace that a
+        // refetched replica's older live data sits under. Merging without it
+        // would bring that data back, so keep the stripped answer only when
+        // everything left out is below every refetched replica's guard, and
+        // otherwise read the replica again in full (Lean:
+        // `Tombstone.a_stripped_version_below_every_other_guard_leaves_the_read_unchanged`,
+        // `Tombstone.keeping_a_stripped_response_over_older_live_data_resurrects`).
+        // `newest_left_out` is only ever set by a replica that found the
+        // partition, so `partitions[0]` is that replica's answer.
+        if let Some(newest_left_out) = full_left_out {
+            let others_guard = partitions
+                .iter()
+                .skip(1)
+                .map(|p| guard_of(Some(p)))
+                .min()
+                .unwrap_or(i64::MAX);
+            if gc_before.is_none() || newest_left_out >= others_guard {
+                let host = full_host_id.ok_or_else(|| {
+                    ClusterError::Internal("stripped full read has no replica identity".into())
+                })?;
+                tracing::debug!(
+                    table = %table_id,
+                    %host,
+                    newest_left_out,
+                    others_guard,
+                    "read repair: the full read left out data another replica's older live \
+                     data sits under; reading it again in full"
+                );
+                match self
+                    .full_refetch_limited_rows(table_id, key, host, 0, None, None)
+                    .await
+                {
+                    Ok(partition) => {
+                        if !partitions.is_empty() {
+                            partitions.remove(0);
+                        }
+                        if let Some(partition) = partition {
+                            partitions.insert(0, partition);
+                        }
+                    }
+                    Err(RefetchError::Malformed(reason)) => {
+                        return Err(ClusterError::Internal(reason))
+                    }
+                    Err(RefetchError::Unreachable(error)) => {
+                        tracing::warn!(%host, %error, "cannot re-read the stripped full read");
+                        return Err(ClusterError::ReadTimeout {
+                            consistency: cl.to_string(),
+                            received,
+                            required,
+                            data_present: !partitions.is_empty(),
+                        });
+                    }
+                }
+            }
+        }
         let mut result_partition = if partitions.is_empty() {
             None
         } else {
@@ -1429,23 +1628,39 @@ impl ClusterCoordinator {
                 partition.rows.truncate(row_limit);
             }
         }
-        stale_host_ids.sort_unstable();
-        stale_host_ids.dedup();
+        // One target per replica; a replica listed twice keeps the lower guard,
+        // which can only send more.
+        targets.sort_unstable_by_key(|t| (t.host_id, t.guard));
+        targets.dedup_by_key(|t| t.host_id);
+        // A sliced read saw only part of each replica, but a partition deletion
+        // shadows the whole partition, rows outside the slice included. Capping
+        // every guard at its timestamp keeps it in the write.
+        let sliced = row_limit > 0 || clustering.is_some() || start_clustering.is_some();
+        if let Some(partition) = result_partition.as_ref() {
+            if sliced && !partition.deletion.is_live() {
+                for target in &mut targets {
+                    target.guard = target.guard.min(partition.deletion.marked_for_delete_at);
+                }
+            }
+        }
 
         // Send repair writes to stale replicas. Awaited inline so that
         // the repair completes before the coordinator returns. This prevents
         // a race where a subsequent read through a different replica sees
         // stale data because the repair hasn't landed yet.
-        if !stale_host_ids.is_empty() {
+        if !targets.is_empty() {
             if let Some(ref partition) = result_partition {
                 send_repair_writes(
                     &self.peer_manager,
                     self.storage.as_ref(),
                     &self.repair_metrics,
                     self.local_host_id(),
-                    table_id,
-                    partition,
-                    &stale_host_ids,
+                    &RepairSource {
+                        table_id,
+                        partition,
+                        gc_before,
+                    },
+                    &targets,
                 )
                 .await;
             }
@@ -1465,14 +1680,24 @@ impl ClusterCoordinator {
         partition: &Partition,
         stale_host_ids: &[uuid::Uuid],
     ) {
+        let targets: Vec<RepairTarget> = stale_host_ids
+            .iter()
+            .map(|&host_id| RepairTarget {
+                host_id,
+                guard: i64::MIN,
+            })
+            .collect();
         send_repair_writes(
             &self.peer_manager,
             self.storage.as_ref(),
             &self.repair_metrics,
             self.local_host_id(),
-            table_id,
-            partition,
-            stale_host_ids,
+            &RepairSource {
+                table_id,
+                partition,
+                gc_before: None,
+            },
+            &targets,
         )
         .await;
     }
@@ -2676,39 +2901,128 @@ pub(crate) fn read_repair_body(
     Ok(Bytes::from(body))
 }
 
+/// The `RepairWrite` body for one target: [`read_repair_body`] without the
+/// merged data that target could drop on its own, `None` when nothing is left.
+///
+/// `policy` is the target's guard ([`ferrosa_storage::compaction::purge::repair_guard`]):
+/// an element past grace and older than everything live the target holds
+/// shadows nothing there, so the target reads the merged answer without it and
+/// its own compaction would drop it anyway. An element that shadows a live,
+/// older value on the target is at or above the guard and is sent. Lean:
+/// `Tombstone.repair_converges_every_replica_to_the_merged_answer`,
+/// `Tombstone.skipping_a_repair_over_older_live_data_resurrects`. No row is
+/// copied: the rows are serialised through borrowed purged views.
+pub(crate) fn read_repair_body_for_target(
+    table_id: &TableId,
+    partition: &Partition,
+    policy: &ferrosa_storage::compaction::purge::PurgePolicy,
+) -> ferrosa_common::Result<Option<Bytes>> {
+    use ferrosa_storage::partition_apply::{
+        deletion_marker, partition_write_timestamp, static_row_marker,
+    };
+    let deletion = deletion_marker(partition.deletion);
+    let static_marker = static_row_marker(&partition.key, partition.static_row.as_ref())?;
+    let rows: Vec<&ferrosa_sstable::types::Row> = deletion
+        .iter()
+        .chain(static_marker)
+        .chain(partition.rows.iter())
+        .collect();
+    let newest = partition_write_timestamp(partition);
+    let body = Mutation::serialize_purged_rows(
+        uuid::Uuid::new_v4().into_bytes(),
+        &table_id.keyspace,
+        &table_id.table,
+        &partition.key,
+        if newest == i64::MIN { 0 } else { newest },
+        &rows,
+        policy,
+    )
+    .map_err(|e| ferrosa_common::Error::InvalidData(format!("read repair mutation: {e}")))?;
+    Ok(body.map(Bytes::from))
+}
+
+/// One replica a read repair writes to, with the guard its own response
+/// imposes ([`ferrosa_storage::compaction::purge::repair_guard`]). `i64::MIN`
+/// sends the whole merged partition.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RepairTarget {
+    pub(crate) host_id: uuid::Uuid,
+    pub(crate) guard: i64,
+}
+
+/// What a read repair writes from: the merged partition and the purge horizon
+/// of its table (`None` when the table has none, which sends it whole).
+pub(crate) struct RepairSource<'a> {
+    pub(crate) table_id: &'a TableId,
+    pub(crate) partition: &'a Partition,
+    pub(crate) gc_before: Option<i64>,
+}
+
+/// The repair body for one target: the whole merged partition when the table
+/// has no purge horizon, otherwise only what the target cannot drop itself.
+fn repair_body_for(source: &RepairSource<'_>, guard: i64) -> ferrosa_common::Result<Option<Bytes>> {
+    let RepairSource {
+        table_id,
+        partition,
+        gc_before,
+    } = *source;
+    match gc_before {
+        None => read_repair_body(table_id, partition).map(Some),
+        Some(gc_before) => read_repair_body_for_target(
+            table_id,
+            partition,
+            &ferrosa_storage::compaction::purge::PurgePolicy {
+                gc_before,
+                max_purgeable_timestamp: guard,
+                table_delete: ferrosa_sstable::types::DeletionTime::LIVE,
+            },
+        ),
+    }
+}
+
 /// Send repair writes to stale replicas.
 ///
-/// Builds a [`Mutation`] from the newest partition data and sends a
-/// `RepairWrite` message to each stale replica. Errors are logged
-/// and counted but do not fail the read.
+/// Builds a [`Mutation`] per target from the newest partition data, without
+/// what that target could drop on its own ([`read_repair_body_for_target`]),
+/// and sends it as a `RepairWrite`. A target left with nothing to write is
+/// skipped and logged at debug. Errors are logged and counted but do not fail
+/// the read.
 async fn send_repair_writes(
     peer_manager: &PeerManager,
     storage: &ferrosa_storage::engine::StorageEngine,
     metrics: &ReadRepairMetrics,
     local_host_id: Option<uuid::Uuid>,
-    table_id: &TableId,
-    partition: &Partition,
-    stale_host_ids: &[uuid::Uuid],
+    source: &RepairSource<'_>,
+    targets: &[RepairTarget],
 ) {
-    let body = match read_repair_body(table_id, partition) {
-        Ok(body) => body,
-        Err(e) => {
-            tracing::error!(
-                table = %table_id,
-                %e,
-                stale_replicas = stale_host_ids.len(),
-                "read repair: newest partition cannot be expressed as a mutation; \
-                 stale replicas NOT repaired"
-            );
-            for _ in stale_host_ids {
+    let table_id = source.table_id;
+    for target in targets {
+        let host_id = target.host_id;
+        let body = match repair_body_for(source, target.guard) {
+            Ok(Some(body)) => body,
+            Ok(None) => {
+                tracing::debug!(
+                    %host_id,
+                    table = %table_id,
+                    guard = target.guard,
+                    "read repair: nothing to write, the replica can drop every differing \
+                     element itself"
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::error!(
+                    %host_id,
+                    table = %table_id,
+                    %e,
+                    "read repair: newest partition cannot be expressed as a mutation; \
+                     replica NOT repaired"
+                );
                 metrics.inc_attempted();
                 metrics.inc_failed();
+                continue;
             }
-            return;
-        }
-    };
-
-    for &host_id in stale_host_ids {
+        };
         metrics.inc_attempted();
         if Some(host_id) == local_host_id {
             // Apply exactly what a remote replica applies: the decoded body.
@@ -4985,6 +5299,656 @@ mod tests {
         assert!(
             storage.read(&table_id, &key).unwrap().is_some(),
             "local repair should write directly to storage"
+        );
+    }
+
+    /// A clustered table with `gc_grace_seconds = 0`, so expired TTL data is
+    /// purgeable the moment it expires.
+    fn register_ttl_table(storage: &StorageEngine) -> TableId {
+        let mut schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "ttl_tbl".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "val".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        };
+        schema.extensions.insert(
+            ferrosa_common::schema::GC_GRACE_EXTENSION.to_string(),
+            "0".to_string(),
+        );
+        storage.register_table(schema).unwrap();
+        TableId::new("test_ks", "ttl_tbl")
+    }
+
+    fn clustered_row(ck: i32, value: &[u8], ts: i64) -> Row {
+        Row {
+            clustering: ck.to_be_bytes().to_vec(),
+            cells: vec![(0, CellValue::live(value.to_vec(), ts))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(ts),
+        }
+    }
+
+    /// A row written `USING TTL 60` in 2001: long expired, and with
+    /// `gc_grace_seconds = 0` long purgeable.
+    fn expired_ttl_row(ck: i32) -> Row {
+        let ldt = 1_000_000_060;
+        Row {
+            clustering: ck.to_be_bytes().to_vec(),
+            cells: vec![(0, CellValue::expiring(b"offered".to_vec(), 500, 60, ldt))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_ttl(500, 60, ldt),
+        }
+    }
+
+    /// Two replicas holding the same VISIBLE data, where only `local` also still
+    /// holds purgeable data (`local_extra`), as after one replica's compaction
+    /// purged it. Reads once at CL=ALL and returns (visible row count, read
+    /// repairs attempted).
+    async fn read_two_replicas(local_extra: Vec<Row>, remote_rows: Vec<Row>) -> (usize, i64) {
+        let local_rows = [clustered_row(1, b"kept", 2_000)]
+            .into_iter()
+            .chain(local_extra)
+            .collect();
+        let read = read_two_replicas_keeping_local(local_rows, remote_rows).await;
+        let visible = read
+            .rows
+            .iter()
+            .filter(|r| {
+                r.cells
+                    .iter()
+                    .any(|(_, c)| !c.is_expiring() && c.value.is_some())
+            })
+            .count();
+        let attempted = read
+            .coordinator
+            .repair_metrics
+            .read_repairs_attempted
+            .load(std::sync::atomic::Ordering::Relaxed);
+        (visible, attempted)
+    }
+
+    /// One CL=ALL read across a local replica and a real remote
+    /// `ReadRequestHandler`, keeping the coordinator so a test can read what the
+    /// inline repair wrote into the LOCAL replica's storage (remote repair writes
+    /// go to a no-op peer manager).
+    struct TwoReplicaRead {
+        rows: Vec<Row>,
+        coordinator: ClusterCoordinator,
+        table_id: TableId,
+        key: DecoratedKey,
+        _dirs: (tempfile::TempDir, tempfile::TempDir),
+    }
+
+    impl TwoReplicaRead {
+        /// The local replica's stored partition, unfiltered: what a later read
+        /// or compaction on that replica sees.
+        fn local_partition(&self) -> Partition {
+            self.coordinator
+                .storage
+                .read(&self.table_id, &self.key)
+                .unwrap()
+                .expect("the local replica holds the partition")
+        }
+    }
+
+    async fn read_two_replicas_keeping_local(
+        local_rows: Vec<Row>,
+        remote_rows: Vec<Row>,
+    ) -> TwoReplicaRead {
+        read_two_replicas_sliced(local_rows, remote_rows, DeletionTime::LIVE, 0).await
+    }
+
+    /// [`read_two_replicas_keeping_local`] where the remote also holds
+    /// `remote_deletion` as its partition deletion, read with `row_limit`
+    /// (0 = the whole partition).
+    async fn read_two_replicas_sliced(
+        local_rows: Vec<Row>,
+        remote_rows: Vec<Row>,
+        remote_deletion: DeletionTime,
+        row_limit: usize,
+    ) -> TwoReplicaRead {
+        let replicas = two_replicas(local_rows, remote_rows, remote_deletion).await;
+        let TwoReplicas {
+            coordinator,
+            table_id,
+            key,
+            _server,
+            _dirs,
+            ..
+        } = replicas;
+        let rows = if row_limit == 0 {
+            coordinator.coordinate_read(&table_id, &key).await
+        } else {
+            coordinator
+                .coordinate_read_with_limited_rows(
+                    &table_id,
+                    &key,
+                    ConsistencyLevel::All,
+                    2,
+                    row_limit,
+                )
+                .await
+        }
+        .unwrap()
+        .unwrap_or_default();
+        TwoReplicaRead {
+            rows,
+            coordinator,
+            table_id,
+            key,
+            _dirs,
+        }
+    }
+
+    /// A local replica and a real remote `ReadRequestHandler`, registered for
+    /// every read type production registers it for, behind a coordinator at
+    /// CL=ALL. Nothing has been read yet.
+    struct TwoReplicas {
+        coordinator: ClusterCoordinator,
+        table_id: TableId,
+        key: DecoratedKey,
+        remote_host_id: Uuid,
+        remote_addr: std::net::SocketAddr,
+        _server: Arc<RpcServer>,
+        _dirs: (tempfile::TempDir, tempfile::TempDir),
+    }
+
+    impl TwoReplicas {
+        /// The remote replica's (host ID, address), as the ring gives it.
+        fn remote(&self) -> Option<(Uuid, String)> {
+            Some((self.remote_host_id, self.remote_addr.to_string()))
+        }
+
+        /// Connect to the remote so its handshake capabilities are known, as
+        /// they are for every peer of a running cluster.
+        async fn connect_remote(&self) {
+            self.coordinator
+                .peer_manager
+                .ensure_peer(self.remote_host_id, &self.remote_addr.to_string())
+                .await
+                .unwrap();
+        }
+
+        /// One full read of the partition from the remote replica, through the
+        /// path a quorum read sends it on.
+        async fn full_read_from_remote(&self) -> Option<Partition> {
+            match full_read_attempt(
+                &self.coordinator,
+                self.table_id.clone(),
+                self.key.clone(),
+                2,
+                self.remote(),
+                0,
+                None,
+                None,
+            )
+            .await
+            {
+                ReplicaRead::Full { partition, .. } => partition,
+                ReplicaRead::Digest { .. } => panic!("a full read answered with a digest"),
+                ReplicaRead::Failed(failure) => panic!("the full read failed: {failure}"),
+            }
+        }
+    }
+
+    /// Register `handler` for every message type the production boot registers
+    /// the read handler for (`controller/cluster.rs`).
+    async fn start_read_server(
+        handler: Arc<dyn RpcHandler>,
+    ) -> (Arc<RpcServer>, std::net::SocketAddr, uuid::Uuid) {
+        start_read_server_advertising(handler, ferrosa_net::handshake::LOCAL_CAPABILITIES).await
+    }
+
+    /// [`start_read_server`] for a peer that advertises `capabilities`: a
+    /// lower value stands in for a peer on an older build.
+    async fn start_read_server_advertising(
+        handler: Arc<dyn RpcHandler>,
+        capabilities: u32,
+    ) -> (Arc<RpcServer>, std::net::SocketAddr, uuid::Uuid) {
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            advertised_capabilities: capabilities,
+            ..NetConfig::default()
+        };
+        let server_id = Uuid::new_v4();
+        let registry = Arc::new(HandlerRegistry::new());
+        registry.register(MsgType::ReadRequest, handler.clone());
+        registry.register(MsgType::PartitionSuffixReadRequest, handler.clone());
+        registry.register(MsgType::PurgedReadRequest, handler);
+        let server = Arc::new(RpcServer::new(config, server_id, registry));
+        let addr = server.start_and_get_addr().await.unwrap();
+        (server, addr, server_id)
+    }
+
+    async fn two_replicas(
+        local_rows: Vec<Row>,
+        remote_rows: Vec<Row>,
+        remote_deletion: DeletionTime,
+    ) -> TwoReplicas {
+        let local_dir = tempfile::tempdir().unwrap();
+        let local = test_storage(local_dir.path());
+        let table_id = register_ttl_table(&local);
+        let remote_dir = tempfile::tempdir().unwrap();
+        let remote = test_storage(remote_dir.path());
+        register_ttl_table(&remote);
+        // A real Murmur3 token: the remote handler re-derives it from the key
+        // bytes, so `test_key()`'s fixed token would make the remote miss.
+        let key = DecoratedKey::new(PartitionKey::new(b"server-device".to_vec()));
+        for row in local_rows {
+            local.write(&table_id, &key, row, 2_000).unwrap();
+        }
+        for row in remote_rows {
+            remote.write(&table_id, &key, row, 2_000).unwrap();
+        }
+        if let Some(marker) = ferrosa_storage::partition_apply::deletion_marker(remote_deletion) {
+            remote
+                .apply_partition_rows(&table_id, &key, vec![marker])
+                .unwrap();
+        }
+        let (server, addr, remote_host_id) = start_read_server(Arc::new(
+            crate::raft::handlers::ReadRequestHandler::new(remote),
+        ))
+        .await;
+
+        let mut local_info = make_node("127.0.0.1:7000");
+        local_info.host_id = Uuid::new_v4();
+        let mut remote_info = make_node(&addr.to_string());
+        remote_info.host_id = remote_host_id;
+        let mut ring = TokenRing::new();
+        ring.add_node(1u64, local_info);
+        ring.add_node(2u64, remote_info);
+        ring.assign_tokens(1u64, &[50]);
+        ring.assign_tokens(2u64, &[100]);
+        let coordinator = make_coordinator(
+            ring,
+            noop_peer_manager(),
+            1u64,
+            local,
+            2,
+            ConsistencyLevel::All,
+        );
+        TwoReplicas {
+            coordinator,
+            table_id,
+            key,
+            remote_host_id,
+            remote_addr: addr,
+            _server: server,
+            _dirs: (local_dir, remote_dir),
+        }
+    }
+
+    /// A coordinator that is NOT a replica for the key, over two remote
+    /// replicas at RF=2, CL=ALL: `a` serves the full read (it owns the token),
+    /// `b` the digest. This is the topology where the full read crosses the
+    /// wire. `a` advertises `a_capabilities`.
+    struct ThreeNodes {
+        coordinator: ClusterCoordinator,
+        table_id: TableId,
+        key: DecoratedKey,
+        _servers: (Arc<RpcServer>, Arc<RpcServer>),
+        _dirs: (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir),
+    }
+
+    impl ThreeNodes {
+        /// Read the partition once and return each returned row's clustering
+        /// value and whether a reader sees it.
+        async fn read(&self) -> Vec<(i32, bool)> {
+            self.coordinator
+                .coordinate_read(&self.table_id, &self.key)
+                .await
+                .unwrap()
+                .unwrap_or_default()
+                .iter()
+                .map(|r| {
+                    (
+                        i32::from_be_bytes(r.clustering.as_slice().try_into().unwrap()),
+                        r.is_visible_at(i32::MAX - 1),
+                    )
+                })
+                .collect()
+        }
+    }
+
+    async fn remote_replica(
+        rows: Vec<Row>,
+        capabilities: u32,
+    ) -> (
+        Arc<RpcServer>,
+        std::net::SocketAddr,
+        Uuid,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        let table_id = register_ttl_table(&storage);
+        let key = DecoratedKey::new(PartitionKey::new(b"server-device".to_vec()));
+        for row in rows {
+            storage.write(&table_id, &key, row, 2_000).unwrap();
+        }
+        let (server, addr, host_id) = start_read_server_advertising(
+            Arc::new(crate::raft::handlers::ReadRequestHandler::new(storage)),
+            capabilities,
+        )
+        .await;
+        (server, addr, host_id, dir)
+    }
+
+    async fn three_nodes(a_rows: Vec<Row>, b_rows: Vec<Row>, a_capabilities: u32) -> ThreeNodes {
+        let local_dir = tempfile::tempdir().unwrap();
+        let local = test_storage(local_dir.path());
+        let table_id = register_ttl_table(&local);
+        let key = DecoratedKey::new(PartitionKey::new(b"server-device".to_vec()));
+        let (a_server, a_addr, a_host, a_dir) = remote_replica(a_rows, a_capabilities).await;
+        let (b_server, b_addr, b_host, b_dir) =
+            remote_replica(b_rows, ferrosa_net::handshake::LOCAL_CAPABILITIES).await;
+
+        // `a` owns the key's token and `b` follows it, so at RF=2 the replicas
+        // are a then b, and the coordinator (last on the ring) holds neither.
+        let token = key.token.0;
+        assert!(token < i64::MAX - 2, "the fixture key's token leaves room");
+        let mut local_info = make_node("127.0.0.1:7000");
+        local_info.host_id = Uuid::new_v4();
+        let mut a_info = make_node(&a_addr.to_string());
+        a_info.host_id = a_host;
+        let mut b_info = make_node(&b_addr.to_string());
+        b_info.host_id = b_host;
+        let mut ring = TokenRing::new();
+        ring.add_node(1u64, local_info);
+        ring.add_node(2u64, a_info);
+        ring.add_node(3u64, b_info);
+        ring.assign_tokens(2u64, &[token]);
+        ring.assign_tokens(3u64, &[token + 1]);
+        ring.assign_tokens(1u64, &[token + 2]);
+        let coordinator = make_coordinator(
+            ring,
+            noop_peer_manager(),
+            1u64,
+            local,
+            2,
+            ConsistencyLevel::All,
+        );
+        // A running cluster has met every peer; the coordinator then knows
+        // what `a` advertised.
+        coordinator
+            .peer_manager
+            .ensure_peer(a_host, &a_addr.to_string())
+            .await
+            .unwrap();
+        ThreeNodes {
+            coordinator,
+            table_id,
+            key,
+            _servers: (a_server, b_server),
+            _dirs: (local_dir, a_dir, b_dir),
+        }
+    }
+
+    /// The full-read replica holds an expired row 0 the other replica holds an
+    /// OLDER live value for, so the digests differ and the coordinator merges.
+    /// The stripped answer left row 0 out, and merging without it would bring
+    /// the older value back. The newest timestamp left out (500) is not below
+    /// the other replica's guard (400), so the coordinator reads the full-read
+    /// replica again in full, and row 0 stays deleted.
+    ///
+    /// A control: it passes before the fix (no answer was stripped), and it
+    /// fails with the re-read removed (row 0 comes back visible). Lean:
+    /// `Tombstone.keeping_a_stripped_response_over_older_live_data_resurrects`.
+    #[tokio::test]
+    async fn a_stripped_full_read_is_read_again_when_older_live_data_sits_under_it() {
+        let nodes = three_nodes(
+            vec![expired_ttl_row(0), clustered_row(1, b"kept", 2_000)],
+            vec![
+                clustered_row(0, b"older", 400),
+                clustered_row(1, b"kept", 2_000),
+            ],
+            ferrosa_net::handshake::LOCAL_CAPABILITIES,
+        )
+        .await;
+        let read = nodes.read().await;
+        assert_eq!(
+            read,
+            vec![(0, false), (1, true)],
+            "row 0's expired write must still shadow the older value"
+        );
+    }
+
+    /// The same shape where the other replica holds nothing older than what
+    /// was left out: it lacks row 3, so the digests differ, but its guard
+    /// (2000) is above the left-out row 0 (500). The coordinator merges the
+    /// stripped answer as it is, and the expired row never arrives.
+    /// Lean: `Tombstone.a_stripped_version_below_every_other_guard_leaves_the_read_unchanged`.
+    #[tokio::test]
+    async fn a_stripped_full_read_is_merged_as_is_when_nothing_older_sits_under_it() {
+        let nodes = three_nodes(
+            vec![
+                expired_ttl_row(0),
+                clustered_row(1, b"kept", 2_000),
+                clustered_row(3, b"only-a", 2_000),
+            ],
+            vec![clustered_row(1, b"kept", 2_000)],
+            ferrosa_net::handshake::LOCAL_CAPABILITIES,
+        )
+        .await;
+        assert_eq!(nodes.read().await, vec![(1, true), (3, true)]);
+    }
+
+    /// The replicas agree on everything not past grace, so the digests match
+    /// and the coordinator returns the full read unmerged: without the expired
+    /// row. Lean: `Tombstone.a_matching_digest_passes_the_stripped_response_check`.
+    #[tokio::test]
+    async fn a_matching_digest_returns_the_stripped_full_read() {
+        let nodes = three_nodes(
+            vec![
+                expired_ttl_row(0),
+                clustered_row(1, b"kept", 2_000),
+                clustered_row(3, b"both", 2_000),
+            ],
+            vec![
+                clustered_row(1, b"kept", 2_000),
+                clustered_row(3, b"both", 2_000),
+            ],
+            ferrosa_net::handshake::LOCAL_CAPABILITIES,
+        )
+        .await;
+        assert_eq!(nodes.read().await, vec![(1, true), (3, true)]);
+    }
+
+    /// A full-read replica on a build without `CAP_PURGED_READ` is sent the
+    /// plain read, never the message type it cannot decode, and answers with
+    /// everything it holds: the expired row arrives, invisible, and the read
+    /// is as correct as before.
+    #[tokio::test]
+    async fn a_replica_without_the_purged_read_capability_gets_the_plain_read() {
+        let nodes = three_nodes(
+            vec![
+                expired_ttl_row(0),
+                clustered_row(1, b"kept", 2_000),
+                clustered_row(3, b"both", 2_000),
+            ],
+            vec![
+                clustered_row(1, b"kept", 2_000),
+                clustered_row(3, b"both", 2_000),
+            ],
+            ferrosa_net::handshake::LOCAL_CAPABILITIES & !ferrosa_net::handshake::CAP_PURGED_READ,
+        )
+        .await;
+        assert_eq!(nodes.read().await, vec![(0, false), (1, true), (3, true)]);
+    }
+
+    /// The full-read replica holds expired TTL history beside one live row, as
+    /// a by-server session index does. Its own compaction would drop that
+    /// history, and no read can see it, so the response must not carry it.
+    ///
+    /// RED before the fix: the replica shipped every expired row it still held
+    /// (rows 0 and 2) on every full read. It fails on the VALUE of the shipped
+    /// partition, through the path a quorum read sends. Lean:
+    /// `Tombstone.shipped_response_carries_purged_data`.
+    #[tokio::test]
+    async fn a_full_read_response_leaves_out_what_the_replica_would_compact_away() {
+        let replicas = two_replicas(
+            vec![clustered_row(1, b"kept", 2_000)],
+            vec![
+                expired_ttl_row(0),
+                clustered_row(1, b"kept", 2_000),
+                expired_ttl_row(2),
+            ],
+            DeletionTime::LIVE,
+        )
+        .await;
+        replicas.connect_remote().await;
+        let shipped: Vec<Vec<u8>> = replicas
+            .full_read_from_remote()
+            .await
+            .expect("the remote holds the partition")
+            .rows
+            .iter()
+            .map(|r| r.clustering.clone())
+            .collect();
+        assert_eq!(
+            shipped,
+            vec![1i32.to_be_bytes().to_vec()],
+            "only the live row crosses the wire"
+        );
+    }
+
+    /// The local replica already purged an expired TTL row the remote still
+    /// holds, and the remote also has a visible row the local lacks, so the
+    /// digests differ and the read repairs. The merged winner for row 0 is the
+    /// expired row. It is past grace and older than everything live the local
+    /// replica holds, so sending it would only store data no read can see,
+    /// until the local replica compacted it away again.
+    ///
+    /// RED before the fix: the repair wrote the whole merged partition, so the
+    /// local replica stored row 0 again. Lean:
+    /// `Tombstone.shipped_repair_writes_purged_data_back`,
+    /// `Tombstone.repair_converges_every_replica_to_the_merged_answer`.
+    #[tokio::test]
+    async fn read_repair_does_not_write_purgeable_data_back_to_a_replica_that_dropped_it() {
+        let read = read_two_replicas_keeping_local(
+            vec![clustered_row(1, b"kept", 2_000)],
+            vec![
+                expired_ttl_row(0),
+                clustered_row(1, b"kept", 2_000),
+                clustered_row(3, b"only-remote", 2_000),
+            ],
+        )
+        .await;
+        let stored: Vec<Vec<u8>> = read
+            .local_partition()
+            .rows
+            .iter()
+            .map(|r| r.clustering.clone())
+            .collect();
+        assert_eq!(
+            stored,
+            vec![1i32.to_be_bytes().to_vec(), 3i32.to_be_bytes().to_vec()],
+            "the visible row is repaired and the expired row is not written back"
+        );
+    }
+
+    /// A sliced read sees only part of each replica, but a partition deletion
+    /// shadows the whole partition. The local replica's live row 5 was written
+    /// before the remote's partition deletion and lies outside the local
+    /// slice, so the local guard computed over the slice cannot see it. The
+    /// repair must still send the deletion, past grace or not, or row 5 stays
+    /// live on the local replica. Lean's convergence theorem assumes the guard
+    /// covers everything the element shadows; this is that hypothesis on a
+    /// slice.
+    #[tokio::test]
+    async fn a_sliced_read_repair_still_sends_a_purgeable_partition_deletion() {
+        let read = read_two_replicas_sliced(
+            vec![
+                clustered_row(1, b"kept", 2_000),
+                clustered_row(3, b"only-local", 2_000),
+                clustered_row(5, b"deleted-before", 50),
+            ],
+            vec![
+                clustered_row(1, b"kept", 2_000),
+                clustered_row(2, b"only-remote", 2_000),
+            ],
+            DeletionTime {
+                marked_for_delete_at: 100,
+                local_deletion_time: 1_000_000_060,
+            },
+            2,
+        )
+        .await;
+        assert_eq!(
+            read.local_partition().deletion.marked_for_delete_at,
+            100,
+            "the partition deletion must reach the local replica"
+        );
+    }
+
+    /// The mirror: the local replica still holds a LIVE value for row 0 written
+    /// before the remote's TTL write. The expired row shadows it, so the repair
+    /// must still send it, or the old value comes back on the local replica.
+    /// Lean: `Tombstone.skipping_a_repair_over_older_live_data_resurrects`.
+    #[tokio::test]
+    async fn read_repair_still_sends_purgeable_data_that_shadows_an_older_live_value() {
+        let read = read_two_replicas_keeping_local(
+            vec![
+                clustered_row(0, b"older", 400),
+                clustered_row(1, b"kept", 2_000),
+            ],
+            vec![
+                expired_ttl_row(0),
+                clustered_row(1, b"kept", 2_000),
+                clustered_row(3, b"only-remote", 2_000),
+            ],
+        )
+        .await;
+        let local = read.local_partition();
+        let row0 = local
+            .rows
+            .iter()
+            .find(|r| r.clustering == 0i32.to_be_bytes().to_vec())
+            .expect("row 0 is still stored locally");
+        let cell = &row0.cells[0].1;
+        assert_eq!(
+            (cell.timestamp, cell.is_expiring()),
+            (500, true),
+            "the expired write must reach the replica and shadow its older value"
+        );
+    }
+
+    /// One replica's compaction purged expired TTL data the other still holds.
+    /// The visible data is identical, so the replicas must agree: a digest over
+    /// the raw stored cells disagreed, and read repair then wrote the purged rows
+    /// back into the replica that had dropped them, on every read until both had
+    /// compacted. Lean: `Tombstone.purging_expired_data_is_invisible_to_reads`.
+    #[tokio::test]
+    async fn replicas_that_differ_only_by_purgeable_data_agree_without_repair() {
+        let (visible, attempted) = read_two_replicas(
+            vec![expired_ttl_row(0), expired_ttl_row(2)],
+            vec![clustered_row(1, b"kept", 2_000)],
+        )
+        .await;
+        assert_eq!(visible, 1);
+        assert_eq!(attempted, 0, "a purge must not look like a divergence");
+    }
+
+    /// The control: a replica missing a VISIBLE row still disagrees and repairs.
+    #[tokio::test]
+    async fn replicas_that_differ_in_visible_data_still_repair() {
+        let (_, attempted) = read_two_replicas(
+            vec![clustered_row(3, b"only-local", 2_000)],
+            vec![clustered_row(1, b"kept", 2_000)],
+        )
+        .await;
+        assert!(
+            attempted > 0,
+            "a missing visible row must still be repaired"
         );
     }
 

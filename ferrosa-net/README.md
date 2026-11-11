@@ -80,6 +80,10 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   `ClusterMembershipForward` (`0x82`), so a forwarded schema/membership op travels
   capnp and falls back to the shipped bincode body for any peer without the bit (a
   versioned magic on the body tells the receiver which it is);
+  `CAP_PURGED_READ` (1<<9) — the peer serves `PurgedReadRequest` (`0x4D`), a
+  whole-partition full read answered without what its own compaction would drop,
+  so the coordinator sends it only to a peer with the bit and the plain
+  `ReadRequest` to any other;
   `CAP_RESULT_CURSOR_PAGE`
   `CAP_PAIR_DISSOLVE` gates `PairDissolve` / `PairDissolveAck` (0x4A/0x4B),
   phase 1 of the operator downgrade from cluster to pair (t_47bbeb66).
@@ -241,6 +245,15 @@ External: `tokio`, `tokio-util`, `bytes`, `capnp`/`capnpc`, `rustls` +
 `tests/` (Cap'n Proto adapters/conformance/envelope framing/protocol,
 end-to-end `integration.rs`, and `reconnect_backoff.rs`). No `#[ignore]`, no
 `TODO`/`FIXME`/`unimplemented!` in `src/`.
+
+Tests on tokio's paused clock must not wait on real sockets: a paused clock
+jumps to the next timer whenever no task is runnable, and a task waiting on
+the kernel for a loopback byte is not runnable, so under CPU load a dial loses
+to its own virtual timeout (t_68b0a1df). The test-only `mem_net` module serves
+TEST-NET-2 addresses (198.51.100.0/24) in memory: `RpcClient` dials them over a
+`tokio::io::duplex` pipe, and `mem_net::MemListener` accepts them. The
+slow-retry lane tests use it; the `peer.rs` outage tests still use loopback
+with a real `RpcServer` (t_cfdc0f61).
 
 ## Specs
 

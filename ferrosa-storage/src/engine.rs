@@ -9943,6 +9943,30 @@ impl StorageEngine {
             .map(|s| TableSchema::clone(&s.schema()))
     }
 
+    /// The purge horizon a read digest uses for `table_id`: the `gc_before` second
+    /// compaction compares local deletion times against
+    /// ([`crate::compaction::purge::PurgePolicy::gc_before`]), taken now.
+    ///
+    /// Replicas purge on their own compaction schedules, so for a while one holds
+    /// a tombstone or an expired TTL cell another has dropped. A digest over the
+    /// raw stored data called that a divergence, and read repair then wrote the
+    /// purged data back. A digest computed without data past this horizon
+    /// ([`crate::compaction::purge::PurgedRow`]) lets them agree. Only the
+    /// digest is affected, never the rows a read returns, so this does not depend
+    /// on the purge kill switch.
+    ///
+    /// `None` keeps the raw digest: an unknown table, a table with no
+    /// `gc_grace_seconds` (it is never purged), or an unreadable value, which every
+    /// compaction of the table reports at ERROR with a counter.
+    pub fn read_purge_horizon(&self, table_id: &TableId) -> Option<i64> {
+        let tables = self.tables.load();
+        let gc_grace = tables.get(table_id)?.schema().gc_grace_seconds().ok()??;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs() as i64);
+        Some(now - i64::from(gc_grace))
+    }
+
     /// The `TableId`s currently registered with this engine. Used by the
     /// self-heal controller to enumerate scan targets.
     pub fn registered_table_ids(&self) -> Vec<TableId> {

@@ -1515,7 +1515,7 @@ impl CompactionExecutor {
             tracing::info!(
                 table_id = %task.table_id,
                 purged_markers,
-                "compaction: dropped deletion markers past gc_grace_seconds"
+                "compaction: dropped deletion markers and expired TTL data past gc_grace_seconds"
             );
         }
         let merged_partition_count = tally.partitions;
@@ -3165,6 +3165,61 @@ mod tests {
         };
         let (_, out) = compact_with_purge(live_and_dead_inputs(), Some(policy));
         assert_eq!(keys_of(&out), ["k0", "k1", "k2", "k3", "k4"]);
+    }
+
+    /// A partition written one TTL'd row per event, every row long expired, plus one
+    /// row written without a TTL.
+    fn ttl_history_partition(key: &str, expired_rows: u32) -> ferrosa_sstable::types::Partition {
+        use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+        let ldt = (PURGE_OLD_LDT - 10) as i32;
+        let mut rows: Vec<Row> = (0..expired_rows)
+            .map(|i| Row {
+                clustering: (i + 1).to_be_bytes().to_vec(),
+                cells: vec![(
+                    0,
+                    CellValue::expiring(b"offered".to_vec(), 1_000 + i64::from(i), 600, ldt),
+                )],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_ttl(1_000 + i64::from(i), 600, ldt),
+            })
+            .collect();
+        rows.push(Row {
+            clustering: (expired_rows + 1).to_be_bytes().to_vec(),
+            cells: vec![(0, CellValue::live(b"kept".to_vec(), 5_000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(5_000),
+        });
+        ferrosa_sstable::types::Partition {
+            key: DecoratedKey::new(PartitionKey::new(key.as_bytes().to_vec())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows,
+        }
+    }
+
+    /// The listener-poll partition that grew without bound: every expired TTL row
+    /// survived every compaction, because only value-less markers were droppable.
+    /// Lean: `Tombstone.expired_history_grows_without_bound`.
+    #[test]
+    fn compaction_past_grace_removes_expired_ttl_rows_and_keeps_live_ones() {
+        let inputs = vec![vec![ttl_history_partition("server", 50)]];
+        let (_, out) = compact_with_purge(inputs, Some(open_policy()));
+        assert_eq!(keys_of(&out), ["server"]);
+        let rows = &out[0].rows;
+        assert_eq!(rows.len(), 1, "only the row without a TTL survives");
+        assert_eq!(rows[0].cells[0].1.value.as_deref(), Some(&b"kept"[..]));
+    }
+
+    #[test]
+    fn expired_ttl_rows_inside_gc_grace_are_kept() {
+        let policy = super::super::purge::PurgePolicy {
+            gc_before: i64::from(PURGE_OLD_LDT) - 100,
+            ..open_policy()
+        };
+        let (_, out) =
+            compact_with_purge(vec![vec![ttl_history_partition("server", 5)]], Some(policy));
+        assert_eq!(out[0].rows.len(), 6);
     }
 
     #[test]

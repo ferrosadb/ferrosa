@@ -100,8 +100,20 @@ threshold is met. Failed replicas get hints; post-quorum stragglers are drained 
 a detached task. See [data-flow.md](data-flow.md).
 
 **Tunable-CL read.** `coordinate_read*` issues one full read + (block_for − 1)
-digest reads, then resolves. On digest mismatch it fail-loud re-fetches the newest
-copy and repairs stale replicas inline; on a corrupt local SSTable it fails over
+digest reads, then resolves. Every digest (`raft::handlers::read_digest`) is taken
+over the partition without data past the table's purge horizon, so replicas that
+purged tombstones or expired TTL data at different times still agree (CL-80). On
+digest mismatch it fail-loud re-fetches the newest
+copy and repairs stale replicas inline. Each target is sent the merged partition
+without what it could drop on its own: elements past grace and older than
+everything live its own response holds (`compaction::purge::repair_guard`). A
+replica whose digest matched shares the full read's guard, and a sliced read caps
+every guard at the merged partition deletion (CL-81, Lean
+`Tombstone.repair_converges_every_replica_to_the_merged_answer`). A remote whole-partition full read to a peer
+advertising `CAP_PURGED_READ` is a `PurgedReadRequest`: the replica answers without what its own compaction
+would drop and reports the newest timestamp it left out, and on a digest mismatch the coordinator keeps that
+answer only when the timestamp is below every refetched replica's guard, otherwise it reads the replica again
+in full (CL-82, Lean `Tombstone.a_stripped_version_below_every_other_guard_leaves_the_read_unchanged`). On a corrupt local SSTable it fails over
 to a healthy replica and enqueues a background anti-entropy refill. Remote
 single-partition reads that are unbounded (`row_limit = 0`, no exact clustering
 key) page on `Lane::Bulk`; bounded and exact reads remain on `Lane::Data`. This

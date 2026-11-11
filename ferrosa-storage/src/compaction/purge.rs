@@ -1,5 +1,7 @@
-//! Last revised: 2026-10-23
-//! Last changed: Bound collection protection scratch without heap allocation.
+//! Last revised: 2026-11-11
+//! Last changed: Expired TTL cells and row liveness purge like tombstones (ST-105);
+//!   `PurgedRow` gives the read digest a borrowed, copy-free view (CL-80), and
+//!   `repair_guard` judges what a read repair target can drop itself (CL-81).
 //! Correctness: Collection sentinel and purge boundary tests.
 //!
 //! Module: Tombstone purge for compaction output (`gc_grace_seconds`).
@@ -105,13 +107,30 @@ pub struct PurgeStats {
     pub partition_deletions: u64,
     pub row_deletions: u64,
     pub cell_tombstones: u64,
+    /// Expired TTL cells dropped.
+    pub expired_cells: u64,
+    /// Expired TTL row liveness (`INSERT ... USING TTL` row markers) dropped.
+    pub expired_liveness: u64,
     pub rows_removed: u64,
+    /// The newest timestamp of anything dropped, or `None` when nothing was. A
+    /// replica that leaves purged data out of a read response reports it, so
+    /// the coordinator can tell whether another replica's older live data sits
+    /// under what was left out (CL-82).
+    pub newest_dropped: Option<i64>,
 }
 
 impl PurgeStats {
-    /// Total markers dropped.
+    fn dropped(&mut self, timestamp: i64) {
+        self.newest_dropped = Some(self.newest_dropped.map_or(timestamp, |n| n.max(timestamp)));
+    }
+
+    /// Total markers dropped, expired TTL data included.
     pub fn markers(&self) -> u64 {
-        self.partition_deletions + self.row_deletions + self.cell_tombstones
+        self.partition_deletions
+            + self.row_deletions
+            + self.cell_tombstones
+            + self.expired_cells
+            + self.expired_liveness
     }
 }
 
@@ -122,6 +141,7 @@ pub fn purge_partition(partition: &mut Partition, policy: &PurgePolicy) -> Purge
     if policy.purgeable_deletion(&partition.deletion) {
         // Rows and static cells it shadowed were already removed by the merge, and
         // the overlap guard says nothing older survives outside this compaction.
+        stats.dropped(partition.deletion.marked_for_delete_at);
         partition.deletion = DeletionTime::LIVE;
         stats.partition_deletions += 1;
     }
@@ -144,46 +164,134 @@ pub(crate) fn row_is_vacant(row: &Row) -> bool {
     row.cells.is_empty() && row.deletion.is_live() && !row.primary_key_liveness.has_timestamp()
 }
 
+/// What a purge leaves of one row's deletion and primary-key liveness.
+#[derive(Clone, Copy)]
+struct RowMarkers {
+    deletion: DeletionTime,
+    liveness: LivenessInfo,
+    deletion_dropped: bool,
+    liveness_expired: bool,
+}
+
+impl RowMarkers {
+    fn for_row(row: &Row, policy: &PurgePolicy) -> Self {
+        let mut deletion = row.deletion;
+        let mut liveness = row.primary_key_liveness;
+        let deletion_dropped = policy.purgeable_deletion(&row.deletion);
+        if deletion_dropped {
+            deletion = DeletionTime::LIVE;
+            // The deletion shadowed any liveness at or below its timestamp. Dropping
+            // only the marker would leave that liveness and resurrect an empty row.
+            if liveness.has_timestamp() && liveness.timestamp < row.deletion.marked_for_delete_at {
+                liveness = LivenessInfo::NONE;
+            }
+        }
+        let liveness_expired = liveness_is_purgeable(&liveness, policy);
+        if liveness_expired {
+            liveness = LivenessInfo::NONE;
+        }
+        Self {
+            deletion,
+            liveness,
+            deletion_dropped,
+            liveness_expired,
+        }
+    }
+}
+
+/// Which of one row's cells a purge drops.
+struct CellRule {
+    policy: PurgePolicy,
+    /// Columns holding a path-keyed element cell. A pathless tombstone on such a
+    /// column shadows those elements only at read time (`merge_rows` keys cells by
+    /// `(column, path)`), so it is kept while any element remains. Column ordinals
+    /// are u16: this fixed 8 KiB bitmap covers every valid ordinal, including
+    /// unsorted callers, without a per-row hash allocation.
+    columns_with_elements: [u64; 1024],
+}
+
+impl CellRule {
+    fn for_row(row: &Row, policy: &PurgePolicy) -> Self {
+        let mut columns_with_elements = [0u64; 1024];
+        for (column, cell) in &row.cells {
+            if cell.path.is_some() {
+                columns_with_elements[usize::from(*column) / 64] |= 1 << (*column % 64);
+            }
+        }
+        Self {
+            policy: *policy,
+            columns_with_elements,
+        }
+    }
+
+    fn drops(&self, column: u16, cell: &ferrosa_common::CellValue) -> bool {
+        let has_elements =
+            self.columns_with_elements[usize::from(column) / 64] & (1 << (column % 64)) != 0;
+        cell_is_purgeable(cell, &self.policy) && !(cell.path.is_none() && has_elements)
+    }
+}
+
 /// Purge one row's markers. Returns whether anything was removed.
 pub(crate) fn purge_row(row: &mut Row, policy: &PurgePolicy, stats: &mut PurgeStats) -> bool {
     let before = stats.markers();
 
-    if policy.purgeable_deletion(&row.deletion) {
-        let deleted_at = row.deletion.marked_for_delete_at;
-        row.deletion = DeletionTime::LIVE;
-        stats.row_deletions += 1;
-        // The deletion shadowed any liveness at or below its timestamp. Dropping
-        // only the marker would leave that liveness and resurrect an empty row.
-        if row.primary_key_liveness.has_timestamp()
-            && row.primary_key_liveness.timestamp < deleted_at
-        {
-            row.primary_key_liveness = LivenessInfo::NONE;
-        }
+    let markers = RowMarkers::for_row(row, policy);
+    if markers.deletion_dropped {
+        stats.dropped(row.deletion.marked_for_delete_at);
     }
+    if row.primary_key_liveness.has_timestamp() && !markers.liveness.has_timestamp() {
+        stats.dropped(row.primary_key_liveness.timestamp);
+    }
+    row.deletion = markers.deletion;
+    row.primary_key_liveness = markers.liveness;
+    stats.row_deletions += u64::from(markers.deletion_dropped);
+    stats.expired_liveness += u64::from(markers.liveness_expired);
 
-    // A pathless tombstone on a column shadows that column's path-keyed element
-    // cells only at read time (`merge_rows` keys cells by `(column, path)`), so it
-    // is kept while any such element remains.
-    // Column ordinals are u16: this fixed 8 KiB bitmap covers every valid
-    // ordinal, including unsorted callers, without a per-row hash allocation.
-    let mut columns_with_elements = [0u64; 1024];
-    for (column, cell) in &row.cells {
-        if cell.path.is_some() {
-            columns_with_elements[usize::from(*column) / 64] |= 1 << (*column % 64);
-        }
-    }
+    let rule = CellRule::for_row(row, policy);
     row.cells.retain(|(column, cell)| {
-        let droppable = cell.is_tombstone()
-            && policy.purgeable(cell.timestamp, i64::from(cell.local_deletion_time))
-            && !(cell.path.is_none()
-                && (columns_with_elements[usize::from(*column) / 64] & (1 << (*column % 64)) != 0));
+        let droppable = rule.drops(*column, cell);
         if droppable {
-            stats.cell_tombstones += 1;
+            stats.dropped(cell.timestamp);
+            if cell.is_tombstone() {
+                stats.cell_tombstones += 1;
+            } else {
+                stats.expired_cells += 1;
+            }
         }
         !droppable
     });
 
     stats.markers() != before
+}
+
+/// A cell compaction may drop: a tombstone, or an expiring cell, whose local
+/// deletion time is past the grace window and whose timestamp is below the
+/// overlap guard.
+///
+/// An expired TTL cell is invisible but still carries its value, so a rule that
+/// looked only at `is_tombstone()` kept it forever, and a partition written one
+/// TTL'd row per event grew with every event (Lean:
+/// `Tombstone.expired_history_grows_without_bound`). Dropping one under these two
+/// conditions cannot change any read: every other version of the cell that
+/// survives outside this compaction is strictly newer and wins the merge anyway
+/// (`Tombstone.purging_expired_data_is_invisible_to_reads`). The cell is dropped,
+/// not rewritten as a tombstone: the reconcile order is expiry-blind, so a
+/// tombstone would beat an equal-timestamp live value the expired cell loses to
+/// (`Tombstone.rewriting_expired_data_as_a_tombstone_changes_a_tie`).
+fn cell_is_purgeable(cell: &ferrosa_common::CellValue, policy: &PurgePolicy) -> bool {
+    (cell.is_tombstone() || cell.is_expiring())
+        && policy.purgeable(cell.timestamp, i64::from(cell.local_deletion_time))
+}
+
+/// A row's primary-key liveness written with a TTL, expired past the grace window
+/// and below the overlap guard: the row marker of an `INSERT ... USING TTL`. Same
+/// argument as [`cell_is_purgeable`]: an older liveness for this row outside the
+/// compaction would sit at or above the guard, and the merge already kept the
+/// newest one inside it.
+fn liveness_is_purgeable(liveness: &LivenessInfo, policy: &PurgePolicy) -> bool {
+    liveness.has_timestamp()
+        && liveness.has_ttl()
+        && policy.purgeable(liveness.timestamp, i64::from(liveness.local_deletion_time))
 }
 
 /// Cheap pre-check: does `partition` hold any marker [`purge_partition`] could
@@ -193,14 +301,147 @@ pub(crate) fn purge_row(row: &mut Row, policy: &PurgePolicy, stats: &mut PurgeSt
 pub fn has_purgeable_marker(partition: &Partition, policy: &PurgePolicy) -> bool {
     let row_has_marker = |row: &Row| {
         policy.purgeable_deletion(&row.deletion)
-            || row.cells.iter().any(|(_, cell)| {
-                cell.is_tombstone()
-                    && policy.purgeable(cell.timestamp, i64::from(cell.local_deletion_time))
-            })
+            || liveness_is_purgeable(&row.primary_key_liveness, policy)
+            || row
+                .cells
+                .iter()
+                .any(|(_, cell)| cell_is_purgeable(cell, policy))
     };
     policy.purgeable_deletion(&partition.deletion)
         || partition.static_row.as_ref().is_some_and(row_has_marker)
         || partition.rows.iter().any(row_has_marker)
+}
+
+/// The policy for viewing an already-merged read result at horizon `gc_before`:
+/// what a replica's read digest is computed over, so replicas that purged at
+/// different times still agree.
+///
+/// A read has merged every local source (memtable and every SSTable), so no local
+/// data sits outside it and the overlap guard is open. The rows a read returns are
+/// never filtered by it: everything it removes is already invisible to a reader,
+/// and whether a REPLICA that never saw a delete can bring data back is the grace
+/// window's question, the same as for compaction.
+pub fn read_view_policy(gc_before: i64) -> PurgePolicy {
+    PurgePolicy {
+        gc_before,
+        max_purgeable_timestamp: i64::MAX,
+        table_delete: DeletionTime::LIVE,
+    }
+}
+
+/// The guard one replica's read response imposes on a read repair written to
+/// it: the smallest timestamp of anything it holds that is not past grace at
+/// `gc_before`, or `i64::MAX` when it holds nothing else.
+///
+/// This is the compaction overlap guard with the target replica as the data
+/// outside. A repair to this replica may leave out a merged element that is
+/// past grace and below the guard (`PurgePolicy { gc_before,
+/// max_purgeable_timestamp: repair_guard(..), .. }`): everything the replica
+/// holds is newer than that element or itself past grace, so the replica reads
+/// the merged answer either way, and its own compaction would drop the element
+/// anyway (Lean: `Tombstone.repair_converges_every_replica_to_the_merged_answer`,
+/// `Tombstone.repaired_write_matches_the_shipped_write_after_compaction`).
+pub fn repair_guard(partition: &Partition, gc_before: i64) -> i64 {
+    let open = read_view_policy(gc_before);
+    let mut guard = i64::MAX;
+    let mut hold = |timestamp: i64| guard = guard.min(timestamp);
+    if !partition.deletion.is_live() && !open.purgeable_deletion(&partition.deletion) {
+        hold(partition.deletion.marked_for_delete_at);
+    }
+    for row in partition.static_row.iter().chain(partition.rows.iter()) {
+        if !row.deletion.is_live() && !open.purgeable_deletion(&row.deletion) {
+            hold(row.deletion.marked_for_delete_at);
+        }
+        let liveness = &row.primary_key_liveness;
+        if liveness.has_timestamp() && !liveness_is_purgeable(liveness, &open) {
+            hold(liveness.timestamp);
+        }
+        for (_, cell) in &row.cells {
+            if !cell_is_purgeable(cell, &open) {
+                hold(cell.timestamp);
+            }
+        }
+    }
+    guard
+}
+
+/// The partition deletion [`purge_partition`] would leave.
+pub fn purged_partition_deletion(deletion: DeletionTime, policy: &PurgePolicy) -> DeletionTime {
+    if policy.purgeable_deletion(&deletion) {
+        DeletionTime::LIVE
+    } else {
+        deletion
+    }
+}
+
+/// One row as [`purge_partition`] would leave it, borrowed rather than copied, so
+/// a digest can hash the purged form of a partition one row at a time without
+/// cloning row data.
+pub struct PurgedRow<'a> {
+    row: &'a Row,
+    cells: CellRule,
+    markers: RowMarkers,
+}
+
+impl<'a> PurgedRow<'a> {
+    pub fn new(row: &'a Row, policy: &PurgePolicy) -> Self {
+        Self {
+            row,
+            cells: CellRule::for_row(row, policy),
+            markers: RowMarkers::for_row(row, policy),
+        }
+    }
+
+    /// The clustering bytes (never changed by a purge).
+    pub fn clustering(&self) -> &'a [u8] {
+        &self.row.clustering
+    }
+
+    /// The cells the purge keeps, in their original order.
+    pub fn cells(&self) -> impl Iterator<Item = &'a (u16, ferrosa_common::CellValue)> + '_ {
+        self.row
+            .cells
+            .iter()
+            .filter(|(column, cell)| !self.cells.drops(*column, cell))
+    }
+
+    /// The surviving row deletion.
+    pub fn deletion(&self) -> DeletionTime {
+        self.markers.deletion
+    }
+
+    /// The surviving primary-key liveness.
+    pub fn liveness(&self) -> LivenessInfo {
+        self.markers.liveness
+    }
+
+    /// Whether the purge removed anything from this row.
+    pub fn changed(&self) -> bool {
+        self.markers.deletion_dropped
+            || self.markers.liveness_expired
+            || self.cells().count() != self.row.cells.len()
+    }
+
+    /// Whether nothing is left: no cells, no deletion, no primary-key liveness.
+    /// Writing such a row changes nothing, so a repair leaves it out.
+    pub fn is_vacant(&self) -> bool {
+        self.cells().next().is_none()
+            && self.markers.deletion.is_live()
+            && !self.markers.liveness.has_timestamp()
+    }
+
+    /// Whether [`purge_partition`] drops this clustered row entirely.
+    pub fn removes_row(&self) -> bool {
+        self.changed()
+            && self.cells().next().is_none()
+            && self.markers.deletion.is_live()
+            && !self.markers.liveness.has_timestamp()
+    }
+
+    /// Whether [`purge_partition`] drops this row when it is the static row.
+    pub fn removes_static_row(&self) -> bool {
+        self.changed() && self.cells().next().is_none()
+    }
 }
 
 /// True when nothing is left to write for `partition`: no deletion, no static row,
@@ -378,6 +619,246 @@ mod tests {
         assert_eq!(p.rows[0].cells.len(), 2);
     }
 
+    /// An expiring cell written at `ts` with a 60 s TTL, expiring at `ldt`.
+    fn expiring(ts: i64, ldt: i32) -> CellValue {
+        CellValue::expiring(b"ttl".to_vec(), ts, 60, ldt)
+    }
+
+    /// Lean: `Tombstone.expired_history_grows_without_bound` is the shipped rule's
+    /// witness; `Tombstone.purging_expired_data_is_invisible_to_reads` is why
+    /// dropping under the two conditions below is safe.
+    #[test]
+    fn an_expired_ttl_cell_past_grace_and_below_the_guard_is_purged() {
+        let cells = vec![
+            (0, CellValue::live(b"keep".to_vec(), 900)),
+            (1, expiring(500, OLD_LDT)),
+            (2, expiring(500, FRESH_LDT)),
+            (3, expiring(1_500, OLD_LDT)),
+        ];
+        let mut p = partition(DeletionTime::LIVE, vec![row(b"c1", cells, 900)]);
+        let stats = purge_partition(&mut p, &policy(1_000));
+        let kept: Vec<u16> = p.rows[0].cells.iter().map(|(c, _)| *c).collect();
+        assert_eq!(
+            kept,
+            vec![0, 2, 3],
+            "the expired cell goes; one inside grace and one at/above the guard stay"
+        );
+        assert_eq!(stats.markers(), 1);
+    }
+
+    #[test]
+    fn a_row_whose_ttl_liveness_and_cells_expired_past_grace_is_removed() {
+        let mut expired = row(b"c1", vec![(0, expiring(500, OLD_LDT))], i64::MIN);
+        expired.primary_key_liveness = LivenessInfo::with_ttl(500, 60, OLD_LDT);
+        let mut fresh = row(b"c2", vec![(0, expiring(500, FRESH_LDT))], i64::MIN);
+        fresh.primary_key_liveness = LivenessInfo::with_ttl(500, 60, FRESH_LDT);
+        let mut p = partition(DeletionTime::LIVE, vec![expired, fresh.clone()]);
+        let stats = purge_partition(&mut p, &policy(1_000));
+        assert_eq!(
+            p.rows,
+            vec![fresh],
+            "only the row still inside grace remains"
+        );
+        assert_eq!(stats.rows_removed, 1);
+    }
+
+    #[test]
+    fn an_expired_ttl_liveness_goes_but_a_live_cell_keeps_the_row() {
+        let mut r = row(
+            b"c1",
+            vec![(0, CellValue::live(b"v".to_vec(), 400))],
+            i64::MIN,
+        );
+        r.primary_key_liveness = LivenessInfo::with_ttl(500, 60, OLD_LDT);
+        let mut p = partition(DeletionTime::LIVE, vec![r]);
+        purge_partition(&mut p, &policy(1_000));
+        assert_eq!(p.rows.len(), 1);
+        assert_eq!(p.rows[0].primary_key_liveness, LivenessInfo::NONE);
+        assert_eq!(
+            p.rows[0].cells,
+            vec![(0, CellValue::live(b"v".to_vec(), 400))]
+        );
+    }
+
+    #[test]
+    fn an_expired_ttl_liveness_above_the_guard_is_kept() {
+        // Data outside this compaction as old as the guard could be an older INSERT
+        // of the same row that the expired liveness shadows.
+        let liveness = LivenessInfo::with_ttl(1_500, 60, OLD_LDT);
+        let mut r = row(b"c1", vec![], i64::MIN);
+        r.primary_key_liveness = liveness;
+        let mut p = partition(DeletionTime::LIVE, vec![r]);
+        assert_eq!(purge_partition(&mut p, &policy(1_000)).markers(), 0);
+        assert_eq!(p.rows[0].primary_key_liveness, liveness);
+    }
+
+    #[test]
+    fn has_purgeable_marker_finds_expired_ttl_data() {
+        let pol = policy(1_000);
+        let cell = row(b"c", vec![(0, expiring(500, OLD_LDT))], 900);
+        assert!(has_purgeable_marker(
+            &partition(DeletionTime::LIVE, vec![cell]),
+            &pol
+        ));
+        let mut liveness = row(b"c", vec![], i64::MIN);
+        liveness.primary_key_liveness = LivenessInfo::with_ttl(500, 60, OLD_LDT);
+        assert!(has_purgeable_marker(
+            &partition(DeletionTime::LIVE, vec![liveness]),
+            &pol
+        ));
+        let fresh = row(b"c", vec![(0, expiring(500, FRESH_LDT))], 900);
+        assert!(!has_purgeable_marker(
+            &partition(DeletionTime::LIVE, vec![fresh]),
+            &pol
+        ));
+    }
+
+    /// Rebuild what the borrowed views say a purge leaves (test-only copy).
+    fn rebuilt_from_views(p: &Partition, policy: &PurgePolicy) -> Partition {
+        let owned = |view: &PurgedRow<'_>| Row {
+            clustering: view.clustering().to_vec(),
+            cells: view.cells().cloned().collect(),
+            deletion: view.deletion(),
+            primary_key_liveness: view.liveness(),
+        };
+        let static_row = p
+            .static_row
+            .as_ref()
+            .map(|r| PurgedRow::new(r, policy))
+            .filter(|v| !v.removes_static_row())
+            .map(|v| owned(&v));
+        let rows = p
+            .rows
+            .iter()
+            .map(|r| PurgedRow::new(r, policy))
+            .filter(|v| !v.removes_row())
+            .map(|v| owned(&v))
+            .collect();
+        Partition {
+            key: p.key.clone(),
+            deletion: purged_partition_deletion(p.deletion, policy),
+            static_row,
+            rows,
+        }
+    }
+
+    #[test]
+    fn a_replica_holding_only_past_grace_data_imposes_no_repair_guard() {
+        let mut expired = row(b"a", vec![(0, expiring(1_500, OLD_LDT))], i64::MIN);
+        expired.primary_key_liveness = LivenessInfo::with_ttl(1_500, 60, OLD_LDT);
+        let tomb = row(
+            b"b",
+            vec![(0, CellValue::tombstone(1_200, OLD_LDT))],
+            i64::MIN,
+        );
+        let p = partition(
+            DeletionTime {
+                marked_for_delete_at: 100,
+                local_deletion_time: OLD_LDT as u32,
+            },
+            vec![expired, tomb],
+        );
+        assert_eq!(repair_guard(&p, GC_BEFORE), i64::MAX);
+        assert_eq!(
+            repair_guard(&partition(DeletionTime::LIVE, vec![]), GC_BEFORE),
+            i64::MAX
+        );
+    }
+
+    #[test]
+    fn the_repair_guard_is_the_oldest_thing_held_that_is_not_past_grace() {
+        let live = row(b"a", vec![(0, CellValue::live(b"v".to_vec(), 900))], 950);
+        let unexpired = row(b"b", vec![(0, expiring(700, FRESH_LDT))], i64::MIN);
+        let fresh_tomb = row(
+            b"c",
+            vec![(0, CellValue::tombstone(650, FRESH_LDT))],
+            i64::MIN,
+        );
+        let old_tomb = row(b"d", vec![(0, CellValue::tombstone(10, OLD_LDT))], i64::MIN);
+        let p = partition(DeletionTime::LIVE, vec![live.clone(), unexpired.clone()]);
+        assert_eq!(
+            repair_guard(&p, GC_BEFORE),
+            700,
+            "an unexpired TTL cell counts"
+        );
+        let p = partition(DeletionTime::LIVE, vec![live.clone(), fresh_tomb, old_tomb]);
+        assert_eq!(
+            repair_guard(&p, GC_BEFORE),
+            650,
+            "a tombstone inside grace counts; one past grace does not"
+        );
+        let mut deleted = live;
+        deleted.deletion = DeletionTime {
+            marked_for_delete_at: 300,
+            local_deletion_time: FRESH_LDT as u32,
+        };
+        let p = partition(DeletionTime::LIVE, vec![deleted]);
+        assert_eq!(
+            repair_guard(&p, GC_BEFORE),
+            300,
+            "a row deletion inside grace counts"
+        );
+    }
+
+    #[test]
+    fn a_purged_row_view_of_an_untouched_row_reports_no_change() {
+        let r = row(b"c", vec![(0, expiring(500, FRESH_LDT))], 900);
+        let view = PurgedRow::new(&r, &read_view_policy(GC_BEFORE));
+        assert!(!view.changed());
+        assert!(!view.removes_row());
+        assert_eq!(view.cells().count(), 1);
+    }
+
+    #[test]
+    fn the_read_view_strips_expired_rows_whatever_their_timestamp() {
+        // A read merged every local source, so there is no overlap guard: even a
+        // timestamp a compaction's guard would have protected is stripped.
+        let mut expired = row(b"a", vec![(0, expiring(1_500, OLD_LDT))], i64::MIN);
+        expired.primary_key_liveness = LivenessInfo::with_ttl(1_500, 60, OLD_LDT);
+        let kept = row(b"b", vec![(0, CellValue::live(b"v".to_vec(), 900))], 900);
+        let p = partition(DeletionTime::LIVE, vec![expired, kept.clone()]);
+        let viewed = rebuilt_from_views(&p, &read_view_policy(GC_BEFORE));
+        assert_eq!(viewed.rows, vec![kept]);
+    }
+
+    #[test]
+    fn purged_row_views_agree_with_purge_partition() {
+        let policy = PurgePolicy {
+            gc_before: GC_BEFORE,
+            max_purgeable_timestamp: 1_000,
+            table_delete: DeletionTime::LIVE,
+        };
+        let mut deleted = row(b"d", vec![(0, CellValue::live(b"x".to_vec(), 950))], 100);
+        deleted.deletion = DeletionTime {
+            marked_for_delete_at: 200,
+            local_deletion_time: OLD_LDT as u32,
+        };
+        let mut ttl_row = row(b"t", vec![(0, expiring(500, OLD_LDT))], i64::MIN);
+        ttl_row.primary_key_liveness = LivenessInfo::with_ttl(500, 60, OLD_LDT);
+        let guarded = row(b"g", vec![(0, expiring(1_500, OLD_LDT))], i64::MIN);
+        let mixed = row(
+            b"m",
+            vec![
+                (0, CellValue::tombstone(300, OLD_LDT)),
+                (1, CellValue::live(b"v".to_vec(), 900)),
+            ],
+            900,
+        );
+        let mut p = partition(
+            DeletionTime {
+                marked_for_delete_at: 50,
+                local_deletion_time: OLD_LDT as u32,
+            },
+            vec![deleted, ttl_row, guarded, mixed],
+        );
+        p.static_row = Some(row(&[], vec![(2, expiring(400, OLD_LDT))], i64::MIN));
+
+        let viewed = rebuilt_from_views(&p, &policy);
+        let mut purged = p.clone();
+        purge_partition(&mut purged, &policy);
+        assert_eq!(viewed, purged);
+    }
+
     fn sst(id: &str, min_token: i64, max_token: i64, min_ts: i64, legacy: bool) -> SSTableMetadata {
         SSTableMetadata {
             id: id.to_string(),
@@ -517,17 +998,20 @@ mod tests {
 
     fn arb_cell() -> impl Strategy<Value = CellValue> {
         (
-            any::<bool>(),
+            0u8..3,
             0i64..2_000,
             prop::sample::select(vec![OLD_LDT, FRESH_LDT]),
         )
-            .prop_map(|(live, ts, ldt)| {
-                if live {
-                    CellValue::live(b"v".to_vec(), ts)
-                } else {
-                    CellValue::tombstone(ts, ldt)
-                }
+            .prop_map(|(kind, ts, ldt)| match kind {
+                0 => CellValue::live(b"v".to_vec(), ts),
+                1 => CellValue::tombstone(ts, ldt),
+                _ => expiring(ts, ldt),
             })
+    }
+
+    /// Visible to a reader at `NOW`: not a tombstone, not past its expiry.
+    fn visible_now(c: &CellValue) -> bool {
+        !c.is_tombstone() && !(c.is_expiring() && i64::from(c.local_deletion_time) <= NOW)
     }
 
     fn arb_row() -> impl Strategy<Value = Row> {
@@ -560,21 +1044,25 @@ mod tests {
             p.rows.dedup_by(|a, b| a.clustering == b.clustering);
             let before = p.clone();
             purge_partition(&mut p, &pol);
+            prop_assert_eq!(&rebuilt_from_views(&before, &pol), &p, "borrowed views must match the purge");
 
             let live_before: Vec<_> = before.rows.iter()
-                .flat_map(|r| r.cells.iter().filter(|(_, c)| !c.is_tombstone()).map(|(i, c)| (r.clustering.clone(), *i, c.clone())))
+                .flat_map(|r| r.cells.iter().filter(|(_, c)| visible_now(c)).map(|(i, c)| (r.clustering.clone(), *i, c.clone())))
                 .collect();
             let live_after: Vec<_> = p.rows.iter()
-                .flat_map(|r| r.cells.iter().filter(|(_, c)| !c.is_tombstone()).map(|(i, c)| (r.clustering.clone(), *i, c.clone())))
+                .flat_map(|r| r.cells.iter().filter(|(_, c)| visible_now(c)).map(|(i, c)| (r.clustering.clone(), *i, c.clone())))
                 .collect();
-            prop_assert_eq!(live_before, live_after, "live cells must survive");
+            prop_assert_eq!(live_before, live_after, "visible cells must survive");
 
             for r in &before.rows {
-                for (i, c) in r.cells.iter().filter(|(_, c)| c.is_tombstone()) {
-                    if !pol.purgeable(c.timestamp, c.local_deletion_time as i64) {
-                        let survived = p.rows.iter().any(|x| x.clustering == r.clustering
-                            && x.cells.iter().any(|(j, d)| j == i && d == c));
-                        prop_assert!(survived, "unpurgeable tombstone dropped");
+                for (i, c) in r.cells.iter().filter(|(_, c)| !visible_now(c)) {
+                    let survived = p.rows.iter().any(|x| x.clustering == r.clustering
+                        && x.cells.iter().any(|(j, d)| j == i && d == c));
+                    let purgeable = pol.purgeable(c.timestamp, i64::from(c.local_deletion_time));
+                    if !purgeable {
+                        prop_assert!(survived, "unpurgeable marker or expired cell dropped");
+                    } else if c.is_expiring() {
+                        prop_assert!(!survived, "purgeable expired cell kept");
                     }
                 }
                 if !r.deletion.is_live()
