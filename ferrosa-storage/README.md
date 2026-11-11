@@ -220,7 +220,12 @@ controls already passed before the fix (`tests/count_payload_alloc.rs`).
   call it too, as a safety net for callers outside table startup). Because it
   runs while writers are live, it removes only staging entries another process
   left (`{pid}-…` names not this process's) and never a dir this process is
-  still staging into (FMEA ST-89).
+  still staging into (FMEA ST-89). Staged components and index sidecars are
+  likewise named with their owner (`{gen}-Data.db.{pid}.tmp`,
+  `.fti-{gen}-{index}.{pid}.tmp`), and the sweep leaves this process's own
+  alone: a compaction output dir is shared by every compaction of its table,
+  so one task's constructor used to quarantine another's publish in flight
+  (FMEA ST-106).
 
   **Digest verification on published bytes, unconditional (`publication-safety.md`
   M2 step 4 / M3, T-012, FMEA ST-32):** between the `.tmp` fsync and the

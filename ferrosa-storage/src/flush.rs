@@ -1099,7 +1099,11 @@ pub(crate) mod fsync_probe {
 /// A `.tmp` component is left behind only when the process died between
 /// renaming staged output to `.tmp` (`FileFlushTarget::flush_files`) and
 /// either quarantining it (verification failure) or promoting it to a live
-/// name (success) — every other path removes it. `{gen}-Data.db.tmp` never
+/// name (success) — every other path removes it. A `.tmp` tagged with THIS
+/// process's pid (`{gen}-Data.db.{pid}.tmp`, `.fti-{gen}-{index}.{pid}.tmp`) is a
+/// publish still in flight and is left alone: this sweep also runs from
+/// every `FileFlushTarget` constructor, and a compaction output dir is shared
+/// by every compaction of its table (t_44d3ab57). `{gen}-Data.db.{pid}.tmp` never
 /// matches the `{gen}-Data.db` suffix generation discovery scans for, so it
 /// is not a data-loss risk by itself, but leaving it as unlabeled debris hides
 /// exactly the kind of interrupted publish M2 asks to make visible. It is
@@ -1163,6 +1167,12 @@ pub(crate) fn sweep_stale_flush_staging(dir: &Path) {
         if is_dir || !name_str.ends_with(".tmp") {
             continue;
         }
+        // A publish or sidecar write of THIS process is in flight: the sweep
+        // also runs from every FileFlushTarget constructor, and a compaction's
+        // output dir is shared by every compaction of the table (t_44d3ab57).
+        if tmp_is_owned_by(&name_str, std::process::id()) {
+            continue;
+        }
 
         if !quarantine_ready {
             if let Err(e) = std::fs::create_dir_all(&quarantine_dir) {
@@ -1194,6 +1204,18 @@ pub(crate) fn sweep_stale_flush_staging(dir: &Path) {
             "flush: swept stale staged output left by an earlier crash"
         );
     }
+}
+
+/// Whether a `.tmp` file named `name` was written by process `pid`: staged
+/// components (`{gen}-Data.db.{pid}.tmp`) and index sidecars
+/// (`.fti-{gen}-{index}.{pid}.tmp`) carry their owner just before `.tmp`.
+/// Untagged names predate owner tags and belong to no live writer. As with
+/// [`staging_entry_is_stale`], a pid reused from a crashed process makes its
+/// debris look live until the next restart, the safe direction.
+fn tmp_is_owned_by(name: &str, pid: u32) -> bool {
+    name.strip_suffix(".tmp")
+        .and_then(|stem| stem.rsplit_once('.'))
+        .is_some_and(|(_, owner)| owner.parse::<u32>() == Ok(pid))
 }
 
 /// Whether a `.sstable-staging/` or `.merge-spill/` entry named `name` is
@@ -1438,11 +1460,16 @@ impl FileFlushTarget {
         }
     }
 
+    /// `{gen}-Data.db` -> `{gen}-Data.db.{pid}.tmp`. The owner pid is what lets
+    /// [`sweep_stale_flush_staging`] tell this process's publish in progress
+    /// from a crashed process's debris (t_44d3ab57); `.fti-`/`.vec-` sidecar
+    /// temporaries carry it in the same position.
     fn tmp_component_path(path: &Path) -> PathBuf {
-        match path.extension().and_then(|ext| ext.to_str()) {
-            Some("txt") => path.with_extension("txt.tmp"),
-            _ => path.with_extension("db.tmp"),
-        }
+        let ext = match path.extension().and_then(|ext| ext.to_str()) {
+            Some("txt") => "txt",
+            _ => "db",
+        };
+        path.with_extension(format!("{ext}.{}.tmp", std::process::id()))
     }
 
     fn rename_path(source: impl AsRef<Path>, target: impl AsRef<Path>) -> std::io::Result<()> {
@@ -4070,6 +4097,93 @@ mod tests {
         );
     }
 
+    /// Every file directly under `dir/quarantine`, by name.
+    fn quarantined_names(dir: &Path) -> Vec<String> {
+        match std::fs::read_dir(dir.join("quarantine")) {
+            Ok(entries) => entries
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => panic!("read quarantine dir: {e}"),
+        }
+    }
+
+    /// t_44d3ab57. A table's compaction output dir is shared by every
+    /// compaction of that table, and each task builds its own
+    /// `FileFlushTarget` there. The constructor's debris sweep ran while
+    /// another task was between renaming its staged output to `.tmp` and
+    /// verifying it, moved those files to `quarantine/`, and the other task's
+    /// readback failed with ENOENT ("FLUSH CORRUPTION ... could not be read
+    /// back"), seen on a live node 2026-11-11.
+    ///
+    /// The staged names come from the production derivation
+    /// (`component_paths` + `tmp_component_paths`), so this test follows the
+    /// names `flush_files` really uses. RED before the fix: the sweep
+    /// quarantines them, so the existence assertion fails.
+    #[test]
+    fn constructing_a_flush_target_spares_a_concurrent_publish_in_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let publishing = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+        let staged = FileFlushTarget::tmp_component_paths(&publishing.component_paths(7));
+        let in_flight = [&staged.data, &staged.partitions, &staged.rows, &staged.toc];
+        for path in in_flight {
+            std::fs::write(path, b"staged by a publish still in progress").unwrap();
+        }
+
+        let _second = FileFlushTarget::new_starting_at(dir.path().to_path_buf()).unwrap();
+
+        for path in in_flight {
+            assert!(
+                path.exists(),
+                "a concurrent publish's staged component was swept: {path:?}; quarantine={:?}",
+                quarantined_names(dir.path())
+            );
+        }
+        assert_eq!(quarantined_names(dir.path()), Vec::<String>::new());
+    }
+
+    /// The same race for an index sidecar, which a flush writes as
+    /// `.fti-{gen}-{index}.{pid}.tmp` before renaming it live. RED before the
+    /// fix: the sweep quarantines every `.tmp` regardless of its owner.
+    #[test]
+    fn constructing_a_flush_target_spares_this_process_sidecar_in_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir
+            .path()
+            .join(format!(".fti-7-by_name.{}.tmp", std::process::id()));
+        std::fs::write(&sidecar, b"sidecar being written").unwrap();
+
+        let _target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+
+        assert!(
+            sidecar.exists(),
+            "a live sidecar write was swept; quarantine={:?}",
+            quarantined_names(dir.path())
+        );
+    }
+
+    /// Guard for the fix above, not a red: sparing this process's staging must
+    /// not spare debris an EARLIER process left, whether it carries that
+    /// process's pid or predates owner-tagged names.
+    #[test]
+    fn constructing_a_flush_target_quarantines_another_process_staged_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let other_pid = std::process::id().wrapping_add(1);
+        let tagged = format!("7-Data.db.{other_pid}.tmp");
+        let sidecar = format!(".fti-7-by_name.{other_pid}.tmp");
+        for name in [tagged.as_str(), sidecar.as_str(), "8-Data.db.tmp"] {
+            std::fs::write(dir.path().join(name), b"left by a crashed process").unwrap();
+        }
+
+        let _target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+
+        let mut quarantined = quarantined_names(dir.path());
+        quarantined.sort();
+        let mut expected = vec![tagged, sidecar, "8-Data.db.tmp".to_string()];
+        expected.sort();
+        assert_eq!(quarantined, expected);
+    }
+
     #[test]
     fn flush_uses_atomic_rename() {
         // After a successful flush, no .tmp files should remain
@@ -4415,22 +4529,22 @@ mod tests {
         let gen = target.generation();
 
         let synced = fsync_probe::synced_files();
+        let staged = FileFlushTarget::tmp_component_paths(&target.component_paths(gen));
         let mut expected = vec![
-            "Data.db.tmp",
-            "Partitions.db.tmp",
-            "Rows.db.tmp",
-            "Filter.db.tmp",
-            "Statistics.db.tmp",
-            "TOC.txt.tmp",
+            staged.data,
+            staged.partitions,
+            staged.rows,
+            staged.filter,
+            staged.statistics,
+            staged.toc,
         ];
         if has_ci {
-            expected.push("CompressionInfo.db.tmp");
+            expected.push(staged.compression_info);
         }
-        for suffix in expected {
-            let path = dir.path().join(format!("{gen}-{suffix}"));
+        for path in expected {
             assert!(
                 synced.contains(&path),
-                "staged component {suffix} was not fsynced before verify; synced={synced:?}"
+                "staged component {path:?} was not fsynced before verify; synced={synced:?}"
             );
         }
 
@@ -4551,10 +4665,11 @@ mod tests {
             "a refused flush must never leave *-Data.db under a live name: {live_data:?}"
         );
 
+        let staged_data = FileFlushTarget::tmp_component_paths(&target.component_paths(gen)).data;
         let quarantined_data = dir
             .path()
             .join("quarantine")
-            .join(format!("{gen}-Data.db.tmp"));
+            .join(staged_data.file_name().unwrap());
         assert!(
             quarantined_data.exists(),
             "the refused staged Data.db must be quarantined for salvage: {quarantined_data:?}"
@@ -4850,10 +4965,11 @@ mod tests {
             !dir.path().join(format!("{gen}-Data.db")).exists(),
             "a bit-flipped flush must never be promoted to a live name"
         );
+        let staged_data = FileFlushTarget::tmp_component_paths(&target.component_paths(gen)).data;
         assert!(
             dir.path()
                 .join("quarantine")
-                .join(format!("{gen}-Data.db.tmp"))
+                .join(staged_data.file_name().unwrap())
                 .exists(),
             "the refused staged Data.db must be quarantined for salvage"
         );
