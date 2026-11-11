@@ -1058,6 +1058,15 @@ impl PeerManager {
     }
 
     /// Called when recent successful peer traffic proves the connection is alive.
+    /// When `host_id` was last active, on [`Self::now_ms`]'s clock.
+    #[cfg(test)]
+    async fn last_activity_ms(&self, host_id: uuid::Uuid) -> Option<u64> {
+        let peers = self.peers.read().await;
+        peers
+            .get(&host_id)
+            .map(|state| state.last_activity_ms.load(Ordering::Relaxed))
+    }
+
     pub async fn record_activity(&self, host_id: uuid::Uuid) {
         let peers = self.peers.read().await;
         if let Some(state) = peers.get(&host_id) {
@@ -1413,12 +1422,16 @@ mod tests {
         );
     }
 
+    /// A successful request stamps the peer's activity. Together with
+    /// `recent_peer_activity_keeps_peer_alive` (activity holds off suspicion,
+    /// on a paused clock) this is "request traffic counts as liveness". The
+    /// test used to run the heartbeat loop with real 90 ms sleeps against a
+    /// 300 ms timeout, which a loaded host overshoots (t_68b0a1df); comparing
+    /// stamps has no timing margin to lose.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn successful_send_refreshes_peer_activity() {
         let config = NetConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
-            heartbeat_interval: Duration::from_millis(100),
-            heartbeat_timeout: Duration::from_millis(300),
             ..NetConfig::default()
         };
 
@@ -1435,24 +1448,31 @@ mod tests {
             listener.clone(),
         ));
         pm.ensure_peer(server_id, &addr.to_string()).await.unwrap();
+        let registered_at = pm.last_activity_ms(server_id).await.expect("peer entry");
 
-        let pm_clone = pm.clone();
-        tokio::spawn(async move { pm_clone.run_heartbeat_loop().await });
+        // Any wait works; it only has to move the millisecond clock.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let before_send = pm.now_ms();
+        assert!(before_send > registered_at, "the clock did not move");
+        let resp = pm
+            .send(
+                server_id,
+                Message::Ping {
+                    nonce: 1,
+                    sent_at: 0,
+                },
+                Lane::Data,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(resp, Message::Pong { .. }));
 
-        for nonce in 0..6 {
-            tokio::time::sleep(Duration::from_millis(90)).await;
-            let resp = pm
-                .send(server_id, Message::Ping { nonce, sent_at: 0 }, Lane::Data)
-                .await
-                .unwrap();
-            assert!(matches!(resp, Message::Pong { .. }));
-        }
-
-        assert_eq!(
-            listener.suspected_count.load(Ordering::Relaxed),
-            0,
-            "successful send/response traffic should refresh peer liveness"
+        let stamped = pm.last_activity_ms(server_id).await.expect("peer entry");
+        assert!(
+            stamped >= before_send,
+            "a successful send did not refresh activity: stamped {stamped} ms, sent at {before_send} ms"
         );
+        assert_eq!(listener.suspected_count.load(Ordering::Relaxed), 0);
 
         pm.remove_peer(server_id).await;
         server.shutdown(Duration::from_millis(50)).await;

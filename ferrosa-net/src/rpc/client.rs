@@ -257,6 +257,16 @@ impl RpcClient {
         tls_connector: Option<&tokio_rustls::TlsConnector>,
         task_pool: TaskPool,
     ) -> Result<Self> {
+        // Tests on a paused clock dial in-memory addresses; see `mem_net`.
+        #[cfg(test)]
+        if let Some(stream) = crate::mem_net::connect(peer_addr) {
+            assert!(
+                tls_connector.is_none(),
+                "the in-memory network carries no TLS"
+            );
+            let framed = Framed::new(stream?, InternodeCodec::new(config.max_frame_body_size));
+            return Self::finish_connect(config, local_host_id, peer_addr, framed, task_pool).await;
+        }
         // Bounded: an unroutable or SYN-dropping peer would otherwise hang here
         // for the OS connect timeout (minutes), stalling every retry loop.
         let tcp_stream =

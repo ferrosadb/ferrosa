@@ -853,14 +853,18 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_reconnect_exits_before_first_attempt() {
-        let before = total_reconnect_attempts();
+        // Dials are counted at the peer: the process-wide attempt counter is
+        // bumped by every other reconnect test running in parallel, so it can
+        // move during this test without this test dialing anything.
+        let addr = crate::mem_net::free_addr();
+        let mut peer = crate::mem_net::MemListener::bind(addr).expect("bind peer");
         let cancelled = Arc::new(AtomicBool::new(true));
         let start = std::time::Instant::now();
 
         let result = connect_with_retry_cancelable(
             Arc::new(NetConfig::default()),
             Uuid::new_v4(),
-            "127.0.0.1:9",
+            &addr.to_string(),
             Lane::Data,
             None,
             Some(cancelled),
@@ -873,10 +877,9 @@ mod tests {
             start.elapsed() < Duration::from_millis(100),
             "cancelled reconnect should not wait for backoff"
         );
-        assert_eq!(
-            total_reconnect_attempts(),
-            before,
-            "cancelled reconnect should not record an attempt"
+        assert!(
+            peer.try_accept().is_none(),
+            "cancelled reconnect should not dial the peer"
         );
     }
 

@@ -246,6 +246,15 @@ External: `tokio`, `tokio-util`, `bytes`, `capnp`/`capnpc`, `rustls` +
 end-to-end `integration.rs`, and `reconnect_backoff.rs`). No `#[ignore]`, no
 `TODO`/`FIXME`/`unimplemented!` in `src/`.
 
+Tests on tokio's paused clock must not wait on real sockets: a paused clock
+jumps to the next timer whenever no task is runnable, and a task waiting on
+the kernel for a loopback byte is not runnable, so under CPU load a dial loses
+to its own virtual timeout (t_68b0a1df). The test-only `mem_net` module serves
+TEST-NET-2 addresses (198.51.100.0/24) in memory: `RpcClient` dials them over a
+`tokio::io::duplex` pipe, and `mem_net::MemListener` accepts them. The
+slow-retry lane tests use it; the `peer.rs` outage tests still use loopback
+with a real `RpcServer` (t_cfdc0f61).
+
 ## Specs
 
 - [Architecture overview](specs/overview.md) — module map, invariants, position
