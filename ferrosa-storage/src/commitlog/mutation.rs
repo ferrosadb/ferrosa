@@ -351,6 +351,18 @@ fn cell_size(cell: &CellValue) -> usize {
     header + value_bytes + path_bytes
 }
 
+/// [`row_size`] of a purged view.
+fn purged_row_size(row: &crate::compaction::purge::PurgedRow<'_>) -> usize {
+    byte_vec_size(row.clustering())
+        + 8
+        + 4
+        + 8
+        + 4
+        + 4
+        + 2
+        + row.cells().map(|(_, cell)| cell_size(cell)).sum::<usize>()
+}
+
 /// Size of a single serialized row.
 fn row_size(row: &Row) -> usize {
     let mut size = 0;
@@ -516,6 +528,75 @@ impl Mutation {
             Self::serialize_row(&mut w, row);
         }
         Ok(buf)
+    }
+
+    /// [`Self::serialize_borrowed_rows`] of each row as `policy` would purge
+    /// it, without copying any row. A row the purge leaves vacant is left out.
+    /// A read repair uses it to send a replica only what that replica could not
+    /// drop on its own ([`crate::compaction::purge::repair_guard`]). With
+    /// nothing purgeable the bytes equal `serialize_borrowed_rows`. `None` when
+    /// the purge leaves no row: there is nothing to write.
+    pub fn serialize_purged_rows(
+        mutation_id: [u8; 16],
+        keyspace: &str,
+        table: &str,
+        key: &DecoratedKey,
+        timestamp: i64,
+        rows: &[&Row],
+        policy: &crate::compaction::purge::PurgePolicy,
+    ) -> Result<Option<Vec<u8>>> {
+        use crate::compaction::purge::PurgedRow;
+        let kept = || {
+            rows.iter()
+                .map(|row| PurgedRow::new(row, policy))
+                .filter(|view| !view.is_vacant())
+        };
+        let kept_rows = kept().count();
+        if kept_rows == 0 {
+            return Ok(None);
+        }
+        let row_count =
+            u16::try_from(kept_rows).map_err(|_| MutationError::TooManyRows { rows: kept_rows })?;
+        let size = 16
+            + string_size(keyspace)
+            + string_size(table)
+            + byte_vec_size(key.key.as_bytes())
+            + 8
+            + 8
+            + 2
+            + kept().map(|view| purged_row_size(&view)).sum::<usize>();
+        let mut buf = vec![0u8; size];
+        let mut w = WriteCursor::new(&mut buf);
+        w.write_bytes(&mutation_id);
+        w.write_string(keyspace);
+        w.write_string(table);
+        w.write_byte_vec(key.key.as_bytes());
+        w.write_i64(key.token.0);
+        w.write_i64(timestamp);
+        w.write_u16(row_count);
+        for view in kept() {
+            Self::serialize_purged_row(&mut w, &view);
+        }
+        Ok(Some(buf))
+    }
+
+    /// [`Self::serialize_row`] over a purged view: the same layout.
+    fn serialize_purged_row(
+        w: &mut WriteCursor<'_>,
+        row: &crate::compaction::purge::PurgedRow<'_>,
+    ) {
+        w.write_byte_vec(row.clustering());
+        let deletion = row.deletion();
+        w.write_i64(deletion.marked_for_delete_at);
+        w.write_u32(deletion.local_deletion_time);
+        let liveness = row.liveness();
+        w.write_i64(liveness.timestamp);
+        w.write_i32(liveness.ttl);
+        w.write_i32(liveness.local_deletion_time);
+        w.write_u16(row.cells().count() as u16);
+        for (column_index, cell) in row.cells() {
+            Self::serialize_cell(w, *column_index, cell);
+        }
     }
 
     fn serialize_row(w: &mut WriteCursor<'_>, row: &Row) {
@@ -959,6 +1040,124 @@ mod tests {
         let mut owned = vec![0u8; m.serialized_size()];
         m.serialize_into(&mut owned);
         assert_eq!(borrowed, owned);
+    }
+
+    fn purge_policy(gc_before: i64, guard: i64) -> crate::compaction::purge::PurgePolicy {
+        crate::compaction::purge::PurgePolicy {
+            gc_before,
+            max_purgeable_timestamp: guard,
+            table_delete: DeletionTime::LIVE,
+        }
+    }
+
+    fn serialize_purged(m: &Mutation, rows: &[Row], guard: i64) -> Vec<u8> {
+        let refs: Vec<&Row> = rows.iter().collect();
+        Mutation::serialize_purged_rows(
+            m.mutation_id,
+            &m.keyspace,
+            &m.table,
+            &m.key,
+            m.timestamp,
+            &refs,
+            &purge_policy(1_000_000, guard),
+        )
+        .unwrap()
+        .expect("a row survives the purge")
+    }
+
+    #[test]
+    fn purged_rows_with_nothing_purgeable_serialize_like_borrowed_rows() {
+        let m = simple_mutation();
+        let refs: Vec<&Row> = m.rows.iter().collect();
+        let borrowed = Mutation::serialize_borrowed_rows(
+            m.mutation_id,
+            &m.keyspace,
+            &m.table,
+            &m.key,
+            m.timestamp,
+            &refs,
+        )
+        .unwrap();
+        assert_eq!(serialize_purged(&m, &m.rows, i64::MAX), borrowed);
+    }
+
+    #[test]
+    fn purged_rows_with_nothing_left_are_not_a_mutation() {
+        let m = simple_mutation();
+        let expired = Row {
+            clustering: b"expired".to_vec(),
+            cells: vec![(0, CellValue::expiring(b"x".to_vec(), 500, 60, 900_000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_ttl(500, 60, 900_000),
+        };
+        let body = Mutation::serialize_purged_rows(
+            m.mutation_id,
+            &m.keyspace,
+            &m.table,
+            &m.key,
+            m.timestamp,
+            &[&expired],
+            &purge_policy(1_000_000, 1_000),
+        )
+        .unwrap();
+        assert_eq!(body, None);
+    }
+
+    #[test]
+    fn purged_rows_serialize_what_purge_partition_leaves() {
+        let m = simple_mutation();
+        let old_ldt = 900_000;
+        let expired = Row {
+            clustering: b"expired".to_vec(),
+            cells: vec![(0, CellValue::expiring(b"x".to_vec(), 500, 60, old_ldt))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_ttl(500, 60, old_ldt),
+        };
+        let guarded = Row {
+            clustering: b"guarded".to_vec(),
+            cells: vec![(0, CellValue::tombstone(5_000, old_ldt))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::NONE,
+        };
+        let mixed = Row {
+            clustering: b"mixed".to_vec(),
+            cells: vec![
+                (0, CellValue::live(b"v".to_vec(), 900)),
+                (1, CellValue::tombstone(800, old_ldt)),
+            ],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(900),
+        };
+        let deletion_marker = Row {
+            clustering: Vec::new(),
+            cells: Vec::new(),
+            deletion: DeletionTime {
+                marked_for_delete_at: 100,
+                local_deletion_time: old_ldt as u32,
+            },
+            primary_key_liveness: LivenessInfo::NONE,
+        };
+        let rows = vec![deletion_marker, expired, guarded.clone(), mixed.clone()];
+
+        let mut purged_mixed = mixed;
+        purged_mixed.cells.truncate(1);
+        let expected_rows = [guarded, purged_mixed];
+        let expected = Mutation::serialize_borrowed_rows(
+            m.mutation_id,
+            &m.keyspace,
+            &m.table,
+            &m.key,
+            m.timestamp,
+            &expected_rows.iter().collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(
+            serialize_purged(&m, &rows, 1_000),
+            expected,
+            "the deletion marker and the expired row go; the tombstone above the guard stays"
+        );
+        let decoded = Mutation::deserialize_from(&expected).unwrap();
+        assert_eq!(decoded.rows.len(), 2);
     }
 
     #[test]
