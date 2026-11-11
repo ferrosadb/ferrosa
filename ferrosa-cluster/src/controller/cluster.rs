@@ -2208,7 +2208,9 @@ impl ModeController {
         self.registry
             .register(MsgType::ReadRequest, read_handler.clone());
         self.registry
-            .register(MsgType::PartitionSuffixReadRequest, read_handler);
+            .register(MsgType::PartitionSuffixReadRequest, read_handler.clone());
+        self.registry
+            .register(MsgType::PurgedReadRequest, read_handler);
 
         // Register batchlog handlers — without these, logged batch writes
         // sent to remote nodes are silently dropped.

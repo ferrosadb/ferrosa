@@ -518,8 +518,13 @@ build; the codec's own cost is its delta against `none`.
 - `coordinator/write.rs` — replica fan-out with `cl.block_for(rf)` ack threshold,
   NTS / `LOCAL_QUORUM` / `EACH_QUORUM` per-DC variants, hinted handoff for failed
   replicas, post-quorum hint drain, lazy mutation encoding.
-- `coordinator/read.rs` — two-phase digest reads, inline read repair on digest
-  mismatch (fail-loud `ReadTimeout` rather than serve stale), corrupt-SSTable
+- `coordinator/read.rs` — two-phase digest reads over the purged view (CL-80),
+  inline read repair on digest mismatch (fail-loud `ReadTimeout` rather than serve
+  stale) that sends each target only what it cannot drop itself, judged by the
+  guard of its own response (CL-81), remote whole-partition full reads answered
+  without what the replica would compact away (`PurgedReadRequest`, gated on
+  `CAP_PURGED_READ`, re-read in full when that could resurrect data, CL-82),
+  corrupt-SSTable
   failover feeding the bounded `AntiEntropyRepairQueue` (cap 1024) — *serve now,
   repair in background* (LOCKED DESIGN). Unbounded single-partition reads use
   the `Bulk` internode lane for every remote page, while LIMIT-bounded and exact

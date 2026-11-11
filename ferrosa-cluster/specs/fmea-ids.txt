@@ -79,4 +79,7 @@ CL-77 36b4236eed78fbdd ddl acknowledged on direct before cluster path publicatio
 CL-78 c40751d1078df456 a refused ring admission was dropped during formation
 CL-79 5f831fe29d802273 a released build cannot read its predecessor's raft state
 CL-8 428c816deab66621 anti-entropy repair queue overflow under sustained corruptio...
+CL-80 03eeeaa058effded a purge on one replica read as a divergence (t070de13e)
+CL-81 beb59aad42107076 read repair wrote purged data back (t1953ebc0)
+CL-82 3e112aa8abd0d5b6 a full-read response shipped purged data (t1953ebc0)
 CL-9 86433555d77b4df2 formation timeout falls back to pair (silent durability redu...
