@@ -47,12 +47,54 @@ pub trait InboundPeerCallback: Send + Sync {
     );
 }
 
+/// Whether the server's listening socket is open. `shutdown` waits for
+/// `Closed`, so the port is free when it returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListenerState {
+    NotStarted,
+    Listening,
+    Closed,
+}
+
+/// The bound listening socket, owned by the accept loop. Dropping it closes
+/// the socket and THEN marks the listener `Closed`, whether the accept loop
+/// exited or its task was dropped unpolled (a runtime shutting down), so
+/// `shutdown` never waits on a listener that is already gone.
+struct BoundListener {
+    listener: Option<TcpListener>,
+    state: Arc<tokio::sync::watch::Sender<ListenerState>>,
+}
+
+impl BoundListener {
+    fn new(listener: TcpListener, state: Arc<tokio::sync::watch::Sender<ListenerState>>) -> Self {
+        state.send_replace(ListenerState::Listening);
+        Self {
+            listener: Some(listener),
+            state,
+        }
+    }
+
+    fn get(&self) -> &TcpListener {
+        self.listener
+            .as_ref()
+            .expect("the listener is only taken in drop")
+    }
+}
+
+impl Drop for BoundListener {
+    fn drop(&mut self) {
+        drop(self.listener.take());
+        self.state.send_replace(ListenerState::Closed);
+    }
+}
+
 pub struct RpcServer {
     config: Arc<NetConfig>,
     local_host_id: uuid::Uuid,
     registry: Arc<HandlerRegistry>,
     active_connections: Arc<AtomicUsize>,
     cancel: CancellationToken,
+    listener_state: Arc<tokio::sync::watch::Sender<ListenerState>>,
     bound_addr: tokio::sync::watch::Sender<Option<std::net::SocketAddr>>,
     #[allow(dead_code)]
     bound_addr_rx: tokio::sync::watch::Receiver<Option<std::net::SocketAddr>>,
@@ -78,6 +120,7 @@ impl RpcServer {
             registry,
             active_connections: Arc::new(AtomicUsize::new(0)),
             cancel: CancellationToken::new(),
+            listener_state: Arc::new(tokio::sync::watch::channel(ListenerState::NotStarted).0),
             bound_addr,
             bound_addr_rx,
             inbound_callback: None,
@@ -113,20 +156,36 @@ impl RpcServer {
         TaskPool::from_optional_runtime("internode-raft", self.raft_runtime.clone())
     }
 
-    /// Signal the server to stop accepting new connections and wait for in-flight
-    /// connections to drain, up to `drain_timeout`. Any connections still active after
-    /// the timeout are abandoned (the OS will close the socket).
+    /// Stop accepting, wait for the listening socket to close, then wait for
+    /// in-flight connections to drain, all within `drain_timeout`. When this
+    /// returns without a warning the port is free and no connection is being
+    /// served. Connections still active at the deadline are abandoned (the OS
+    /// closes their sockets), and that is logged with how many there were.
     ///
     /// # Cancel Safety
     ///
-    /// This method is cancel-safe. Shutdown is signalled via `CancellationToken::cancel`,
-    /// which is an instantaneous, idempotent operation. In-flight connections run to
-    /// completion within the drain window regardless of whether this future is dropped.
+    /// Cancel-safe. Shutdown is signalled via `CancellationToken::cancel`, an
+    /// instantaneous, idempotent operation. In-flight connections run to
+    /// completion within the drain window whether or not this future is dropped.
     pub async fn shutdown(&self, drain_timeout: Duration) {
         self.cancel.cancel();
-        tokio::time::timeout(drain_timeout, self.wait_for_connections())
-            .await
-            .ok();
+        let mut listener = self.listener_state.subscribe();
+        let drained = tokio::time::timeout(drain_timeout, async {
+            // The sender lives in `self`, so this cannot see a closed channel.
+            let _ = listener
+                .wait_for(|state| *state != ListenerState::Listening)
+                .await;
+            self.wait_for_connections().await;
+        })
+        .await;
+        if drained.is_err() {
+            tracing::warn!(
+                listener = ?*self.listener_state.borrow(),
+                active_connections = self.active_connections.load(Ordering::Acquire),
+                ?drain_timeout,
+                "RpcServer shutdown: drain deadline passed; abandoning what is left"
+            );
+        }
     }
 
     /// Busy-poll until no active connections remain.
@@ -172,6 +231,7 @@ impl RpcServer {
                                 return;
                             }
                         };
+                        let listener = BoundListener::new(listener, Arc::clone(&server.listener_state));
                         if let Err(e) = bound_addr_tx.send(Some(addr)) {
                             // Receiver gone — parent gave up before bind completed.
                             // Continue serving anyway (some other peer may still
@@ -235,6 +295,9 @@ impl RpcServer {
                     "bound_addr update had no subscribers (synchronous start path)"
                 );
             }
+            // Marked listening before `start` returns, so a `shutdown` right
+            // after it waits on this socket even if the loop has not run yet.
+            let listener = BoundListener::new(listener, Arc::clone(&self.listener_state));
             tracing::info!(%addr, "internode server listening");
             data_task_pool.spawn(async move { server.accept_loop(listener, tls_acceptor).await });
             Ok(addr)
@@ -243,16 +306,19 @@ impl RpcServer {
 
     async fn accept_loop(
         self: Arc<Self>,
-        listener: TcpListener,
+        listener: BoundListener,
         tls_acceptor: Option<TlsAcceptor>,
     ) {
         loop {
+            // Biased: once shutdown is signalled no further connection is
+            // accepted, even one already waiting in the backlog.
             let (stream, peer_addr) = tokio::select! {
+                biased;
                 _ = self.cancel.cancelled() => {
                     tracing::info!("RpcServer: stopping accept loop");
                     break;
                 }
-                result = listener.accept() => {
+                result = listener.get().accept() => {
                     match result {
                         Ok(conn) => conn,
                         Err(e) => {
@@ -756,6 +822,29 @@ mod tests {
         let resp =
             Message::decode(resp_frame.header.msg_type, &mut resp_frame.body.clone()).unwrap();
         assert!(matches!(resp, Message::Pong { nonce: 42, .. }));
+    }
+
+    /// When `shutdown` returns, the listening socket is closed: the address can
+    /// be bound again at once, which is what a restarting node does. Before the
+    /// fix `shutdown` only signalled the accept loop, so the listener outlived
+    /// it and a connect landed in its backlog (t_68b0a1df).
+    #[tokio::test]
+    async fn the_listener_is_closed_when_shutdown_returns() {
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+        let registry = Arc::new(HandlerRegistry::new());
+        let server = Arc::new(RpcServer::new(config, uuid::Uuid::new_v4(), registry));
+        let addr = server.start_and_get_addr().await.unwrap();
+
+        server.shutdown(Duration::from_millis(200)).await;
+
+        let rebound = std::net::TcpListener::bind(addr);
+        assert!(
+            rebound.is_ok(),
+            "the server's listener was still open after shutdown returned: {rebound:?}"
+        );
     }
 
     /// After shutdown(), the listener should stop accepting new connections.
