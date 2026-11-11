@@ -119,6 +119,10 @@ pub enum MsgType {
     /// `ReadRequest` so mixed-version peers reject unsupported semantics
     /// instead of silently executing a prefix read.
     PartitionSuffixReadRequest = 0x2F,
+    /// Whole-partition full read whose answer leaves out what the replica's
+    /// own compaction would drop (CL-82). Sent only to a peer that advertised
+    /// [`crate::handshake::CAP_PURGED_READ`]; the reply is a `ReadResponse`.
+    PurgedReadRequest = 0x4D,
     // ADR-020 streaming range read — multi-message RPC keyed by
     // request_id, terminated by RangeReadStreamDone, cancellable via
     // RangeReadStreamCancel, kept alive by RangeReadStreamHeartbeat.
@@ -310,6 +314,7 @@ impl TryFrom<u8> for MsgType {
             0x2D => Ok(Self::RepairApplyRequest),
             0x2E => Ok(Self::RepairApplyResponse),
             0x2F => Ok(Self::PartitionSuffixReadRequest),
+            0x4D => Ok(Self::PurgedReadRequest),
             0x30 => Ok(Self::StreamStart),
             0x31 => Ok(Self::StreamChunk),
             0x32 => Ok(Self::StreamEnd),

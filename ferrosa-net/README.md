@@ -80,6 +80,10 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   `ClusterMembershipForward` (`0x82`), so a forwarded schema/membership op travels
   capnp and falls back to the shipped bincode body for any peer without the bit (a
   versioned magic on the body tells the receiver which it is);
+  `CAP_PURGED_READ` (1<<9) — the peer serves `PurgedReadRequest` (`0x4D`), a
+  whole-partition full read answered without what its own compaction would drop,
+  so the coordinator sends it only to a peer with the bit and the plain
+  `ReadRequest` to any other;
   `CAP_RESULT_CURSOR_PAGE`
   `CAP_PAIR_DISSOLVE` gates `PairDissolve` / `PairDissolveAck` (0x4A/0x4B),
   phase 1 of the operator downgrade from cluster to pair (t_47bbeb66).

@@ -190,6 +190,10 @@ pub enum Message {
     /// Older peers reject the unknown message type and cannot accidentally
     /// reinterpret it as a legacy prefix read.
     PartitionSuffixReadRequest(Bytes),
+    /// Additive request type for a full read that leaves out what the replica
+    /// would compact away. Sent only to a peer advertising
+    /// [`crate::handshake::CAP_PURGED_READ`].
+    PurgedReadRequest(Bytes),
     RepairWrite(Bytes),
     RangeReadRequest(Bytes),
     RangeReadResponse(Bytes),
@@ -409,6 +413,7 @@ impl Message {
             Self::ReadRequest(_) => MsgType::ReadRequest,
             Self::ReadResponse(_) => MsgType::ReadResponse,
             Self::PartitionSuffixReadRequest(_) => MsgType::PartitionSuffixReadRequest,
+            Self::PurgedReadRequest(_) => MsgType::PurgedReadRequest,
             Self::RepairWrite(_) => MsgType::RepairWrite,
             Self::RangeReadRequest(_) => MsgType::RangeReadRequest,
             Self::RangeReadResponse(_) => MsgType::RangeReadResponse,
@@ -602,6 +607,7 @@ impl Message {
             | Self::ReadRequest(b)
             | Self::ReadResponse(b)
             | Self::PartitionSuffixReadRequest(b)
+            | Self::PurgedReadRequest(b)
             | Self::RepairWrite(b)
             | Self::RangeReadRequest(b)
             | Self::RangeReadResponse(b)
@@ -832,6 +838,7 @@ impl Message {
             MsgType::PartitionSuffixReadRequest => {
                 Self::PartitionSuffixReadRequest(body.split_to(body.remaining()))
             }
+            MsgType::PurgedReadRequest => Self::PurgedReadRequest(body.split_to(body.remaining())),
             MsgType::RepairWrite => Self::RepairWrite(body.split_to(body.remaining())),
             MsgType::RangeReadRequest => Self::RangeReadRequest(body.split_to(body.remaining())),
             MsgType::RangeReadResponse => Self::RangeReadResponse(body.split_to(body.remaining())),
@@ -1475,6 +1482,28 @@ mod tests {
                 | 0x80..=0x83
         );
         assert!(!legacy_knows);
+    }
+
+    /// The purged full read is its own message type, outside every range a
+    /// build before it decodes, so it can only reach a peer that advertised
+    /// `CAP_PURGED_READ` and never a legacy read handler.
+    #[test]
+    fn purged_read_uses_additive_message_type() {
+        let payload = Bytes::from_static(b"purged-v1");
+        let message = Message::PurgedReadRequest(payload.clone());
+        assert_eq!(message.msg_type(), MsgType::PurgedReadRequest);
+        assert_eq!(MsgType::PurgedReadRequest as u8, 0x4D);
+        assert_eq!(MsgType::try_from(0x4D).unwrap(), MsgType::PurgedReadRequest);
+
+        let mut body = BytesMut::new();
+        message.encode(&mut body).unwrap();
+        let decoded = Message::decode(MsgType::PurgedReadRequest, &mut body.freeze()).unwrap();
+        assert_eq!(decoded, Message::PurgedReadRequest(payload));
+        assert_ne!(
+            crate::handshake::LOCAL_CAPABILITIES & crate::handshake::CAP_PURGED_READ,
+            0,
+            "this build serves the purged read and must say so"
+        );
     }
 
     #[test]
