@@ -494,6 +494,10 @@ impl FerrosStateMachine {
     /// The synchronous transition runs against a staged metadata copy. A
     /// detached waiter leaves the owned handle here, so the next trait call
     /// reaps it before exposing an applied index or constructing a snapshot.
+    fn snapshot_refusal(error: super::quarantine::RecoveryRefusal) -> StorageIOError<u64> {
+        StorageIOError::read_state_machine(to_any_error(std::io::Error::other(error.to_string())))
+    }
+
     fn staged_apply(&self) -> Self {
         Self {
             state: self.state.clone(),
@@ -2535,8 +2539,16 @@ impl Default for FerrosStateMachine {
 
 impl RaftSnapshotBuilder<FerrosRaftConfig> for FerrosStateMachine {
     async fn build_snapshot(&mut self) -> Result<Snapshot<FerrosRaftConfig>, StorageError<u64>> {
+        let admission = Arc::clone(&self.recovery_admission);
+        let epoch = admission.epoch();
+        admission
+            .admits_epoch(epoch)
+            .map_err(Self::snapshot_refusal)?;
         let physical = self.physical_admission().map_err(|error| *error)?;
         self.finish_pending_apply().await.map_err(|error| *error)?;
+        admission
+            .admits_epoch(epoch)
+            .map_err(Self::snapshot_refusal)?;
         let data = SnapshotData {
             state: self.state.clone(),
             last_applied: self.last_applied,
@@ -2558,13 +2570,10 @@ impl RaftSnapshotBuilder<FerrosRaftConfig> for FerrosStateMachine {
             snapshot_id,
         };
 
-        // Publish to the slot this builder shares with the live state machine
-        // BEFORE persisting and before `mark_durably_applied` lets the log
-        // store purge up to this index (D1): replication must already be able
-        // to serve a snapshot covering anything that may be purged. If a newer
-        // snapshot was installed meanwhile, the slot keeps it, and the
-        // watermark below is monotonic, so it never exceeds the slot either.
-        self.publish_snapshot(meta.clone(), bytes.clone());
+        // Keep blocking file IO outside the admission transition lock. The
+        // completed file cannot authorize purge or an exported snapshot unless
+        // this same epoch is still healthy when publication linearizes.
+        let persisted = self.snapshot_path.is_some();
         if let Some(path) = self.snapshot_path.clone() {
             let meta_for_disk = meta.clone();
             let disk_lifecycle = Arc::clone(&self.physical_lifecycle);
@@ -2582,8 +2591,18 @@ impl RaftSnapshotBuilder<FerrosRaftConfig> for FerrosStateMachine {
                 })
                 .await
                 .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))??;
-            self.mark_durably_applied(meta.last_log_id);
         }
+
+        admission
+            .with_admission_epoch(epoch, || {
+                // Publication precedes the watermark under one transition lease:
+                // anything purge may remove already has an exportable snapshot.
+                self.publish_snapshot(meta.clone(), bytes.clone());
+                if persisted {
+                    self.mark_durably_applied(meta.last_log_id);
+                }
+            })
+            .map_err(Self::snapshot_refusal)?;
 
         Ok(Snapshot {
             meta,
@@ -2850,13 +2869,21 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<FerrosRaftConfig>>, StorageError<u64>> {
+        let admission = Arc::clone(&self.recovery_admission);
+        let epoch = admission.epoch();
+        admission
+            .admits_epoch(epoch)
+            .map_err(Self::snapshot_refusal)?;
         self.finish_pending_apply().await.map_err(|error| *error)?;
-        Ok(self
-            .current_snapshot_cloned()
-            .map(|(meta, bytes)| Snapshot {
-                meta,
-                snapshot: Box::new(Cursor::new(bytes)),
-            }))
+        admission
+            .with_admission_epoch(epoch, || {
+                self.current_snapshot_cloned()
+                    .map(|(meta, bytes)| Snapshot {
+                        meta,
+                        snapshot: Box::new(Cursor::new(bytes)),
+                    })
+            })
+            .map_err(|error| Self::snapshot_refusal(error).into())
     }
 }
 
@@ -4217,6 +4244,95 @@ mod tests {
     /// The durable snapshot may lag a successfully applied DROP/CREATE and
     /// durable user writes in the new UUID. Startup has no authority to erase
     /// that UUID merely to install the older metadata before log replay.
+    #[tokio::test]
+    async fn quarantine_gate_refuses_snapshot_builder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quarantine.snapshot.bin");
+        let mut sm = FerrosStateMachine::with_snapshot_path(path.clone());
+        let admission = Arc::new(super::super::quarantine::RecoveryAdmission::new());
+        sm.set_recovery_admission(Arc::clone(&admission));
+        let watermark = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        sm.set_durable_applied_handle(Arc::clone(&watermark));
+        sm.apply(vec![make_entry(
+            1,
+            1,
+            RaftOp::CreateKeyspace(simple_keyspace("quarantine_ks")),
+        )])
+        .await
+        .unwrap();
+        let mut builder = sm.get_snapshot_builder().await;
+        admission.quarantine("owned-raft-group", "owned inconsistent projection");
+        assert!(builder.build_snapshot().await.is_err(), "a builder captured before quarantine must not snapshot inconsistent state into consistency");
+        assert_eq!(watermark.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert!(!path.exists());
+        assert!(sm.current_snapshot.read().is_none());
+    }
+
+    #[tokio::test]
+    async fn quarantine_gate_during_snapshot_disk_io_cannot_authorize_purge() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("held.snapshot.bin");
+        let writer_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.path().join("held.snapshot.bin.writer.lock"))
+            .unwrap();
+        writer_lock.lock().unwrap();
+        let mut sm = FerrosStateMachine::with_snapshot_path(path);
+        let admission = Arc::new(super::super::quarantine::RecoveryAdmission::new());
+        sm.set_recovery_admission(Arc::clone(&admission));
+        let watermark = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        sm.set_durable_applied_handle(Arc::clone(&watermark));
+        sm.apply(vec![make_entry(
+            1,
+            1,
+            RaftOp::CreateKeyspace(simple_keyspace("quarantine_ks")),
+        )])
+        .await
+        .unwrap();
+        let mut builder = sm.get_snapshot_builder().await;
+        let pending = builder.build_snapshot();
+        tokio::pin!(pending);
+        // The first suspension follows ownership transfer to the blocking file
+        // job. Its real writer lock cannot finish until this fixture releases it.
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        admission.quarantine(
+            "owned-raft-group",
+            "detected while snapshot file IO was pending",
+        );
+        drop(writer_lock);
+        assert!(pending.await.is_err());
+        assert_eq!(
+            watermark.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "a completed old file write must not raise purge authority after quarantine"
+        );
+        assert!(sm.current_snapshot.read().is_none());
+    }
+
+    #[tokio::test]
+    async fn quarantine_gate_refuses_outgoing_current_snapshot() {
+        let mut sm = FerrosStateMachine::new();
+        let admission = Arc::new(super::super::quarantine::RecoveryAdmission::new());
+        sm.set_recovery_admission(Arc::clone(&admission));
+        sm.apply(vec![make_entry(
+            1,
+            1,
+            RaftOp::CreateKeyspace(simple_keyspace("quarantine_ks")),
+        )])
+        .await
+        .unwrap();
+        sm.build_snapshot().await.unwrap();
+        assert!(sm.get_current_snapshot().await.unwrap().is_some());
+        admission.quarantine("owned-raft-group", "owned inconsistency");
+        assert!(
+            sm.get_current_snapshot().await.is_err(),
+            "quarantined nodes must not export snapshots even when an older snapshot is cached"
+        );
+    }
+
     #[tokio::test]
     async fn startup_snapshot_preserves_newer_durable_incarnation_before_replay() {
         use ferrosa_common::{DecoratedKey, PartitionKey};

@@ -936,12 +936,21 @@ impl LazyRaft {
 /// reads as evidence that the leader is live.
 pub struct RaftAppendHandler {
     raft: LazyRaft,
+    recovery_admission: Arc<super::quarantine::RecoveryAdmission>,
     contact: Arc<super::leader_contact::LeaderContact>,
 }
 
 impl RaftAppendHandler {
-    pub fn new(raft: LazyRaft, contact: Arc<super::leader_contact::LeaderContact>) -> Self {
-        Self { raft, contact }
+    pub fn new(
+        raft: LazyRaft,
+        contact: Arc<super::leader_contact::LeaderContact>,
+        recovery_admission: Arc<super::quarantine::RecoveryAdmission>,
+    ) -> Self {
+        Self {
+            raft,
+            contact,
+            recovery_admission,
+        }
     }
 }
 
@@ -988,11 +997,18 @@ impl RpcHandler for RaftAppendHandler {
 /// returns the serialized vote response.
 pub struct RaftVoteHandler {
     raft: LazyRaft,
+    recovery_admission: Arc<super::quarantine::RecoveryAdmission>,
 }
 
 impl RaftVoteHandler {
-    pub fn new(raft: LazyRaft) -> Self {
-        Self { raft }
+    pub fn new(
+        raft: LazyRaft,
+        recovery_admission: Arc<super::quarantine::RecoveryAdmission>,
+    ) -> Self {
+        Self {
+            raft,
+            recovery_admission,
+        }
     }
 }
 
@@ -1041,11 +1057,18 @@ impl RpcHandler for RaftVoteHandler {
 /// persistent term state and a pre-vote must never do so.
 pub struct RaftPreVoteHandler {
     raft: LazyRaft,
+    recovery_admission: Arc<super::quarantine::RecoveryAdmission>,
 }
 
 impl RaftPreVoteHandler {
-    pub fn new(raft: LazyRaft) -> Self {
-        Self { raft }
+    pub fn new(
+        raft: LazyRaft,
+        recovery_admission: Arc<super::quarantine::RecoveryAdmission>,
+    ) -> Self {
+        Self {
+            raft,
+            recovery_admission,
+        }
     }
 }
 
@@ -1897,7 +1920,10 @@ mod tests {
     #[tokio::test]
     async fn prevote_handler_rejects_a_non_prevote_message() {
         let (_tx, lazy) = LazyRaft::channel();
-        let handler = RaftPreVoteHandler::new(lazy);
+        let handler = RaftPreVoteHandler::new(
+            lazy,
+            Arc::new(crate::raft::quarantine::RecoveryAdmission::new()),
+        );
 
         let wrong = Message::RaftVote(Bytes::from_static(b"not a prevote"));
         let out = handler.handle(make_peer_id(), wrong).await;

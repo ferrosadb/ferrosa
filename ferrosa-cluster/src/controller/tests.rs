@@ -7415,7 +7415,11 @@ mod raft_leader_liveness_after_restart {
         // Once the leader's AppendEntries arrives through the real handler,
         let (tx, lazy) = LazyRaft::channel();
         tx.send(Some(Arc::clone(&raft))).expect("publish raft");
-        let handler = RaftAppendHandler::new(lazy, controller.leader_contact());
+        let handler = RaftAppendHandler::new(
+            lazy,
+            controller.leader_contact(),
+            controller.recovery_admission(),
+        );
         let body = bytes::Bytes::from(bincode::serialize(&heartbeat()).unwrap());
         let reply = handler
             .handle(
@@ -7950,4 +7954,29 @@ async fn corrupt_persisted_restore_refuses_cluster_transition_without_erasing_ev
         raft_dir.is_dir(),
         "Do not replace or discard failed recovery evidence."
     );
+}
+
+#[tokio::test]
+async fn quarantine_gate_closes_cql_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let (controller, _, _) = boot_gate_controller(dir.path()).await;
+    assert!(controller.is_cql_ready());
+    assert!(controller.consensus_is_healthy());
+    let mode = controller.mode();
+    let admission = controller.recovery_admission();
+    admission.quarantine("owned-raft-group", "owned projection behind durable state");
+    assert!(
+        !controller.is_cql_ready(),
+        "quarantined nodes must not admit client reads or writes"
+    );
+    assert!(
+        !controller.consensus_is_healthy(),
+        "all mounted consensus admission checks must observe the shared quarantine gate"
+    );
+    assert_eq!(
+        controller.mode(),
+        mode,
+        "quarantine is not uninstall, membership removal or process shutdown"
+    );
+    assert!(controller.peer_manager.load().is_some());
 }

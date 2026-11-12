@@ -1222,4 +1222,83 @@ mod tests {
         // Just verify the call doesn't panic — the actual keepalive is set server-side
         let _ = sock_ref.keepalive();
     }
+    #[tokio::test]
+    async fn quarantine_gate_keeps_new_cql_protocol_responsive() {
+        let (state, _dir) = setup_state();
+        state.mode_controller.recovery_admission().quarantine(
+            "owned-raft-group",
+            "owned inconsistent projection at entry 7",
+        );
+        assert!(
+            state.mode_controller.consensus_health().is_healthy(),
+            "quarantine must not become an irreversible runtime-health latch"
+        );
+        let mut config = test_config(10, 64);
+        config.auth_disabled = true;
+        let server = CqlServer::new(config, state);
+        let addr = server.start_background().await.unwrap();
+
+        let mut conn = TcpStream::connect(addr).await.unwrap();
+        let (options_header, _) = send_empty_request_and_read_frame(&mut conn, 1, 0x05).await;
+        assert_eq!(options_header.opcode, Opcode::Supported);
+        assert_eq!(
+            startup_and_read_one_frame(&mut conn).await.opcode,
+            Opcode::Ready
+        );
+
+        let (query_header, query_body) =
+            send_empty_request_and_read_frame(&mut conn, 2, 0x07).await;
+        assert_eq!(query_header.opcode, Opcode::Error);
+        assert_eq!(
+            i32::from_be_bytes(query_body[..4].try_into().unwrap()),
+            0x1001,
+            "expected retriable Overloaded"
+        );
+        let message_len = u16::from_be_bytes(query_body[4..6].try_into().unwrap()) as usize;
+        let message = std::str::from_utf8(&query_body[6..6 + message_len]).unwrap();
+        assert_eq!(
+            message,
+            "node unavailable: consensus runtime failed; retry another node"
+        );
+    }
+
+    #[tokio::test]
+    async fn quarantine_gate_fences_established_cql_connection() {
+        let (state, _dir) = setup_state();
+        let mut config = test_config(10, 64);
+        config.auth_disabled = true;
+        let server = CqlServer::new(config, state.clone());
+        let addr = server.start_background().await.unwrap();
+        let mut conn = TcpStream::connect(addr).await.unwrap();
+        assert_eq!(
+            startup_and_read_one_frame(&mut conn).await.opcode,
+            Opcode::Ready
+        );
+
+        state.mode_controller.recovery_admission().quarantine(
+            "owned-raft-group",
+            "owned inconsistent projection at entry 7",
+        );
+        assert!(
+            state.mode_controller.consensus_health().is_healthy(),
+            "quarantine must not become an irreversible runtime-health latch"
+        );
+
+        let (options_header, _) = send_empty_request_and_read_frame(&mut conn, 1, 0x05).await;
+        assert_eq!(options_header.opcode, Opcode::Supported);
+
+        let (query_header, query_body) =
+            send_empty_request_and_read_frame(&mut conn, 2, 0x07).await;
+        assert_eq!(query_header.opcode, Opcode::Error);
+        assert_eq!(
+            i32::from_be_bytes(query_body[..4].try_into().unwrap()),
+            0x1001,
+            "existing connections receive retriable Overloaded"
+        );
+        let message_len = u16::from_be_bytes(query_body[4..6].try_into().unwrap()) as usize;
+        assert_eq!(
+            std::str::from_utf8(&query_body[6..6 + message_len]).unwrap(),
+            "node unavailable: consensus runtime failed; retry another node"
+        );
+    }
 }

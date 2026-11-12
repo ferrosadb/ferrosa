@@ -19,7 +19,7 @@ use openraft::error::{InstallSnapshotError, RPCError, RaftError, Unreachable};
 use openraft::network::RPCOption;
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    VoteRequest, VoteResponse,
+    PreVoteRequest, VoteRequest, VoteResponse,
 };
 use openraft::{
     BasicNode, CommittedLeaderId, LogId, RaftNetwork, RaftNetworkFactory, SnapshotMeta, Vote,
@@ -136,9 +136,16 @@ fn handler_for(msg_type: MsgType, lazy: LazyRaft) -> Arc<dyn RpcHandler> {
         MsgType::RaftAppendEntries => Arc::new(RaftAppendHandler::new(
             lazy,
             Arc::new(ferrosa_cluster::raft::leader_contact::LeaderContact::new()),
+            Arc::new(ferrosa_cluster::raft::quarantine::RecoveryAdmission::new()),
         )),
-        MsgType::RaftVote => Arc::new(RaftVoteHandler::new(lazy)),
-        MsgType::RaftPreVote => Arc::new(RaftPreVoteHandler::new(lazy)),
+        MsgType::RaftVote => Arc::new(RaftVoteHandler::new(
+            lazy,
+            Arc::new(ferrosa_cluster::raft::quarantine::RecoveryAdmission::new()),
+        )),
+        MsgType::RaftPreVote => Arc::new(RaftPreVoteHandler::new(
+            lazy,
+            Arc::new(ferrosa_cluster::raft::quarantine::RecoveryAdmission::new()),
+        )),
         MsgType::RaftInstallSnapshot => Arc::new(RaftSnapshotHandler::new(lazy)),
         other => panic!("no Raft handler for {other:?}"),
     }
@@ -349,7 +356,11 @@ async fn append_handler_records_contact_only_for_accepted_requests() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (lazy, _raft) = ready_lazy_raft(&dir).await;
     let contact = Arc::new(LeaderContact::new());
-    let handler: Arc<dyn RpcHandler> = Arc::new(RaftAppendHandler::new(lazy, Arc::clone(&contact)));
+    let handler: Arc<dyn RpcHandler> = Arc::new(RaftAppendHandler::new(
+        lazy,
+        Arc::clone(&contact),
+        Arc::new(ferrosa_cluster::raft::quarantine::RecoveryAdmission::new()),
+    ));
 
     // Given a node that has heard from nobody,
     assert_eq!(contact.last(), None);
@@ -391,4 +402,91 @@ async fn append_handler_records_contact_only_for_accepted_requests() {
         (99, 5),
         "a refused request must not overwrite contact"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quarantine_gate_refuses_append_ack_without_recording_contact() {
+    use ferrosa_cluster::raft::leader_contact::LeaderContact;
+    use ferrosa_cluster::raft::quarantine::RecoveryAdmission;
+    let dir = tempfile::tempdir().unwrap();
+    let (lazy, raft) = ready_lazy_raft(&dir).await;
+    let contact = Arc::new(LeaderContact::new());
+    let admission = Arc::new(RecoveryAdmission::new());
+    let handler: Arc<dyn RpcHandler> = Arc::new(RaftAppendHandler::new(
+        lazy,
+        Arc::clone(&contact),
+        Arc::clone(&admission),
+    ));
+    let (healthy, _) = send_to_handler(
+        MsgType::RaftAppendEntries,
+        Arc::clone(&handler),
+        heartbeat(5, 99),
+    )
+    .await;
+    assert!(matches!(healthy, Ok(Message::RaftAppendResponse(_))));
+    let before = contact.last().unwrap();
+    admission.quarantine("owned-raft-group", "owned projection quarantine");
+    let (reply, elapsed) =
+        send_to_handler(MsgType::RaftAppendEntries, handler, heartbeat(6, 99)).await;
+    let reason = expect_remote_failure(
+        &reply,
+        elapsed,
+        MsgType::RaftAppendEntries,
+        RemoteFailureKind::NotReady,
+    );
+    assert!(reason.contains("quarantin"));
+    let after = contact.last().unwrap();
+    assert_eq!((after.leader, after.term), (before.leader, before.term));
+    raft.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quarantine_gate_refuses_vote_and_prevote_rpc() {
+    use ferrosa_cluster::raft::quarantine::RecoveryAdmission;
+    let dir = tempfile::tempdir().unwrap();
+    let (lazy, raft) = ready_lazy_raft(&dir).await;
+    let admission = Arc::new(RecoveryAdmission::new());
+    let vote: Arc<dyn RpcHandler> =
+        Arc::new(RaftVoteHandler::new(lazy.clone(), Arc::clone(&admission)));
+    let prevote: Arc<dyn RpcHandler> =
+        Arc::new(RaftPreVoteHandler::new(lazy, Arc::clone(&admission)));
+    let req: VoteRequest<u64> = VoteRequest {
+        vote: Vote::new(5, 99),
+        last_log_id: None,
+    };
+    let body = Bytes::from(bincode::serialize(&req).unwrap());
+    let (healthy, _) = send_to_handler(
+        MsgType::RaftVote,
+        Arc::clone(&vote),
+        request(MsgType::RaftVote, body.clone()),
+    )
+    .await;
+    assert!(matches!(healthy, Ok(Message::RaftVoteResponse(_))));
+    let prebody = Bytes::from(
+        bincode::serialize(&PreVoteRequest::<u64> {
+            vote: Vote::new(6, 99),
+            last_log_id: None,
+        })
+        .unwrap(),
+    );
+    let (healthy_prevote, _) = send_to_handler(
+        MsgType::RaftPreVote,
+        Arc::clone(&prevote),
+        request(MsgType::RaftPreVote, prebody.clone()),
+    )
+    .await;
+    assert!(matches!(
+        healthy_prevote,
+        Ok(Message::RaftPreVoteResponse(_))
+    ));
+    admission.quarantine("owned-raft-group", "owned projection quarantine");
+    for (kind, handler, body) in [
+        (MsgType::RaftVote, vote, body),
+        (MsgType::RaftPreVote, prevote, prebody),
+    ] {
+        let (reply, elapsed) = send_to_handler(kind, handler, request(kind, body)).await;
+        let reason = expect_remote_failure(&reply, elapsed, kind, RemoteFailureKind::NotReady);
+        assert!(reason.contains("quarantin"));
+    }
+    raft.shutdown().await.unwrap();
 }

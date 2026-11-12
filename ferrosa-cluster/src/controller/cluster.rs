@@ -1443,6 +1443,7 @@ impl ModeController {
                 return;
             }
         };
+        log_store.set_recovery_admission(Arc::clone(&self.recovery_admission));
         let snapshot_path = raft_dir.join("state-machine.snapshot.bin");
 
         // 2. Create state machine from current schema
@@ -1549,6 +1550,9 @@ impl ModeController {
                             match SledLogStore::new(&raft_dir) {
                                 Ok(fresh) => {
                                     log_store = fresh;
+                                    log_store.set_recovery_admission(Arc::clone(
+                                        &self.recovery_admission,
+                                    ));
                                     state_machine =
                                         FerrosStateMachine::with_side_effects_and_snapshot_path(
                                             self.schema.clone(),
@@ -1558,6 +1562,9 @@ impl ModeController {
                                     state_machine.set_durable_applied_handle(
                                         log_store.durable_applied_handle(),
                                     );
+                                    state_machine.set_recovery_admission(Arc::clone(
+                                        &self.recovery_admission,
+                                    ));
                                     physical_registration =
                                         match self.physical_raft_workers.reserve(
                                             crate::raft::RaftGroupId::for_dc(
@@ -1945,11 +1952,15 @@ impl ModeController {
         let append_handler = Arc::new(RaftAppendHandler::new(
             lazy_raft.clone(),
             self.leader_contact.clone(),
+            Arc::clone(&self.recovery_admission),
         ));
         self.registry
             .register(MsgType::RaftAppendEntries, append_handler);
 
-        let vote_handler = Arc::new(RaftVoteHandler::new(lazy_raft.clone()));
+        let vote_handler = Arc::new(RaftVoteHandler::new(
+            lazy_raft.clone(),
+            Arc::clone(&self.recovery_admission),
+        ));
         self.registry.register(MsgType::RaftVote, vote_handler);
 
         // The PreVote receive side is registered unconditionally, even while
@@ -1957,7 +1968,10 @@ impl ModeController {
         // pre-vote before any node is allowed to SEND one, or the first node
         // upgraded in a rolling restart would probe peers that reject the
         // frame, read the rejections as "no", and never win an election.
-        let pre_vote_handler = Arc::new(RaftPreVoteHandler::new(lazy_raft.clone()));
+        let pre_vote_handler = Arc::new(RaftPreVoteHandler::new(
+            lazy_raft.clone(),
+            Arc::clone(&self.recovery_admission),
+        ));
         self.registry
             .register(MsgType::RaftPreVote, pre_vote_handler);
 

@@ -703,6 +703,49 @@ mod tests {
     /// Standalone is intentional here: the handler must consult the health gate
     /// before any mode shortcut or Raft-handle await.
     #[tokio::test]
+    async fn quarantine_gate_readyz_names_reason_while_health_stays_up() {
+        let state = make_state();
+        state.mode_controller.recovery_admission().quarantine(
+            "owned-raft-group",
+            "state-machine.snapshot.bin cannot cover purged entry 7",
+        );
+        assert!(state.mode_controller.consensus_health().is_healthy());
+        let router = build_router(state);
+        let up = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            up.status(),
+            StatusCode::OK,
+            "quarantine keeps the process and repair channel up"
+        );
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["ready"], false);
+        assert_eq!(body["waiting_for"], "raft_quarantine");
+        assert!(body["detail"].as_str().unwrap().contains("purged entry 7"));
+    }
+
+    #[tokio::test]
     async fn readyz_consensus_failure_is_immediate_503() {
         let state = make_state();
         state.mode_controller.consensus_health().fail(
