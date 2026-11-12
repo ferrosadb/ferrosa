@@ -223,12 +223,11 @@ pub use row::{
     build_decorated_key, build_delete_row, build_row, column_projection,
     consume_partition_rows_with_clustering, decode_clustering, decode_pk, encode_clustering,
     partition_to_rows, partition_to_rows_with_clustering, partition_to_rows_with_storage_mapping,
-    projected_column_raw_encodable, visit_partition_rows_with_clustering,
-    write_partition_raw_rows_projected, write_partition_raw_rows_with_storage_mapping,
+    projected_column_raw_encodable, visit_partition_rows_with_cell_meta,
+    visit_partition_rows_with_clustering, write_partition_raw_rows_projected,
+    write_partition_raw_rows_with_storage_mapping, CellMeta, TableLayout,
 };
 
-// Liveness helpers are re-exported for `ferrosa-cql`'s remaining metadata
-// decomposition variants, which still live in `ferrosa-cql` but reuse these.
 pub use row::{cell_is_live, ldt_is_expired, overlay_static_cells};
 
 // Collection (CRDT per-element) cell encoding/assembly. Lives here (not in

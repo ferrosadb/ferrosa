@@ -158,12 +158,115 @@ where
             continue;
         }
 
-        let output_row = decode_output_row(row, &decode_context)?;
+        let output_row = decode_output_row(row, &decode_context, None)?;
         if let ControlFlow::Break(()) = visit(row.clustering.as_slice(), output_row) {
             break;
         }
     }
     Ok(())
+}
+
+/// Write metadata of one decoded column: the cell its value was read from.
+///
+/// This is what `writetime()` and `TTL()` report. It comes from the same cell
+/// selection as the decoded value, so a column's metadata never describes a
+/// cell other than the one whose value the row carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellMeta {
+    /// Cell write timestamp, microseconds since epoch. `i64::MIN`
+    /// ([`ferrosa_common::NO_TIMESTAMP`]) for a key column or an absent cell.
+    pub timestamp: i64,
+    /// TTL in seconds as originally written. 0 = no TTL.
+    pub ttl: i32,
+    /// Expiry (seconds since epoch) of an expiring cell; `i32::MAX` when the
+    /// cell does not expire.
+    pub local_deletion_time: i32,
+}
+
+impl CellMeta {
+    /// No metadata: a primary-key column, or a column with no stored cell.
+    pub const NONE: CellMeta = CellMeta {
+        timestamp: i64::MIN,
+        ttl: 0,
+        local_deletion_time: i32::MAX,
+    };
+}
+
+/// A table's column layout, as the read-direction decoders take it.
+#[derive(Debug, Clone, Copy)]
+pub struct TableLayout<'a> {
+    /// Every table column, in table order.
+    pub column_names: &'a [String],
+    /// The type of each column in `column_names`.
+    pub column_types: &'a [CqlType],
+    /// Table indices of the partition-key columns, in key order.
+    pub pk_columns: &'a [usize],
+    /// Table indices of the clustering columns, in key order.
+    pub ck_columns: &'a [usize],
+    /// Storage cell ordinal → table column index.
+    pub storage_to_table: &'a [usize],
+}
+
+/// Like [`visit_partition_rows_with_clustering`], with each row's per-column
+/// [`CellMeta`] beside it. The same rows survive: visibility, static-cell
+/// overlay and value assembly are the shared code, not a copy.
+///
+/// Streams: `visit` is handed each row as it is decoded, and the metadata is a
+/// borrow of ONE buffer reused across the partition's rows, so the only
+/// per-row allocation is the row itself, as on the plain path. Each row is
+/// allocated with room for `extra_slots` more values, so a caller appending
+/// derived values (`writetime()`, `TTL()`) does not reallocate it.
+///
+/// # Errors
+/// [`RowDecodeError`] when a stored key or cell cannot be decoded, or the
+/// first error `visit` returns; decoding stops at either.
+pub fn visit_partition_rows_with_cell_meta<E, F>(
+    partition: &Partition,
+    layout: &TableLayout<'_>,
+    extra_slots: usize,
+    mut visit: F,
+) -> Result<(), E>
+where
+    E: From<RowDecodeError>,
+    F: FnMut(Vec<Option<CqlValue>>, &[CellMeta]) -> Result<(), E>,
+{
+    let now_secs = read_now_secs();
+    let pk_values = decode_pk(&partition.key, layout.pk_columns.len());
+    let decode_context = RowDecodeContext {
+        pk_values: &pk_values,
+        column_names: layout.column_names,
+        column_types: layout.column_types,
+        pk_columns: layout.pk_columns,
+        ck_columns: layout.ck_columns,
+        storage_to_table: layout.storage_to_table,
+        now_secs,
+        partition_key: partition.key.key.as_bytes(),
+        static_row: partition.static_row.as_ref(),
+    };
+    let mut meta = vec![CellMeta::NONE; layout.column_names.len()];
+    for row in &partition.rows {
+        if !row_is_visible(row, now_secs) {
+            continue;
+        }
+        meta.fill(CellMeta::NONE);
+        let output_row = decode_output_row(
+            row,
+            &decode_context,
+            Some(RowMetaOut {
+                meta: &mut meta,
+                extra_slots,
+            }),
+        )?;
+        visit(output_row, &meta)?;
+    }
+    Ok(())
+}
+
+/// Where [`decode_output_row`] writes a row's cell metadata, and how many
+/// trailing values the caller will append to the row.
+struct RowMetaOut<'m> {
+    meta: &'m mut [CellMeta],
+    extra_slots: usize,
 }
 
 /// Consume surviving rows in a partition one at a time, moving clustering-key
@@ -213,7 +316,7 @@ where
                 continue;
             }
 
-            let output_row = decode_output_row(&row, &decode_context)?;
+            let output_row = decode_output_row(&row, &decode_context, None)?;
             if let ControlFlow::Break(()) = visit(pk_bytes, row.clustering, output_row) {
                 break;
             }
@@ -314,11 +417,24 @@ fn decode_key_component(
     Ok(())
 }
 
+/// Decode one visible row. When `meta_out` is given (one slot per table
+/// column, all [`CellMeta::NONE`] on entry), each regular/static column's slot
+/// is set from the newest of its cells, the cell
+/// [`crate::collection::assemble_column_cells`] reads a simple column from,
+/// and the row is allocated with room for the caller's trailing values.
 fn decode_output_row(
     row: &Row,
     context: &RowDecodeContext<'_>,
+    meta_out: Option<RowMetaOut<'_>>,
 ) -> Result<Vec<Option<CqlValue>>, RowDecodeError> {
-    let mut output_row: Vec<Option<CqlValue>> = vec![None; context.column_names.len()];
+    let width = context.column_names.len();
+    let (mut meta, extra_slots) = match meta_out {
+        Some(RowMetaOut { meta, extra_slots }) => (Some(meta), extra_slots),
+        None => (None, 0),
+    };
+    debug_assert!(meta.as_ref().is_none_or(|m| m.len() == width));
+    let mut output_row: Vec<Option<CqlValue>> = Vec::with_capacity(width + extra_slots);
+    output_row.resize(width, None);
 
     // Fill PK columns.
     for (i, &col_idx) in context.pk_columns.iter().enumerate() {
@@ -363,6 +479,16 @@ fn decode_output_row(
     }
 
     for (table_idx, cells) in cells_by_col {
+        if let (Some(meta), Some(newest)) = (
+            meta.as_deref_mut(),
+            cells.iter().copied().max_by_key(|c| c.timestamp),
+        ) {
+            meta[table_idx] = CellMeta {
+                timestamp: newest.timestamp,
+                ttl: newest.ttl,
+                local_deletion_time: newest.local_deletion_time,
+            };
+        }
         // A cell that cannot be assembled fails the read (RB-Tcf7ca2cc); it is
         // never presented to the client as NULL.
         output_row[table_idx] = crate::collection::assemble_column_cells(

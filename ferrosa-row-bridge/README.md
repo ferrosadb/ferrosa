@@ -36,6 +36,14 @@ ordering — the top FMEA risk for the SQL front-end — so it lives here once.
   A partition's `static_row` is overlaid on every clustered row
   (`overlay_static_cells`, cell last-write-wins by `(ordinal, path)`); cell
   ordinals are storage's flat space, statics first (t_65661473).
+- **Per-cell metadata** — `visit_partition_rows_with_cell_meta` hands a visitor
+  each visible row with one `CellMeta { timestamp, ttl, local_deletion_time }`
+  per table column (the newest cell's; `CellMeta::NONE` for an absent cell).
+  The metadata is a borrow of one buffer reused across the partition, and each
+  row is allocated with `extra_slots` spare capacity, so it adds no per-row
+  allocation. It shares row visibility and decoding with
+  `partition_to_rows_with_storage_mapping`, so the two cannot disagree on which
+  rows exist. It backs CQL `writetime()` / `TTL()` (t_7987e84c).
 - **`RowDecodeError`** — returned by every read-direction function when a stored
   key or cell is corrupt: carries column, partition key and reason, and the
   caller attaches the table (`in_table`). Reads fail; they never yield NULL.
@@ -65,6 +73,7 @@ callers are unaffected. `ferrosa-postgres` calls them directly.
 | Codec | `encode_value`, `decode_value`, `parse_cql_type`, `parse_cql_type_in_keyspace` |
 | Write rows | `build_decorated_key`, `build_row`, `build_delete_row`, `encode_clustering` |
 | Read rows | `partition_to_rows[_with_storage_mapping|_with_clustering]`, `decode_pk`, `decode_clustering` |
+| Cell metadata | `visit_partition_rows_with_cell_meta`, `CellMeta`, `TableLayout` |
 | Liveness | `cell_is_live`, `ldt_is_expired` |
 | Error | `RowBridgeError` |
 

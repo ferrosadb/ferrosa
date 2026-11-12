@@ -426,3 +426,58 @@ async fn a_broken_connection_retry_on_another_node_completes_the_iteration() {
     a.rpc.shutdown(Duration::from_millis(50)).await;
     b.rpc.shutdown(Duration::from_millis(50)).await;
 }
+
+/// `writetime()` through a forwarded cursor (t_7987e84c). The cursor spools
+/// rows that are already projected, so the owner computes each cell's time
+/// and B relays it. Every row carries its own timestamp, so a relay that
+/// dropped or flattened the metadata cannot pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forwarded_page_carries_each_rows_own_writetime() {
+    const WT_QUERY: &str = "SELECT v, writetime(v) FROM fw.wt ORDER BY v";
+    let ts_of = |v: usize| 1_700_000_000_000_000_i64 + (v as i64) * 1_000;
+    let (a, b) = two_nodes().await;
+    for n in [&a, &b] {
+        run(&n.state, "CREATE TABLE fw.wt (id int PRIMARY KEY, v int)").await;
+    }
+    for id in 0..ROWS {
+        let v = (id * 7) % ROWS;
+        run(
+            &a.state,
+            &format!(
+                "INSERT INTO fw.wt (id, v) VALUES ({id}, {v}) USING TIMESTAMP {}",
+                ts_of(v)
+            ),
+        )
+        .await;
+    }
+    let Statement::Select(stmt) = ferrosa_cql::parser::parse(WT_QUERY).unwrap() else {
+        panic!("expected a select");
+    };
+    let auth = superuser();
+    let ks = Some("fw".to_string());
+    let mut got: Vec<(i32, i64)> = Vec::new();
+    let mut next: Option<Vec<u8>> = None;
+    let mut via_b = 0;
+    for i in 0..100 {
+        let target = if i == 0 { &a } else { &b };
+        via_b += usize::from(i > 0);
+        let c = ctx(&auth, &ks, "client:wt", next.take());
+        let raw = route_select_raw(&target.state, &c, &stmt).await.unwrap();
+        got.extend(raw.rows.iter().map(|r| match (&r[0], &r[1]) {
+            (Some(CqlValue::Int(v)), Some(CqlValue::Bigint(wt))) => (*v, *wt),
+            other => panic!("expected (int, bigint writetime), got {other:?}"),
+        }));
+        next = raw.paging_state;
+        if next.is_none() {
+            break;
+        }
+    }
+    assert!(via_b >= 2, "most pages must go through B");
+    assert_eq!(
+        got,
+        (0..ROWS).map(|v| (v as i32, ts_of(v))).collect::<Vec<_>>(),
+        "every row once, in order, with its own cell timestamp"
+    );
+    a.rpc.shutdown(Duration::from_millis(50)).await;
+    b.rpc.shutdown(Duration::from_millis(50)).await;
+}

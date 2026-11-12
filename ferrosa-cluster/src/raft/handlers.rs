@@ -2127,6 +2127,42 @@ mod tests {
         assert_eq!(partition_from_wire(wire), original);
     }
 
+    /// `writetime()` and `TTL()` on a coordinator are computed from the cells a
+    /// replica sends back, so each cell's own timestamp, TTL and expiry must
+    /// cross the wire unchanged (t_7987e84c). Cells carry distinct values so a
+    /// decoder that stamped one row-level time on every cell would fail.
+    #[test]
+    fn row_wire_carries_each_cells_timestamp_and_ttl() {
+        let mut original = make_partition(b"cell-meta", 1_000);
+        original.rows[0].cells = vec![
+            (0, CellValue::live(b"a".to_vec(), 1_234_567)),
+            (
+                1,
+                CellValue::expiring(b"b".to_vec(), 7_654_321, 1_000, 1_800_000_000),
+            ),
+        ];
+        let owned = bincode::serialize(&partition_to_wire(original)).unwrap();
+        let wire: PartitionWire = bincode::deserialize(&owned).unwrap();
+        let decoded = partition_from_wire(wire);
+        let meta: Vec<(u16, i64, i32, i32)> = decoded.rows[0]
+            .cells
+            .iter()
+            .map(|(i, c)| (*i, c.timestamp, c.ttl, c.local_deletion_time))
+            .collect();
+        assert_eq!(
+            meta,
+            vec![
+                (
+                    0,
+                    1_234_567,
+                    ferrosa_common::NO_TTL,
+                    ferrosa_common::NO_DELETION_TIME
+                ),
+                (1, 7_654_321, 1_000, 1_800_000_000),
+            ]
+        );
+    }
+
     /// The borrowed serializer must emit the same bytes as the owned path for
     /// complex cells too. It used to skip the path without a word, which would
     /// hand a receiver each list element as a LIVE path-less cell. Its only

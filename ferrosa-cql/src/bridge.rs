@@ -13,7 +13,7 @@ use num_bigint::BigInt;
 
 use crate::ast::{CqlTypeName, Term};
 use crate::error::CqlError;
-use crate::types::{decode_value, CqlType, CqlValue};
+use crate::types::{CqlType, CqlValue};
 use ferrosa_schema::Schema;
 
 // ---------------------------------------------------------------------------
@@ -1049,34 +1049,22 @@ pub use ferrosa_row_bridge::{
 // Function 7: CellMeta and partition_to_rows_with_metadata
 // ---------------------------------------------------------------------------
 
-/// Cell metadata for `writetime()` and `TTL()` CQL functions.
-///
-/// Each entry corresponds to a column in the output row:
-/// - `timestamp`: cell timestamp in microseconds since epoch (`i64::MIN` for PK/CK/missing).
-/// - `ttl`: TTL in seconds as originally set (0 = no TTL).
-#[derive(Debug, Clone)]
-pub struct CellMeta {
-    pub timestamp: i64,
-    pub ttl: i32,
-}
-
-impl CellMeta {
-    /// Sentinel: no metadata available (PK/CK columns, missing cells).
-    pub const NONE: CellMeta = CellMeta {
-        timestamp: i64::MIN,
-        ttl: 0,
-    };
-}
+/// Cell metadata for `writetime()` and `TTL()`: the write timestamp, TTL and
+/// expiry of the cell each decoded column came from. Defined beside the row
+/// decoder so the metadata and the value come from one cell selection. The
+/// read path streams it with [`visit_partition_rows_with_cell_meta`].
+pub use ferrosa_row_bridge::{visit_partition_rows_with_cell_meta, CellMeta, TableLayout};
 
 /// Decoded rows plus per-cell metadata parallel to them.
-pub type RowsWithMeta = (Vec<Vec<Option<CqlValue>>>, Vec<Vec<CellMeta>>);
+#[cfg(test)]
+pub(crate) type RowsWithMeta = (Vec<Vec<Option<CqlValue>>>, Vec<Vec<CellMeta>>);
 
-/// Like [`partition_to_rows`], but also returns per-cell metadata (timestamp, TTL)
-/// needed by `writetime()` and `TTL()` CQL functions.
-///
-/// Returns `(rows, metadata)` where each entry in `metadata` is a
-/// `Vec<CellMeta>` parallel to the corresponding row.
-pub fn partition_to_rows_with_metadata(
+/// Like [`partition_to_rows`], but also returns per-cell metadata (timestamp,
+/// TTL). A test helper: it collects a partition and copies each row's
+/// metadata, which the read path never does (it streams through
+/// [`visit_partition_rows_with_cell_meta`]).
+#[cfg(test)]
+pub(crate) fn partition_to_rows_with_metadata(
     partition: &ferrosa_sstable::types::Partition,
     column_names: &[String],
     column_types: &[CqlType],
@@ -1099,7 +1087,8 @@ pub fn partition_to_rows_with_metadata(
     )
 }
 
-pub fn partition_to_rows_with_metadata_storage_mapping(
+#[cfg(test)]
+fn partition_to_rows_with_metadata_storage_mapping(
     partition: &ferrosa_sstable::types::Partition,
     column_names: &[String],
     column_types: &[CqlType],
@@ -1107,126 +1096,20 @@ pub fn partition_to_rows_with_metadata_storage_mapping(
     ck_columns: &[usize],
     storage_to_table: &[usize],
 ) -> Result<RowsWithMeta, RowDecodeError> {
-    let mut result = Vec::new();
-    let mut meta_result = Vec::new();
-
-    let pk_values = decode_pk(&partition.key, pk_columns.len());
-    let now_secs = i32::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
-    )
-    .unwrap_or(i32::MAX);
-
-    for row in &partition.rows {
-        if !row.deletion.is_live() {
-            let del_ts = row.deletion.marked_for_delete_at;
-            let liveness_supersedes = row.primary_key_liveness.timestamp > del_ts;
-            let any_cell_supersedes = row.cells.iter().any(|(_, cell)| cell.timestamp > del_ts);
-            if !liveness_supersedes && !any_cell_supersedes {
-                continue;
-            }
-        }
-
-        let mut output_row: Vec<Option<CqlValue>> = vec![None; column_names.len()];
-        let mut meta_row: Vec<CellMeta> = vec![CellMeta::NONE; column_names.len()];
-
-        for (i, &col_idx) in pk_columns.iter().enumerate() {
-            if col_idx < column_types.len() {
-                if let Some(bytes) = pk_values.get(i) {
-                    let val = decode_value(&column_types[col_idx], bytes)
-                        .map_err(|e| corrupt_cell(column_names, col_idx, &partition.key, e))?;
-                    output_row[col_idx] = Some(val);
-                }
-            }
-        }
-
-        let ck_values = decode_clustering(&row.clustering, ck_columns.len());
-        for (i, &col_idx) in ck_columns.iter().enumerate() {
-            if col_idx < column_types.len() {
-                if let Some(bytes) = ck_values.get(i) {
-                    let val = decode_value(&column_types[col_idx], bytes)
-                        .map_err(|e| corrupt_cell(column_names, col_idx, &partition.key, e))?;
-                    output_row[col_idx] = Some(val);
-                }
-            }
-        }
-
-        // Group cells by their table column index. A simple (scalar) column has
-        // exactly one cell (path = None). A complex (collection) column has many
-        // cells sharing one column index, each distinguished by a per-element
-        // path (set element / map key / list TimeUUID) — the CRDT encoding from
-        // t_83c4f093. Those must be ASSEMBLED into a single collection value, not
-        // decoded cell-by-cell as if each were the whole column.
-        let mut cells_by_col: std::collections::BTreeMap<usize, Vec<&ferrosa_common::CellValue>> =
-            std::collections::BTreeMap::new();
-        // The partition's static cells are part of every row, as in the
-        // primary SELECT decoder (`ferrosa_row_bridge::overlay_static_cells`).
-        let overlaid;
-        let row_cells: &mut dyn Iterator<Item = (&u16, &ferrosa_common::CellValue)> =
-            match partition.static_row.as_ref() {
-                Some(static_row) if !static_row.cells.is_empty() => {
-                    overlaid = ferrosa_row_bridge::overlay_static_cells(static_row, row);
-                    &mut overlaid.iter().map(|((idx, _), cell)| (idx, *cell))
-                }
-                _ => &mut row.cells.iter().map(|(idx, cell)| (idx, cell)),
-            };
-        for (col_index, cell) in row_cells {
-            let storage_idx = *col_index as usize;
-            let table_idx = match storage_to_table.get(storage_idx) {
-                Some(&idx) => idx,
-                None => continue,
-            };
-            if table_idx < column_types.len() {
-                cells_by_col.entry(table_idx).or_default().push(cell);
-            }
-        }
-
-        for (table_idx, cells) in cells_by_col {
-            // Column metadata carries the newest cell's timestamp/ttl.
-            let newest = cells
-                .iter()
-                .copied()
-                .max_by_key(|c| c.timestamp)
-                .expect("grouped column has at least one cell");
-            meta_row[table_idx] = CellMeta {
-                timestamp: newest.timestamp,
-                ttl: newest.ttl,
-            };
-
-            // Value assembly is shared with the primary SELECT read path so the
-            // two cannot diverge (complex → reconcile-by-path + assemble; simple
-            // → newest live cell; legacy whole-value collection decodes whole).
-            output_row[table_idx] = crate::collection_cells::assemble_column_cells(
-                &column_types[table_idx],
-                &cells,
-                now_secs,
-            )
-            .map_err(|e| corrupt_cell(column_names, table_idx, &partition.key, e))?;
-        }
-
-        result.push(output_row);
-        meta_result.push(meta_row);
-    }
-
-    Ok((result, meta_result))
-}
-
-/// A corrupt cell fails the read (CQL-Tcf7ca2cc); it is never returned as NULL.
-fn corrupt_cell(
-    column_names: &[String],
-    table_idx: usize,
-    key: &ferrosa_common::DecoratedKey,
-    reason: impl std::fmt::Display + ferrosa_row_bridge::HasJsonbFault,
-) -> RowDecodeError {
-    let column = column_names
-        .get(table_idx)
-        .map(String::as_str)
-        .unwrap_or("?");
-    tracing::error!(column, error = %reason, "corrupt cell: failing the read");
-    RowDecodeError::new(column, key.key.as_bytes(), reason.to_string())
-        .with_jsonb_fault(reason.fault().cloned())
+    let layout = TableLayout {
+        column_names,
+        column_types,
+        pk_columns,
+        ck_columns,
+        storage_to_table,
+    };
+    let (mut rows, mut metas) = (Vec::new(), Vec::new());
+    visit_partition_rows_with_cell_meta(partition, &layout, 0, |row, meta| {
+        rows.push(row);
+        metas.push(meta.to_vec());
+        Ok::<(), RowDecodeError>(())
+    })?;
+    Ok((rows, metas))
 }
 
 // ---------------------------------------------------------------------------

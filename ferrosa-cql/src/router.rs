@@ -1104,12 +1104,60 @@ fn row_matches_select_predicates(
     )
 }
 
+#[derive(Clone, Copy)]
 struct PartitionRowContext<'a> {
     all_col_names: &'a [String],
     all_col_types: &'a [CqlType],
     pk_indices: &'a [usize],
     ck_indices: &'a [usize],
     storage_to_table: &'a [usize],
+    /// The query's `writetime()` / `TTL()` selectors; [`Self::decode`] appends
+    /// their values to every row.
+    cell_meta: &'a CellMetaProjection,
+}
+
+impl PartitionRowContext<'_> {
+    /// Decode a partition's visible rows, each with the query's cell-metadata
+    /// values appended after the table's columns (see [`CellMetaProjection`]).
+    fn decode(
+        &self,
+        partition: &ferrosa_sstable::types::Partition,
+    ) -> Result<Vec<Vec<Option<CqlValue>>>, CqlError> {
+        if self.cell_meta.is_empty() {
+            return Ok(bridge::partition_to_rows_with_storage_mapping(
+                partition,
+                self.all_col_names,
+                self.all_col_types,
+                self.pk_indices,
+                self.ck_indices,
+                self.storage_to_table,
+            )?);
+        }
+        let now_secs = unix_now_secs()?;
+        let layout = bridge::TableLayout {
+            column_names: self.all_col_names,
+            column_types: self.all_col_types,
+            pk_columns: self.pk_indices,
+            ck_columns: self.ck_indices,
+            storage_to_table: self.storage_to_table,
+        };
+        // Same output shape as the plain decode (one Vec per partition). The
+        // metadata is a borrow of one reused buffer; each row was allocated
+        // with room for the appended values.
+        let mut rows = Vec::new();
+        bridge::visit_partition_rows_with_cell_meta(
+            partition,
+            &layout,
+            self.cell_meta.columns.len(),
+            |mut row, meta| {
+                self.cell_meta
+                    .extend_row(self.all_col_names, &mut row, meta, now_secs)?;
+                rows.push(row);
+                Ok::<(), CqlError>(())
+            },
+        )?;
+        Ok(rows)
+    }
 }
 
 struct SelectPredicateContext<'a> {
@@ -1126,14 +1174,7 @@ async fn count_rows_from_partitions(
 ) -> Result<i64, CqlError> {
     let mut count = 0_i64;
     for (idx, partition) in partitions.iter().enumerate() {
-        for row in bridge::partition_to_rows_with_storage_mapping(
-            partition,
-            row_context.all_col_names,
-            row_context.all_col_types,
-            row_context.pk_indices,
-            row_context.ck_indices,
-            row_context.storage_to_table,
-        )? {
+        for row in row_context.decode(partition)? {
             if row_matches_select_predicates(
                 &row,
                 predicate_context.statement,
@@ -1183,21 +1224,10 @@ fn filter_rows_by_select_predicates(
 async fn extend_rows_from_partitions(
     partitions: &[ferrosa_sstable::types::Partition],
     all_rows: &mut Vec<Vec<Option<CqlValue>>>,
-    all_col_names: &[String],
-    all_col_types: &[CqlType],
-    pk_indices: &[usize],
-    ck_indices: &[usize],
-    storage_to_table: &[usize],
+    row_context: PartitionRowContext<'_>,
 ) -> Result<(), CqlError> {
     for (idx, partition) in partitions.iter().enumerate() {
-        let mut prows = bridge::partition_to_rows_with_storage_mapping(
-            partition,
-            all_col_names,
-            all_col_types,
-            pk_indices,
-            ck_indices,
-            storage_to_table,
-        )?;
+        let mut prows = row_context.decode(partition)?;
         all_rows.append(&mut prows);
         if should_yield_during_partition_scan(idx + 1, cooperative_scan_yield_every_partitions()) {
             tokio::task::yield_now().await;
@@ -1218,23 +1248,12 @@ async fn extend_rows_from_partitions(
 async fn extend_rows_from_partition_stream(
     mut stream: ferrosa_cluster::write_path::PartitionResultStream,
     all_rows: &mut Vec<Vec<Option<CqlValue>>>,
-    all_col_names: &[String],
-    all_col_types: &[CqlType],
-    pk_indices: &[usize],
-    ck_indices: &[usize],
-    storage_to_table: &[usize],
+    row_context: PartitionRowContext<'_>,
 ) -> Result<(), CqlError> {
     let mut processed_partitions = 0usize;
     while let Some(partition) = stream.next().await {
         let partition = partition?;
-        let mut prows = bridge::partition_to_rows_with_storage_mapping(
-            &partition,
-            all_col_names,
-            all_col_types,
-            pk_indices,
-            ck_indices,
-            storage_to_table,
-        )?;
+        let mut prows = row_context.decode(&partition)?;
         all_rows.append(&mut prows);
         processed_partitions += 1;
         if should_yield_during_partition_scan(
@@ -1263,14 +1282,7 @@ async fn collect_index_rows_with_limit(
     let mut rows = Vec::new();
     while let Some(partition) = stream.next().await {
         let partition = partition?;
-        for row in bridge::partition_to_rows_with_storage_mapping(
-            &partition,
-            row_context.all_col_names,
-            row_context.all_col_types,
-            row_context.pk_indices,
-            row_context.ck_indices,
-            row_context.storage_to_table,
-        )? {
+        for row in row_context.decode(&partition)? {
             if row_matches_select_predicates(
                 &row,
                 predicate_context.statement,
@@ -1319,14 +1331,7 @@ async fn sort_rows_from_partition_stream_spilling(
     let mut processed_partitions = 0usize;
     while let Some(partition) = stream.next().await {
         let partition = partition?;
-        for row in bridge::partition_to_rows_with_storage_mapping(
-            &partition,
-            row_context.all_col_names,
-            row_context.all_col_types,
-            row_context.pk_indices,
-            row_context.ck_indices,
-            row_context.storage_to_table,
-        )? {
+        for row in row_context.decode(&partition)? {
             if row_matches_select_predicates(
                 &row,
                 predicate_context.statement,
@@ -1370,14 +1375,7 @@ async fn count_rows_from_partition_stream(
     let mut processed_partitions = 0usize;
     while let Some(partition) = stream.next().await {
         let partition = partition?;
-        for row in bridge::partition_to_rows_with_storage_mapping(
-            &partition,
-            row_context.all_col_names,
-            row_context.all_col_types,
-            row_context.pk_indices,
-            row_context.ck_indices,
-            row_context.storage_to_table,
-        )? {
+        for row in row_context.decode(&partition)? {
             if row_matches_select_predicates(
                 &row,
                 predicate_context.statement,
@@ -1617,14 +1615,7 @@ async fn fold_builtin_aggregates(
     let mut processed_partitions = 0usize;
     while let Some(partition) = stream.next().await {
         let partition = partition?;
-        for row in bridge::partition_to_rows_with_storage_mapping(
-            &partition,
-            row_context.all_col_names,
-            row_context.all_col_types,
-            row_context.pk_indices,
-            row_context.ck_indices,
-            row_context.storage_to_table,
-        )? {
+        for row in row_context.decode(&partition)? {
             if row_matches_select_predicates(
                 &row,
                 predicate_context.statement,
@@ -1824,9 +1815,9 @@ fn select_is_aggregate(s: &SelectStatement, resolved_funcs: &[(usize, ResolvedFu
             .any(|(_, f)| matches!(f.kind, ResolvedFunctionKind::Aggregate { .. }))
 }
 
-/// Turn full table rows into result rows: column selection, scalar UDFs and
-/// `toJson()`. One row in, one row out, so it can run on any batch — the
-/// whole result, or one page of a result cursor.
+/// Turn full table rows into result rows: column selection, `writetime()` /
+/// `TTL()`, scalar UDFs and `toJson()`. One row in, one row out, so it can run
+/// on any batch — the whole result, or one page of a result cursor.
 fn project_select_rows(
     state: &SharedState,
     s: &SelectStatement,
@@ -1834,9 +1825,10 @@ fn project_select_rows(
     all_col_names: &[String],
     col_names: &[String],
     resolved_funcs: &[(usize, ResolvedFunction)],
+    cell_meta: &CellMetaProjection,
 ) -> Result<Vec<Vec<Option<CqlValue>>>, CqlError> {
     // Apply column selection if not Star
-    let selected_rows = select_columns(rows, all_col_names, col_names);
+    let selected_rows = select_result_columns(rows, all_col_names, col_names, cell_meta)?;
 
     // Evaluate scalar UDFs on each projected row.
     let scalar_funcs: Vec<&ResolvedFunction> = resolved_funcs
@@ -2062,6 +2054,7 @@ async fn build_result_cursor(
             q.rows.all_col_names,
             q.col_names,
             q.resolved_funcs,
+            q.rows.cell_meta,
         )
     };
     let mut dedup = if q.s.distinct {
@@ -2109,14 +2102,7 @@ async fn build_result_cursor(
     let mut processed_partitions = 0usize;
     'scan: while let Some(partition) = stream.next().await {
         let partition = partition?;
-        let mut rows = bridge::partition_to_rows_with_storage_mapping(
-            &partition,
-            q.rows.all_col_names,
-            q.rows.all_col_types,
-            q.rows.pk_indices,
-            q.rows.ck_indices,
-            q.rows.storage_to_table,
-        )?;
+        let mut rows = q.rows.decode(&partition)?;
         filter_rows_by_select_predicates(
             &mut rows,
             q.s,
@@ -4424,6 +4410,22 @@ async fn route_select(
         }
     }
 
+    // `writetime()` / `TTL()` read a stored cell's metadata. The system tables
+    // below are synthesized and a virtual table has no cells, so either would
+    // drop the column or answer NULL; refuse by name instead.
+    if let Some(func) = s.columns.iter().find_map(|c| match c {
+        SelectColumn::FunctionCall { name, .. } => CellMetaFn::parse(name),
+        _ => None,
+    }) {
+        if ks.starts_with("system") || state.schema.virtual_tables().get(ks, &s.table).is_some() {
+            return Err(CqlError::Invalid(format!(
+                "{}() is not supported for system or virtual table {ks}.{}",
+                func.name(),
+                s.table
+            )));
+        }
+    }
+
     // System table dispatch — no permission check needed for system tables.
     match (ks, s.table.as_str()) {
         ("system", "local") => {
@@ -5710,11 +5712,7 @@ async fn route_prepared_select_fast_inner(
 struct GeoRowContext<'a> {
     col_names: &'a [String],
     col_types: &'a [CqlType],
-    all_col_names: &'a [String],
-    all_col_types: &'a [CqlType],
-    pk_indices: &'a [usize],
-    ck_indices: &'a [usize],
-    storage_to_table: &'a [usize],
+    rows: PartitionRowContext<'a>,
 }
 
 /// Resolve the geo index name for `column` from the schema snapshot, matching by
@@ -5908,6 +5906,7 @@ async fn route_geo_select(
 
     // Index of the geo column within the full (storage-order) row, for refining.
     let geo_col_idx = rowctx
+        .rows
         .all_col_names
         .iter()
         .position(|n| n == &geo_column)
@@ -5923,14 +5922,7 @@ async fn route_geo_select(
             .map_err(|e| CqlError::Invalid(format!("geo index read failed: {e}")))?;
         let mut rows = Vec::new();
         for partition in &partitions {
-            let mut prows = bridge::partition_to_rows_with_storage_mapping(
-                partition,
-                rowctx.all_col_names,
-                rowctx.all_col_types,
-                rowctx.pk_indices,
-                rowctx.ck_indices,
-                rowctx.storage_to_table,
-            )?;
+            let mut prows = rowctx.rows.decode(partition)?;
             rows.append(&mut prows);
         }
         Ok(rows)
@@ -5956,16 +5948,29 @@ async fn route_geo_select(
         // the primary key, so distinct rows never collide).
         let mut seen_rows: Vec<Vec<Option<CqlValue>>> = Vec::new();
         let mut row_ids: HashMap<Vec<u8>, usize> = HashMap::new();
+        // `nearest_k` cannot carry an error out of a ring fetch, so the first
+        // one is kept and fails the query below. Reading a failed ring as "no
+        // candidates" would answer a shorter, wrong nearest-k list.
+        let mut fetch_error: Option<CqlError> = None;
+        let table_width = rowctx.rows.all_col_names.len();
         let candidates = geo::nearest_k(gn.lat, gn.lon, k, |ranges| {
+            if fetch_error.is_some() {
+                return Vec::new();
+            }
             let pairs = cover_ranges_to_pairs(ranges);
             let rows = match fetch_rows(pairs) {
                 Ok(r) => r,
-                Err(_) => return Vec::new(),
+                Err(e) => {
+                    fetch_error = Some(e);
+                    return Vec::new();
+                }
             };
             let mut out = Vec::new();
             for row in rows {
                 if let Some((lat, lon)) = row_geo_point(&row, geo_col_idx) {
-                    let row_key = encode_row_identity(&row);
+                    // The table columns only: a remaining TTL appended for
+                    // `TTL()` ticks between rings, and must not split a row.
+                    let row_key = encode_row_identity(&row[..table_width]);
                     let id = *row_ids.entry(row_key).or_insert_with(|| {
                         let next = seen_rows.len();
                         seen_rows.push(row.clone());
@@ -5976,6 +5981,9 @@ async fn route_geo_select(
             }
             out
         });
+        if let Some(e) = fetch_error {
+            return Err(e);
+        }
         candidates
             .into_iter()
             .map(|c| seen_rows[c.id].clone())
@@ -6067,8 +6075,8 @@ async fn route_geo_select(
     filter_rows_by_select_predicates(
         &mut result_rows,
         s,
-        rowctx.all_col_names,
-        rowctx.all_col_types,
+        rowctx.rows.all_col_names,
+        rowctx.rows.all_col_types,
         table_meta,
         ks,
         state,
@@ -6082,7 +6090,12 @@ async fn route_geo_select(
     }
 
     // Project to the selected columns.
-    let selected_rows = select_columns(&result_rows, rowctx.all_col_names, rowctx.col_names);
+    let selected_rows = select_result_columns(
+        &result_rows,
+        rowctx.rows.all_col_names,
+        rowctx.col_names,
+        rowctx.rows.cell_meta,
+    )?;
 
     Ok(SelectRawResult {
         column_names: rowctx.col_names.to_vec(),
@@ -6314,6 +6327,20 @@ async fn route_select_user_table_inner(
     // User-defined functions in the projection, resolved once: the result
     // cursor and the generic tail both project with them.
     let select_funcs = resolve_select_functions(state, ks, s, &all_col_names, &all_col_types)?;
+    // `writetime()` / `TTL()`: every read shape below decodes through
+    // `row_context`, which carries their values on each row.
+    let cell_meta = CellMetaProjection::resolve(s, table_meta)?;
+    if select_is_aggregate(s, &select_funcs) {
+        cell_meta.refuse("an aggregate query")?;
+    }
+    let row_context = PartitionRowContext {
+        all_col_names: &all_col_names,
+        all_col_types: &all_col_types,
+        pk_indices: &pk_indices,
+        ck_indices: &ck_indices,
+        storage_to_table: &storage_to_table,
+        cell_meta: &cell_meta,
+    };
 
     // ── fts_match(): full-text index search ───────────────────────────────────
     //
@@ -6494,14 +6521,7 @@ async fn route_select_user_table_inner(
                             &row.clustering,
                         ))
                     });
-                    let mut prows = bridge::partition_to_rows_with_storage_mapping(
-                        &partition,
-                        &all_col_names,
-                        &all_col_types,
-                        &pk_indices,
-                        &ck_indices,
-                        &storage_to_table,
-                    )?;
+                    let mut prows = row_context.decode(&partition)?;
                     // Post-filter: apply remaining (non-fts_match) WHERE predicates.
                     filter_rows_by_select_predicates(
                         &mut prows,
@@ -6564,7 +6584,8 @@ async fn route_select_user_table_inner(
         };
 
         // Project to selected columns.
-        let selected_rows = select_columns(&fts_rows, &all_col_names, &col_names);
+        let selected_rows =
+            select_result_columns(&fts_rows, &all_col_names, &col_names, &cell_meta)?;
         return Ok(SelectRawResult {
             column_names: col_names.to_vec(),
             column_types: col_types.to_vec(),
@@ -6593,11 +6614,7 @@ async fn route_select_user_table_inner(
             GeoRowContext {
                 col_names: &col_names,
                 col_types: &col_types,
-                all_col_names: &all_col_names,
-                all_col_types: &all_col_types,
-                pk_indices: &pk_indices,
-                ck_indices: &ck_indices,
-                storage_to_table: &storage_to_table,
+                rows: row_context,
             },
         )
         .await;
@@ -6842,14 +6859,7 @@ async fn route_select_user_table_inner(
         };
         let mut pk_rows = Vec::new();
         for partition in &partitions {
-            pk_rows.extend(bridge::partition_to_rows_with_storage_mapping(
-                partition,
-                &all_col_names,
-                &all_col_types,
-                &pk_indices,
-                &ck_indices,
-                &storage_to_table,
-            )?);
+            pk_rows.extend(row_context.decode(partition)?);
         }
         #[cfg(test)]
         PK_LOOKUP_ROWS_VISITED.with(|c| c.set(c.get() + pk_rows.len()));
@@ -6871,11 +6881,7 @@ async fn route_select_user_table_inner(
         &state.schema,
         &state.engine,
         &table_id,
-        &all_col_names,
-        &all_col_types,
-        &pk_indices,
-        &ck_indices,
-        &storage_to_table,
+        row_context,
     )? {
         // PK IN (...) — multi-partition lookup.
         // Apply clustering key and other non-PK WHERE predicates.
@@ -7081,16 +7087,7 @@ async fn route_select_user_table_inner(
             );
 
             let mut ann_rows = Vec::new();
-            extend_rows_from_partitions(
-                &partitions,
-                &mut ann_rows,
-                &all_col_names,
-                &all_col_types,
-                &pk_indices,
-                &ck_indices,
-                &storage_to_table,
-            )
-            .await?;
+            extend_rows_from_partitions(&partitions, &mut ann_rows, row_context).await?;
             ann_rows
         } else {
             match scan_plan {
@@ -7140,13 +7137,7 @@ async fn route_select_user_table_inner(
                     if count_only_select {
                         let count = count_rows_from_partitions(
                             &partitions,
-                            PartitionRowContext {
-                                all_col_names: &all_col_names,
-                                all_col_types: &all_col_types,
-                                pk_indices: &pk_indices,
-                                ck_indices: &ck_indices,
-                                storage_to_table: &storage_to_table,
-                            },
+                            row_context,
                             SelectPredicateContext {
                                 statement: s,
                                 table_meta,
@@ -7165,16 +7156,7 @@ async fn route_select_user_table_inner(
                         });
                     }
                     let mut all_rows = Vec::new();
-                    extend_rows_from_partitions(
-                        &partitions,
-                        &mut all_rows,
-                        &all_col_names,
-                        &all_col_types,
-                        &pk_indices,
-                        &ck_indices,
-                        &storage_to_table,
-                    )
-                    .await?;
+                    extend_rows_from_partitions(&partitions, &mut all_rows, row_context).await?;
                     filter_rows_by_select_predicates(
                         &mut all_rows,
                         s,
@@ -7269,13 +7251,6 @@ async fn route_select_user_table_inner(
                             .index_read_stream(&table_id, index_name, &index_key, after.as_ref())
                             .await?,
                     );
-                    let row_context = PartitionRowContext {
-                        all_col_names: &all_col_names,
-                        all_col_types: &all_col_types,
-                        pk_indices: &pk_indices,
-                        ck_indices: &ck_indices,
-                        storage_to_table: &storage_to_table,
-                    };
                     let predicate_context = SelectPredicateContext {
                         statement: s,
                         table_meta,
@@ -7365,13 +7340,6 @@ async fn route_select_user_table_inner(
                     )
                     .await?;
 
-                    let row_context = PartitionRowContext {
-                        all_col_names: &all_col_names,
-                        all_col_types: &all_col_types,
-                        pk_indices: &pk_indices,
-                        ck_indices: &ck_indices,
-                        storage_to_table: &storage_to_table,
-                    };
                     let predicate_context = SelectPredicateContext {
                         statement: s,
                         table_meta,
@@ -7545,13 +7513,7 @@ async fn route_select_user_table_inner(
                             stream,
                             page_size,
                             resume,
-                            PartitionRowContext {
-                                all_col_names: &all_col_names,
-                                all_col_types: &all_col_types,
-                                pk_indices: &pk_indices,
-                                ck_indices: &ck_indices,
-                                storage_to_table: &storage_to_table,
-                            },
+                            row_context,
                         )
                         .await?;
                         streamed_paging_state = Some(page.next_paging_state);
@@ -7615,13 +7577,7 @@ async fn route_select_user_table_inner(
                             stream,
                             request_bound,
                             resume,
-                            PartitionRowContext {
-                                all_col_names: &all_col_names,
-                                all_col_types: &all_col_types,
-                                pk_indices: &pk_indices,
-                                ck_indices: &ck_indices,
-                                storage_to_table: &storage_to_table,
-                            },
+                            row_context,
                         )
                         .await?;
 
@@ -7685,13 +7641,7 @@ async fn route_select_user_table_inner(
                                 stream,
                                 request_bound,
                                 resume,
-                                PartitionRowContext {
-                                    all_col_names: &all_col_names,
-                                    all_col_types: &all_col_types,
-                                    pk_indices: &pk_indices,
-                                    ck_indices: &ck_indices,
-                                    storage_to_table: &storage_to_table,
-                                },
+                                row_context,
                                 SelectPredicateContext {
                                     statement: s,
                                     table_meta,
@@ -7728,13 +7678,7 @@ async fn route_select_user_table_inner(
                             let agg_row = fold_builtin_aggregates(
                                 stream,
                                 accs,
-                                PartitionRowContext {
-                                    all_col_names: &all_col_names,
-                                    all_col_types: &all_col_types,
-                                    pk_indices: &pk_indices,
-                                    ck_indices: &ck_indices,
-                                    storage_to_table: &storage_to_table,
-                                },
+                                row_context,
                                 SelectPredicateContext {
                                     statement: s,
                                     table_meta,
@@ -7772,13 +7716,7 @@ async fn route_select_user_table_inner(
                                 .unwrap_or(0),
                                 col_names: &col_names,
                                 col_types: &col_types,
-                                rows: PartitionRowContext {
-                                    all_col_names: &all_col_names,
-                                    all_col_types: &all_col_types,
-                                    pk_indices: &pk_indices,
-                                    ck_indices: &ck_indices,
-                                    storage_to_table: &storage_to_table,
-                                },
+                                rows: row_context,
                                 resolved_funcs: &select_funcs,
                             })
                             .await;
@@ -7977,13 +7915,7 @@ async fn route_select_user_table_inner(
                                             reservation.path(),
                                             ferrosa_storage::RowOrder::new(order_specs),
                                             threshold,
-                                            PartitionRowContext {
-                                                all_col_names: &all_col_names,
-                                                all_col_types: &all_col_types,
-                                                pk_indices: &pk_indices,
-                                                ck_indices: &ck_indices,
-                                                storage_to_table: &storage_to_table,
-                                            },
+                                            row_context,
                                             SelectPredicateContext {
                                                 statement: s,
                                                 table_meta,
@@ -8042,13 +7974,6 @@ async fn route_select_user_table_inner(
                                     None
                                 };
                             if count_only_select {
-                                let row_context = PartitionRowContext {
-                                    all_col_names: &all_col_names,
-                                    all_col_types: &all_col_types,
-                                    pk_indices: &pk_indices,
-                                    ck_indices: &ck_indices,
-                                    storage_to_table: &storage_to_table,
-                                };
                                 let predicate_context = SelectPredicateContext {
                                     statement: s,
                                     table_meta,
@@ -8122,24 +8047,12 @@ async fn route_select_user_table_inner(
                                 extend_rows_from_partition_stream(
                                     instrument_full_scan_rows(stream),
                                     &mut all_rows,
-                                    &all_col_names,
-                                    &all_col_types,
-                                    &pk_indices,
-                                    &ck_indices,
-                                    &storage_to_table,
+                                    row_context,
                                 )
                                 .await?;
                             } else if let Some(partitions) = partitions.as_ref() {
-                                extend_rows_from_partitions(
-                                    partitions,
-                                    &mut all_rows,
-                                    &all_col_names,
-                                    &all_col_types,
-                                    &pk_indices,
-                                    &ck_indices,
-                                    &storage_to_table,
-                                )
-                                .await?;
+                                extend_rows_from_partitions(partitions, &mut all_rows, row_context)
+                                    .await?;
                             } else {
                                 // Unreachable by construction: every arm above
                                 // streams or spills, so a full-scan row result is
@@ -8307,8 +8220,15 @@ async fn route_select_user_table_inner(
     }
 
     // Project: column selection, scalar UDFs, toJson().
-    let selected_rows =
-        project_select_rows(state, s, &rows, &all_col_names, &col_names, &resolved_funcs)?;
+    let selected_rows = project_select_rows(
+        state,
+        s,
+        &rows,
+        &all_col_names,
+        &col_names,
+        &resolved_funcs,
+        &cell_meta,
+    )?;
 
     // DISTINCT deduped with a `BTreeSet<Vec<Option<CqlValue>>>`, which keeps a
     // full clone of every distinct row resident — O(distinct rows x row size),
@@ -8483,15 +8403,19 @@ pub(crate) fn cdc_event_to_result_frame(
         static_row: None,
         rows,
     };
-    let all_rows = bridge::partition_to_rows_with_storage_mapping(
-        &partition,
-        &all_col_names,
-        &all_col_types,
-        &pk_indices,
-        &ck_indices,
-        &storage_to_table,
-    )?;
-    let selected = select_columns(&all_rows, &all_col_names, &col_names);
+    // A CDC event carries the written cells, timestamps and TTLs included, so
+    // `writetime()` / `TTL()` read them as a SELECT would.
+    let cell_meta = CellMetaProjection::resolve(select, table_meta)?;
+    let row_context = PartitionRowContext {
+        all_col_names: &all_col_names,
+        all_col_types: &all_col_types,
+        pk_indices: &pk_indices,
+        ck_indices: &ck_indices,
+        storage_to_table: &storage_to_table,
+        cell_meta: &cell_meta,
+    };
+    let all_rows = row_context.decode(&partition)?;
+    let selected = select_result_columns(&all_rows, &all_col_names, &col_names, &cell_meta)?;
     Ok(Some(result::encode_rows(
         &col_names,
         &col_types,
@@ -13850,11 +13774,7 @@ fn try_pk_in_lookup(
     schema: &Schema,
     engine: &StorageEngine,
     table_id: &TableId,
-    all_col_names: &[String],
-    all_col_types: &[CqlType],
-    pk_indices: &[usize],
-    ck_indices: &[usize],
-    storage_to_table: &[usize],
+    row_context: PartitionRowContext<'_>,
 ) -> Result<Option<Vec<Vec<Option<CqlValue>>>>, CqlError> {
     let pk_names = &table_meta.partition_key;
 
@@ -13940,14 +13860,7 @@ fn try_pk_in_lookup(
 
         let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
         if let Some(partition) = engine.read(table_id, &decorated_key)? {
-            let mut prows = bridge::partition_to_rows_with_storage_mapping(
-                &partition,
-                all_col_names,
-                all_col_types,
-                pk_indices,
-                ck_indices,
-                storage_to_table,
-            )?;
+            let mut prows = row_context.decode(&partition)?;
             all_rows.append(&mut prows);
         }
     }
@@ -15329,128 +15242,239 @@ fn apply_tojson_projections(
     projected_rows
 }
 
-/// Apply `now()`, `toTimestamp()`, `writetime()`, and `TTL()` built-in functions
-/// to projected rows for user-table SELECT queries.
-///
-/// `cell_meta` carries per-column metadata (timestamp, TTL) from storage,
-/// parallel to `full_rows`. For `now()` and `toTimestamp()`, no source data
-/// is needed. For `writetime()` and `TTL()`, the metadata is looked up by
-/// the target column name.
-///
-/// Currently unused — will be wired into route_select when partition reads
-/// integrate cell metadata via partition_to_rows_with_metadata.
-#[allow(dead_code)]
-fn apply_builtin_functions(
-    select_columns_ast: &[SelectColumn],
-    proj_col_names: &[String],
-    all_col_names: &[String],
-    cell_meta: &[Vec<bridge::CellMeta>],
-    mut projected_rows: Vec<Vec<Option<CqlValue>>>,
-) -> Vec<Vec<Option<CqlValue>>> {
-    // Collect operations: (projected_index, kind)
-    enum BuiltinOp {
-        Now,
-        ToTimestamp,
-        Writetime(usize), // source column index in full row
-        Ttl(usize),       // source column index in full row
-    }
-    let mut ops: Vec<(usize, BuiltinOp)> = Vec::new();
+/// A per-cell metadata selector: `writetime(col)` or `TTL(col)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CellMetaFn {
+    Writetime,
+    Ttl,
+}
 
-    for (proj_idx, sc) in select_columns_ast.iter().enumerate() {
-        if let SelectColumn::FunctionCall { name, args, .. } = sc {
-            let fn_lower = name.to_lowercase();
-            match fn_lower.as_str() {
-                "now" if proj_idx < proj_col_names.len() => {
-                    ops.push((proj_idx, BuiltinOp::Now));
-                }
-                "totimestamp" if proj_idx < proj_col_names.len() => {
-                    ops.push((proj_idx, BuiltinOp::ToTimestamp));
-                }
-                "writetime" => {
-                    if let Some(arg) = args.first() {
-                        if let Ok(col_name) = extract_column_name(arg) {
-                            if let Some(src_idx) = all_col_names.iter().position(|n| *n == col_name)
-                            {
-                                if proj_idx < proj_col_names.len() {
-                                    ops.push((proj_idx, BuiltinOp::Writetime(src_idx)));
-                                }
-                            }
-                        }
-                    }
-                }
-                "ttl" => {
-                    if let Some(arg) = args.first() {
-                        if let Ok(col_name) = extract_column_name(arg) {
-                            if let Some(src_idx) = all_col_names.iter().position(|n| *n == col_name)
-                            {
-                                if proj_idx < proj_col_names.len() {
-                                    ops.push((proj_idx, BuiltinOp::Ttl(src_idx)));
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
+impl CellMetaFn {
+    fn parse(name: &str) -> Option<Self> {
+        if name.eq_ignore_ascii_case("writetime") {
+            Some(Self::Writetime)
+        } else if name.eq_ignore_ascii_case("ttl") {
+            Some(Self::Ttl)
+        } else {
+            None
         }
     }
 
-    if ops.is_empty() {
-        return projected_rows;
+    fn name(self) -> &'static str {
+        match self {
+            Self::Writetime => "writetime",
+            Self::Ttl => "ttl",
+        }
     }
 
-    let now_ts = std::time::SystemTime::now()
+    /// The selector's value for one decoded column. NULL exactly where
+    /// Cassandra answers NULL: the column has no live value, or (`TTL`) its
+    /// cell does not expire. A value with no cell behind it is a decoder bug
+    /// and fails the read rather than reading as NULL.
+    fn value(
+        self,
+        column: &str,
+        value: &Option<CqlValue>,
+        meta: &bridge::CellMeta,
+        now_secs: i64,
+    ) -> Result<Option<CqlValue>, CqlError> {
+        if value.is_none() {
+            return Ok(None);
+        }
+        if meta.timestamp == ferrosa_common::NO_TIMESTAMP {
+            return Err(CqlError::ServerError(format!(
+                "internal: column {column} has a value but no cell metadata, so {}() \
+                 cannot be answered",
+                self.name()
+            )));
+        }
+        Ok(match self {
+            Self::Writetime => Some(CqlValue::Bigint(meta.timestamp)),
+            Self::Ttl
+                if meta.ttl == ferrosa_common::NO_TTL
+                    || meta.local_deletion_time == ferrosa_common::NO_DELETION_TIME =>
+            {
+                None
+            }
+            // Remaining seconds, from the cell's own expiry — not from its
+            // write timestamp, which a client sets freely with USING TIMESTAMP.
+            Self::Ttl => i32::try_from(i64::from(meta.local_deletion_time) - now_secs)
+                .ok()
+                .filter(|remaining| *remaining > 0)
+                .map(CqlValue::Int),
+        })
+    }
+}
+
+/// One `writetime(col)` / `TTL(col)` in a SELECT list.
+#[derive(Clone, Copy, Debug)]
+struct CellMetaColumn {
+    /// Position in the SELECT list, which is its position in the result row.
+    select_idx: usize,
+    func: CellMetaFn,
+    /// The argument column's index in the table row.
+    source: usize,
+}
+
+/// The `writetime()` / `TTL()` selectors of a user-table SELECT, resolved
+/// against its table.
+///
+/// When non-empty, every row a read decodes ([`PartitionRowContext::decode`])
+/// carries one extra value per selector after the table's columns, computed
+/// from the cell its column's value was read from. The projection
+/// ([`select_result_columns`]) moves those values into their result slots and
+/// refuses a row that lacks them, so a read shape that skipped the metadata
+/// fails loudly instead of answering NULL. A shape that cannot carry them at
+/// all refuses up front ([`Self::refuse`]).
+#[derive(Debug, Default)]
+struct CellMetaProjection {
+    columns: Vec<CellMetaColumn>,
+}
+
+impl CellMetaProjection {
+    /// Resolve and validate every selector, with Cassandra's refusals: a
+    /// primary-key column has no cell, so its write time is an error, not NULL.
+    fn resolve(s: &SelectStatement, table_meta: &TableMetadata) -> Result<Self, CqlError> {
+        let mut columns = Vec::new();
+        for (select_idx, sc) in s.columns.iter().enumerate() {
+            let SelectColumn::FunctionCall { name, args, .. } = sc else {
+                continue;
+            };
+            let Some(func) = CellMetaFn::parse(name) else {
+                continue;
+            };
+            let fname = func.name();
+            let [arg] = args.as_slice() else {
+                return Err(CqlError::Invalid(format!(
+                    "{fname}() takes exactly one column argument, got {}",
+                    args.len()
+                )));
+            };
+            let column = extract_column_name(arg).map_err(|_| {
+                CqlError::Invalid(format!("{fname}() takes a column name as its argument"))
+            })?;
+            let (source, _, meta) = table_meta.columns.get_full(&column).ok_or_else(|| {
+                CqlError::Invalid(format!("Undefined column name {column} in {fname}()"))
+            })?;
+            if matches!(meta.kind, ColumnKind::PartitionKey | ColumnKind::Clustering) {
+                return Err(CqlError::Invalid(format!(
+                    "Cannot use selection function {fname} on PRIMARY KEY part {column}"
+                )));
+            }
+            if storage_column_is_multicell(table_meta, &column) {
+                return Err(CqlError::Invalid(format!(
+                    "{fname}() is not supported for non-frozen collection column {column}"
+                )));
+            }
+            columns.push(CellMetaColumn {
+                select_idx,
+                func,
+                source,
+            });
+        }
+        if !columns.is_empty() && s.columns.iter().any(|c| matches!(c, SelectColumn::Star)) {
+            return Err(CqlError::Invalid(format!(
+                "{}() cannot be selected together with *",
+                columns[0].func.name()
+            )));
+        }
+        Ok(Self { columns })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.columns.is_empty()
+    }
+
+    /// Refuse a read shape that cannot carry cell metadata, by name.
+    fn refuse(&self, shape: &str) -> Result<(), CqlError> {
+        match self.columns.first() {
+            None => Ok(()),
+            Some(c) => Err(CqlError::Invalid(format!(
+                "{}() is not supported for {shape}",
+                c.func.name()
+            ))),
+        }
+    }
+
+    /// Append each selector's value to its decoded row, in place. The values
+    /// are computed from the row's own cells, so a selector reads its source
+    /// column before any value is appended after it.
+    fn extend_row(
+        &self,
+        all_col_names: &[String],
+        row: &mut Vec<Option<CqlValue>>,
+        meta: &[bridge::CellMeta],
+        now_secs: i64,
+    ) -> Result<(), CqlError> {
+        debug_assert_eq!(row.len(), all_col_names.len());
+        for c in &self.columns {
+            let value = c.func.value(
+                &all_col_names[c.source],
+                &row[c.source],
+                &meta[c.source],
+                now_secs,
+            )?;
+            row.push(value);
+        }
+        Ok(())
+    }
+}
+
+/// [`select_columns`], plus the `writetime()` / `TTL()` values a cell-metadata
+/// read appended to each row ([`CellMetaProjection`]). A row without them came
+/// from a read shape that did not decode cell metadata: it is refused, never
+/// answered with NULL.
+fn select_result_columns(
+    rows: &[Vec<Option<CqlValue>>],
+    all_names: &[String],
+    selected: &[String],
+    cell_meta: &CellMetaProjection,
+) -> Result<Vec<Vec<Option<CqlValue>>>, CqlError> {
+    if cell_meta.is_empty() {
+        return Ok(select_columns(rows, all_names, selected));
+    }
+    let width = all_names.len() + cell_meta.columns.len();
+    let mut indices: Vec<Option<usize>> = selected
+        .iter()
+        .map(|name| all_names.iter().position(|n| n == name))
+        .collect();
+    // Positional, not by name: a selector's display name may equal a real
+    // column's (`writetime(v) AS w`), or another selector's (`writetime`).
+    for (k, c) in cell_meta.columns.iter().enumerate() {
+        let slot = indices.get_mut(c.select_idx).ok_or_else(|| {
+            CqlError::ServerError(format!(
+                "internal: {}() is select column {} of a {}-column result",
+                c.func.name(),
+                c.select_idx,
+                selected.len()
+            ))
+        })?;
+        *slot = Some(all_names.len() + k);
+    }
+    rows.iter()
+        .map(|row| {
+            if row.len() != width {
+                return Err(CqlError::ServerError(format!(
+                    "internal: {}() reached a row read without cell metadata ({} values, \
+                     expected {width}); this read path does not decode cell timestamps",
+                    cell_meta.columns[0].func.name(),
+                    row.len()
+                )));
+            }
+            Ok(indices
+                .iter()
+                .map(|i| i.and_then(|i| row[i].clone()))
+                .collect())
+        })
+        .collect()
+}
+
+/// Seconds since the Unix epoch, for remaining-TTL arithmetic.
+fn unix_now_secs() -> Result<i64, CqlError> {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-
-    for (row_idx, proj_row) in projected_rows.iter_mut().enumerate() {
-        let meta = cell_meta.get(row_idx);
-        for (proj_idx, op) in &ops {
-            match op {
-                BuiltinOp::Now => {
-                    proj_row[*proj_idx] = Some(crate::bridge::eval_now());
-                }
-                BuiltinOp::ToTimestamp => {
-                    // toTimestamp(now()) -- generate a timeuuid and convert
-                    let timeuuid = crate::bridge::eval_now();
-                    proj_row[*proj_idx] = eval_to_timestamp(&timeuuid).ok();
-                }
-                BuiltinOp::Writetime(src_idx) => {
-                    if let Some(m) = meta.and_then(|m| m.get(*src_idx)) {
-                        if m.timestamp != i64::MIN {
-                            proj_row[*proj_idx] = Some(CqlValue::Bigint(m.timestamp));
-                        } else {
-                            proj_row[*proj_idx] = None;
-                        }
-                    } else {
-                        proj_row[*proj_idx] = None;
-                    }
-                }
-                BuiltinOp::Ttl(src_idx) => {
-                    if let Some(m) = meta.and_then(|m| m.get(*src_idx)) {
-                        if m.ttl > 0 {
-                            // Remaining TTL = ttl - (now_secs - cell_timestamp_secs)
-                            let cell_ts_secs = m.timestamp / 1_000_000;
-                            let elapsed = now_ts - cell_ts_secs;
-                            let remaining = (m.ttl as i64) - elapsed;
-                            if remaining > 0 {
-                                proj_row[*proj_idx] = Some(CqlValue::Int(remaining as i32));
-                            } else {
-                                proj_row[*proj_idx] = None; // expired
-                            }
-                        } else {
-                            proj_row[*proj_idx] = None; // no TTL set
-                        }
-                    } else {
-                        proj_row[*proj_idx] = None;
-                    }
-                }
-            }
-        }
-    }
-
-    projected_rows
+        .map(|d| d.as_secs() as i64)
+        .map_err(|e| CqlError::ServerError(format!("system clock is before the Unix epoch: {e}")))
 }
 
 /// Project rows to a selected column subset.
@@ -16916,6 +16940,9 @@ mod tests {
 
     /// Rows written with legacy nanosecond Accord stamps (t_cf637b6e).
     mod legacy_ns;
+
+    /// `writetime()` / `TTL()` values on every SELECT shape (t_7987e84c).
+    mod cell_meta;
 
     // ── select_accord_replicas: live-path replica selection ───────────────────
 
@@ -24006,12 +24033,14 @@ mod tests {
         let pk_indices = vec![0];
         let ck_indices = vec![1];
         let storage_to_table = Vec::new();
+        let cell_meta = CellMetaProjection::default();
         let context = || PartitionRowContext {
             all_col_names: &names,
             all_col_types: &types,
             pk_indices: &pk_indices,
             ck_indices: &ck_indices,
             storage_to_table: &storage_to_table,
+            cell_meta: &cell_meta,
         };
 
         let page = collect_distinct_partition_page_from_stream(stream(), 2, None, context())
@@ -24294,17 +24323,27 @@ mod tests {
 
     /// (a)+(c) A function-call projection (`writetime`) over a full ALLOW
     /// FILTERING scan is a per-row projection, so it streams; it must return
-    /// every row past the cap rather than erroring.
+    /// every row past the cap rather than erroring — and every row's REAL
+    /// write time, not NULL (t_7987e84c: this test counted rows and passed
+    /// over a NULL in every one).
     #[tokio::test]
     async fn function_projection_scan_returns_all_rows_past_10k() {
         let n = (ferrosa_cluster::write_path::LEGACY_RANGE_READ_REPLICA_WINDOW as i64) + 500;
+        let now_us = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_micros() as i64
+        };
+        let seeded_from = now_us();
         let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
+        let seeded_to = now_us();
 
         let (rows, _pages) = collect_all_pages(
             &state,
             &auth,
             &ks,
-            "SELECT writetime(v) FROM pageks.t WHERE v >= 0 ALLOW FILTERING",
+            "SELECT id, writetime(v) FROM pageks.t WHERE v >= 0 ALLOW FILTERING",
             None,
         )
         .await;
@@ -24314,6 +24353,31 @@ mod tests {
             "a per-row function projection over {n} rows must return every row, not a \
              server-capped {} window",
             ferrosa_cluster::write_path::LEGACY_RANGE_READ_REPLICA_WINDOW
+        );
+        let mut by_id: Vec<(i32, i64)> = rows
+            .iter()
+            .map(|r| match (&r[0], &r[1]) {
+                (Some(CqlValue::Int(id)), Some(CqlValue::Bigint(wt))) => (*id, *wt),
+                other => panic!("expected (id, writetime) values, got {other:?}"),
+            })
+            .collect();
+        by_id.sort_unstable();
+        for (id, wt) in &by_id {
+            assert!(
+                (seeded_from..=seeded_to).contains(wt),
+                "writetime(v) of row {id} is {wt}, outside the seeding window \
+                 [{seeded_from}, {seeded_to}]"
+            );
+        }
+        // Rows were inserted in id order, so their write times follow it; a
+        // constant answer cannot satisfy both this and the window.
+        assert!(
+            by_id.windows(2).all(|w| w[0].1 <= w[1].1),
+            "write times must follow insertion order"
+        );
+        assert!(
+            by_id[0].1 < by_id[by_id.len() - 1].1,
+            "{n} sequential inserts cannot share one write time"
         );
     }
 

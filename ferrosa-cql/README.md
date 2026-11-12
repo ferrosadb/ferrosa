@@ -337,8 +337,33 @@ SQL-front-end FMEA risk.
 with an invalid-request error: storage reads that range as legacy nanosecond
 Accord stamps and divides it by 1000. This is a deliberate Cassandra
 incompatibility (Cassandra accepts any `long`); 1e18 microseconds is the year
-33658. `SELECT writetime()`/`TTL()` are not wired to cell metadata yet and
-return null (t_7987e84c).
+33658.
+
+## `writetime()` / `TTL()` (t_7987e84c)
+
+`SELECT writetime(col)` returns the cell's write timestamp (bigint, µs) and
+`TTL(col)` its remaining seconds (int), on every read shape: point, partition,
+clustering slice, `IN`, paged, filtered and ordered full scans, secondary,
+full-text and geo indexes, SUBSCRIBE deltas, and cursor pages forwarded from
+another coordinator. Replica reads carry each cell's timestamp, TTL and expiry
+over the internode wire, so a cluster coordinator computes them from the
+replicas' cells.
+
+How: `CellMetaProjection::resolve` finds the selectors, `PartitionRowContext::decode`
+appends one value per selector to every decoded row
+(`ferrosa_row_bridge::visit_partition_rows_with_cell_meta`, which shares row
+visibility with the plain decoder and streams: the metadata is a borrow of one
+buffer reused across a partition's rows, and each row is allocated with room
+for the appended values; a SELECT without these selectors takes the plain
+decode unchanged), and `select_result_columns` moves them
+into their result slots. A row that arrives without them is a named server
+error, never a null. TTL is `local_deletion_time - now`, not derived from the
+client-chosen write timestamp.
+
+NULL only where Cassandra returns it: the cell is null or absent, or (TTL) it
+does not expire. Refused by name, as Cassandra does: a primary-key column, a
+non-frozen collection, an aggregate query, `*`, and system or virtual tables.
+The prepared fast path declines these selects to the general path.
 
 ## Public API (key entry points)
 
