@@ -473,13 +473,11 @@ async fn rerun_local_bootstrap(
         &ring,
         local_node_id,
     );
+    let schema_version = schema.snapshot().version;
     let proposer = super::data_movement::ForwardingProposer {
         raft,
         peer_manager,
         ring: ring_holder,
-        // Membership commands change no schema: carry the node's CURRENT
-        // version, never a fresh random one (t_7dda9421).
-        schema_version: schema.snapshot().version,
     };
     if let Err(e) = super::data_movement::bootstrap_verified(
         &proposer,
@@ -487,6 +485,7 @@ async fn rerun_local_bootstrap(
         local_node_id,
         &tables,
         &executor,
+        schema_version,
     )
     .await
     {
@@ -498,6 +497,19 @@ async fn rerun_local_bootstrap(
             "bootstrap rerun did not complete; the node stays Joining until the next restart"
         );
     }
+}
+
+/// The schema version a Raft command that changes NO schema must carry: the
+/// node's CURRENT committed version, read from the shared `Schema`.
+///
+/// The topology ops the cluster-formation task proposes (`JoinNode` /
+/// `AssignTokens` / `UpdateNodeInfo` / `SetNodeState`) change no schema, so a
+/// command naming them must carry the version the node actually holds rather
+/// than a freshly minted random one — a schema version must name the schema
+/// state (bug: `schema-version-diverges-after-restart`, t_7dda9421). Read it
+/// ONCE per task and reuse it for every command that task builds.
+pub(crate) fn current_schema_version(schema: &ferrosa_schema::Schema) -> Uuid {
+    schema.snapshot().version
 }
 
 pub(super) fn keyspace_needs_cluster_replay(name: &str) -> bool {
@@ -2094,6 +2106,13 @@ impl ModeController {
         let bootstrap_complete_counter = bootstrap_complete_count;
         let consensus_health = self.consensus_health();
         self.spawn_tracked(async move {
+            // Topology commands built in this task (recovered-topology refresh,
+            // seed/peer JoinNode + AssignTokens, SetNodeState promote) change no
+            // schema, so they carry the node's CURRENT committed version rather
+            // than a freshly minted random one (bug: schema_version diverges
+            // after restart, t_7dda9421). Read it ONCE here and reuse it for
+            // every command this task builds.
+            let schema_version = current_schema_version(&schema_for_bootstrap);
             // Deliver ClusterInvite to all peers BEFORE starting Raft.
             // This ensures peers transition to cluster mode and register
             // Raft handlers before elections begin.
@@ -2585,7 +2604,7 @@ impl ModeController {
                             if let Err(e) = raft_arc
                                 .client_write(crate::raft::RaftCommand {
                                     op: crate::raft::RaftOp::UpdateNodeInfo(node_info.clone()),
-                                    schema_version: Uuid::new_v4(),
+                                    schema_version,
                                 })
                                 .await
                             {
@@ -2601,7 +2620,7 @@ impl ModeController {
                             if let Err(e) = raft_arc
                                 .client_write(crate::raft::RaftCommand {
                                     op: crate::raft::RaftOp::AssignTokens { node_id, tokens },
-                                    schema_version: Uuid::new_v4(),
+                                    schema_version,
                                 })
                                 .await
                             {
@@ -2642,7 +2661,7 @@ impl ModeController {
                         };
                         let self_join_cmd = crate::raft::RaftCommand {
                             op: crate::raft::RaftOp::JoinNode(local_node_info),
-                            schema_version: Uuid::new_v4(),
+                            schema_version,
                         };
                         if let Err(e) = raft_arc.client_write(self_join_cmd).await {
                             tracing::warn!(
@@ -2661,7 +2680,7 @@ impl ModeController {
                                 node_id: local_node_id,
                                 tokens: self_tokens,
                             },
-                            schema_version: Uuid::new_v4(),
+                            schema_version,
                         };
                         if let Err(e) = raft_arc.client_write(self_assign_cmd).await {
                             tracing::warn!(
@@ -2692,7 +2711,7 @@ impl ModeController {
                             };
                             let join_cmd = crate::raft::RaftCommand {
                                 op: crate::raft::RaftOp::JoinNode(node_info),
-                                schema_version: Uuid::new_v4(),
+                                schema_version,
                             };
                             if let Err(e) = raft_arc.client_write(join_cmd).await {
                                 tracing::warn!(
@@ -2711,7 +2730,7 @@ impl ModeController {
                                     node_id: peer_node_id,
                                     tokens: peer_tokens,
                                 },
-                                schema_version: Uuid::new_v4(),
+                                schema_version,
                             };
                             if let Err(e) = raft_arc.client_write(assign_cmd).await {
                                 tracing::warn!(
@@ -3134,7 +3153,7 @@ impl ModeController {
                                             node_id: nid,
                                             state: NodeState::Normal,
                                         },
-                                        schema_version: Uuid::new_v4(),
+                                        schema_version,
                                     };
                                     if let Err(e) = raft_arc.client_write(cmd).await {
                                         tracing::warn!(
@@ -3233,7 +3252,7 @@ impl ModeController {
                             for op in promote_plan {
                                 let cmd = crate::raft::RaftCommand {
                                     op,
-                                    schema_version: Uuid::new_v4(),
+                                    schema_version,
                                 };
                                 // A recovery pass can run on ANY node, and
                                 // `client_write` on a non-leader returns a

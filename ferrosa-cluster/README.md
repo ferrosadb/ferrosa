@@ -618,18 +618,32 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   Tests: `boot_gate_defers_cluster_transition_until_state_loaded`,
   `cluster_transition_proceeds_when_boot_gate_is_open`,
   `mark_boot_state_loaded_opens_the_gate_and_redrives_the_deferred_transition`.
-- **Schema version on non-schema operations** (t_7dda9421, bug
-  `schema-version-diverges-after-restart`). Topology (`JoinNode` /
-  `AssignTokens` / `UpdateNodeInfo`) and data-movement (`SetNodeState` /
-  `LeaveNode` through `ForwardingProposer`) commands change no schema, so the
-  controller now stamps them with the node's CURRENT committed `Schema` version
-  instead of minting `Uuid::new_v4()`. The state machine's `schema_changed` gate
-  (topology arms clear it) already kept the committed version where the last real
-  DDL put it, so a random version never propagated cluster-wide; this removes the
-  mint so the command carries the version it means to. A node that restarts
-  re-adopts its PERSISTED version through `Schema::apply_snapshot`
-  (ferrosa-schema), which is what makes `system.local.schema_version` agree with
-  the cluster after a restart.
+- **Schema version on non-schema operations** (t_7dda9421, swept under
+  t_17569632; bug `schema-version-diverges-after-restart`). Topology (`JoinNode` /
+  `AssignTokens` / `UpdateNodeInfo` / `SetNodeState` / `LeaveNode` /
+  `ApproveNode`) and data-movement (`RecordBootstrapComplete`) commands change no
+  schema, so they carry the node's CURRENT committed `Schema` version instead of
+  a minted `Uuid::new_v4()`. Swept: the eight commands the cluster-formation task
+  in `controller/cluster.rs` builds (the task reads the version once per spawn via
+  `controller::cluster::current_schema_version`, reusing it per node),
+  `MembershipProposer::propose` (which now TAKES the version, so neither
+  `FerrosRaft` nor `ForwardingProposer` chooses it — the trait's callers
+  `decommission_verified` / `bootstrap_verified` thread it from the `Schema`),
+  `MembershipChanger`'s seven commands, `rebalance.rs`'s `AssignTokens`, and the
+  web layer's `ApproveNode`. `MembershipChanger` holds no registry, so it carries
+  a `schema_version` field (`with_schema_version`); its default is the inert,
+  deterministic `Uuid::nil()`, never a random value. The state machine's
+  `schema_changed` gate (topology arms clear it) already kept the committed
+  version where the last real DDL put it, so a random version never propagated
+  cluster-wide; this removes the mint so the command carries the version it means
+  to. A node that restarts re-adopts its PERSISTED version through
+  `Schema::apply_snapshot` (ferrosa-schema), which is what makes
+  `system.local.schema_version` agree with the cluster after a restart. Left
+  minting deliberately: `ddl_path.rs`'s two real-DDL sites (a new version there is
+  load-bearing for `should_persist_schema`). Tests:
+  `data_movement_commands_carry_the_current_schema_version` (the red, on the real
+  decommission/bootstrap path), `topology_commands_carry_the_current_schema_version`,
+  `membership_commands_carry_the_current_schema_version`.
 - `ModeController::expected_cluster_size()` (the operator's
   `FERROSA_EXPECTED_CLUSTER_SIZE` declaration) and `committed_cluster_size()`
   (the membership the node has actually committed to — itself plus the peers it

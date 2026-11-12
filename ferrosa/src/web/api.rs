@@ -548,10 +548,13 @@ async fn add_node_handler(
     mc.approve_node(host_id);
 
     // If Raft is initialized, also propose ApproveNode so all replicas learn.
+    // `ApproveNode` changes no schema, so the command carries the node's CURRENT
+    // committed version, never a freshly minted random one (bug: schema_version
+    // diverges after restart, t_7dda9421).
     if let Some(raft) = mc.raft() {
         let cmd = ferrosa_cluster::raft::RaftCommand {
             op: ferrosa_cluster::raft::RaftOp::ApproveNode { host_id },
-            schema_version: uuid::Uuid::new_v4(),
+            schema_version: mc.schema().snapshot().version,
         };
         if let Err(e) = raft.client_write(cmd).await {
             return (

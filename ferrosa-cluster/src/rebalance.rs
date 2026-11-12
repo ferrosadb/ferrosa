@@ -273,11 +273,15 @@ pub async fn execute_rebalance(
         );
     }
 
-    // Propose AssignTokens for each target node.
+    // Propose AssignTokens for each target node. `AssignTokens` changes no
+    // schema, so the command must carry the node's CURRENT committed version —
+    // read once here, never a freshly minted random one (bug: schema_version
+    // diverges after restart, t_7dda9421).
+    let schema_version = schema.snapshot().version;
     for (node_id, tokens) in by_target {
         let cmd = crate::raft::RaftCommand {
             op: crate::raft::RaftOp::AssignTokens { node_id, tokens },
-            schema_version: uuid::Uuid::new_v4(),
+            schema_version,
         };
         raft.client_write(cmd).await.map_err(|e| {
             crate::error::ClusterError::RaftError(format!(

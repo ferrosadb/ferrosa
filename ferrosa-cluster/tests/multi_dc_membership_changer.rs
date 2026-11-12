@@ -17,6 +17,98 @@ use common::raft_harness::TestCluster;
 use ferrosa_cluster::membership::MembershipChanger;
 use ferrosa_cluster::raft::RaftGroupId;
 
+/// A schema registry fixture for the schema-version tests below. Mirrors the
+/// builder the controller's own tests use.
+fn test_schema() -> ferrosa_schema::Schema {
+    use ferrosa_schema::{
+        AuthMethod, DeploymentMode as SchemaDeploymentMode, LogAuditSink, PasswordHasher,
+        PasswordPolicy, RateLimitConfig, SchemaConfig,
+    };
+    let config = SchemaConfig {
+        hasher: PasswordHasher::default(),
+        password_policy: PasswordPolicy::permissive(),
+        auth_method: AuthMethod::Password,
+        rate_limit: RateLimitConfig::default(),
+        audit_sink: Box::new(LogAuditSink),
+        secrets: Box::new(ferrosa_schema::EnvSecretsProvider),
+        mode: SchemaDeploymentMode::Development,
+    };
+    ferrosa_schema::Schema::new(config).expect("schema registry")
+}
+
+/// bug-schema-version-diverges-after-restart (t_7dda9421): a `MembershipChanger`
+/// proposes only ops that change NO schema (`JoinNode` / `SetNodeState` /
+/// `LeaveNode` / `ApproveNode` / `UpdateNodeInfo` / `AccordApply`), so every
+/// command it builds must carry the node's CURRENT committed schema version. The
+/// `Uuid::new_v4()` that used to sit at each construction site in
+/// `src/membership/mod.rs` is what this replaces.
+///
+/// The changer holds no registry, so the value comes from the caller's `Schema`
+/// at construction; a changer built without it carries the documented nil "not
+/// known here" — deterministic, never a random version.
+///
+/// Regression guard, not the red: `MembershipChanger` needs a live
+/// `openraft::Raft`, so there is no unit-level seam that observes the command it
+/// builds. The red for this sweep drives the real
+/// `decommission_verified` / `bootstrap_verified` path
+/// (`controller::data_movement::tests`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn membership_commands_carry_the_current_schema_version() {
+    let cluster = TestCluster::with_voters(1).await;
+    let _ = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .expect("leader");
+
+    let schema = test_schema();
+    let current = schema.snapshot().version;
+
+    let changer = MembershipChanger::new(
+        cluster.leader_node().raft.clone(),
+        cluster.membership_network(),
+    )
+    .with_schema_version(current);
+    assert_eq!(
+        changer.schema_version(),
+        current,
+        "the changer must stamp the version the caller read from its Schema"
+    );
+
+    // A real DDL moves the node's version, and a changer rebuilt from the same
+    // `Schema` follows it — the value is the node's current one, not one frozen
+    // at boot.
+    let after_ddl = uuid::Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_bbb1);
+    assert_ne!(
+        after_ddl, current,
+        "the moved version must differ from the fixture's, or this is vacuous"
+    );
+    schema.set_schema_version(after_ddl);
+    let rebuilt = MembershipChanger::new(
+        cluster.leader_node().raft.clone(),
+        cluster.membership_network(),
+    )
+    .with_schema_version(schema.snapshot().version);
+    assert_eq!(
+        rebuilt.schema_version(),
+        after_ddl,
+        "after a DDL the next membership command must carry the new schema version"
+    );
+
+    // Without the builder the changer carries the honest "not known here" nil,
+    // never a freshly minted random one.
+    let unset = MembershipChanger::new(
+        cluster.leader_node().raft.clone(),
+        cluster.membership_network(),
+    );
+    assert_eq!(
+        unset.schema_version(),
+        uuid::Uuid::nil(),
+        "an unset version must be nil, never a random UUID"
+    );
+
+    cluster.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn membership_changer_scoped_to_dc() {
     let dc1_cluster = TestCluster::with_voters(3).await;

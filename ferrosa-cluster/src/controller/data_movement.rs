@@ -112,30 +112,28 @@ pub trait PartitionStreamer: Send + Sync {
 }
 
 /// Proposes a membership op and waits for it to commit.
+///
+/// The op is one that changes NO schema, so the caller supplies the node's
+/// CURRENT committed `schema_version` — a schema version must name the schema
+/// state, and minting a fresh random one at the point of construction is the
+/// bug class `schema-version-diverges-after-restart` (t_7dda9421). The Raft
+/// state machine's `schema_changed` gate ignores the value for these ops, so
+/// threading the real one removes a lie without moving committed state.
 #[async_trait]
 pub trait MembershipProposer: Send + Sync {
-    async fn propose(&self, op: RaftOp) -> Result<()>;
+    async fn propose(&self, op: RaftOp, schema_version: uuid::Uuid) -> Result<()>;
 }
 
 #[async_trait]
 impl MembershipProposer for crate::raft::FerrosRaft {
-    /// NOTE (t_7dda9421): this impl still mints a fresh `schema_version`. A bare
-    /// `openraft::Raft` handle holds no schema registry, so it cannot read the
-    /// node's actual committed version, and the membership / data-movement ops
-    /// it sends change no schema (the state machine's `schema_changed` gate
-    /// ignores the value). Production callers in `ferrosa-cluster` now use
-    /// [`ForwardingProposer`], which does carry the actual version; this impl is
-    /// left for callers that hold only the raft handle. The smallest change that
-    /// removes the mint entirely is a `schema_version: Uuid` parameter on
-    /// [`MembershipProposer::propose`], threaded from the caller's `Schema`.
-    async fn propose(&self, op: RaftOp) -> Result<()> {
-        self.client_write(crate::raft::RaftCommand {
-            op,
-            schema_version: uuid::Uuid::new_v4(),
-        })
-        .await
-        .map(|_| ())
-        .map_err(|e| ClusterError::RaftError(e.to_string()))
+    /// A bare `openraft::Raft` handle holds no schema registry, so the caller
+    /// must supply the version (`decommission_verified` / `bootstrap_verified`
+    /// thread it from the `Schema` they are handed).
+    async fn propose(&self, op: RaftOp, schema_version: uuid::Uuid) -> Result<()> {
+        self.client_write(crate::raft::RaftCommand { op, schema_version })
+            .await
+            .map(|_| ())
+            .map_err(|e| ClusterError::RaftError(e.to_string()))
     }
 }
 
@@ -318,6 +316,12 @@ async fn send_verified(
 /// all its data, and the error names what failed. Rerunning the decommission
 /// restreams everything; the receivers apply with last-write-wins, so a
 /// repeated batch is harmless.
+///
+/// `schema_version` is the node's CURRENT committed schema version, threaded to
+/// every command this function proposes. All of them are membership ops that
+/// change no schema, so they must carry the actual version rather than a
+/// freshly minted random one (bug: `schema_version` diverges after restart,
+/// t_7dda9421). The caller reads it from the shared `Schema` it holds.
 pub async fn decommission_verified<F>(
     proposer: &dyn MembershipProposer,
     ring: &TokenRing,
@@ -325,12 +329,13 @@ pub async fn decommission_verified<F>(
     tables: &[(TableId, ReplicationStrategy)],
     scan: F,
     streamer: &dyn PartitionStreamer,
+    schema_version: uuid::Uuid,
 ) -> Result<DataMovementEvidence>
 where
     F: Fn(&TableId) -> BoxStream<'static, ferrosa_common::Result<Partition>>,
 {
     proposer
-        .propose(super::membership::decommission_drain_op(node_id))
+        .propose(super::membership::decommission_drain_op(node_id), schema_version)
         .await?;
     let plan = DecommissionPlan::new(ring, node_id);
     let evidence = match stream_decommission_data(&plan, tables, scan, streamer).await {
@@ -347,7 +352,7 @@ where
             return Err(e.into());
         }
     };
-    proposer.propose(RaftOp::LeaveNode { node_id }).await?;
+    proposer.propose(RaftOp::LeaveNode { node_id }, schema_version).await?;
     tracing::info!(
         node_id,
         sessions = evidence.sessions,
@@ -581,12 +586,17 @@ pub async fn verify_bootstrap(
 /// safe because anti-entropy converges (ranges already in sync cost one Merkle
 /// comparison and move nothing). On any failure nothing is recorded and the
 /// node stays `Joining`, out of `replicas()`.
+///
+/// `schema_version` is the node's CURRENT committed schema version, threaded to
+/// every command this function proposes (see
+/// [`decommission_verified`] for why membership ops must carry it).
 pub async fn bootstrap_verified(
     proposer: &dyn MembershipProposer,
     ring: &TokenRing,
     joiner: u64,
     tables: &[(TableId, ReplicationStrategy)],
     executor: &dyn crate::repair::SessionExecutor,
+    schema_version: uuid::Uuid,
 ) -> Result<DataMovementEvidence> {
     let outcome = match bootstrap_sessions(ring, joiner, tables) {
         Ok((sessions, ranges)) => verify_bootstrap(&sessions, ranges, executor).await,
@@ -606,16 +616,22 @@ pub async fn bootstrap_verified(
         }
     };
     proposer
-        .propose(RaftOp::RecordBootstrapComplete {
-            node_id: joiner,
-            evidence: evidence.clone(),
-        })
+        .propose(
+            RaftOp::RecordBootstrapComplete {
+                node_id: joiner,
+                evidence: evidence.clone(),
+            },
+            schema_version,
+        )
         .await?;
     proposer
-        .propose(RaftOp::SetNodeState {
-            node_id: joiner,
-            state: NodeState::Normal,
-        })
+        .propose(
+            RaftOp::SetNodeState {
+                node_id: joiner,
+                state: NodeState::Normal,
+            },
+            schema_version,
+        )
         .await?;
     tracing::info!(
         joiner,
@@ -669,21 +685,12 @@ pub struct ForwardingProposer {
     pub raft: std::sync::Arc<crate::raft::FerrosRaft>,
     pub peer_manager: std::sync::Arc<ferrosa_net::peer::PeerManager>,
     pub ring: std::sync::Arc<arc_swap::ArcSwap<Option<std::sync::Arc<TokenRing>>>>,
-    /// The node's CURRENT committed schema version, stamped on the membership /
-    /// data-movement commands this proposer sends. Those operations change no
-    /// schema, so they must carry the actual version, never a freshly minted
-    /// random one (bug: schema_version diverges after restart, t_7dda9421).
-    /// The caller reads it from the shared `Schema` it already holds.
-    pub schema_version: uuid::Uuid,
 }
 
 #[async_trait]
 impl MembershipProposer for ForwardingProposer {
-    async fn propose(&self, op: RaftOp) -> Result<()> {
-        let cmd = crate::raft::RaftCommand {
-            op,
-            schema_version: self.schema_version,
-        };
+    async fn propose(&self, op: RaftOp, schema_version: uuid::Uuid) -> Result<()> {
+        let cmd = crate::raft::RaftCommand { op, schema_version };
         let outcome = match self.raft.client_write(cmd.clone()).await {
             Ok(_) => Ok(()),
             Err(e) => Err(crate::raft_forward::classify_client_write_error(&e)),
@@ -828,15 +835,27 @@ mod tests {
         }
     }
 
+    /// A fixed schema version for the tests that only assert op ORDER. The
+    /// version carries no behaviour for these ops (the state machine's
+    /// `schema_changed` gate ignores it); the VALUE contract — that a built
+    /// command carries the node's CURRENT version — is pinned by
+    /// `data_movement_commands_carry_the_current_schema_version`.
+    fn fixture_version() -> uuid::Uuid {
+        uuid::Uuid::from_u128(0x0f0f_0f0f_0f0f_0f0f_0f0f_0f0f_0f0f_0f0f)
+    }
+
     #[derive(Default)]
     struct RecordingProposer {
         ops: StdMutex<Vec<RaftOp>>,
+        /// The `schema_version` each proposed command carried, in propose order.
+        versions: StdMutex<Vec<uuid::Uuid>>,
     }
 
     #[async_trait]
     impl MembershipProposer for RecordingProposer {
-        async fn propose(&self, op: RaftOp) -> Result<()> {
+        async fn propose(&self, op: RaftOp, schema_version: uuid::Uuid) -> Result<()> {
             self.ops.lock().unwrap().push(op);
+            self.versions.lock().unwrap().push(schema_version);
             Ok(())
         }
     }
@@ -882,6 +901,7 @@ mod tests {
             &[(table(), rf2())],
             scan_of(vec![partition(50, b"a"), partition(350, b"b")]),
             &streamer,
+            fixture_version(),
         )
         .await;
 
@@ -927,6 +947,7 @@ mod tests {
                 partition(250, b"unrelated"),
             ]),
             &streamer,
+            fixture_version(),
         )
         .await
         .expect("a fully verified transfer must decommission");
@@ -964,6 +985,7 @@ mod tests {
             &[(table(), rf2())],
             scan_of(vec![partition(50, b"a"), partition(60, b"b")]),
             &streamer,
+            fixture_version(),
         )
         .await
         .expect_err("a short apply must abort");
@@ -987,9 +1009,17 @@ mod tests {
             .boxed()
         };
 
-        let err = decommission_verified(&proposer, &ring, 1, &[(table(), rf2())], scan, &streamer)
-            .await
-            .expect_err("a read error must abort");
+        let err = decommission_verified(
+            &proposer,
+            &ring,
+            1,
+            &[(table(), rf2())],
+            scan,
+            &streamer,
+            fixture_version(),
+        )
+        .await
+        .expect_err("a read error must abort");
 
         assert!(err.to_string().contains("sstable corrupt"), "{err}");
         assert!(!proposer.proposed_leave());
@@ -1011,6 +1041,7 @@ mod tests {
             &[(table(), rf2())],
             scan_of(vec![partition(50, b"a")]),
             &RecordingStreamer::default(),
+            fixture_version(),
         )
         .await
         .expect_err("leaving with no remaining replica must abort");
@@ -1099,6 +1130,7 @@ mod tests {
             4,
             &[(table(), rf2())],
             &executor,
+            fixture_version(),
         )
         .await
         .expect_err("a failed session must abort the bootstrap");
@@ -1124,6 +1156,7 @@ mod tests {
             4,
             &[(table(), rf2())],
             &executor,
+            fixture_version(),
         )
         .await
         .expect("all sessions succeed");
@@ -1162,6 +1195,7 @@ mod tests {
             4,
             &[(table(), rf2())],
             &RecordingExecutor::default(),
+            fixture_version(),
         )
         .await
         .expect_err("no source replica must abort");
@@ -1180,6 +1214,99 @@ mod tests {
         assert_eq!(
             range_segments(&[100], 0),
             vec![(i64::MIN, 101), (101, i64::MAX)]
+        );
+    }
+
+    /// bug-schema-version-diverges-after-restart (t_7dda9421), Expected:
+    /// "versions should differ only while a schema change is actually being
+    /// applied". Decommission and bootstrap propose membership ops
+    /// (`SetNodeState` / `LeaveNode` / `RecordBootstrapComplete`), none of which
+    /// changes a schema, so every command they build must carry the node's
+    /// CURRENT committed schema version — never a freshly minted random one.
+    ///
+    /// Exercises the production callers of `MembershipProposer::propose`:
+    /// `decommission_verified` (Leaving → drain → `LeaveNode`) and
+    /// `bootstrap_verified` (record → `SetNodeState`). The recording proposer
+    /// stands in for Raft, so the VALUE the real path stamps is what is asserted.
+    ///
+    /// RED as written: the trait's `propose` took no version and the
+    /// `FerrosRaft` impl minted `Uuid::new_v4()` inside itself, so this test did
+    /// not compile, and once the version is threaded it fails against any mint
+    /// left on the path.
+    #[tokio::test]
+    async fn data_movement_commands_carry_the_current_schema_version() {
+        let schema = crate::controller::tests::test_schema();
+        let current = schema.snapshot().version;
+
+        let decommission_proposer = RecordingProposer::default();
+        decommission_verified(
+            &decommission_proposer,
+            &four_node_ring(1),
+            1,
+            &[(table(), rf2())],
+            scan_of(vec![partition(50, b"a"), partition(350, b"b")]),
+            &RecordingStreamer::default(),
+            current,
+        )
+        .await
+        .expect("a fully verified transfer must decommission");
+
+        let bootstrap_proposer = RecordingProposer::default();
+        bootstrap_verified(
+            &bootstrap_proposer,
+            &ring_with_joiner(),
+            4,
+            &[(table(), rf2())],
+            &RecordingExecutor::default(),
+            current,
+        )
+        .await
+        .expect("every bootstrap session succeeds");
+
+        for (label, proposer) in [
+            ("decommission", &decommission_proposer),
+            ("bootstrap", &bootstrap_proposer),
+        ] {
+            let versions = proposer.versions.lock().unwrap().clone();
+            assert!(
+                !versions.is_empty(),
+                "{label} proposed nothing, so this assertion is vacuous"
+            );
+            assert!(
+                versions.iter().all(|v| *v == current),
+                "{label} sent a schema_version that is not the node's CURRENT one \
+                 ({versions:?} vs {current}); a schema version must name the schema state"
+            );
+        }
+
+        // Control: after a real DDL moves the version, the built command follows
+        // it — the version is the node's current one at construction time, not a
+        // value cached at boot.
+        let moved = uuid::Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_9999);
+        assert_ne!(
+            moved, current,
+            "the moved version must differ from the fixture's, or this is vacuous"
+        );
+        schema.set_schema_version(moved);
+
+        let after_ddl = RecordingProposer::default();
+        decommission_verified(
+            &after_ddl,
+            &four_node_ring(1),
+            1,
+            &[(table(), rf2())],
+            scan_of(vec![partition(50, b"a"), partition(350, b"b")]),
+            &RecordingStreamer::default(),
+            schema.snapshot().version,
+        )
+        .await
+        .expect("decommission after the DDL");
+
+        let versions = after_ddl.versions.lock().unwrap().clone();
+        assert!(
+            !versions.is_empty() && versions.iter().all(|v| *v == moved),
+            "after a DDL the command must carry the schema's CURRENT version \
+             ({versions:?} vs {moved})"
         );
     }
 }

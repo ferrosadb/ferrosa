@@ -350,6 +350,24 @@ pub struct MembershipChanger<N: MembershipNetwork> {
     /// new joiners by default and identifies the Raft group via
     /// [`RaftGroupId::for_dc`].
     dc_name: String,
+    /// The node's CURRENT committed schema version, stamped on every
+    /// [`RaftCommand`] this changer proposes.
+    ///
+    /// Every op a `MembershipChanger` sends — `JoinNode`, `SetNodeState`,
+    /// `LeaveNode`, `ApproveNode`, `UpdateNodeInfo`, `AccordApply` — changes NO
+    /// schema, so the command must carry the version the node actually holds
+    /// rather than a freshly minted random one: a schema version must name the
+    /// schema state (bug: `schema-version-diverges-after-restart`,
+    /// t_7dda9421). A bare `openraft::Raft` handle holds no registry, so this
+    /// changer cannot read it itself — callers that hold the node's `Schema`
+    /// MUST set it with [`Self::with_schema_version`].
+    ///
+    /// [`Uuid::nil()`] is the honest "not known here" marker on a changer built
+    /// by [`Self::new`] / [`Self::for_dc`]: it is deterministic (never a random
+    /// value that could churn a version), and it is inert, because the state
+    /// machine's `schema_changed` gate ignores the value on every arm these ops
+    /// take.
+    schema_version: Uuid,
 }
 
 impl<N: MembershipNetwork> MembershipChanger<N> {
@@ -381,7 +399,25 @@ impl<N: MembershipNetwork> MembershipChanger<N> {
             default_dc,
             default_rack: "rack1".to_string(),
             dc_name,
+            // No registry is reachable from here; see the field's docs. A caller
+            // that holds the node's `Schema` sets the real version.
+            schema_version: Uuid::nil(),
         }
+    }
+
+    /// Return a copy of this changer that stamps `schema_version` on every
+    /// command it proposes.
+    ///
+    /// Callers that hold the node's shared `Schema` MUST use this: pass
+    /// `schema.snapshot().version`. See the `schema_version` field for why.
+    pub fn with_schema_version(mut self, schema_version: Uuid) -> Self {
+        self.schema_version = schema_version;
+        self
+    }
+
+    /// The schema version this changer stamps on the commands it proposes.
+    pub fn schema_version(&self) -> Uuid {
+        self.schema_version
     }
 
     /// DC this changer is bound to.
@@ -551,7 +587,7 @@ impl<N: MembershipNetwork> MembershipChanger<N> {
                 hlc,
                 mutation,
             },
-            schema_version: Uuid::new_v4(),
+            schema_version: self.schema_version,
         };
 
         // Submit via openraft. ForwardToLeader → NotLeader.
@@ -623,7 +659,7 @@ impl<N: MembershipNetwork> MembershipChanger<N> {
     async fn submit_join_node(&self, info: NodeInfo) -> Result<(), MembershipError> {
         let cmd = RaftCommand {
             op: RaftOp::JoinNode(info),
-            schema_version: Uuid::new_v4(),
+            schema_version: self.schema_version,
         };
         match self.raft.client_write(cmd).await {
             Ok(_) => Ok(()),
@@ -713,7 +749,7 @@ impl<N: MembershipNetwork> MembershipChanger<N> {
                 node_id,
                 state: NodeState::Normal,
             },
-            schema_version: Uuid::new_v4(),
+            schema_version: self.schema_version,
         };
         match self.raft.client_write(cmd).await {
             Ok(_) => Ok(()),
@@ -797,7 +833,7 @@ impl<N: MembershipNetwork> MembershipChanger<N> {
                 node_id,
                 state: NodeState::Learner { owns_tokens: true },
             },
-            schema_version: Uuid::new_v4(),
+            schema_version: self.schema_version,
         };
         match self.raft.client_write(cmd).await {
             Ok(_) => Ok(()),
@@ -914,7 +950,7 @@ impl<N: MembershipNetwork> MembershipChanger<N> {
         // Step 3 — drop from state.members.
         let cmd = RaftCommand {
             op: RaftOp::LeaveNode { node_id },
-            schema_version: Uuid::new_v4(),
+            schema_version: self.schema_version,
         };
         match self.raft.client_write(cmd).await {
             Ok(_) => {}
@@ -949,7 +985,7 @@ impl<N: MembershipNetwork> MembershipChanger<N> {
     pub async fn approve_node(&self, host_id: Uuid) -> Result<(), MembershipError> {
         let cmd = RaftCommand {
             op: RaftOp::ApproveNode { host_id },
-            schema_version: Uuid::new_v4(),
+            schema_version: self.schema_version,
         };
         match self.raft.client_write(cmd).await {
             Ok(_) => Ok(()),
@@ -999,7 +1035,7 @@ impl<N: MembershipNetwork> MembershipChanger<N> {
 
         let cmd = RaftCommand {
             op: RaftOp::UpdateNodeInfo(info),
-            schema_version: Uuid::new_v4(),
+            schema_version: self.schema_version,
         };
 
         match self.raft.client_write(cmd).await {

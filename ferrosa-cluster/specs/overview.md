@@ -190,14 +190,23 @@ than a total wait budget (CL-63). See
     the crate README (CL-56/57/58).
 
 13. **A command that changes no schema carries the CURRENT schema version.**
-    Topology (`JoinNode` / `AssignTokens` / `UpdateNodeInfo`) and data-movement
-    (`SetNodeState` / `LeaveNode`) commands mint no version: the controller
-    stamps them with the node's committed `Schema` version (`ForwardingProposer`,
-    `controller/membership.rs`). The state machine's `schema_changed` gate keeps
-    the committed version where the last real DDL put it. A restarted node
-    re-adopts its persisted version through `Schema::apply_snapshot`
-    (ferrosa-schema), so `system.local.schema_version` agrees with the cluster
-    after a restart instead of diverging until the next DDL (t_7dda9421).
+    Topology (`JoinNode` / `AssignTokens` / `UpdateNodeInfo` / `SetNodeState` /
+    `LeaveNode` / `ApproveNode`) and data-movement (`RecordBootstrapComplete`)
+    commands mint no version: the builder stamps them with the node's committed
+    `Schema` version. The sweep covers the cluster-formation task
+    (`controller/cluster.rs`, read once per spawn through
+    `current_schema_version`), `MembershipProposer::propose` (the version is a
+    parameter, so `FerrosRaft` and `ForwardingProposer` no longer choose it),
+    `MembershipChanger` (a `schema_version` field, default
+    `Uuid::nil()` — the changer holds no registry, and nil is inert because the
+    state machine's `schema_changed` gate ignores it), `rebalance.rs`, and the
+    web layer's `ApproveNode`. The only sites still minting are the real DDL
+    paths in `ddl_path.rs`, where a new version is the point. The state machine's
+    `schema_changed` gate keeps the committed version where the last real DDL put
+    it. A restarted node re-adopts its persisted version through
+    `Schema::apply_snapshot` (ferrosa-schema), so `system.local.schema_version`
+    agrees with the cluster after a restart instead of diverging until the next
+    DDL (t_7dda9421, swept under t_17569632).
 
 ## Correctness evidence (be honest)
 

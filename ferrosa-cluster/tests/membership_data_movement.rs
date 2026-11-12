@@ -288,6 +288,7 @@ async fn a_failed_decommission_stream_leaves_the_node_committed_as_leaving() {
         &tables,
         scan,
         &Streamer { fail: true },
+        test_schema().snapshot().version,
     )
     .await
     .expect_err("a failed stream must abort the decommission");
@@ -305,6 +306,7 @@ async fn a_failed_decommission_stream_leaves_the_node_committed_as_leaving() {
         &tables,
         scan,
         &Streamer { fail: false },
+        test_schema().snapshot().version,
     )
     .await
     .expect("a verified transfer decommissions");
@@ -422,6 +424,7 @@ async fn a_restart_mid_bootstrap_does_not_promote_until_the_rerun_records_comple
         joiner,
         &tables,
         &Executor { fail: true },
+        test_schema().snapshot().version,
     )
     .await
     .expect_err("a failed rerun must not complete the bootstrap");
@@ -435,6 +438,7 @@ async fn a_restart_mid_bootstrap_does_not_promote_until_the_rerun_records_comple
         joiner,
         &tables,
         &Executor { fail: false },
+        test_schema().snapshot().version,
     )
     .await
     .expect("a verified rerun completes the bootstrap");

@@ -230,14 +230,15 @@ impl ModeController {
                 .map(|r| r.map(Arc::unwrap_or_clone))
                 .boxed()
         };
-        // Membership / data-movement commands change no schema, so this proposer
-        // carries the node's CURRENT schema version rather than minting one
-        // (bug: schema_version diverges after restart, t_7dda9421).
+        // Membership / data-movement commands change no schema, so every command
+        // built below carries the node's CURRENT schema version rather than a
+        // freshly minted random one (bug: schema_version diverges after restart,
+        // t_7dda9421).
+        let schema_version = self.schema.snapshot().version;
         let proposer = super::data_movement::ForwardingProposer {
             raft,
             peer_manager: peer_manager.clone(),
             ring: self.ring.clone(),
-            schema_version: self.schema.snapshot().version,
         };
         let streamer = super::data_movement::StreamSenderStreamer {
             peer_manager,
@@ -245,7 +246,7 @@ impl ModeController {
             source_node: node_id,
         };
         super::data_movement::decommission_verified(
-            &proposer, &ring, node_id, &tables, scan, &streamer,
+            &proposer, &ring, node_id, &tables, scan, &streamer, schema_version,
         )
         .await
         .map(|_| ())

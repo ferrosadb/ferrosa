@@ -1,7 +1,7 @@
 use super::cluster::{
     build_recovered_topology_refresh_plan, build_recovered_topology_token_repair_plan,
-    drain_ddl_queue, keyspace_needs_cluster_replay, should_initialize_seed_membership,
-    should_run_bootstrap_streaming,
+    current_schema_version, drain_ddl_queue, keyspace_needs_cluster_replay,
+    should_initialize_seed_membership, should_run_bootstrap_streaming,
 };
 use super::*;
 use crate::raft::{NodeInfo, NodeState};
@@ -57,6 +57,44 @@ pub(crate) fn test_schema() -> Arc<Schema> {
         mode: SchemaDeploymentMode::Development,
     };
     Arc::new(Schema::new(config).unwrap())
+}
+
+/// bug-schema-version-diverges-after-restart (t_7dda9421): every topology
+/// command the cluster-formation task builds (`UpdateNodeInfo` / `AssignTokens`
+/// on the recovered-topology refresh, `JoinNode` for seed and peers,
+/// `SetNodeState` on the promote pass) changes NO schema, so the task must stamp
+/// it with the version the node actually holds. This pins the construction seam
+/// the task reads once per spawn (`current_schema_version`); the mint
+/// `Uuid::new_v4()` that used to sit at each of those sites is what it replaces.
+///
+/// Regression guard, not the red: the state-machine-level contract is already
+/// pinned by `topology_command_leaves_the_schema_version_unchanged`
+/// (`raft::state_machine`), which passes with or without this sweep because the
+/// `schema_changed` gate ignores the value on topology arms. This is the first
+/// test that asserts the VALUE the task stamps.
+#[test]
+fn topology_commands_carry_the_current_schema_version() {
+    let schema = test_schema();
+    let boot = current_schema_version(&schema);
+    assert_eq!(
+        boot,
+        schema.snapshot().version,
+        "the formation task must read the node's CURRENT committed version"
+    );
+
+    // A real DDL moves it, and the next command must carry the moved value —
+    // not a value cached before the DDL, and not a fresh random one.
+    let after_ddl = Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_aaa1);
+    assert_ne!(
+        after_ddl, boot,
+        "the moved version must differ from the fixture's, or this is vacuous"
+    );
+    schema.set_schema_version(after_ddl);
+    assert_eq!(
+        current_schema_version(&schema),
+        after_ddl,
+        "after a DDL the next topology command must carry the new schema version"
+    );
 }
 
 struct EchoPingHandler;

@@ -1,10 +1,11 @@
 # After a restart every node reports its own schema version, and drivers never reach schema agreement
 
-**Status**: **partially fixed** — the restart divergence is fixed (a node now adopts the
-schema version it persisted instead of the random one minted at boot), and the
-controller-built topology/data-movement commands now carry the node's actual
-schema version instead of a freshly minted one. Two mint sites remain, each with a
-recorded reason (see [Fix](#fix)).
+**Status**: **fixed** — a restarted node adopts the schema version it persisted
+instead of the random one minted at boot, and every `RaftCommand` built for an
+operation that changes NO schema now carries the node's ACTUAL current committed
+version instead of `Uuid::new_v4()`. Two mint sites remain, both on the REAL DDL
+paths where a new version is correct; each has a recorded reason (see
+[Fix](#fix)). Sweep task: t_17569632 (parent fix t_7dda9421).
 **Found**: 2026-10-15, ferrosa-ent (AWS, 3 nodes, v2026.10.15.0002; the 2026-10-08 image binary behaves the same)
 **Severity**: outage for any client that waits for schema agreement. ferrosa-dbaas `dbaas-api` cannot
 start after any database node restarts: its startup migration (`CREATE ... IF NOT EXISTS`) waits for
@@ -73,14 +74,41 @@ snapshot never moves it). Because every restore path goes through
 state-machine's `sync_schema_and_engine_from_state`, which already built a
 snapshot carrying `state.schema_version` but had it discarded.
 
-### (a) Operations that change no schema carry the actual version — landed for controller commands
+### (a) Operations that change no schema carry the actual version — swept
 
-Topology (`JoinNode` / `AssignTokens` / `UpdateNodeInfo`) and data-movement
-commands change no schema, so they must carry the node's CURRENT committed
-version. The controller's command builders in `controller/membership.rs`
-(join, join-refresh, `on_peer_connected`) and `controller/data_movement.rs`
-(`ForwardingProposer`, used by decommission and the bootstrap rerun) now read it
-from the shared `Schema` instead of calling `Uuid::new_v4()`.
+Topology (`JoinNode` / `AssignTokens` / `UpdateNodeInfo` / `SetNodeState` /
+`LeaveNode` / `ApproveNode`) and data-movement (`RecordBootstrapComplete`) ops
+change no schema, so a command naming one must carry the node's CURRENT
+committed version. Every construction site that minted `Uuid::new_v4()` for such
+an op is now gone. What was swept (task t_17569632):
+
+- `controller/membership.rs` — join, join-refresh and `on_peer_connected` read
+  `self.schema.snapshot().version` (landed with the parent fix).
+- `controller/cluster.rs` — the eight commands the cluster-formation task builds
+  (`UpdateNodeInfo` / `AssignTokens` on the recovered-topology refresh, `JoinNode`
+  and `AssignTokens` for the seed and for each peer, `SetNodeState` on the promote
+  pass). The task reads the version ONCE per spawn through
+  `controller::cluster::current_schema_version(&schema_for_bootstrap)` and reuses
+  it for every command, so the per-node loops do not re-read the snapshot.
+- `controller/data_movement.rs` — `MembershipProposer::propose` now takes a
+  `schema_version: Uuid` parameter, so the impls no longer choose the version
+  themselves: `impl MembershipProposer for FerrosRaft` uses the parameter (its
+  mint is what the parent fix left behind), and `ForwardingProposer` no longer
+  carries the version in a field. `decommission_verified` and
+  `bootstrap_verified` take the version and thread it from the caller's
+  `Schema` (`initiate_decommission`, `rerun_local_bootstrap`).
+- `membership/mod.rs` — `MembershipChanger`'s seven commands (`AccordApply`,
+  `JoinNode`, `SetNodeState` ×2, `LeaveNode`, `ApproveNode`,
+  `UpdateNodeInfo`). The changer holds no registry, so it carries a
+  `schema_version` field set by the new `with_schema_version` builder; see the
+  note below for the default.
+- `rebalance.rs` — `execute_rebalance`'s `AssignTokens` stamps the version it
+  already holds in its `schema` argument.
+- `ferrosa/src/web/api.rs` — `add_node_handler`'s `ApproveNode` stamps
+  `ModeController::schema().snapshot().version`.
+- `raft_forward.rs` — checked, nothing to sweep: the module only DECODES and
+  forwards an already-built `RaftCommand`; it constructs none outside its
+  `#[cfg(test)]` fixtures.
 
 ### Deliberately left minting
 
@@ -90,13 +118,15 @@ from the shared `Schema` instead of calling `Uuid::new_v4()`.
   change, and a new version there is load-bearing: the maintenance loop persists
   `schema.json` only when the version CHANGED (`should_persist_schema(a, b) = a != b`),
   so removing the bump would stop a standalone/pair node from persisting its
-  schema at all.
-- `data_movement.rs:125` (`impl MembershipProposer for FerrosRaft`) — a bare
-  `openraft::Raft` handle holds no schema registry, so it cannot read the node's
-  version. Production callers now use `ForwardingProposer`; the impl is left for
-  callers that hold only the raft handle. The smallest change that removes the
-  mint is a `schema_version: Uuid` parameter on `MembershipProposer::propose`,
-  threaded from the caller's `Schema`.
+  schema at all. `ddl_op_to_raft_command` names the new version a DDL is about to
+  commit; minting it is the point.
+- `MembershipChanger`'s DEFAULT version is `Uuid::nil()`, not a mint. The changer
+  cannot reach a registry, and every op it sends is gated off by the state
+  machine's `schema_changed`, so nil is an inert, deterministic "not known here":
+  it can never churn a version. Callers that hold the node's `Schema` MUST set the
+  real one with `with_schema_version`. Nil is a recorded choice, not an oversight.
+- Random versions inside `#[cfg(test)]` modules and `tests/` are fixtures for
+  test-built commands, not production mints.
 
 ### Why the state machine already agrees
 
@@ -104,8 +134,23 @@ from the shared `Schema` instead of calling `Uuid::new_v4()`.
 set it false), so a random version on a topology command never propagated
 cluster-wide. The topology contract test
 (`topology_command_leaves_the_schema_version_unchanged`) is therefore a
-regression guard, not the red that produced the fix; the red is
-`apply_snapshot_adopts_the_persisted_schema_version` in `ferrosa-schema`.
+regression guard, not the red that produced the fix; the red that produced the
+restart half is `apply_snapshot_adopts_the_persisted_schema_version` in
+`ferrosa-schema`.
+
+For this sweep the red is at COMMAND CONSTRUCTION, not at the state machine: a
+state-machine-level test passes with or without the sweep (it did — the gate
+predates it). `data_movement_commands_carry_the_current_schema_version`
+(`controller::data_movement`) drives the real `decommission_verified` /
+`bootstrap_verified` path with a recording proposer and asserts the VALUE of the
+command's `schema_version` — it did not compile while `propose` took no version,
+and it fails at run time if any mint is restored on that path (verified by
+restoring one). The tests added next to code that already existed
+(`topology_commands_carry_the_current_schema_version`,
+`membership_commands_carry_the_current_schema_version`) are labelled regression
+guards in their own doc comments: those two sites sit behind a live
+`openraft::Raft` or inside a spawned task and have no unit-level construction
+seam.
 
 ## Not acceptable as a fix
 
