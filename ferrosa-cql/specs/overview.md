@@ -303,3 +303,12 @@ there. Direct function replacement validates and publishes its component before
 removing old metadata, then performs DROP and CREATE in that same owned job and
 lease. Dropping the requesting future cannot submit only the DROP half of an
 admitted replacement. Pair and Cluster coordination keep their existing paths.
+
+Direct conditional CREATE/DROP rechecks existence and the existing authorization
+policy under the lifecycle writer before changing metadata, physical state or
+persistent rows. Conditional no-ops do not change schema version, audit or native
+events. Table-event jobs report whether they applied a change and the table they
+actually changed; index removal resolves and authorizes its current owner there.
+Index creation validates the current parent/target columns and rebuilds filtered
+predicates from current types and storage ordinals before persistence. Existing
+aggregate IF NOT EXISTS returns before irrelevant proposed dependency validation.
