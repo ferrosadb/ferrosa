@@ -1,4 +1,7 @@
 //! Segment: fixed-size byte buffer with lock-free CAS allocation.
+//! Correctness: disjoint reservations, writer barriers and CRC-checked durable replay.
+//! Last revised: 2026-10-29
+//! Last changed: Added opt-in numeric write/sync evidence for the correctness probe.
 //!
 //! A `Segment` is the central building block of the commit log. Writers
 //! concurrently allocate non-overlapping slices from the segment's buffer
@@ -563,6 +566,11 @@ impl Segment {
         let payload_crc = crc32fast::hash(&buf[payload_start..payload_end]);
         buf[payload_end..payload_end + 4].copy_from_slice(&payload_crc.to_be_bytes());
 
+        #[cfg(feature = "correctness-tracing")]
+        tracing::event!(target: "ferrosa::correctness", tracing::Level::TRACE,
+            kind = 1_u64, segment = self.id, offset,
+            end = (off + total_size) as u64, checksum = u64::from(payload_crc));
+
         CommitLogPosition {
             segment_id: self.id,
             offset,
@@ -612,6 +620,11 @@ impl Segment {
 
         let payload_crc = crc32fast::hash(&buf[payload_start..payload_end]);
         buf[payload_end..payload_end + 4].copy_from_slice(&payload_crc.to_be_bytes());
+
+        #[cfg(feature = "correctness-tracing")]
+        tracing::event!(target: "ferrosa::correctness", tracing::Level::TRACE,
+            kind = 1_u64, segment = self.id, offset,
+            end = (off + total_size) as u64, checksum = u64::from(payload_crc));
 
         CommitLogPosition {
             segment_id: self.id,
@@ -751,7 +764,7 @@ impl Segment {
     }
 
     /// Flushes, and repairs the sync marker at `prev_marker_offset` if the
-    /// backwards patch [`write_sync_marker_at`](Self::write_sync_marker_at)
+    /// backwards patch `write_sync_marker_at`
     /// made to it now sits behind the flush watermark.
     ///
     /// The repair is decided inside the flush, under the file lock, against
@@ -930,6 +943,10 @@ impl Segment {
             }
         }
 
+        #[cfg(feature = "correctness-tracing")]
+        tracing::event!(target: "ferrosa::correctness", tracing::Level::TRACE,
+            kind = 2_u64, segment = self.id, offset = 0_u64,
+            end = current_pos as u64, checksum = 0_u64);
         Ok(())
     }
 
@@ -1120,7 +1137,7 @@ impl Segment {
     /// The largest single entry (payload + overhead) that can ever fit in a
     /// fresh segment of `capacity` bytes.
     ///
-    /// A fresh segment starts at [`INITIAL_POSITION`] (header + first sync
+    /// A fresh segment starts at `INITIAL_POSITION` (header + first sync
     /// marker); a closing sync marker is also reserved so `force_sync` can
     /// always append its EOF marker. Returns 0 when the capacity cannot hold
     /// even an empty entry — callers must treat that as "no entry fits".
@@ -1142,7 +1159,7 @@ impl Segment {
     /// Returns the current heap size of the buffer in bytes.
     ///
     /// Returns the segment capacity before [`release_buffer()`](Self::release_buffer)
-    /// is called, and 0 after.  Used by [`CommitLog::closed_segments_total_bytes()`]
+    /// is called, and 0 after. Used by [`super::CommitLog::closed_segments_total_bytes`]
     /// to confirm that closed segments are not holding memory.
     pub fn buffer_bytes(&self) -> usize {
         // SAFETY: We only read the Vec's length field — no slice access.
@@ -1151,7 +1168,7 @@ impl Segment {
 
     /// Drops the in-memory write buffer, retaining only segment metadata.
     ///
-    /// Called by [`CommitLog::force_rotate()`] immediately after the segment
+    /// Called by [`super::CommitLog::force_rotate`] immediately after the segment
     /// has been fsynced to disk and moved to `closed_segments`.  Replacing
     /// the 32 MB buffer with an empty `Vec` caps closed-segment memory at
     /// ~200 bytes of metadata per segment regardless of GC lag.

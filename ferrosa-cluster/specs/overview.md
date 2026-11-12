@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cluster
 status: implemented
-last_updated: 2026-10-10
+last_updated: 2026-10-29
 executive_summary: >
   The distribution layer that turns single-node ferrosa-storage engines into a
   cluster: Raft metadata consensus (openraft 0.9 fork with CheckQuorum; a PreVote
@@ -16,6 +16,12 @@ executive_summary: >
 # ferrosa-cluster — Architecture Overview
 
 ## Purpose & boundary
+
+The `consensus_policy_probe` example exports 75 cases from the real
+`ConsistencyLevel::block_for` function for independent comparison with policy
+models. It covers configured RF 1/2/3/5/9, CL ALL/QUORUM/ONE, and available
+response counts; a satisfied threshold is distinct from a successful consensus
+operation. The example changes no production policy or dependency.
 
 Single-row replica writes encode borrowed inputs with
 `pair::coordinator::encode_single_row_mutation`; local application still consumes

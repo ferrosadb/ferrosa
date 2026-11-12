@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-storage
 doc: roadmap
-last_updated: 2026-09-26
+last_updated: 2026-10-29
 ---
 
 # ferrosa-storage â€” Roadmap
@@ -12,6 +12,12 @@ dependency/usage review. The crate has **no in-source `TODO`/`FIXME`** markers â
 open work lives in specs and the items below.
 
 ## Done (recent)
+
+- Added the opt-in `correctness_probe` experiment for WAL recovery, exact byte
+  preservation, prepared-write allocation checks and release recording cost.
+  Default production instrumentation is unchanged: release builds omit the
+  feature. Whole-engine crash coverage remains unestablished; active recording
+  may exceed 5% and is reserved for explicitly instrumented experiments.
 
 - **Streaming write-set staging (`write_set_stage.rs`).** `WriteSetStage` is the
   streaming twin of `WriteSetSpill`: driven one payload at a time as rows arrive, it

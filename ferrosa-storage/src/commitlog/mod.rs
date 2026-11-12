@@ -1,8 +1,8 @@
 //! Module: Persist mutations in a bounded, replayable write-ahead log.
 //! Correctness: Correct when acknowledged mutations survive restart and segment
 //! retention advances only after every dirty table is durably flushed.
-//! Last revised: 2026-09-01
-//! Last changed: Added byte-bounded, oldest-segment-scoped flush pressure.
+//! Last revised: 2026-10-29
+//! Last changed: Added a narrow safe wrapper for the opt-in correctness probe.
 //!
 //! Commit log (write-ahead log) for durability.
 //!
@@ -31,6 +31,8 @@ pub(crate) mod config;
 pub(crate) mod descriptor;
 pub mod manifest;
 pub(crate) mod mutation;
+#[cfg(feature = "correctness-probe")]
+mod probe;
 pub(crate) mod reader;
 pub mod replay_progress;
 pub(crate) mod segment;
@@ -73,7 +75,12 @@ use uuid::Uuid;
 
 use checkpoint::CommitLogCheckpoint;
 use config::CommitLogConfig as Config;
+#[cfg(feature = "correctness-probe")]
+pub use probe::ProbeSegment;
+#[cfg(not(feature = "correctness-probe"))]
 use reader::SegmentReader;
+#[cfg(feature = "correctness-probe")]
+pub use reader::SegmentReader;
 use segment::Segment;
 use sync::{AckPolicy, BatchSync, FlushCallback, GroupSync, PeriodicSync, SyncStrategy};
 pub use sync::{StallCause, SyncHealthSnapshot};

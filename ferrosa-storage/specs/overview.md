@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-storage
 status: implemented
-last_updated: 2026-10-09
+last_updated: 2026-10-29
 executive_summary: >
   The single-node storage engine and durable substrate of the platform:
   memtable, write-ahead commit log, flush to BTI SSTables, S3 write-behind
@@ -15,6 +15,14 @@ executive_summary: >
 # ferrosa-storage — Architecture Overview
 
 ## Purpose & boundary
+
+The feature-gated `correctness_probe` example uses real segment reservation,
+both entry encoders, sync and replay. `correctness-tracing` adds numeric boundary
+events; default builds compile them out. The experiment measures prepared
+synchronous writes separately from construction, decode and file sync, and
+compares complete replay encodings. It changes no persisted format, sync policy
+or dependency. Its evidence does not cover complete engine admission or a client
+acknowledgment: the driver emits its own acknowledgment after sync returns.
 
 `ferrosa-storage` owns the **complete single-node data lifecycle**. It accepts
 writes into an in-memory memtable, makes them durable through a segmented

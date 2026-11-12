@@ -1,8 +1,8 @@
 //! Module: Incrementally validate and yield mutations from one commit-log segment.
 //! Correctness: Correct when sync markers and CRCs gate every yielded entry, active
 //! segment tails can be refreshed, and payload allocation is caller-bounded.
-//! Last revised: 2026-08-29
-//! Last changed: Replaced whole-segment loading with incremental bounded entry reads.
+//! Last revised: 2026-10-29
+//! Last changed: Added opt-in recovery evidence after CRC and envelope validation.
 //!
 //! [`SegmentReader`] keeps an open file, validates the fixed header, and follows
 //! sync markers while allocating at most one caller-bounded entry payload.
@@ -316,6 +316,10 @@ impl SegmentReader {
                     continue;
                 }
             };
+            #[cfg(feature = "correctness-tracing")]
+            tracing::event!(target: "ferrosa::correctness", tracing::Level::TRACE,
+                kind = 5_u64, segment = position.segment_id, offset = position.offset,
+                end = entry_end, checksum = u64::from(u32::from_be_bytes(payload_crc)));
             self.transaction_entries
                 .extend(mutations.into_iter().enumerate().map(|(index, mutation)| {
                     (

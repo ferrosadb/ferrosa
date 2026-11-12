@@ -55,6 +55,9 @@ proptest = { version = "1", optional = true }
 tempfile = { version = "3", optional = true }
 
 [features]
+correctness-probe = []
+# Opt-in boundary events; absent from ordinary release builds.
+correctness-tracing = ["correctness-probe"]
 # The production write path should avoid the sharded BTree memtable's
 # parking_lot::RwLock hot path by default. The skiplist memtable uses
 # crossbeam's concurrent map plus per-partition CAS updates instead.
@@ -147,3 +150,7 @@ tempfile = "3"
 # Tests that assert on what WAS or WAS NOT logged: a degraded index and a
 # working one return the same rows, so the log line is the only difference.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[example]]
+name = "correctness_probe"
+required-features = ["correctness-probe"]

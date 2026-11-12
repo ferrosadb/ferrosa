@@ -6,6 +6,18 @@
 
 ## What this crate is
 
+The opt-in `correctness_probe` example exercises both production WAL entry
+writers, sync and incremental replay. It checks exact replay bytes, damaged-tail
+rejection, shared payload identity and zero allocations in prepared synchronous
+write/serialization windows. Run with `--features correctness-tracing -- capture
+<path>` or `--release --features correctness-tracing -- bench`. Numeric events
+exist only with `correctness-tracing`; `correctness-probe` alone exposes a safe
+segment wrapper and reader for a compiled-out baseline. Reservation and write
+remain paired; the raw internal segment is private. The fixed-capacity collector
+rejects overflow. Timing reports include disabled/recording trials for 256-byte,
+4-KiB and 64-KiB payloads; these experiments do not establish a production latency
+guarantee or allocation-free decode, rotation or complete CQL handling.
+
 `ferrosa-storage` is the **storage substrate** of the platform — the largest and
 most critical crate in the workspace (~73k LoC across ~95 source files). It owns
 the full single-node data lifecycle: writes land in an in-memory memtable, are

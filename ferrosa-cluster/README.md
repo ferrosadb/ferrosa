@@ -1,5 +1,12 @@
 # ferrosa-cluster
 
+`cargo run -p ferrosa-cluster --example consensus_policy_probe` exports the
+production ALL/QUORUM/ONE acknowledgment thresholds for replica counts 1/2/3/5/9
+and each possible live count. This supports independent policy correspondence
+checking. The `live >= required` output describes the threshold only; it does
+not establish election authority, RPC admission, durable acknowledgment or
+linearizable reads.
+
 Single-row replica fan-out serializes borrowed row/key fields through
 `encode_single_row_mutation`, then moves the row into the local write. It avoids
 an owned temporary mutation solely for encoding and retains a distinct mutation
