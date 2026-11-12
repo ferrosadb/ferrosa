@@ -905,6 +905,7 @@ pub(crate) async fn before_property_write_for_test() {
 
 /// Central coordinator for graph query processing.
 pub struct GraphEngine {
+    recovery_admission: Option<Arc<ferrosa_cluster::raft::quarantine::RecoveryAdmission>>,
     publication: Arc<tokio::sync::RwLock<()>>,
     // One FIFO writer domain for every keyspace/key through this engine. Always
     // acquire BEFORE publication; a queued writer cannot delay its owner's COMMIT.
@@ -995,6 +996,15 @@ impl GraphEngine {
         )
     }
 
+    /// Attach the node's shared client-admission authority before serving transports.
+    pub fn with_recovery_admission(
+        mut self,
+        admission: Arc<ferrosa_cluster::raft::quarantine::RecoveryAdmission>,
+    ) -> Self {
+        self.recovery_admission = Some(admission);
+        self
+    }
+
     /// Like `new`, but routes graph-engine-driven DDL (adjacency keyspace +
     /// adjacency table creation) through the provided coordinator. Use this
     /// in multi-node cluster wiring so every replica registers the adjacency
@@ -1030,6 +1040,7 @@ impl GraphEngine {
         // the lazy path; nothing here is so urgent that it can't wait
         // for the first query.
         Self {
+            recovery_admission: None,
             publication: Arc::new(tokio::sync::RwLock::new(())),
             writer_admission: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(debug_assertions)]

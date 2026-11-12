@@ -541,16 +541,29 @@ fn build_app_and_engine(
     schema: Arc<Schema>,
     storage: Arc<StorageEngine>,
 ) -> (axum::Router, Arc<GraphEngine>) {
+    build_app_and_engine_with_recovery(schema, storage, None)
+}
+
+fn build_app_and_engine_with_recovery(
+    schema: Arc<Schema>,
+    storage: Arc<StorageEngine>,
+    admission: Option<Arc<ferrosa_cluster::raft::quarantine::RecoveryAdmission>>,
+) -> (axum::Router, Arc<GraphEngine>) {
     let write_path = Arc::new(arc_swap::ArcSwap::from_pointee(
         ferrosa_cluster::write_path::WritePath::direct(Arc::clone(&storage)),
     ));
-    let engine = Arc::new(GraphEngine::new(
+    let engine = GraphEngine::new(
         Arc::clone(&schema),
         Arc::clone(&storage),
         write_path,
         GraphEngineConfig::default(),
         std::time::Duration::from_secs(300),
-    ));
+    );
+    let engine = match admission {
+        Some(admission) => engine.with_recovery_admission(admission),
+        None => engine,
+    };
+    let engine = Arc::new(engine);
     let state = AppState {
         engine: Arc::clone(&engine),
         schema: Arc::clone(&schema),
@@ -9485,4 +9498,209 @@ async fn http_limit_short_circuits_expansion_hydration() {
         "LIMIT 2 must skip hydrating the 3 excess neighbors (short-circuit): \
          limited={read_2} unlimited={read_all}"
     );
+}
+
+// Recovery admission is shared with the controller, including already-open transports.
+struct RecoveryHttpFixture {
+    _dir: TempDir,
+    app: axum::Router,
+    engine: Arc<GraphEngine>,
+    admission: Arc<ferrosa_cluster::raft::quarantine::RecoveryAdmission>,
+    schema: Arc<Schema>,
+    storage: Arc<StorageEngine>,
+}
+
+async fn recovery_http_fixture() -> RecoveryHttpFixture {
+    let (schema, storage, dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    let admission = Arc::new(ferrosa_cluster::raft::quarantine::RecoveryAdmission::new());
+    let (app, engine) = build_app_and_engine_with_recovery(
+        schema.clone(),
+        storage.clone(),
+        Some(admission.clone()),
+    );
+    let response = app.clone().oneshot(json_request("POST", "/graph/query", Some(serde_json::json!({
+        "query": "MERGE (n:Person {id: '00000000-0000-0000-0000-00000000a001', name: 'Alice'}) RETURN n.name",
+        "keyspace": "social"
+    })))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response_json(response).await["rows"][0][0]
+        .as_str()
+        .unwrap()
+        .starts_with("merged 1 vertices"));
+    let positive = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({
+                "query": "MATCH (n:Person) RETURN n.name", "keyspace": "social"
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(positive.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(positive).await["rows"],
+        serde_json::json!([["Alice"]])
+    );
+    RecoveryHttpFixture {
+        _dir: dir,
+        app,
+        engine,
+        admission,
+        schema,
+        storage,
+    }
+}
+
+#[tokio::test]
+async fn graph_recovery_admission_http_reads_and_writes_refuse() {
+    let fixture = recovery_http_fixture().await;
+    fixture
+        .admission
+        .quarantine("test", "projection not verified");
+    let mut statuses = Vec::new();
+    for query in [
+        "MATCH (n:Person) RETURN n.name",
+        "MERGE (n:Person {id: '00000000-0000-0000-0000-00000000b002', name: 'Bob'}) RETURN n.name",
+    ] {
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/graph/query",
+                Some(serde_json::json!({"query":query,"keyspace":"social"})),
+            ))
+            .await
+            .unwrap();
+        statuses.push(response.status());
+    }
+    assert_eq!(
+        statuses,
+        vec![StatusCode::SERVICE_UNAVAILABLE; 2],
+        "both reads and writes must refuse during recovery"
+    );
+    let inspector = build_app(fixture.schema.clone(), fixture.storage.clone());
+    let response = inspector
+        .oneshot(json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({"query":"MATCH (n:Person) RETURN n.name","keyspace":"social"})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        response_json(response).await["rows"],
+        serde_json::json!([["Alice"]]),
+        "denied writes must leave physical data unchanged"
+    );
+}
+
+#[tokio::test]
+async fn graph_recovery_admission_open_query_body_refuses() {
+    use futures::StreamExt;
+    let fixture = recovery_http_fixture().await;
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({"query":"MATCH (n:Person) RETURN n.name","keyspace":"social"})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    fixture
+        .admission
+        .quarantine("test", "fault after HTTP headers");
+    let first = response.into_body().into_data_stream().next().await;
+    assert!(
+        matches!(first, Some(Err(_))),
+        "an already-open query must not publish stale rows"
+    );
+}
+
+#[tokio::test]
+async fn graph_recovery_admission_open_subscription_refuses() {
+    use futures::StreamExt;
+    let fixture = recovery_http_fixture().await;
+    let response = fixture.app.clone().oneshot(json_request("POST", "/graph/subscribe", Some(serde_json::json!({"query":"SUBSCRIBE MATCH (n:Person) RETURN n.name EVERY 500 ms DELTA","keyspace":"social"})))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(fixture.engine.subscription_registry().count(), 1);
+    fixture
+        .admission
+        .quarantine("test", "fault before initial SSE snapshot");
+    let first = response.into_body().into_data_stream().next().await;
+    assert!(
+        matches!(first, Some(Err(_))),
+        "existing SSE must not publish its cached initial snapshot"
+    );
+}
+
+#[tokio::test]
+async fn graph_recovery_admission_open_cdc_page_refuses() {
+    use futures::StreamExt;
+    let fixture = recovery_http_fixture().await;
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/graph/cdc/page",
+            Some(serde_json::json!({"keyspace":"social","table":"person","after":null,"limit":32})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    fixture
+        .admission
+        .quarantine("test", "fault after CDC replay before publication");
+    let first = response.into_body().into_data_stream().next().await;
+    assert!(
+        matches!(first, Some(Err(_))),
+        "completed CDC replay must not publish across a recovery epoch"
+    );
+}
+
+#[tokio::test]
+async fn graph_recovery_admission_bolt_stream_and_new_queries_refuse() {
+    use futures::StreamExt;
+    let fixture = recovery_http_fixture().await;
+    let params = HashMap::new();
+    let (_, mut rows, _) = fixture
+        .engine
+        .execute_bolt_stream_with_params(
+            "MATCH (n:Person) RETURN n.name",
+            "social",
+            &superuser_auth(),
+            &params,
+        )
+        .await
+        .unwrap();
+    fixture
+        .admission
+        .quarantine("test", "fault before Bolt PULL");
+    let first = rows.next().await;
+    assert!(
+        matches!(
+            first,
+            Some(Err(ferrosa_graph::error::GraphError::Unavailable(_)))
+        ),
+        "Bolt must not publish rows from the preceding admission epoch"
+    );
+    assert!(matches!(
+        fixture
+            .engine
+            .execute(
+                "MATCH (n:Person) RETURN n.name",
+                "social",
+                &superuser_auth()
+            )
+            .await,
+        Err(ferrosa_graph::error::GraphError::Unavailable(_))
+    ));
 }

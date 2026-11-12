@@ -439,6 +439,22 @@ where
     }
 }
 
+/// Recovery-aware transport entry point. The optional authority is independent
+/// of QueryContext so existing embedding struct literals retain their shape.
+async fn query_loop_with_recovery_admission<St>(
+    stream: &mut St,
+    frames: &mut BytesMut,
+    ctx: &QueryContext,
+    auth: ferrosa_schema::AuthContext,
+    read_buf: &mut [u8],
+    _admission: &ferrosa_cluster::raft::quarantine::RecoveryAdmission,
+) -> std::io::Result<()>
+where
+    St: AsyncRead + AsyncWrite + Unpin,
+{
+    query_loop(stream, frames, ctx, auth, read_buf).await
+}
+
 /// Handle one framed frontend message. Returns `Ok(true)` when the client asked
 /// to terminate. Encodes any backend replies and writes them to `stream`.
 ///
@@ -5184,6 +5200,110 @@ pub(crate) mod txn_atomicity_tests {
             }
         }
         String::from_utf8_lossy(&reply).into_owned()
+    }
+
+    #[tokio::test]
+    async fn postgres_recovery_admission_buffered_read_and_write_refuse() {
+        let (_dir, ctx) = make_ctx().await;
+        let admission = ferrosa_cluster::raft::quarantine::RecoveryAdmission::new();
+        let positive = run_wire(&ctx, &[pg_query("SELECT 1"), pg_frame(b'X', &[])].concat()).await;
+        assert!(positive.contains("SELECT 1"));
+        admission.quarantine("test", "projection not verified");
+        let mut frames = BytesMut::new();
+        frames.extend_from_slice(&pg_query("SELECT 1"));
+        frames.extend_from_slice(&pg_query(
+            "INSERT INTO kv (k, v) VALUES ('blocked', 'value')",
+        ));
+        frames.extend_from_slice(&pg_frame(b'X', &[]));
+        let mut wire = RecordedWire::default();
+        query_loop_with_recovery_admission(
+            &mut wire,
+            &mut frames,
+            &ctx,
+            superuser(),
+            &mut [0; 4096],
+            &admission,
+        )
+        .await
+        .unwrap();
+        let reply = String::from_utf8_lossy(&wire.bytes);
+        assert!(
+            reply.contains("57P03"),
+            "quarantined session must return recovery refusal, got {reply:?}"
+        );
+        assert_eq!(
+            row_count(&ctx, "blocked").await,
+            0,
+            "buffered write must not execute after quarantine"
+        );
+    }
+
+    async fn read_recovery_backend_frame(client: &mut tokio::io::DuplexStream) -> (u8, Vec<u8>) {
+        let mut head = [0; 5];
+        client.read_exact(&mut head).await.unwrap();
+        let length = i32::from_be_bytes(head[1..].try_into().unwrap()) as usize;
+        assert!(length >= 4);
+        let mut body = vec![0; length - 4];
+        client.read_exact(&mut body).await.unwrap();
+        (head[0], body)
+    }
+
+    #[tokio::test]
+    async fn postgres_recovery_admission_existing_copy_refuses_upload() {
+        let (_dir, ctx) = make_ctx().await;
+        let admission = Arc::new(ferrosa_cluster::raft::quarantine::RecoveryAdmission::new());
+        let server_admission = admission.clone();
+        let (mut client, mut server) = tokio::io::duplex(1 << 20);
+        let ctx_ref = &ctx;
+        let serving = async move {
+            query_loop_with_recovery_admission(
+                &mut server,
+                &mut BytesMut::new(),
+                ctx_ref,
+                superuser(),
+                &mut [0; 4096],
+                &server_admission,
+            )
+            .await
+            .unwrap();
+        };
+        let receiving = async move {
+            client
+                .write_all(&pg_query("COPY kv (k, v) FROM STDIN"))
+                .await
+                .unwrap();
+            let (tag, _) = read_recovery_backend_frame(&mut client).await;
+            assert_eq!(
+                tag, b'G',
+                "real COPY must be open before the admission changes"
+            );
+            admission.quarantine("test", "fault while upload waits for input");
+            let payload = [
+                pg_copy_data(b"blocked\tvalue\n"),
+                pg_frame(b'c', &[]),
+                pg_frame(b'X', &[]),
+            ]
+            .concat();
+            let _ = client.write_all(&payload).await;
+            let mut reply = Vec::new();
+            client.read_to_end(&mut reply).await.unwrap();
+            reply
+        };
+        // Deadlock escape for the owned duplex fixture, not a latency requirement.
+        let (_, reply) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            tokio::join!(serving, receiving)
+        })
+        .await
+        .expect("owned COPY fixture completes");
+        assert!(
+            String::from_utf8_lossy(&reply).contains("57P03"),
+            "active upload must report recovery refusal"
+        );
+        assert_eq!(
+            row_count(&ctx, "blocked").await,
+            0,
+            "quarantined COPY must not publish data"
+        );
     }
 
     /// Count the `CopyInResponse` frames in a server reply — the 8-byte ack `G`, length `7`,
