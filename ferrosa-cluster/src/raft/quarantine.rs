@@ -4,7 +4,15 @@
 //! Last changed: type retryable refusals and wake drains on publication release.
 
 use parking_lot::{Mutex, MutexGuard, RwLock};
-use std::{collections::BTreeMap, fmt};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
+
+thread_local! {
+    static HELD_PUBLICATIONS: RefCell<BTreeSet<usize>> = const { RefCell::new(BTreeSet::new()) };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryRefusalKind {
@@ -17,13 +25,26 @@ pub enum RecoveryRefusalKind {
 struct PublicationLease<'a> {
     guard: Option<MutexGuard<'a, ()>>,
     released: &'a tokio::sync::Notify,
+    owner_key: usize,
 }
 impl Drop for PublicationLease<'_> {
     fn drop(&mut self) {
         // Unlock before waking waiters, including the unwind path.
         drop(self.guard.take());
+        HELD_PUBLICATIONS.with(|held| {
+            held.borrow_mut().remove(&self.owner_key);
+        });
         self.released.notify_waiters();
     }
+}
+
+/// The callback ran in both variants. Only `Current` may be advertised as
+/// current state; `Invalidated` retains the output without claiming rollback.
+#[derive(Debug)]
+#[must_use]
+pub enum PublicationOutcome<T> {
+    Current(T),
+    Invalidated { value: T, refusal: RecoveryRefusal },
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +68,7 @@ impl std::error::Error for RecoveryRefusal {}
 struct AdmissionState {
     epoch: u64,
     faults: BTreeMap<String, String>,
+    epoch_exhausted: bool,
 }
 
 /// Every client/readiness/snapshot/vote/ack consumer shares this node gate.
@@ -66,8 +88,11 @@ impl RecoveryAdmission {
         self.transition.read().epoch
     }
     pub fn reason(&self) -> Option<String> {
-        self.transition
-            .read()
+        let state = self.transition.read();
+        if state.epoch_exhausted {
+            return Some("recovery epoch exhausted".into());
+        }
+        state
             .faults
             .iter()
             .next()
@@ -93,19 +118,19 @@ impl RecoveryAdmission {
         epoch
     }
     /// Register before checking state so a transition cannot be lost before
-    /// suspension. Terminal epoch exhaustion also wakes; callers must recheck
-    /// admission after every wake, even when the returned epoch is unchanged.
-    pub async fn changed_since(&self, seen: u64) -> u64 {
+    /// suspension. Quarantine is a typed terminal result, never successful
+    /// unchanged progress; ordinary `changed_since(seen).await?` loops stop.
+    pub async fn changed_since(&self, seen: u64) -> Result<u64, RecoveryRefusal> {
         loop {
             let changed = self.epoch_changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            let observed = {
+            {
                 let state = self.transition.read();
-                (state.epoch, state.faults.contains_key("epoch"))
-            };
-            if observed.0 != seen || observed.1 {
-                return observed.0;
+                Self::check(&state, None)?;
+                if state.epoch != seen {
+                    return Ok(state.epoch);
+                }
             }
             changed.await;
         }
@@ -113,18 +138,22 @@ impl RecoveryAdmission {
     /// Refuse a busy publisher without waiting, including cross-thread nesting.
     /// No fault-state lock is held across caller code: detection and admission
     /// remain callable from the closure.
-    /// A changed epoch rejects the result; already-admitted I/O is not rolled back.
+    /// Outer `Err` means the callback did not run. Once it runs, its output is
+    /// retained in an explicit execution outcome even if admission is invalidated.
+    /// An invalidated outcome must not be exported as a current snapshot/ACK.
     pub fn with_admission_epoch<T>(
         &self,
         epoch: u64,
         publish: impl FnOnce() -> T,
-    ) -> Result<T, RecoveryRefusal> {
+    ) -> Result<PublicationOutcome<T>, RecoveryRefusal> {
         self.admits_epoch(epoch)?;
         let _publisher = self.try_publication()?;
         self.admits_epoch(epoch)?;
-        let result = publish();
-        self.admits_epoch(epoch)?;
-        Ok(result)
+        let value = publish();
+        Ok(match self.admits_epoch(epoch) {
+            Ok(()) => PublicationOutcome::Current(value),
+            Err(refusal) => PublicationOutcome::Invalidated { value, refusal },
+        })
     }
 
     /// Prove no old publisher remains only for the exact quarantined epoch.
@@ -142,6 +171,15 @@ impl RecoveryAdmission {
         expected_epoch: u64,
     ) -> Result<(), RecoveryRefusal> {
         loop {
+            // Publication callbacks are synchronous. Polling a drain while this
+            // thread owns their lease would await the current callback itself.
+            if self.holds_publication() {
+                return Err(RecoveryRefusal {
+                    kind: RecoveryRefusalKind::Busy,
+                    epoch: self.epoch(),
+                    reason: "cannot drain an owned publication".into(),
+                });
+            }
             let released = self.publication_released.notified();
             tokio::pin!(released);
             released.as_mut().enable();
@@ -151,12 +189,23 @@ impl RecoveryAdmission {
             }
         }
     }
+    fn holds_publication(&self) -> bool {
+        let key = self as *const Self as usize;
+        HELD_PUBLICATIONS.with(|held| held.borrow().contains(&key))
+    }
     fn try_publication(&self) -> Result<PublicationLease<'_>, RecoveryRefusal> {
         self.publication
             .try_lock()
-            .map(|guard| PublicationLease {
-                guard: Some(guard),
-                released: &self.publication_released,
+            .map(|guard| {
+                let owner_key = self as *const Self as usize;
+                HELD_PUBLICATIONS.with(|held| {
+                    held.borrow_mut().insert(owner_key);
+                });
+                PublicationLease {
+                    guard: Some(guard),
+                    released: &self.publication_released,
+                    owner_key,
+                }
             })
             .ok_or_else(|| RecoveryRefusal {
                 kind: RecoveryRefusalKind::Busy,
@@ -173,7 +222,7 @@ impl RecoveryAdmission {
                 reason: "stale recovery publication drain".into(),
             });
         }
-        if state.faults.is_empty() {
+        if state.faults.is_empty() && !state.epoch_exhausted {
             return Err(RecoveryRefusal {
                 kind: RecoveryRefusalKind::InvalidDrain,
                 epoch: state.epoch,
@@ -184,13 +233,6 @@ impl RecoveryAdmission {
     }
 
     fn check(state: &AdmissionState, epoch: Option<u64>) -> Result<(), RecoveryRefusal> {
-        if let Some((group, reason)) = state.faults.iter().next() {
-            return Err(RecoveryRefusal {
-                kind: RecoveryRefusalKind::Quarantined,
-                epoch: state.epoch,
-                reason: format!("{group}: {reason}"),
-            });
-        }
         if epoch.is_some_and(|expected| expected != state.epoch) {
             return Err(RecoveryRefusal {
                 kind: RecoveryRefusalKind::EpochChanged,
@@ -198,16 +240,26 @@ impl RecoveryAdmission {
                 reason: "stale recovery admission epoch".into(),
             });
         }
+        if state.epoch_exhausted {
+            return Err(RecoveryRefusal {
+                kind: RecoveryRefusalKind::Quarantined,
+                epoch: state.epoch,
+                reason: "recovery epoch exhausted".into(),
+            });
+        }
+        if let Some((group, reason)) = state.faults.iter().next() {
+            return Err(RecoveryRefusal {
+                kind: RecoveryRefusalKind::Quarantined,
+                epoch: state.epoch,
+                reason: format!("{group}: {reason}"),
+            });
+        }
         Ok(())
     }
     fn advance(state: &mut AdmissionState) -> u64 {
         match state.epoch.checked_add(1) {
             Some(next) => state.epoch = next,
-            None => {
-                state
-                    .faults
-                    .insert("epoch".into(), "recovery epoch exhausted".into());
-            }
+            None => state.epoch_exhausted = true,
         }
         state.epoch
     }
@@ -222,15 +274,19 @@ mod tests {
         let epoch = gate.epoch();
         assert!(gate.admits().is_ok());
         assert!(gate.admits_epoch(epoch).is_ok());
-        assert_eq!(gate.with_admission_epoch(epoch, || 7).unwrap(), 7);
+        assert!(matches!(
+            gate.with_admission_epoch(epoch, || 7).unwrap(),
+            PublicationOutcome::Current(7)
+        ));
     }
     #[test]
     fn publication_holds_the_publisher_lease() {
         let gate = RecoveryAdmission::new();
-        gate.with_admission_epoch(gate.epoch(), || {
-            assert!(gate.publication.try_lock().is_none());
-        })
-        .unwrap();
+        let _ = gate
+            .with_admission_epoch(gate.epoch(), || {
+                assert!(gate.publication.try_lock().is_none());
+            })
+            .unwrap();
     }
     #[test]
     fn recursive_checks_and_fault_detection_do_not_wait_on_publication() {
@@ -243,7 +299,7 @@ mod tests {
             gate.quarantine("dc1", "fault during publication");
             assert!(gate.admits().is_err());
         });
-        assert!(result.is_err());
+        assert!(matches!(result, Ok(PublicationOutcome::Invalidated { .. })));
         assert!(gate.reason().unwrap().contains("fault during publication"));
     }
     #[test]
@@ -262,13 +318,14 @@ mod tests {
     fn recursive_publication_is_refused_before_waiting() {
         let gate = RecoveryAdmission::new();
         let epoch = gate.epoch();
-        gate.with_admission_epoch(epoch, || {
-            assert!(
-                gate.with_admission_epoch(epoch, || ()).is_err(),
-                "nested publication must be refused rather than overlap the current publisher"
-            );
-        })
-        .unwrap();
+        let _ = gate
+            .with_admission_epoch(epoch, || {
+                assert!(
+                    gate.with_admission_epoch(epoch, || ()).is_err(),
+                    "nested publication must be refused rather than overlap the current publisher"
+                );
+            })
+            .unwrap();
     }
     #[test]
     fn cross_thread_nested_publication_refuses_instead_of_waiting() {
@@ -276,17 +333,18 @@ mod tests {
         let (send, receive) = std::sync::mpsc::channel();
         let mut child = None;
         let mut nested_result = None;
-        gate.with_admission_epoch(gate.epoch(), || {
-            let nested = std::sync::Arc::clone(&gate);
-            child = Some(std::thread::spawn(move || {
-                let result = nested.with_admission_epoch(nested.epoch(), || ());
-                send.send(result).unwrap();
-            }));
-            // Cleanup deadline only: the held publication makes the blocked
-            // dependency deterministic; release it before joining on failure.
-            nested_result = receive.recv_timeout(std::time::Duration::from_secs(5)).ok();
-        })
-        .unwrap();
+        let _ = gate
+            .with_admission_epoch(gate.epoch(), || {
+                let nested = std::sync::Arc::clone(&gate);
+                child = Some(std::thread::spawn(move || {
+                    let result = nested.with_admission_epoch(nested.epoch(), || ());
+                    send.send(result).unwrap();
+                }));
+                // Cleanup deadline only: the held publication makes the blocked
+                // dependency deterministic; release it before joining on failure.
+                nested_result = receive.recv_timeout(std::time::Duration::from_secs(5)).ok();
+            })
+            .unwrap();
         child.unwrap().join().unwrap();
         assert!(
             matches!(nested_result, Some(Err(_))),
@@ -315,8 +373,13 @@ mod tests {
         })
         .await;
         let closed = gate.quarantine("group", "projection failure");
-        assert_eq!(wait.await, closed);
-        assert_eq!(gate.changed_since(initial).await, closed);
+        let error = wait.await.unwrap_err();
+        assert_eq!(error.epoch, closed);
+        assert_eq!(error.kind, RecoveryRefusalKind::Quarantined);
+        assert_eq!(
+            gate.changed_since(initial).await.unwrap_err().kind,
+            RecoveryRefusalKind::Quarantined
+        );
     }
     #[tokio::test]
     async fn terminal_overflow_fault_wakes_without_an_epoch_delta() {
@@ -332,7 +395,14 @@ mod tests {
         gate.quarantine("group", "projection failure");
         std::future::poll_fn(|context| {
             assert!(
-                matches!(wait.as_mut().poll(context), Poll::Ready(u64::MAX)),
+                matches!(
+                    wait.as_mut().poll(context),
+                    Poll::Ready(Err(RecoveryRefusal {
+                        epoch: u64::MAX,
+                        kind: RecoveryRefusalKind::Quarantined,
+                        ..
+                    }))
+                ),
                 "terminal fault must wake the registered consumer even though epoch cannot advance"
             );
             Poll::Ready(())
@@ -344,15 +414,16 @@ mod tests {
     #[test]
     fn busy_and_quarantined_refusals_are_distinct() {
         let gate = RecoveryAdmission::new();
-        gate.with_admission_epoch(gate.epoch(), || {
-            assert_eq!(
-                gate.with_admission_epoch(gate.epoch(), || ())
-                    .unwrap_err()
-                    .kind,
-                RecoveryRefusalKind::Busy
-            );
-        })
-        .unwrap();
+        let _ = gate
+            .with_admission_epoch(gate.epoch(), || {
+                assert_eq!(
+                    gate.with_admission_epoch(gate.epoch(), || ())
+                        .unwrap_err()
+                        .kind,
+                    RecoveryRefusalKind::Busy
+                );
+            })
+            .unwrap();
         gate.quarantine("group", "projection failure");
         assert_eq!(
             gate.admits().unwrap_err().kind,
@@ -362,8 +433,17 @@ mod tests {
     #[tokio::test]
     async fn publication_release_wakes_registered_quarantine_drain() {
         use std::{future::Future, task::Poll};
-        let gate = RecoveryAdmission::new();
-        let lease = gate.try_publication().unwrap();
+        let gate = std::sync::Arc::new(RecoveryAdmission::new());
+        let (entered, ready) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let publisher = std::sync::Arc::clone(&gate);
+        let owner = std::thread::spawn(move || {
+            publisher.with_admission_epoch(publisher.epoch(), || {
+                entered.send(()).unwrap();
+                let _ = released.recv();
+            })
+        });
+        ready.recv().unwrap();
         let closed = gate.quarantine("group", "projection failure");
         let mut drain = Box::pin(gate.drain_publications_async(closed));
         std::future::poll_fn(|context| {
@@ -386,11 +466,68 @@ mod tests {
             Poll::Ready(())
         })
         .await;
-        drop(lease);
+        release.send(()).unwrap();
+        assert!(matches!(
+            owner.join().unwrap(),
+            Ok(PublicationOutcome::Invalidated { .. })
+        ));
         std::future::poll_fn(|context| {
             assert!(matches!(drain.as_mut().poll(context), Poll::Ready(Ok(()))));
             Poll::Ready(())
         })
         .await;
+    }
+    #[test]
+    fn review_feedback_async_drain_refuses_its_active_publication() {
+        use std::{
+            future::Future,
+            task::{Context, Poll, Waker},
+        };
+        let gate = RecoveryAdmission::new();
+        let _ = gate.with_admission_epoch(gate.epoch(), || {
+            let epoch = gate.quarantine("group", "fault while publishing");
+            let mut drain = Box::pin(gate.drain_publications_async(epoch));
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(
+                matches!(drain.as_mut().poll(&mut context), Poll::Ready(Err(error))
+                if error.kind == RecoveryRefusalKind::Busy),
+                "async drain must not wait for its own publication"
+            );
+        });
+    }
+    #[test]
+    fn review_feedback_executed_publication_is_not_reported_as_unexecuted() {
+        let gate = RecoveryAdmission::new();
+        let effect = std::cell::Cell::new(0);
+        let result = gate.with_admission_epoch(gate.epoch(), || {
+            effect.set(effect.get() + 1);
+            gate.quarantine("group", "fault after publication");
+            17
+        });
+        assert_eq!(effect.get(), 1);
+        assert!(
+            result.is_ok(),
+            "an executed callback needs a retained execution outcome, not pre-admission refusal"
+        );
+        assert!(matches!(
+            result,
+            Ok(PublicationOutcome::Invalidated { value: 17, .. })
+        ));
+    }
+    #[test]
+    fn review_feedback_group_name_cannot_be_overwritten_by_overflow_sentinel() {
+        let gate = RecoveryAdmission::new();
+        gate.quarantine("epoch", "real group failure");
+        gate.transition.write().epoch = u64::MAX;
+        gate.quarantine("another-group", "another failure");
+        assert_eq!(
+            gate.transition
+                .read()
+                .faults
+                .get("epoch")
+                .map(String::as_str),
+            Some("real group failure"),
+            "an internal overflow marker must not replace a caller's group failure"
+        );
     }
 }
