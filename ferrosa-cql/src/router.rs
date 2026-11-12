@@ -15951,6 +15951,41 @@ mod tests {
         );
     }
 
+    /// Cassandra 6.0-alpha2's CQL-on-Accord guide lists AUTO_READ for
+    /// automatically generated reads such as list-index assignment.
+    #[tokio::test]
+    async fn accord_list_index_assignment_requires_auto_read() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        for ddl in [
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE ks.t (k int PRIMARY KEY, v list<int>)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(ddl).unwrap())
+                .await
+                .unwrap();
+        }
+
+        let Statement::Update(update) =
+            crate::parser::parse("UPDATE ks.t SET v[0] = 9 WHERE k = 1").unwrap()
+        else {
+            panic!("expected UPDATE");
+        };
+        let statement = Statement::Update(update);
+        assert!(
+            build_transaction_write(&state, &ctx, &statement).is_ok(),
+            "list-index assignment requires AUTO_READ and must not be rejected as unsupported"
+        );
+    }
+
     #[tokio::test]
     async fn map_element_put_then_key_remove_keeps_complex_cell_shape() {
         let (state, _dir) = setup();

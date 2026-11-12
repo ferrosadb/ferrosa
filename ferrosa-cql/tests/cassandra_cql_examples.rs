@@ -62,28 +62,115 @@ fn is_non_cql(stmt: &str) -> bool {
 fn split_statements(content: &str) -> Vec<String> {
     let mut stmts = Vec::new();
     let mut current = String::new();
+    let mut chars = content.chars().peekable();
+    let mut quote: Option<char> = None;
+    let mut dollar_quote: Option<String> = None;
+    let mut block_comment = false;
+    let mut line_comment = false;
 
-    for line in content.lines() {
-        let trimmed = line.trim();
-        // Skip line comments
-        if trimmed.starts_with("//") || trimmed.starts_with("--") {
+    while let Some(ch) = chars.next() {
+        let next = chars.peek().copied();
+        if line_comment {
+            if ch == '\n' {
+                line_comment = false;
+                current.push('\n');
+            }
             continue;
         }
-        // Strip inline comments
-        let line = if let Some(pos) = line.find("//") {
-            &line[..pos]
-        } else {
-            line
-        };
-        current.push_str(line);
-        current.push('\n');
-
-        if line.trim_end().ends_with(';') {
-            let stmt = current.trim().trim_end_matches(';').trim().to_string();
-            if !stmt.is_empty() {
-                stmts.push(stmt);
+        if block_comment {
+            if ch == '*' && next == Some('/') {
+                chars.next();
+                block_comment = false;
+                current.push(' ');
             }
-            current.clear();
+            continue;
+        }
+        if let Some(delimiter) = &dollar_quote {
+            if ch == '$' {
+                let mut closing = String::from("$");
+                while closing.len() < delimiter.len() {
+                    if let Some(c) = chars.next() {
+                        closing.push(c);
+                    } else {
+                        break;
+                    }
+                }
+                current.push_str(&closing);
+                if &closing == delimiter {
+                    dollar_quote = None;
+                }
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        if let Some(delim) = quote {
+            current.push(ch);
+            if ch == delim {
+                if next == Some(delim) {
+                    current.push(chars.next().unwrap());
+                } else {
+                    quote = None;
+                }
+            } else if ch == '\\' && next.is_some() {
+                current.push(chars.next().unwrap());
+            }
+            continue;
+        }
+
+        if ch == '-' && next == Some('-') || ch == '/' && next == Some('/') {
+            chars.next();
+            line_comment = true;
+        } else if ch == '/' && next == Some('*') {
+            chars.next();
+            block_comment = true;
+        } else if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            current.push(ch);
+        } else if ch == '$' {
+            let mut tag = String::from("$");
+            while chars
+                .peek()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
+            {
+                tag.push(chars.next().unwrap());
+            }
+            if chars.peek() == Some(&'$') {
+                tag.push(chars.next().unwrap());
+                dollar_quote = Some(tag.clone());
+                current.push_str(&tag);
+            } else {
+                current.push_str(&tag);
+            }
+        } else if ch == ';' {
+            current.push(ch);
+            let normalized = current.trim().trim_end_matches(';').trim();
+            let is_batch = normalized
+                .split_whitespace()
+                .take(4)
+                .collect::<Vec<_>>()
+                .iter()
+                .any(|word| word.eq_ignore_ascii_case("BATCH"))
+                && normalized.to_ascii_uppercase().ends_with("APPLY BATCH");
+            let begins_batch = current
+                .split_whitespace()
+                .take(4)
+                .collect::<Vec<_>>()
+                .first()
+                .is_some_and(|word| word.eq_ignore_ascii_case("BEGIN"))
+                && current
+                    .split_whitespace()
+                    .take(4)
+                    .any(|word| word.eq_ignore_ascii_case("BATCH"));
+            if !begins_batch || is_batch {
+                let stmt = current.trim().trim_end_matches(';').trim().to_string();
+                if !stmt.is_empty() {
+                    stmts.push(stmt);
+                }
+                current.clear();
+            }
+        } else {
+            current.push(ch);
         }
     }
     // Handle trailing statement without semicolon
@@ -92,6 +179,55 @@ fn split_statements(content: &str) -> Vec<String> {
         stmts.push(remaining);
     }
     stmts
+}
+
+#[cfg(test)]
+mod splitter_tests {
+    use super::split_statements;
+
+    #[test]
+    fn split_statements_keeps_semicolons_in_quoted_text() {
+        let statements = split_statements(
+            "INSERT INTO t (k, v) VALUES (1, 'a;b');\nUPDATE t SET v = \"x;y\" WHERE k = 1;",
+        );
+
+        assert_eq!(statements.len(), 2);
+        assert!(statements[0].contains("'a;b'"));
+        assert!(statements[1].contains("\"x;y\""));
+    }
+
+    #[test]
+    fn split_statements_keeps_semicolons_in_dollar_quoted_udf_body() {
+        let statements = split_statements(
+            "CREATE FUNCTION f (x int) RETURNS NULL ON NULL INPUT RETURNS int LANGUAGE java AS $$ return x; $$;\nSELECT * FROM t;",
+        );
+
+        assert_eq!(statements.len(), 2);
+        assert!(statements[0].contains("return x;"));
+        assert!(statements[1].starts_with("SELECT"));
+    }
+
+    #[test]
+    fn split_statements_ignores_semicolons_in_comments() {
+        let statements =
+            split_statements("SELECT 1 /* ignored; */ FROM t;\nSELECT 2 -- ignored;\nFROM t;");
+
+        assert_eq!(statements.len(), 2);
+        assert!(statements[0].contains("SELECT 1"));
+        assert!(statements[1].contains("SELECT 2"));
+    }
+
+    #[test]
+    fn split_statements_keeps_batch_as_one_statement() {
+        let statements = split_statements(
+            "BEGIN UNLOGGED BATCH\nINSERT INTO t (k) VALUES (1);\nUPDATE t SET v = 2 WHERE k = 1;\nAPPLY BATCH;\nSELECT * FROM t;",
+        );
+
+        assert_eq!(statements.len(), 2);
+        assert!(statements[0].starts_with("BEGIN UNLOGGED BATCH"));
+        assert!(statements[0].contains("APPLY BATCH"));
+        assert!(statements[1].starts_with("SELECT"));
+    }
 }
 
 #[test]
