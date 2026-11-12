@@ -485,7 +485,18 @@ Direct `DROP KEYSPACE` runs schema removal and physical cleanup on the blocking
 DDL task pool. Its job owns the compaction pauses, shared schema lifecycle writer
 and completion notification, including when the requesting client disconnects.
 The response is sent only after durable recovery intents and physical cleanup
-succeed. Direct keyspace/table CREATE and keyspace ALTER wait for the same
-lifecycle writer on the blocking pool, so a same-name CREATE cannot publish a new
-incarnation while old directories are still being removed. Other DDL paths keep
-their existing coordination behavior.
+succeed. Direct keyspace/table CREATE and ALTER, table DROP, and index CREATE
+and DROP wait for the same lifecycle writer on the blocking pool. Their jobs own
+storage updates, existing durability barriers and completion events, so client
+cancellation cannot interrupt those effects. A same-name CREATE cannot publish a
+new incarnation while old directories are still being removed. Paired and cluster
+DDL paths retain their existing coordination behavior. Role/permission updates and local type alteration also execute their authorization and persistence inside owned blocking jobs. Shared Direct execution for type/function operations uses the same blocking boundary; no synchronous lifecycle lease is retained across an await.
+
+
+Direct role-membership changes, function removal, and aggregate creation/removal
+perform their permission checks after their blocking job acquires the lifecycle
+writer. Aggregate creation also rechecks its state/final function dependencies
+there. Direct function replacement validates and publishes its component before
+removing old metadata, then performs DROP and CREATE in that same owned job and
+lease. Dropping the requesting future cannot submit only the DROP half of an
+admitted replacement. Pair and Cluster coordination keep their existing paths.
