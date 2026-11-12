@@ -36,6 +36,18 @@ use crate::flush::FileFlushTarget;
 use crate::store::TableStore;
 use crate::upload::{ObjectStoreConfig, UploadManager};
 
+fn current_rss_kb() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status.lines().find_map(|line| {
+                let value = line.strip_prefix("VmRSS:")?.trim();
+                value.split_whitespace().next()?.parse().ok()
+            })
+        })
+        .unwrap_or(0)
+}
+
 /// Configuration for NVMe pin mode on a table.
 ///
 /// When a table is pinned, newly flushed SSTables are kept on local NVMe
@@ -543,6 +555,14 @@ impl StorageEngine {
         config: StorageEngineConfig,
         runtime: Option<&tokio::runtime::Handle>,
     ) -> ferrosa_common::Result<Self> {
+        let _storage_open_span = tracing::info_span!(
+            "startup.storage_open",
+            phase = "startup.storage_open",
+            data_dir = %config.data_dir.display(),
+            rss_kb = current_rss_kb(),
+        )
+        .entered();
+
         // Pin the process-wide memtable shard count from config. The
         // sharded memtable's `with_default_shards()` reads this
         // atomic, so every memtable created after this point honors
@@ -754,6 +774,14 @@ impl StorageEngine {
         config: StorageEngineConfig,
         runtime: Option<&tokio::runtime::Handle>,
     ) -> ferrosa_common::Result<(Self, Vec<Mutation>)> {
+        let _storage_open_span = tracing::info_span!(
+            "startup.storage_open",
+            phase = "startup.storage_open",
+            data_dir = %config.data_dir.display(),
+            rss_kb = current_rss_kb(),
+        )
+        .entered();
+
         std::fs::create_dir_all(&config.data_dir).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!("failed to create data dir: {e}"))
         })?;
@@ -783,32 +811,41 @@ impl StorageEngine {
 
         let tables = RwLock::new(HashMap::new());
         let schema_path = config.data_dir.join("schema.json");
-        if let Ok(data) = std::fs::read_to_string(&schema_path) {
-            match Self::table_schemas_from_schema_json(&data) {
-                Ok(schemas) => {
-                    for schema in schemas {
-                        let table_id = TableId::new(&schema.keyspace, &schema.table);
-                        match Self::build_table_state(&config, schema, vec![]) {
-                            Ok(state) => {
-                                for (index_name, _col_pos) in state.store.indexed_columns() {
-                                    index_tracker.register_index(
-                                        table_id.keyspace(),
-                                        table_id.table(),
-                                        index_name,
-                                    );
+        {
+            let _schema_load_span = tracing::info_span!(
+                "startup.schema_local_load",
+                phase = "startup.schema_local_load",
+                path = %schema_path.display(),
+                rss_kb = current_rss_kb(),
+            )
+            .entered();
+            if let Ok(data) = std::fs::read_to_string(&schema_path) {
+                match Self::table_schemas_from_schema_json(&data) {
+                    Ok(schemas) => {
+                        for schema in schemas {
+                            let table_id = TableId::new(&schema.keyspace, &schema.table);
+                            match Self::build_table_state(&config, schema, vec![]) {
+                                Ok(state) => {
+                                    for (index_name, _col_pos) in state.store.indexed_columns() {
+                                        index_tracker.register_index(
+                                            table_id.keyspace(),
+                                            table_id.table(),
+                                            index_name,
+                                        );
+                                    }
+                                    tables.write().insert(table_id, state);
                                 }
-                                tables.write().insert(table_id, state);
+                                Err(e) => tracing::warn!(
+                                    "failed to re-register table from schema.json before replay: {e}"
+                                ),
                             }
-                            Err(e) => tracing::warn!(
-                                "failed to re-register table from schema.json before replay: {e}"
-                            ),
                         }
                     }
+                    Err(e) => tracing::warn!(
+                        "failed to parse schema.json at {} before replay: {e}",
+                        schema_path.display()
+                    ),
                 }
-                Err(e) => tracing::warn!(
-                    "failed to parse schema.json at {} before replay: {e}",
-                    schema_path.display()
-                ),
             }
         }
 
@@ -817,28 +854,37 @@ impl StorageEngine {
         let max_pending_without_schema = config.max_pending_replay_mutations_without_schema;
         let mut seen_replay_ids: std::collections::HashSet<[u8; 16]> =
             std::collections::HashSet::new();
-        let commit_log = crate::commitlog::CommitLog::open_and_replay_streaming(
-            config.commit_log.clone(),
-            |mutation| {
-                if !mutation.has_legacy_id() && !seen_replay_ids.insert(mutation.mutation_id) {
-                    return Ok(());
-                }
-
-                if tables.read().is_empty() {
-                    if pending_mutations.len() >= max_pending_without_schema {
-                        return Err(ferrosa_common::Error::InvalidData(format!(
-                            "commit-log replay schema unavailable and pending replay limit \
-                             ({max_pending_without_schema}) exceeded; restore local/S3 schema \
-                             before replay or raise FERROSA_MAX_PENDING_REPLAY_WITHOUT_SCHEMA"
-                        )));
+        let commit_log = {
+            let _commitlog_replay_span = tracing::info_span!(
+                "startup.commitlog_replay",
+                phase = "startup.commitlog_replay",
+                log_dir = %config.commit_log.log_dir.display(),
+                rss_kb = current_rss_kb(),
+            )
+            .entered();
+            crate::commitlog::CommitLog::open_and_replay_streaming(
+                config.commit_log.clone(),
+                |mutation| {
+                    if !mutation.has_legacy_id() && !seen_replay_ids.insert(mutation.mutation_id) {
+                        return Ok(());
                     }
-                    pending_mutations.push(mutation);
-                } else if !Self::apply_replay_mutation_to_tables(&tables, &mutation) {
-                    deferred_replay_mutations.lock().push(mutation);
-                }
-                Ok(())
-            },
-        )?;
+
+                    if tables.read().is_empty() {
+                        if pending_mutations.len() >= max_pending_without_schema {
+                            return Err(ferrosa_common::Error::InvalidData(format!(
+                                "commit-log replay schema unavailable and pending replay limit \
+                                 ({max_pending_without_schema}) exceeded; restore local/S3 schema \
+                                 before replay or raise FERROSA_MAX_PENDING_REPLAY_WITHOUT_SCHEMA"
+                            )));
+                        }
+                        pending_mutations.push(mutation);
+                    } else if !Self::apply_replay_mutation_to_tables(&tables, &mutation) {
+                        deferred_replay_mutations.lock().push(mutation);
+                    }
+                    Ok(())
+                },
+            )?
+        };
 
         let engine = Self {
             config,
@@ -873,6 +919,14 @@ impl StorageEngine {
     /// entry. The upload is idempotent (S3 PUT overwrites). Call this after
     /// the engine is opened and tables are registered.
     pub async fn replay_pending_uploads(&self) {
+        let _pending_upload_span = tracing::info_span!(
+            "startup.pending_upload_replay",
+            phase = "startup.pending_upload_replay",
+            data_dir = %self.config.data_dir.display(),
+            rss_kb = current_rss_kb(),
+        )
+        .entered();
+
         let pending_log_path = self.config.data_dir.join("pending-uploads.log");
         let pending_log = match crate::upload::PendingUploadsLog::open(&pending_log_path) {
             Ok(log) => log,
@@ -9756,6 +9810,7 @@ mod tests {
     /// Requires MinIO + Cassandra 5 containers (Docker or Podman).
     /// Set FERROSA_TEST_CONTAINERS=1 after starting the compose stack.
     #[tokio::test]
+    #[ignore = "requires MinIO + Cassandra containers; run in cluster-gated CI with FERROSA_TEST_CONTAINERS=1"]
     async fn cassandra_reads_compacted_sstable_from_s3() {
         if std::env::var("FERROSA_TEST_CONTAINERS").is_err() {
             panic!(
@@ -10058,6 +10113,7 @@ mod tests {
     /// Requires MinIO + Cassandra 5 containers (Docker or Podman).
     /// Set FERROSA_TEST_CONTAINERS=1 after starting the compose stack.
     #[tokio::test]
+    #[ignore = "requires MinIO + Cassandra containers; run in cluster-gated CI with FERROSA_TEST_CONTAINERS=1"]
     async fn compaction_end_to_end_pipeline() {
         if std::env::var("FERROSA_TEST_CONTAINERS").is_err() {
             panic!(
@@ -11439,6 +11495,10 @@ mod tests {
         let _ = engine.read(&table_id, &key);
 
         let recorded = crate::test_span_collector::drain_names();
+        assert!(
+            recorded.iter().any(|n| n == "startup.storage_open"),
+            "expected 'startup.storage_open' span, got: {recorded:?}",
+        );
         assert!(
             recorded.iter().any(|n| n == "storage.write"),
             "expected 'storage.write' span, got: {recorded:?}",
