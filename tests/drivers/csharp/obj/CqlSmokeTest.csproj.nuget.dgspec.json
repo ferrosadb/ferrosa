@@ -1,0 +1,88 @@
+{
+  "format": 1,
+  "restore": {
+    "/Users/bkearns/src/ferrosa-suite/ferrosa/.wt-driver-ttl/tests/drivers/csharp/CqlSmokeTest.csproj": {}
+  },
+  "projects": {
+    "/Users/bkearns/src/ferrosa-suite/ferrosa/.wt-driver-ttl/tests/drivers/csharp/CqlSmokeTest.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "/Users/bkearns/src/ferrosa-suite/ferrosa/.wt-driver-ttl/tests/drivers/csharp/CqlSmokeTest.csproj",
+        "projectName": "CqlSmokeTest",
+        "projectPath": "/Users/bkearns/src/ferrosa-suite/ferrosa/.wt-driver-ttl/tests/drivers/csharp/CqlSmokeTest.csproj",
+        "packagesPath": "/Users/bkearns/.nuget/packages/",
+        "outputPath": "/Users/bkearns/src/ferrosa-suite/ferrosa/.wt-driver-ttl/tests/drivers/csharp/obj/",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "/Users/bkearns/.nuget/NuGet/NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net8.0"
+        ],
+        "sources": {
+          "/opt/homebrew/Cellar/dotnet/10.0.107/libexec/library-packs": {},
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net8.0": {
+            "targetAlias": "net8.0",
+            "projectReferences": {}
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        },
+        "restoreAuditProperties": {
+          "enableAudit": "true",
+          "auditLevel": "low",
+          "auditMode": "direct"
+        },
+        "SdkAnalysisLevel": "10.0.100"
+      },
+      "frameworks": {
+        "net8.0": {
+          "targetAlias": "net8.0",
+          "dependencies": {
+            "CassandraCSharpDriver": {
+              "target": "Package",
+              "version": "[3.20.1, )"
+            }
+          },
+          "imports": [
+            "net461",
+            "net462",
+            "net47",
+            "net471",
+            "net472",
+            "net48",
+            "net481"
+          ],
+          "assetTargetFallback": true,
+          "warn": true,
+          "downloadDependencies": [
+            {
+              "name": "Microsoft.AspNetCore.App.Ref",
+              "version": "[8.0.26, 8.0.26]"
+            },
+            {
+              "name": "Microsoft.NETCore.App.Host.osx-arm64",
+              "version": "[8.0.26, 8.0.26]"
+            },
+            {
+              "name": "Microsoft.NETCore.App.Ref",
+              "version": "[8.0.26, 8.0.26]"
+            }
+          ],
+          "frameworkReferences": {
+            "Microsoft.NETCore.App": {
+              "privateAssets": "all"
+            }
+          },
+          "runtimeIdentifierGraphPath": "/opt/homebrew/Cellar/dotnet/10.0.107/libexec/sdk/10.0.107/PortableRuntimeIdentifierGraph.json"
+        }
+      }
+    }
+  }
+}
