@@ -6024,6 +6024,108 @@ mod tests {
     /// We pre-create the file, then issue `RaftOp::CreateTable` and
     /// confirm apply refuses publication with the original registration reason,
     /// retains the preceding index, and prevents a successor from applying.
+    /// Advisory I/O measurement only: timings are observations, never test gates.
+    #[test]
+    fn recovery_intent_io_cost_model() {
+        use std::io::Write;
+        use std::time::Instant;
+        let dir = tempfile::tempdir().unwrap();
+        let first = make_entry(1, 1, RaftOp::CreateKeyspace(simple_keyspace("io_model"))).log_id;
+        let last = make_entry(1, 1000, RaftOp::CreateKeyspace(simple_keyspace("io_model"))).log_id;
+        // Candidate range/digest format, NOT a production protocol. Existing
+        // retained Raft entries would supply commands; no full state copy here.
+        let range = bincode::serialize(&(1u32, first, last, [0u8; 32])).unwrap();
+        let mut state = RaftState::default();
+        state.keyspaces.insert("io_model".into(), simple_keyspace("io_model"));
+        let mut observations = Vec::new();
+        for count in [1usize, 100, 1000] {
+            for index in state.tables.len()..count {
+                let name = format!("table_{index}");
+                state.tables.insert(("io_model".into(), name.clone()), simple_table("io_model", &name));
+            }
+            let data = SnapshotData { state: state.clone(), last_applied: Some(last), last_membership: StoredMembership::default() };
+            let snapshot = encode_snapshot(&data).unwrap();
+            assert_eq!(decode_snapshot(&snapshot).unwrap().state.tables.len(), count);
+            let mut rows = Vec::new();
+            for (name, payload) in [("range_digest", range.as_slice()), ("full_snapshot", snapshot.as_slice())] {
+                let mut micros = Vec::new();
+                for iteration in 0..16 {
+                    let temporary = dir.path().join(format!("{name}-{iteration}.tmp"));
+                    let destination = dir.path().join(name);
+                    let started = Instant::now();
+                    let mut file = std::fs::OpenOptions::new().create_new(true).write(true).open(&temporary).unwrap();
+                    file.write_all(payload).unwrap();
+                    file.sync_all().unwrap();
+                    std::fs::rename(&temporary, &destination).unwrap();
+                    std::fs::File::open(dir.path()).unwrap().sync_all().unwrap();
+                    micros.push(started.elapsed().as_micros());
+                    assert_eq!(std::fs::read(&destination).unwrap(), payload);
+                }
+                micros.sort_unstable();
+                rows.push(serde_json::json!({"candidate":name,"payloadBytes":payload.len(),"samples":16,"fileSyncs":16,"directorySyncs":16,"p50Micros":micros[8],"maxMicros":micros[15]}));
+            }
+            observations.push(serde_json::json!({"tables":count,"measurements":rows}));
+        }
+        println!("RECOVERY_IO_MODEL {}", serde_json::json!({"environment":"owned Linux container task-volume temporary filesystem","meaning":"advisory metadata I/O only; excludes physical apply and is not an end-to-end throughput claim","observations":observations}));
+    }
+
+    /// A process-local latch cannot guard a new process against partial shared effects.
+    #[tokio::test]
+    async fn recovery_intent_failed_apply_refuses_fresh_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let path = dir.path().join("raft.snapshot.bin");
+        let mut sm = FerrosStateMachine::with_side_effects_and_snapshot_path(
+            Arc::clone(&schema), Arc::clone(&engine), path.clone(),
+        );
+        sm.apply(vec![make_entry(1, 1, RaftOp::CreateKeyspace(simple_keyspace("restart_ks")))])
+            .await.unwrap();
+        sm.build_snapshot().await.unwrap();
+        let blocker = dir.path().join("sstables/restart_ks.victim");
+        std::fs::create_dir_all(blocker.parent().unwrap()).unwrap();
+        std::fs::write(&blocker, b"owned fixture prevents registration").unwrap();
+        let failure = sm.apply(vec![make_entry(1, 2,
+            RaftOp::CreateTable(Box::new(simple_table("restart_ks", "victim"))))]).await;
+        assert!(failure.is_err());
+        assert_eq!(sm.last_applied.unwrap().index, 1);
+        drop(sm);
+
+        for _ in 0..2 {
+            let mut restarted = FerrosStateMachine::with_side_effects_and_snapshot_path(
+                Arc::new(test_schema_instance()), Arc::clone(&engine), path.clone(),
+            );
+            let recovery = restarted.recover_from_persisted_snapshot();
+            assert!(recovery.is_err(), "partial local apply must remain refused across restart: {recovery:?}");
+            assert!(restarted.last_applied.is_none(), "failed intent must not publish the old snapshot as a repaired prefix");
+            assert_eq!(std::fs::read(&blocker).unwrap(), b"owned fixture prevents registration");
+        }
+    }
+
+    /// The durable guard is a precondition, not a best-effort post-failure log.
+    #[tokio::test]
+    async fn recovery_intent_write_failure_precedes_shared_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let path = dir.path().join("raft.snapshot.bin");
+        // Occupy the exact journal destination with a directory. No permission tricks.
+        let intent = path.with_file_name("raft.snapshot.bin.apply-intent");
+        std::fs::create_dir(&intent).unwrap();
+        let mut sm = FerrosStateMachine::with_side_effects_and_snapshot_path(
+            Arc::clone(&schema), Arc::clone(&engine), path,
+        );
+        let result = sm.apply(vec![make_entry(1, 1,
+            RaftOp::CreateKeyspace(simple_keyspace("must_not_exist")))]).await;
+        assert!(result.is_err(), "an unwritable intent must refuse before executing committed local effects");
+        assert!(!schema.snapshot().keyspaces.contains_key("must_not_exist"));
+        assert!(!sm.state.keyspaces.contains_key("must_not_exist"));
+        assert!(sm.last_applied.is_none());
+        assert!(intent.is_dir());
+    }
+
     #[tokio::test]
     async fn apply_command_propagates_engine_register_failure() {
         let dir = tempfile::tempdir().unwrap();
