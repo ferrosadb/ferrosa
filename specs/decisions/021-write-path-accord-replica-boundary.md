@@ -43,7 +43,7 @@ Make `WritePath` the boundary for **replica resolution** (the topology concern),
 while keeping `AccordCoordinatorDriver` construction in the CQL layer for the
 single-key LWT path — because the LWT **condition gate** is irreducibly
 CQL-specific: it decodes CQL schema (`decode_agreed_row_to_map`) and evaluates
-the `IF` predicate (`eval_lwt_for_statement`) inside a closure the driver runs
+the `IF` predicate (`TypedLwtPredicate::eval`) inside a closure the driver runs
 during the read-vote phase. The cluster layer cannot build that closure, so
 relocating the whole driver there would just push a CQL closure back across the
 boundary — no real decoupling.

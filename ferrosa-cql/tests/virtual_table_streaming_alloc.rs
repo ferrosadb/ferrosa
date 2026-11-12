@@ -165,14 +165,12 @@ fn virtual_table_read_path_allocation_profile() {
     );
 
     // --- 4. eval_if_conditions MOVES the row (no clone) -----------------
-    // Isolation note: the evaluator also clones ONE cell per condition
-    // (`row.get(&cond.column).cloned()`) to compare — pre-existing and not
-    // touched here. So the not-applied path is not literally zero; what this
-    // measures is that MOVING the row costs strictly less than the replaced
-    // shape, by exactly the whole-row clone it no longer performs.
+    // What this measures is that MOVING the row costs strictly less than the
+    // replaced shape, by exactly the whole-row clone it no longer performs.
     use ferrosa_common::CqlValue;
-    use ferrosa_cql::accord_router::eval_if_conditions;
+    use ferrosa_cql::accord_router::{eval_if_conditions, type_if_conditions};
     use ferrosa_cql::ast::{IfCondition, IfOperator, Term};
+    use ferrosa_cql::types::CqlType;
 
     // Text cells: their clone allocates a String each, so the removed clone is
     // visible in the counter.
@@ -186,11 +184,16 @@ fn virtual_table_read_path_allocation_profile() {
         }
         row
     };
-    let conditions = vec![IfCondition {
-        column: "c0".into(),
-        operator: IfOperator::Eq,
-        value: Term::StringLiteral("never".into()), // never matches
-    }];
+    // Typed against `c0 text` once, outside every measured window.
+    let conditions = type_if_conditions(
+        &[IfCondition {
+            column: "c0".into(),
+            operator: IfOperator::Eq,
+            value: Term::StringLiteral("never".into()), // never matches
+        }],
+        |column| Ok((column == "c0").then_some(CqlType::Varchar)),
+    )
+    .expect("c0 is a text column");
 
     // Warm the map/eval paths.
     assert!(!eval_if_conditions(&conditions, false, Some(text_row())).applied);

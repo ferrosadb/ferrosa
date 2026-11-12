@@ -281,8 +281,18 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   the target table at the agreed `t` (`ReadPredicate::ReadClusteringRow`, which
   returns that one row, t_5504f601); the coordinator evaluates the condition on
   the row at the statement's clustering and gates the write with
-  `eval_lwt_for_statement`. A row with the same key in another table, or another
+  `TypedLwtPredicate::eval`. A row with the same key in another table, or another
   row of the partition, does not satisfy or fail the condition.
+  **Every `IF` operand is compared as its column's declared type (t_07632c59).**
+  Before evaluation, both paths convert each operand — a literal or a bound
+  value — against the column's type (`accord_router::type_if_conditions`, via
+  `bridge::term_to_cql_value`), so `timestamp`, `bigint`/`varint` past 32 bits,
+  `decimal`, `float`, `date`, `time`, `timeuuid`, `ascii`, `blob` and `inet`
+  conditions compare like-for-like. Ordering follows the CQL type: `decimal` by
+  numeric value, `timeuuid` by embedded time, `inet` by address bytes. A
+  condition on an undefined column, or an operand that is not a value of the
+  column's type, is refused with `Invalid` instead of answering
+  `[applied]=false`.
 - **SUBSCRIBE / CDC** (`subscribe.rs`, `event.rs`) — per-connection streaming
   subscriptions that re-run an inner SELECT on an interval and push delta frames;
   dual-timestamp (Accord ts + apply ts) events; CQL `EVENT` push via a broadcast

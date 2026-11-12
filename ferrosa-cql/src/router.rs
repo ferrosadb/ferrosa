@@ -3051,20 +3051,45 @@ fn accord_read_predicate(
     }
 }
 
-/// Whether `stmt`'s IF condition holds against the F+1-agreed partition read at
-/// `t`, evaluated on the row at `clustering`.
-///
-/// A statement that is not an LWT never applies through the gate.
+/// Whether an LWT's typed predicate holds against the F+1-agreed partition read
+/// at `t`, evaluated on the row at `clustering`.
 fn lwt_gate_verdict(
     schema: &Schema,
     ks: &str,
     table: &str,
-    stmt: &Statement,
+    predicate: &crate::accord_router::TypedLwtPredicate,
     clustering: &[u8],
     agreed_row: Option<&[u8]>,
 ) -> Result<bool, CqlError> {
     let agreed = decode_agreed_row_to_map(schema, ks, table, clustering, agreed_row)?;
-    Ok(crate::accord_router::eval_lwt_for_statement(stmt, agreed).is_some_and(|r| r.applied))
+    Ok(predicate.eval(agreed).applied)
+}
+
+/// `stmt`'s LWT predicate with every IF operand typed as its column in
+/// `ks.table`, or `None` when `stmt` is not an LWT.
+///
+/// # Errors
+///
+/// `CqlError::Invalid` when the table is unknown, a condition names an
+/// undefined column, or an operand is not a value of its column's type.
+fn typed_lwt_predicate(
+    schema: &Schema,
+    ks: &str,
+    table: &str,
+    stmt: &Statement,
+) -> Result<Option<crate::accord_router::TypedLwtPredicate>, CqlError> {
+    let snap = schema.snapshot();
+    let table_meta = snap
+        .tables
+        .get(&(ks.to_string(), table.to_string()))
+        .ok_or_else(|| CqlError::Invalid(format!("table {ks}.{table} not found")))?;
+    crate::accord_router::TypedLwtPredicate::for_statement(stmt, |column| {
+        table_meta
+            .columns
+            .get(column)
+            .map(|c| resolve_col_type(&c.column_type, ks, schema))
+            .transpose()
+    })
 }
 
 /// Encode a DML statement as a buffered [`TransactionWrite`] for a CQL
@@ -3835,6 +3860,11 @@ async fn route_lwt_via_accord(
     // (and the coordinator's own local reader) can target the read-at-`t`.
     let (ks, table) = lwt_keyspace_table(ctx, stmt)?;
 
+    // Type every IF operand as its column now, so an invalid condition is
+    // refused before any peer traffic, and the gate below compares values of
+    // the column's declared type.
+    let predicate = typed_lwt_predicate(&state.schema, &ks, &table, stmt)?;
+
     // Token-aware participant resolution (ADR-021): in cluster mode the write
     // path maps the key to its RF replicas from the ring (a proper subset of the
     // cluster); otherwise we keep the live-peer fallback. This makes the live
@@ -3856,7 +3886,6 @@ async fn route_lwt_via_accord(
 
     // Every conditional statement reads its row of `ks.table` at `t` and the
     // coordinator evaluates the IF clause; see `accord_read_predicate`.
-    let is_lwt = crate::accord_router::classify_lwt(stmt).is_some();
     let read_predicate = accord_read_predicate(stmt, &ks, &table, &clustering);
 
     // A replica-coordinator must cast and persist its own protocol votes against
@@ -3886,7 +3915,7 @@ async fn route_lwt_via_accord(
         ));
         driver = driver.with_local_applier(applier);
     }
-    if is_lwt {
+    if let Some(gate_predicate) = predicate {
         let reader = Arc::new(ferrosa_cluster::accord::EngineStorageReader::new(
             state.engine.clone(),
         ));
@@ -3897,9 +3926,9 @@ async fn route_lwt_via_accord(
         // read-vote phase and aborts (ConditionNotMet, no Apply) when it returns
         // false — so a failing `IF col=val` never persists its mutation. The
         // closure wraps the canonical eval_if_conditions (via
-        // eval_lwt_for_statement), so there is no forked evaluator. We capture
-        // owned clones (schema Arc, ks/table, the statement) because the gate is
-        // a 'static closure called inside the driver.
+        // TypedLwtPredicate::eval), so there is no forked evaluator. We capture
+        // owned clones (schema Arc, ks/table, the typed predicate) because the
+        // gate is a 'static closure called inside the driver.
         //
         // Fail-loud: a decode failure of our own read-vote bytes is a real
         // corruption signal. The gate cannot return an error, so it records the
@@ -3910,7 +3939,6 @@ async fn route_lwt_via_accord(
         let schema = state.schema.clone();
         let gate_ks = ks.clone();
         let gate_table = table.clone();
-        let gate_stmt = stmt.clone();
         let gate_clustering = clustering.clone();
         let gate_err: Arc<std::sync::Mutex<Option<CqlError>>> =
             Arc::new(std::sync::Mutex::new(None));
@@ -3920,7 +3948,7 @@ async fn route_lwt_via_accord(
                 &schema,
                 &gate_ks,
                 &gate_table,
-                &gate_stmt,
+                &gate_predicate,
                 &gate_clustering,
                 row,
             ) {
@@ -9894,6 +9922,15 @@ async fn eval_local_condition(
     conditions: &[IfCondition],
     if_exists: bool,
 ) -> Result<Option<BytesMut>, CqlError> {
+    // Type every operand as its column before reading, so an invalid condition
+    // is refused rather than evaluated as a mismatch.
+    let meta = target.table_meta;
+    let conditions = crate::accord_router::type_if_conditions(conditions, |column| {
+        meta.columns
+            .get(column)
+            .map(|c| resolve_col_type(&c.column_type, target.ks, &state.schema))
+            .transpose()
+    })?;
     let existing = read_lwt_row(state, target).await?;
     let as_map: Option<HashMap<String, Option<CqlValue>>> = existing.as_ref().map(|row| {
         target
@@ -9904,7 +9941,7 @@ async fn eval_local_condition(
             .zip(row.iter().cloned())
             .collect()
     });
-    let verdict = crate::accord_router::eval_if_conditions(conditions, if_exists, as_map);
+    let verdict = crate::accord_router::eval_if_conditions(&conditions, if_exists, as_map);
     if verdict.applied {
         return Ok(None);
     }
@@ -35362,11 +35399,14 @@ mod tests {
                 Timestamp::synthetic(t),
             )
             .expect("replica read at t");
+        let predicate = typed_lwt_predicate(&state.schema, &ks, &table, &stmt)
+            .expect("type the IF clause")
+            .expect("a conditional statement has a predicate");
         lwt_gate_verdict(
             &state.schema,
             &ks,
             &table,
-            &stmt,
+            &predicate,
             &write.clustering,
             row.as_deref(),
         )
@@ -35495,6 +35535,53 @@ mod tests {
             ),
             "the condition must be read from row r2, not the partition's first row r1"
         );
+    }
+
+    /// The Accord gate compares an IF operand as the column's declared type.
+    ///
+    /// A timestamp operand past `i32` used to be narrowed to a 32-bit `int`
+    /// before comparison, so `=` never held and `!=` always did: the gate
+    /// refused the matching write and let the guarded one through.
+    #[tokio::test]
+    async fn the_accord_gate_compares_a_timestamp_condition_as_a_timestamp() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let no_ks: Option<String> = None;
+        let ctx = test_ctx(&auth, &no_ks);
+        for ddl in [
+            "CREATE KEYSPACE lwt_ts WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE lwt_ts.t (k int PRIMARY KEY, ts timestamp, v text)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(ddl).unwrap())
+                .await
+                .unwrap();
+        }
+        apply_accord_lwt(
+            &state,
+            &ctx,
+            "INSERT INTO lwt_ts.t (k, ts, v) VALUES (1, 1700000000123, 'orig') IF NOT EXISTS",
+            100,
+        )
+        .await;
+
+        for (cond, want) in [
+            ("ts = 1700000000123", true),
+            ("ts <= '2023-11-14T22:13:20.123Z'", true),
+            ("ts = 1700000000124", false),
+            ("ts != 1700000000123", false),
+        ] {
+            assert_eq!(
+                accord_lwt_verdict(
+                    &state,
+                    &ctx,
+                    &format!("UPDATE lwt_ts.t SET v = 'new' WHERE k = 1 IF {cond}"),
+                    200,
+                ),
+                want,
+                "IF {cond} against ts = 1700000000123"
+            );
+        }
     }
 
     #[test]
