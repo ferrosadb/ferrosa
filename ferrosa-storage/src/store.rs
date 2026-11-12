@@ -1483,6 +1483,8 @@ enum RotationKind {
     Truncate,
     /// Change nothing; answered once every rotation queued before it is done.
     Barrier,
+    /// Seal writers and flush their rows before recoverable retirement.
+    Retain,
 }
 
 /// A catalog or schema change one rotation applies, in queue order.
@@ -5458,12 +5460,13 @@ impl<F: FlushTarget> TableStore<F> {
         let mut group = Vec::new();
         for request in batch {
             match request.kind {
-                RotationKind::Truncate | RotationKind::Barrier => {
+                RotationKind::Truncate | RotationKind::Barrier | RotationKind::Retain => {
                     if !group.is_empty() {
                         self.run_rotation_group(std::mem::take(&mut group));
                     }
                     let result = match request.kind {
                         RotationKind::Truncate => self.truncate_now(),
+                        RotationKind::Retain => self.retain_now(),
                         _ => Ok(FlushOutcome::NothingToFlush),
                     };
                     Self::answer(&request.reply, result);
@@ -5510,7 +5513,7 @@ impl<F: FlushTarget> TableStore<F> {
                     changes.push(RotationChange::Schema(schema));
                     releases.push(on_release);
                 }
-                RotationKind::Truncate | RotationKind::Barrier => {
+                RotationKind::Truncate | RotationKind::Barrier | RotationKind::Retain => {
                     unreachable!("run_rotation_batch never groups a truncate or barrier")
                 }
             }
@@ -5580,6 +5583,33 @@ impl<F: FlushTarget> TableStore<F> {
                 (name.clone(), index)
             })
             .collect()
+    }
+
+    /// Refuse new writers, drain admitted writers and persist their rows before
+    /// the owner moves this store's directory. Unlike `retire`, every failure
+    /// propagates; callers must retain the directory when confirmation fails.
+    pub(crate) fn retain_for_recovery(&self) -> Result<()> {
+        self.rotate(RotationKind::Retain).map(|_| ())
+    }
+
+    fn retain_now(&self) -> Result<FlushOutcome> {
+        self.retired.store(true, std::sync::atomic::Ordering::SeqCst);
+        let view = self.view.load_full();
+        // Keep this view active and sealed: publishing a fresh writable view
+        // would let an old engine-map reader write after the final flush.
+        view.indexes.gate.seal_and_drain(MEMTABLE_SEAL_DEADLINE)?;
+        let current = SealedMemtable::new(
+            Arc::clone(&view.active),
+            Arc::clone(&view.indexes),
+            Arc::clone(&view.vector_indexes),
+        );
+        let mut pending: Vec<_> = view.flushing.iter().rev().cloned().collect();
+        pending.push(current);
+        let start = Instant::now();
+        for sealed in pending {
+            self.flush_sealed(&sealed, &view.indexes.catalog, &view.indexes.schema, start)?;
+        }
+        Ok(FlushOutcome::Published)
     }
 
     /// Mark this store dropped: wait for a rotation already running to

@@ -4207,6 +4207,92 @@ mod tests {
     /// The durable snapshot may lag a successfully applied DROP/CREATE and
     /// durable user writes in the new UUID. Startup has no authority to erase
     /// that UUID merely to install the older metadata before log replay.
+    async fn assert_raft_drop_retains_recoverable_incarnation(register_system: bool) {
+        use ferrosa_common::{DecoratedKey, PartitionKey};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let table = simple_table("retention_ks", "retained");
+        let tid = TableId::new(&table.keyspace, &table.name);
+        let mut sm = FerrosStateMachine::with_side_effects(schema, Arc::clone(&engine));
+        sm.apply(vec![
+            make_entry(
+                1,
+                1,
+                RaftOp::CreateKeyspace(simple_keyspace("retention_ks")),
+            ),
+            make_entry(1, 2, RaftOp::CreateTable(Box::new(table.clone()))),
+        ])
+        .await
+        .unwrap();
+        let key = DecoratedKey::new(PartitionKey::new(b"retained-user-row".to_vec()));
+        engine
+            .write(
+                &tid,
+                &key,
+                ferrosa_sstable::types::Row {
+                    clustering: vec![],
+                    cells: vec![],
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
+                },
+                1,
+            )
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        assert!(engine.read(&tid, &key).unwrap().is_some());
+        if !register_system {
+            engine
+                .unregister_table(&TableId::new("system_schema", "tables"))
+                .unwrap();
+        }
+        let result = sm
+            .apply(vec![make_entry(
+                1,
+                3,
+                RaftOp::DropTable {
+                    keyspace: table.keyspace.clone(),
+                    table: table.name.clone(),
+                },
+            )])
+            .await;
+        assert_eq!(
+            result.is_ok(),
+            register_system,
+            "only the missing canonical projection may reject this DROP"
+        );
+        assert_eq!(
+            sm.last_applied.unwrap().index,
+            if register_system { 3 } else { 2 }
+        );
+        let retained = dir
+            .path()
+            .join("retired-tables")
+            .join(table.id.to_string())
+            .join("data");
+        assert!(retained.is_dir(), "Raft DROP must retain its exact physical incarnation even if later canonical projection fails");
+        assert!(
+            std::fs::read_dir(&retained).unwrap().any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with("-Data.db")),
+            "retention must preserve actual durable user SSTables, not just a marker"
+        );
+        assert!(!dir.path().join("sstables").join(tid.to_string()).exists());
+    }
+
+    #[tokio::test]
+    async fn raft_drop_retains_incarnation_after_success() {
+        assert_raft_drop_retains_recoverable_incarnation(true).await;
+    }
+
+    #[tokio::test]
+    async fn raft_drop_retains_incarnation_after_projection_failure() {
+        assert_raft_drop_retains_recoverable_incarnation(false).await;
+    }
+
     #[tokio::test]
     async fn startup_snapshot_preserves_newer_durable_incarnation_before_replay() {
         use ferrosa_common::{DecoratedKey, PartitionKey};
