@@ -527,8 +527,14 @@ controls already passed before the fix (`tests/count_payload_alloc.rs`).
   engine's point, range, index and full-text read entry points and never by
   anti-entropy repair, compaction or self-heal. When only hot tables keep the
   cache over its limit, one WARN names `hot_bytes` and the hot tables (and one
-  INFO when it clears). Startup restore of evicted SSTables logs its plan and
-  progress. Before deleting, it writes and fsyncs a
+  INFO when it clears). A listing is not proof of durability: before evicting
+  it HEADs every component it would delete and keeps the generation if the
+  store lacks one (FMEA ST-104), and `sync_sstables_to_s3` checks each listed
+  local generation against the store once per process (at most
+  `SYNC_VERIFY_BUDGET_PER_PASS` per pass) and re-uploads one the store lacks
+  (`ferrosa_storage_eviction_audit_sync_reuploaded_listed_total`; Lean model
+  `specs/lean4/Ferrosa/Storage/Eviction.lean`). Startup restore of evicted
+  SSTables logs its plan and progress. Before deleting, it writes and fsyncs a
   `<gen>.evicted` marker; the engine constructors restore every marked generation
   from S3 before any table registers (`restore_evicted_sstables`), because
   generation discovery reads local files only. Only marked generations are

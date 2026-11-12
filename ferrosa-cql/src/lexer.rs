@@ -693,9 +693,14 @@ impl<'input> Lexer<'input> {
                 }
             }
 
+            // Name the character as typed: `other` is only its first UTF-8 byte.
             other => Err(CqlError::SyntaxError(format!(
                 "unexpected character '{}' at position {}",
-                other as char, start
+                self.input
+                    .get(start..)
+                    .and_then(|rest| rest.chars().next())
+                    .unwrap_or(char::from(other)),
+                start
             ))),
         }
     }
@@ -1038,31 +1043,44 @@ impl<'input> Lexer<'input> {
         content_start: usize,
     ) -> Result<Token<'input>, CqlError> {
         self.pos = content_start;
-        let mut s = String::new();
-        loop {
-            if self.pos >= self.bytes.len() {
-                return Err(CqlError::SyntaxError(format!(
-                    "unterminated string literal starting at position {start}"
-                )));
-            }
-            let b = self.bytes[self.pos];
-            if b == b'\'' {
-                self.pos += 1;
-                if self.pos < self.bytes.len() && self.bytes[self.pos] == b'\'' {
-                    s.push('\'');
-                    self.pos += 1;
-                } else {
-                    break;
-                }
-            } else {
-                s.push(b as char);
-                self.pos += 1;
-            }
-        }
+        let s = self.read_doubled_delimited(b'\'').ok_or_else(|| {
+            CqlError::SyntaxError(format!(
+                "unterminated string literal starting at position {start}"
+            ))
+        })?;
         Ok(Token {
             kind: TokenKind::StringLiteral(s),
             pos: start,
         })
+    }
+
+    /// Read a `delim`-delimited body from `self.pos` up to and past its closing
+    /// `delim`, where a doubled `delim` stands for one literal `delim`.
+    ///
+    /// Runs between delimiters are copied as `&str` slices. `delim` is ASCII,
+    /// so every cut falls on a char boundary and multi-byte UTF-8 is carried
+    /// whole. Pushing each byte as a `char` (the previous code) re-encoded
+    /// every non-ASCII code point as two or three Latin-1 ones: "–" became
+    /// "â\u{80}\u{93}". `None` when the input ends before the closing delimiter.
+    fn read_doubled_delimited(&mut self, delim: u8) -> Option<String> {
+        debug_assert!(delim.is_ascii(), "a delimiter must be one ASCII byte");
+        let mut s = String::new();
+        let mut run_start = self.pos;
+        while self.pos < self.bytes.len() {
+            if self.bytes[self.pos] != delim {
+                self.pos += 1;
+                continue;
+            }
+            s.push_str(&self.input[run_start..self.pos]);
+            self.pos += 1;
+            if self.bytes.get(self.pos) != Some(&delim) {
+                return Some(s);
+            }
+            s.push(char::from(delim));
+            self.pos += 1;
+            run_start = self.pos;
+        }
+        None
     }
 
     /// Read a quoted identifier: `"MyTable"`.
@@ -1071,29 +1089,12 @@ impl<'input> Lexer<'input> {
         let start = self.pos;
         self.pos += 1; // skip opening double-quote
 
-        let mut s = String::new();
-        loop {
-            if self.pos >= self.bytes.len() {
-                return Err(CqlError::SyntaxError(format!(
-                    "unterminated quoted identifier starting at position {}",
-                    start
-                )));
-            }
-            let b = self.bytes[self.pos];
-            if b == b'"' {
-                self.pos += 1;
-                // CQL allows "" to escape a double-quote inside a quoted identifier
-                if self.pos < self.bytes.len() && self.bytes[self.pos] == b'"' {
-                    s.push('"');
-                    self.pos += 1;
-                } else {
-                    break;
-                }
-            } else {
-                s.push(b as char);
-                self.pos += 1;
-            }
-        }
+        // CQL allows "" to escape a double-quote inside a quoted identifier.
+        let s = self.read_doubled_delimited(b'"').ok_or_else(|| {
+            CqlError::SyntaxError(format!(
+                "unterminated quoted identifier starting at position {start}"
+            ))
+        })?;
         Ok(Token {
             kind: TokenKind::QuotedIdent(s),
             pos: start,
@@ -1162,6 +1163,22 @@ mod tests {
             tokens.push(tok.kind);
         }
         tokens
+    }
+
+    /// The error names the character the user typed. Formatting the first
+    /// UTF-8 byte as a `char` reported "unexpected character 'Ã'" for "é".
+    #[test]
+    fn an_unexpected_non_ascii_character_is_named_as_typed() {
+        let mut lexer = Lexer::new("SELECT é").unwrap();
+        assert_eq!(
+            lexer.next_token().unwrap().kind,
+            TokenKind::Keyword(Keyword::Select)
+        );
+        let err = lexer.next_token().unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            CqlError::SyntaxError("unexpected character 'é' at position 7".into()).to_string()
+        );
     }
 
     #[test]

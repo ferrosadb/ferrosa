@@ -359,13 +359,22 @@ impl<'input> Lexer<'input> {
             // Identifier or keyword.
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.lex_ident_or_keyword(start),
 
-            other => Err(ParseError::new(
-                format!("unexpected character: '{}'", other as char),
-                Span {
-                    start,
-                    end: start + 1,
-                },
-            )),
+            // Name the character as typed and span all of it: `other` is only
+            // its first UTF-8 byte.
+            other => {
+                let typed = self
+                    .input
+                    .get(start..)
+                    .and_then(|rest| rest.chars().next())
+                    .unwrap_or(char::from(other));
+                Err(ParseError::new(
+                    format!("unexpected character: '{typed}'"),
+                    Span {
+                        start,
+                        end: start + typed.len_utf8(),
+                    },
+                ))
+            }
         }
     }
 
@@ -412,8 +421,14 @@ impl<'input> Lexer<'input> {
     }
 
     fn lex_string(&mut self, start: usize, quote: u8) -> ParseResult<Token<'input>> {
+        debug_assert!(quote.is_ascii(), "a quote must be one ASCII byte");
         self.pos += 1; // skip opening quote
+                       // Runs between quotes are copied as `&str` slices: `quote` is ASCII, so
+                       // every cut is a char boundary and multi-byte UTF-8 is carried whole.
+                       // Pushing each byte as a `char` (the previous code) stored every
+                       // non-ASCII literal re-encoded as Latin-1: "Zoë" became "ZoÃ«".
         let mut s = String::new();
+        let mut run_start = self.pos;
         loop {
             if self.pos >= self.bytes.len() {
                 return Err(ParseError::new(
@@ -424,20 +439,19 @@ impl<'input> Lexer<'input> {
                     },
                 ));
             }
-            let b = self.bytes[self.pos];
-            if b == quote {
+            if self.bytes[self.pos] != quote {
                 self.pos += 1;
-                // Check for escaped quote ('' or "").
-                if self.pos < self.bytes.len() && self.bytes[self.pos] == quote {
-                    s.push(quote as char);
-                    self.pos += 1;
-                } else {
-                    break;
-                }
-            } else {
-                s.push(b as char);
-                self.pos += 1;
+                continue;
             }
+            s.push_str(&self.input[run_start..self.pos]);
+            self.pos += 1;
+            // A doubled quote ('' or "") is one literal quote.
+            if self.bytes.get(self.pos) != Some(&quote) {
+                break;
+            }
+            s.push(char::from(quote));
+            self.pos += 1;
+            run_start = self.pos;
         }
         Ok(Token {
             kind: TokenKind::StringLit(s),
@@ -547,6 +561,17 @@ mod tests {
             tokens.push(tok.kind);
         }
         tokens
+    }
+
+    /// The error names the character the user typed, and its span covers the
+    /// whole character. Formatting the first UTF-8 byte as a `char` reported
+    /// "unexpected character: 'Ã'" for "é", with a span ending mid-character.
+    #[test]
+    fn an_unexpected_non_ascii_character_is_named_as_typed() {
+        let mut lexer = Lexer::new("é");
+        let err = lexer.next_token().unwrap_err();
+        assert_eq!(err.message, "unexpected character: 'é'");
+        assert_eq!((err.span.start, err.span.end), (0, "é".len()));
     }
 
     #[test]

@@ -932,3 +932,35 @@ Status: fixed on `feat/postgres-oban`; regression tests
 `a_forced_sync_clears_the_stall_clock_and_writes_are_admitted`,
 `a_failed_forced_sync_leaves_the_stall_clock_running` and
 `a_superseded_sync_does_not_reopen_the_stall_clock` in `commitlog/mod.rs`.
+
+## G22 — storage: "the manifest lists it" was read as "the store holds it"
+
+Source: `ferrosa-storage/src/engine.rs` (`enforce_uploaded_sstable_cache_limit`,
+`sync_sstables_to_s3`), model `Ferrosa/Storage/Eviction.lean`.
+
+The manifest can list a generation the object store does not hold: an upload that stored only a
+sidecar, a generation copied in by hand. Both the cache evictor and the sync treated a listing as
+proof of durability. On 2026-11-03 the evictor deleted the only copy of two such generations and
+their nodes refused every restart; the guard added on 2026-11-06 stopped the deletion but not the
+cause, and on 2026-11-09 node2 still held two listed `trajectory_folds` generations with one copy
+each, which the sync never uploaded and the evictor refused on every pass.
+
+- **The violation** (`evict_old_loses_data`, `evict_old_strands_the_marker`, `old_reaches_loss`):
+  from a fresh generation, drift then the shipped eviction reaches a state with no copy and a
+  marker startup cannot honour.
+- **The second half** (`sync_old_never_heals`): a drifted generation is a fixpoint of the shipped
+  sync, so no number of passes uploads it.
+- **The fix** (`evict_new_preserves_no_loss`, `evict_new_preserves_recoverable`, `sync_new_heals`):
+  eviction requires every component in the store; the sync uploads a listed local generation the
+  store lacks.
+- **Minimality** (`sync_new_agrees_on_unlisted`, `sync_new_skips_stored`): unlisted generations
+  sync exactly as before, and a listed generation the store holds is not re-uploaded.
+- **The invariant** (`new_rules_keep_the_invariant`): under the fixed rules, with drift allowed at
+  any step, every reachable state keeps a copy and an honourable marker; a drifted generation is
+  evictable after one sync (`drifted_generation_heals_then_evicts`).
+
+Status: the eviction guard is on `main`
+(`uploaded_cache_eviction_keeps_a_generation_the_store_does_not_hold`); the sync heal is on
+`fix/sync-heals-unstored-generation` (`sync_uploads_a_listed_generation_the_store_does_not_hold`,
+`sync_leaves_a_listed_generation_the_store_holds`,
+`sync_heals_listed_generations_beyond_the_budget_on_later_passes` in `engine.rs`).

@@ -496,7 +496,11 @@ fn parse_legacy_line(raw: &[u8]) -> LegacyLine {
     let (Some(table), Some(sstable)) = (parts.next(), parts.next()) else {
         return LegacyLine::Corrupt("fewer than two tab-separated fields".to_string());
     };
-    let (table_id, sstable_id) = (url_decode(table), url_decode(sstable));
+    let (table_id, sstable_id) = match (url_decode(table), url_decode(sstable)) {
+        (Ok(table_id), Ok(sstable_id)) => (table_id, sstable_id),
+        (Err(e), _) => return LegacyLine::Corrupt(format!("table id {e}")),
+        (_, Err(e)) => return LegacyLine::Corrupt(format!("SSTable id {e}")),
+    };
     if table_id.is_empty() || sstable_id.is_empty() {
         return LegacyLine::Corrupt("empty table or SSTable id".to_string());
     }
@@ -510,7 +514,11 @@ fn parse_legacy_line(raw: &[u8]) -> LegacyLine {
     // unconfirmed: keep it pending without the context rather than drop it.
     let compaction = match parts.next().map(url_decode) {
         None => None,
-        Some(payload) => match serde_json::from_str(&payload) {
+        Some(Err(e)) => {
+            damage.push(format!("compaction context {e}; kept without it"));
+            None
+        }
+        Some(Ok(payload)) => match serde_json::from_str(&payload) {
             Ok(compaction) => Some(compaction),
             Err(e) => {
                 damage.push(format!(
@@ -536,24 +544,33 @@ fn parse_legacy_line(raw: &[u8]) -> LegacyLine {
 }
 
 /// Decode the small subset of percent-encoding the legacy writer produced.
-fn url_decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+///
+/// Decodes to BYTES and then requires UTF-8: a percent sequence names one byte
+/// of a UTF-8 encoding, not one `char`. Pushing each byte as a `char` (the
+/// previous code) turned "caf%C3%A9" and a raw "café" alike into "cafÃ©", and
+/// silently accepted sequences that are not UTF-8 at all.
+fn url_decode(s: &str) -> Result<String, String> {
     let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 3 <= bytes.len() {
-            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
-                if let Ok(b) = u8::from_str_radix(hex, 16) {
-                    out.push(b as char);
-                    i += 3;
-                    continue;
-                }
+        let escaped = (bytes[i] == b'%')
+            .then(|| bytes.get(i + 1..i + 3))
+            .flatten()
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match escaped {
+            Some(b) => {
+                out.push(b);
+                i += 3;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
     }
-    out
+    String::from_utf8(out).map_err(|e| format!("percent-decodes to invalid UTF-8 ({e})"))
 }
 
 #[cfg(test)]
@@ -886,6 +903,46 @@ mod tests {
             migrate_legacy_log(dir.path()).unwrap(),
             LegacyMigration::default(),
             "a migrated data directory has nothing left to migrate"
+        );
+    }
+
+    /// A non-ASCII id migrates as written, whether the legacy writer left it raw
+    /// or percent-encoded its bytes. The decoder pushed each byte as a `char`,
+    /// so "café" migrated as "cafÃ©": a pending record naming a table that does
+    /// not exist, while the real SSTable lost its eviction protection. A percent
+    /// sequence that does not decode to UTF-8 is quarantined, never replaced.
+    #[test]
+    fn legacy_log_migration_keeps_non_ascii_ids_and_quarantines_invalid_utf8() {
+        let dir = tempdir().unwrap();
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice("ks.café\t1\n".as_bytes());
+        legacy.extend_from_slice(b"ks.caf%C3%A9\t2\n");
+        legacy.extend_from_slice(b"ks.bad%FF\t3\n");
+        std::fs::write(dir.path().join(LEGACY_LOG_FILE), &legacy).unwrap();
+
+        let outcome = migrate_legacy_log(dir.path()).unwrap();
+
+        assert_eq!(
+            outcome,
+            LegacyMigration {
+                migrated: 2,
+                salvaged: 0,
+                quarantined: 1,
+            }
+        );
+        let log = PendingUploadsLog::open(dir.path()).unwrap();
+        let keys: Vec<(String, String)> = log
+            .pending_records()
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.table_id, r.sstable_id))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                ("ks.café".to_string(), "1".to_string()),
+                ("ks.café".to_string(), "2".to_string()),
+            ]
         );
     }
 }

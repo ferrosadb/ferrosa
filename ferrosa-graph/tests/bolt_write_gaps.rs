@@ -485,6 +485,28 @@ async fn set_without_return_keeps_the_status_row() {
     assert_eq!(h.age_of("Alice").await, json!(31));
 }
 
+/// A Cypher string literal is stored as written. The lexer pushed each UTF-8
+/// BYTE as a `char`, so every non-ASCII literal (escaped or not) was stored
+/// re-encoded as Latin-1: "Zoë" came back as "ZoÃ«". The row is read back by
+/// `age`, because a `{name: ...}` lookup would be corrupted the same way and
+/// match the corrupted value.
+#[tokio::test]
+async fn a_non_ascii_string_literal_is_stored_as_written() {
+    let h = Harness::new();
+    h.create_person(&uuid_for(7), "Zoë – d''Arc 日本", 77).await;
+    h.create_person(&uuid_for(8), "Zoë plain", 78).await;
+
+    let escaped = h
+        .ok("MATCH (n:Person) WHERE n.age = 77 RETURN n.name AS v")
+        .await;
+    let plain = h
+        .ok("MATCH (n:Person) WHERE n.age = 78 RETURN n.name AS v")
+        .await;
+
+    assert_eq!(plain.rows, vec![vec![json!("Zoë plain")]]);
+    assert_eq!(escaped.rows, vec![vec![json!("Zoë – d'Arc 日本")]]);
+}
+
 // ---------------------------------------------------------------------------
 // gap 2 — parameterised list of maps in UNWIND
 // ---------------------------------------------------------------------------

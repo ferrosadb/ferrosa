@@ -166,7 +166,8 @@ unselected tasks, repeated requests and empty registries.
 | ID | Failure mode | Effect | S | O | D | RPN | Mitigation |
 |---|---|---|---|---|---|---|---|
 | ST-92 (t_c8625592) | **A `DROP TABLE` / `TRUNCATE` whose SSTable-directory removal fails is reported as success, and a same-name CREATE reloads the survivors** — `unregister_table_quiesced` and `truncate_local` called `std::fs::remove_dir_all` and, on failure, only logged a WARN and returned `Ok(())`; `register_table` -> `build_table_state` then rescanned the directory (`load_existing_sstables_and_sidecars_reporting`) and loaded the dropped rows. On a cluster, a follower whose `unregister_table` is refused (an in-flight compaction leaves `pause_table().is_drained()` false) keeps its rows while the leader reports the DROP as applied. | Dropped-table rows stay readable; DROP+CREATE yields a table silently mixing old and new data. Live: orphaned SSTables under `public.pgbench_accounts` survived DROP+CREATE and TRUNCATE; census 1.0M -> 1.15M -> 1.25M across reloads; `SELECT ... WHERE aid > 100000` returned 230,879 rows on a table that should have held <= 100,000. | 10 | 4 | 4 | 160 -> 20 | **Fixed (t_c8625592):** a durable, name-keyed **pending-sweep intent** (`table_drops::PENDING_SWEEPS_FILE`) is recorded BEFORE the removal and cleared only after it succeeds; a failed removal now returns `Err` (fail loud), and a later `build_table_state` sweeps the directory before loading — registration precedes any write, so its whole contents are a previous incarnation's rows and are deleted, not hidden. Tests: `a_drop_that_cannot_remove_its_sstables_leaves_no_readable_rows` (red first: left 8, right 3), `a_same_name_recreate_after_an_unremovable_drop_holds_only_new_rows_across_a_restart`, `the_orphaned_sstables_are_physically_reclaimed_on_recreate`, `truncate_leaves_zero_rows_even_when_its_sstables_cannot_be_removed`. **Replica-atomicity, now guarded (was the residual):** `unregister_table` records the intent BEFORE the step that can refuse it (the `is_drained` check), so ANY refused DROP is recorded durably and retried — the node's in-memory schema can no longer say "dropped" while its durable directory survives unrecorded; and `register_table_inner` honours a live intent by retiring a still-registered store instead of taking the "already registered" shortcut, so a same-name re-create can never reach a previous incarnation's store. The cluster half — the applied `RaftResponse::Error` being surfaced to the client rather than reported as success — is `ferrosa-cluster` FMEA **CL-47**, with the red-then-green cluster test `tests/drop_table_replica_agreement.rs::a_refused_drop_on_the_applying_node_surfaces_and_never_resurrects` (three real voters with a real engine each; the applying node's directory made unremovable). **Process coverage:** `ferrosa/tests/drop_table_replica_process.rs::a_refused_drop_on_a_real_node_process_fails_loud_and_never_resurrects` spawns three real `ferrosa` node processes, forms a real cluster, and drives the DROP over the PostgreSQL wire — the client must receive an ERROR, no node may serve the dropped rows, and they must stay gone after **restarting the applying node** (real WAL replay, which is where a tombstone that only lived in memory would let the rows back). GREEN with the `engine.rs`/`ddl_path.rs` fix; RED with both reverted to 05fda229 the DROP is reported to the client as success. Invariant 5 (all replicas agree) is guarded at both the in-process and the process boundary. |
-| ST-104 | **The uploaded-cache evictor deleted the only copy of a generation the object store never received** | The manifest listed it although only a sidecar was uploaded; the node then refused every restart. | 9 | 2 | 4 | 72 | Fixed: before writing a marker the evictor HEADs every base component and listed index artifact at local size; a gap keeps the generation local, logs it and counts `ferrosa_eviction_audit_refused_not_in_store_total`. Details in the ST-104 section below. |
+| ST-104 | **The uploaded-cache evictor deleted the only copy of a generation the object store never received** | The manifest listed it although only a sidecar was uploaded; the node then refused every restart. | 9 | 2 | 4 | 72 | Fixed: before writing a marker the evictor HEADs every base component and listed index artifact at local size; a gap keeps the generation local, logs it and counts `ferrosa_storage_eviction_audit_refused_not_in_store_total`. The sync re-uploads such a generation (once-per-process HEAD check of listed generations). Details in the ST-104 section below. |
+| ST-105 | **The legacy pending-upload log migration decoded ids byte by byte** | `url_decode` pushed each byte, raw or percent-decoded, as a `char`: a non-ASCII table id migrated as a different id ("café" → "cafÃ©"), so the real SSTable lost its eviction protection; invalid UTF-8 was accepted silently. | 8 | 1 | 8 | 64 | Fixed: decodes to bytes and requires UTF-8; an id that is not UTF-8 quarantines the line, a compaction context that is not UTF-8 is salvaged without it. Test: `legacy_log_migration_keeps_non_ascii_ids_and_quarantines_invalid_utf8`. |
 
 ## ST-54 collection-cell ordinal in the memtable merge normalizer
 
@@ -277,15 +278,40 @@ generation(s) are neither local nor resolvable from the object store").
 is about to delete plus every index artifact the marker will list, and requires
 each to exist at its local size. Missing or short objects keep the generation
 local, log an error naming them, and count
-`ferrosa_eviction_audit_refused_not_in_store_total`; a store error other than
+`ferrosa_storage_eviction_audit_refused_not_in_store_total`; a store error other than
 not-found also keeps it local (retried next pass).
 
+**Re-upload (2026-11-09).** The guard made eviction safe but left the data with
+one copy: `sync_sstables_to_s3` skipped every listed generation, so a listed
+generation the store lacked was never uploaded, and the evictor refused it on
+every pass. Node2 of the memory cluster held two such `trajectory_folds`
+generations. The sync now checks each listed local generation against the store
+once per process (the same HEAD as the evictor, base components at local
+size); a gap logs a warning, counts
+`ferrosa_storage_eviction_audit_sync_reuploaded_listed_total`, and re-uploads through
+the ordinary confirmed-upload path, which re-lists it with its real size. A
+verified generation is remembered (pruned with the on-disk set), and one pass
+checks at most `SYNC_VERIFY_BUDGET_PER_PASS` (128) generations, so the first
+pass after a restart cannot hold the single-flight sync for minutes; the rest
+are checked on later passes. A store error stops checking for that pass with
+one warning.
+
+**Model.** `specs/lean4/Ferrosa/Storage/Eviction.lean`: the shipped evictor
+reaches a state with no copy and an unhonourable marker (`old_reaches_loss`),
+the shipped sync never heals a drifted generation (`sync_old_never_heals`), and
+under the guarded evictor with the healing sync every reachable state keeps a
+copy and an honourable marker (`new_rules_keep_the_invariant`).
+
 **Detection.** Non-zero `refused_not_in_store_total` means a manifest-listed
-generation exists only on local disk and needs re-uploading.
+generation exists only on local disk; non-zero `sync_reuploaded_listed_total`
+means the sync found and re-uploaded one.
 
 **Tests.** `uploaded_cache_eviction_keeps_a_generation_the_store_does_not_hold`,
-`uploaded_cache_eviction_keeps_a_generation_whose_stored_copy_is_truncated`.
+`uploaded_cache_eviction_keeps_a_generation_whose_stored_copy_is_truncated`,
+`sync_uploads_a_listed_generation_the_store_does_not_hold`,
+`sync_leaves_a_listed_generation_the_store_holds`,
+`sync_heals_listed_generations_beyond_the_budget_on_later_passes`.
 
 **Open.** Why those generations entered the manifest without their base
-components was not established (June-era behaviour); no re-upload path exists
-for them yet.
+components was not established (the June-era temporal_edges pair, and the node2
+trajectory_folds pair first seen 2026-11-06).

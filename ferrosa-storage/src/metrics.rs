@@ -395,6 +395,17 @@ pub fn eviction_refused_not_in_store_total() -> u64 {
     EVICTION_AUDIT_REFUSED_NOT_IN_STORE_TOTAL.load(Ordering::Relaxed)
 }
 
+/// The sync found a manifest-listed generation the object store does not hold
+/// and is re-uploading it. Each one was a generation with a single copy.
+pub fn inc_sync_reuploaded_listed_generation() {
+    SYNC_REUPLOADED_LISTED_GENERATION_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Current count of [`inc_sync_reuploaded_listed_generation`].
+pub fn sync_reuploaded_listed_generation_total() -> u64 {
+    SYNC_REUPLOADED_LISTED_GENERATION_TOTAL.load(Ordering::Relaxed)
+}
+
 pub fn inc_write_admission_delayed() {
     WRITE_ADMISSION_DELAYED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
@@ -546,6 +557,7 @@ static EVICTION_AUDIT_WRITE_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static EVICTION_AUDIT_OFFLOAD_UPLOADED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static EVICTION_AUDIT_OFFLOAD_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static EVICTION_AUDIT_REFUSED_NOT_IN_STORE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SYNC_REUPLOADED_LISTED_GENERATION_TOTAL: AtomicU64 = AtomicU64::new(0);
 static EVICTION_AUDIT_LAST_UNIX_MS: AtomicU64 = AtomicU64::new(0);
 static EVICTION_AUDIT_LAST_TRIGGER: AtomicU64 = AtomicU64::new(0);
 static EVICTION_AUDIT_LAST_EVICTED_GENERATIONS: AtomicU64 = AtomicU64::new(0);
@@ -1361,6 +1373,12 @@ pub fn render_prometheus() -> String {
             "counter",
             "Evictions refused because the object store lacks the generation the manifest lists.",
             &EVICTION_AUDIT_REFUSED_NOT_IN_STORE_TOTAL,
+        ),
+        (
+            "sync_reuploaded_listed_total",
+            "counter",
+            "Manifest-listed generations the sync found missing from the object store and re-uploaded.",
+            &SYNC_REUPLOADED_LISTED_GENERATION_TOTAL,
         ),
         (
             "last_unix_ms",

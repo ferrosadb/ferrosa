@@ -38,6 +38,7 @@ import Ferrosa.Sql.SimpleSplit
 import Ferrosa.Sql.Dml
 import Ferrosa.Cql.V5Framing
 import Ferrosa.Storage.SyncHealth
+import Ferrosa.Storage.Eviction
 
 #check Ferrosa.Sql.Expr.legacy_compare_agrees
 #check Ferrosa.Sql.Expr.any_true_iff
@@ -99,6 +100,17 @@ import Ferrosa.Storage.SyncHealth
 #check Ferrosa.Storage.SyncHealth.failed_force_leaves_the_clock
 #check Ferrosa.Storage.SyncHealth.superseded_ticket_changes_nothing
 #check Ferrosa.Storage.SyncHealth.a_lost_race_keeps_the_clock_cleared
+#check Ferrosa.Storage.Eviction.evict_old_loses_data
+#check Ferrosa.Storage.Eviction.evict_old_strands_the_marker
+#check Ferrosa.Storage.Eviction.sync_old_never_heals
+#check Ferrosa.Storage.Eviction.old_reaches_loss
+#check Ferrosa.Storage.Eviction.evict_new_preserves_no_loss
+#check Ferrosa.Storage.Eviction.evict_new_preserves_recoverable
+#check Ferrosa.Storage.Eviction.sync_new_heals
+#check Ferrosa.Storage.Eviction.sync_new_agrees_on_unlisted
+#check Ferrosa.Storage.Eviction.sync_new_skips_stored
+#check Ferrosa.Storage.Eviction.drifted_generation_heals_then_evicts
+#check Ferrosa.Storage.Eviction.new_rules_keep_the_invariant
 #check Ferrosa.Topology.DcQuorum.dc_quorum_writes_share_a_replica
 #check Ferrosa.Topology.DcQuorum.no_partition_admits_two_dc_quorum_writes
 #check Ferrosa.Topology.DcQuorum.node_gate_forces_a_shared_replica

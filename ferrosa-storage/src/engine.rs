@@ -630,6 +630,12 @@ const SSTABLE_BASE_COMPONENTS: [&str; 9] = [
     "CRC.db",
 ];
 
+/// How many unverified manifest-listed generations one `sync_sstables_to_s3`
+/// pass checks against the store. Each check is one HEAD per base component on
+/// disk, so this caps a pass at roughly 128 × 9 HEADs; generations beyond it
+/// are checked on later passes, and verified ones are never checked again.
+const SYNC_VERIFY_BUDGET_PER_PASS: usize = 128;
+
 /// Composes sub-configurations for each component. Use `from_env()` for
 /// production (reads `FERROSA_*` env vars) or `test_config()` for tests.
 pub struct StorageEngineConfig {
@@ -1720,6 +1726,21 @@ pub struct StorageEngine {
     /// gains its missing component is still uploaded. Keyed by
     /// `table_id/generation`; pruned once the generation leaves disk.
     incomplete_generations: parking_lot::Mutex<std::collections::HashMap<String, Vec<String>>>,
+    /// Manifest-listed generations this process has checked against the store
+    /// and found whole: every base component present at its local size. A
+    /// manifest listing does not prove the store holds a generation (a
+    /// sidecar-only upload, a hand-copied generation), and a sync that skips
+    /// every listed generation never uploads one the store lacks (Lean
+    /// `Ferrosa.Storage.Eviction.sync_old_never_heals`). Each listed local
+    /// generation is therefore checked once per process; the store does not
+    /// lose an object it acknowledged, so a verified generation stays verified.
+    /// Keyed by `table_id/generation`; pruned once the generation leaves disk.
+    store_verified_generations: parking_lot::Mutex<std::collections::HashSet<String>>,
+    /// How many unverified listed generations one sync pass may check against
+    /// the store ([`SYNC_VERIFY_BUDGET_PER_PASS`]). The first pass after a
+    /// restart would otherwise HEAD every local generation while holding the
+    /// single-flight sync, delaying the upload of new flushes.
+    sync_verify_budget: usize,
     /// Edge state for the "hot tables alone keep the cache over its limit"
     /// warning: true while the last eviction pass was blocked by hot data.
     cache_hot_blocked: AtomicBool,
@@ -3762,6 +3783,8 @@ impl StorageEngine {
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             s3_sync_running: AtomicBool::new(false),
             incomplete_generations: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            store_verified_generations: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            sync_verify_budget: SYNC_VERIFY_BUDGET_PER_PASS,
             cache_hot_blocked: AtomicBool::new(false),
             manifest_drift_flagged: AtomicBool::new(false),
             eviction_audit,
@@ -4047,6 +4070,8 @@ impl StorageEngine {
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             s3_sync_running: AtomicBool::new(false),
             incomplete_generations: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            store_verified_generations: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            sync_verify_budget: SYNC_VERIFY_BUDGET_PER_PASS,
             cache_hot_blocked: AtomicBool::new(false),
             manifest_drift_flagged: AtomicBool::new(false),
             eviction_audit,
@@ -4357,6 +4382,8 @@ impl StorageEngine {
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             s3_sync_running: AtomicBool::new(false),
             incomplete_generations: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            store_verified_generations: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            sync_verify_budget: SYNC_VERIFY_BUDGET_PER_PASS,
             cache_hot_blocked: AtomicBool::new(false),
             manifest_drift_flagged: AtomicBool::new(false),
             eviction_audit,
@@ -15576,6 +15603,64 @@ impl StorageEngine {
         self.incomplete_generations
             .lock()
             .retain(|key, _| present.contains(key));
+        self.store_verified_generations
+            .lock()
+            .retain(|key| present.contains(key));
+    }
+
+    /// Whether manifest-listed generation `gen` must be uploaded again because
+    /// the store does not hold every base component at its local size.
+    ///
+    /// A generation verified earlier in this process is not checked again.
+    /// Otherwise the check spends one unit of `budget`; with none left the
+    /// generation is deferred to a later pass. A store error ends checking for
+    /// this pass (one warning, not one per generation) and the generation is
+    /// retried on the next pass; its local copy is never evicted meanwhile,
+    /// because the evictor performs the same check.
+    #[allow(clippy::too_many_arguments)] // each is a distinct coordinate of one generation
+    async fn listed_generation_needs_upload(
+        &self,
+        store: &dyn object_store::ObjectStore,
+        prefix: &str,
+        table_id: &str,
+        table_dir: &std::path::Path,
+        gen: &str,
+        memo_key: &str,
+        budget: &mut usize,
+    ) -> bool {
+        if self.store_verified_generations.lock().contains(memo_key) || *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        match Self::components_missing_from_store(store, prefix, table_id, table_dir, gen, &[])
+            .await
+        {
+            Ok(missing) if missing.is_empty() => {
+                self.store_verified_generations
+                    .lock()
+                    .insert(memo_key.to_string());
+                false
+            }
+            Ok(missing) => {
+                tracing::warn!(
+                    table = table_id,
+                    sstable = gen,
+                    ?missing,
+                    "s3-sync: manifest lists a generation the store does not hold; re-uploading"
+                );
+                crate::metrics::inc_sync_reuploaded_listed_generation();
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    table = table_id,
+                    sstable = gen,
+                    "s3-sync: cannot verify listed generations against the store this pass: {e}"
+                );
+                *budget = 0;
+                false
+            }
+        }
     }
 
     /// Sync all local SSTables to S3 and update the manifest.
@@ -15620,6 +15705,7 @@ impl StorageEngine {
         // pruned to exactly what still exists (and cannot grow without bound).
         let mut present_generation_keys: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        let mut verify_budget = self.sync_verify_budget;
 
         // Collect table IDs and directories under the lock, then release
         // before any .await (RwLockReadGuard is !Send).
@@ -15653,7 +15739,22 @@ impl StorageEngine {
                 let gen_str = gen.to_string();
                 let memo_key = format!("{table_id_str}/{gen_str}");
                 present_generation_keys.insert(memo_key.clone());
-                if existing_ids.contains(&gen_str) {
+                // Listed is not stored: a listed generation is skipped only
+                // once the store is known to hold it; one it lacks falls
+                // through to the confirmed upload below, which re-lists it.
+                if existing_ids.contains(&gen_str)
+                    && !self
+                        .listed_generation_needs_upload(
+                            store.as_ref(),
+                            &prefix,
+                            table_id_str,
+                            table_dir,
+                            &gen_str,
+                            &memo_key,
+                            &mut verify_budget,
+                        )
+                        .await
+                {
                     continue;
                 }
 
@@ -15727,6 +15828,9 @@ impl StorageEngine {
                             crate::metrics::UploadPhase::SyncAwait,
                             phase_start.elapsed(),
                         );
+                        self.store_verified_generations
+                            .lock()
+                            .insert(memo_key.clone());
                         manifest.add_sstable(
                             table_id_str,
                             crate::manifest::ManifestEntry {
@@ -17458,6 +17562,8 @@ impl StorageEngine {
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             s3_sync_running: AtomicBool::new(false),
             incomplete_generations: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            store_verified_generations: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            sync_verify_budget: SYNC_VERIFY_BUDGET_PER_PASS,
             cache_hot_blocked: AtomicBool::new(false),
             manifest_drift_flagged: AtomicBool::new(false),
             eviction_audit,
@@ -39136,6 +39242,190 @@ mod tests {
             entries.is_empty(),
             "remote manifest must not contain a generation missing Filter.db: {entries:?}"
         );
+    }
+
+    /// The complete component set the heal tests write for one generation.
+    const HEAL_COMPONENTS: &[(&str, &[u8])] = &[
+        ("Data.db", b"legacy data"),
+        ("Partitions.db", b"legacy partitions"),
+        ("Rows.db", b"legacy rows"),
+        ("Filter.db", b"legacy filter"),
+    ];
+
+    /// List `gens` of `table_id` in the store's manifest without uploading any
+    /// component: the state a sidecar-only upload or a hand-copied generation
+    /// leaves (Lean `Ferrosa.Storage.Eviction.drift`).
+    async fn list_without_storing(
+        store: &dyn object_store::ObjectStore,
+        prefix: &str,
+        table_id: &str,
+        gens: &[&str],
+    ) {
+        let mut manifest = crate::manifest::Manifest::new();
+        for gen in gens {
+            manifest.add_sstable(
+                table_id,
+                crate::manifest::ManifestEntry {
+                    id: (*gen).to_string(),
+                    size: 1,
+                    min_token: i64::MIN,
+                    max_token: i64::MAX,
+                    min_timestamp: 0,
+                    max_timestamp: 0,
+                },
+            );
+        }
+        manifest.save_without_cas(store, prefix).await.unwrap();
+    }
+
+    /// The stored bytes of `component` of generation `gen`, or `None`.
+    async fn stored_component(
+        store: &dyn object_store::ObjectStore,
+        prefix: &str,
+        table_id: &str,
+        gen: &str,
+        component: &str,
+    ) -> Option<Vec<u8>> {
+        let hex = crate::upload::manager::hex_prefix_for(gen);
+        let key =
+            crate::upload::manager::sstable_object_key(prefix, &hex, table_id, gen, component);
+        match store.get(&key).await {
+            Ok(object) => Some(object.bytes().await.unwrap().to_vec()),
+            Err(object_store::Error::NotFound { .. }) => None,
+            Err(e) => panic!("get {key}: {e}"),
+        }
+    }
+
+    /// 2026-11-09: node2 of the memory cluster listed two `trajectory_folds`
+    /// generations whose base components had never reached the store (only a
+    /// vector sidecar had). The sync skipped every listed generation, so it
+    /// never uploaded them; the guarded evictor then refused them on every
+    /// pass, and the data had exactly one copy. A listed local generation the
+    /// store does not hold must be uploaded (Lean
+    /// `Ferrosa.Storage.Eviction.sync_new_heals`).
+    #[tokio::test]
+    async fn sync_uploads_a_listed_generation_the_store_does_not_hold() {
+        let (_dir, engine, store, prefix, tid) =
+            s3_sync_fixture("test-sync-heal-listed", HEAL_COMPONENTS);
+        let table_id = tid.to_string();
+        // GIVEN the manifest lists generation 1 and the store holds none of it
+        list_without_storing(store.as_ref(), &prefix, &table_id, &["1"]).await;
+        assert_eq!(
+            stored_component(store.as_ref(), &prefix, &table_id, "1", "Data.db").await,
+            None,
+            "precondition: the store must not hold the generation"
+        );
+
+        // WHEN the sync runs
+        engine.sync_sstables_to_s3().await.unwrap();
+
+        // THEN the store holds every component, byte for byte
+        for (component, bytes) in HEAL_COMPONENTS {
+            assert_eq!(
+                stored_component(store.as_ref(), &prefix, &table_id, "1", component)
+                    .await
+                    .as_deref(),
+                Some(*bytes),
+                "{component} of a listed generation the store lacked must be uploaded"
+            );
+        }
+        // AND the evictor's own guard now accepts it
+        let missing = StorageEngine::components_missing_from_store(
+            store.as_ref(),
+            &prefix,
+            &table_id,
+            &engine.table_sstable_dir(&tid),
+            "1",
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(missing, Vec::<String>::new());
+        // AND it is still listed exactly once
+        let (manifest, _) = crate::manifest::Manifest::load(store.as_ref(), &prefix)
+            .await
+            .unwrap();
+        let ids: Vec<String> = manifest.sstables[&table_id]
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
+        assert_eq!(ids, vec!["1".to_string()]);
+    }
+
+    /// The heal must not turn every sync into a re-upload: a listed generation
+    /// the store already holds is checked and left alone (Lean
+    /// `Ferrosa.Storage.Eviction.sync_new_skips_stored`).
+    #[tokio::test]
+    async fn sync_leaves_a_listed_generation_the_store_holds() {
+        use object_store::ObjectStore as _;
+        let (_dir, engine, store, prefix, tid) =
+            s3_sync_fixture("test-sync-heal-stored", HEAL_COMPONENTS);
+        let table_id = tid.to_string();
+        // GIVEN generation 1 is listed AND every component is in the store
+        list_without_storing(store.as_ref(), &prefix, &table_id, &["1"]).await;
+        let hex = crate::upload::manager::hex_prefix_for("1");
+        let mut etags = Vec::new();
+        for (component, bytes) in HEAL_COMPONENTS {
+            let key = crate::upload::manager::sstable_object_key(
+                &prefix, &hex, &table_id, "1", component,
+            );
+            store.put(&key, bytes.to_vec().into()).await.unwrap();
+            etags.push((key.clone(), store.head(&key).await.unwrap().e_tag));
+        }
+
+        // WHEN two sync passes run
+        engine.sync_sstables_to_s3().await.unwrap();
+        engine.sync_sstables_to_s3().await.unwrap();
+
+        // THEN no component was written again
+        for (key, before) in etags {
+            assert_eq!(
+                store.head(&key).await.unwrap().e_tag,
+                before,
+                "{key} of a generation the store holds must not be re-uploaded"
+            );
+        }
+        // AND the generation is remembered as verified
+        assert!(engine
+            .store_verified_generations
+            .lock()
+            .contains(&format!("{table_id}/1")));
+    }
+
+    /// The per-pass check budget defers generations to later passes; it never
+    /// drops one. With a budget of one, two listed generations the store lacks
+    /// are healed one per pass, oldest first.
+    #[tokio::test]
+    async fn sync_heals_listed_generations_beyond_the_budget_on_later_passes() {
+        let (_dir, mut engine, store, prefix, tid) =
+            s3_sync_fixture("test-sync-heal-budget", HEAL_COMPONENTS);
+        engine.sync_verify_budget = 1;
+        let table_id = tid.to_string();
+        let table_dir = engine.table_sstable_dir(&tid);
+        for (component, bytes) in HEAL_COMPONENTS {
+            std::fs::write(table_dir.join(format!("2-{component}")), bytes).unwrap();
+        }
+        // GIVEN generations 1 and 2 are listed and the store holds neither
+        list_without_storing(store.as_ref(), &prefix, &table_id, &["1", "2"]).await;
+
+        // WHEN one pass runs THEN only generation 1 is healed
+        engine.sync_sstables_to_s3().await.unwrap();
+        let data = |gen: &'static str| {
+            let store = Arc::clone(&store);
+            let prefix = prefix.clone();
+            let table_id = table_id.clone();
+            async move { stored_component(store.as_ref(), &prefix, &table_id, gen, "Data.db").await }
+        };
+        assert_eq!(data("1").await.as_deref(), Some(&b"legacy data"[..]));
+        assert_eq!(
+            data("2").await,
+            None,
+            "generation 2 waits for the next pass"
+        );
+
+        // WHEN the next pass runs THEN generation 2 is healed too
+        engine.sync_sstables_to_s3().await.unwrap();
+        assert_eq!(data("2").await.as_deref(), Some(&b"legacy data"[..]));
     }
 
     /// Object store wrapper that fails all PUT operations immediately with a
