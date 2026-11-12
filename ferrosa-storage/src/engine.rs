@@ -31111,6 +31111,256 @@ mod tests {
         );
     }
 
+    // RED-only restart investigation. Test list (bounded to four cases):
+    // 1. Canonical WAL + historical ALTER round trip preserves named cells.
+    // 2. Initial admission of an unordered legacy mutation survives that path.
+    // 3. The same incoming mutation on a canonical existing row survives it.
+    // 4. An old-epoch WAL frame must not silently acquire current column names.
+    // Case 2 is a boundary witness, NOT proof of the native frame's producer:
+    // current CQL build_row sorts ordinals; the captured log contains no WAL cells.
+    mod restart_replay_cell_order {
+        use super::*;
+
+        fn schema(names: &[&str]) -> TableSchema {
+            TableSchema {
+                keyspace: "test_ks".into(),
+                table: "restart_cell_order".into(),
+                key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                clustering_columns: vec![ColumnDefinition {
+                    name: "ck".into(),
+                    type_name: "org.apache.cassandra.db.marshal.Int32Type".into(),
+                }],
+                static_columns: vec![],
+                regular_columns: names
+                    .iter()
+                    .map(|name| ColumnDefinition {
+                        name: (*name).into(),
+                        type_name: if *name == "p" {
+                            "org.apache.cassandra.db.marshal.MapType(\
+                             org.apache.cassandra.db.marshal.UTF8Type,\
+                             org.apache.cassandra.db.marshal.UTF8Type)"
+                                .into()
+                        } else {
+                            "org.apache.cassandra.db.marshal.UTF8Type".into()
+                        },
+                    })
+                    .collect(),
+                extensions: Default::default(),
+            }
+        }
+
+        // Resolve names in the SOURCE layout. Preserve mutation field order:
+        // storage/WAL accept these fields, whereas the CQL builder sorts them.
+        // No invalid ordinal, invalid value encoding, or invented cell flag.
+        fn named_row(schema: &TableSchema, fields: &[(&str, CellValue)]) -> Row {
+            Row {
+                clustering: 1i32.to_be_bytes().to_vec(),
+                cells: fields
+                    .iter()
+                    .map(|(name, cell)| (schema.column_index(name).unwrap(), cell.clone()))
+                    .collect(),
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1_000),
+            }
+        }
+
+        fn assert_named_cells(
+            engine: &StorageEngine,
+            tid: &TableId,
+            key: &DecoratedKey,
+            expected: &[(&str, CellValue)],
+        ) {
+            let schema = engine.table_schema(tid).unwrap();
+            let partition = engine
+                .read(tid, key)
+                .unwrap()
+                .expect("row survives restart");
+            assert_eq!(partition.rows.len(), 1);
+            assert_eq!(partition.rows[0].clustering, 1i32.to_be_bytes());
+            let mut actual: Vec<_> = partition.rows[0]
+                .cells
+                .iter()
+                .map(|(idx, cell)| {
+                    (
+                        schema.column_at_ordinal(*idx).unwrap().name.clone(),
+                        cell.clone(),
+                    )
+                })
+                .collect();
+            let mut expected: Vec<_> = expected
+                .iter()
+                .map(|(name, cell)| ((*name).to_owned(), cell.clone()))
+                .collect();
+            let order = |a: &(String, CellValue), b: &(String, CellValue)| {
+                (&a.0, &a.1.path).cmp(&(&b.0, &b.1.path))
+            };
+            actual.sort_by(order);
+            expected.sort_by(order);
+            // Compare the complete cell, including value, timestamp, TTL,
+            // local deletion time and path, under its COLUMN NAME.
+            assert_eq!(
+                actual, expected,
+                "WAL/schema replay changed named cell identity"
+            );
+        }
+
+        #[test]
+        fn canonical_cells_keep_names_and_metadata_across_restart_and_alter_replay() {
+            let dir = tempfile::tempdir().unwrap();
+            let current = schema(&["a", "b", "c", "d", "e", "m", "p", "z"]);
+            let historical = schema(&["a", "b", "c", "d", "m", "n", "p", "z"]);
+            let tid = TableId::new(&current.keyspace, &current.table);
+            let key = make_key("canonical");
+            let fields = vec![
+                ("m", CellValue::live(b"memo".to_vec(), 1_000)),
+                (
+                    "p",
+                    CellValue::live(b"value".to_vec(), 1_001).with_path(b"key".to_vec()),
+                ),
+                (
+                    "p",
+                    CellValue::live(b"survivor".to_vec(), 1_002).with_path(b"other".to_vec()),
+                ),
+                ("z", CellValue::tombstone(1_002, i32::MAX)),
+            ];
+            {
+                let engine =
+                    StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+                engine.register_table(current.clone()).unwrap();
+                engine.flush(&tid).unwrap(); // Persist schema; following data stays in WAL.
+                engine
+                    .write(&tid, &key, named_row(&current, &fields), 1_002)
+                    .unwrap();
+                // A CQL map-element DELETE at the same timestamp wins its tie.
+                let delete = CellValue::tombstone(1_001, i32::MAX).with_path(b"key".to_vec());
+                engine
+                    .write(&tid, &key, named_row(&current, &[("p", delete)]), 1_001)
+                    .unwrap();
+                engine.commit_log.shutdown().unwrap();
+            }
+            let mut expected = fields;
+            expected[1].1 = CellValue::tombstone(1_001, i32::MAX).with_path(b"key".to_vec());
+            let (engine, pending) =
+                StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            assert!(pending.is_empty());
+            assert_named_cells(&engine, &tid, &key, &expected);
+            // Raft's older snapshot/intermediate ALTER, then its later ALTER.
+            engine.update_table_schema(&tid, historical).unwrap();
+            engine.update_table_schema(&tid, current).unwrap();
+            assert_named_cells(&engine, &tid, &key, &expected);
+            engine.commit_log.shutdown().unwrap();
+            drop(engine);
+            let (engine, pending) =
+                StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            assert!(pending.is_empty());
+            assert_named_cells(&engine, &tid, &key, &expected);
+        }
+
+        fn legacy_frame_then_historical_alter(existing_row: bool) {
+            let dir = tempfile::tempdir().unwrap();
+            let current = schema(&["a", "b", "c", "d", "m", "n", "p", "z"]);
+            let historical = schema(&["a", "b", "c", "d", "n", "p", "z"]);
+            let tid = TableId::new(&current.keyspace, &current.table);
+            let key = make_key("legacy-frame");
+            // Legal named assignments, but an unordered STORAGE mutation. This
+            // witnesses acceptance of a pre-existing noncanonical frame; it
+            // does not claim today's CQL encoder emits this ordering.
+            // The write-time layout has m=4, z=7.
+            let fields = vec![
+                ("z", CellValue::tombstone(1_002, i32::MAX)),
+                ("m", CellValue::live(b"memo".to_vec(), 1_001)),
+            ];
+            {
+                let engine =
+                    StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+                engine.register_table(current.clone()).unwrap();
+                engine.flush(&tid).unwrap();
+                if existing_row {
+                    // CQL-equivalent earlier partial UPDATE, same clustering.
+                    engine
+                        .write(
+                            &tid,
+                            &key,
+                            named_row(&current, &[("m", CellValue::live(b"old".to_vec(), 900))]),
+                            900,
+                        )
+                        .unwrap();
+                }
+                engine
+                    .write(&tid, &key, named_row(&current, &fields), 1_002)
+                    .unwrap();
+                engine.commit_log.shutdown().unwrap();
+            }
+            let (engine, pending) =
+                StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            assert!(
+                pending.is_empty(),
+                "durable schema must stream WAL into the memtable"
+            );
+            let result = engine.update_table_schema(&tid, historical);
+            assert!(result.is_ok(),
+                "accepted named mutation must survive restart + ALTER; native failure boundary: {result:?}");
+            engine.update_table_schema(&tid, current).unwrap();
+            assert_named_cells(&engine, &tid, &key, &fields);
+        }
+
+        #[test]
+        fn initial_legacy_frame_survives_restart_and_historical_alter() {
+            legacy_frame_then_historical_alter(false);
+        }
+
+        #[test]
+        fn merge_into_canonical_row_survives_restart_and_historical_alter() {
+            legacy_frame_then_historical_alter(true);
+        }
+
+        #[test]
+        fn old_epoch_wal_must_not_silently_acquire_new_column_names() {
+            let dir = tempfile::tempdir().unwrap();
+            let historical = schema(&["a", "b", "c", "d", "m", "n", "p", "z"]);
+            let current = schema(&["a", "b", "c", "d", "e", "m", "p", "z"]);
+            let tid = TableId::new(&current.keyspace, &current.table);
+            let key = make_key("old-epoch");
+            // Canonical, valid source-epoch UPDATE + column/element DELETE.
+            // n has been dropped in current; its tombstone must not delete m.
+            let fields = vec![
+                ("m", CellValue::live(b"memo".to_vec(), 1_000)),
+                ("n", CellValue::tombstone(1_001, i32::MAX)),
+                (
+                    "p",
+                    CellValue::tombstone(1_002, i32::MAX).with_path(b"key".to_vec()),
+                ),
+                ("z", CellValue::live(b"tail".to_vec(), 1_003)),
+            ];
+            {
+                let engine =
+                    StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+                engine.register_table(historical.clone()).unwrap();
+                engine.flush(&tid).unwrap();
+                // Materialize a valid mutation before DDL, then deliver it after
+                // the schema rotation, as an in-flight old-epoch write. The
+                // public write API carries no source layout/epoch to check.
+                let in_flight = named_row(&historical, &fields);
+                engine.update_table_schema(&tid, current.clone()).unwrap();
+                engine.write(&tid, &key, in_flight, 1_003).unwrap();
+                engine.commit_log.shutdown().unwrap();
+            }
+            let (engine, pending) =
+                StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            assert!(pending.is_empty());
+            // Historical DDL's flush must not legitimize a wrong name binding
+            // by writing it into an SSTable header. Restoring current afterwards
+            // cannot recover identities that were already misattributed.
+            engine.update_table_schema(&tid, historical).unwrap();
+            engine.update_table_schema(&tid, current).unwrap();
+            let expected: Vec<_> = fields
+                .into_iter()
+                .filter(|(name, _)| *name != "n")
+                .collect();
+            assert_named_cells(&engine, &tid, &key, &expected);
+        }
+    }
+
     /// FMEA #9: Write data, flush, ALTER TABLE ADD column, write more,
     /// flush again, read back — old SSTables should still be readable.
     #[test]
