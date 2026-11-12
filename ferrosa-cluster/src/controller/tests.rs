@@ -12,7 +12,7 @@ use ferrosa_net::rpc::server::RpcServer;
 use ferrosa_net::rpc::{PeerId, RpcHandler};
 use proptest::prelude::*;
 
-fn test_storage(dir: &std::path::Path) -> Arc<StorageEngine> {
+fn test_storage_config(dir: &std::path::Path) -> ferrosa_storage::StorageEngineConfig {
     use ferrosa_storage::{CommitLogConfig, CompactionConfig, StorageEngineConfig};
     let config = StorageEngineConfig {
         commit_log: CommitLogConfig {
@@ -37,7 +37,11 @@ fn test_storage(dir: &std::path::Path) -> Arc<StorageEngine> {
         memtable_num_shards: 64,
         cache_hot_window_secs: 900,
     };
-    Arc::new(StorageEngine::new(config, None).unwrap())
+    config
+}
+
+fn test_storage(dir: &std::path::Path) -> Arc<StorageEngine> {
+    Arc::new(StorageEngine::new(test_storage_config(dir), None).unwrap())
 }
 
 /// The controller's own schema fixture. `pub(crate)` so the in-crate test modules of
@@ -6004,8 +6008,14 @@ async fn switchover_drains_admitted_writes_before_granting_the_peer_authority() 
 /// Build a controller wired to a peer manager, ready to transition, and return
 /// it with the peer ids/addresses a transition will name.
 async fn boot_gate_controller(dir: &std::path::Path) -> (Arc<ModeController>, Uuid, SocketAddr) {
-    let storage = test_storage(dir);
-    let schema = test_schema();
+    boot_gate_controller_with_storage(dir, test_storage(dir), test_schema()).await
+}
+
+async fn boot_gate_controller_with_storage(
+    dir: &std::path::Path,
+    storage: Arc<StorageEngine>,
+    schema: Arc<Schema>,
+) -> (Arc<ModeController>, Uuid, SocketAddr) {
     let config = Arc::new(ClusterConfig {
         raft_data_dir: Some(dir.join("raft")),
         ..ClusterConfig::default()
@@ -7950,4 +7960,129 @@ async fn corrupt_persisted_restore_refuses_cluster_transition_without_erasing_ev
         raft_dir.is_dir(),
         "Do not replace or discard failed recovery evidence."
     );
+}
+
+async fn assert_required_snapshot_startup(fault: Option<&str>) {
+    use crate::raft::log_store::SledLogStore;
+    use crate::raft::state_machine::FerrosStateMachine;
+    use crate::raft::{FerrosRaftConfig, RaftCommand, RaftOp};
+    use openraft::storage::{RaftLogStorage, RaftSnapshotBuilder, RaftStateMachine};
+    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    storage.register_system_tables().unwrap();
+    let schema = test_schema();
+    let raft_dir = super::cluster::raft_log_dir_for_dc(
+        &dir.path().join("raft"),
+        &ClusterConfig::default().data_center,
+    );
+    std::fs::create_dir_all(&raft_dir).unwrap();
+    let snapshot = raft_dir.join("state-machine.snapshot.bin");
+    let mut logs = SledLogStore::new(&raft_dir).unwrap();
+    let mut sm = FerrosStateMachine::with_side_effects_and_snapshot_path(
+        Arc::clone(&schema),
+        Arc::clone(&storage),
+        snapshot.clone(),
+    );
+    sm.set_durable_applied_handle(logs.durable_applied_handle());
+    let entry = |index, op| Entry::<FerrosRaftConfig> {
+        log_id: LogId::new(CommittedLeaderId::new(1, 1), index),
+        payload: EntryPayload::Normal(RaftCommand {
+            op,
+            schema_version: Uuid::new_v4(),
+        }),
+    };
+    // Use actual persisted log records and the snapshot's shared durability
+    // watermark; no fabricated purge metadata or test-only durability override.
+    let keyspace = ferrosa_schema::metadata::keyspace::KeyspaceMetadata {
+        name: "smoke_ks".into(),
+        durable_writes: true,
+        replication: ferrosa_schema::metadata::keyspace::ReplicationParams {
+            strategy: "SimpleStrategy".into(),
+            options: [("replication_factor".into(), "1".into())]
+                .into_iter()
+                .collect(),
+        },
+    };
+    let entries = vec![
+        entry(1, RaftOp::CreateKeyspace(keyspace)),
+        entry(2, RaftOp::CreateTable(Box::new(switchover_kv_table(false)))),
+    ];
+    logs.append_entries_for_test(entries.clone()).await.unwrap();
+    sm.apply(entries).await.unwrap();
+    sm.build_snapshot().await.unwrap();
+    let applied = sm.last_applied_index().unwrap();
+    let point = LogId::new(CommittedLeaderId::new(1, 1), applied);
+    logs.save_committed(Some(point)).await.unwrap();
+    logs.purge(point).await.unwrap();
+    assert_eq!(logs.last_purged_log_id().unwrap(), Some(point));
+    let snapshot_bytes = std::fs::read(&snapshot).unwrap();
+    drop(sm);
+    drop(logs);
+    drop(storage);
+    drop(schema);
+    match fault {
+        Some("unreadable") => {
+            std::fs::rename(&snapshot, raft_dir.join("snapshot.saved-evidence")).unwrap();
+            std::os::unix::fs::symlink(snapshot.file_name().unwrap(), &snapshot).unwrap();
+            assert!(std::fs::symlink_metadata(&snapshot)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert!(std::fs::read(&snapshot).is_err());
+        }
+        Some("missing") => {
+            std::fs::rename(&snapshot, raft_dir.join("snapshot.saved-evidence")).unwrap()
+        }
+        None => {}
+        _ => unreachable!(),
+    }
+    let (cold, pending) = StorageEngine::open(test_storage_config(dir.path()), None).unwrap();
+    cold.register_system_tables().unwrap();
+    cold.replay_mutations(pending).unwrap();
+    let (controller, peer_id, _) =
+        boot_gate_controller_with_storage(dir.path(), Arc::new(cold), test_schema()).await;
+    assert!(controller.is_cql_ready());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    controller.transition_to_cluster(vec![(peer_id, listener.local_addr().unwrap())]);
+    if fault.is_some() {
+        assert!(!controller.consensus_health().is_healthy(), "required snapshot failure must refuse real startup, never adopt the purge index without its state");
+        assert!(
+            !controller.is_cql_ready(),
+            "required-snapshot recovery must close mounted CQL admission"
+        );
+        assert!(controller.raft().is_none());
+        assert!(!write_path_is_cluster(&controller));
+        let reopened = SledLogStore::new(&raft_dir).unwrap();
+        assert_eq!(
+            reopened.last_purged_log_id().unwrap(),
+            Some(point),
+            "failed startup must preserve the actual persisted purge evidence"
+        );
+        assert_eq!(
+            std::fs::read(raft_dir.join("snapshot.saved-evidence")).unwrap(),
+            snapshot_bytes
+        );
+    } else {
+        assert!(controller.consensus_health().is_healthy());
+        let raft = controller
+            .raft()
+            .expect("valid covering snapshot must remain startable");
+        raft.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn unreadable_required_snapshot_cold_start_refuses_cql_reads() {
+    assert_required_snapshot_startup(Some("unreadable")).await;
+}
+
+#[tokio::test]
+async fn missing_required_snapshot_cold_start_refuses_cql_reads() {
+    assert_required_snapshot_startup(Some("missing")).await;
+}
+
+#[tokio::test]
+async fn valid_required_snapshot_cold_start_keeps_raft_startable() {
+    assert_required_snapshot_startup(None).await;
 }

@@ -662,6 +662,15 @@ impl SledLogStore {
         }
     }
 
+    /// Exercise the real append path from sibling in-crate startup fixtures.
+    #[cfg(test)]
+    pub(crate) async fn append_entries_for_test(
+        &mut self,
+        entries: Vec<Entry<FerrosRaftConfig>>,
+    ) -> Result<(), StorageError<u64>> {
+        self.append_inner(entries).await
+    }
+
     /// Internal helper for `append` that does the actual sled work. Split
     /// out so the public `append` can route both success and failure
     /// through `LogFlushed::log_io_completed` (W1.19a). Test code can
