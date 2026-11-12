@@ -1361,6 +1361,8 @@ impl FerrosStateMachine {
                 return Ok(false);
             };
             if !path.exists() {
+                super::apply_failure::check(&path, None)
+                    .map_err(|error| StorageIOError::read_state_machine(to_any_error(error)))?;
                 return Ok(false);
             }
 
@@ -1368,6 +1370,8 @@ impl FerrosStateMachine {
                 .map_err(|e| StorageIOError::read_state_machine(to_any_error(e)))?;
             let persisted: PersistedSnapshot = bincode::deserialize(&bytes)
                 .map_err(|e| StorageIOError::read_state_machine(to_any_error(e)))?;
+            super::apply_failure::check(&path, persisted.meta.last_log_id)
+                .map_err(|error| StorageIOError::read_state_machine(to_any_error(error)))?;
             self.apply_snapshot_data_from(
                 &persisted.meta,
                 &persisted.bytes,
@@ -2708,10 +2712,17 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
                     let mut staged = self.staged_apply();
                     let physical_job = Arc::clone(&physical).into_job();
                     let job_lifecycle = Arc::clone(&self.physical_lifecycle);
+                    let failure_snapshot = self.snapshot_path.clone();
+                    let failed_from = entry.log_id;
+                    let previous_applied = self.last_applied;
                     let job = ferrosa_net::task_pool::TaskPool::current("raft-physical-apply")
                         .spawn_blocking(move || {
-                            let _physical = physical_job;
                             let _pauses = worker_pauses;
+                            let _physical = physical_job;
+                            let _failure_on_unwind = super::apply_failure::UnwindGuard {
+                                snapshot: failure_snapshot.clone(), previous: previous_applied,
+                                first: failed_from, last: last_log_id,
+                            };
                             let result: ferrosa_common::Result<CompletedApply> = (|| {
                                 let mut responses = Vec::with_capacity(commands.len());
                                 let mut dirty = false;
@@ -2728,9 +2739,20 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
                                 })
                             })(
                             );
-                            if let Err(error) = &result {
-                                job_lifecycle.fail(error);
-                            }
+                            let result = result.map_err(|error| {
+                                if let Some(path) = &failure_snapshot {
+                                    let record = super::apply_failure::FailureRecord::new(
+                                        previous_applied, failed_from, last_log_id, error.to_string(),
+                                    );
+                                    if let Err(persist_error) = super::apply_failure::persist(path, &record) {
+                                        return ferrosa_common::Error::Io(std::io::Error::other(format!(
+                                            "{error}; could not finish durable apply failure record: {persist_error}"
+                                        )));
+                                    }
+                                }
+                                error
+                            });
+                            if let Err(error) = &result { job_lifecycle.fail(error); }
                             result
                         });
                     self.pending_apply = Some(PendingApply {
@@ -6166,6 +6188,60 @@ mod tests {
             builder.build_snapshot().await.is_err(),
             "failed projection cannot be snapshotted and purged"
         );
+    }
+
+    #[tokio::test]
+    async fn persistent_projection_failure_refuses_cold_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("raft.snapshot");
+        let engine = test_engine_with_reserve(
+            dir.path(),
+            ferrosa_storage::SyncStrategyConfig::Batch,
+            u64::MAX,
+        );
+        engine.register_system_tables().unwrap();
+        let mut sm = FerrosStateMachine::with_side_effects_and_snapshot_path(
+            Arc::new(test_schema_instance()),
+            Arc::clone(&engine),
+            snapshot.clone(),
+        );
+        let result = sm
+            .apply(vec![make_entry(
+                1,
+                1,
+                RaftOp::CreateKeyspace(simple_keyspace("disk_refused")),
+            )])
+            .await;
+        assert!(
+            result.is_err(),
+            "actual storage admission refusal must fail the apply"
+        );
+        assert!(sm.last_applied.is_none());
+        assert!(sm.apply_failure.is_some());
+        drop(sm);
+        drop(engine);
+        let reopened = test_engine_with_reserve(
+            dir.path(),
+            ferrosa_storage::SyncStrategyConfig::Batch,
+            u64::MAX,
+        );
+        reopened.register_system_tables().unwrap();
+        let mut cold = FerrosStateMachine::with_side_effects_and_snapshot_path(
+            Arc::new(test_schema_instance()),
+            reopened,
+            snapshot,
+        );
+        let boot = cold.recover_from_persisted_snapshot();
+        assert!(
+            boot.is_err(),
+            "persisted apply failure must refuse a second boot before replay, got {boot:?}"
+        );
+        let reason = boot.unwrap_err().to_string();
+        assert!(
+            reason.contains("1") && reason.contains("failed"),
+            "boot refusal must name failed entry/cause: {reason}"
+        );
+        assert!(cold.last_applied.is_none());
     }
 
     #[tokio::test]

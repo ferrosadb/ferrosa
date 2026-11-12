@@ -18,6 +18,7 @@ pub(crate) mod physical_apply;
 pub mod replication_health;
 pub mod snapshot_pusher;
 pub mod snapshot_transport;
+mod apply_failure;
 pub mod state_machine;
 
 pub use group_id::{RaftGroupId, DEFAULT_DC_NAME};
