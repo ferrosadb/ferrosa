@@ -322,20 +322,21 @@ impl PriorityPool {
         self.handle(lane).fire(msg, None).await
     }
 
-    /// Trigger an immediate reconnect for a single lane.
+    /// Make a reconnecting lane dial now instead of waiting out its backoff,
+    /// inter-cycle pause or slow-retry interval.
     ///
-    /// No-op: the alive watcher attached to each lane actor handles
-    /// reconnection automatically.  Retained for API compatibility.
-    pub fn reconnect_lane(&self, _lane: Lane) {
-        // Reconnection is driven by the alive watcher inside each lane actor.
+    /// The alive watcher still decides *when* a lane is reconnecting; this
+    /// only shortens the wait. Harmless on a connected lane: the request is
+    /// consumed by the lane's next dial.
+    pub fn reconnect_lane(&self, lane: Lane) {
+        self.handle(lane).redial_now();
     }
 
-    /// Trigger an immediate reconnect for all 3 lanes concurrently.
-    ///
-    /// No-op: the alive watcher attached to each lane actor handles
-    /// reconnection automatically.  Retained for API compatibility.
+    /// [`Self::reconnect_lane`] for all 3 lanes.
     pub fn reconnect_all_lanes(&self) {
-        // Reconnection is driven by the alive watcher inside each lane actor.
+        for lane in [Lane::Raft, Lane::Data, Lane::Bulk] {
+            self.reconnect_lane(lane);
+        }
     }
 
     /// Inspect the current state of all lanes.

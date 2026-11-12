@@ -1034,6 +1034,120 @@ fn cluster_invite_keeps_live_peer_when_payload_advertises_older_address() {
     );
 }
 
+/// A peer that restarts on the SAME address keeps our outbound pool (no
+/// refresh), but that pool's lanes are asleep in reconnect backoff. Its inbound
+/// handshake proves it is back, so the refresh path must wake them.
+///
+/// Nightly pair smoke 2026-10-23: node2/node3 restarted on their old IPs and
+/// dialled node1 within a second, but node1's lanes to them stayed in a 16 s
+/// backoff and a QUORUM write failed "lane is reconnecting" (received=1,
+/// required=2) with every replica up.
+#[tokio::test]
+async fn inbound_handshake_from_restarted_peer_wakes_reconnecting_lanes() {
+    use ferrosa_net::codec::InternodeCodec;
+    use ferrosa_net::handshake::accept_handshake;
+    use ferrosa_net::pool::PriorityPool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio_util::codec::Framed;
+
+    struct NoopListener;
+    impl ferrosa_net::peer::PeerEventListener for NoopListener {
+        fn on_peer_connected(&self, _: ferrosa_net::rpc::handler::PeerId) {}
+        fn on_peer_disconnected(&self, _: ferrosa_net::rpc::handler::PeerId) {}
+        fn on_peer_suspected(&self, _: ferrosa_net::rpc::handler::PeerId) {}
+        fn on_peer_recovered(&self, _: uuid::Uuid) {}
+        fn on_peer_failed(&self, _: uuid::Uuid) {}
+    }
+
+    let net_config = Arc::new(NetConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        ..NetConfig::default()
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let peer_id = Uuid::new_v4();
+    let peer_up = Arc::new(AtomicBool::new(true));
+    let refused = Arc::new(AtomicUsize::new(0));
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let server = {
+        let (cfg, up, rf, ac) = (
+            Arc::clone(&net_config),
+            Arc::clone(&peer_up),
+            Arc::clone(&refused),
+            Arc::clone(&accepted),
+        );
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                if !up.load(Ordering::SeqCst) {
+                    rf.fetch_add(1, Ordering::SeqCst);
+                    continue;
+                }
+                let mut framed = Framed::new(stream, InternodeCodec::new(cfg.max_frame_body_size));
+                accept_handshake(&mut framed, &cfg, peer_id).await.unwrap();
+                held.push(framed);
+                if ac.fetch_add(1, Ordering::SeqCst) + 1 == 3 {
+                    up.store(false, Ordering::SeqCst); // the peer goes down
+                    held.clear();
+                }
+            }
+        })
+    };
+
+    let local_id = Uuid::new_v4();
+    let pool = PriorityPool::connect(
+        Arc::clone(&net_config),
+        local_id,
+        &addr.to_string(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let pm = Arc::new(PeerManager::new(
+        Arc::clone(&net_config),
+        local_id,
+        Arc::new(NoopListener),
+    ));
+    pm.add_peer((peer_id, addr), pool).await;
+
+    // Given: every lane has failed two reconnects and sleeps a 4-5 s backoff.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while refused.load(Ordering::SeqCst) < 6 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("each lane should fail two reconnects while the peer is down");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // When: the peer is back on the same address and dials us.
+    peer_up.store(true, Ordering::SeqCst);
+    super::peer_events::refresh_outbound_peer_for_inbound_for_test(
+        Arc::clone(&pm),
+        Arc::clone(&net_config),
+        local_id,
+        peer_id,
+        addr,
+    )
+    .await;
+
+    // Then: our outbound lanes reconnect well inside the remaining backoff.
+    let reconnected = tokio::time::timeout(Duration::from_secs(1), async {
+        while accepted.load(Ordering::SeqCst) < 6 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        reconnected.is_ok(),
+        "an inbound handshake must wake our reconnecting lanes; {} of 3 reconnected within 1 s",
+        accepted.load(Ordering::SeqCst).saturating_sub(3)
+    );
+    server.abort();
+}
+
 #[test]
 fn inbound_peer_address_change_refreshes_live_outbound_pool() {
     let current_inbound_addr = "10.89.1.174:7000".parse().unwrap();

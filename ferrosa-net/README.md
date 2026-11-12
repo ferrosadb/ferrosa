@@ -112,7 +112,13 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   an exhaustion, and after `DORMANT_AFTER_EXHAUSTIONS` it drops into the
   indefinite slow-retry phase (`Dormant`): one single-attempt probe per
   `slow_retry_interval()` (default 30 s, plus up to 25% jitter) until the peer
-  returns or the lane is shut down, for an outage of any length. Both bounds are
+  returns or the lane is shut down, for an outage of any length. Every one of
+  those waits (backoff, the 5 s pause between cycles, the slow-retry interval)
+  is cut short by `LaneHandle::redial_now` / `PriorityPool::reconnect_all_lanes`
+  / `PeerManager::wake_peer_lanes` (a sticky `RedialSignal`, consumed by the
+  next dial); the cluster calls it when a peer completes an inbound handshake,
+  so a peer that restarts on the same address is reached again at once instead
+  of after up to 30 s of backoff (NET-21). Both bounds are
   env-tunable (`FERROSA_NET_RECONNECT_FAST_ATTEMPTS`,
   `FERROSA_NET_RECONNECT_SLOW_INTERVAL_MS`; see `PROFILE.md`). Logging is
   edge-only: one line on losing the connection, one on entering slow-retry, one

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rand::RngExt;
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 use uuid::Uuid;
 
 use crate::codec::Lane;
@@ -476,6 +476,71 @@ impl ExponentialBackoff {
 }
 
 // ---------------------------------------------------------------------------
+// RedialSignal
+// ---------------------------------------------------------------------------
+
+/// "The peer is back, dial now": cuts short whatever wait a reconnecting lane
+/// is in — fast-phase backoff, the pause between cycles, or the slow-retry
+/// interval.
+///
+/// Without it a peer that restarts on the same address stays unreachable from
+/// this side for the rest of the current backoff (up to 30 s) even though it
+/// has already dialled us inbound. Nightly pair smoke 2026-10-23: a QUORUM
+/// write failed "lane is reconnecting" with both replicas up.
+///
+/// The request is a sticky flag, not only a wake-up: it stays pending through
+/// every wait until a dial actually starts ([`Self::take`]). So a request that
+/// lands mid-dial still skips the next wait, and one that wakes the pause
+/// between cycles also skips the new cycle's first backoff.
+#[derive(Default)]
+pub struct RedialSignal {
+    requested: AtomicBool,
+    notify: Notify,
+}
+
+impl RedialSignal {
+    /// Ask the lane to dial now. Idempotent; never blocks.
+    pub fn request(&self) {
+        self.requested.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    /// Consume a pending request. Called as a dial starts (that dial serves
+    /// it) and when the lane connects (nothing left to cut short).
+    pub(crate) fn take(&self) -> bool {
+        self.requested.swap(false, Ordering::AcqRel)
+    }
+
+    /// Sleep for `delay`, or return early if a redial is (or becomes) requested.
+    /// Returns `true` when the wait was cut short. Leaves the request pending.
+    pub(crate) async fn sleep(&self, delay: Duration) -> bool {
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        // Register before checking the flag so a request between the check and
+        // the select cannot be lost.
+        notified.as_mut().enable();
+        if self.requested.load(Ordering::Acquire) {
+            return true;
+        }
+        tokio::select! {
+            () = tokio::time::sleep(delay) => false,
+            () = notified => true,
+        }
+    }
+}
+
+/// [`RedialSignal::sleep`] when a signal is attached, a plain sleep otherwise.
+async fn sleep_or_redial(redial: Option<&RedialSignal>, delay: Duration) -> bool {
+    match redial {
+        Some(signal) => signal.sleep(delay).await,
+        None => {
+            tokio::time::sleep(delay).await;
+            false
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // LaneState
 // ---------------------------------------------------------------------------
 
@@ -545,6 +610,21 @@ pub(crate) fn spawn_alive_watcher(
 // connect_with_retry
 // ---------------------------------------------------------------------------
 
+/// The owning lane's controls over a fast-phase reconnect cycle.
+#[derive(Default)]
+pub(crate) struct ReconnectSignals {
+    /// Set when the lane shuts down: stop before the next attempt.
+    pub(crate) cancelled: Option<Arc<AtomicBool>>,
+    /// Set when the peer is known to be back: skip the current backoff.
+    pub(crate) redial: Option<Arc<RedialSignal>>,
+}
+
+impl ReconnectSignals {
+    fn is_cancelled(&self) -> bool {
+        is_cancelled(&self.cancelled)
+    }
+}
+
 /// Returns `true` when the optional cancel flag is set.
 fn is_cancelled(cancelled: &Option<Arc<AtomicBool>>) -> bool {
     cancelled
@@ -605,7 +685,7 @@ pub(crate) async fn connect_with_retry_cancelable(
     peer_host: &str,
     lane: Lane,
     tls_connector: Option<Arc<tokio_rustls::TlsConnector>>,
-    cancelled: Option<Arc<AtomicBool>>,
+    signals: ReconnectSignals,
     task_pool: TaskPool,
 ) -> Option<RpcClient> {
     let mut backoff = ExponentialBackoff::new(
@@ -614,7 +694,7 @@ pub(crate) async fn connect_with_retry_cancelable(
     );
 
     for attempt in 1..=reconnect_fast_attempts() {
-        if is_cancelled(&cancelled) {
+        if signals.is_cancelled() {
             tracing::debug!(?lane, peer = peer_host, "reconnect cancelled");
             return None;
         }
@@ -626,10 +706,20 @@ pub(crate) async fn connect_with_retry_cancelable(
             peer = peer_host,
             "reconnecting lane"
         );
-        tokio::time::sleep(delay).await;
-        if is_cancelled(&cancelled) {
+        if sleep_or_redial(signals.redial.as_deref(), delay).await {
+            tracing::debug!(
+                ?lane,
+                attempt,
+                peer = peer_host,
+                "backoff cut short: redial requested"
+            );
+        }
+        if signals.is_cancelled() {
             tracing::debug!(?lane, peer = peer_host, "reconnect cancelled");
             return None;
+        }
+        if let Some(signal) = &signals.redial {
+            signal.take();
         }
 
         match dial_once(
@@ -862,7 +952,10 @@ mod tests {
             "127.0.0.1:9",
             Lane::Data,
             None,
-            Some(cancelled),
+            ReconnectSignals {
+                cancelled: Some(cancelled),
+                redial: None,
+            },
             TaskPool::current("test-reconnect"),
         )
         .await;

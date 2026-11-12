@@ -51,7 +51,8 @@ use crate::metrics;
 use crate::reconnect::{
     connect_once_cancelable, connect_with_retry_cancelable, dec_dormant_peer_count,
     inc_dormant_peer_count, lane_probe_timeout, slow_retry_interval, spawn_alive_watcher,
-    with_jitter, LaneAction, LaneHealth, LaneState, DORMANT_AFTER_EXHAUSTIONS,
+    with_jitter, LaneAction, LaneHealth, LaneState, ReconnectSignals, RedialSignal,
+    DORMANT_AFTER_EXHAUSTIONS,
 };
 use crate::rpc::client::RpcClient;
 use crate::task_pool::TaskPool;
@@ -312,6 +313,8 @@ pub struct LaneHandle {
     lane: Lane,
     default_timeout: Duration,
     cancelled: Arc<AtomicBool>,
+    /// Shared by every clone of this handle and the actor's reconnect tasks.
+    redial: Arc<RedialSignal>,
     /// `None` for actors that run on a runtime owned elsewhere (a `TaskPool`);
     /// only the pooled Raft lane actor needs reaping.
     _guard: Option<Arc<HandleGuard>>,
@@ -442,6 +445,12 @@ impl LaneHandle {
         }
     }
 
+    /// Wake this lane's reconnect loop so it dials now instead of waiting out
+    /// its backoff, inter-cycle pause or slow-retry interval.
+    pub fn redial_now(&self) {
+        self.redial.request();
+    }
+
     /// Query the current lane status.
     pub async fn query_status(&self) -> Result<LaneStatusReport> {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -503,7 +512,10 @@ impl ActorReconnectContext {
                 &ctx.peer_host,
                 ctx.lane,
                 ctx.tls_connector.clone(),
-                Some(Arc::clone(&ctx.cancelled)),
+                ReconnectSignals {
+                    cancelled: Some(Arc::clone(&ctx.cancelled)),
+                    redial: Some(Arc::clone(&ctx.handle.redial)),
+                },
                 ctx.task_pool.clone(),
             )
             .await;
@@ -531,7 +543,10 @@ impl ActorReconnectContext {
         let handle = self.handle.clone();
         let cancelled = Arc::clone(&self.cancelled);
         self.task_pool.spawn(async move {
-            tokio::time::sleep(with_jitter(slow_retry_interval())).await;
+            handle
+                .redial
+                .sleep(with_jitter(slow_retry_interval()))
+                .await;
             if cancelled.load(Ordering::Relaxed) {
                 return;
             }
@@ -570,6 +585,7 @@ pub fn spawn_lane_actor_with_timeout(
         lane,
         default_timeout,
         cancelled: Arc::new(AtomicBool::new(false)),
+        redial: Arc::new(RedialSignal::default()),
         _guard: None,
     };
     let ctx = ctx_builder(handle.clone());
@@ -591,6 +607,7 @@ pub(crate) fn spawn_lane_actor_on_pool_with_timeout(
         lane,
         default_timeout,
         cancelled: Arc::new(AtomicBool::new(false)),
+        redial: Arc::new(RedialSignal::default()),
         _guard: None,
     };
     let ctx = ctx_builder(handle.clone());
@@ -637,6 +654,7 @@ pub(crate) fn spawn_raft_lane_actor_with_timeout(
         lane,
         default_timeout,
         cancelled,
+        redial: Arc::new(RedialSignal::default()),
         _guard: Some(reaper.acquire()),
     };
     // The context gets a handle clone WITHOUT a guard. Its `ctx_builder`
@@ -896,6 +914,8 @@ async fn lane_actor_loop(
                 } else {
                     tracing::info!(?lane, peer = %ctx.peer_host, "lane reconnected");
                 }
+                // Connected: a redial requested during the dial has been served.
+                ctx.handle.redial.take();
                 let alive_rx = new_client.alive_rx();
                 state = LaneState::Connected(new_client);
                 let watcher_ctx = ctx.clone();
@@ -975,7 +995,7 @@ async fn lane_actor_loop(
                     };
                     let retry_ctx = ctx.clone();
                     ctx.task_pool.spawn(async move {
-                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        retry_ctx.handle.redial.sleep(Duration::from_secs(5)).await;
                         retry_ctx.spawn_reconnect(next_exhaustion);
                     });
                 }
@@ -992,6 +1012,9 @@ async fn lane_actor_loop(
                     if probe_ctx.cancelled.load(Ordering::Relaxed) {
                         return;
                     }
+                    // This probe serves any pending redial request; leaving it
+                    // set would make every later slow-retry wait return at once.
+                    probe_ctx.handle.redial.take();
                     let result = connect_once_cancelable(
                         Arc::clone(&probe_ctx.config),
                         probe_ctx.local_host_id,

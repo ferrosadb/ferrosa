@@ -324,6 +324,29 @@ cql_ok() {
     fi
 }
 
+# Helper: retry one CQL statement on one node until it succeeds or <timeout>
+# seconds pass, then FAIL with the last error. For statements issued right after
+# peers restart: their CQL port opens before they have dialled us back, so the
+# first attempt can race the reconnect. Keep <timeout> short enough that a lane
+# left asleep in reconnect backoff (up to 30 s) still fails the run; a lane woken
+# by the peer's inbound handshake reconnects in milliseconds. Logs the attempt
+# count so a slow-but-passing recovery stays visible.
+cql_ok_within() {
+    local timeout=$1 port=$2 stmt=$3 description=$4
+    local deadline=$((SECONDS + timeout)) attempts=0 out=""
+    while (( SECONDS < deadline )); do
+        attempts=$((attempts + 1))
+        if out=$(cqlsh --request-timeout=10 localhost "$port" -e "$stmt" 2>&1); then
+            if (( attempts > 1 )); then
+                info "$description succeeded on attempt $attempts"
+            fi
+            return 0
+        fi
+        sleep 1
+    done
+    fail "$description: still failing after ${timeout}s ($attempts attempts): $out"
+}
+
 # Helper: run one CQL statement against a list of contact points, and fail only
 # once none of them acknowledges it. cqlsh speaks to a single host:port and has
 # no client-side failover, so a node that accepts the socket and then does not
@@ -739,9 +762,11 @@ wait_for_cluster_mode 9090 "Node1" 90
 wait_for_cluster_mode 9091 "Node2" 90
 wait_for_cluster_mode 9092 "Node3" 90
 
-# Writes should work again
+# Writes should work again. node1 never left cluster mode, so the waits above
+# return at once; node2/node3 may not have dialled node1 back yet (nightly
+# 2026-10-23: write landed 0.6 s after restart, "lane is reconnecting").
 info "Writing after recovery..."
-cql_ok 9042 "CONSISTENCY QUORUM; INSERT INTO cluster_test.data (k, v, source) VALUES ('recovered', 'yes', 'node1')" \
+cql_ok_within 10 9042 "CONSISTENCY QUORUM; INSERT INTO cluster_test.data (k, v, source) VALUES ('recovered', 'yes', 'node1')" \
     "QUORUM write after recovery"
 pass "Write succeeds after cluster recovery"
 

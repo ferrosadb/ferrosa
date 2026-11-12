@@ -651,6 +651,16 @@ impl PeerManager {
         }
     }
 
+    /// The peer has proven it is reachable again (it just completed an inbound
+    /// handshake): wake our outbound lanes to it so they dial now instead of
+    /// waiting out their reconnect backoff. No-op without a pool.
+    pub async fn wake_peer_lanes(&self, host_id: uuid::Uuid) {
+        let peers = self.peers.read().await;
+        if let Some(pool) = peers.get(&host_id).and_then(|state| state.pool.as_ref()) {
+            pool.reconnect_all_lanes();
+        }
+    }
+
     /// Return the last known socket address for `host_id`, even if this peer
     /// currently has no active outbound pool.
     pub async fn peer_addr(&self, host_id: uuid::Uuid) -> Option<String> {
@@ -1274,6 +1284,102 @@ mod tests {
                 _ => None,
             }
         }
+    }
+
+    /// A peer that went away and came back on the same address must be reached
+    /// again as soon as `wake_peer_lanes` is called, not after the outbound lanes'
+    /// backoff runs out (nightly pair smoke 2026-10-23: QUORUM write failed
+    /// "lane is reconnecting" with every replica up).
+    #[tokio::test]
+    async fn wake_peer_lanes_restores_lanes_without_waiting_out_the_backoff() {
+        use crate::codec::InternodeCodec;
+        use crate::handshake::accept_handshake;
+        use crate::pool::PriorityPool;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use tokio::net::TcpListener;
+        use tokio_util::codec::Framed;
+
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_id = uuid::Uuid::new_v4();
+        let peer_up = Arc::new(AtomicBool::new(true));
+        let refused = Arc::new(AtomicUsize::new(0));
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let server_config = config.clone();
+        let (up, rf, ac) = (
+            Arc::clone(&peer_up),
+            Arc::clone(&refused),
+            Arc::clone(&accepted),
+        );
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                if !up.load(Ordering::SeqCst) {
+                    rf.fetch_add(1, Ordering::SeqCst);
+                    continue; // down: the dial fails at once
+                }
+                let mut framed = Framed::new(
+                    stream,
+                    InternodeCodec::new(server_config.max_frame_body_size),
+                );
+                accept_handshake(&mut framed, &server_config, server_id)
+                    .await
+                    .unwrap();
+                held.push(framed);
+                // The first three are the initial pool; drop them to take the peer down.
+                if ac.fetch_add(1, Ordering::SeqCst) + 1 == 3 {
+                    up.store(false, Ordering::SeqCst);
+                    held.clear();
+                }
+            }
+        });
+
+        let config = Arc::new(config);
+        let pool = PriorityPool::connect(
+            Arc::clone(&config),
+            uuid::Uuid::new_v4(),
+            &addr.to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let pm = PeerManager::new(config, uuid::Uuid::new_v4(), Arc::new(TestListener::new()));
+        pm.add_peer((server_id, addr), pool).await;
+
+        // Given: each lane has failed two reconnects (1 s, 2 s backoff) and is
+        // now in a 4-5 s backoff.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while refused.load(Ordering::SeqCst) < 6 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("each lane should fail two reconnects while the peer is down");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // When: the peer is back and has told us so.
+        peer_up.store(true, Ordering::SeqCst);
+        pm.wake_peer_lanes(server_id).await;
+
+        // Then: all three lanes reconnect well inside the remaining backoff.
+        let reconnected = tokio::time::timeout(Duration::from_secs(1), async {
+            while accepted.load(Ordering::SeqCst) < 6 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            reconnected.is_ok(),
+            "wake_peer_lanes must reconnect all 3 lanes within 1 s; {} of 3 reconnected",
+            accepted.load(Ordering::SeqCst).saturating_sub(3)
+        );
+        server.abort();
     }
 
     #[tokio::test]

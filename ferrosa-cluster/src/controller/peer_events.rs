@@ -90,6 +90,28 @@ pub(super) fn should_refresh_outbound_peer_for_inbound(
     should_refresh_outbound_peer_for_inbound_impl(known_addr, live, inbound_reverse_addr)
 }
 
+/// Test entry point for the inbound-handshake outbound refresh, without a
+/// `ModeController` or tracked task.
+#[cfg(test)]
+pub(super) async fn refresh_outbound_peer_for_inbound_for_test(
+    peer_manager: Arc<ferrosa_net::peer::PeerManager>,
+    net_config: Arc<ferrosa_net::config::NetConfig>,
+    local_host_id: uuid::Uuid,
+    host_id: uuid::Uuid,
+    reverse_addr: std::net::SocketAddr,
+) {
+    refresh_outbound_peer_for_inbound(
+        peer_manager,
+        net_config,
+        local_host_id,
+        None,
+        None,
+        host_id,
+        reverse_addr,
+    )
+    .await;
+}
+
 #[cfg(test)]
 pub(super) fn should_install_refreshed_outbound_peer(
     observed_addr: Option<&str>,
@@ -126,6 +148,12 @@ async fn refresh_outbound_peer_for_inbound(
     let known_addr = peer_manager.peer_addr(host_id).await;
     let live = peer_manager.has_live_peer(host_id);
     if !should_refresh_outbound_peer_for_inbound_impl(known_addr.as_deref(), live, reverse_addr) {
+        // Same address and a pool exists, so it is kept. "Live" only means the
+        // pool exists: after a peer restart its lanes may be asleep in
+        // reconnect backoff (up to 30 s). This handshake proves the peer is
+        // back, so dial now; otherwise every write coordinated here misses it
+        // (nightly pair smoke 2026-10-23: QUORUM received=1, required=2).
+        peer_manager.wake_peer_lanes(host_id).await;
         return;
     }
 

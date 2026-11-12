@@ -101,7 +101,12 @@ and rejects frames whose version does not match. `length` is bounded by
 6. **Reconnect targets a re-resolvable hostname, not a frozen IP.** Lanes prefer
    the peer's advertised internode-broadcast hostname so a peer that restarts on
    a new container IP is reconnected (P3 fix in `pool::pick_reconnect_host`).
-7. **Fail loud on bad auth / require_tls.** PSK mismatch rejects the handshake;
+7. **A peer known to be back is dialled now.** Every reconnect wait (fast
+   backoff, inter-cycle pause, slow-retry interval) is a `RedialSignal::sleep`;
+   `PeerManager::wake_peer_lanes` cuts it short. The request stays pending until
+   a dial consumes it, so it is never lost mid-dial and never turns a wait into
+   a tight loop (NET-21).
+8. **Fail loud on bad auth / require_tls.** PSK mismatch rejects the handshake;
    `require_tls` with no cert errors at startup rather than silently running
    plaintext.
 
