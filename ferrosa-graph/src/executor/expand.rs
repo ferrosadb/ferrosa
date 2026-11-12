@@ -5652,41 +5652,20 @@ async fn execute_set(
                     .get(col_name)
                     .map(String::as_str)
                     .unwrap_or(col_name);
-                let table_id = TableId::new(keyspace, table_name);
-                let table_meta = table_metadata_for(schema, keyspace, table_name);
-                let is_edge_table = table_meta.as_ref().is_some_and(|meta| {
-                    meta.extensions
-                        .get("graph.type")
-                        .is_some_and(|graph_type| graph_type == "edge")
-                });
-                let key_hex = if is_edge_table {
-                    row_values
-                        .get(col_idx)
-                        .and_then(|value| value.as_object())
-                        .and_then(|map| map.get("__ferrosa_key"))
-                        .and_then(|value| value.as_str())
-                        .unwrap_or(hex_id)
-                } else {
-                    hex_id
-                };
-                let key_bytes = hex::decode(key_hex)
-                    .map_err(|e| GraphError::Internal(format!("invalid hex storage key: {e}")))?;
-                let key = DecoratedKey::new(PartitionKey::new(key_bytes));
-                let clustering = if is_edge_table {
-                    row_values
-                        .get(col_idx)
-                        .and_then(|value| value.as_object())
-                        .and_then(|map| map.get("__ferrosa_clustering"))
-                        .and_then(|value| value.as_str())
-                        .map(hex::decode)
-                        .transpose()
-                        .map_err(|e| {
-                            GraphError::Internal(format!("invalid hex storage clustering: {e}"))
-                        })?
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
+                let StoredElement {
+                    table_id,
+                    key,
+                    clustering,
+                    ..
+                } = resolve_stored_element(
+                    write_path,
+                    schema,
+                    keyspace,
+                    table_name,
+                    row_values.get(col_idx),
+                    hex_id,
+                )
+                .await?;
 
                 let mut cells = Vec::with_capacity(row_assignments.len());
                 for (prop, value) in row_assignments {
@@ -5904,41 +5883,20 @@ async fn execute_remove(
                 .get(col_name)
                 .map(String::as_str)
                 .unwrap_or(col_name);
-            let table_id = TableId::new(keyspace, table_name);
-            let table_meta = table_metadata_for(schema, keyspace, table_name);
-            let is_edge_table = table_meta.as_ref().is_some_and(|meta| {
-                meta.extensions
-                    .get("graph.type")
-                    .is_some_and(|graph_type| graph_type == "edge")
-            });
-            let key_hex = if is_edge_table {
-                row_values
-                    .get(col_idx)
-                    .and_then(|value| value.as_object())
-                    .and_then(|map| map.get("__ferrosa_key"))
-                    .and_then(|value| value.as_str())
-                    .unwrap_or(hex_id)
-            } else {
-                hex_id
-            };
-            let key_bytes = hex::decode(key_hex)
-                .map_err(|e| GraphError::Internal(format!("invalid hex storage key: {e}")))?;
-            let key = DecoratedKey::new(PartitionKey::new(key_bytes));
-            let clustering = if is_edge_table {
-                row_values
-                    .get(col_idx)
-                    .and_then(|value| value.as_object())
-                    .and_then(|map| map.get("__ferrosa_clustering"))
-                    .and_then(|value| value.as_str())
-                    .map(hex::decode)
-                    .transpose()
-                    .map_err(|e| {
-                        GraphError::Internal(format!("invalid hex storage clustering: {e}"))
-                    })?
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
+            let StoredElement {
+                table_id,
+                key,
+                clustering,
+                ..
+            } = resolve_stored_element(
+                write_path,
+                schema,
+                keyspace,
+                table_name,
+                row_values.get(col_idx),
+                hex_id,
+            )
+            .await?;
 
             let mut cells = Vec::with_capacity(matching_props.len());
             for prop in &matching_props {
@@ -6072,6 +6030,224 @@ fn tombstone_mutation(
     )
 }
 
+/// Where a matched graph element is stored: the row a DELETE, SET or REMOVE of
+/// it must write.
+struct StoredElement {
+    table_id: TableId,
+    meta: Option<ferrosa_schema::metadata::table::TableMetadata>,
+    key: DecoratedKey,
+    /// The row's clustering. Empty only when the element IS its partition.
+    clustering: Vec<u8>,
+    is_edge: bool,
+}
+
+/// Resolve the stored row of one matched element from its binding.
+///
+/// An edge binding carries its row explicitly (`__ferrosa_key`,
+/// `__ferrosa_clustering`). A vertex binding carries only `_id`, its PARTITION
+/// key, so a vertex table with clustering columns, where several vertices
+/// share one partition, needs the clustering too: it is rebuilt from the
+/// binding's own clustering-column values and then confirmed against storage.
+/// Writing at an empty clustering instead tombstones or rewrites the whole
+/// partition: every entity of an agent_memory session at once.
+async fn resolve_stored_element(
+    write_path: &dyn GraphWrite,
+    schema: Option<&Schema>,
+    keyspace: &str,
+    table_name: &str,
+    binding: Option<&serde_json::Value>,
+    hex_id: &str,
+) -> Result<StoredElement> {
+    let table_id = TableId::new(keyspace, table_name);
+    let meta = table_metadata_for(schema, keyspace, table_name);
+    let is_edge = meta.as_ref().is_some_and(|meta| {
+        meta.extensions
+            .get("graph.type")
+            .is_some_and(|graph_type| graph_type == "edge")
+    });
+    let internal = |field: &str| {
+        binding
+            .and_then(|value| value.as_object())
+            .and_then(|map| map.get(field))
+            .and_then(|value| value.as_str())
+    };
+    let key_hex = if is_edge {
+        internal("__ferrosa_key").unwrap_or(hex_id)
+    } else {
+        hex_id
+    };
+    let key_bytes = hex::decode(key_hex)
+        .map_err(|e| GraphError::Internal(format!("invalid hex storage key: {e}")))?;
+    let key = DecoratedKey::new(PartitionKey::new(key_bytes));
+    let clustering = if is_edge {
+        internal("__ferrosa_clustering")
+            .map(hex::decode)
+            .transpose()
+            .map_err(|e| GraphError::Internal(format!("invalid hex storage clustering: {e}")))?
+            .unwrap_or_default()
+    } else {
+        match meta.as_ref() {
+            Some(meta) if !meta.clustering_key.is_empty() => {
+                vertex_row_clustering(write_path, &table_id, meta, &key, binding).await?
+            }
+            _ => Vec::new(),
+        }
+    };
+    Ok(StoredElement {
+        table_id,
+        meta,
+        key,
+        clustering,
+        is_edge,
+    })
+}
+
+/// The clustering of a matched vertex in a table that has clustering columns,
+/// rebuilt from the binding's clustering-column values. Refuses, rather than
+/// writing anywhere, when the binding does not name exactly one live row of
+/// its own partition.
+async fn vertex_row_clustering(
+    write_path: &dyn GraphWrite,
+    table_id: &TableId,
+    meta: &ferrosa_schema::metadata::table::TableMetadata,
+    key: &DecoratedKey,
+    binding: Option<&serde_json::Value>,
+) -> Result<Vec<u8>> {
+    let unresolved = |why: &str| {
+        GraphError::Validation(format!(
+            "cannot resolve which row of {}.{} the matched vertex is: {why}; nothing was written",
+            table_id.keyspace, table_id.table
+        ))
+    };
+    let bindings: HashMap<String, serde_json::Value> = binding
+        .map(|value| HashMap::from([(String::new(), value.clone())]))
+        .unwrap_or_default();
+    let Some((derived_key, clustering)) =
+        build_direct_lookup_shape(meta, &bindings, &[], &HashMap::new())?
+    else {
+        return Err(unresolved("its binding lacks a key column"));
+    };
+    if derived_key.key.as_bytes() != key.key.as_bytes() {
+        return Err(unresolved("its key columns do not match its partition"));
+    }
+    let exists = write_path
+        .read(table_id, key)
+        .await?
+        .is_some_and(|partition| {
+            partition.rows.iter().any(|row| {
+                row.clustering == clustering && !crate::adjacency::schema::row_is_deleted(row)
+            })
+        });
+    if !exists {
+        return Err(unresolved("no live row has its clustering"));
+    }
+    Ok(clustering)
+}
+
+/// The identity a vertex has in the adjacency index: the value its edges hold
+/// in their `graph.source`/`graph.target` column. Mirrors
+/// `graph_vertex_lookup_key`, which the hop executor uses to go the other way.
+fn vertex_adjacency_id(element: &StoredElement) -> Result<Vec<u8>> {
+    let Some(meta) = element.meta.as_ref() else {
+        return Ok(element.key.key.as_bytes().to_vec());
+    };
+    match meta.clustering_key.len() {
+        0 => Ok(element.key.key.as_bytes().to_vec()),
+        1 => decode_clustering_components(&element.clustering, 1)
+            .and_then(|components| components.into_iter().next())
+            .ok_or_else(|| {
+                GraphError::Internal(format!(
+                    "clustering of a matched {}.{} vertex does not decode",
+                    element.table_id.keyspace, element.table_id.table
+                ))
+            }),
+        _ => Err(GraphError::Validation(format!(
+            "{}.{} has {} clustering columns, so which one its edges reference is \
+             ambiguous; deleting one of its vertices is refused rather than guessed",
+            element.table_id.keyspace,
+            element.table_id.table,
+            meta.clustering_key.len()
+        ))),
+    }
+}
+
+/// Every live row of `edge_table` between `source_id` and `target_id`, read
+/// from the one partition those rows can live in. Its partition-key columns
+/// are the endpoint values, or else the deleted vertex's own values for the
+/// columns it shares with the edge table (an agent_memory session's
+/// `tenant_id` and `session_id`). One endpoint pair may hold several rows,
+/// one per value of a further clustering column such as `edge_type`.
+async fn edge_rows_between(
+    write_path: &dyn GraphWrite,
+    schema: Option<&Schema>,
+    edge_table: &TableId,
+    vertex_binding: Option<&serde_json::Value>,
+    source_id: &[u8],
+    target_id: &[u8],
+) -> Result<Vec<(DecoratedKey, Vec<u8>)>> {
+    let Some(meta) = table_metadata_for(schema, &edge_table.keyspace, &edge_table.table) else {
+        // No schema: the edge is keyed (source) / (target), as it was written.
+        return Ok(vec![(
+            DecoratedKey::new(PartitionKey::new(source_id.to_vec())),
+            target_id.to_vec(),
+        )]);
+    };
+    let (Some(source_col), Some(target_col)) = (
+        meta.extensions.get("graph.source"),
+        meta.extensions.get("graph.target"),
+    ) else {
+        return Err(GraphError::Validation(format!(
+            "edge table {}.{} names no graph.source/graph.target, so its rows cannot be found",
+            edge_table.keyspace, edge_table.table
+        )));
+    };
+    let endpoints = HashMap::from([
+        (source_col.clone(), source_id.to_vec()),
+        (target_col.clone(), target_id.to_vec()),
+    ]);
+    let bindings: HashMap<String, serde_json::Value> = vertex_binding
+        .map(|value| HashMap::from([(String::new(), value.clone())]))
+        .unwrap_or_default();
+    let mut components = Vec::with_capacity(meta.partition_key.len());
+    for column_name in &meta.partition_key {
+        let column = meta.columns.get(column_name);
+        let resolved = match column {
+            Some(column) => resolve_lookup_component(column, &bindings, &[], &endpoints)?,
+            None => None,
+        };
+        let Some(bytes) = resolved else {
+            return Err(GraphError::Validation(format!(
+                "cannot find the {}.{} rows of a deleted vertex: partition column \
+                 '{column_name}' is neither an endpoint nor a column of the vertex; \
+                 nothing was deleted",
+                edge_table.keyspace, edge_table.table
+            )));
+        };
+        components.push(bytes);
+    }
+    let key = DecoratedKey::new(PartitionKey::new(encode_partition_components(&components)));
+    let strategy = graph_replication_strategy(schema, &edge_table.keyspace)?;
+    let Some(partition) = write_path
+        .pk_read(edge_table, &key, graph_write_consistency(), &strategy)
+        .await?
+    else {
+        return Ok(Vec::new());
+    };
+    let partition_key = partition.key.key.as_bytes();
+    Ok(partition
+        .rows
+        .iter()
+        .filter(|row| !crate::adjacency::schema::row_is_deleted(row))
+        .filter(|row| {
+            extract_column_bytes_from_row(&meta, partition_key, row, source_col).as_deref()
+                == Some(source_id)
+                && extract_column_bytes_from_row(&meta, partition_key, row, target_col).as_deref()
+                    == Some(target_id)
+        })
+        .map(|row| (partition.key.clone(), row.clustering.clone()))
+        .collect())
+}
+
 /// DETACH DELETE cascade for one vertex (URS-QEC-D01/D03/D07).
 ///
 /// Enumerates ALL incident edges via the adjacency index (forward OUT +
@@ -6083,16 +6259,25 @@ fn tombstone_mutation(
 /// invented; adjacency cleanup happens inside the delete, so a subsequent
 /// scan finds zero references without reconciliation (URS-QEC-D03).
 ///
-/// Returns the number of incident edges tombstoned.
+/// The adjacency index is keyed by the vertex's ADJACENCY identity (the value
+/// its edges hold), which differs from its storage key whenever the vertex
+/// table has clustering columns; each edge row is found from the edge table's
+/// own key columns ([`edge_rows_between`]), not assumed to be keyed
+/// (source) / (target). Every read happens before the one batch write, so a
+/// refusal deletes nothing.
+///
+/// Returns the number of incident edge rows tombstoned.
 async fn delete_with_adjacency(
     write_path: &dyn GraphWrite,
+    schema: Option<&Schema>,
     keyspace: &str,
-    vertex_key: &DecoratedKey,
-    vertex_table: &TableId,
+    vertex: &StoredElement,
+    vertex_binding: Option<&serde_json::Value>,
     timestamp: i64,
     strategy: &ReplicationStrategy,
 ) -> Result<usize> {
-    let vid = vertex_key.key.as_bytes().to_vec();
+    let vid = vertex_adjacency_id(vertex)?;
+    let vertex_adjacency_key = DecoratedKey::new(PartitionKey::new(vid.clone()));
     let adj_ks = adjacency_keyspace_name(keyspace);
     let adj_table = TableId::new(&adj_ks, "adjacency");
 
@@ -6100,7 +6285,7 @@ async fn delete_with_adjacency(
     let mut edges_deleted = 0usize;
 
     // Enumerate incident edges from the vertex's adjacency partition.
-    if let Some(partition) = write_path.read(&adj_table, vertex_key).await? {
+    if let Some(partition) = write_path.read(&adj_table, &vertex_adjacency_key).await? {
         for row in &partition.rows {
             if !row.deletion.is_live() {
                 continue;
@@ -6129,29 +6314,50 @@ async fn delete_with_adjacency(
                 continue;
             };
 
-            // Reconstruct the edge's storage key: partition = source vertex,
-            // clustering = target vertex.
             let (src_id, dst_id) = if direction == DIRECTION_OUT {
-                (vid.clone(), neighbor_id.clone())
+                (vid.as_slice(), neighbor_id.as_slice())
             } else {
-                (neighbor_id.clone(), vid.clone())
+                (neighbor_id.as_slice(), vid.as_slice())
             };
-            let edge_src_key = DecoratedKey::new(PartitionKey::new(src_id));
 
-            // (a) Tombstone the edge row itself.
-            mutations.push(tombstone_mutation(
-                edge_ks,
-                edge_tbl,
-                &edge_src_key,
-                Some(dst_id),
-                timestamp,
-            ));
+            // (a) Tombstone every edge row the entry stands for.
+            let edge_table = TableId::new(edge_ks, edge_tbl);
+            let edge_rows = edge_rows_between(
+                write_path,
+                schema,
+                &edge_table,
+                vertex_binding,
+                src_id,
+                dst_id,
+            )
+            .await?;
+            if edge_rows.is_empty() {
+                // The entry outlived its edge, or the edge is stored outside the
+                // vertex's own scope. The entry still goes; the reconcile owns
+                // the rest.
+                tracing::warn!(
+                    edge_table = %edge_fqn,
+                    source = %hex::encode(src_id),
+                    target = %hex::encode(dst_id),
+                    "DETACH DELETE: adjacency entry has no edge row in the vertex's scope"
+                );
+            }
+            for (edge_key, edge_clustering) in edge_rows {
+                mutations.push(tombstone_mutation(
+                    edge_ks,
+                    edge_tbl,
+                    &edge_key,
+                    Some(edge_clustering),
+                    timestamp,
+                ));
+                edges_deleted += 1;
+            }
 
             // (b) Tombstone this vertex's adjacency entry (exact clustering).
             mutations.push(tombstone_mutation(
                 &adj_ks,
                 "adjacency",
-                vertex_key,
+                &vertex_adjacency_key,
                 Some(row.clustering.clone()),
                 timestamp,
             ));
@@ -6172,17 +6378,16 @@ async fn delete_with_adjacency(
                 Some(mirror_clustering),
                 timestamp,
             ));
-
-            edges_deleted += 1;
         }
     }
 
-    // Finally, tombstone the vertex row (whole-partition delete).
+    // Finally, tombstone the vertex's own row: the whole partition only when
+    // the vertex is its partition (empty clustering).
     mutations.push(tombstone_mutation(
-        &vertex_table.keyspace,
-        &vertex_table.table,
-        vertex_key,
-        None,
+        &vertex.table_id.keyspace,
+        &vertex.table_id.table,
+        &vertex.key,
+        Some(vertex.clustering.clone()),
         timestamp,
     ));
 
@@ -6246,21 +6451,21 @@ async fn check_plain_delete_constraint(
                 .get(col_name)
                 .map(String::as_str)
                 .unwrap_or(col_name);
+            let element = resolve_stored_element(
+                write_path,
+                schema,
+                keyspace,
+                table_name,
+                row_values.get(col_idx),
+                &hex_id,
+            )
+            .await?;
             // Edge tables have no adjacency partition keyed by the edge row;
             // the constraint only governs vertices.
-            let is_edge_table = table_metadata_for(schema, keyspace, table_name)
-                .as_ref()
-                .is_some_and(|meta| {
-                    meta.extensions
-                        .get("graph.type")
-                        .is_some_and(|graph_type| graph_type == "edge")
-                });
-            if is_edge_table {
+            if element.is_edge {
                 continue;
             }
-            let key_bytes = hex::decode(&hex_id)
-                .map_err(|e| GraphError::Internal(format!("invalid hex storage key: {e}")))?;
-            let key = DecoratedKey::new(PartitionKey::new(key_bytes));
+            let key = DecoratedKey::new(PartitionKey::new(vertex_adjacency_id(&element)?));
             if vertex_has_incident_edges(write_path, keyspace, &key).await? {
                 return Err(GraphError::ConstraintViolation(format!(
                     "Cannot delete node {hex_id}, because it still has relationships. \
@@ -6349,41 +6554,12 @@ async fn execute_delete(
                     .get(col_name)
                     .map(String::as_str)
                     .unwrap_or(col_name);
-                let table_id = TableId::new(keyspace, table_name);
-                let table_meta = table_metadata_for(schema, keyspace, table_name);
-                let is_edge_table = table_meta.as_ref().is_some_and(|meta| {
-                    meta.extensions
-                        .get("graph.type")
-                        .is_some_and(|graph_type| graph_type == "edge")
-                });
-                let key_hex = if is_edge_table {
-                    row_values
-                        .get(col_idx)
-                        .and_then(|value| value.as_object())
-                        .and_then(|map| map.get("__ferrosa_key"))
-                        .and_then(|value| value.as_str())
-                        .unwrap_or(hex_id.as_str())
-                } else {
-                    hex_id.as_str()
-                };
-                let key_bytes = hex::decode(key_hex)
-                    .map_err(|e| GraphError::Internal(format!("invalid hex storage key: {e}")))?;
-                let key = DecoratedKey::new(PartitionKey::new(key_bytes));
-                let clustering = if is_edge_table {
-                    row_values
-                        .get(col_idx)
-                        .and_then(|value| value.as_object())
-                        .and_then(|map| map.get("__ferrosa_clustering"))
-                        .and_then(|value| value.as_str())
-                        .map(hex::decode)
-                        .transpose()
-                        .map_err(|e| {
-                            GraphError::Internal(format!("invalid hex storage clustering: {e}"))
-                        })?
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
+                let binding = row_values.get(col_idx);
+                let element = resolve_stored_element(
+                    write_path, schema, keyspace, table_name, binding, &hex_id,
+                )
+                .await?;
+                let is_edge_table = element.is_edge;
 
                 if detach && !is_edge_table {
                     // DETACH DELETE: cascade through the adjacency index,
@@ -6391,13 +6567,19 @@ async fn execute_delete(
                     // adjacency entries together with the vertex, atomically
                     // (URS-QEC-D01/D03/D07).
                     let edges_deleted = delete_with_adjacency(
-                        write_path, keyspace, &key, &table_id, timestamp, &strategy,
+                        write_path, schema, keyspace, &element, binding, timestamp, &strategy,
                     )
                     .await?;
                     stats.edges_deleted += edges_deleted;
                     stats.vertices_deleted += 1;
                     continue;
                 }
+                let StoredElement {
+                    table_id,
+                    key,
+                    clustering,
+                    ..
+                } = element;
 
                 // Plain `DELETE n` constraint (URS-QEC-D02) was already
                 // validated for every matched vertex by the pre-pass above, so
