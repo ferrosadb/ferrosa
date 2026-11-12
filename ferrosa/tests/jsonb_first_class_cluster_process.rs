@@ -73,7 +73,7 @@ fn alloc_ports(alloc: &mut PortAllocator) -> Ports {
 // ── node process ──────────────────────────────────────────────────────────────
 
 struct Node {
-    _dir: tempfile::TempDir,
+    data_dir_lease: Option<tempfile::TempDir>,
     data_dir: PathBuf,
     ports: Ports,
     host_id: String,
@@ -105,6 +105,16 @@ impl Node {
 impl Drop for Node {
     fn drop(&mut self) {
         self.stop();
+        if std::thread::panicking() {
+            if let Some(directory) = self.data_dir_lease.take() {
+                let retained = directory.keep();
+                eprintln!(
+                    "retained JSONB cluster failure artifacts for {}: {}",
+                    self.host_id,
+                    retained.display()
+                );
+            }
+        }
     }
 }
 
@@ -127,7 +137,12 @@ fn spawn_child(
     seed: Option<&str>,
 ) -> Child {
     warm_node_binary();
-    let log = std::fs::File::create(data_dir.join("node.log")).expect("create node log");
+    // A restart must preserve the prior process's recovery evidence.
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_dir.join("node.log"))
+        .expect("open node log");
     let stderr = log.try_clone().expect("clone log handle");
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ferrosa"));
@@ -225,8 +240,11 @@ fn wait_ready(node: &mut Node, timeout: Duration) {
     // is what separates a node starved by the full parallel suite from one that is
     // genuinely hung -- the latter stops writing and still fails at the nominal
     // budget, so this does not lengthen any assertion.
-    let mut seen_len = 0u64;
+    let mut seen_len = std::fs::metadata(node.log_path())
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
     let mut progressed_at = started;
+    let mut last_readiness = None;
     loop {
         if let Some(status) = node.child.try_wait().expect("try_wait") {
             let log = std::fs::read_to_string(node.log_path()).unwrap_or_default();
@@ -240,6 +258,7 @@ fn wait_ready(node: &mut Node, timeout: Duration) {
             if raw.contains("\"ready\":true") {
                 return;
             }
+            last_readiness = Some(raw);
         }
         let len = std::fs::metadata(node.log_path())
             .map(|m| m.len())
@@ -255,8 +274,9 @@ fn wait_ready(node: &mut Node, timeout: Duration) {
         if (Instant::now() >= deadline && stalled) || Instant::now() >= hard_cap {
             let log = std::fs::read_to_string(node.log_path()).unwrap_or_default();
             panic!(
-                "node {} did not become ready within {timeout:?}; log tail:\n{}",
+                "node {} did not become ready within {timeout:?}; last readiness: {}; log tail:\n{}",
                 node.host_id,
+                last_readiness.as_deref().unwrap_or("no response"),
                 tail(&log, 40)
             );
         }
@@ -372,9 +392,21 @@ async fn jsonb_schema_and_data_replicate_across_a_real_cluster() {
             .join(",")
     };
 
+    let artifact_root = std::env::var_os("FERROSA_TEST_ARTIFACT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("CARGO_TARGET_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("target"))
+                .join("test-failure-artifacts")
+        });
+    std::fs::create_dir_all(&artifact_root).expect("create failure artifact root");
     let mut nodes: Vec<Node> = Vec::new();
     for (i, ports) in all_ports.iter().enumerate() {
-        let dir = tempfile::tempdir().expect("node data dir");
+        let dir = tempfile::Builder::new()
+            .prefix("jsonb-cluster-")
+            .tempdir_in(&artifact_root)
+            .expect("node data dir");
         // Distinct in BOTH halves of the host id: Raft reads bytes[8..16],
         // Accord reads bytes[0..8], so a single distinguishing group is not
         // enough (see `drop_table_replica_process.rs`).
@@ -394,7 +426,7 @@ async fn jsonb_schema_and_data_replicate_across_a_real_cluster() {
                 &cluster_name,
                 Some(&seeds_for(i)),
             ),
-            _dir: dir,
+            data_dir_lease: Some(dir),
         });
     }
     for node in nodes.iter_mut() {

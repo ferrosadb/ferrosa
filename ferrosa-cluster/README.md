@@ -1,5 +1,11 @@
 # ferrosa-cluster
 
+Persisted Raft range, point and last-entry reads require an exact 8-byte storage
+key whose index matches the decoded entry index. Malformed keys and identity
+mismatches return unreadable-entry storage errors; mismatches name both indices.
+Valid entries retain their full term/node/index and payload through existing wire
+decoders. Reads preserve persisted bytes and the committed marker.
+
 Single-row replica fan-out serializes borrowed row/key fields through
 `encode_single_row_mutation`, then moves the row into the local write. It avoids
 an owned temporary mutation solely for encoding and retains a distinct mutation
@@ -358,6 +364,35 @@ build; the codec's own cost is its delta against `none`.
 ## What's implemented
 
 ### Raft metadata consensus (`raft/`)
+- `repair_coverage` provides a pure borrowed-entry streaming classifier with fixed
+  scalar state and a privately constructed, non-Clone `MetadataIntervalReceipt`.
+  It checks a complete supplied interval after a mandatory checkpoint through the
+  exact retired/snapshot full LogId, bounded entry count, ordering and identities;
+  the first error remains sticky. Blank/Membership, CreateKeyspace, index
+  create/status/drop and ALTER with only regular-column additions are structurally
+  accepted; every other `RaftOp` is explicitly refused. Terminal `u64::MAX` needs
+  no successor. No payload/history clones or retained entry borrows are used.
+  This is syntactic classification only: `add_columns` can replace existing
+  meanings, so evolving-schema/layout semantic preflight is still required;
+  type removal can invalidate references and remains unsupported. The receipt
+  establishes neither schema-dependent semantic preservation, source authentication,
+  trusted checkpoint provenance, immutable history acquisition, engine maintenance,
+  user-row inventory, physical completeness, metadata/index reconciliation, durable
+  activation, dormant restart nor admission release. Automatic runtime repair is
+  not wired, and the receipt grants no repair activation or fault-clearing authority.
+- `repair_artifact` provides incoming network-file byte staging: borrowed chunks
+  are written and hashed incrementally with `sha2` 0.10 (also used by
+  `ferrosa-storage`). A fresh path, configured size cap, sequential offsets,
+  exact declared length and SHA-256 are required. A rejected chunk poisons the
+  attempt; only explicit `finish` syncs and returns an owned read/seek-only
+  artifact. Dropping either owner removes its staging file, with best-effort
+  cleanup on filesystem errors. The caller supplies a private, stable staging
+  directory. Production consumer wiring is pending. This byte token precedes
+  `ferrosa_storage::recovery_checkpoint::{stage_checkpoint,
+  resume_checkpoint_stage, VerifiedStagedCheckpoint}`, the existing multi-file
+  physical staging boundary. It provides no metadata decoding, replica coverage,
+  StorageEngine adoption, admission release, journal settlement, Raft restart,
+  or physical activation receipt.
 - openraft 0.9 with features `serde`, `storage-v2`, `loosen-follower-log-revert`,
   plus a pinned fork adding **PreVote** (`raft_enable_pre_vote`) and
   **CheckQuorum** (`raft_check_quorum_ratio`, default 0.75) per ADR-012.
@@ -1481,3 +1516,5 @@ log readers share the controller's recovery admission.
 
 
 Recovery sessions retain a durable pre-effect guard beside each Raft group directory. The guard is armed before an apply group's physical effects and settles once they all complete, so a restart after completed applies replays the un-snapshotted log tail as normal. Only a group interrupted mid-effect, or one whose apply failed or panicked, is an unsafe restart. After an unsafe restart, native startup keeps admission closed, drains that group’s actual state-machine owner, and records the retirement scope plus committed and purged bounds for repair preparation. Repeated peer discovery retains that session rather than reopening its files. Preparation does not authorize data installation, Core replacement, or healthy admission; verified physical-data installation and the corresponding release path remain unfinished.
+
+Prepared repair now has a read-only snapshot metadata eligibility gate: it checks group/source identity against the caller's selected healthy peer request, current epoch and retirement ownership, the synced/purged watermark, and committed coverage (including full term/node identity at an equal index). It borrows the candidate log position without payload clones or allocations. Automatic verified peer handoff, physical-data verification/installation, journal cleanup, Raft publication, and admission release remain unimplemented.

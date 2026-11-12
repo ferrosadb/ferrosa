@@ -4,6 +4,56 @@ doc: fmea
 last_updated: 2026-11-01
 ---
 # ferrosa-cluster — FMEA / Known Issues
+
+Persisted Raft entry identity: a valid entry stored under a different index can
+substitute log identity during reads. `deserialize_entry_at` rejects malformed
+keys and storage-key/decoded-index mismatches through `UnreadableLogEntry`; the
+storage error names both indices on mismatch. Range, point and last-entry reads
+share this guard and preserve the on-disk evidence. This integrity check does
+not establish complete repair or a historical restart cause.
+
+Committed interval classification (`raft::repair_coverage`) is a pure streaming
+structural check over individually borrowed entries with fixed scalar state and
+no payload/history clones or retained entry borrows. Missing checkpoint, successor
+overflow, invalid/excessive bounds, gaps, duplicates, out-of-order/outside entries,
+conflicting leader identities, a mismatched final or snapshot full LogId and
+unsupported effects refuse the private non-Clone receipt; the first streaming
+error stays sticky through finish. A terminal `u64::MAX` target needs no successor.
+The allowlist is limited to Blank/Membership, CreateKeyspace, index create/status/drop
+and ALTER containing only regular-column additions; all other real `RaftOp`
+variants are explicitly refused, with no wildcard to admit future variants.
+
+Residual: this receipt establishes ONLY complete syntactically row-preserving
+supplied interval classification. It does NOT establish schema-dependent semantic
+preservation: `add_columns` can replace an existing column's meaning, and type
+removal can invalidate live references (type removal is refused here). Trusted
+evolving-schema/layout semantic preflight remains necessary. Source authentication,
+trusted checkpoint provenance, immutable history acquisition, engine maintenance,
+user-row inventory, physical completeness, metadata/index reconciliation, durable
+activation, dormant restart and admission release remain outside this classifier.
+It neither changes admission/journal/controller behavior nor wires automatic
+runtime repair, and must never authorize activation or fault clearing by itself.
+
+Prepared Raft repair has a read-only metadata eligibility gate for request group/source, current epoch and retirement ownership, synced/purged watermark, and committed coverage with full term/node identity at an equal index. The caller must select an authenticated healthy peer independently of payload identity. This gate preserves quarantine and does not implement automatic verified peer handoff, physical-data verification/installation, journal cleanup, Raft publication, or admission release.
+
+Incoming byte staging (`raft::repair_artifact`) separately rejects oversized
+declarations before file creation and invalid offsets or excess bytes before
+writing. Any chunk error poisons the attempt; explicit EOF verifies exact length
+and SHA-256 and syncs the file before returning an owned read/seek-only reader.
+Creation never overwrites an existing path. Cancellation and sealed-owner drop
+only attempt to remove that owned staging path; cleanup errors can leave an
+orphan. The staging directory must be private and stable: pathname replacement
+by another actor is outside this ownership contract. Crash cleanup and directory
+publication durability are not implemented. Production consumer wiring remains
+pending, so dead-code warnings are expected until that wiring exists. The frozen
+20-case test exercises byte acceptance/rejection, ownership cleanup and unchanged
+quarantine; it does not measure allocations or inject sync/cleanup failures.
+This artifact precedes storage's existing multi-file
+`recovery_checkpoint::{stage_checkpoint, resume_checkpoint_stage,
+VerifiedStagedCheckpoint}` boundary. It does not decode metadata, prove replica
+coverage, adopt physical data, release admission, settle the journal, restart
+Raft, or manufacture a physical activation receipt.
+
 Failure modes are ranked by **RPN = Severity × Occurrence × Detection** (1–10
 each; higher = worse). This is the distribution layer, so safety failures are
 cluster-wide and severities run high. Several entries are *evidence* gaps

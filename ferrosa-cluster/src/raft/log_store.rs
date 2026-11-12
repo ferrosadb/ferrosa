@@ -995,19 +995,36 @@ impl SledLogStore {
         }
     }
 
-    /// [`Self::deserialize_entry`] with the entry index threaded into the
-    /// error so the operator-facing fatal names what is damaged and how to
-    /// recover (bug-raft-log-bincode-format-instability item 4).
+    /// Decode an entry and require its index to match the exact 8-byte storage key.
+    /// Errors retain the operator-facing unreadable-entry recovery diagnostic.
     fn deserialize_entry_at(
         key: &[u8],
         bytes: &[u8],
     ) -> Result<Entry<FerrosRaftConfig>, StorageIOError<u64>> {
-        Self::deserialize_entry(bytes).map_err(|e| {
+        let index = Self::index_from_key(key).ok_or_else(|| {
             StorageIOError::read_logs(to_any_error(UnreadableLogEntry {
-                index: Self::index_from_key(key),
+                index: None,
+                detail: format!("malformed log key ({} bytes; expected 8)", key.len()),
+            }))
+        })?;
+        let entry = Self::deserialize_entry(bytes).map_err(|e| {
+            StorageIOError::read_logs(to_any_error(UnreadableLogEntry {
+                index: Some(index),
                 detail: e.to_string(),
             }))
-        })
+        })?;
+        if entry.log_id.index != index {
+            return Err(StorageIOError::read_logs(to_any_error(
+                UnreadableLogEntry {
+                    index: Some(index),
+                    detail: format!(
+                        "storage key index {index} differs from decoded entry index {}",
+                        entry.log_id.index
+                    ),
+                },
+            )));
+        }
+        Ok(entry)
     }
 
     /// The `LogId` of the entry stored at `index`, if it is still present.
@@ -1562,6 +1579,83 @@ mod tests {
                 op,
                 schema_version: Uuid::new_v4(),
             }),
+        }
+    }
+
+    /// Recovery must reject a valid committed entry copied under another index.
+    /// Reading the evidence must leave the persisted bytes and marker intact.
+    #[tokio::test]
+    async fn persisted_reads_reject_storage_key_entry_index_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let decoded_index = 41u64;
+        let storage_index = 42u64;
+        let entry: Entry<FerrosRaftConfig> = Entry {
+            log_id: LogId::new(CommittedLeaderId::new(7, 13), decoded_index),
+            payload: EntryPayload::Blank,
+        };
+        let bytes = SledLogStore::serialize_entry(&entry).unwrap();
+        {
+            let mut store = SledLogStore::new(dir.path()).unwrap();
+            for index in [decoded_index, storage_index] {
+                store
+                    .log
+                    .insert(SledLogStore::index_key(index), bytes.as_slice())
+                    .unwrap();
+            }
+            store.save_committed(Some(entry.log_id)).await.unwrap();
+            store.db.flush().unwrap();
+        }
+
+        let mut store = SledLogStore::new(dir.path()).unwrap();
+        let committed_before = store.read_committed().await.unwrap();
+        assert_eq!(committed_before, Some(entry.log_id));
+        let log_before: Vec<_> = store.log.iter().map(Result::unwrap).collect();
+        assert_eq!(log_before.len(), 2);
+        for (index, (key, value)) in [decoded_index, storage_index].iter().zip(&log_before) {
+            assert_eq!(key.as_ref(), SledLogStore::index_key(*index).as_slice());
+            assert_eq!(value.as_ref(), bytes.as_slice());
+        }
+
+        // Positive control: equality includes the original term, node and index.
+        let matching =
+            RaftLogReader::try_get_log_entries(&mut store, decoded_index..=decoded_index)
+                .await
+                .unwrap();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].log_id, entry.log_id);
+        assert!(matches!(&matching[0].payload, EntryPayload::Blank));
+        assert_eq!(store.log_id_at(decoded_index).unwrap(), Some(entry.log_id));
+
+        // Exercise production reads before asserting, so no repair can mask loss.
+        let range_read =
+            RaftLogReader::try_get_log_entries(&mut store, storage_index..=storage_index).await;
+        let point_read = store.log_id_at(storage_index);
+        let last_read = store.last_entry_log_id();
+        let log_after: Vec<_> = store.log.iter().map(Result::unwrap).collect();
+        assert_eq!(
+            log_after, log_before,
+            "reads must preserve the log evidence"
+        );
+        assert_eq!(store.read_committed().await.unwrap(), committed_before);
+
+        let range_error = range_read.expect_err(
+            "RaftLogReader must reject storage key index 42 containing decoded index 41",
+        );
+        let point_error = point_read
+            .expect_err("log_id_at must reject storage key index 42 containing decoded index 41");
+        let last_error = last_read.expect_err(
+            "last_entry_log_id must reject storage key index 42 containing decoded index 41",
+        );
+        for (path, diagnostic) in [
+            ("RaftLogReader", range_error.to_string()),
+            ("log_id_at", point_error.to_string()),
+            ("last_entry_log_id", last_error.to_string()),
+        ] {
+            assert!(
+                diagnostic.contains(&storage_index.to_string())
+                    && diagnostic.contains(&decoded_index.to_string()),
+                "{path} must name storage index {storage_index} and decoded index {decoded_index}: {diagnostic}"
+            );
         }
     }
 

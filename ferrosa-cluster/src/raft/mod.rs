@@ -16,6 +16,8 @@ pub mod multi_dc_apply;
 pub mod network;
 pub(crate) mod physical_apply;
 pub mod quarantine;
+pub(crate) mod repair_artifact;
+pub(crate) mod repair_coverage;
 pub mod replication_health;
 pub mod snapshot_pusher;
 pub mod snapshot_transport;

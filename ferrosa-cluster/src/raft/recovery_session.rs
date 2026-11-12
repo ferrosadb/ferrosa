@@ -26,6 +26,55 @@ pub(crate) struct PreparedRaftRepair {
     pub(crate) committed_target: Option<super::recovery_journal::RecoveryLogPosition>,
 }
 
+/// Request bound by the caller to a selected authenticated, healthy peer.
+pub(crate) struct RepairSnapshotRequest {
+    pub(crate) group: super::RaftGroupId,
+    pub(crate) source: u64,
+    pub(crate) epoch: u64,
+}
+
+/// Candidate identity and position, without owning any snapshot or log payload.
+pub(crate) struct RepairSnapshotMetadata<'a> {
+    pub(crate) group: super::RaftGroupId,
+    pub(crate) source: u64,
+    pub(crate) epoch: u64,
+    pub(crate) retirement_scope: uuid::Uuid,
+    pub(crate) last_log: Option<&'a super::recovery_journal::RecoveryLogPosition>,
+}
+
+impl PreparedRaftRepair {
+    /// Check metadata against the request and current repair ownership.
+    ///
+    /// The caller selects the healthy peer; matching its identity here does not
+    /// establish peer health or verify physical data. Eligibility changes no
+    /// admission, journal, storage, or Raft state and does not authorize activation.
+    pub(crate) fn snapshot_is_eligible(
+        &self,
+        request: &RepairSnapshotRequest,
+        current_epoch: u64,
+        current_scope: uuid::Uuid,
+        candidate: &RepairSnapshotMetadata<'_>,
+    ) -> bool {
+        if candidate.group != request.group
+            || candidate.source != request.source
+            || candidate.epoch != request.epoch
+            || current_epoch != request.epoch
+            || candidate.retirement_scope != self.retirement_scope
+            || current_scope != self.retirement_scope
+        {
+            return false;
+        }
+        let Some(last_log) = candidate.last_log else {
+            return false;
+        };
+        last_log.index >= self.required_snapshot_index
+            && self
+                .committed_target
+                .as_ref()
+                .is_none_or(|committed| last_log.index > committed.index || last_log == committed)
+    }
+}
+
 pub(crate) struct ActiveRaftRepair {
     pub(crate) preparation: PreparedRaftRepair,
     pub(crate) epoch: u64,
@@ -343,6 +392,205 @@ impl RecoverySession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_quarantined_repair_checks_snapshot_eligibility_without_activation() {
+        use super::{RepairSnapshotMetadata, RepairSnapshotRequest};
+        use crate::raft::{quarantine::RecoveryAdmission, RaftGroupId};
+
+        // API-absence RED: these production metadata types and the read-only
+        // predicate do not exist yet. Eligibility cannot verify physical rows
+        // or authorize activation, journal cleanup, or clearing quarantine.
+        use crate::raft::recovery_journal::RecoveryLogPosition;
+
+        struct Case {
+            name: &'static str,
+            group: RaftGroupId,
+            source: u64,
+            epoch_delta: u64,
+            scope: uuid::Uuid,
+            current_scope: uuid::Uuid,
+            fresh_fault: bool,
+            watermark: u64,
+            committed: Option<RecoveryLogPosition>,
+            last_log: Option<RecoveryLogPosition>,
+            eligible: bool,
+        }
+
+        let group = RaftGroupId::for_dc("dc-a");
+        let scope = uuid::Uuid::from_u128(1);
+        let other_scope = uuid::Uuid::from_u128(2);
+        let position = |term, node_id, index| RecoveryLogPosition {
+            term,
+            node_id,
+            index,
+        };
+        let matching = || Case {
+            name: "matching committed identity",
+            group,
+            source: 11,
+            epoch_delta: 0,
+            scope,
+            current_scope: scope,
+            fresh_fault: false,
+            watermark: 40,
+            committed: Some(position(7, 11, 50)),
+            last_log: Some(position(7, 11, 50)),
+            eligible: true,
+        };
+        let cases = [
+            matching(),
+            Case {
+                name: "later snapshot",
+                last_log: Some(position(8, 12, 51)),
+                ..matching()
+            },
+            Case {
+                name: "wrong group",
+                group: RaftGroupId::for_dc("dc-b"),
+                eligible: false,
+                ..matching()
+            },
+            Case {
+                name: "wrong source",
+                source: 12,
+                eligible: false,
+                ..matching()
+            },
+            Case {
+                name: "wrong candidate epoch",
+                epoch_delta: 1,
+                eligible: false,
+                ..matching()
+            },
+            Case {
+                name: "fresh fault invalidates prepared epoch",
+                fresh_fault: true,
+                eligible: false,
+                ..matching()
+            },
+            Case {
+                name: "wrong candidate retirement scope",
+                scope: other_scope,
+                eligible: false,
+                ..matching()
+            },
+            Case {
+                name: "lost current retirement ownership",
+                current_scope: other_scope,
+                eligible: false,
+                ..matching()
+            },
+            Case {
+                name: "missing snapshot position",
+                last_log: None,
+                eligible: false,
+                ..matching()
+            },
+            Case {
+                name: "below committed target but above watermark",
+                last_log: Some(position(7, 11, 49)),
+                eligible: false,
+                ..matching()
+            },
+            Case {
+                name: "equal committed index with different term",
+                last_log: Some(position(8, 11, 50)),
+                eligible: false,
+                ..matching()
+            },
+            Case {
+                name: "equal committed index with different node",
+                last_log: Some(position(7, 12, 50)),
+                eligible: false,
+                ..matching()
+            },
+            Case {
+                name: "below synced or purge watermark despite committed coverage",
+                watermark: 51,
+                eligible: false,
+                ..matching()
+            },
+            Case {
+                name: "exactly at higher watermark",
+                watermark: 51,
+                last_log: Some(position(8, 12, 51)),
+                ..matching()
+            },
+            Case {
+                name: "no committed target still accepts exact watermark",
+                committed: None,
+                last_log: Some(position(6, 11, 40)),
+                ..matching()
+            },
+            Case {
+                name: "no committed target still rejects below watermark",
+                committed: None,
+                last_log: Some(position(6, 11, 39)),
+                eligible: false,
+                ..matching()
+            },
+        ];
+
+        for case in cases {
+            // Given a prepared quarantined repair and a request bound to the
+            // selected authenticated healthy peer (not the payload's claim).
+            let admission = RecoveryAdmission::new();
+            let epoch = admission.quarantine("dc-a", "interrupted physical effects");
+            let request = RepairSnapshotRequest {
+                group,
+                source: 11,
+                epoch,
+            };
+            let prepared = PreparedRaftRepair {
+                retirement_scope: scope,
+                required_snapshot_index: case.watermark,
+                committed_target: case.committed,
+            };
+            if case.fresh_fault {
+                admission.quarantine("dc-a", "new fault during repair");
+            }
+            let current_epoch = admission.epoch();
+            let reason = admission.reason();
+            let candidate = RepairSnapshotMetadata {
+                group: case.group,
+                source: case.source,
+                epoch: epoch + case.epoch_delta,
+                retirement_scope: case.scope,
+                last_log: case.last_log.as_ref(),
+            };
+
+            // When checking eligibility, borrow only immutable metadata;
+            // there is no snapshot/log payload to clone or storage to adopt.
+            assert_eq!(
+                prepared.snapshot_is_eligible(
+                    &request,
+                    current_epoch,
+                    case.current_scope,
+                    &candidate,
+                ),
+                case.eligible,
+                "{}",
+                case.name
+            );
+
+            // Then both accepted and rejected metadata leave quarantine closed.
+            assert!(
+                admission.admits().is_err(),
+                "{} cleared quarantine",
+                case.name
+            );
+            assert_eq!(admission.epoch(), current_epoch, "{}", case.name);
+            assert_eq!(admission.reason(), reason, "{}", case.name);
+            assert_eq!(prepared.retirement_scope, scope, "{}", case.name);
+            assert_eq!(
+                prepared.required_snapshot_index, case.watermark,
+                "{}",
+                case.name
+            );
+        }
+    }
+
     #[test]
     fn runtime_review_dotted_group_names_have_independent_sessions() {
         let directory = tempfile::tempdir().unwrap();
