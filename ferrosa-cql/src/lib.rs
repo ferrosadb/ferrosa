@@ -43,6 +43,7 @@ pub mod router;
 pub mod server;
 pub mod session;
 pub mod subscribe;
+pub mod table_options;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
 pub mod topology;
