@@ -5,7 +5,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use ferrosa_cluster::raft::NodeState;
-use ferrosa_cluster::ModeController;
+use ferrosa_cluster::{DeploymentMode, ModeController, PairRole};
 use ferrosa_common::DataType;
 use ferrosa_schema::VirtualTableRegistry;
 use serde_json::{json, Value};
@@ -49,6 +49,77 @@ pub fn routes() -> Router<WebAppState> {
         .route("/active_queries", get(get_active_queries))
         .route("/queries", get(get_active_queries))
         .route("/tables", get(list_tables))
+}
+
+/// Cheap liveness probe: if the web task can answer this route, the process is
+/// alive enough to observe. It intentionally does not touch storage, CQL, or
+/// cluster formation state so probes cannot amplify recovery work.
+pub async fn health_live() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::OK,
+        Json(json!({
+            "status": "live",
+        })),
+    )
+}
+
+/// Phase-aware readiness probe for CQL-serving availability.
+///
+/// This is allowed to return 503 while the node is legitimately forming or is a
+/// pair secondary. Operators and dependents can use the JSON phase/reason to
+/// distinguish recovery from a wedged process; compose liveness must not use it
+/// as a restart trigger.
+pub async fn health_ready(State(mc): State<Arc<ModeController>>) -> (StatusCode, Json<Value>) {
+    let (ready, phase, reason) = readiness_state(&mc);
+    let status = if ready { "ready" } else { "not_ready" };
+    let code = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (
+        code,
+        Json(json!({
+            "status": status,
+            "phase": phase,
+            "reason": reason,
+            "mode": mc.mode().to_string(),
+            "role": mc.role().map(|r| r.to_string()),
+            "host_id": mc.host_id().to_string(),
+        })),
+    )
+}
+
+fn readiness_state(mc: &ModeController) -> (bool, &'static str, &'static str) {
+    match (mc.mode(), mc.role()) {
+        (DeploymentMode::Standalone, _) => (true, "standalone", "CQL accepts clients"),
+        (DeploymentMode::Pair, Some(PairRole::Primary)) => {
+            (true, "pair_primary", "CQL accepts clients")
+        }
+        (DeploymentMode::Pair, Some(PairRole::Secondary)) => (
+            false,
+            "pair_secondary",
+            "pair secondary does not accept CQL clients",
+        ),
+        (DeploymentMode::Pair, None) => (false, "pair", "pair role is not assigned yet"),
+        (DeploymentMode::Forming, _) => (
+            false,
+            "forming",
+            "cluster is forming and CQL is not ready yet",
+        ),
+        (DeploymentMode::Cluster, _) => (true, "cluster", "CQL accepts clients"),
+        (DeploymentMode::DegradedPair, _) => (
+            true,
+            "degraded_pair",
+            "CQL accepts stale reads while pair recovers",
+        ),
+        (DeploymentMode::DegradedCluster, _) => (
+            true,
+            "degraded_cluster",
+            "CQL accepts degraded CL=ONE reads while cluster recovers",
+        ),
+    }
 }
 
 /// Prometheus text exposition endpoint — returns `text/plain; charset=utf-8`.
@@ -794,6 +865,43 @@ mod tests {
         fn subscription_mode(&self) -> SubscriptionMode {
             SubscriptionMode::Pollable
         }
+    }
+
+    #[tokio::test]
+    async fn healthz_live_is_cheap_and_does_not_require_cql_readiness() {
+        let mut state = make_state();
+        state.mode_controller =
+            ModeController::pair_secondary_for_test(state.schema.clone(), state.storage.clone());
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .uri("/healthz/live")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn healthz_ready_reports_phase_when_cql_is_not_ready() {
+        let mut state = make_state();
+        state.mode_controller =
+            ModeController::pair_secondary_for_test(state.schema.clone(), state.storage.clone());
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .uri("/healthz/ready")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["status"], "not_ready");
+        assert_eq!(body["phase"], "pair_secondary");
+        assert_eq!(body["reason"], "pair secondary does not accept CQL clients");
     }
 
     #[test]
