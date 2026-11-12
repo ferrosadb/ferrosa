@@ -32,6 +32,18 @@ open work lives in specs and the items below.
 
 ## Now (highest value)
 
+- **Compaction retirement and recovery (t_df374fa8).** Reproduce durable manifests
+  retaining consumed inputs under concurrent flush/sync publication, assert
+  retired IDs remain absent, and test post-grace deletion plus remote-only
+  restart/TTL safety. The [live evidence](../../deploy/fly-compaction-explore/NEXT-RESULTS.md)
+  is a discrepancy without demonstrated data loss; isolate the interleaving.
+- **Compaction I/O admission (t_0e97b46b).** Use the measured wide-partition
+  fixture to test byte pacing against foreground p99 and commit-log backlog.
+  Resolve selector progress/cap behavior before shrinking task budgets. Then
+  evaluate fan-in-aware read-ahead and metadata-only output verification
+  (t_61ebd0fe), preserving corruption and cancellation checks. Automatic
+  strategy switching remains unvalidated.
+
 - **Operator-facing durability guidance (FMEA ST-1).** The default `Periodic`
   sync strategy trades a bounded loss window for throughput. Make the per-table /
   per-deployment choice explicit (when to pick `Batch`/`Group`), and surface the

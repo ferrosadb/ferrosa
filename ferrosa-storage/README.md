@@ -1565,6 +1565,16 @@ clear the pause and retry streak; the next failure starts at the initial delay.
 
 ## Compaction allocation contract (2026-10-23)
 
+Measured follow-ups are documented in the
+[sustained compaction report](../deploy/fly-compaction-explore/NEXT-RESULTS.md).
+At PR #601, durable manifests retained input generations consumed by completed
+compactions (t_df374fa8; cause and recovery effects still under investigation).
+A four-wide-partition Fly workload also crossed the commit-log fsync backlog
+readiness deadline while averaging 600 operations/s (t_0e97b46b). Prioritize
+manifest retirement/recovery and shared local-I/O admission before automatic
+strategy changes. Smaller read-ahead windows have a measured memory/time
+tradeoff; disabling output verification is not the proposed optimization.
+
 The merge and decode buffers belong to each worker. Sequential `scan_iter`
 bypasses shared compressed/CRC chunk-cache mutexes; output verification fully
 decodes rows into reusable storage and still rejects truncation and checksum

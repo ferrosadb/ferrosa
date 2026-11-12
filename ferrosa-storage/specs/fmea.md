@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-storage
 doc: fmea
-last_updated: 2026-10-10 (ST-92)
+last_updated: 2026-10-23 (compaction exploration follow-ups)
 ---
 
 # ferrosa-storage — FMEA / Known Issues
@@ -99,6 +99,29 @@ the top of the scale: a defect here is silent data loss or corruption.
 | ST-91 (t_9cf1b0e5 churn) | **SSTable streaming dropped a declared zero-byte component, silently corrupting the RECEIVING replica only.** `read_sstable_component` reads a file in a loop that exits on the first zero-byte read, so a 0-byte component (`Rows.db`, a mandatory BTI component that is empty for a generation with no clustered rows) produces NO chunks. The sender listed it in `SstableStreamStartPayload.components` (size 0), but the receiver's `SSTableAssembler` only materialised a component when a chunk arrived, and both integrity checks passed anyway — an absent empty file contributes 0 to the byte-sum AND is absent from the CRC32 stream. So the peer promoted a generation missing `Rows.db` while the source kept it. | Corruption on one replica: generations present on every node, with `Rows.db` on the source and absent on the peer. Measured: identical generation IDs present on node1 AND node3, with `Rows.db` on one and missing on the other, every other component present on both; all 121 affected generations were missing only Rows.db, and every affected table's Rows.db was 0 bytes (only `system_schema.columns`, which has clustering columns and a non-empty 1595-byte Rows.db, always transferred intact). Downstream, the sync re-warned about the corrupt set every pass (~95 WARNs/30 s, 99 % of that node's log). | 9 | 4 | 8 | 288 → 24 | **Fixed:** the receiver now materialises every component the manifest declared with size 0 that received no chunks (`SSTableAssembler::ensure_declared_empty_components`), before writing/promoting; a non-zero declared component that received no chunks is still a real shortfall and fails the byte-count check (not papered over). A second fix stops the WARN storm: an `incomplete_generations` memo warns once per distinct missing set and re-verifies only the recorded files. `Rows.db` stays required everywhere — never fall back, never synthesize. Test: `streaming::receiver::tests::sstable_stream_materialises_a_declared_zero_byte_component`. **Remediation of existing corruption:** the affected generations are corrupt on the replica that lost the file and must be removed (moved aside) and re-streamed from a replica that still has them, then a full repair. Residual: replicas already written before this fix keep their Rows-less generations until that repair runs. |
 
 ## Top risks to act on
+
+**New measured compaction findings (PR #601, 2026-10-23; open):**
+
+- **Durable manifest retirement, t_df374fa8.** Across three successful Fly
+  workload cases, stable S3 manifests contained consumed input generations in
+  addition to the runtime live set. One node had 298 entries versus 70 live
+  SSTables; the other 228 IDs matched inputs of observed completed compactions.
+  All referenced Data.db objects existed; input deletion has a one-hour grace
+  period. This demonstrates a manifest discrepancy, not data loss. Isolate
+  stale publication/replay interleavings, then test post-grace deletion,
+  remote-only restart, and TTL/tombstone safety. No automatic controller should
+  infer durable progress from the completed-merge counter alone.
+- **Foreground disk contention, t_0e97b46b.** Four partitions of 4,096 rows with
+  16 KiB values, 4 MiB flushes, and one compaction worker on performance-2 CPU /
+  4 GiB nodes averaged 599.9 operations/s but had scheduled p99 1.97 s and p99.9
+  3.56 s. Six supervisor events crossed the two-second commit-log fsync backlog
+  deadline. Request/payload checks still passed. Test shared I/O admission and
+  pacing while preserving durability guards; lowering the compaction byte cap
+  also requires resolving the STCS minimum-input progress cliff (t_5f246338).
+
+These observations are not yet assigned calibrated occurrence/RPN scores.
+See the [evidence and limitations](../../deploy/fly-compaction-explore/NEXT-RESULTS.md)
+before treating either as a proven root cause or a validated tuning policy.
 
 1. **ST-1 (RPN 216)** — the default `Periodic` sync strategy means acked writes
    are not durable for up to `sync_interval`. This is the single most important
