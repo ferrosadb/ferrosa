@@ -2135,6 +2135,14 @@ impl FerrosStateMachine {
             RaftOp::DropRole(name) => {
                 self.state.roles.remove(&name);
                 self.state.grants.remove(&name);
+                // Store only changed names here, not duplicate role payloads;
+                // queue_stored_role_write later preserves Registry-owned hashes.
+                let mut changed_children = Vec::new();
+                for role in self.state.roles.values_mut() {
+                    if role.member_of.remove(&name) {
+                        changed_children.push(role.name.clone());
+                    }
+                }
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.drop_role_internal(&name) {
                         tracing::error!(%e, "Raft apply: schema.drop_role_internal failed");
@@ -2149,6 +2157,13 @@ impl FerrosStateMachine {
                         level: SystemWriteLogLevel::Error,
                         context: "Raft apply: system table write failed",
                     });
+                    for child in changed_children {
+                        self.queue_stored_role_write(
+                            &child,
+                            &mut pending_system_writes,
+                            "Raft apply: child membership persistence failed",
+                        );
+                    }
                 }
             }
             RaftOp::Grant(entry) => {
@@ -4847,6 +4862,85 @@ mod tests {
         sm.apply(entries).await.unwrap();
 
         assert!(!sm.state().roles.contains_key("analyst"));
+    }
+
+    #[tokio::test]
+    async fn canonical_parent_drop_removes_inbound_membership() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let mut sm =
+            FerrosStateMachine::with_side_effects(Arc::clone(&schema), Arc::clone(&engine));
+        let mk = |name: &str| {
+            RaftOp::CreateRole(RoleMetadata {
+                name: name.into(),
+                is_superuser: false,
+                can_login: false,
+                salted_hash: None,
+                member_of: Default::default(),
+                scram: None,
+            })
+        };
+        sm.apply(vec![
+            make_entry(1, 1, mk("parent_a")),
+            make_entry(1, 2, mk("parent_b")),
+            make_entry(1, 3, mk("child")),
+            make_entry(
+                1,
+                4,
+                RaftOp::GrantRole {
+                    member: "child".into(),
+                    granted_role: "parent_a".into(),
+                },
+            ),
+            make_entry(
+                1,
+                5,
+                RaftOp::GrantRole {
+                    member: "child".into(),
+                    granted_role: "parent_b".into(),
+                },
+            ),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(sm.state().roles.get("child").unwrap().member_of.len(), 2);
+        sm.apply(vec![make_entry(1, 6, RaftOp::DropRole("parent_a".into()))])
+            .await
+            .unwrap();
+        let expected = ["parent_b".into()].into_iter().collect();
+        assert_eq!(
+            sm.state().roles.get("child").unwrap().member_of,
+            expected,
+            "committed DropRole must remove inbound membership in Raft state"
+        );
+        assert_eq!(
+            schema.snapshot().roles.get("child").unwrap().member_of,
+            expected,
+            "shared registry must agree with committed poststate"
+        );
+        sm.apply(vec![make_entry(1, 7, mk("parent_a"))])
+            .await
+            .unwrap();
+        engine.flush(&TableId::new("system_auth", "roles")).unwrap();
+        engine
+            .flush(&TableId::new("system_auth", "role_members"))
+            .unwrap();
+        engine.force_commit_log_sync().unwrap();
+        drop(sm);
+        drop(schema);
+        drop(engine);
+        let reopened = test_engine(dir.path());
+        reopened.register_system_tables().unwrap();
+        let roles = crate::system_table_loader::SystemTableLoader::new(reopened)
+            .load_roles()
+            .unwrap();
+        assert_eq!(
+            roles.iter().find(|r| r.name == "child").unwrap().member_of,
+            expected,
+            "cold restart after same-name recreation must not resurrect dropped parent membership"
+        );
     }
 
     #[tokio::test]

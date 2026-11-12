@@ -2330,20 +2330,19 @@ fn decode_index_clustering(clustering: &[u8]) -> Option<(String, String)> {
 
 /// Read a UTF-8 cell value at `col_index` from a row, if present and live.
 fn cell_text(row: &Row, col_index: u16) -> Option<String> {
-    row.cells
-        .iter()
-        .find(|(idx, _)| *idx == col_index)
-        .and_then(|(_, cell)| cell.value.as_deref())
-        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+    cell_text_after(row, col_index, row.deletion.marked_for_delete_at)
 }
 
-/// Read the raw bytes of a cell at `col_index` from a row, if present and live.
-fn cell_bytes(row: &Row, col_index: u16) -> Option<Vec<u8>> {
+/// Borrow live system metadata only above its effective deletion watermark.
+fn cell_bytes(row: &Row, col_index: u16, deleted_at: i64) -> Option<&[u8]> {
     row.cells
         .iter()
-        .find(|(idx, _)| *idx == col_index)
+        .find(|(idx, cell)| *idx == col_index && cell.timestamp > deleted_at)
         .and_then(|(_, cell)| cell.value.as_deref())
-        .map(|bytes| bytes.to_vec())
+}
+
+fn cell_text_after(row: &Row, col_index: u16, deleted_at: i64) -> Option<String> {
+    cell_bytes(row, col_index, deleted_at).map(|bytes| String::from_utf8_lossy(bytes).into_owned())
 }
 
 /// A decoded row of the persisted `system_schema.indexes` table.
@@ -2491,22 +2490,26 @@ pub struct PersistedTypeRow {
 /// Returns `None` for tombstones or rows whose `field_names`/`field_types`
 /// cells are missing, malformed JSON, or length-mismatched — so callers surface
 /// only well-formed UDT metadata rather than reconstructing a corrupt type.
-fn decode_persisted_type_row(keyspace: &str, row: &Row) -> Option<PersistedTypeRow> {
-    if !row.deletion.is_live() {
-        return None;
-    }
+fn decode_persisted_type_row(
+    keyspace: &str,
+    row: &Row,
+    partition_deleted_at: i64,
+) -> Option<PersistedTypeRow> {
+    let deleted_at = partition_deleted_at.max(row.deletion.marked_for_delete_at);
     let type_name = String::from_utf8(row.clustering.clone()).ok()?;
 
     let names_bytes = cell_bytes(
         row,
         ferrosa_schema::system::persistence::TYPES_COL_FIELD_NAMES,
+        deleted_at,
     )?;
     let types_bytes = cell_bytes(
         row,
         ferrosa_schema::system::persistence::TYPES_COL_FIELD_TYPES,
+        deleted_at,
     )?;
-    let names: Vec<String> = serde_json::from_slice(&names_bytes).ok()?;
-    let types: Vec<ferrosa_common::CqlType> = serde_json::from_slice(&types_bytes).ok()?;
+    let names: Vec<String> = serde_json::from_slice(names_bytes).ok()?;
+    let types: Vec<ferrosa_common::CqlType> = serde_json::from_slice(types_bytes).ok()?;
     if names.len() != types.len() {
         return None;
     }
@@ -2571,35 +2574,45 @@ fn decode_function_clustering(clustering: &[u8]) -> Option<(String, Vec<ferrosa_
 /// Returns `None` for tombstones or rows whose clustering / required cells are
 /// missing or malformed, so callers surface only well-formed function metadata
 /// rather than reconstructing a corrupt overload.
-fn decode_persisted_function_row(keyspace: &str, row: &Row) -> Option<PersistedFunctionRow> {
-    if !row.deletion.is_live() {
-        return None;
-    }
+fn decode_persisted_function_row(
+    keyspace: &str,
+    row: &Row,
+    partition_deleted_at: i64,
+) -> Option<PersistedFunctionRow> {
+    let deleted_at = partition_deleted_at.max(row.deletion.marked_for_delete_at);
     let (function_name, arg_types) = decode_function_clustering(&row.clustering)?;
 
     let names_bytes = cell_bytes(
         row,
         ferrosa_schema::system::persistence::FUNCTIONS_COL_ARGUMENT_NAMES,
+        deleted_at,
     )?;
-    let arg_names: Vec<String> = serde_json::from_slice(&names_bytes).ok()?;
+    let arg_names: Vec<String> = serde_json::from_slice(names_bytes).ok()?;
 
     let return_bytes = cell_bytes(
         row,
         ferrosa_schema::system::persistence::FUNCTIONS_COL_RETURN_TYPE,
+        deleted_at,
     )?;
-    let return_type: ferrosa_common::CqlType = serde_json::from_slice(&return_bytes).ok()?;
+    let return_type: ferrosa_common::CqlType = serde_json::from_slice(return_bytes).ok()?;
 
     let called_on_null_bytes = cell_bytes(
         row,
         ferrosa_schema::system::persistence::FUNCTIONS_COL_CALLED_ON_NULL,
+        deleted_at,
     )?;
     let called_on_null = called_on_null_bytes.first().copied().unwrap_or(0) != 0;
 
-    let language = cell_text(
+    let language = cell_text_after(
         row,
         ferrosa_schema::system::persistence::FUNCTIONS_COL_LANGUAGE,
+        deleted_at,
     )?;
-    let body = cell_text(row, ferrosa_schema::system::persistence::FUNCTIONS_COL_BODY)?;
+    let body = cell_text_after(
+        row,
+        ferrosa_schema::system::persistence::FUNCTIONS_COL_BODY,
+        deleted_at,
+    )?;
 
     Some(PersistedFunctionRow {
         keyspace_name: keyspace.to_string(),
@@ -6271,7 +6284,11 @@ impl StorageEngine {
         for partition in &partitions {
             let keyspace = String::from_utf8_lossy(partition.key.key.as_bytes()).to_string();
             for row in &partition.rows {
-                if let Some(decoded) = decode_persisted_type_row(&keyspace, row) {
+                if let Some(decoded) = decode_persisted_type_row(
+                    &keyspace,
+                    row,
+                    partition.deletion.marked_for_delete_at,
+                ) {
                     out.push(decoded);
                 }
             }
@@ -6299,7 +6316,11 @@ impl StorageEngine {
         for partition in &partitions {
             let keyspace = String::from_utf8_lossy(partition.key.key.as_bytes()).to_string();
             for row in &partition.rows {
-                if let Some(decoded) = decode_persisted_function_row(&keyspace, row) {
+                if let Some(decoded) = decode_persisted_function_row(
+                    &keyspace,
+                    row,
+                    partition.deletion.marked_for_delete_at,
+                ) {
                     out.push(decoded);
                 }
             }

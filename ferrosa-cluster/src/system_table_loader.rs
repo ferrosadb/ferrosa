@@ -91,8 +91,18 @@ impl SystemTableLoader {
         let tid = TableId::new("system_schema", "keyspaces");
         let mut names: Vec<String> = Vec::new();
         self.walk_all_partitions(&tid, |p| {
-            if let Ok(name) = String::from_utf8(p.key.key.as_bytes().to_vec()) {
-                names.push(name);
+            let visible = p.rows.iter().any(|row| {
+                row.cells.iter().any(|(_, cell)| {
+                    cell.value.is_some()
+                        && cell.timestamp
+                            > p.deletion
+                                .marked_for_delete_at
+                                .max(row.deletion.marked_for_delete_at)
+                })
+            });
+            match (visible, String::from_utf8(p.key.key.as_bytes().to_vec())) {
+                (true, Ok(name)) => names.push(name),
+                _ => {}
             }
             Ok(())
         })?;
@@ -726,7 +736,7 @@ mod tests {
             .sum()
     }
 
-    async fn canonical_family_after_future_cells(case: usize) {
+    async fn canonical_family_after_future_cells(case: usize, verify_reload: bool) {
         use ferrosa_common::CqlType;
         use ferrosa_schema::metadata::{
             function::UserFunctionMetadata, index::IndexMetadata, table::TableMetadata,
@@ -856,6 +866,17 @@ mod tests {
             engine.write(&tid, &key, row, future).unwrap();
         }
         writer.apply(drop_mutation).unwrap();
+        if verify_reload && case == 0 {
+            assert!(
+                !SystemTableLoader::new(Arc::clone(&engine))
+                    .load_keyspace_names()
+                    .unwrap()
+                    .iter()
+                    .any(|n| n == name),
+                "loader must not restore a dropped keyspace partition"
+            );
+        }
+
         let deleted = engine.read(&tid, &key).unwrap().unwrap();
         assert_eq!(
             visible_projection_cells(&deleted),
@@ -876,36 +897,392 @@ mod tests {
             visible_projection_cells(&reopened.read(&tid, &key).unwrap().unwrap()) > 0,
             "ordered recreation must survive cold reopen: {tid}"
         );
+        if verify_reload {
+            let loader = SystemTableLoader::new(Arc::clone(&reopened));
+            match case {
+                0 => assert!(loader
+                    .load_keyspace_names()
+                    .unwrap()
+                    .iter()
+                    .any(|n| n == name)),
+                3 => assert!(reopened
+                    .read_persisted_indexes()
+                    .unwrap()
+                    .iter()
+                    .any(|i| i.keyspace_name == name && i.index_name == "i")),
+                4 => assert!(
+                    loader
+                        .load_user_types()
+                        .unwrap()
+                        .iter()
+                        .any(|u| u.keyspace == name && u.name == "u"),
+                    "UDT loader must accept recreated cells newer than old row deletion"
+                ),
+                5 => assert!(
+                    loader
+                        .load_user_functions()
+                        .unwrap()
+                        .iter()
+                        .any(|f| f.keyspace == name && f.name == "f"),
+                    "UDF loader must accept recreated cells newer than old row deletion"
+                ),
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[tokio::test]
     async fn canonical_family_keyspace_after_clock_regression() {
-        canonical_family_after_future_cells(0).await;
+        canonical_family_after_future_cells(0, false).await;
     }
 
     #[tokio::test]
     async fn canonical_family_table_after_clock_regression() {
-        canonical_family_after_future_cells(1).await;
+        canonical_family_after_future_cells(1, false).await;
     }
 
     #[tokio::test]
     async fn canonical_family_role_after_clock_regression() {
-        canonical_family_after_future_cells(2).await;
+        canonical_family_after_future_cells(2, false).await;
     }
 
     #[tokio::test]
     async fn canonical_family_index_after_clock_regression() {
-        canonical_family_after_future_cells(3).await;
+        canonical_family_after_future_cells(3, false).await;
     }
 
     #[tokio::test]
     async fn canonical_family_type_after_clock_regression() {
-        canonical_family_after_future_cells(4).await;
+        canonical_family_after_future_cells(4, false).await;
     }
 
     #[tokio::test]
     async fn canonical_family_function_after_clock_regression() {
-        canonical_family_after_future_cells(5).await;
+        canonical_family_after_future_cells(5, false).await;
+    }
+
+    #[tokio::test]
+    async fn canonical_reload_keyspace_after_drop_and_recreate() {
+        canonical_family_after_future_cells(0, true).await;
+    }
+    #[tokio::test]
+    async fn canonical_reload_index_after_drop_and_recreate() {
+        canonical_family_after_future_cells(3, true).await;
+    }
+    #[tokio::test]
+    async fn canonical_reload_type_after_drop_and_recreate() {
+        canonical_family_after_future_cells(4, true).await;
+    }
+    #[tokio::test]
+    async fn canonical_reload_function_after_drop_and_recreate() {
+        canonical_family_after_future_cells(5, true).await;
+    }
+
+    fn membership_test_role(name: &str) -> RoleMetadata {
+        RoleMetadata {
+            name: name.into(),
+            is_superuser: false,
+            can_login: false,
+            salted_hash: None,
+            member_of: Default::default(),
+            scram: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_reload_authority_deleted_flags_are_not_reused() {
+        use ferrosa_schema::system::persistence::{role_to_row, ROLES_COL_SALTED_HASH};
+        use ferrosa_common::CellValue;
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let roles = TableId::new("system_auth", "roles");
+        let (key, mut old, _) = role_to_row(&RoleMetadata {
+            is_superuser: true,
+            can_login: true,
+            ..membership_test_role("partial_role")
+        });
+        old.primary_key_liveness.timestamp = 1_000_000;
+        for (_, cell) in &mut old.cells {
+            cell.timestamp = 1_000_000;
+        }
+        engine.write(&roles, &key, old, 1_000_000).unwrap();
+        engine
+            .write(
+                &roles,
+                &key,
+                Row {
+                    clustering: vec![],
+                    cells: vec![],
+                    deletion: DeletionTime::new(3_000_000, 3),
+                    primary_key_liveness: LivenessInfo::NONE,
+                },
+                3_000_000,
+            )
+            .unwrap();
+        engine
+            .write(
+                &roles,
+                &key,
+                Row {
+                    clustering: vec![],
+                    cells: vec![(
+                        ROLES_COL_SALTED_HASH,
+                        CellValue::live(b"new_hash".to_vec(), 8_000_000),
+                    )],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(8_000_000),
+                },
+                8_000_000,
+            )
+            .unwrap();
+        engine.flush(&roles).unwrap();
+        engine.force_commit_log_sync().unwrap();
+        drop(engine);
+        assert!(
+            SystemTableLoader::new(reopen_test_engine(dir.path()))
+                .load_roles()
+                .is_err(),
+            "fresh hash must not resurrect deleted login/superuser flags from an older incarnation"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_reload_authority_missing_parent_is_refused_before_publish() {
+        use ferrosa_schema::system::persistence::SystemTableMutation;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        SystemTableWriter::new(Arc::clone(&engine))
+            .apply(SystemTableMutation::RoleCreated(RoleMetadata {
+                member_of: ["absent_parent".into()].into_iter().collect(),
+                ..membership_test_role("child")
+            }))
+            .unwrap();
+        let schema = fast_schema();
+        assert!(SystemTableLoader::new(engine).replay_roles_into_schema(&schema).is_err(),
+            "unresolved membership authority must refuse, not disappear or reactivate on later name reuse");
+        assert!(
+            !schema.snapshot().roles.contains_key("child"),
+            "validation must precede authority publication"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_reload_authority_existing_builtin_parent_is_preserved() {
+        use ferrosa_schema::system::persistence::SystemTableMutation;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        SystemTableWriter::new(Arc::clone(&engine))
+            .apply(SystemTableMutation::RoleCreated(RoleMetadata {
+                member_of: ["builtin_parent".into()].into_iter().collect(),
+                ..membership_test_role("child")
+            }))
+            .unwrap();
+        let schema = fast_schema();
+        schema
+            .insert_role_if_absent(membership_test_role("builtin_parent"))
+            .unwrap();
+        SystemTableLoader::new(engine)
+            .replay_roles_into_schema(&schema)
+            .unwrap();
+        assert_eq!(
+            schema.snapshot().roles.get("child").unwrap().member_of,
+            ["builtin_parent".into()].into_iter().collect(),
+            "existing trusted bootstrap roles remain valid parents"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_reload_authority_orphan_child_is_refused() {
+        use ferrosa_schema::system::persistence::SystemTableMutation;
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let writer = SystemTableWriter::new(Arc::clone(&engine));
+        writer
+            .apply(SystemTableMutation::RoleCreated(membership_test_role(
+                "parent",
+            )))
+            .unwrap();
+        writer
+            .apply(SystemTableMutation::RoleCreated(RoleMetadata {
+                member_of: ["parent".into()].into_iter().collect(),
+                ..membership_test_role("orphan")
+            }))
+            .unwrap();
+        // Legacy drop removed the role row but left its role_members partition.
+        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            b"orphan".to_vec(),
+        ));
+        engine
+            .write(
+                &TableId::new("system_auth", "roles"),
+                &key,
+                Row {
+                    clustering: vec![],
+                    cells: vec![],
+                    deletion: DeletionTime::new(i64::MAX, 1),
+                    primary_key_liveness: LivenessInfo::NONE,
+                },
+                i64::MAX,
+            )
+            .unwrap();
+        let schema = fast_schema();
+        assert!(
+            SystemTableLoader::new(engine)
+                .replay_roles_into_schema(&schema)
+                .is_err(),
+            "live orphan membership must fail closed rather than become future authority"
+        );
+        assert!(
+            !schema.snapshot().roles.contains_key("parent"),
+            "invalid graph must not partially replace authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_reload_persisted_memberships_after_cold_restart() {
+        use ferrosa_schema::system::persistence::SystemTableMutation;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let writer = SystemTableWriter::new(Arc::clone(&engine));
+        for name in ["parent_a", "parent_b"] {
+            writer
+                .apply(SystemTableMutation::RoleCreated(membership_test_role(name)))
+                .unwrap();
+        }
+        let child = RoleMetadata {
+            member_of: ["parent_a".into(), "parent_b".into()].into_iter().collect(),
+            ..membership_test_role("child")
+        };
+        writer
+            .apply(SystemTableMutation::RoleCreated(child.clone()))
+            .unwrap();
+        engine.flush(&TableId::new("system_auth", "roles")).unwrap();
+        engine
+            .flush(&TableId::new("system_auth", "role_members"))
+            .unwrap();
+        engine.force_commit_log_sync().unwrap();
+        drop(writer);
+        drop(engine);
+        let reopened = reopen_test_engine(dir.path());
+        let schema = fast_schema();
+        SystemTableLoader::new(reopened)
+            .replay_roles_into_schema(&schema)
+            .unwrap();
+        assert_eq!(
+            schema.snapshot().roles.get("child").unwrap().member_of,
+            child.member_of,
+            "startup must restore persisted parent membership, not silently discard it"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_reload_direct_parent_drop_removes_inbound_edges() {
+        use crate::{ddl_path::apply_direct, pair::ddl::DdlOperation};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = fast_schema();
+        for name in ["parent_a", "parent_b", "child"] {
+            apply_direct(
+                &DdlOperation::CreateRole(membership_test_role(name)),
+                &schema,
+                &engine,
+            )
+            .unwrap();
+        }
+        for parent in ["parent_a", "parent_b"] {
+            apply_direct(
+                &DdlOperation::GrantRole {
+                    member: "child".into(),
+                    granted_role: parent.into(),
+                },
+                &schema,
+                &engine,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            schema
+                .snapshot()
+                .roles
+                .get("child")
+                .unwrap()
+                .member_of
+                .len(),
+            2
+        );
+        apply_direct(&DdlOperation::DropRole("parent_a".into()), &schema, &engine).unwrap();
+        assert_eq!(
+            schema.snapshot().roles.get("child").unwrap().member_of,
+            ["parent_b".into()].into_iter().collect(),
+            "dropping a parent must remove inbound authority references"
+        );
+        apply_direct(
+            &DdlOperation::CreateRole(membership_test_role("parent_a")),
+            &schema,
+            &engine,
+        )
+        .unwrap();
+        engine.flush(&TableId::new("system_auth", "roles")).unwrap();
+        engine
+            .flush(&TableId::new("system_auth", "role_members"))
+            .unwrap();
+        engine.force_commit_log_sync().unwrap();
+        drop(schema);
+        drop(engine);
+        let restored = SystemTableLoader::new(reopen_test_engine(dir.path()))
+            .load_roles()
+            .unwrap();
+        assert_eq!(
+            restored
+                .iter()
+                .find(|r| r.name == "child")
+                .unwrap()
+                .member_of,
+            ["parent_b".into()].into_iter().collect(),
+            "same-name parent recreation must not restore the revoked edge"
+        );
+    }
+
+    #[test]
+    fn canonical_reload_authenticated_parent_drop_cleans_registry() {
+        let schema = fast_schema();
+        for name in ["operator", "parent_a", "parent_b"] {
+            schema
+                .insert_role_if_absent(RoleMetadata {
+                    is_superuser: name == "operator",
+                    ..membership_test_role(name)
+                })
+                .unwrap();
+        }
+        schema
+            .insert_role_if_absent(RoleMetadata {
+                member_of: ["parent_a".into(), "parent_b".into()].into_iter().collect(),
+                ..membership_test_role("child")
+            })
+            .unwrap();
+        schema
+            .drop_role(
+                "parent_a",
+                &AuthContext {
+                    role: "operator".into(),
+                    is_superuser: true,
+                    must_change_password: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            schema.snapshot().roles.get("child").unwrap().member_of,
+            ["parent_b".into()].into_iter().collect(),
+            "authenticated registry drop must remove only the dropped parent edge"
+        );
     }
 
     #[tokio::test]

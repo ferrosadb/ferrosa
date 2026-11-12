@@ -740,6 +740,9 @@ impl Schema {
         let mut snap = (**self.inner.load()).clone();
         snap.roles.remove(name);
         snap.grants.remove(name);
+        for role in snap.roles.values_mut() {
+            role.member_of.remove(name);
+        }
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -1719,6 +1722,9 @@ impl Schema {
         }
         // Remove all grants for the dropped role
         snap.grants.remove(name);
+        for role in snap.roles.values_mut() {
+            role.member_of.remove(name);
+        }
         snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         self.emit_audit_with_actor(

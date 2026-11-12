@@ -432,9 +432,36 @@ pub fn apply_direct(op: &DdlOperation, schema: &Schema, engine: &Arc<StorageEngi
                 .map_err(|e| ClusterError::Internal(format!("alter_role: {e}")))?;
         }
         DdlOperation::DropRole(name) => {
+            let before = schema.snapshot();
             schema
                 .drop_role_internal(name)
                 .map_err(|e| ClusterError::Internal(format!("drop_role: {e}")))?;
+            let after = schema.snapshot();
+            let writer = SystemTableWriter::new(Arc::clone(engine));
+            writer
+                .apply(
+                    ferrosa_schema::system::persistence::SystemTableMutation::RoleDropped(
+                        name.clone(),
+                    ),
+                )
+                .map_err(ClusterError::Storage)?;
+            // Borrow the pre-drop snapshot to identify changed children, then
+            // persist authoritative stored poststates, including credential bytes.
+            for prior in before
+                .roles
+                .values()
+                .filter(|role| role.member_of.contains(name))
+            {
+                if let Some(stored) = after.roles.get(&prior.name) {
+                    writer
+                        .apply(
+                            ferrosa_schema::system::persistence::SystemTableMutation::RoleCreated(
+                                stored.clone(),
+                            ),
+                        )
+                        .map_err(ClusterError::Storage)?;
+                }
+            }
         }
         DdlOperation::Grant(entry) => {
             schema
