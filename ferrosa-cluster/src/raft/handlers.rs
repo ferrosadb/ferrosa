@@ -51,6 +51,18 @@ use super::FerrosRaftConfig;
 // Replying
 // ---------------------------------------------------------------------------
 
+fn raft_recovery_refusal(
+    handler: &str,
+    admission: Option<&super::quarantine::RecoveryAdmission>,
+    epoch: Option<u64>,
+) -> Option<HandlerOutcome> {
+    admission.zip(epoch).and_then(|(admission, epoch)| {
+        admission.admits_epoch(epoch).err().map(|error| {
+            HandlerOutcome::fail(RemoteFailureKind::NotReady, format!("{handler}: {error}"))
+        })
+    })
+}
+
 /// The body every Raft RPC handler shares: wait for Raft, decode the request,
 /// run it, encode the response.
 ///
@@ -63,6 +75,7 @@ use super::FerrosRaftConfig;
 async fn raft_rpc<Req, Resp, E, F, Fut>(
     handler: &'static str,
     lazy: &LazyRaft,
+    admission: Option<&super::quarantine::RecoveryAdmission>,
     bytes: &[u8],
     call: F,
     wrap: fn(Bytes) -> Message,
@@ -74,12 +87,19 @@ where
     F: FnOnce(Arc<super::FerrosRaft>, Req) -> Fut + Send,
     Fut: std::future::Future<Output = Result<Resp, E>> + Send,
 {
+    let recovery_epoch = admission.map(|admission| admission.epoch());
+    if let Some(refusal) = raft_recovery_refusal(handler, admission, recovery_epoch) {
+        return refusal;
+    }
     let Some(raft) = lazy.get().await else {
         return HandlerOutcome::fail(
             RemoteFailureKind::NotReady,
             format!("{handler}: Raft is not ready on this node (not initialised)"),
         );
     };
+    if let Some(refusal) = raft_recovery_refusal(handler, admission, recovery_epoch) {
+        return refusal;
+    }
     let req: Req = match bincode::deserialize(bytes) {
         Ok(req) => req,
         Err(e) => {
@@ -89,7 +109,11 @@ where
             )
         }
     };
-    let resp = match call(raft, req).await {
+    let result = call(raft, req).await;
+    if let Some(refusal) = raft_recovery_refusal(handler, admission, recovery_epoch) {
+        return refusal;
+    }
+    let resp = match result {
         Ok(resp) => resp,
         Err(e) => {
             return HandlerOutcome::fail(
@@ -936,12 +960,21 @@ impl LazyRaft {
 /// reads as evidence that the leader is live.
 pub struct RaftAppendHandler {
     raft: LazyRaft,
+    recovery_admission: Arc<super::quarantine::RecoveryAdmission>,
     contact: Arc<super::leader_contact::LeaderContact>,
 }
 
 impl RaftAppendHandler {
-    pub fn new(raft: LazyRaft, contact: Arc<super::leader_contact::LeaderContact>) -> Self {
-        Self { raft, contact }
+    pub fn new(
+        raft: LazyRaft,
+        contact: Arc<super::leader_contact::LeaderContact>,
+        recovery_admission: Arc<super::quarantine::RecoveryAdmission>,
+    ) -> Self {
+        Self {
+            raft,
+            contact,
+            recovery_admission,
+        }
     }
 }
 
@@ -957,9 +990,12 @@ impl RpcHandler for RaftAppendHandler {
             other => return unexpected_message("RaftAppendHandler", &other),
         };
         let contact = self.contact.clone();
+        let admission = Arc::clone(&self.recovery_admission);
+        let contact_epoch = admission.epoch();
         raft_rpc(
             "RaftAppendHandler",
             &self.raft,
+            Some(&self.recovery_admission),
             &bytes,
             |raft, req: AppendEntriesRequest<FerrosRaftConfig>| async move {
                 let vote = req.vote;
@@ -967,8 +1003,12 @@ impl RpcHandler for RaftAppendHandler {
                     .append_entries(req)
                     .await
                     .map_err(|e| format!("append_entries failed: {e}"))?;
-                if let Some((leader, term)) = super::leader_contact::accepted_append(&vote, &resp) {
-                    contact.record(leader, term, std::time::Instant::now());
+                if admission.admits_epoch(contact_epoch).is_ok() {
+                    if let Some((leader, term)) =
+                        super::leader_contact::accepted_append(&vote, &resp)
+                    {
+                        contact.record(leader, term, std::time::Instant::now());
+                    }
                 }
                 Ok::<_, String>(resp)
             },
@@ -988,11 +1028,18 @@ impl RpcHandler for RaftAppendHandler {
 /// returns the serialized vote response.
 pub struct RaftVoteHandler {
     raft: LazyRaft,
+    recovery_admission: Arc<super::quarantine::RecoveryAdmission>,
 }
 
 impl RaftVoteHandler {
-    pub fn new(raft: LazyRaft) -> Self {
-        Self { raft }
+    pub fn new(
+        raft: LazyRaft,
+        recovery_admission: Arc<super::quarantine::RecoveryAdmission>,
+    ) -> Self {
+        Self {
+            raft,
+            recovery_admission,
+        }
     }
 }
 
@@ -1010,6 +1057,7 @@ impl RpcHandler for RaftVoteHandler {
         raft_rpc(
             "RaftVoteHandler",
             &self.raft,
+            Some(&self.recovery_admission),
             &bytes,
             |raft, req: VoteRequest<u64>| async move {
                 raft.vote(req)
@@ -1041,11 +1089,18 @@ impl RpcHandler for RaftVoteHandler {
 /// persistent term state and a pre-vote must never do so.
 pub struct RaftPreVoteHandler {
     raft: LazyRaft,
+    recovery_admission: Arc<super::quarantine::RecoveryAdmission>,
 }
 
 impl RaftPreVoteHandler {
-    pub fn new(raft: LazyRaft) -> Self {
-        Self { raft }
+    pub fn new(
+        raft: LazyRaft,
+        recovery_admission: Arc<super::quarantine::RecoveryAdmission>,
+    ) -> Self {
+        Self {
+            raft,
+            recovery_admission,
+        }
     }
 }
 
@@ -1063,6 +1118,7 @@ impl RpcHandler for RaftPreVoteHandler {
         raft_rpc(
             "RaftPreVoteHandler",
             &self.raft,
+            Some(&self.recovery_admission),
             &bytes,
             |raft, req: PreVoteRequest<u64>| async move {
                 raft.pre_vote(req)
@@ -1111,6 +1167,7 @@ impl RpcHandler for RaftSnapshotHandler {
         raft_rpc(
             "RaftSnapshotHandler",
             &self.raft,
+            None,
             &bytes,
             |raft, req: InstallSnapshotRequest<FerrosRaftConfig>| async move {
                 raft.install_snapshot(req)
@@ -1897,7 +1954,10 @@ mod tests {
     #[tokio::test]
     async fn prevote_handler_rejects_a_non_prevote_message() {
         let (_tx, lazy) = LazyRaft::channel();
-        let handler = RaftPreVoteHandler::new(lazy);
+        let handler = RaftPreVoteHandler::new(
+            lazy,
+            Arc::new(crate::raft::quarantine::RecoveryAdmission::new()),
+        );
 
         let wrong = Message::RaftVote(Bytes::from_static(b"not a prevote"));
         let out = handler.handle(make_peer_id(), wrong).await;

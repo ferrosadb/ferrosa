@@ -1958,11 +1958,15 @@ impl ModeController {
         let append_handler = Arc::new(RaftAppendHandler::new(
             lazy_raft.clone(),
             self.leader_contact.clone(),
+            Arc::clone(&self.recovery_admission),
         ));
         self.registry
             .register(MsgType::RaftAppendEntries, append_handler);
 
-        let vote_handler = Arc::new(RaftVoteHandler::new(lazy_raft.clone()));
+        let vote_handler = Arc::new(RaftVoteHandler::new(
+            lazy_raft.clone(),
+            Arc::clone(&self.recovery_admission),
+        ));
         self.registry.register(MsgType::RaftVote, vote_handler);
 
         // The PreVote receive side is registered unconditionally, even while
@@ -1970,7 +1974,10 @@ impl ModeController {
         // pre-vote before any node is allowed to SEND one, or the first node
         // upgraded in a rolling restart would probe peers that reject the
         // frame, read the rejections as "no", and never win an election.
-        let pre_vote_handler = Arc::new(RaftPreVoteHandler::new(lazy_raft.clone()));
+        let pre_vote_handler = Arc::new(RaftPreVoteHandler::new(
+            lazy_raft.clone(),
+            Arc::clone(&self.recovery_admission),
+        ));
         self.registry
             .register(MsgType::RaftPreVote, pre_vote_handler);
 

@@ -7482,7 +7482,11 @@ mod raft_leader_liveness_after_restart {
         // Once the leader's AppendEntries arrives through the real handler,
         let (tx, lazy) = LazyRaft::channel();
         tx.send(Some(Arc::clone(&raft))).expect("publish raft");
-        let handler = RaftAppendHandler::new(lazy, controller.leader_contact());
+        let handler = RaftAppendHandler::new(
+            lazy,
+            controller.leader_contact(),
+            controller.recovery_admission(),
+        );
         let body = bytes::Bytes::from(bincode::serialize(&heartbeat()).unwrap());
         let reply = handler
             .handle(
