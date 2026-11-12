@@ -113,6 +113,10 @@ pub struct SeedConfig {
     pub service_password: Option<String>,
     /// Deployment mode controls whether well-known defaults are used.
     pub mode: DeploymentMode,
+    /// Break-glass (`FERROSA_RESET_ADMIN_PASSWORD`): re-persist
+    /// `admin_password` over a stored `ferrosa_admin` that does not verify
+    /// against it. Off by default; meant to be set for one restart.
+    pub reset_admin_password: bool,
 }
 
 impl SeedConfig {
@@ -127,6 +131,17 @@ impl SeedConfig {
             DeploymentMode::from_env(),
             std::env::var("FERROSA_SEED_ADMIN_PASSWORD").ok(),
         )
+        .with_admin_reset(reset_flag_enabled(
+            std::env::var("FERROSA_RESET_ADMIN_PASSWORD")
+                .ok()
+                .as_deref(),
+        ))
+    }
+
+    /// Set the break-glass admin reset (see `reset_admin_password`).
+    pub fn with_admin_reset(mut self, reset: bool) -> Self {
+        self.reset_admin_password = reset;
+        self
     }
 
     /// Pure constructor backing `from_env`, separated so tests stay free of
@@ -139,6 +154,25 @@ impl SeedConfig {
             admin_password: admin_password.filter(|p| !p.is_empty()),
             service_password: None,
             mode,
+            reset_admin_password: false,
+        }
+    }
+}
+
+/// `FERROSA_RESET_ADMIN_PASSWORD` is on only for `1` or `true` (any case).
+/// Any other non-empty value is refused loudly rather than read as off, so a
+/// typo such as `yes` cannot silently skip a recovery the operator asked for.
+fn reset_flag_enabled(raw: Option<&str>) -> bool {
+    match raw.map(str::trim) {
+        None | Some("") => false,
+        Some(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
+        Some(v) if v == "0" || v.eq_ignore_ascii_case("false") => false,
+        Some(other) => {
+            tracing::error!(
+                value = other,
+                "FERROSA_RESET_ADMIN_PASSWORD must be 1/true or 0/false; treating it as off"
+            );
+            false
         }
     }
 }
@@ -706,6 +740,7 @@ mod tests {
             admin_password: None,
             service_password: None,
             mode: DeploymentMode::Production,
+            reset_admin_password: false,
         };
         let outcome = seed_default_roles_with_config(&schema, &config).unwrap();
         let actual_admin_pw = outcome
@@ -725,6 +760,7 @@ mod tests {
             admin_password: None,
             service_password: None,
             mode: DeploymentMode::Production,
+            reset_admin_password: false,
         };
         seed_default_roles_with_config(&schema, &config).unwrap();
         let result = schema.authenticate(SEED_ADMIN_USER, SEED_ADMIN_PASSWORD);
@@ -742,6 +778,7 @@ mod tests {
             admin_password: None,
             service_password: None,
             mode: DeploymentMode::Development,
+            reset_admin_password: false,
         };
         seed_default_roles_with_config(&schema, &config).unwrap();
         let result = schema.authenticate(SEED_ADMIN_USER, SEED_ADMIN_PASSWORD);
@@ -759,6 +796,7 @@ mod tests {
             admin_password: None,
             service_password: None,
             mode: DeploymentMode::Development,
+            reset_admin_password: false,
         };
         let first = seed_default_roles_with_config(&schema, &config).unwrap();
         assert!(
@@ -785,6 +823,7 @@ mod tests {
             admin_password: None,
             service_password: None,
             mode: DeploymentMode::Production,
+            reset_admin_password: false,
         };
         seed_default_roles_with_config(&schema, &config).unwrap();
         // graph_engine must not authenticate with SEED_APP_PASSWORD
@@ -810,6 +849,7 @@ mod tests {
             admin_password: Some(explicit_pw.to_string()),
             service_password: None,
             mode: DeploymentMode::Production,
+            reset_admin_password: false,
         };
         let outcome = seed_default_roles_with_config(&schema, &config).unwrap();
         assert_eq!(
@@ -847,6 +887,32 @@ mod tests {
         assert!(
             config.admin_password.is_none(),
             "FERROSA_SEED_ADMIN_PASSWORD=\"\" must not seed an empty admin password"
+        );
+    }
+
+    /// The break-glass admin reset is off unless explicitly `1`/`true`, and
+    /// never on by default from `from_parts`.
+    #[test]
+    fn reset_admin_flag_is_on_only_for_explicit_true() {
+        for on in ["1", "true", "TRUE", " true "] {
+            assert!(reset_flag_enabled(Some(on)), "{on:?} must enable the reset");
+        }
+        for off in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("yes"),
+            Some("2"),
+        ] {
+            assert!(
+                !reset_flag_enabled(off),
+                "{off:?} must not enable the reset"
+            );
+        }
+        assert!(
+            !SeedConfig::from_parts(DeploymentMode::Production, Some("pw".into()))
+                .reset_admin_password
         );
     }
 }
