@@ -37,6 +37,12 @@ pub struct ReconcileMetrics {
     /// ([`ReconcileMode::Rewrite`] only): another replica may still hold them
     /// wrong.
     pub entries_rewritten: usize,
+    /// Repair steps whose state read never returned inside
+    /// [`repair_write_budget`]. Counted per attempt: a step that succeeds on a
+    /// retry still appears here while the pass completes.
+    pub budget_exceeded_reads: usize,
+    /// Repair steps whose write never returned inside [`repair_write_budget`].
+    pub budget_exceeded_writes: usize,
     /// Reads, scans and writes that failed. A pass with errors is INCOMPLETE:
     /// the index may still be missing entries, so a caller that gates queries
     /// on the pass must not treat it as healed.
@@ -47,6 +53,22 @@ impl ReconcileMetrics {
     /// Whether the pass checked everything it set out to check.
     pub fn is_complete(&self) -> bool {
         self.errors == 0
+    }
+
+    /// Why steps were cut short, for the retryable refusal a client sees and
+    /// the WARN an operator reads. Empty when no step hit the budget: an
+    /// operator must be able to tell a wedged await from a slow cluster.
+    pub fn budget_note(&self) -> String {
+        let total = self.budget_exceeded_reads + self.budget_exceeded_writes;
+        if total == 0 {
+            return String::new();
+        }
+        format!(
+            "; {total} repair step(s) exceeded the {} ms repair budget ({} read, {} write)",
+            repair_write_budget().as_millis(),
+            self.budget_exceeded_reads,
+            self.budget_exceeded_writes
+        )
     }
 }
 
@@ -506,23 +528,32 @@ pub async fn reconcile_once_with(
 
                 if !edge_exists {
                     // Write a tombstone to remove this orphan adjacency entry.
-                    match write_tombstone(
+                    match within_repair_budget(write_tombstone(
                         write_path,
                         &index,
                         &partition.key,
                         &row.clustering,
                         &edge_label,
-                    )
+                    ))
                     .await
                     {
-                        Ok(()) => metrics.orphans_removed += 1,
-                        Err(e) => {
+                        Some(Ok(())) => metrics.orphans_removed += 1,
+                        Some(Err(e)) => {
                             metrics.errors += 1;
                             tracing::warn!(
                                 table = %edge_table_fqn,
                                 error = %e,
                                 "adjacency reconcile: could not remove an orphan adjacency \
                                  entry; the next pass retries"
+                            );
+                        }
+                        None => {
+                            metrics.errors += 1;
+                            tracing::warn!(
+                                table = %edge_table_fqn,
+                                budget_ms = repair_write_budget().as_millis() as u64,
+                                "adjacency reconcile: an orphan-removal write did not finish \
+                                 within its budget (a lane never answered); the next pass retries"
                             );
                         }
                     }
@@ -675,6 +706,29 @@ const RECONCILE_ENTRY_RETRIES: u32 = 3;
 /// Wait before retry `n` is `n` times this.
 const RECONCILE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Longest any ONE await of an entry's repair — its state read, or its repair
+/// write — may take before that entry is counted as failed and retried. Both
+/// are awaits on peer lanes: a lane that never applies its own deadline would
+/// otherwise hold the whole pass, and with it the keyspace's first-use heal,
+/// which refuses every query on the keyspace ("the heal is still running")
+/// until the process exits (nightly 40474224462, 2026-10-27, where one such
+/// await outlived the test's entire 120 s budget). Overridable so a test can
+/// prove the bound without waiting it out.
+const DEFAULT_REPAIR_WRITE_BUDGET: Duration = Duration::from_secs(30);
+
+static REPAIR_WRITE_BUDGET_MS: AtomicU64 =
+    AtomicU64::new(DEFAULT_REPAIR_WRITE_BUDGET.as_millis() as u64);
+
+fn repair_write_budget() -> Duration {
+    Duration::from_millis(REPAIR_WRITE_BUDGET_MS.load(Ordering::Relaxed))
+}
+
+/// Set the per-entry repair-write budget for this process (tests only).
+#[doc(hidden)]
+pub fn set_repair_write_budget_for_test(budget: Duration) {
+    REPAIR_WRITE_BUDGET_MS.store(budget.as_millis().max(1) as u64, Ordering::Relaxed);
+}
+
 /// Failed entries a pass holds for retry. Past this many the cluster is not
 /// failing transiently, and the rest count as errors at once.
 const RECONCILE_RETRY_CAPACITY: usize = 10_000;
@@ -811,7 +865,17 @@ enum Outcome {
 /// What reconciling one entry did, folded into the pass's metrics by the
 /// caller (entries are reconciled concurrently, so none of them holds the
 /// metrics).
+/// Which await of a repair step exceeded [`repair_write_budget`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BudgetSide {
+    Read,
+    Write,
+}
+
 enum EntryResult {
+    /// The step's own await never returned inside the repair budget: `side`
+    /// says which one. The entry is retried like any other failure.
+    BudgetExceeded(ExpectedEntry, BudgetSide),
     /// Already right, or left for the next pass (a concurrent write).
     Unchanged,
     Written(Outcome),
@@ -828,6 +892,13 @@ impl ReconcileMetrics {
             EntryResult::Written(Outcome::Repaired) => self.entries_repaired += 1,
             EntryResult::Written(Outcome::Removed) => self.orphans_removed += 1,
             EntryResult::Written(Outcome::Rewritten) => self.entries_rewritten += 1,
+            EntryResult::BudgetExceeded(entry, side) => {
+                match side {
+                    BudgetSide::Read => self.budget_exceeded_reads += 1,
+                    BudgetSide::Write => self.budget_exceeded_writes += 1,
+                }
+                return Some(entry);
+            }
             EntryResult::Failed(entry) => return Some(entry),
         }
         None
@@ -928,7 +999,13 @@ async fn retry_failed_entries(
     }
 }
 
-/// Check one expected entry against the index and repair it.
+/// Check one expected entry against the index and repair it. Each await it
+/// makes — the state read and the repair write — is bounded by
+/// [`repair_write_budget`]: a lane that never answers costs THIS entry its retry
+/// budget (the pass then concludes retryably), never the keyspace's heal, which
+/// otherwise refuses every query "the heal is still running" until the process
+/// exits (nightly 40474224462, 2026-10-27, where one such await outlived the
+/// test's whole 120 s budget).
 async fn reconcile_entry(
     write_path: &WritePath,
     index: &AdjacencyIndex,
@@ -936,19 +1013,35 @@ async fn reconcile_entry(
     entry: ExpectedEntry,
     pass: Pass,
 ) -> EntryResult {
-    let state =
-        match read_entry_state(write_path, index, &entry.vertex_key, &entry.clustering).await {
-            Ok(state) => state,
-            Err(e) => {
-                tracing::warn!(
-                    table = %edge_table_fqn,
-                    error = %e,
-                    "adjacency reconcile: could not read an adjacency partition; \
-                     retrying it later in this pass"
-                );
-                return EntryResult::Failed(entry);
-            }
-        };
+    let Some(state) = within_repair_budget(read_entry_state(
+        write_path,
+        index,
+        &entry.vertex_key,
+        &entry.clustering,
+    ))
+    .await
+    else {
+        tracing::warn!(
+            table = %edge_table_fqn,
+            budget_ms = repair_write_budget().as_millis() as u64,
+            "adjacency reconcile: reading an adjacency entry did not finish within its \
+             budget (a lane never answered); counting the entry as failed so the pass can \
+             conclude"
+        );
+        return EntryResult::BudgetExceeded(entry, BudgetSide::Read);
+    };
+    let state = match state {
+        Ok(state) => state,
+        Err(e) => {
+            tracing::warn!(
+                table = %edge_table_fqn,
+                error = %e,
+                "adjacency reconcile: could not read an adjacency partition; \
+                 retrying it later in this pass"
+            );
+            return EntryResult::Failed(entry);
+        }
+    };
     let Some((row, at, outcome)) = entry_repair(&entry, &state, pass) else {
         return EntryResult::Unchanged;
     };
@@ -959,7 +1052,18 @@ async fn reconcile_entry(
         vec![row],
         at,
     );
-    match write_mutation(write_path, index, repair).await {
+    let Some(written) = within_repair_budget(write_mutation(write_path, index, repair)).await
+    else {
+        tracing::warn!(
+            table = %edge_table_fqn,
+            budget_ms = repair_write_budget().as_millis() as u64,
+            "adjacency reconcile: an adjacency repair write did not finish within its \
+             budget (a lane never answered); counting the entry as failed so the pass can \
+             conclude"
+        );
+        return EntryResult::BudgetExceeded(entry, BudgetSide::Write);
+    };
+    match written {
         Ok(()) => EntryResult::Written(outcome),
         Err(e) => {
             tracing::warn!(
@@ -995,6 +1099,19 @@ fn extract_edge_label(clustering: &[u8]) -> Option<String> {
     std::str::from_utf8(&clustering[label_start..label_start + label_len])
         .ok()
         .map(|s| s.to_string())
+}
+
+/// Await `write` for at most [`repair_write_budget`]. `None` means it did not
+/// finish: the caller counts the entry as failed, so one wedged write costs the
+/// entry its retry budget rather than holding the whole pass — and the
+/// keyspace's first-use heal — open forever.
+async fn within_repair_budget<F, T>(write: F) -> Option<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::time::timeout(repair_write_budget(), write)
+        .await
+        .ok()
 }
 
 /// Write a mutation by decomposing it into individual row writes via WritePath.

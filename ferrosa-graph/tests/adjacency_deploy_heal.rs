@@ -1817,6 +1817,245 @@ mod cluster {
         server.shutdown(std::time::Duration::from_millis(50)).await;
     }
 
+    /// A repair write that is never answered must end the heal, not hold it
+    /// open: a heal stuck in one write refuses every query on the keyspace
+    /// ("the heal is still running") until the process exits.
+    ///
+    /// Live on 2026-10-27 (nightly 40474224462): a cluster write of the heal
+    /// never returned, and `first_heal_completes` reported "the heal is still
+    /// running" for its whole 120 s budget. The write path bounds a replica
+    /// request by the lane timeout, so the wedge is an await with no deadline
+    /// at all -- the pass must not depend on that: one wedged entry write is
+    /// that entry's failure, retried inside the pass and counted after its
+    /// retries, never an unbounded await.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_repair_write_that_never_answers_ends_the_heal_retryably() {
+        // Every forward to the replica is dropped, so no write can ever be
+        // acknowledged; the lane timeout is set to ten minutes so the write
+        // itself sits in the lane instead of failing, exactly as it did on the
+        // nightly.
+        let (node, all, live) = damage(Node::with_replication_factor(2), 1, 1, 24).await;
+        let _ = Reference::new(&all, &live);
+        let remote_dir = TempDir::new().unwrap();
+        let remote = Arc::new(StorageEngine::new(storage_config(&remote_dir), None).unwrap());
+        register_storage_tables(&remote);
+        remote
+            .register_table(
+                ferrosa_graph::adjacency::adjacency_table_metadata(KEYSPACE).to_storage_schema(),
+            )
+            .unwrap();
+        tombstone_entries(&remote, &live, now_micros());
+
+        // A wedged write must cost an entry its retry budget, not the keyspace
+        // its heal; the production budget is far longer than this test's wait.
+        ferrosa_graph::adjacency::reconcile::set_repair_write_budget_for_test(
+            // Comfortably above the 400 ms per-request latency the sibling
+            // long-heal test injects, far below this test's own 20 s wait.
+            std::time::Duration::from_millis(1000),
+        );
+
+        let registry = Arc::new(HandlerRegistry::new());
+        registry.register(
+            MsgType::MutationForward,
+            Arc::new(DropsFirstWrites {
+                inner: MutationForwardHandler::new(Arc::clone(&remote)),
+                unacked: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            }),
+        );
+        let read_handler = Arc::new(ReadRequestHandler::new(Arc::clone(&remote)));
+        registry.register(MsgType::ReadRequest, read_handler.clone());
+        registry.register(MsgType::PartitionSuffixReadRequest, read_handler);
+        let remote_host = Uuid::new_v4();
+        let server = Arc::new(RpcServer::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                ..NetConfig::default()
+            },
+            remote_host,
+            registry,
+        ));
+        let remote_addr = server.start_and_get_addr().await.unwrap().to_string();
+
+        let local_host = Uuid::new_v4();
+        let mut ring = TokenRing::new();
+        ring.add_node(1, node_info("127.0.0.1:7000", local_host));
+        ring.add_node(2, node_info(&remote_addr, remote_host));
+        ring.assign_tokens(1, &[0]);
+        ring.assign_tokens(2, &[i64::MIN / 2]);
+        let coordinator = Arc::new(ClusterCoordinator::new(
+            Arc::new(arc_swap::ArcSwap::from_pointee(ring)),
+            Arc::new(PeerManager::new(
+                Arc::new(NetConfig {
+                    // Far longer than a repair step's budget, so the step, not
+                    // the lane, is what has to conclude; short enough that the
+                    // requests it abandons die with the test, not the process.
+                    data_lane_timeout: std::time::Duration::from_secs(60),
+                    ..NetConfig::default()
+                }),
+                local_host,
+                Arc::new(NoopPeers),
+            )),
+            1,
+            Arc::clone(&node.storage),
+            2,
+            ConsistencyLevel::One,
+        ));
+        let fresh = GraphEngine::new(
+            Arc::clone(&node.schema),
+            Arc::clone(&node.storage),
+            Arc::new(arc_swap::ArcSwap::from_pointee(WritePath::cluster(
+                coordinator,
+            ))),
+            GraphEngineConfig::default(),
+            std::time::Duration::from_secs(300),
+        );
+
+        // The heal may not report success (no write can be acknowledged), but it
+        // must conclude: a retryable refusal that names the failed pass, not
+        // "the heal is still running" forever.
+        let outcome: Result<(), String> =
+            tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                loop {
+                    match fresh.ensure_adjacency_ready_for_test(KEYSPACE).await {
+                        Ok(()) => return Ok(()),
+                        Err(ferrosa_graph::error::GraphError::Unavailable(reason))
+                            if reason.contains("the heal is still running") =>
+                        {
+                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        }
+                        Err(other) => return Err(other.to_string()),
+                    }
+                }
+            })
+            .await
+            .expect("a repair write that never answers left the heal running past 20 s");
+
+        let reason = outcome.expect_err("no write can be acknowledged, so the heal must not serve");
+        assert!(
+            reason.contains("retry"),
+            "the concluded heal must tell the client to retry: {reason}"
+        );
+        // The refusal is the only diagnostic a client sees, and the WARN line
+        // the only one an operator sees: the next occurrence has to name WHAT
+        // was cut short, or it is a 120 s mystery again (40474224462).
+        assert!(
+            reason.contains("budget"),
+            "the concluded heal must name the repair steps that exceeded their budget: {reason}"
+        );
+        assert!(
+            reason.contains("write"),
+            "the refusal must say which side of the step exceeded its budget: {reason}"
+        );
+        drop(fresh);
+        server.shutdown(std::time::Duration::from_millis(50)).await;
+    }
+
+    /// A reply the replica never sends must not wedge a cluster write.
+    ///
+    /// The nightly's hang (40474224462) sat in one repair await for its whole
+    /// 120 s budget with the data lane's own deadline at 300 ms, so a request
+    /// that WAS answered late, or not at all, left something behind that never
+    /// fires again. Each round here heals over a replica that swallows the
+    /// first three forwards and answers the rest: a dropped reply must cost the
+    /// write a retry, never the heal its conclusion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dropped_replies_never_wedge_a_cluster_write() {
+        // Above the bound asserted below, so the stall — not the repair budget
+        // this crate added for nightly 40474224462 — is what trips it.
+        ferrosa_graph::adjacency::reconcile::set_repair_write_budget_for_test(
+            std::time::Duration::from_secs(60),
+        );
+
+        for attempt in 0..10 {
+            let (node, _all, live) = damage(Node::with_replication_factor(2), 1, 1, 24).await;
+            let remote_dir = TempDir::new().unwrap();
+            let remote = Arc::new(StorageEngine::new(storage_config(&remote_dir), None).unwrap());
+            register_storage_tables(&remote);
+            remote
+                .register_table(
+                    ferrosa_graph::adjacency::adjacency_table_metadata(KEYSPACE)
+                        .to_storage_schema(),
+                )
+                .unwrap();
+            tombstone_entries(&remote, &live, now_micros());
+
+            let registry = Arc::new(HandlerRegistry::new());
+            registry.register(
+                MsgType::MutationForward,
+                Arc::new(DropsFirstWrites {
+                    inner: MutationForwardHandler::new(Arc::clone(&remote)),
+                    unacked: std::sync::atomic::AtomicUsize::new(3),
+                }),
+            );
+            let read_handler = Arc::new(ReadRequestHandler::new(Arc::clone(&remote)));
+            registry.register(MsgType::ReadRequest, read_handler.clone());
+            registry.register(MsgType::PartitionSuffixReadRequest, read_handler);
+            let remote_host = Uuid::new_v4();
+            let server = Arc::new(RpcServer::new(
+                NetConfig {
+                    bind_addr: "127.0.0.1:0".parse().unwrap(),
+                    ..NetConfig::default()
+                },
+                remote_host,
+                registry,
+            ));
+            let remote_addr = server.start_and_get_addr().await.unwrap().to_string();
+
+            let local_host = Uuid::new_v4();
+            let mut ring = TokenRing::new();
+            ring.add_node(1, node_info("127.0.0.1:7000", local_host));
+            ring.add_node(2, node_info(&remote_addr, remote_host));
+            ring.assign_tokens(1, &[0]);
+            ring.assign_tokens(2, &[i64::MIN / 2]);
+            let coordinator = Arc::new(ClusterCoordinator::new(
+                Arc::new(arc_swap::ArcSwap::from_pointee(ring)),
+                Arc::new(PeerManager::new(
+                    Arc::new(NetConfig {
+                        data_lane_timeout: std::time::Duration::from_millis(300),
+                        ..NetConfig::default()
+                    }),
+                    local_host,
+                    Arc::new(NoopPeers),
+                )),
+                1,
+                Arc::clone(&node.storage),
+                2,
+                ConsistencyLevel::One,
+            ));
+            let fresh = GraphEngine::new(
+                Arc::clone(&node.schema),
+                Arc::clone(&node.storage),
+                Arc::new(arc_swap::ArcSwap::from_pointee(WritePath::cluster(
+                    coordinator,
+                ))),
+                GraphEngineConfig::default(),
+                std::time::Duration::from_secs(300),
+            );
+
+            let concluded = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    match fresh.ensure_adjacency_ready_for_test(KEYSPACE).await {
+                        Ok(()) => return Ok(()),
+                        Err(ferrosa_graph::error::GraphError::Unavailable(reason))
+                            if reason.contains("the heal is still running") =>
+                        {
+                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        }
+                        Err(other) => return Err(other.to_string()),
+                    }
+                }
+            })
+            .await;
+            assert!(
+                concluded.is_ok(),
+                "attempt {attempt}: a dropped reply wedged the heal past 5 s"
+            );
+
+            drop(fresh);
+            server.shutdown(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     /// A query does not wait out a long heal: it is refused retryably at once
     /// and the heal goes on in its own task.
     ///

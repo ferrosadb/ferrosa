@@ -664,8 +664,9 @@ async fn catch_up_adjacency(
         );
         return Err(format!(
             "graph adjacency index for keyspace {keyspace} is being brought up to date \
-             ({} reconcile errors); retry",
-            metrics.errors
+             ({} reconcile errors{}); retry",
+            metrics.errors,
+            metrics.budget_note()
         ));
     }
     if metrics.entries_repaired > 0 || metrics.orphans_removed > 0 {
@@ -707,6 +708,7 @@ async fn heal_adjacency(
         tracing::warn!(
             keyspace,
             errors = metrics.errors,
+            budget_note = %metrics.budget_note(),
             entries_checked = metrics.entries_checked,
             entries_repaired = metrics.entries_repaired,
             entries_removed = metrics.orphans_removed,
@@ -716,8 +718,9 @@ async fn heal_adjacency(
         );
         return Err(format!(
             "graph adjacency index for keyspace {keyspace} is being repaired \
-             ({} reconcile errors); retry",
-            metrics.errors
+             ({} reconcile errors{}); retry",
+            metrics.errors,
+            metrics.budget_note()
         ));
     }
     if metrics.entries_repaired > 0 || metrics.orphans_removed > 0 {

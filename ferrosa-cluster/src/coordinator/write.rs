@@ -1333,6 +1333,106 @@ mod tests {
         }
     }
 
+    /// MutationForward handler that swallows the first `unacked` requests: the
+    /// peer accepts the frame and never answers, like a forward lost on the wire.
+    struct DropsFirstMutationForwards {
+        unacked: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl RpcHandler for DropsFirstMutationForwards {
+        async fn handle(&self, _from: PeerId, _msg: Message) -> Option<Message> {
+            use std::sync::atomic::Ordering;
+            if self
+                .unacked
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return None;
+            }
+            Some(Message::MutationAck(Bytes::new()))
+        }
+    }
+
+    /// A reply the replica never sends must cost the write a retry, never wedge
+    /// it: every write has to return inside the lane's own deadline.
+    ///
+    /// Nightly 40474224462 (2026-10-27): one repair await outlived its 300 ms
+    /// data-lane deadline by 400x and held the keyspace's adjacency heal for the
+    /// whole test budget. Three dropped forwards are exactly what that path
+    /// injects, so they are replayed here at the write level, many times over,
+    /// through one peer and one connection pool.
+    #[tokio::test]
+    async fn dropped_replies_never_wedge_a_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let (server, addr, remote_host_id) = start_rpc_server(
+            MsgType::MutationForward,
+            Arc::new(DropsFirstMutationForwards {
+                unacked: std::sync::atomic::AtomicUsize::new(3),
+            }),
+        )
+        .await;
+
+        let local_node_id = 1u64;
+        let pm = short_timeout_peer_manager();
+        let mut ring = TokenRing::new();
+        let mut local = make_node("10.0.0.1:7000");
+        local.host_id = Uuid::new_v4();
+        let mut remote = make_node(&addr.to_string());
+        remote.host_id = remote_host_id;
+        ring.add_node(local_node_id, local);
+        ring.add_node(2u64, remote);
+        ring.assign_tokens(local_node_id, &[50]);
+        ring.assign_tokens(2u64, &[100]);
+        let coordinator = make_coordinator(
+            ring,
+            pm.clone(),
+            local_node_id,
+            storage.clone(),
+            2,
+            ConsistencyLevel::All,
+        );
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+
+        for i in 0..200u32 {
+            let written = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                coordinator.coordinate_write_with(
+                    &table_id,
+                    &key,
+                    test_row(),
+                    1000 + i as i64,
+                    ConsistencyLevel::All,
+                    2,
+                ),
+            )
+            .await;
+            assert!(
+                written.is_ok(),
+                "write {i} never returned: a dropped reply wedged the write path"
+            );
+        }
+
+        let rendered = crate::coordinator::metrics::render_prometheus();
+        let in_flight = rendered
+            .lines()
+            .find_map(|line| line.strip_prefix("ferrosa_coordinator_write_admission_in_flight "))
+            .expect("the admission gauge is rendered");
+        assert_eq!(
+            in_flight.trim(),
+            "0",
+            "every write returned, so no admission permit may still be held: a leaked \
+             permit starves the next write forever (nightly 40474224462)"
+        );
+
+        server.shutdown(std::time::Duration::from_millis(50)).await;
+    }
+
     /// MutationForward handler that actually writes to a backing
     /// `StorageEngine`, mirroring the production
     /// `MutationForwardHandler` in `coordinator::mod`. Used to assert
