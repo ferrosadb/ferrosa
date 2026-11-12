@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use std::future::Future;
 
 use russh::client;
-use russh::keys::ssh_key;
+use russh::keys::PublicKeyOrCertificate;
 use russh::{ChannelMsg, Disconnect};
 use tracing::{debug, info};
 
@@ -28,7 +28,7 @@ impl client::Handler for ClientHandler {
 
     fn check_server_key(
         &mut self,
-        _server_public_key: &ssh_key::PublicKey,
+        _server_public_key: &PublicKeyOrCertificate,
     ) -> impl Future<Output = std::result::Result<bool, Self::Error>> + Send {
         // Accept all keys — VMs are ephemeral and we built the rootfs.
         std::future::ready(Ok(true))
