@@ -866,3 +866,63 @@ mod physical_handoff_tests {
             .admits_peer(controller.local_host_id, old_partner));
     }
 }
+
+/// The promotion guard reads `connected_peers` as its evidence the peer is
+/// alive. Nightly smoke run 43549692347 killed the primary and was refused with
+/// "pair peer ... is still connected" while this node's own watchdog had already
+/// logged `peer suspected dead: 3 missed heartbeats`. `Topology/Pair.lean`
+/// admits `Step.promote1` only while the peer is down.
+#[cfg(test)]
+mod promotion_guard_tests {
+    use super::*;
+    use crate::controller::tests::test_schema;
+    use ferrosa_net::peer::PeerEventListener;
+    use ferrosa_storage::{StorageEngine, StorageEngineConfig};
+
+    fn pair_secondary() -> (Arc<ModeController>, Uuid) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(&dir.path().join("data"));
+        config.commit_log.sync_strategy = Default::default();
+        let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+        let controller = ModeController::pair_secondary_for_test(test_schema(), engine);
+        let peer = controller
+            .pair_context
+            .lock()
+            .as_ref()
+            .expect("pair context")
+            .peer_host_id;
+        std::mem::forget(dir); // the engine's storage lives in the controller
+        (controller, peer)
+    }
+
+    fn promotion_error(controller: &ModeController) -> String {
+        match controller.force_promote() {
+            Ok(()) => String::new(),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_peer_the_heartbeat_watchdog_declared_dead_is_not_a_connected_peer() {
+        let (controller, peer) = pair_secondary();
+        let addr = "172.18.0.3:7000".parse().unwrap();
+        controller
+            .connected_peers
+            .store(Arc::new(vec![(peer, addr)]));
+
+        // A live transport must still refuse: that is the split brain of
+        // `unguarded_promotion_splits_brain`.
+        let live = promotion_error(&controller);
+        assert!(
+            live.contains("is still connected"),
+            "a live peer must still refuse promotion, got: {live}"
+        );
+
+        controller.on_peer_suspected((peer, addr));
+        let dead = promotion_error(&controller);
+        assert!(
+            !dead.contains("is still connected"),
+            "promotion over a peer the watchdog declared dead was refused as connected: {dead}"
+        );
+    }
+}
