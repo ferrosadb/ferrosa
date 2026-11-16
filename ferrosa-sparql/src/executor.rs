@@ -1,467 +1,725 @@
 //! SPARQL query executor.
 //!
-//! Executes a [`QueryPlan`] against ferrosa's StorageEngine, producing
-//! binding sets that are serialized into SPARQL results.
+//! Executes a [`QueryPlan`] against ferrosa's write path as a LAZY STREAM of
+//! solutions. Nothing in the pipeline holds "every solution": the consumer
+//! (the HTTP response body, an ASK, an UPDATE) pulls one solution at a time,
+//! and each pull pulls just enough from the storage scan beneath it.
 //!
 //! # Streaming scans
 //!
-//! Triple-pattern scans STREAM. A scan pulls one partition at a time from
-//! [`WritePath::range_read_stream_all`], decodes its rows, filters them, and
-//! pushes each surviving triple straight into the binding loop. There is no
-//! intermediate `Vec` of fetched triples, so the memory a scan costs is one
-//! partition — not the table. This is what stops `SELECT * WHERE { ?s ?p ?o }`
-//! (30 bytes of query) from materializing an entire triple store.
+//! A triple-pattern scan pulls one partition at a time from
+//! [`WritePath::range_read_stream_all`] (or a point read / index stream),
+//! decodes its rows one by one and hands each surviving triple downstream. The
+//! memory a scan costs is one partition.
 //!
-//! # Bounds
+//! # Joins
 //!
-//! [`ExecutionLimits::max_rows`] is the executor's ONE row bound. It is checked
-//! at the source (storage rows read by a scan) and on every operator's solution
-//! buffer. Exceeding it is an ERROR, never a truncation: a clipped result
-//! reported as complete is worse than a failure, because the caller cannot tell
-//! the difference. `LIMIT` is pushed INTO the scan whenever it is safe to do so
-//! — one triple pattern, no explicit Join, ORDER BY, DISTINCT, FILTER, or graph form —
-//! so a bounded query does bounded work rather than reading the whole table and
-//! throwing most of it away.
+//! A pattern applied to the solutions before it is a BLOCK nested-loop join:
+//! the outer stream is cut into blocks of [`JOIN_BLOCK_SOLUTIONS`], and for each
+//! block the inner side (a scan, a property path, a sub-pattern or a COUNT) is
+//! re-evaluated as a stream and matched against the block. The working set is
+//! one block plus one inner item, whatever the sizes of the two sides.
+//!
+//! # Blocking operators spill
+//!
+//! ORDER BY sorts through ferrosa-storage's [`ExternalSorter`]; DISTINCT
+//! de-duplicates through its [`SpillingDedup`](ferrosa_storage::spilling_dedup::SpillingDedup).
+//! Both keep a bounded working set and spill the rest under the context's spill
+//! root (see [`ExecutionContext`]).
+//!
+//! # No row bound
+//!
+//! There is no server-side row cap. A query returns every solution its pattern
+//! matches, or an error; it never returns a truncated result that looks
+//! complete. `LIMIT` is an optimization, not a bound: because every stage is
+//! pulled, `LIMIT n` stops the scan after the `n`-th solution (plus `OFFSET`).
 //! Correctness: legacy RDF identity tests and COUNT/JSON/protocol regressions.
-//! Last revised: 2026-10-27
-//! Last changed: Stream COUNT input and preserve typed bindings.
+//! Last revised: 2026-11-16
+//! Last changed: Stream solutions end to end; spill ORDER BY and DISTINCT; drop the row cap.
 
 use std::collections::HashMap;
-use std::ops::ControlFlow;
+use std::future::ready;
 use std::sync::Arc;
 
 use ferrosa_cluster::write_path::WritePath;
 use ferrosa_sstable::types::{Partition, Row};
-use futures::StreamExt;
+use ferrosa_storage::external_sort::{ExternalSorter, SortedRows, SpillOrder};
+use futures::stream::{self, BoxStream};
+use futures::{StreamExt, TryStreamExt};
 
 use crate::error::SparqlError;
-use crate::planner::{PlanStep, QueryPlan, TripleOp, TripleScope};
+use crate::planner::{OrderCondition, PlanStep, QueryPlan, TripleOp, TripleScope};
 use crate::results::{Binding, SparqlJsonResults};
 use crate::triple_store;
 
-/// Default value for [`ExecutionLimits::max_rows`].
-///
-/// Sized so that the worst case an unconstrained query can buffer — one
-/// solution row per storage row — stays in tens of megabytes rather than
-/// exhausting the server. Deployments with larger stores should raise it
-/// deliberately via `SparqlConfig::max_rows` and accept the memory cost.
-pub const DEFAULT_MAX_ROWS: usize = 100_000;
+use crate::spill::{solution_key, spill_error, SpillSolution};
+pub use crate::spill::{ExecutionContext, ExecutionStats, Solution};
 
-/// The executor's resource bounds.
-///
-/// One number, enforced in two places, both of them real:
-///
-/// - **at the source** — the number of storage rows a single triple-pattern
-///   scan may read, checked as rows are pulled from the partition stream;
-/// - **at each operator** — the number of solutions a pattern may buffer,
-///   checked as solutions are appended.
-///
-/// Crossing either is a [`SparqlError::Execution`]. Nothing is silently
-/// truncated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExecutionLimits {
-    /// Maximum storage rows read per scan, and maximum solutions buffered per
-    /// operator.
-    pub max_rows: usize,
+/// A lazy stream of solutions. `'static` so it can outlive the request handler
+/// and be written into the response body as it is produced.
+pub type SolutionStream = BoxStream<'static, Result<Solution, SparqlError>>;
+
+/// A lazy stream of decoded triples from one access path.
+pub(crate) type TripleStream = BoxStream<'static, Result<FetchedTriple, SparqlError>>;
+
+/// Outer solutions per block of a block nested-loop join: a working-set size,
+/// not a result bound — every block is joined, however many there are.
+pub const JOIN_BLOCK_SOLUTIONS: usize = 1024;
+
+/// What every stage of one query shares.
+pub(crate) struct Shared {
+    pub(crate) plan: Arc<QueryPlan>,
+    pub(crate) write_path: Arc<WritePath>,
+    pub(crate) cx: ExecutionContext,
 }
 
-impl Default for ExecutionLimits {
-    fn default() -> Self {
-        Self {
-            max_rows: DEFAULT_MAX_ROWS,
-        }
-    }
-}
-
-/// Execute a query plan and return SPARQL JSON results.
+/// Execute a query plan and collect SPARQL JSON results.
+///
+/// This MATERIALIZES the result, so it is for tests and embedded callers that
+/// want a value. The served path ([`crate::http`]) writes [`select_stream`]
+/// into the response incrementally instead.
 pub async fn execute(
     plan: &QueryPlan,
     write_path: &Arc<WritePath>,
-    limits: &ExecutionLimits,
+    cx: &ExecutionContext,
 ) -> Result<SparqlJsonResults, SparqlError> {
-    let mut binding_sets = evaluate_pattern(plan, write_path, limits).await?;
-
-    // BUG-S13 / URS-QEC-S04: apply ORDER BY (evaluates expressions per solution;
-    // fails loud on unsupported forms).
-    apply_order_by(&mut binding_sets, &plan.order_by)?;
-
-    // BUG-S13: apply DISTINCT.
-    if plan.distinct {
-        apply_distinct(&mut binding_sets, &plan.projection);
-    }
-
-    // BUG-S5 fix: clamp start to len so slicing never panics.
-    //
-    // `offset` and `limit` come straight out of the query text and are
-    // attacker-controlled `usize` values, so `start + limit` MUST saturate:
-    // `OFFSET 1 LIMIT 18446744073709551615` panics in debug and wraps to 0 in
-    // release (silently returning no rows) with an unchecked add. Do not rely
-    // on the trailing `.min(len)` to mask the wrap — it only happens to work
-    // because a materialized `Vec` has a `len()` to clamp against.
-    let start = plan.offset.unwrap_or(0).min(binding_sets.len());
-    let end = plan
-        .limit
-        .map(|l| start.saturating_add(l))
-        .unwrap_or(binding_sets.len())
-        .min(binding_sets.len());
-
-    let mut results = SparqlJsonResults::new(plan.projection.clone());
-    // Drain the LIMIT window and MOVE each selected binding out of its solution
-    // row into the projection, instead of cloning every binding (`b.clone()`).
-    // The drained window is the result set we are about to return, so this
-    // produces byte-identical `SparqlJsonResults` while removing one `Binding`
-    // (and its boxed term string) allocation per projected column per row. The
-    // solutions outside `[start, end)` are dropped here exactly as the borrow
-    // form left them to be dropped by the caller.
-    for row in binding_sets.drain(start..end) {
-        let mut row = row;
-        let projected: HashMap<String, Binding> = plan
-            .projection
-            .iter()
-            .filter_map(|var| row.remove(var).map(|b| (var.clone(), b)))
-            .collect();
-        results.add_row(projected);
-    }
-
+    let plan = Arc::new(plan.clone());
+    let projection = plan.projection.clone();
+    let rows: Vec<Solution> = select_stream(plan, Arc::clone(write_path), cx.clone())?
+        .try_collect()
+        .await?;
+    let mut results = SparqlJsonResults::new(projection);
+    rows.into_iter().for_each(|row| results.add_row(row));
     Ok(results)
 }
 
-/// Evaluate a plan's WHERE pattern and return the raw solution bindings
-/// (after FILTER, before projection/ORDER/DISTINCT/LIMIT).
+/// The full SELECT pipeline as a stream: WHERE → ORDER BY → projection →
+/// DISTINCT → OFFSET/LIMIT.
 ///
-/// Used by SPARQL UPDATE pattern-deletes (`DELETE WHERE`,
-/// `DELETE/INSERT … WHERE`): the full, unprojected binding set is needed so
-/// every matched solution can be substituted into the delete/insert templates.
-pub async fn execute_bindings(
-    plan: &QueryPlan,
-    write_path: &Arc<WritePath>,
-    limits: &ExecutionLimits,
-) -> Result<Vec<HashMap<String, Binding>>, SparqlError> {
-    evaluate_pattern(plan, write_path, limits).await
+/// Forms the executor cannot evaluate (an unsupported ORDER BY expression) are
+/// refused HERE, before any row is produced, so a caller can still answer with
+/// a clean error status.
+pub fn select_stream(
+    plan: Arc<QueryPlan>,
+    write_path: Arc<WritePath>,
+    cx: ExecutionContext,
+) -> Result<SolutionStream, SparqlError> {
+    validate_order_by(&plan.order_by)?;
+    let shared = Arc::new(Shared {
+        plan: Arc::clone(&plan),
+        write_path,
+        cx: cx.clone(),
+    });
+    let mut rows = where_stream(&shared);
+    if !plan.order_by.is_empty() {
+        rows = order_by_stream(rows, Arc::new(plan.order_by.clone()), cx.clone());
+    }
+    let projection: Arc<[String]> = plan.projection.clone().into();
+    rows = rows.map_ok(move |row| project(row, &projection)).boxed();
+    if plan.distinct {
+        rows = distinct_stream(rows, plan.projection.clone(), &cx);
+    }
+    Ok(slice_stream(rows, plan.offset.unwrap_or(0), plan.limit))
 }
 
-/// Evaluate the WHERE algebra in order, returning full solution bindings.
+/// Evaluate a plan's WHERE pattern as a stream of full (unprojected) solutions.
 ///
-/// SCOPE NOTE (unchanged by the streaming work): the join itself is still a
-/// nested loop that rebuilds a materialized `binding_sets` per pattern, so for
-/// a multi-pattern query the peak memory is set by the INTERMEDIATE solution
-/// sets, not by the scan. Those intermediates are now *bounded* — appending
-/// past [`ExecutionLimits::max_rows`] is a loud error — but they are not
-/// pipelined. Pipelining the join is a separate redesign.
-async fn evaluate_pattern(
-    plan: &QueryPlan,
-    write_path: &Arc<WritePath>,
-    limits: &ExecutionLimits,
-) -> Result<Vec<HashMap<String, Binding>>, SparqlError> {
-    evaluate_steps(&plan.steps, plan, write_path, limits, scan_budget(plan)).await
+/// Used by SPARQL UPDATE pattern ops, which substitute every solution into
+/// their templates.
+pub fn where_solutions(
+    plan: Arc<QueryPlan>,
+    write_path: Arc<WritePath>,
+    cx: ExecutionContext,
+) -> SolutionStream {
+    where_stream(&Arc::new(Shared {
+        plan,
+        write_path,
+        cx,
+    }))
 }
 
-async fn evaluate_steps(
-    steps: &[PlanStep],
-    plan: &QueryPlan,
-    write_path: &Arc<WritePath>,
-    limits: &ExecutionLimits,
-    budget: Option<usize>,
-) -> Result<Vec<HashMap<String, Binding>>, SparqlError> {
-    let mut binding_sets = vec![HashMap::new()];
+fn where_stream(shared: &Arc<Shared>) -> SolutionStream {
+    let seed: SolutionStream = stream::iter([Ok(Solution::new())]).boxed();
+    let steps: Arc<[PlanStep]> = shared.plan.steps.clone().into();
+    build_steps(&steps, seed, shared)
+}
+
+/// Compose `steps` over `input`. Synchronous: it only wires streams together;
+/// nothing is read until the result is polled.
+fn build_steps(steps: &[PlanStep], input: SolutionStream, shared: &Arc<Shared>) -> SolutionStream {
+    let mut rows = input;
     for step in steps {
-        match step {
+        rows = match step {
             PlanStep::Filter(index) => {
-                binding_sets.retain(|row| crate::filter::eval_filter(&plan.filters[*index], row));
+                let shared = Arc::clone(shared);
+                let index = *index;
+                rows.try_filter(move |row| {
+                    ready(crate::filter::eval_filter(&shared.plan.filters[index], row))
+                })
+                .boxed()
             }
             PlanStep::Extend {
                 variable,
                 expression,
             } => {
-                for row in &mut binding_sets {
-                    if let Some(binding) = crate::bind::evaluate(expression, row)? {
-                        row.insert(variable.clone(), binding);
-                    }
-                }
+                let variable: Arc<str> = variable.as_str().into();
+                let expression = Arc::new(expression.clone());
+                rows.and_then(move |mut row| {
+                    let bound = crate::bind::evaluate(&expression, &row).map(|binding| {
+                        if let Some(binding) = binding {
+                            row.insert(variable.to_string(), binding);
+                        }
+                        row
+                    });
+                    ready(bound)
+                })
+                .boxed()
             }
             PlanStep::Join { left, right } => {
-                // Neither operand may see the other's variables until the join.
-                let left = Box::pin(evaluate_steps(left, plan, write_path, limits, None)).await?;
-                let right = Box::pin(evaluate_steps(right, plan, write_path, limits, None)).await?;
-                binding_sets = join_solutions(&binding_sets, &left, limits)?;
-                binding_sets = join_solutions(&binding_sets, &right, limits)?;
+                // Neither operand may see the other's variables until the join,
+                // so each is evaluated from an empty seed and joined.
+                let rows = block_join(rows, sub_pattern(left.clone().into(), shared));
+                block_join(rows, sub_pattern(right.clone().into(), shared))
             }
             PlanStep::Count {
                 input,
                 variables,
                 aggregates,
             } => {
-                let counted =
-                    evaluate_counts(input, variables, aggregates, plan, write_path, limits).await?;
-                binding_sets = join_solutions(&binding_sets, &counted, limits)?;
+                let inner = count_inner(
+                    input.clone().into(),
+                    variables.clone().into(),
+                    aggregates.clone().into(),
+                    shared,
+                );
+                block_join(rows, inner)
             }
-            PlanStep::Triple(index) => {
-                let (tp, op) = &plan.ops[*index];
-                binding_sets = match op {
-                    TripleOp::PropertyPath {
-                        scope,
-                        subject,
-                        path,
-                        object,
-                    } => {
-                        evaluate_path_op(
-                            scope,
-                            subject,
-                            path,
-                            object,
-                            &binding_sets,
-                            write_path,
-                            limits,
-                        )
-                        .await?
-                    }
-                    _ => {
-                        evaluate_standard_op(tp, op, &binding_sets, write_path, limits, budget)
-                            .await?
-                    }
-                };
-            }
-        }
-    }
-    Ok(binding_sets)
-}
-
-/// A single triple scan streams into counters; joins/path operations use their
-/// existing bounded evaluator. Neither path returns input rows as COUNT output.
-async fn evaluate_counts(
-    input: &[PlanStep],
-    variables: &[String],
-    aggregates: &[(String, crate::planner::CountAggregate)],
-    plan: &QueryPlan,
-    write_path: &Arc<WritePath>,
-    limits: &ExecutionLimits,
-) -> Result<Vec<HashMap<String, Binding>>, SparqlError> {
-    let mut counts = crate::aggregate::Counts::new(variables, aggregates, limits);
-    if let Some((index, tail)) = count_stream_input(input, plan) {
-        let (pattern, op) = &plan.ops[index];
-        let empty = HashMap::new();
-        for_each_triple(op, write_path, limits, |triple| {
-            let Some(mut row) = try_bind_triple(pattern, &triple, &empty) else {
-                return Ok(ControlFlow::Continue(()));
-            };
-            for step in tail {
-                match step {
-                    PlanStep::Filter(index)
-                        if !crate::filter::eval_filter(&plan.filters[*index], &row) =>
-                    {
-                        return Ok(ControlFlow::Continue(()))
-                    }
-                    PlanStep::Extend {
-                        variable,
-                        expression,
-                    } => {
-                        if let Some(binding) = crate::bind::evaluate(expression, &row)? {
-                            row.insert(variable.clone(), binding);
-                        }
-                    }
-                    _ => {}
+            PlanStep::Triple(index) => match &shared.plan.ops[*index].1 {
+                TripleOp::PropertyPath {
+                    scope,
+                    subject,
+                    path,
+                    object,
+                } => {
+                    let inner = path_inner(
+                        scope.clone(),
+                        subject.clone(),
+                        path.clone(),
+                        object.clone(),
+                        shared,
+                    );
+                    block_join(rows, inner)
                 }
-            }
-            counts.feed(row)?;
-            Ok(ControlFlow::Continue(()))
-        })
-        .await?;
-    } else {
-        let input = Box::pin(evaluate_steps(input, plan, write_path, limits, None)).await?;
-        for row in input {
-            counts.feed(row)?;
-        }
-    }
-    Ok(counts.finish())
-}
-fn count_stream_input<'a>(
-    input: &'a [PlanStep],
-    plan: &QueryPlan,
-) -> Option<(usize, &'a [PlanStep])> {
-    let (PlanStep::Triple(index), tail) = input.split_first()? else {
-        return None;
-    };
-    if matches!(plan.ops[*index].1, TripleOp::PropertyPath { .. })
-        || !tail
-            .iter()
-            .all(|s| matches!(s, PlanStep::Filter(_) | PlanStep::Extend { .. }))
-    {
-        return None;
-    }
-    Some((*index, tail))
-}
-
-fn join_solutions(
-    left: &[HashMap<String, Binding>],
-    right: &[HashMap<String, Binding>],
-    limits: &ExecutionLimits,
-) -> Result<Vec<HashMap<String, Binding>>, SparqlError> {
-    let mut joined = Vec::new();
-    for left_row in left {
-        for right_row in right {
-            if let Some(row) = try_merge_bindings(left_row, right_row) {
-                joined.push(row);
-                check_solution_bound(joined.len(), limits)?;
-            }
-        }
-    }
-    Ok(joined)
-}
-
-/// How many solutions a single-pattern scan must produce before the executor
-/// can stop reading storage — the LIMIT pushdown budget.
-///
-/// `LIMIT` may only be pushed into the scan when every operator between the
-/// scan and the LIMIT preserves both the row count and the row order:
-///
-/// - exactly one triple pattern and no explicit Join — a join re-pairs
-///   solutions, so pattern *n*'s
-///   rows are not the query's rows;
-/// - no `ORDER BY` and no `DISTINCT` — both are blocking, and the top *n* of a
-///   sorted or deduplicated sequence is not the first *n* rows read;
-/// - no `FILTER` — a filter drops solutions after binding, so stopping at *n*
-///   bound rows can return fewer than *n* results;
-/// - no `CONSTRUCT`/`DESCRIBE`, whose graph result is derived from every
-///   solution rather than from the projected window.
-///
-/// `None` means "read every matching row". That is still bounded by
-/// [`ExecutionLimits::max_rows`] — it is unbounded LIMIT, not unbounded work.
-fn scan_budget(plan: &QueryPlan) -> Option<usize> {
-    if plan
-        .steps
-        .iter()
-        .any(|step| matches!(step, PlanStep::Join { .. } | PlanStep::Count { .. }))
-        || plan.ops.len() != 1
-        || !plan.order_by.is_empty()
-        || plan.distinct
-        || !plan.filters.is_empty()
-        || plan.graph_mode.is_some()
-    {
-        return None;
-    }
-    // OFFSET rows are consumed and discarded downstream, so the scan must
-    // produce `offset + limit` solutions. Saturating: both come from the query
-    // text and `usize::MAX` is a legal LIMIT.
-    plan.limit
-        .map(|l| plan.offset.unwrap_or(0).saturating_add(l))
-}
-
-/// Evaluate a property path op via BFS traversal.
-async fn evaluate_path_op(
-    scope: &TripleScope,
-    subject: &spargebra::term::TermPattern,
-    path: &spargebra::algebra::PropertyPathExpression,
-    object: &spargebra::term::TermPattern,
-    existing_bindings: &[HashMap<String, Binding>],
-    write_path: &Arc<WritePath>,
-    limits: &ExecutionLimits,
-) -> Result<Vec<HashMap<String, Binding>>, SparqlError> {
-    let results = crate::property_path::evaluate_property_path(
-        subject, path, object, scope, write_path, limits,
-    )
-    .await?;
-    let path_bindings = crate::property_path::path_results_to_bindings(subject, object, &results);
-
-    let mut new_bindings = Vec::new();
-    for existing in existing_bindings {
-        for pb in &path_bindings {
-            if let Some(merged) = try_merge_bindings(existing, pb) {
-                new_bindings.push(merged);
-                check_solution_bound(new_bindings.len(), limits)?;
-            }
-        }
-    }
-    Ok(new_bindings)
-}
-
-/// Evaluate a standard (non-path) triple pattern op against a STREAMING scan.
-///
-/// The loop nesting is triple-major (`for each streamed triple { for each
-/// existing binding }`) rather than the binding-major form it replaced. That
-/// inversion is what lets the triple side stream: a triple is bound and dropped
-/// before the next one is pulled, so no `Vec<FetchedTriple>` ever exists. For
-/// the single-pattern case (`existing_bindings == [{}]`) the emitted order is
-/// identical to the old code; for a join the solution order changes, which
-/// SPARQL bag semantics do not constrain in the absence of `ORDER BY`.
-async fn evaluate_standard_op(
-    tp: &spargebra::term::TriplePattern,
-    op: &TripleOp,
-    existing_bindings: &[HashMap<String, Binding>],
-    write_path: &Arc<WritePath>,
-    limits: &ExecutionLimits,
-    budget: Option<usize>,
-) -> Result<Vec<HashMap<String, Binding>>, SparqlError> {
-    let mut new_bindings: Vec<HashMap<String, Binding>> = Vec::new();
-    let subject_index = bound_subject_index(tp, existing_bindings);
-    for_each_triple(op, write_path, limits, |triple| {
-        let kind = if triple.0.starts_with("_:") {
-            "bnode"
-        } else {
-            "uri"
+                _ => triple_join(rows, *index, shared),
+            },
         };
-        let indexed = subject_index
-            .as_ref()
-            .and_then(|index| index.get(&(kind, triple.0.as_str())))
+    }
+    rows
+}
+
+/// Re-evaluates an inner side for each outer block.
+type InnerFactory = Arc<dyn Fn() -> SolutionStream + Send + Sync>;
+
+fn sub_pattern(steps: Arc<[PlanStep]>, shared: &Arc<Shared>) -> InnerFactory {
+    let shared = Arc::clone(shared);
+    Arc::new(move || {
+        let seed: SolutionStream = stream::iter([Ok(Solution::new())]).boxed();
+        build_steps(&steps, seed, &shared)
+    })
+}
+
+fn count_inner(
+    input: Arc<[PlanStep]>,
+    variables: Arc<[String]>,
+    aggregates: Arc<[(String, crate::planner::CountAggregate)]>,
+    shared: &Arc<Shared>,
+) -> InnerFactory {
+    let shared = Arc::clone(shared);
+    Arc::new(move || {
+        let seed: SolutionStream = stream::iter([Ok(Solution::new())]).boxed();
+        let rows = build_steps(&input, seed, &shared);
+        crate::aggregate::count_stream(
+            rows,
+            Arc::clone(&variables),
+            Arc::clone(&aggregates),
+            shared.cx.clone(),
+        )
+    })
+}
+
+fn path_inner(
+    scope: TripleScope,
+    subject: spargebra::term::TermPattern,
+    path: spargebra::algebra::PropertyPathExpression,
+    object: spargebra::term::TermPattern,
+    shared: &Arc<Shared>,
+) -> InnerFactory {
+    let shared = Arc::clone(shared);
+    let parts = Arc::new((scope, subject, path, object));
+    Arc::new(move || {
+        let (scope, subject, path, object) = &*parts;
+        let pairs = crate::property_path::path_pairs(
+            subject,
+            path,
+            object,
+            scope,
+            &shared.write_path,
+            &shared.cx,
+        );
+        let ends = Arc::clone(&parts);
+        pairs
+            .try_filter_map(move |(s, o)| {
+                ready(Ok(crate::property_path::pair_to_binding(
+                    &ends.1, &ends.3, s, o,
+                )))
+            })
+            .boxed()
+    })
+}
+
+/// Block nested-loop join of `outer` with a re-evaluated inner stream.
+fn block_join(outer: SolutionStream, inner: InnerFactory) -> SolutionStream {
+    outer
+        .try_chunks(JOIN_BLOCK_SOLUTIONS)
+        .map_err(|e| e.1)
+        .map_ok(move |block| {
+            let block = Arc::new(block);
+            inner()
+                .map_ok(move |inner_row| {
+                    let joined: Vec<Result<Solution, SparqlError>> = block
+                        .iter()
+                        .filter_map(|outer_row| try_merge_bindings(outer_row, &inner_row))
+                        .map(Ok)
+                        .collect();
+                    stream::iter(joined)
+                })
+                .try_flatten()
+        })
+        .try_flatten()
+        .boxed()
+}
+
+/// Join `outer` with triple pattern `index`: per outer block, one streaming
+/// scan of the pattern's access path, each triple bound against the block.
+///
+/// The loop nesting is triple-major within a block (`for each streamed triple
+/// { for each block solution }`), which is what lets the triple side stream.
+/// SPARQL bag semantics do not constrain solution order without `ORDER BY`.
+fn triple_join(outer: SolutionStream, index: usize, shared: &Arc<Shared>) -> SolutionStream {
+    let shared = Arc::clone(shared);
+    outer
+        .try_chunks(JOIN_BLOCK_SOLUTIONS)
+        .map_err(|e| e.1)
+        .map_ok(move |block| {
+            let (pattern, op) = &shared.plan.ops[index];
+            let subject_index = Arc::new(bound_subject_index(pattern, &block));
+            let block = Arc::new(block);
+            let bind = Arc::clone(&shared);
+            triple_stream(op, &shared.write_path, &shared.cx)
+                .map_ok(move |triple| {
+                    let pattern = &bind.plan.ops[index].0;
+                    stream::iter(bind_against_block(
+                        pattern,
+                        &triple,
+                        &block,
+                        Option::as_ref(&*subject_index),
+                    ))
+                })
+                .try_flatten()
+        })
+        .try_flatten()
+        .boxed()
+}
+
+/// Every block solution `triple` extends, as ready-to-emit items.
+fn bind_against_block(
+    pattern: &spargebra::term::TriplePattern,
+    triple: &FetchedTriple,
+    block: &[Solution],
+    subject_index: Option<&SubjectIndex>,
+) -> Vec<Result<Solution, SparqlError>> {
+    let bind = |existing: &Solution| try_bind_triple(pattern, triple, existing).map(Ok);
+    match subject_index {
+        // An unbound subject still needs the general compatibility join.
+        None => block.iter().filter_map(bind).collect(),
+        // Otherwise only visit the block rows whose subject hashes alike;
+        // `try_bind_triple` re-checks the exact term.
+        Some(index) => index
+            .get(&subject_hash(subject_kind(&triple.0), &triple.0))
             .into_iter()
             .flatten()
-            .copied();
-        // An unbound subject still needs the general compatibility join.
-        // Otherwise only visit matching indices, retaining duplicates and
-        // arrival order without cloning keys or candidate solutions.
-        let fallback = 0..if subject_index.is_none() {
-            existing_bindings.len()
-        } else {
-            0
-        };
-        for position in indexed.chain(fallback) {
-            let existing = &existing_bindings[position];
-            let Some(row) = try_bind_triple(tp, &triple, existing) else {
-                continue;
-            };
-            new_bindings.push(row);
-            check_solution_bound(new_bindings.len(), limits)?;
-            if budget.is_some_and(|needed| new_bindings.len() >= needed) {
-                return Ok(ControlFlow::Break(()));
-            }
-        }
-        Ok(ControlFlow::Continue(()))
-    })
-    .await?;
-    Ok(new_bindings)
+            .filter_map(|&position| bind(&block[position]))
+            .collect(),
+    }
 }
 
-type SubjectIndex<'a> = HashMap<(&'a str, &'a str), Vec<usize>>;
+/// Block positions keyed by the hash of their bound subject term.
+type SubjectIndex = HashMap<u64, Vec<usize>>;
 
-fn bound_subject_index<'a>(
+fn subject_kind(subject: &str) -> &'static str {
+    if subject.starts_with("_:") {
+        "bnode"
+    } else {
+        "uri"
+    }
+}
+
+fn subject_hash(kind: &str, value: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    kind.hash(&mut hasher);
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Index the block by its subject variable's value, when every row binds it.
+fn bound_subject_index(
     pattern: &spargebra::term::TriplePattern,
-    rows: &'a [HashMap<String, Binding>],
-) -> Option<SubjectIndex<'a>> {
+    rows: &[Solution],
+) -> Option<SubjectIndex> {
     let spargebra::term::TermPattern::Variable(var) = &pattern.subject else {
         return None;
     };
     let mut index = HashMap::new();
     for (position, row) in rows.iter().enumerate() {
         let value = row.get(var.as_str())?;
-        let key = (value.kind(), value.scalar_value()?);
+        let key = subject_hash(value.kind(), value.scalar_value()?);
         index.entry(key).or_insert_with(Vec::new).push(position);
     }
     Some(index)
 }
 
-/// Fail loud when an operator's solution buffer crosses the row bound.
-pub(crate) fn check_solution_bound(
-    buffered: usize,
-    limits: &ExecutionLimits,
-) -> Result<(), SparqlError> {
-    if buffered > limits.max_rows {
-        return Err(SparqlError::Execution(format!(
-            "SPARQL query buffered more than {} solutions. Refusing to return a \
-             truncated result that would look complete — add a LIMIT, constrain the \
-             pattern, or raise the engine's max_rows bound.",
-            limits.max_rows
-        )));
+/// Move the projected bindings out of a solution.
+fn project(mut row: Solution, projection: &[String]) -> Solution {
+    projection
+        .iter()
+        .filter_map(|var| row.remove_entry(var))
+        .collect()
+}
+
+/// `OFFSET`/`LIMIT` over a stream. Errors are never skipped or counted: an
+/// error inside the OFFSET window still fails the query. Once `limit` solutions
+/// have been emitted the upstream is not polled again, which is what stops the
+/// scan (LIMIT pushdown by pull).
+fn slice_stream(rows: SolutionStream, offset: usize, limit: Option<usize>) -> SolutionStream {
+    let mut skipped = 0usize;
+    let rows = rows.try_filter(move |_| {
+        let keep = skipped >= offset;
+        if !keep {
+            skipped += 1;
+        }
+        ready(keep)
+    });
+    let Some(remaining) = limit else {
+        return rows.boxed();
+    };
+    stream::unfold(
+        (rows.boxed(), remaining),
+        |(mut rows, remaining)| async move {
+            if remaining == 0 {
+                return None;
+            }
+            let item = rows.next().await?;
+            let remaining = if item.is_ok() { remaining - 1 } else { 0 };
+            Some((item, (rows, remaining)))
+        },
+    )
+    .boxed()
+}
+
+/// DISTINCT on the (already projected) solution, first occurrence wins.
+fn distinct_stream(
+    rows: SolutionStream,
+    projection: Vec<String>,
+    cx: &ExecutionContext,
+) -> SolutionStream {
+    let mut seen = cx.dedup("sparql-distinct");
+    rows.try_filter_map(move |row| {
+        let fresh =
+            solution_key(&row, &projection).and_then(|key| seen.insert(&key).map(|f| (f, row)));
+        ready(fresh.map(|(fresh, row)| fresh.then_some(row)))
+    })
+    .boxed()
+}
+
+/// Refuse ORDER BY forms this engine cannot evaluate (URS-QEC-X01): sorting
+/// those rows as equal would return an arbitrary order that looks deliberate.
+fn validate_order_by(order_by: &[OrderCondition]) -> Result<(), SparqlError> {
+    for cond in order_by {
+        if let Some(what) = crate::filter::unsupported_expr(&cond.expression) {
+            return Err(SparqlError::Plan(format!(
+                "ORDER BY expression is not supported: {what}; \
+                 cannot evaluate it per solution, refusing to return an \
+                 arbitrarily-ordered result"
+            )));
+        }
     }
     Ok(())
+}
+
+/// ORDER BY conditions as an external-sort comparator.
+#[derive(Clone)]
+struct SolutionOrder(Arc<Vec<OrderCondition>>);
+
+impl SpillOrder<SpillSolution> for SolutionOrder {
+    fn compare(&self, a: &SpillSolution, b: &SpillSolution) -> std::cmp::Ordering {
+        compare_solutions(&self.0, &a.0, &b.0)
+    }
+}
+
+/// Sort solutions by ORDER BY conditions (BUG-S13, URS-QEC-S04).
+///
+/// Each condition holds a full expression (a plain `?var` is the trivial
+/// `Variable` expression), evaluated per solution; numeric when both sides are
+/// numeric.
+fn compare_solutions(
+    order_by: &[OrderCondition],
+    a: &Solution,
+    b: &Solution,
+) -> std::cmp::Ordering {
+    for cond in order_by {
+        let ord = crate::filter::order_cmp(&cond.expression, a, b);
+        let ord = if cond.ascending { ord } else { ord.reverse() };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// ORDER BY through ferrosa-storage's spilling external sorter.
+///
+/// Blocking by nature — no output row is known until every input row is seen —
+/// but bounded: the sorter holds at most the spill threshold in memory and
+/// merges sorted runs from disk with one row per run resident.
+fn order_by_stream(
+    rows: SolutionStream,
+    order_by: Arc<Vec<OrderCondition>>,
+    cx: ExecutionContext,
+) -> SolutionStream {
+    stream::once(async move {
+        let dir = cx.reserve_dir("sparql-order-by")?;
+        let mut sorter = ExternalSorter::new(
+            dir.path(),
+            SolutionOrder(order_by),
+            cx.spill_threshold_bytes(),
+        );
+        rows.try_for_each(|row| {
+            ready(
+                sorter
+                    .push(SpillSolution(row))
+                    .map_err(|e| spill_error("ORDER BY", e)),
+            )
+        })
+        .await?;
+        if sorter.spilled() {
+            cx.stats().note_sort_spill();
+        }
+        let sorted = sorter.finish().map_err(|e| spill_error("ORDER BY", e))?;
+        Ok::<_, SparqlError>(stream::iter(Sorted {
+            rows: sorted,
+            _dir: dir,
+        }))
+    })
+    .try_flatten()
+    .boxed()
+}
+
+/// Sorted output that keeps its run directory alive until it is consumed.
+struct Sorted {
+    rows: SortedRows<SpillSolution, SolutionOrder>,
+    _dir: ferrosa_storage::engine::TempSortTableReservation,
+}
+
+impl Iterator for Sorted {
+    type Item = Result<Solution, SparqlError>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.rows
+            .next()
+            .map(|row| row.map(|r| r.0).map_err(|e| spill_error("ORDER BY", e)))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Access paths
+// ---------------------------------------------------------------------------
+
+/// Stream every triple `op`'s access path yields, filtered to the op.
+///
+/// This is the streaming source. A range scan pulls ONE PARTITION AT A TIME
+/// from [`WritePath::range_read_stream_all`]; dropping the stream (a satisfied
+/// `LIMIT`, an ASK, a cancelled request) stops the scan.
+pub(crate) fn triple_stream(
+    op: &TripleOp,
+    write_path: &Arc<WritePath>,
+    cx: &ExecutionContext,
+) -> TripleStream {
+    let Some(scope) = op_scope(op) else {
+        return stream::empty().boxed();
+    };
+    let graph_filter = scope
+        .isolated_graph
+        .then(|| Arc::<str>::from(scope.graph.as_str()));
+    let op = Arc::new(op.clone());
+    let stats = Arc::clone(cx.stats());
+    let write_path = Arc::clone(write_path);
+    stream::once(open_partitions(Arc::clone(&op), write_path))
+        .try_flatten()
+        .map_ok(move |partition| {
+            stream::iter(PartitionTriples::new(
+                partition,
+                Arc::clone(&op),
+                graph_filter.clone(),
+                Arc::clone(&stats),
+            ))
+        })
+        .try_flatten()
+        .boxed()
+}
+
+type PartitionStream = BoxStream<'static, Result<Partition, SparqlError>>;
+
+/// Open `op`'s partition source.
+async fn open_partitions(
+    op: Arc<TripleOp>,
+    write_path: Arc<WritePath>,
+) -> Result<PartitionStream, SparqlError> {
+    let Some(scope) = op_scope(&op) else {
+        return Ok(stream::empty().boxed());
+    };
+    // The TABLE is named by the keyspace; the partition key is (GRAPH, subject).
+    let table_id = triple_store::triples_table_id(&scope.keyspace);
+    match &*op {
+        TripleOp::SubjectLookup { subject, .. } => {
+            // Point read: one partition by construction.
+            let key = triple_store::checked_partition_key(&scope.graph, subject)?;
+            let partition = write_path.read(&table_id, &key).await?;
+            Ok(stream::iter(partition.map(Ok)).boxed())
+        }
+        TripleOp::ObjectScan { object, .. } => {
+            object_partitions(object, &table_id, &write_path).await
+        }
+        TripleOp::PredicateScan { .. } | TripleOp::FullScan { .. } => {
+            scan_partitions(&table_id, &write_path).await
+        }
+        TripleOp::PropertyPath { .. } => Ok(stream::empty().boxed()),
+    }
+}
+
+/// A streaming full scan of the table.
+async fn scan_partitions(
+    table_id: &ferrosa_storage::TableId,
+    write_path: &Arc<WritePath>,
+) -> Result<PartitionStream, SparqlError> {
+    // `row_limit = 0` means "do not truncate rows within a partition".
+    Ok(write_path
+        .range_read_stream_all(table_id, 0)
+        .await?
+        .map_err(SparqlError::from)
+        .boxed())
+}
+
+/// The object index is an optimisation over a scan that is always correct, so
+/// it is read only where it can answer: this node must DECLARE it and it must
+/// be CURRENT (a pending backfill holds a fraction of the table, and a
+/// fraction reported as the whole answer is worse than a slow one).
+async fn object_partitions(
+    object: &str,
+    table_id: &ferrosa_storage::TableId,
+    write_path: &Arc<WritePath>,
+) -> Result<PartitionStream, SparqlError> {
+    if !write_path.declares_index_locally(table_id, OBJECT_INDEX_NAME) {
+        tracing::warn!(
+            object,
+            index = OBJECT_INDEX_NAME,
+            "ObjectScan: object index is not declared; streaming full scan \
+             with filtering"
+        );
+        return scan_partitions(table_id, write_path).await;
+    }
+    if !write_path.index_is_current(table_id, OBJECT_INDEX_NAME) {
+        tracing::warn!(
+            object,
+            index = OBJECT_INDEX_NAME,
+            "ObjectScan: object index is declared but not yet current — its backfill \
+             is still pending or has failed; streaming full scan with filtering"
+        );
+        return scan_partitions(table_id, write_path).await;
+    }
+    let index_key = ferrosa_index::IndexKey(object.as_bytes().to_vec());
+    let mut indexed = write_path
+        .index_read_stream(table_id, OBJECT_INDEX_NAME, &index_key, None)
+        .await?
+        .map_err(SparqlError::from)
+        .peekable();
+    if std::pin::Pin::new(&mut indexed).peek().await.is_none() {
+        tracing::warn!(
+            object,
+            "ObjectScan: no secondary index hit; falling back to a streaming \
+             full scan with filtering"
+        );
+        return scan_partitions(table_id, write_path).await;
+    }
+    Ok(indexed.boxed())
+}
+
+/// The triples of one partition, decoded one row at a time.
+struct PartitionTriples {
+    partition: Partition,
+    subject: Option<String>,
+    next_row: usize,
+    op: Arc<TripleOp>,
+    stats: Arc<ExecutionStats>,
+    failed: Option<SparqlError>,
+}
+
+impl PartitionTriples {
+    fn new(
+        partition: Partition,
+        op: Arc<TripleOp>,
+        graph_filter: Option<Arc<str>>,
+        stats: Arc<ExecutionStats>,
+    ) -> Self {
+        // BUG-S3 fix: decode composite partition key (graph, subject) properly.
+        let (subject, failed) = match triple_store::decode_partition(partition.key.key.as_bytes()) {
+            // A partition outside an isolated graph is skipped whole.
+            Ok((graph, _)) if graph_filter.as_deref().is_some_and(|g| g != graph) => (None, None),
+            Ok((_, subject)) => (Some(subject), None),
+            Err(e) => (None, Some(e)),
+        };
+        Self {
+            partition,
+            subject,
+            next_row: 0,
+            op,
+            stats,
+            failed,
+        }
+    }
+}
+
+impl Iterator for PartitionTriples {
+    type Item = Result<FetchedTriple, SparqlError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(e) = self.failed.take() {
+            return Some(Err(e));
+        }
+        let subject = self.subject.as_deref()?;
+        while let Some(row) = self.partition.rows.get(self.next_row) {
+            self.next_row += 1;
+            self.stats.add_rows_read(1);
+            let triple = match decode_triple(row, subject) {
+                Ok(Some(triple)) => triple,
+                Ok(None) => continue,
+                Err(e) => return Some(Err(e)),
+            };
+            if triple_matches_op(&self.op, &triple) {
+                return Some(Ok(triple));
+            }
+        }
+        None
+    }
 }
 
 /// Merge two binding sets if compatible (no conflicting values).
@@ -613,53 +871,6 @@ fn try_insert_binding(row: &mut HashMap<String, Binding>, name: &str, binding: &
     }
 }
 
-/// Sort binding sets by ORDER BY conditions (BUG-S13, URS-QEC-S04).
-///
-/// Each condition holds a full expression (a plain `?var` is the trivial
-/// `Variable` expression). The expression is evaluated per solution and the
-/// solutions are sorted by the result, numerically when both sides are numeric.
-///
-/// URS-QEC-X01 (fail loud): if any ORDER BY expression contains a sub-form this
-/// engine cannot evaluate, return an error instead of silently sorting those
-/// rows as equal (which would yield an arbitrary, undocumented order).
-fn apply_order_by(
-    binding_sets: &mut [HashMap<String, Binding>],
-    order_by: &[crate::planner::OrderCondition],
-) -> Result<(), SparqlError> {
-    if order_by.is_empty() {
-        return Ok(());
-    }
-    for cond in order_by {
-        if let Some(what) = crate::filter::unsupported_expr(&cond.expression) {
-            return Err(SparqlError::Plan(format!(
-                "ORDER BY expression is not supported: {what}; \
-                 cannot evaluate it per solution, refusing to return an \
-                 arbitrarily-ordered result"
-            )));
-        }
-    }
-    binding_sets.sort_by(|a, b| {
-        for cond in order_by {
-            let ord = crate::filter::order_cmp(&cond.expression, a, b);
-            let ord = if cond.ascending { ord } else { ord.reverse() };
-            if ord != std::cmp::Ordering::Equal {
-                return ord;
-            }
-        }
-        std::cmp::Ordering::Equal
-    });
-    Ok(())
-}
-
-/// Remove duplicate binding rows (BUG-S13).
-fn apply_distinct(binding_sets: &mut Vec<HashMap<String, Binding>>, projection: &[String]) {
-    let mut seen = std::collections::HashSet::new();
-    binding_sets.retain(|row| {
-        let key: Vec<_> = projection.iter().map(|var| row.get(var).cloned()).collect();
-        seen.insert(key)
-    });
-}
-
 /// A fetched triple: (subject, predicate, object, object_type, datatype, language).
 type FetchedTriple = (String, String, Binding);
 
@@ -671,7 +882,7 @@ type FetchedTriple = (String, String, Binding);
 pub(crate) const OBJECT_INDEX_NAME: &str = "rdf_triples_object_idx";
 
 /// The graph a storage-backed op reads from. `None` for `PropertyPath`, which
-/// is evaluated by [`evaluate_path_op`] and never reaches the scan.
+/// is evaluated by [`crate::property_path`] and never reaches the scan.
 fn op_scope(op: &TripleOp) -> Option<&TripleScope> {
     match op {
         // BUG-S2 fix: use the graph from the execution plan, not hardcoded "rdf".
@@ -684,206 +895,6 @@ fn op_scope(op: &TripleOp) -> Option<&TripleScope> {
         | TripleOp::FullScan { scope, .. } => Some(scope),
         TripleOp::PropertyPath { .. } => None,
     }
-}
-
-/// Human-readable access path, for bound-exceeded diagnostics.
-fn describe_op(op: &TripleOp) -> String {
-    match op {
-        TripleOp::SubjectLookup { subject, .. } => format!("a subject lookup of <{subject}>"),
-        TripleOp::PredicateScan { predicate, .. } => format!("a scan for predicate <{predicate}>"),
-        TripleOp::ObjectScan { object, .. } => format!("a scan for object '{object}'"),
-        TripleOp::FullScan { scope } => {
-            format!("a full scan of graph '{}'", scope.graph)
-        }
-        TripleOp::PropertyPath { .. } => "a property path".to_string(),
-    }
-}
-
-/// Per-scan state: the caller's sink plus the storage-row counter that enforces
-/// [`ExecutionLimits::max_rows`] AT THE SOURCE — where the unbounded data
-/// enters, not after it has already been materialized.
-struct Scan<'a, F> {
-    op: &'a TripleOp,
-    limits: &'a ExecutionLimits,
-    sink: F,
-    rows_read: usize,
-    /// When set, a partition whose graph component is not this value is skipped
-    /// whole — it never reaches the row loop, so it costs neither a solution
-    /// nor a row of the scan budget. `None` for scopes that do not isolate a
-    /// graph (see [`TripleScope::isolated_graph`]).
-    graph_filter: Option<String>,
-}
-
-impl<F> Scan<'_, F>
-where
-    F: FnMut(FetchedTriple) -> Result<ControlFlow<()>, SparqlError>,
-{
-    /// Decode one partition and push its matching triples to the sink.
-    ///
-    /// Nothing accumulates here: a row is decoded, filtered, handed to the sink
-    /// and dropped before the next one is touched.
-    fn feed(&mut self, partition: &Partition) -> Result<ControlFlow<()>, SparqlError> {
-        // BUG-S3 fix: decode composite partition key (graph, subject) properly.
-        let (graph, subject) = triple_store::decode_partition(partition.key.key.as_bytes())?;
-        if self
-            .graph_filter
-            .as_deref()
-            .is_some_and(|expected| expected != graph)
-        {
-            return Ok(ControlFlow::Continue(()));
-        }
-        for row in &partition.rows {
-            self.rows_read += 1;
-            if self.rows_read > self.limits.max_rows {
-                return Err(SparqlError::Execution(format!(
-                    "SPARQL scan read more than {} storage rows while evaluating {}. \
-                     Refusing to return a truncated result that would look complete — \
-                     add a LIMIT, constrain the pattern, or raise the engine's max_rows \
-                     bound.",
-                    self.limits.max_rows,
-                    describe_op(self.op),
-                )));
-            }
-            let Some(triple) = decode_triple(row, &subject)? else {
-                continue;
-            };
-            if !triple_matches_op(self.op, &triple) {
-                continue;
-            }
-            if (self.sink)(triple)?.is_break() {
-                return Ok(ControlFlow::Break(()));
-            }
-        }
-        Ok(ControlFlow::Continue(()))
-    }
-}
-
-/// Drive `op`'s access path, handing every matching triple to `sink`.
-///
-/// This is the streaming source. A range scan pulls ONE PARTITION AT A TIME
-/// from [`WritePath::range_read_stream_all`] — the same streaming primitive the
-/// CQL path uses — instead of collecting the whole table into a `Vec` first.
-/// `sink` returns [`ControlFlow::Break`] to stop the scan early, which is how
-/// `LIMIT` pushdown terminates a scan without reading the rest of the table.
-async fn for_each_triple<F>(
-    op: &TripleOp,
-    write_path: &Arc<WritePath>,
-    limits: &ExecutionLimits,
-    sink: F,
-) -> Result<(), SparqlError>
-where
-    F: FnMut(FetchedTriple) -> Result<ControlFlow<()>, SparqlError>,
-{
-    let Some(scope) = op_scope(op) else {
-        return Ok(());
-    };
-    // The TABLE is named by the keyspace; the partition key is (GRAPH, subject).
-    // These were the same value until this fix, which is why a point read
-    // missed rows a scan of the same table found.
-    let table_id = triple_store::triples_table_id(&scope.keyspace);
-    let mut scan = Scan {
-        op,
-        limits,
-        sink,
-        rows_read: 0,
-        graph_filter: if scope.isolated_graph {
-            Some(scope.graph.clone())
-        } else {
-            None
-        },
-    };
-
-    match op {
-        TripleOp::SubjectLookup { subject, .. } => {
-            // Point read: bounded by one partition's row count by construction.
-            let key = triple_store::checked_partition_key(&scope.graph, subject)?;
-            if let Some(partition) = write_path.read(&table_id, &key).await? {
-                // Exactly one partition: `Break` and `Continue` are equivalent
-                // here because there is nothing left to feed either way.
-                let _ = scan.feed(&partition)?;
-            }
-        }
-        TripleOp::ObjectScan { object, .. } => {
-            // The index is an optimisation over a scan that is always correct,
-            // so the index path is taken only where it can actually answer:
-            // this node must DECLARE the index AND the index must be CURRENT.
-            //
-            // An undeclared index used to be read as "no hits"; it is refused
-            // now, not answered empty (t_50c8bc7d), so the fallback is chosen
-            // here, up front. A DECLARED index whose backfill is still pending
-            // is refused too, for a different reason — it holds a fraction of
-            // the table, and a fraction reported as the whole answer is worse
-            // than a slow one. During that window the scan is the only correct
-            // access path, exactly as it was before the index existed.
-            if !write_path.declares_index_locally(&table_id, OBJECT_INDEX_NAME) {
-                tracing::warn!(
-                    object,
-                    index = OBJECT_INDEX_NAME,
-                    "ObjectScan: object index is not declared; streaming full scan \
-                     with filtering"
-                );
-                stream_scan(&table_id, write_path, &mut scan).await?;
-            } else if !write_path.index_is_current(&table_id, OBJECT_INDEX_NAME) {
-                tracing::warn!(
-                    object,
-                    index = OBJECT_INDEX_NAME,
-                    "ObjectScan: object index is declared but not yet current — its backfill \
-                     is still pending or has failed; streaming full scan with filtering"
-                );
-                stream_scan(&table_id, write_path, &mut scan).await?;
-            } else {
-                // Keyed index read first. The stream keeps transport bounded and
-                // lets the scan stop as soon as its sink is satisfied.
-                let index_key = ferrosa_index::IndexKey(object.as_bytes().to_vec());
-                let mut indexed = write_path
-                    .index_read_stream(&table_id, OBJECT_INDEX_NAME, &index_key, None)
-                    .await?;
-                let mut found = false;
-                let mut stopped = false;
-                while let Some(partition) = indexed.next().await {
-                    found = true;
-                    if scan.feed(&partition?)?.is_break() {
-                        stopped = true;
-                        break;
-                    }
-                }
-                if !found && !stopped {
-                    tracing::warn!(
-                        object,
-                        "ObjectScan: no secondary index hit; falling back to a streaming \
-                         full scan with filtering"
-                    );
-                    stream_scan(&table_id, write_path, &mut scan).await?;
-                }
-            }
-        }
-        TripleOp::PredicateScan { .. } | TripleOp::FullScan { .. } => {
-            stream_scan(&table_id, write_path, &mut scan).await?;
-        }
-        TripleOp::PropertyPath { .. } => {}
-    }
-    Ok(())
-}
-
-/// Consume a streaming range scan, feeding each partition to `scan` as it
-/// arrives and stopping as soon as the sink is satisfied.
-async fn stream_scan<F>(
-    table_id: &ferrosa_storage::TableId,
-    write_path: &Arc<WritePath>,
-    scan: &mut Scan<'_, F>,
-) -> Result<(), SparqlError>
-where
-    F: FnMut(FetchedTriple) -> Result<ControlFlow<()>, SparqlError>,
-{
-    // `row_limit = 0` means "do not truncate rows within a partition"; the
-    // executor's own bound and LIMIT budget decide when to stop.
-    let mut partitions = write_path.range_read_stream_all(table_id, 0).await?;
-    while let Some(partition) = partitions.next().await {
-        if scan.feed(&partition?)?.is_break() {
-            break;
-        }
-    }
-    Ok(())
 }
 
 /// BUG-S3 fix: Properly decode CQL composite partition key to extract the subject.
@@ -1213,15 +1224,63 @@ mod tests {
     // --- BUG-S13: DISTINCT ---
 
     #[test]
-    fn apply_distinct_removes_duplicates() {
-        let mut rows = vec![
+    fn distinct_stream_removes_duplicates() {
+        let rows = vec![
             make_binding_row("name", "Alice"),
             make_binding_row("name", "Bob"),
             make_binding_row("name", "Alice"),
         ];
-        let projection = vec!["name".into()];
-        apply_distinct(&mut rows, &projection);
-        assert_eq!(rows.len(), 2);
+        let dir = tempfile::tempdir().unwrap();
+        let cx = ExecutionContext::new(dir.path(), 1 << 20);
+        let input: SolutionStream = stream::iter(rows.into_iter().map(Ok)).boxed();
+        let out: Vec<Solution> = futures::executor::block_on(
+            distinct_stream(input, vec!["name".into()], &cx).try_collect(),
+        )
+        .unwrap();
+        let names: Vec<&str> = out
+            .iter()
+            .map(|r| r["name"].scalar_value().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["Alice", "Bob"],
+            "first occurrence wins, order kept"
+        );
+    }
+
+    #[test]
+    fn distinct_stream_past_its_resident_keys_spills_and_stays_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let cx = ExecutionContext::new(dir.path(), 1 << 20).with_dedup_resident_keys(4);
+        let rows = (0..200).map(|i| Ok(make_binding_row("n", &(i % 50).to_string())));
+        let input: SolutionStream = stream::iter(rows.collect::<Vec<_>>()).boxed();
+        let out: Vec<Solution> = futures::executor::block_on(
+            distinct_stream(input, vec!["n".into()], &cx).try_collect(),
+        )
+        .unwrap();
+        assert_eq!(out.len(), 50);
+        assert_eq!(cx.stats().dedup_spills(), 1, "the set must have spilled");
+    }
+
+    #[test]
+    fn slice_stream_never_skips_an_error_inside_the_offset() {
+        let input: SolutionStream = stream::iter(vec![
+            Err(SparqlError::Execution("boom".into())),
+            Ok(make_binding_row("n", "1")),
+        ])
+        .boxed();
+        let out: Result<Vec<Solution>, _> =
+            futures::executor::block_on(slice_stream(input, 1, Some(1)).try_collect());
+        assert!(out.is_err(), "an error is never consumed by OFFSET");
+    }
+
+    fn apply_order_by(
+        rows: &mut [Solution],
+        conditions: &[crate::planner::OrderCondition],
+    ) -> Result<(), SparqlError> {
+        validate_order_by(conditions)?;
+        rows.sort_by(|a, b| compare_solutions(conditions, a, b));
+        Ok(())
     }
 
     // --- BUG-S10: clustering string extraction with logging ---

@@ -123,7 +123,7 @@ pub struct OrderCondition {
 
 /// Algebra-ordered evaluation steps. Indices address the plan's storage ops
 /// and filters; Join operands retain independent expression scopes.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum PlanStep {
     /// Evaluate one storage operation against the current solutions.
     Triple(usize),
@@ -148,7 +148,7 @@ pub enum PlanStep {
 }
 
 /// A validated COUNT expression; `None` denotes COUNT(*).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CountAggregate {
     /// Expression whose successfully bound values are counted.
     pub expression: Option<spargebra::algebra::Expression>,
@@ -157,7 +157,7 @@ pub struct CountAggregate {
 }
 
 /// A query execution plan.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct QueryPlan {
     /// Storage-operation inventory; `steps` defines evaluation order.
     pub ops: Vec<(TriplePattern, TripleOp)>,
