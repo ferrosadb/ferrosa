@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cql
 doc: fmea
-last_updated: 2026-11-11
+last_updated: 2026-11-16
 ---
 
 # ferrosa-cql — FMEA / Known Issues
@@ -122,3 +122,4 @@ other branches (CQL-20, CQL-21 and CQL-24 are already duplicated above).
 | CQL-LIMIT-PAGE-01 | A limited full scan caps its upstream input at the client fetch size, then an offset paginator mistakes that window for the complete result | `LIMIT 20000` returns 5000 rows without a continuation | Native streaming scan with raw key resume and cumulative LIMIT cursor. `limited_scan_paging` covers v4, projections, narrow/wide partitions, exact final pages, and one-page upstream consumption. |
 | CQL-LIMIT-PAGE-02 | A filtered streaming scan resets LIMIT for every page | Iteration can return more rows than the query requested | Both plain and filtered scan collectors receive the remaining global limit. `filtered_scan_preserves_the_total_limit_across_pages` compares the exact paged and unpaged result. |
 | CQL-LIMIT-PAGE-03 | A newer limited-scan token is accepted as an offset by an older coordinator | A mixed-version traversal can skip or replay rows | Signed outer FF/LS/version envelope makes old length-prefixed decoders reject it. Int/bigint upgrade guards verify old-decoder refusal and current-node continuation; version and outer-authentication guards cover malformed tokens. |
+| CQL-31 | **The local (non-Accord) LWT path copied the row to evaluate its IF clause.** `eval_local_condition` cloned every cell of the locked row (and every column name) into a `HashMap` only to call `eval_if_conditions`, then encoded the reply from the original row. | One extra copy of the row per conditional write; flagged by the OOM audit (`cloned-stream-elements`, router.rs) under an exemption that expired 2026-11-15. | 3 | 5 | 5 | 75 → 15 | **Fixed.** `accord_router::if_conditions_hold` evaluates the clause through a borrowed lookup; the local path looks cells up by `columns.get_index_of`, and `eval_if_conditions` (Accord path) wraps the same evaluator so both reach one verdict. Test: `the_borrowed_if_evaluator_agrees_with_the_owned_one` (RED: compile error, no `if_conditions_hold`); local-path tests `standalone_conditional_update_*`, `a_conditional_update_compares_its_own_clustering_row` stay green. Lean: `Ferrosa.Streaming.Audit` site row `cql` (.streaming). |

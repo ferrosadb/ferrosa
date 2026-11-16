@@ -10145,17 +10145,17 @@ async fn eval_local_condition(
     if_exists: bool,
 ) -> Result<Option<BytesMut>, CqlError> {
     let existing = read_lwt_row(state, target).await?;
-    let as_map: Option<HashMap<String, Option<CqlValue>>> = existing.as_ref().map(|row| {
-        target
-            .table_meta
-            .columns
-            .keys()
-            .cloned()
-            .zip(row.iter().cloned())
-            .collect()
+    let columns = &target.table_meta.columns;
+    // Read the row in place: its cells are in `columns` order.
+    let lookup = existing.as_deref().map(|row| {
+        move |column: &str| {
+            columns
+                .get_index_of(column)
+                .and_then(|i| row.get(i))
+                .and_then(Option::as_ref)
+        }
     });
-    let verdict = crate::accord_router::eval_if_conditions(conditions, if_exists, as_map);
-    if verdict.applied {
+    if crate::accord_router::if_conditions_hold(conditions, if_exists, lookup) {
         return Ok(None);
     }
     Ok(Some(encode_lwt_applied(
