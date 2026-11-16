@@ -40,7 +40,7 @@ pub enum LookupResult {
 ///
 /// Dense nodes can be up to ~2060 bytes (LongDense with 256 children at 8
 /// bytes each + 3 header + payload), so we use a generous buffer.
-const MAX_NODE_READ: usize = 2560;
+const MAX_NODE_READ_BYTES: usize = 2560;
 
 /// Look up an exact key in the trie.
 ///
@@ -60,7 +60,7 @@ pub fn lookup(reader: &impl ReadAt, root_pos: u64, key: &[u8]) -> Result<LookupR
         }
 
         // Read enough bytes to decode any node type.
-        let read_len = MAX_NODE_READ.min((data_len - pos) as usize);
+        let read_len = MAX_NODE_READ_BYTES.min((data_len - pos) as usize);
         let mut buf = vec![0u8; read_len];
         reader.read_exact_at(&mut buf[..read_len], pos)?;
 
