@@ -76,7 +76,8 @@ fn clone_transpose(cols: &[Vec<Cell>], nrows: usize) -> Vec<Vec<Cell>> {
 }
 
 /// The FIXED transpose: consume each column through `into_iter()` and MOVE each
-/// cell into its row. Mirrors `record_batch_to_rows` exactly.
+/// cell into its row: the per-row move `convert::BatchRows::next` performs
+/// (which hands rows out one at a time instead of collecting them).
 fn move_transpose(cols: Vec<Vec<Cell>>, nrows: usize) -> Vec<Vec<Cell>> {
     let mut cols: Vec<std::vec::IntoIter<Cell>> = cols.into_iter().map(|c| c.into_iter()).collect();
     let mut rows = Vec::with_capacity(nrows);
