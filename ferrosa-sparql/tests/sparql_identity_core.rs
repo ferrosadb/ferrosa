@@ -696,29 +696,13 @@ async fn ask_and_construct_use_full_term_matching() {
 }
 
 #[tokio::test]
-async fn clear_wide_graph_preflights_limits_then_deletes_every_fragment() {
+async fn clear_wide_graph_deletes_every_fragment_with_no_row_bound() {
     let f = Fixture::new();
     for i in 0..600 {
         f.insert(G, &format!("\"term-{i}\"")).await;
     }
     f.storage.flush(&triples_table_id(KS)).unwrap();
-    let bounded = SparqlEngine::new(
-        f.storage.clone(),
-        Arc::new(WritePath::direct(f.storage.clone())),
-        SparqlConfig {
-            max_rows: 599,
-            ..Default::default()
-        },
-    );
-    assert!(bounded
-        .execute_update(&format!("CLEAR GRAPH <{G}>"), KS)
-        .await
-        .is_err());
-    assert_eq!(
-        f.objects(G).await.len(),
-        600,
-        "failed preflight must not delete a prefix"
-    );
+    assert_eq!(f.objects(G).await.len(), 600);
     f.engine
         .execute_update(&format!("CLEAR GRAPH <{G}>"), KS)
         .await

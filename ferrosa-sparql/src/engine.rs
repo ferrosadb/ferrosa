@@ -1,15 +1,19 @@
 //! SPARQL engine: parse → plan → execute.
 //! Correctness: legacy RDF identity tests and COUNT/JSON/protocol regressions.
-//! Last revised: 2026-10-27
-//! Last changed: Add query base context and negotiate typed result boundaries.
+//! Last revised: 2026-11-16
+//! Last changed: Return results as lazy streams; spill instead of a row bound.
 
+use std::future::ready;
 use std::sync::Arc;
 
 use ferrosa_cluster::write_path::WritePath;
 use ferrosa_storage::engine::StorageEngine;
 
 use crate::error::SparqlError;
-use crate::executor::{ExecutionLimits, DEFAULT_MAX_ROWS};
+use futures::stream::{self, BoxStream};
+use futures::{StreamExt, TryStreamExt};
+
+use crate::executor::ExecutionContext;
 use crate::planner::{self, GraphQueryMode};
 use crate::results::{SparqlAskResult, SparqlJsonResults};
 
@@ -28,6 +32,46 @@ pub struct ConstructedTriple {
     pub datatype: Option<String>,
     /// Language tag for `rdf:langString` literals.
     pub lang: Option<String>,
+}
+
+impl ConstructedTriple {
+    /// This triple as one N-Triples line.
+    pub fn to_ntriples_line(&self) -> String {
+        let t = self;
+        let subj = if t.subject.starts_with("_:") {
+            t.subject.clone()
+        } else {
+            format!("<{}>", t.subject)
+        };
+        let pred = format!("<{}>", t.predicate);
+        let obj = match t.object_type.as_str() {
+            "uri" => format!("<{}>", t.object),
+            "bnode" => {
+                if t.object.starts_with("_:") {
+                    t.object.clone()
+                } else {
+                    format!("_:{}", t.object)
+                }
+            }
+            _ => {
+                let escaped = t
+                    .object
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n")
+                    .replace('\r', "\\r")
+                    .replace('\t', "\\t");
+                if let Some(lang) = &t.lang {
+                    format!("\"{}\"@{}", escaped, lang)
+                } else if let Some(dt) = &t.datatype {
+                    format!("\"{}\"^^<{}>", escaped, dt)
+                } else {
+                    format!("\"{}\"", escaped)
+                }
+            }
+        };
+        format!("{subj} {pred} {obj} .\n")
+    }
 }
 
 /// Result of a SPARQL query execution, supporting SELECT, ASK, and graph forms.
@@ -118,39 +162,7 @@ impl SparqlResult {
             Self::Graph(triples) => {
                 let mut buf = String::new();
                 for t in triples {
-                    let subj = if t.subject.starts_with("_:") {
-                        t.subject.clone()
-                    } else {
-                        format!("<{}>", t.subject)
-                    };
-                    let pred = format!("<{}>", t.predicate);
-                    let obj = match t.object_type.as_str() {
-                        "uri" => format!("<{}>", t.object),
-                        "bnode" => {
-                            if t.object.starts_with("_:") {
-                                t.object.clone()
-                            } else {
-                                format!("_:{}", t.object)
-                            }
-                        }
-                        _ => {
-                            let escaped = t
-                                .object
-                                .replace('\\', "\\\\")
-                                .replace('"', "\\\"")
-                                .replace('\n', "\\n")
-                                .replace('\r', "\\r")
-                                .replace('\t', "\\t");
-                            if let Some(lang) = &t.lang {
-                                format!("\"{}\"@{}", escaped, lang)
-                            } else if let Some(dt) = &t.datatype {
-                                format!("\"{}\"^^<{}>", escaped, dt)
-                            } else {
-                                format!("\"{}\"", escaped)
-                            }
-                        }
-                    };
-                    buf.push_str(&format!("{subj} {pred} {obj} .\n"));
+                    buf.push_str(&t.to_ntriples_line());
                 }
                 Ok(buf.into_bytes())
             }
@@ -200,34 +212,56 @@ impl SparqlResult {
 pub struct SparqlConfig {
     /// Default graph name for queries without explicit FROM.
     pub default_graph: String,
-    /// The executor's row bound: the most storage rows a single scan may read,
-    /// and the most solutions any operator may buffer.
+    /// Bytes a spilling operator (ORDER BY, GROUP BY, closure frontier, update
+    /// staging) buffers before it writes to disk.
     ///
-    /// This replaces the former `max_results` field, which was never read
-    /// anywhere in the workspace, and the former `SCAN_ROW_CAP` constant, which
-    /// only logged a warning claiming results had been "truncated at row cap"
-    /// AFTER the whole table had already been materialized and truncated
-    /// nothing. Unlike both of those, this bound is real: it is enforced at the
-    /// storage scan and on every operator's buffer, and crossing it returns a
-    /// [`SparqlError::Execution`] rather than a silently short result.
-    pub max_rows: usize,
+    /// This bounds MEMORY, not results. There is no row bound: the former
+    /// `max_rows` refused any query that read or buffered more than 100_000
+    /// rows; queries now stream and spill instead.
+    pub spill_threshold_bytes: u64,
 }
 
 impl Default for SparqlConfig {
     fn default() -> Self {
         Self {
             default_graph: "default".into(),
-            max_rows: DEFAULT_MAX_ROWS,
+            spill_threshold_bytes: ferrosa_storage::process_spill_threshold_bytes(),
         }
     }
 }
+
+/// A query result whose rows have not been produced yet.
+///
+/// The served path writes it into the response as it is pulled; nothing holds
+/// the whole result.
+pub enum SparqlStream {
+    /// SELECT solutions, already projected/ordered/sliced.
+    Select {
+        /// Projected variables, in order.
+        vars: Vec<String>,
+        /// Whether a solution may carry an RDF 1.2 term (a triple term or a
+        /// directional literal). Decided from the plan, because the rows are
+        /// not known when the response head is written. Stored RDF v2 data
+        /// cannot hold such terms, so only query expressions can bind them.
+        may_bind_rdf12: bool,
+        /// The solutions.
+        rows: crate::executor::SolutionStream,
+    },
+    /// ASK: needs at most one solution, so it is answered eagerly.
+    Ask(SparqlAskResult),
+    /// CONSTRUCT / DESCRIBE triples.
+    Graph(GraphStream),
+}
+
+/// A lazy stream of constructed/described triples.
+pub type GraphStream = BoxStream<'static, Result<ConstructedTriple, SparqlError>>;
 
 /// SPARQL query engine backed by ferrosa's StorageEngine.
 pub struct SparqlEngine {
     storage: Arc<StorageEngine>,
     write_path: Arc<arc_swap::ArcSwap<WritePath>>,
     config: SparqlConfig,
-    limits: ExecutionLimits,
+    cx: ExecutionContext,
 }
 
 impl SparqlEngine {
@@ -254,14 +288,17 @@ impl SparqlEngine {
         write_path: Arc<arc_swap::ArcSwap<WritePath>>,
         config: SparqlConfig,
     ) -> Self {
-        let limits = ExecutionLimits {
-            max_rows: config.max_rows,
-        };
+        // Spills live beside the data they were read from, under a root each
+        // query's reservations are created (and removed) in.
+        let cx = ExecutionContext::new(
+            storage.data_dir().join("tmp_sparql_spill"),
+            config.spill_threshold_bytes,
+        );
         let engine = Self {
             storage,
             write_path,
             config,
-            limits,
+            cx,
         };
         if let Err(error) = engine.ensure_table_registered(&engine.config.default_graph) {
             tracing::warn!(%error,"SPARQL dataset admission refused; requests will fail");
@@ -398,14 +435,21 @@ impl SparqlEngine {
             }
         }
         self.ensure_table_registered(ks)?;
-        crate::update::execute_update(update_str, ks, &self.storage, &write_path, &self.limits)
-            .await
+        crate::update::execute_update(
+            update_str,
+            ks,
+            &self.storage,
+            &write_path,
+            &self.cx.for_query(),
+        )
+        .await
     }
 
-    /// Execute a SPARQL query and return results.
+    /// Execute a SPARQL query and collect the result.
     ///
-    /// The `keyspace` parameter scopes the query to a specific tenant/keyspace.
-    /// ASK queries return a boolean result; SELECT queries return binding sets.
+    /// This MATERIALIZES the result, for tests and embedded callers that want a
+    /// value. The HTTP endpoint uses [`Self::execute_stream_with_base`] and
+    /// writes rows as they are produced.
     pub async fn execute(
         &self,
         query_str: &str,
@@ -414,13 +458,39 @@ impl SparqlEngine {
         self.execute_with_base(query_str, keyspace, None).await
     }
 
-    /// Execute with an HTTP service base IRI; explicit BASE declarations take precedence.
+    /// [`Self::execute`] with an HTTP service base IRI.
     pub async fn execute_with_base(
         &self,
         query_str: &str,
         keyspace: &str,
         base: Option<&str>,
     ) -> Result<SparqlResult, SparqlError> {
+        match self
+            .execute_stream_with_base(query_str, keyspace, base)
+            .await?
+        {
+            SparqlStream::Select { vars, rows, .. } => {
+                let rows: Vec<_> = rows.try_collect().await?;
+                let mut results = SparqlJsonResults::new(vars);
+                rows.into_iter().for_each(|row| results.add_row(row));
+                Ok(SparqlResult::Select(results))
+            }
+            SparqlStream::Ask(result) => Ok(SparqlResult::Ask(result)),
+            SparqlStream::Graph(triples) => Ok(SparqlResult::Graph(triples.try_collect().await?)),
+        }
+    }
+
+    /// Parse and plan a query and return its result as a lazy stream.
+    ///
+    /// Parse and plan errors (and ORDER BY forms the executor cannot evaluate)
+    /// are returned here, before any row exists; errors found while reading
+    /// arrive in the stream.
+    pub async fn execute_stream_with_base(
+        &self,
+        query_str: &str,
+        keyspace: &str,
+        base: Option<&str>,
+    ) -> Result<SparqlStream, SparqlError> {
         // 1. Parse SPARQL → algebra. The parser recurses per nesting level
         // without a limit, so the depth is bounded first.
         crate::nesting::check_nesting(query_str)?;
@@ -455,266 +525,225 @@ impl SparqlEngine {
         self.ensure_table_registered(graph)?;
 
         // The keyspace names the TABLE; the default graph names the PARTITION.
-        // These were one value until this fix, and that conflation meant a
-        // bound-subject point read looked under ("<keyspace>", subject) for a
-        // row the writer had stored under ("default", subject).
-        //
         // The scope is ISOLATED: the served path reads only the default graph's
         // partitions, so data inserted into a `GRAPH <iri>` block never leaks
         // into an un-claused read.
         let scope = planner::TripleScope::isolated(graph, &self.config.default_graph);
-        let plan = planner::plan_query(&query, &scope)?;
+        let plan = Arc::new(planner::plan_query(&query, &scope)?);
 
         // 3. Execute against one live path snapshot for the entire query.
         let write_path = self.write_path.load_full();
-        let results = crate::executor::execute(&plan, &write_path, &self.limits).await?;
+        let cx = self.cx.for_query();
+        let rows =
+            crate::executor::select_stream(Arc::clone(&plan), Arc::clone(&write_path), cx.clone())?;
 
-        // BUG-S6 fix: ASK queries return boolean result format.
+        // BUG-S6 fix: ASK queries return boolean result format. The plan
+        // carries LIMIT 1, so this reads until the first solution only.
         if plan.is_ask {
-            let has_results = !results.results.bindings.is_empty();
-            return Ok(SparqlResult::Ask(SparqlAskResult {
+            let mut rows = rows;
+            let boolean = rows.next().await.transpose()?.is_some();
+            return Ok(SparqlStream::Ask(SparqlAskResult {
                 head: crate::results::ResultHead { vars: vec![] },
-                boolean: has_results,
+                boolean,
             }));
         }
 
         // URS-QEC-S01: CONSTRUCT / DESCRIBE return a graph result.
         if let Some(graph_mode) = &plan.graph_mode {
-            return Ok(SparqlResult::Graph(
-                build_graph_result(graph_mode, &results, &plan, &write_path, &self.limits).await?,
-            ));
+            return Ok(SparqlStream::Graph(graph_stream(
+                graph_mode.clone(),
+                rows,
+                &plan,
+                write_path,
+                cx,
+            )));
         }
 
-        Ok(SparqlResult::Select(results))
+        Ok(SparqlStream::Select {
+            vars: plan.projection.clone(),
+            may_bind_rdf12: steps_may_bind_rdf12(&plan.steps),
+            rows,
+        })
     }
 }
 
-/// Build the `Vec<ConstructedTriple>` for CONSTRUCT and DESCRIBE queries.
+/// Whether any expression in `steps` can bind an RDF 1.2 term (a triple term or
+/// a directional literal). Conservative: a hit may still evaluate unbound.
+fn steps_may_bind_rdf12(steps: &[planner::PlanStep]) -> bool {
+    use planner::PlanStep;
+    steps.iter().any(|step| match step {
+        PlanStep::Extend { expression, .. } => expression_may_be_rdf12(expression),
+        PlanStep::Join { left, right } => steps_may_bind_rdf12(left) || steps_may_bind_rdf12(right),
+        PlanStep::Count { input, .. } => steps_may_bind_rdf12(input),
+        PlanStep::Triple(_) | PlanStep::Filter(_) => false,
+    })
+}
+
+fn expression_may_be_rdf12(expression: &spargebra::algebra::Expression) -> bool {
+    use spargebra::algebra::{Expression, Function};
+    match expression {
+        Expression::FunctionCall(Function::Triple, _) => true,
+        Expression::Literal(literal) => literal.direction().is_some(),
+        _ => false,
+    }
+}
+
+/// CONSTRUCT / DESCRIBE triples as a stream over the WHERE solutions.
 ///
-/// For `CONSTRUCT { template } WHERE { … }`:
-///   Instantiate the template triples once per WHERE solution.  Variables in
-///   the template are replaced with the corresponding bound values.
-///
-/// For `DESCRIBE <iri>`:
-///   Run a subject-lookup for the described IRI and return all triples found.
-async fn build_graph_result(
-    mode: &GraphQueryMode,
-    where_results: &SparqlJsonResults,
+/// For `CONSTRUCT { template } WHERE { … }` the template is instantiated once
+/// per solution. For `DESCRIBE` each described subject is read with a point
+/// lookup; `DESCRIBE ?var` de-duplicates its subjects through a spilling set.
+fn graph_stream(
+    mode: GraphQueryMode,
+    solutions: crate::executor::SolutionStream,
     plan: &planner::QueryPlan,
-    write_path: &Arc<WritePath>,
-    limits: &ExecutionLimits,
-) -> Result<Vec<ConstructedTriple>, SparqlError> {
-    use spargebra::term::{NamedNodePattern, TermPattern};
-
+    write_path: Arc<WritePath>,
+    cx: ExecutionContext,
+) -> GraphStream {
     match mode {
-        GraphQueryMode::Construct(template) => {
-            let mut triples = Vec::new();
-            for solution in &where_results.results.bindings {
-                for tp in template {
-                    // Resolve subject.
-                    let subject = match &tp.subject {
-                        TermPattern::NamedNode(n) => n.as_str().to_string(),
-                        TermPattern::Variable(v) => match solution.get(v.as_str()) {
-                            Some(b) => graph_scalar(b)?.to_owned(),
-                            None => continue,
-                        },
-                        TermPattern::BlankNode(b) => format!("_:{}", b.as_str()),
-                        _ => continue,
-                    };
-
-                    // Resolve predicate.
-                    let predicate = match &tp.predicate {
-                        NamedNodePattern::NamedNode(n) => n.as_str().to_string(),
-                        NamedNodePattern::Variable(v) => match solution.get(v.as_str()) {
-                            Some(b) => graph_scalar(b)?.to_owned(),
-                            None => continue,
-                        },
-                    };
-
-                    // Resolve object.
-                    let (object, object_type, datatype, lang) = match &tp.object {
-                        TermPattern::NamedNode(n) => {
-                            (n.as_str().to_string(), "uri".to_string(), None, None)
-                        }
-                        TermPattern::Literal(l) => {
-                            let binding = crate::results::Binding::from_literal(l);
-                            (
-                                graph_scalar(&binding)?.to_owned(),
-                                "literal".to_owned(),
-                                binding.datatype().map(str::to_owned),
-                                binding.lang().map(str::to_owned),
-                            )
-                        }
-                        TermPattern::BlankNode(b) => {
-                            (format!("_:{}", b.as_str()), "bnode".to_string(), None, None)
-                        }
-                        TermPattern::Variable(v) => match solution.get(v.as_str()) {
-                            Some(b) => (
-                                graph_scalar(b)?.to_owned(),
-                                b.kind().to_owned(),
-                                b.datatype().map(str::to_owned),
-                                b.lang().map(str::to_owned),
-                            ),
-                            None => continue,
-                        },
-                        TermPattern::Triple(_) => {
-                            return Err(SparqlError::Plan(
-                                "RDF 1.2 graph terms are not implemented".into(),
-                            ))
-                        }
-                    };
-
-                    triples.push(ConstructedTriple {
-                        subject,
-                        predicate,
-                        object,
-                        object_type,
-                        datatype,
-                        lang,
-                    });
-                }
-            }
-            Ok(triples)
+        GraphQueryMode::Construct(template) => solutions
+            .map_ok(move |solution| stream::iter(instantiate_template(&template, &solution)))
+            .try_flatten()
+            .boxed(),
+        GraphQueryMode::DescribeIris(iris) => {
+            // The planner built one SubjectLookup op per IRI; their scope is
+            // the query's.
+            let scope = plan.ops.first().map_or_else(
+                || planner::TripleScope::new("__default", "__default"),
+                |(_, o)| match o {
+                    planner::TripleOp::SubjectLookup { scope, .. } => scope.clone(),
+                    _ => planner::TripleScope::new("__default", "__default"),
+                },
+            );
+            stream::iter(iris)
+                .map(move |iri| describe_subject(iri, &scope, &write_path, &cx))
+                .flatten()
+                .boxed()
         }
-
-        GraphQueryMode::DescribeIris(iris_list) => {
-            // The planner ran SubjectLookup ops for each IRI. The where_results
-            // bindings contain __p and __o rows — but subjects are mixed. Since
-            // binding rows don't carry the subject (it was the partition key),
-            // we re-issue individual SubjectLookups to correctly attribute rows.
-            use crate::planner::TripleOp;
-            use spargebra::term::{NamedNode, NamedNodePattern, TermPattern, TriplePattern};
-
-            let mut triples = Vec::new();
-            for iri in iris_list {
-                let dummy_tp = TriplePattern {
-                    subject: TermPattern::NamedNode(NamedNode::new_unchecked(iri.as_str())),
-                    predicate: NamedNodePattern::Variable(
-                        spargebra::term::Variable::new_unchecked("__p"),
-                    ),
-                    object: TermPattern::Variable(spargebra::term::Variable::new_unchecked("__o")),
-                };
-                let op = TripleOp::SubjectLookup {
-                    scope: plan.ops.first().map_or_else(
-                        || planner::TripleScope::new("__default", "__default"),
-                        |(_, o)| match o {
-                            TripleOp::SubjectLookup { scope, .. } => scope.clone(),
-                            _ => planner::TripleScope::new("__default", "__default"),
-                        },
-                    ),
-                    subject: iri.clone(),
-                    predicate_filter: None,
-                };
-                let lookup_plan = planner::QueryPlan {
-                    ops: vec![(dummy_tp, op)],
-                    steps: vec![planner::PlanStep::Triple(0)],
-                    projection: vec!["__p".into(), "__o".into()],
-                    limit: None,
-                    offset: None,
-                    is_ask: false,
-                    distinct: false,
-                    order_by: vec![],
-                    filters: vec![],
-                    graph_mode: None,
-                };
-                let sub = crate::executor::execute(&lookup_plan, write_path, limits).await?;
-                for row in sub.results.bindings {
-                    let pred = match row.get("__p") {
-                        Some(b) => graph_scalar(b)?.to_owned(),
-                        None => continue,
-                    };
-                    let obj_b = match row.get("__o") {
-                        Some(b) => b,
-                        None => continue,
-                    };
-                    triples.push(ConstructedTriple {
-                        subject: iri.clone(),
-                        predicate: pred,
-                        object: graph_scalar(obj_b)?.to_owned(),
-                        object_type: obj_b.kind().to_owned(),
-                        datatype: obj_b.datatype().map(str::to_owned),
-                        lang: obj_b.lang().map(str::to_owned),
-                    });
-                }
-            }
-            Ok(triples)
-        }
-
         GraphQueryMode::Describe(scope) => {
-            // DESCRIBE: collect all triples about every subject bound by the
-            // WHERE clause (or the directly described IRI if no WHERE clause
-            // was supplied by spargebra).
-            let mut subjects: Vec<String> = Vec::new();
-            if where_results.results.bindings.is_empty() {
-                // No WHERE solutions — nothing to describe.
-                return Ok(vec![]);
-            }
-            // Collect all bound URI values that look like the described subject.
-            for sol in &where_results.results.bindings {
-                for binding in sol.values() {
-                    if binding.kind() == "uri" {
-                        let value = graph_scalar(binding)?.to_owned();
-                        if !subjects.contains(&value) {
-                            subjects.push(value);
-                        }
-                    }
-                }
-            }
-
-            let mut triples = Vec::new();
-            for subject_iri in subjects {
-                // SubjectLookup: fetch all (pred, obj) for this subject.
-                use crate::planner::TripleOp;
-                use spargebra::term::NamedNode;
-                use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
-
-                let dummy_tp = TriplePattern {
-                    subject: TermPattern::NamedNode(NamedNode::new_unchecked(&subject_iri)),
-                    predicate: NamedNodePattern::Variable(
-                        spargebra::term::Variable::new_unchecked("__p"),
-                    ),
-                    object: TermPattern::Variable(spargebra::term::Variable::new_unchecked("__o")),
-                };
-                let op = TripleOp::SubjectLookup {
-                    scope: scope.clone(),
-                    subject: subject_iri.clone(),
-                    predicate_filter: None,
-                };
-                let dummy_plan = planner::QueryPlan {
-                    ops: vec![(dummy_tp, op)],
-                    steps: vec![planner::PlanStep::Triple(0)],
-                    projection: vec!["__p".into(), "__o".into()],
-                    limit: None,
-                    offset: None,
-                    is_ask: false,
-                    distinct: false,
-                    order_by: vec![],
-                    filters: vec![],
-                    graph_mode: None,
-                };
-                let sub_result = crate::executor::execute(&dummy_plan, write_path, limits).await?;
-                for row in sub_result.results.bindings {
-                    let pred = match row.get("__p") {
-                        Some(b) => graph_scalar(b)?.to_owned(),
-                        None => continue,
-                    };
-                    let obj_binding = match row.get("__o") {
-                        Some(b) => b,
-                        None => continue,
-                    };
-                    triples.push(ConstructedTriple {
-                        subject: subject_iri.clone(),
-                        predicate: pred,
-                        object: graph_scalar(obj_binding)?.to_owned(),
-                        object_type: obj_binding.kind().to_owned(),
-                        datatype: obj_binding.datatype().map(str::to_owned),
-                        lang: obj_binding.lang().map(str::to_owned),
-                    });
-                }
-            }
-            Ok(triples)
+            // Every bound IRI of every WHERE solution, first appearance wins.
+            let mut seen = cx.dedup("sparql-describe");
+            solutions
+                .map_ok(|solution| {
+                    let iris: Vec<Result<String, SparqlError>> = solution
+                        .into_values()
+                        .filter_map(|binding| match binding {
+                            crate::results::Binding::Uri { value } => Some(Ok(value)),
+                            _ => None,
+                        })
+                        .collect();
+                    stream::iter(iris)
+                })
+                .try_flatten()
+                .try_filter_map(move |iri| {
+                    let fresh = seen.insert(iri.as_bytes());
+                    ready(fresh.map(|fresh| fresh.then_some(iri)))
+                })
+                .map_ok(move |iri| describe_subject(iri, &scope, &write_path, &cx))
+                .try_flatten()
+                .boxed()
         }
     }
+}
+
+/// Every stored triple of `subject`, through one point read.
+fn describe_subject(
+    subject: String,
+    scope: &planner::TripleScope,
+    write_path: &Arc<WritePath>,
+    cx: &ExecutionContext,
+) -> GraphStream {
+    let op = planner::TripleOp::SubjectLookup {
+        scope: scope.clone(),
+        subject,
+        predicate_filter: None,
+    };
+    crate::executor::triple_stream(&op, write_path, cx)
+        .and_then(|(subject, predicate, object)| {
+            ready(
+                graph_scalar(&object)
+                    .map(str::to_owned)
+                    .map(|value| ConstructedTriple {
+                        subject,
+                        predicate,
+                        object: value,
+                        object_type: object.kind().to_owned(),
+                        datatype: object.datatype().map(str::to_owned),
+                        lang: object.lang().map(str::to_owned),
+                    }),
+            )
+        })
+        .boxed()
+}
+
+/// Instantiate the CONSTRUCT template against one solution. A template triple
+/// with an unbound variable is skipped (SPARQL 1.1 §16.2).
+fn instantiate_template(
+    template: &[spargebra::term::TriplePattern],
+    solution: &crate::executor::Solution,
+) -> Vec<Result<ConstructedTriple, SparqlError>> {
+    template
+        .iter()
+        .filter_map(|tp| instantiate_triple(tp, solution).transpose())
+        .collect()
+}
+
+fn instantiate_triple(
+    tp: &spargebra::term::TriplePattern,
+    solution: &crate::executor::Solution,
+) -> Result<Option<ConstructedTriple>, SparqlError> {
+    use spargebra::term::{NamedNodePattern, TermPattern};
+    let subject = match &tp.subject {
+        TermPattern::NamedNode(n) => n.as_str().to_string(),
+        TermPattern::Variable(v) => match solution.get(v.as_str()) {
+            Some(b) => graph_scalar(b)?.to_owned(),
+            None => return Ok(None),
+        },
+        TermPattern::BlankNode(b) => format!("_:{}", b.as_str()),
+        _ => return Ok(None),
+    };
+    let predicate = match &tp.predicate {
+        NamedNodePattern::NamedNode(n) => n.as_str().to_string(),
+        NamedNodePattern::Variable(v) => match solution.get(v.as_str()) {
+            Some(b) => graph_scalar(b)?.to_owned(),
+            None => return Ok(None),
+        },
+    };
+    let (object, object_type, datatype, lang) = match &tp.object {
+        TermPattern::NamedNode(n) => (n.as_str().to_string(), "uri".to_string(), None, None),
+        TermPattern::Literal(l) => {
+            let binding = crate::results::Binding::from_literal(l);
+            (
+                graph_scalar(&binding)?.to_owned(),
+                "literal".to_owned(),
+                binding.datatype().map(str::to_owned),
+                binding.lang().map(str::to_owned),
+            )
+        }
+        TermPattern::BlankNode(b) => (format!("_:{}", b.as_str()), "bnode".to_string(), None, None),
+        TermPattern::Variable(v) => match solution.get(v.as_str()) {
+            Some(b) => (
+                graph_scalar(b)?.to_owned(),
+                b.kind().to_owned(),
+                b.datatype().map(str::to_owned),
+                b.lang().map(str::to_owned),
+            ),
+            None => return Ok(None),
+        },
+        TermPattern::Triple(_) => {
+            return Err(SparqlError::Plan(
+                "RDF 1.2 graph terms are not implemented".into(),
+            ))
+        }
+    };
+    Ok(Some(ConstructedTriple {
+        subject,
+        predicate,
+        object,
+        object_type,
+        datatype,
+        lang,
+    }))
 }
 
 fn graph_scalar(binding: &crate::results::Binding) -> Result<&str, SparqlError> {

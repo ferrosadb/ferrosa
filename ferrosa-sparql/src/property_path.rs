@@ -1,188 +1,356 @@
-//! Property path evaluation via BFS/DFS traversal.
+//! Property path evaluation as a stream of `(start, end)` pairs.
 //!
-//! Implements SPARQL 1.1 property path operators (`+`, `*`, `?`) by
-//! walking the adjacency structure of the triple store. Fixes the
-//! silent single-hop degradation bug (BUG-S7).
-//! Correctness: legacy RDF identity tests and COUNT/JSON/protocol regressions.
-//! Last revised: 2026-10-27
-//! Last changed: Preserve typed scalar term identity through path results.
+//! Implements SPARQL 1.1 property path operators (`+`, `*`, `?`, `^`) without
+//! holding the predicate's adjacency in memory (BUG-S7 fixed the silent
+//! single-hop degradation; this module fixes the materialization):
+//!
+//! - a single hop streams the predicate's edges — a point read when the subject
+//!   is a constant, a streaming scan otherwise;
+//! - a closure is a breadth-first search that EXPANDS THE FRONTIER BY LOOKUP:
+//!   each node's outgoing edges come from a point read of that node's
+//!   partition, never from a pre-loaded edge list. The visited set is a
+//!   spilling de-duplication set and each BFS level is a spilling bag, so the
+//!   closure's working set is bounded however large the reachable graph is;
+//! - a variable start enumerates the predicate's distinct subjects from a
+//!   streaming scan (de-duplicated through a spilling set) and runs one BFS per
+//!   start.
+//!
+//! Correctness: legacy RDF identity tests; closure pinned past the old row bound.
+//! Last revised: 2026-11-16
+//! Last changed: Stream path pairs; BFS by per-node lookup with spilled visited/frontier state.
 
-use std::collections::{HashSet, VecDeque};
+use std::future::ready;
 use std::sync::Arc;
 
 use ferrosa_cluster::write_path::WritePath;
-use futures::StreamExt;
+use futures::stream::{self, BoxStream};
+use futures::{StreamExt, TryStreamExt};
+use serde::{Deserialize, Serialize};
 use spargebra::algebra::PropertyPathExpression;
 use spargebra::term::TermPattern;
 
 use crate::error::SparqlError;
-use crate::executor::ExecutionLimits;
+use crate::executor::{triple_stream, TripleStream};
+use crate::planner::{TripleOp, TripleScope};
 use crate::results::Binding;
-use crate::triple_store;
+use crate::spill::{
+    binding_heap_bytes, term_key, BagIter, ExecutionContext, Solution, SpillBag, SpillDedup, Term,
+    TermRef,
+};
 
-/// Result of evaluating a property path: pairs of (start_node, end_node).
-pub type PathResult = Vec<(Binding, Binding)>;
+/// A lazy stream of `(start, end)` pairs satisfying a path.
+pub type PairStream = BoxStream<'static, Result<(Binding, Binding), SparqlError>>;
 
-/// Evaluate a property path pattern against storage.
-///
-/// Returns all `(subject, object)` pairs reachable via the path expression.
-pub async fn evaluate_property_path(
+/// Evaluate a property path pattern as a stream of `(subject, object)` pairs.
+pub fn path_pairs(
     subject: &TermPattern,
     path: &PropertyPathExpression,
     object: &TermPattern,
-    scope: &crate::planner::TripleScope,
+    scope: &TripleScope,
     write_path: &Arc<WritePath>,
-    limits: &ExecutionLimits,
-) -> Result<PathResult, SparqlError> {
+    cx: &ExecutionContext,
+) -> PairStream {
+    let env = Env {
+        scope: scope.clone(),
+        write_path: Arc::clone(write_path),
+        cx: cx.clone(),
+    };
     match path {
         PropertyPathExpression::NamedNode(predicate) => {
-            evaluate_single_hop(
-                subject,
-                predicate.as_str(),
-                object,
-                scope,
-                write_path,
-                limits,
-            )
-            .await
+            single_hop(subject, predicate.as_str(), object, env)
         }
-        PropertyPathExpression::OneOrMore(inner) => {
-            evaluate_closure(subject, inner, object, scope, write_path, limits, false).await
-        }
-        PropertyPathExpression::ZeroOrMore(inner) => {
-            evaluate_closure(subject, inner, object, scope, write_path, limits, true).await
-        }
-        PropertyPathExpression::ZeroOrOne(inner) => {
-            evaluate_zero_or_one(subject, inner, object, scope, write_path, limits).await
-        }
+        PropertyPathExpression::OneOrMore(inner) => closure(subject, inner, object, env, false),
+        PropertyPathExpression::ZeroOrMore(inner) => closure(subject, inner, object, env, true),
+        PropertyPathExpression::ZeroOrOne(inner) => zero_or_one(subject, inner, object, env),
         PropertyPathExpression::Reverse(inner) => {
             // Swap subject and object, evaluate, then swap results back.
-            let results = Box::pin(evaluate_property_path(
-                object, inner, subject, scope, write_path, limits,
-            ))
-            .await?;
-            Ok(results.into_iter().map(|(s, o)| (o, s)).collect())
+            path_pairs(object, inner, subject, scope, write_path, cx)
+                .map_ok(|(s, o)| (o, s))
+                .boxed()
         }
-        _ => Err(SparqlError::Plan(format!(
+        _ => fail(SparqlError::Plan(format!(
             "unsupported property path expression: {path:?}"
         ))),
     }
 }
 
-/// Single-hop: fetch triples matching (subject, predicate, object).
-async fn evaluate_single_hop(
+/// One path pair as a solution over the pattern's variables, or `None` when a
+/// variable used at both ends would need two different values.
+pub(crate) fn pair_to_binding(
+    subject: &TermPattern,
+    object: &TermPattern,
+    s: Binding,
+    o: Binding,
+) -> Option<Solution> {
+    let mut row = Solution::new();
+    if let TermPattern::Variable(var) = subject {
+        row.insert(var.as_str().to_string(), s);
+    }
+    if let TermPattern::Variable(var) = object {
+        if row.get(var.as_str()).is_some_and(|existing| *existing != o) {
+            return None;
+        }
+        row.insert(var.as_str().to_string(), o);
+    }
+    Some(row)
+}
+
+/// What every path stage needs to reach storage and spill.
+#[derive(Clone)]
+struct Env {
+    scope: TripleScope,
+    write_path: Arc<WritePath>,
+    cx: ExecutionContext,
+}
+
+impl Env {
+    /// Objects of `node`'s `predicate` edges: one point read of its partition.
+    /// Only IRIs and blank nodes have outgoing edges.
+    fn out_edges(&self, node: &Binding, predicate: &str) -> TripleStream {
+        if !matches!(node, Binding::Uri { .. } | Binding::BlankNode { .. }) {
+            return stream::empty().boxed();
+        }
+        let Some(subject) = node.scalar_value() else {
+            return stream::empty().boxed();
+        };
+        let op = TripleOp::SubjectLookup {
+            scope: self.scope.clone(),
+            subject: subject.to_owned(),
+            predicate_filter: Some(predicate.to_owned()),
+        };
+        triple_stream(&op, &self.write_path, &self.cx)
+    }
+
+    /// Every `predicate` edge in scope, as a streaming scan.
+    fn all_edges(&self, predicate: &str) -> TripleStream {
+        let op = TripleOp::PredicateScan {
+            scope: self.scope.clone(),
+            predicate: predicate.to_owned(),
+        };
+        triple_stream(&op, &self.write_path, &self.cx)
+    }
+
+    /// The start nodes for `subject`: the constant itself, or every distinct
+    /// subject of a `predicate` edge (de-duplicated through a spilling set).
+    fn starts(&self, subject: &TermPattern, predicate: &str) -> NodeStream {
+        match subject {
+            TermPattern::NamedNode(n) => stream::iter([Ok(node_term(n.as_str()))]).boxed(),
+            TermPattern::Literal(l) => stream::iter([Ok(Binding::from_literal(l))]).boxed(),
+            _ => {
+                let mut seen = self.cx.dedup("sparql-path-starts");
+                self.all_edges(predicate)
+                    .try_filter_map(move |(s, _, _)| {
+                        let start = node_term(&s);
+                        let fresh = term_key(&start).and_then(|key| seen.insert(&key));
+                        ready(fresh.map(|fresh| fresh.then_some(start)))
+                    })
+                    .boxed()
+            }
+        }
+    }
+}
+
+type NodeStream = BoxStream<'static, Result<Binding, SparqlError>>;
+
+fn fail(e: SparqlError) -> PairStream {
+    stream::iter([Err(e)]).boxed()
+}
+
+/// Single hop: the predicate's edges whose ends match the patterns.
+fn single_hop(
     subject: &TermPattern,
     predicate: &str,
     object: &TermPattern,
-    scope: &crate::planner::TripleScope,
-    write_path: &Arc<WritePath>,
-    limits: &ExecutionLimits,
-) -> Result<PathResult, SparqlError> {
-    let triples = fetch_triples_for_predicate(scope, predicate, write_path, limits).await?;
-    filter_by_endpoints(subject, object, &triples)
+    env: Env,
+) -> PairStream {
+    let edges = match subject {
+        TermPattern::NamedNode(n) => env.out_edges(&node_term(n.as_str()), predicate),
+        _ => env.all_edges(predicate),
+    };
+    let subject = subject.clone();
+    let object = object.clone();
+    edges
+        .try_filter_map(move |(s, _, o)| {
+            let s = node_term(&s);
+            let keep = matches_endpoint(&subject, &s) && matches_endpoint(&object, &o);
+            ready(Ok(keep.then_some((s, o))))
+        })
+        .boxed()
 }
 
-/// Transitive closure via BFS (OneOrMore / ZeroOrMore).
+/// Transitive closure (OneOrMore / ZeroOrMore): one BFS per start node.
 ///
-/// When `include_start` is true (ZeroOrMore), includes the start node
-/// paired with itself. When false (OneOrMore), requires at least one hop.
-async fn evaluate_closure(
+/// When `include_start` is true (ZeroOrMore) the start is paired with itself;
+/// otherwise at least one hop is required, and the start is never reported
+/// even when a cycle leads back to it.
+fn closure(
     subject: &TermPattern,
     inner: &PropertyPathExpression,
     object: &TermPattern,
-    scope: &crate::planner::TripleScope,
-    write_path: &Arc<WritePath>,
-    limits: &ExecutionLimits,
+    env: Env,
     include_start: bool,
-) -> Result<PathResult, SparqlError> {
-    let predicate = extract_single_predicate(inner)?;
-    let adjacency = fetch_triples_for_predicate(scope, &predicate, write_path, limits).await?;
-    let starts = collect_start_nodes(subject, &adjacency);
-
-    let mut results = Vec::new();
-    for start in &starts {
-        let reachable = bfs_reachable(start, &adjacency, include_start);
-        let filtered = filter_reachable_by_object(object, start, &reachable);
-        results.extend(filtered);
-        if results.len() > limits.max_rows {
-            return Err(SparqlError::Execution(
-                "property path result exceeds row bound".into(),
-            ));
-        }
-    }
-    Ok(results)
+) -> PairStream {
+    let predicate: Arc<str> = match extract_single_predicate(inner) {
+        Ok(p) => p.into(),
+        Err(e) => return fail(e),
+    };
+    let object = Arc::new(object.clone());
+    let starts = env.starts(subject, &predicate);
+    starts
+        .map_ok(move |start| {
+            bfs(
+                start,
+                Arc::clone(&predicate),
+                Arc::clone(&object),
+                env.clone(),
+                include_start,
+            )
+        })
+        .try_flatten()
+        .boxed()
 }
 
-/// ZeroOrOne: return 0-hop (self) and 1-hop matches.
-async fn evaluate_zero_or_one(
+/// ZeroOrOne: the 0-hop self pair and the 1-hop neighbours of each start.
+fn zero_or_one(
     subject: &TermPattern,
     inner: &PropertyPathExpression,
     object: &TermPattern,
-    scope: &crate::planner::TripleScope,
-    write_path: &Arc<WritePath>,
-    limits: &ExecutionLimits,
-) -> Result<PathResult, SparqlError> {
-    let predicate = extract_single_predicate(inner)?;
-    let adjacency = fetch_triples_for_predicate(scope, &predicate, write_path, limits).await?;
-    let starts = collect_start_nodes(subject, &adjacency);
+    env: Env,
+) -> PairStream {
+    let predicate: Arc<str> = match extract_single_predicate(inner) {
+        Ok(p) => p.into(),
+        Err(e) => return fail(e),
+    };
+    let object = Arc::new(object.clone());
+    env.starts(subject, &predicate)
+        .map_ok(move |start| {
+            let hops = env.out_edges(&start, &predicate);
+            let object_hop = Arc::clone(&object);
+            let first = matches_endpoint(&object, &start).then(|| (start.clone(), start.clone()));
+            let neighbours = hops.try_filter_map(move |(_, _, o)| {
+                let pair = matches_endpoint(&object_hop, &o).then(|| (start.clone(), o));
+                ready(Ok(pair))
+            });
+            stream::iter(first.map(Ok)).chain(neighbours)
+        })
+        .try_flatten()
+        .boxed()
+}
 
-    let mut results = Vec::new();
-    for start in &starts {
-        // Zero hop: start node matches itself.
-        if matches_endpoint(object, start) {
-            results.push((start.clone(), start.clone()));
+/// A node parked in a BFS level, spilled in the [`Term`] form.
+struct SpillNode(Binding);
+
+impl Serialize for SpillNode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        TermRef::from(&self.0).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SpillNode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Term::deserialize(deserializer).map(|term| Self(term.into_binding()))
+    }
+}
+
+impl ferrosa_storage::external_sort::SpillRow for SpillNode {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Binding>() + binding_heap_bytes(&self.0)
+    }
+}
+
+/// BFS state between pulls.
+struct Bfs {
+    start: Binding,
+    predicate: Arc<str>,
+    object: Arc<TermPattern>,
+    env: Env,
+    visited: SpillDedup,
+    /// The level being expanded.
+    current: BagIter<SpillNode>,
+    /// The level being discovered.
+    next: SpillBag<SpillNode>,
+    /// Outgoing edges of the node being expanded.
+    edges: Option<TripleStream>,
+    /// ZeroOrMore's self pair, still to be reported.
+    pending_start: bool,
+}
+
+/// Breadth-first closure from `start`, expanding each node by a point lookup.
+fn bfs(
+    start: Binding,
+    predicate: Arc<str>,
+    object: Arc<TermPattern>,
+    env: Env,
+    include_start: bool,
+) -> PairStream {
+    let mut visited = env.cx.dedup("sparql-path-visited");
+    let seeded = term_key(&start).and_then(|key| visited.insert(&key));
+    if let Err(e) = seeded {
+        return fail(e);
+    }
+    let edges = Some(env.out_edges(&start, &predicate));
+    let state = Bfs {
+        next: env.cx.bag("sparql-path-frontier"),
+        current: BagIter::Memory(Vec::new().into_iter()),
+        start,
+        predicate,
+        object,
+        env,
+        visited,
+        edges,
+        pending_start: include_start,
+    };
+    stream::unfold(Some(state), |state| async move {
+        let mut state = state?;
+        match state.advance().await {
+            Ok(Some(pair)) => Some((Ok(pair), Some(state))),
+            Ok(None) => None,
+            // Fail loud, then end: a closure that keeps going after a lost
+            // lookup would report a partial reachability set as complete.
+            Err(e) => Some((Err(e), None)),
         }
-        // One hop: direct neighbors.
-        for (s, o) in &adjacency {
-            if s == start && matches_endpoint(object, o) {
-                results.push((s.clone(), o.clone()));
-                if results.len() > limits.max_rows {
-                    return Err(SparqlError::Execution(
-                        "property path result exceeds row bound".into(),
-                    ));
+    })
+    .boxed()
+}
+
+impl Bfs {
+    /// Produce the next reachable pair, or `None` when the closure is done.
+    async fn advance(&mut self) -> Result<Option<(Binding, Binding)>, SparqlError> {
+        if std::mem::take(&mut self.pending_start) && matches_endpoint(&self.object, &self.start) {
+            return Ok(Some((self.start.clone(), self.start.clone())));
+        }
+        loop {
+            // 1. Discover: drain the expanding node's edges into the next level.
+            if let Some(edges) = self.edges.as_mut() {
+                match edges.next().await {
+                    Some(edge) => {
+                        let (_, _, node) = edge?;
+                        if self.visited.insert(&term_key(&node)?)? {
+                            self.next.push(SpillNode(node))?;
+                        }
+                        continue;
+                    }
+                    None => self.edges = None,
                 }
             }
-        }
-    }
-    Ok(results)
-}
-
-/// BFS from a start node, collecting all reachable nodes.
-///
-/// Uses a visited set for cycle detection.
-fn bfs_reachable<T: Clone + Eq + std::hash::Hash>(
-    start: &T,
-    adjacency: &[(T, T)],
-    include_start: bool,
-) -> Vec<T> {
-    let mut visited = HashSet::new();
-    let mut queue = VecDeque::new();
-    let mut reachable = Vec::new();
-
-    if include_start {
-        reachable.push(start.clone());
-    }
-    visited.insert(start.clone());
-
-    // Seed queue with direct neighbors.
-    for (s, o) in adjacency {
-        if s == start && visited.insert(o.clone()) {
-            queue.push_back(o.clone());
-            reachable.push(o.clone());
-        }
-    }
-
-    // BFS over remaining hops.
-    while let Some(node) = queue.pop_front() {
-        for (s, o) in adjacency {
-            if s == &node && visited.insert(o.clone()) {
-                queue.push_back(o.clone());
-                reachable.push(o.clone());
+            // 2. Expand: take the next node of the current level, report it and
+            //    open its edges.
+            if let Some(node) = self.current.next() {
+                let SpillNode(node) = node?;
+                self.edges = Some(self.env.out_edges(&node, &self.predicate));
+                if matches_endpoint(&self.object, &node) {
+                    return Ok(Some((self.start.clone(), node)));
+                }
+                continue;
             }
+            // 3. Advance a level, or finish.
+            if self.next.is_empty() {
+                return Ok(None);
+            }
+            let level = std::mem::replace(&mut self.next, self.env.cx.bag("sparql-path-frontier"));
+            self.current = level.drain()?;
         }
     }
-
-    reachable
 }
 
 /// Extract a simple predicate IRI from a path expression.
@@ -197,71 +365,6 @@ fn extract_single_predicate(path: &PropertyPathExpression) -> Result<String, Spa
     }
 }
 
-/// Fetch all (subject, object) pairs for a given predicate from storage.
-///
-/// The scan STREAMS: partitions arrive one at a time from
-/// [`WritePath::range_read_stream_all`] and only the matching `(subject,
-/// object)` pairs are retained, so the whole table is never materialized.
-///
-/// BFS closure is a blocking operator — it cannot emit a reachable node before
-/// it has seen the edges that reach it — so the adjacency list it walks IS
-/// buffered. That buffer is bounded by [`ExecutionLimits::max_rows`] and
-/// crossing the bound is a loud error, never a silent partial traversal (a
-/// partial adjacency would produce a wrong answer that looks complete).
-async fn fetch_triples_for_predicate(
-    scope: &crate::planner::TripleScope,
-    predicate: &str,
-    write_path: &Arc<WritePath>,
-    limits: &ExecutionLimits,
-) -> Result<PathResult, SparqlError> {
-    let table_id = triple_store::triples_table_id(&scope.keyspace);
-    let mut partitions = write_path.range_read_stream_all(&table_id, 0).await?;
-
-    let mut pairs = Vec::new();
-    let mut rows_read: usize = 0;
-    while let Some(partition) = partitions.next().await {
-        let partition = partition?;
-        let (graph, subject) = triple_store::decode_partition(partition.key.key.as_bytes())?;
-        if scope.isolated_graph && graph != scope.graph {
-            continue;
-        }
-        let subject = node_term(&subject);
-        for row in &partition.rows {
-            rows_read += 1;
-            if rows_read > limits.max_rows {
-                return Err(SparqlError::Execution(format!(
-                    "property path over <{predicate}> read more than {} storage rows. \
-                     A partial adjacency would yield a wrong reachability answer that \
-                     looks complete, so this fails instead of truncating — constrain the \
-                     path or raise the engine's max_rows bound.",
-                    limits.max_rows
-                )));
-            }
-            if let Some((pred, obj)) = triple_store::decode_v2_row(row)? {
-                if pred == predicate {
-                    pairs.push((subject.clone(), obj));
-                }
-            }
-        }
-    }
-    Ok(pairs)
-}
-
-/// Determine start nodes from the subject pattern.
-fn collect_start_nodes(subject: &TermPattern, adjacency: &[(Binding, Binding)]) -> Vec<Binding> {
-    match subject {
-        TermPattern::NamedNode(n) => vec![node_term(n.as_str())],
-        TermPattern::Literal(l) => vec![literal_term(l)],
-        _ => {
-            // Variable subject: collect all unique subjects from adjacency.
-            let mut starts: Vec<Binding> = adjacency.iter().map(|(s, _)| s.clone()).collect();
-            starts.sort();
-            starts.dedup();
-            starts
-        }
-    }
-}
-
 /// Check whether a node matches an endpoint pattern.
 fn matches_endpoint(pattern: &TermPattern, node: &Binding) -> bool {
     match pattern {
@@ -269,60 +372,9 @@ fn matches_endpoint(pattern: &TermPattern, node: &Binding) -> bool {
             node.kind() == "uri" && node.scalar_value() == Some(n.as_str())
         }
         TermPattern::Variable(_) => true,
-        TermPattern::Literal(l) => literal_term(l) == *node,
+        TermPattern::Literal(l) => Binding::from_literal(l) == *node,
         _ => true,
     }
-}
-
-/// Filter BFS reachable nodes against the object pattern.
-fn filter_reachable_by_object(
-    object: &TermPattern,
-    start: &Binding,
-    reachable: &[Binding],
-) -> PathResult {
-    reachable
-        .iter()
-        .filter(|node| matches_endpoint(object, node))
-        .map(|node| (start.clone(), node.clone()))
-        .collect()
-}
-
-/// Filter raw triples by subject/object endpoint patterns.
-fn filter_by_endpoints(
-    subject: &TermPattern,
-    object: &TermPattern,
-    triples: &[(Binding, Binding)],
-) -> Result<PathResult, SparqlError> {
-    let results = triples
-        .iter()
-        .filter(|(s, o)| matches_endpoint(subject, s) && matches_endpoint(object, o))
-        .cloned()
-        .collect();
-    Ok(results)
-}
-
-/// Convert path results to binding sets for the executor.
-pub fn path_results_to_bindings(
-    subject: &TermPattern,
-    object: &TermPattern,
-    results: &PathResult,
-) -> Vec<std::collections::HashMap<String, Binding>> {
-    results
-        .iter()
-        .filter_map(|(s, o)| {
-            let mut row = std::collections::HashMap::new();
-            if let TermPattern::Variable(var) = subject {
-                row.insert(var.as_str().to_string(), s.clone());
-            }
-            if let TermPattern::Variable(var) = object {
-                if row.get(var.as_str()).is_some_and(|existing| existing != o) {
-                    return None;
-                }
-                row.insert(var.as_str().to_string(), o.clone());
-            }
-            Some(row)
-        })
-        .collect()
 }
 
 fn node_term(value: &str) -> Binding {
@@ -332,92 +384,10 @@ fn node_term(value: &str) -> Binding {
         Binding::uri(value)
     }
 }
-fn literal_term(literal: &spargebra::term::Literal) -> Binding {
-    Binding::from_literal(literal)
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- BFS cycle detection ---
-
-    #[test]
-    fn bfs_reachable_detects_cycle() {
-        // Graph: A -> B -> C -> A (cycle)
-        let adjacency: Vec<(String, String)> = vec![
-            ("A".into(), "B".into()),
-            ("B".into(), "C".into()),
-            ("C".into(), "A".into()),
-        ];
-        let reachable = bfs_reachable(&"A".to_string(), &adjacency, false);
-        // Should find B and C (and A via cycle), but not loop forever.
-        assert!(reachable.contains(&"B".to_string()));
-        assert!(reachable.contains(&"C".to_string()));
-        // A is revisited via cycle but was already in visited set —
-        // however since include_start=false, A was in visited from the start.
-        // So no duplicate A in reachable.
-        let a_count = reachable.iter().filter(|n| *n == "A").count();
-        assert_eq!(a_count, 0, "start node should not appear in OneOrMore");
-    }
-
-    #[test]
-    fn bfs_reachable_zero_or_more_includes_start() {
-        let adjacency: Vec<(String, String)> =
-            vec![("A".into(), "B".into()), ("B".into(), "C".into())];
-        let reachable = bfs_reachable(&"A".to_string(), &adjacency, true);
-        assert!(
-            reachable.contains(&"A".to_string()),
-            "ZeroOrMore includes start"
-        );
-        assert!(reachable.contains(&"B".to_string()));
-        assert!(reachable.contains(&"C".to_string()));
-    }
-
-    // --- Multi-hop property path ---
-
-    #[test]
-    fn bfs_multi_hop_returns_transitive_nodes() {
-        // Graph: alice -> bob -> carol -> dave
-        let adjacency: Vec<(String, String)> = vec![
-            ("alice".into(), "bob".into()),
-            ("bob".into(), "carol".into()),
-            ("carol".into(), "dave".into()),
-        ];
-        let reachable = bfs_reachable(&"alice".to_string(), &adjacency, false);
-        assert_eq!(reachable.len(), 3);
-        assert!(reachable.contains(&"bob".to_string()));
-        assert!(reachable.contains(&"carol".to_string()));
-        assert!(reachable.contains(&"dave".to_string()));
-    }
-
-    #[test]
-    fn bfs_single_node_no_edges() {
-        let adjacency: Vec<(String, String)> = vec![];
-        let reachable = bfs_reachable(&"lonely".to_string(), &adjacency, false);
-        assert!(
-            reachable.is_empty(),
-            "no outgoing edges means no reachable nodes"
-        );
-    }
-
-    #[test]
-    fn bfs_diamond_graph_no_duplicates() {
-        // Diamond: A -> B, A -> C, B -> D, C -> D
-        let adjacency: Vec<(String, String)> = vec![
-            ("A".into(), "B".into()),
-            ("A".into(), "C".into()),
-            ("B".into(), "D".into()),
-            ("C".into(), "D".into()),
-        ];
-        let reachable = bfs_reachable(&"A".to_string(), &adjacency, false);
-        // D should appear only once despite two paths.
-        let d_count = reachable.iter().filter(|n| *n == "D").count();
-        assert_eq!(d_count, 1, "diamond graph must not produce duplicate D");
-        assert_eq!(reachable.len(), 3); // B, C, D
-    }
-
-    // --- matches_endpoint ---
 
     #[test]
     fn matches_endpoint_named_node() {
@@ -432,8 +402,6 @@ mod tests {
         let pattern = TermPattern::Variable(spargebra::term::Variable::new_unchecked("x"));
         assert!(matches_endpoint(&pattern, &node_term("anything")));
     }
-
-    // --- extract_single_predicate ---
 
     #[test]
     fn extract_single_predicate_success() {
@@ -453,40 +421,24 @@ mod tests {
         assert!(extract_single_predicate(&path).is_err());
     }
 
-    // --- collect_start_nodes ---
-
     #[test]
-    fn collect_start_nodes_bound_subject() {
-        let subject =
-            TermPattern::NamedNode(spargebra::term::NamedNode::new_unchecked("http://ex/alice"));
-        let adjacency: Vec<(String, String)> = vec![("other".into(), "x".into())];
-        let adjacency: Vec<_> = adjacency
-            .iter()
-            .map(|(s, o)| (node_term(s), node_term(o)))
-            .collect();
-        let starts = collect_start_nodes(&subject, &adjacency)
-            .into_iter()
-            .map(|b| b.scalar_value().unwrap().to_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(starts, vec!["http://ex/alice"]);
+    fn a_spilled_frontier_node_round_trips() {
+        for node in [
+            node_term("http://ex/a"),
+            node_term("_:b1"),
+            Binding::literal("x", None, Some("en".into())),
+        ] {
+            let bytes = serde_json::to_vec(&SpillNode(node.clone())).unwrap();
+            let back: SpillNode = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(back.0, node);
+        }
     }
 
     #[test]
-    fn collect_start_nodes_variable_subject() {
-        let subject = TermPattern::Variable(spargebra::term::Variable::new_unchecked("s"));
-        let adjacency: Vec<(String, String)> = vec![
-            ("alice".into(), "bob".into()),
-            ("bob".into(), "carol".into()),
-            ("alice".into(), "carol".into()),
-        ];
-        let adjacency: Vec<_> = adjacency
-            .iter()
-            .map(|(s, o)| (node_term(s), node_term(o)))
-            .collect();
-        let starts = collect_start_nodes(&subject, &adjacency)
-            .into_iter()
-            .map(|b| b.scalar_value().unwrap().to_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(starts, vec!["alice", "bob"]);
+    fn a_variable_used_at_both_ends_must_agree() {
+        let x = TermPattern::Variable(spargebra::term::Variable::new_unchecked("x"));
+        assert!(pair_to_binding(&x, &x, node_term("a"), node_term("b")).is_none());
+        let row = pair_to_binding(&x, &x, node_term("a"), node_term("a")).unwrap();
+        assert_eq!(row["x"], node_term("a"));
     }
 }
