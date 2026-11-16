@@ -95,6 +95,13 @@ pub enum MsgType {
     /// misreading a non-mutating probe as a real, term-advancing vote.
     RaftPreVote = 0x15,
     RaftPreVoteResponse = 0x16,
+    /// A quarantined node's request for a committed snapshot covering its
+    /// repair target. Sent ONLY to a peer that advertised
+    /// [`crate::handshake::CAP_RAFT_REPAIR_SNAPSHOT`]: an older node does not
+    /// know this byte and would drop the whole connection.
+    RaftRepairSnapshotRequest = 0x17,
+    /// Reply to [`MsgType::RaftRepairSnapshotRequest`].
+    RaftRepairSnapshotResponse = 0x18,
     // Data
     MutationForward = 0x20,
     MutationAck = 0x21,
@@ -288,6 +295,8 @@ impl TryFrom<u8> for MsgType {
             0x15 => Ok(Self::RaftPreVote),
             0x16 => Ok(Self::RaftPreVoteResponse),
             0x14 => Ok(Self::RaftInstallSnapshot),
+            0x17 => Ok(Self::RaftRepairSnapshotRequest),
+            0x18 => Ok(Self::RaftRepairSnapshotResponse),
             0x20 => Ok(Self::MutationForward),
             0x21 => Ok(Self::MutationAck),
             0x22 => Ok(Self::ReadRequest),

@@ -548,7 +548,8 @@ enum SnapshotSource {
 }
 
 /// The current-snapshot slot one live state machine shares with its builders.
-type SharedSnapshotSlot = Arc<parking_lot::RwLock<Option<(SnapshotMeta<u64, BasicNode>, Vec<u8>)>>>;
+pub(crate) type SharedSnapshotSlot =
+    Arc<parking_lot::RwLock<Option<(SnapshotMeta<u64, BasicNode>, Vec<u8>)>>>;
 
 struct CompletedApply {
     state: RaftState,
@@ -639,6 +640,13 @@ impl FerrosStateMachine {
         expected: &Arc<super::quarantine::RecoveryAdmission>,
     ) -> bool {
         std::sync::Arc::ptr_eq(&self.recovery_admission, expected)
+    }
+
+    /// The slot this machine and its builders publish snapshots into, shared
+    /// so a repair server can read the committed cut after the machine has
+    /// moved into Raft.
+    pub(crate) fn snapshot_slot(&self) -> SharedSnapshotSlot {
+        Arc::clone(&self.current_snapshot)
     }
 
     pub(crate) fn physical_lifecycle(&self) -> Arc<super::physical_apply::PhysicalApplyLifecycle> {
@@ -1055,6 +1063,21 @@ impl FerrosStateMachine {
         sm.recovery_session = Some(Arc::new(
             super::recovery_session::RecoverySession::for_snapshot(&snapshot_path),
         ));
+        sm.snapshot_path = Some(snapshot_path);
+        sm
+    }
+
+    /// A state machine for a repair install that shares the repair's open
+    /// recovery session. Opening a second session would contend for the
+    /// journal lease the repair already holds.
+    pub(crate) fn for_repair(
+        schema: Arc<Schema>,
+        engine: Arc<StorageEngine>,
+        snapshot_path: PathBuf,
+        session: Arc<super::recovery_session::RecoverySession>,
+    ) -> Self {
+        let mut sm = Self::with_side_effects(schema, engine);
+        sm.recovery_session = Some(session);
         sm.snapshot_path = Some(snapshot_path);
         sm
     }

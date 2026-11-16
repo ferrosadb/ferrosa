@@ -31,8 +31,52 @@ pub(crate) struct ActiveRaftRepair {
     pub(crate) epoch: u64,
     session: std::sync::Arc<RecoverySession>,
     _retired: std::sync::Arc<super::physical_apply::RetiredRaftGroup>,
+    /// Held for the whole completion (install, purge, journal, release) so
+    /// two callers never open the group's log store and journal at once.
+    install: tokio::sync::Mutex<()>,
 }
 impl ActiveRaftRepair {
+    /// The lowest snapshot index this repair can install: at or above both
+    /// the journal's floor and the committed target, so no entry this node
+    /// may have half-applied is ever replayed.
+    pub(crate) fn minimum_index(&self) -> u64 {
+        let target = self
+            .preparation
+            .committed_target
+            .as_ref()
+            .map_or(0, |target| target.index);
+        self.preparation.required_snapshot_index.max(target)
+    }
+
+    /// Whether a peer cut ending at `cut` covers this repair. At the target
+    /// index the leader must match too, or the peer holds another entry.
+    pub(crate) fn covers(&self, cut: openraft::LogId<u64>) -> Result<(), String> {
+        let minimum = self.minimum_index();
+        if cut.index < minimum {
+            return Err(format!("cut {cut} is below the repair minimum {minimum}"));
+        }
+        if let Some(target) = &self.preparation.committed_target {
+            let same = cut.leader_id.term == target.term && cut.leader_id.node_id == target.node_id;
+            if cut.index == target.index && !same {
+                return Err(format!(
+                    "cut {cut} holds another entry than committed target {}-{}-{}",
+                    target.term, target.node_id, target.index
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn session(&self) -> std::sync::Arc<RecoverySession> {
+        std::sync::Arc::clone(&self.session)
+    }
+
+    /// Exclusive right to complete this repair, or `None` while another
+    /// completion runs.
+    pub(crate) fn try_begin_install(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        self.install.try_lock().ok()
+    }
+
     pub(crate) fn new(
         preparation: PreparedRaftRepair,
         epoch: u64,
@@ -44,6 +88,7 @@ impl ActiveRaftRepair {
             epoch,
             session,
             _retired: retired,
+            install: tokio::sync::Mutex::new(()),
         }
     }
     pub(crate) fn record(&self) -> io::Result<Option<RecoveryRecord>> {
