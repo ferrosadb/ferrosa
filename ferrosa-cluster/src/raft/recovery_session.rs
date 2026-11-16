@@ -284,6 +284,77 @@ impl RecoverySession {
         })
     }
 
+    /// Record that a peer's snapshot through `installed` is now this group's
+    /// durable state, ending the quarantine.
+    ///
+    /// The caller has already applied the snapshot to the schema and engine
+    /// and fsynced it as `state-machine.snapshot.bin`. This is the step after
+    /// which a restart replays from that file instead of re-entering
+    /// quarantine, so it accepts only a cut that covers everything this node
+    /// might have half-applied: the prepared retirement scope, the floor
+    /// (`synced`, purge point), and the committed target. At the target's own
+    /// index the term must match too, or the snapshot holds a different entry.
+    pub(crate) fn repair_installed(
+        &self,
+        scope: uuid::Uuid,
+        installed: openraft::LogId<u64>,
+        source: u64,
+    ) -> io::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("recovery session poisoned"))?;
+        self.initialize(&mut state)?;
+        let refuse = |reason: String| Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
+        if !state.reopened_unclean {
+            return refuse("a healthy Raft session has no repair to complete".into());
+        }
+        let mut record = state
+            .record
+            .clone()
+            .ok_or_else(|| io::Error::other("quarantine record is missing"))?;
+        if record.phase != RecoveryPhase::Repairing || record.retirement_scope != Some(scope) {
+            return refuse(format!(
+                "installation for retirement {scope} does not match the prepared repair \
+                 ({:?}, scope {:?})",
+                record.phase, record.retirement_scope
+            ));
+        }
+        let floor = record.synced.max(record.purge_point);
+        if installed.index < floor {
+            return refuse(format!(
+                "installed snapshot at {} is below the repair floor {floor}",
+                installed.index
+            ));
+        }
+        if let Some(target) = &record.committed_target {
+            let same_entry = installed.leader_id.term == target.term
+                && installed.leader_id.node_id == target.node_id;
+            if installed.index < target.index || (installed.index == target.index && !same_entry) {
+                return refuse(format!(
+                    "installed snapshot at {installed} does not cover committed target \
+                     {}-{}-{}",
+                    target.term, target.node_id, target.index
+                ));
+            }
+        }
+        record.phase = RecoveryPhase::SnapshotSynced;
+        record.reason =
+            format!("verified repair installed peer {source}'s snapshot through {installed}");
+        record.synced = record.synced.max(installed.index);
+        record.received = record.received.max(installed.index);
+        record.source = Some(source);
+        state
+            .journal
+            .as_ref()
+            .ok_or_else(|| io::Error::other("missing recovery journal"))?
+            .persist(&record)?;
+        state.record = Some(record);
+        state.reopened_unclean = false;
+        state.highest_started = state.highest_started.max(installed.index);
+        Ok(())
+    }
+
     pub(crate) fn record(&self) -> io::Result<Option<RecoveryRecord>> {
         let mut state = self
             .state
@@ -343,6 +414,103 @@ impl RecoverySession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openraft::{CommittedLeaderId, LogId};
+
+    fn log_id(term: u64, index: u64) -> LogId<u64> {
+        LogId::new(CommittedLeaderId::new(term, 1), index)
+    }
+
+    /// A session interrupted mid-apply, reopened, and prepared for repair with
+    /// committed target (term 2, index 9) and purge point 4.
+    fn prepared_session(
+        path: &Path,
+    ) -> (
+        RecoverySession,
+        super::super::physical_apply::RetiredRaftGroup,
+    ) {
+        let session = RecoverySession::for_snapshot(path);
+        session.before_apply(9, 4).unwrap();
+        drop(session);
+        let reopened = RecoverySession::for_snapshot(path);
+        assert!(reopened.startup_reason().unwrap().is_some());
+        let retired = super::super::physical_apply::RetiredRaftGroup::for_test(
+            super::super::RaftGroupId::for_dc("dc-a"),
+            vec![super::super::physical_apply::RetiredRaftOwner {
+                applied: Some(log_id(2, 8)),
+                committed: Some(log_id(2, 9)),
+                purged: Some(log_id(1, 4)),
+                failure: None,
+                shutdown_error: None,
+            }],
+        );
+        reopened.prepare_from_retired(&retired).unwrap();
+        (reopened, retired)
+    }
+
+    #[test]
+    fn a_verified_installation_covering_the_committed_target_ends_quarantine() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("dc-a/state-machine.snapshot.bin");
+        let (session, retired) = prepared_session(&path);
+        session
+            .repair_installed(retired.scope(), log_id(3, 12), 7)
+            .expect("a peer cut above the committed target is a verified repair");
+        assert_eq!(session.startup_reason().unwrap(), None);
+        drop(session);
+
+        let restarted = RecoverySession::for_snapshot(&path);
+        assert_eq!(
+            restarted.startup_reason().unwrap(),
+            None,
+            "the installed repair must survive a restart as a clean session"
+        );
+        let record = restarted.record().unwrap().unwrap();
+        assert_eq!(record.phase, RecoveryPhase::SnapshotSynced);
+        assert_eq!(record.synced, 12);
+        assert_eq!(record.source, Some(7));
+        assert_eq!(record.received, 12);
+    }
+
+    #[test]
+    fn an_installation_that_does_not_cover_the_committed_target_stays_quarantined() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("dc-a/state-machine.snapshot.bin");
+        let (session, retired) = prepared_session(&path);
+        assert!(session
+            .repair_installed(retired.scope(), log_id(2, 8), 7)
+            .is_err());
+        assert!(
+            session
+                .repair_installed(retired.scope(), log_id(3, 9), 7)
+                .is_err(),
+            "the committed index under another term is a different entry"
+        );
+        assert!(
+            session
+                .repair_installed(uuid::Uuid::new_v4(), log_id(3, 12), 7)
+                .is_err(),
+            "another retirement's installation cannot clear this one"
+        );
+        drop(session);
+        let restarted = RecoverySession::for_snapshot(&path);
+        assert!(restarted.startup_reason().unwrap().is_some());
+        assert_eq!(
+            restarted.record().unwrap().unwrap().phase,
+            RecoveryPhase::Repairing
+        );
+    }
+
+    #[test]
+    fn a_healthy_session_cannot_record_a_repair() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("dc-a/state-machine.snapshot.bin");
+        let session = RecoverySession::for_snapshot(&path);
+        assert_eq!(session.startup_reason().unwrap(), None);
+        assert!(session
+            .repair_installed(uuid::Uuid::new_v4(), log_id(1, 3), 7)
+            .is_err());
+    }
+
     #[test]
     fn runtime_review_dotted_group_names_have_independent_sessions() {
         let directory = tempfile::tempdir().unwrap();

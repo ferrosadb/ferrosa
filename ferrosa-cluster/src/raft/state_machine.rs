@@ -504,6 +504,41 @@ impl std::fmt::Display for RecoveryError {
 
 impl std::error::Error for RecoveryError {}
 
+/// Why a repair could not install a peer's snapshot.
+#[derive(Debug)]
+pub(crate) enum RepairInstallError {
+    /// The cut does not reach the repair's minimum index; a later or other
+    /// peer's snapshot may.
+    Insufficient(String),
+    /// The bytes did not decode or carried no log position.
+    Invalid(String),
+    /// Installing would discard or orphan durable local data. Retrying the
+    /// same repair cannot resolve it, so the node stays quarantined.
+    Refused(String),
+    /// Applying or persisting failed locally.
+    Local(String),
+}
+
+impl RepairInstallError {
+    /// Whether another attempt, perhaps from another peer, could succeed.
+    pub(crate) fn is_retryable(&self) -> bool {
+        matches!(self, Self::Insufficient(_) | Self::Invalid(_))
+    }
+}
+
+impl std::fmt::Display for RepairInstallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Insufficient(reason) => write!(f, "insufficient repair snapshot: {reason}"),
+            Self::Invalid(reason) => write!(f, "invalid repair snapshot: {reason}"),
+            Self::Refused(reason) => write!(f, "repair refused: {reason}"),
+            Self::Local(reason) => write!(f, "repair install failed locally: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for RepairInstallError {}
+
 /// A local file supplies a durable metadata cut, not the ordering of an
 /// already-registered physical incarnation against retained committed entries.
 #[derive(Clone, Copy)]
@@ -1498,6 +1533,68 @@ impl FerrosStateMachine {
                 .and_then(|dir| dir.sync_all())
                 .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
         }
+        Ok(())
+    }
+
+    /// Adopt a peer's committed snapshot as this quarantined node's state.
+    ///
+    /// This is the repair's install step, run on a fresh machine for the
+    /// group while Raft is not running, so nothing else applies concurrently.
+    /// It checks the cut before touching anything:
+    ///
+    /// * `last_log_id` must reach `minimum`, the index at or above which
+    ///   nothing this node half-applied lies. A shorter cut is retryable.
+    /// * No table this node holds rows for may be absent from the cut. The
+    ///   fresh machine's own state is empty, so the comparison is against the
+    ///   live schema, which is what the node actually holds. Absence is
+    ///   ambiguous without a drop marker, so the node refuses rather than
+    ///   orphan the rows (obligation 4: no lost durable data).
+    ///
+    /// Only then does it apply the snapshot to the schema and engine as an
+    /// authoritative install, so a same-name table with another incarnation
+    /// is retired. The cut covers this node's committed target, which is
+    /// the chronology a persisted startup snapshot lacks. Finally it fsyncs
+    /// `state-machine.snapshot.bin` and raises the durable watermark. The
+    /// caller records the repair in the journal only after this returns.
+    pub(crate) fn install_repair_snapshot(
+        &mut self,
+        meta: &SnapshotMeta<u64, BasicNode>,
+        bytes: &[u8],
+        minimum: u64,
+    ) -> Result<(), RepairInstallError> {
+        let Some(installed) = meta.last_log_id else {
+            return Err(RepairInstallError::Invalid(
+                "the snapshot carries no log position".into(),
+            ));
+        };
+        if installed.index < minimum {
+            return Err(RepairInstallError::Insufficient(format!(
+                "snapshot through {installed} is below the repair minimum {minimum}"
+            )));
+        }
+        let data = decode_snapshot(bytes)
+            .map_err(|error| RepairInstallError::Invalid(error.to_string()))?;
+        if let Some(schema) = &self.schema {
+            let held: BTreeMap<(String, String), TableMetadata> = schema
+                .snapshot()
+                .tables
+                .iter()
+                .map(|(name, table)| (name.clone(), table.clone()))
+                .collect();
+            let absent = tables_absent_from_snapshot(&held, &data.state.tables);
+            self.refuse_ambiguous_snapshot_drops(&absent, meta.last_log_id)
+                .map_err(|error| RepairInstallError::Refused(error.to_string()))?;
+        }
+        self.apply_snapshot_data_from(meta, bytes, SnapshotSource::Installed)
+            .map_err(|error| RepairInstallError::Local(error.to_string()))?;
+        if let Some(path) = &self.snapshot_path {
+            Self::persist_snapshot_to_disk(path, meta, bytes)
+                .map_err(|error| RepairInstallError::Local(error.to_string()))?;
+        }
+        self.publish_snapshot(meta.clone(), bytes.to_vec());
+        self.mark_durably_applied(meta.last_log_id);
+        self.physical_lifecycle.applied(self.last_applied);
+        tracing::info!(%installed, minimum, "Raft repair installed a peer snapshot");
         Ok(())
     }
 
@@ -4456,6 +4553,133 @@ mod tests {
             .snapshot()
             .tables
             .contains_key(&(incoming.keyspace, incoming.name)));
+    }
+
+    /// A healthy peer's snapshot through index 2: keyspace `repair_ks`, table
+    /// `repair_ks.repaired`.
+    async fn peer_snapshot() -> (SnapshotMeta<u64, BasicNode>, Vec<u8>) {
+        let mut peer = FerrosStateMachine::new();
+        peer.apply(vec![
+            make_entry(1, 1, RaftOp::CreateKeyspace(simple_keyspace("repair_ks"))),
+            make_entry(
+                1,
+                2,
+                RaftOp::CreateTable(Box::new(simple_table("repair_ks", "repaired"))),
+            ),
+        ])
+        .await
+        .unwrap();
+        let snapshot = peer.build_snapshot().await.unwrap();
+        (snapshot.meta, snapshot.snapshot.into_inner())
+    }
+
+    fn repair_machine(
+        dir: &std::path::Path,
+    ) -> (
+        FerrosStateMachine,
+        Arc<ferrosa_schema::Schema>,
+        Arc<StorageEngine>,
+        PathBuf,
+    ) {
+        let engine = test_engine(dir);
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let path = dir.join("dc-a").join("state-machine.snapshot.bin");
+        let sm = FerrosStateMachine::with_side_effects_and_snapshot_path(
+            Arc::clone(&schema),
+            Arc::clone(&engine),
+            path.clone(),
+        );
+        (sm, schema, engine, path)
+    }
+
+    /// The quarantined node adopts a verified peer cut: the schema, the engine
+    /// and the durable snapshot file all move to it together.
+    #[tokio::test]
+    async fn a_repair_installs_a_covering_peer_snapshot_durably() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sm, schema, engine, path) = repair_machine(dir.path());
+        let (meta, bytes) = peer_snapshot().await;
+        sm.install_repair_snapshot(&meta, &bytes, 2)
+            .expect("a snapshot at the minimum index installs");
+        assert_eq!(sm.last_applied_index(), Some(2));
+        assert!(schema
+            .snapshot()
+            .tables
+            .contains_key(&("repair_ks".into(), "repaired".into())));
+        assert!(engine
+            .table_schema(&TableId::new("repair_ks", "repaired"))
+            .is_some());
+        let persisted: PersistedSnapshot =
+            bincode::deserialize(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted.meta.last_log_id, meta.last_log_id);
+    }
+
+    /// A cut that does not reach what this node may have half-applied is no
+    /// repair at all, and installing it must change nothing.
+    #[tokio::test]
+    async fn a_repair_refuses_a_snapshot_below_its_minimum_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sm, schema, engine, path) = repair_machine(dir.path());
+        let (meta, bytes) = peer_snapshot().await;
+        let error = sm.install_repair_snapshot(&meta, &bytes, 3).unwrap_err();
+        assert!(
+            error.is_retryable(),
+            "a newer cut may come from another attempt: {error}"
+        );
+        assert!(!schema
+            .snapshot()
+            .tables
+            .contains_key(&("repair_ks".into(), "repaired".into())));
+        assert!(engine
+            .table_schema(&TableId::new("repair_ks", "repaired"))
+            .is_none());
+        assert!(!path.exists());
+    }
+
+    /// Obligation 4, no lost durable data: a local table holding rows that the
+    /// peer cut does not name is preserved, and the repair refuses loudly.
+    #[tokio::test]
+    async fn a_repair_refuses_a_snapshot_that_would_orphan_local_rows() {
+        use ferrosa_common::{DecoratedKey, PartitionKey};
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sm, schema, engine, path) = repair_machine(dir.path());
+        let local = simple_table("local_ks", "only_here");
+        schema
+            .create_keyspace_internal(simple_keyspace("local_ks"))
+            .unwrap();
+        schema.create_table_internal(local.clone()).unwrap();
+        engine.register_table(local.to_storage_schema()).unwrap();
+        let tid = TableId::new("local_ks", "only_here");
+        let key = DecoratedKey::new(PartitionKey::new(b"durable-local-row".to_vec()));
+        engine
+            .write(
+                &tid,
+                &key,
+                ferrosa_sstable::types::Row {
+                    clustering: vec![],
+                    cells: vec![],
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
+                },
+                1,
+            )
+            .unwrap();
+        engine.flush(&tid).unwrap();
+
+        let (meta, bytes) = peer_snapshot().await;
+        let error = sm.install_repair_snapshot(&meta, &bytes, 2).unwrap_err();
+        assert!(
+            !error.is_retryable(),
+            "local rows need a decision, not a retry: {error}"
+        );
+        assert!(error.to_string().contains("local_ks.only_here"), "{error}");
+        assert!(schema
+            .snapshot()
+            .tables
+            .contains_key(&("local_ks".into(), "only_here".into())));
+        assert!(engine.read(&tid, &key).unwrap().is_some());
+        assert!(!path.exists());
     }
 
     /// Every apply group that finished is complete on disk, so a restart whose
