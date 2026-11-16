@@ -30,7 +30,9 @@ use crate::executor::expand::{
     graph_vertex_lookup_key, row_to_json, table_metadata_for, traversable_neighbor_id,
     GraphEngineConfig,
 };
-use crate::executor::result::{GraphResult, QueryStats};
+#[cfg(test)]
+use crate::executor::result::GraphResult;
+use crate::executor::result::QueryStats;
 use crate::executor::spill::{OrderSemantics, RowAcc};
 use crate::parser::Direction;
 use crate::parser::ReturnClause;
@@ -71,6 +73,7 @@ fn admit_neighbor(
 /// buffered `GraphResult` boundary — the caller asked for a whole result —
 /// rather than keeping a second tail that could drift from it.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub async fn execute_var_length(
     write_path: &dyn GraphWrite,
     keyspace: &str,

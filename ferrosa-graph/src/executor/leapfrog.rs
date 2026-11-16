@@ -25,7 +25,9 @@ use crate::executor::eval;
 use crate::executor::expand::{
     build_columns, check_timeout, extract_neighbor_id, GraphEngineConfig,
 };
-use crate::executor::result::{GraphResult, QueryStats};
+#[cfg(test)]
+use crate::executor::result::GraphResult;
+use crate::executor::result::QueryStats;
 use crate::executor::spill::{OrderSemantics, RowAcc};
 use crate::parser::ReturnClause;
 use crate::planner::physical::WcoJoinPlan;
@@ -167,6 +169,7 @@ fn next_common_value(iterators: &mut [AdjacencyIterator]) -> Option<Vec<u8>> {
 ///    d. Check that the closing edge `(c)->(a)` is satisfied.
 /// 3. Collect matched bindings and project via return clause.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub async fn execute_wco_join(
     write_path: &dyn GraphWrite,
     keyspace: &str,

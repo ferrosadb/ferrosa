@@ -30,6 +30,10 @@
 //! select rows by their `text`/`int` properties (`name`, `age`) rather than by a
 //! UUID string literal.
 
+mod support;
+#[allow(unused_imports)] // a test binary may only use the streaming API
+use support::ExecuteCollect as _;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 

@@ -7,6 +7,10 @@
 //! Last revised: 2026-11-03
 //! Last changed: Cover legacy cascade row keys and temporal vertex endpoint identities.
 
+mod support;
+#[allow(unused_imports)] // a test binary may only use the streaming API
+use support::ExecuteCollect as _;
+
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;

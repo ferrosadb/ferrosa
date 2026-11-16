@@ -18,6 +18,10 @@
 //! edge, in the right direction, no deleted edge), or fail retryably. Never a
 //! partial answer presented as complete.
 
+mod support;
+#[allow(unused_imports)] // a test binary may only use the streaming API
+use support::ExecuteCollect as _;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
