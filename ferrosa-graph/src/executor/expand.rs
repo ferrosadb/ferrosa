@@ -4227,18 +4227,18 @@ async fn execute_create(
         });
         let (key, row, hex_key) = create_row_from_schema(op, meta.as_ref(), timestamp)?;
 
+        let adjacency = explicit_adjacency_for(schema, &table_id, &key, &row, timestamp);
         write_path
             .write(
                 &table_id,
                 &key,
-                row.clone(),
+                row,
                 timestamp,
                 graph_write_consistency(),
                 &strategy,
             )
             .await?;
-        write_explicit_adjacency_entries(write_path, &table_id, &key, &row, timestamp, schema)
-            .await?;
+        write_explicit_adjacency_entries(write_path, &table_id, adjacency, schema).await?;
         stats.vertices_written += 1;
         var_keys.push((op.var.clone(), hex_key));
     }
@@ -4546,11 +4546,12 @@ async fn execute_merge(
                 primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
             };
 
+            let adjacency = explicit_adjacency_for(schema, &table_id, &key, &row, timestamp);
             write_path
                 .write(
                     &table_id,
                     &key,
-                    row.clone(),
+                    row,
                     timestamp,
                     graph_write_consistency(),
                     &strategy,
@@ -4566,8 +4567,7 @@ async fn execute_merge(
                     );
                     e
                 })?;
-            write_explicit_adjacency_entries(write_path, &table_id, &key, &row, timestamp, schema)
-                .await?;
+            write_explicit_adjacency_entries(write_path, &table_id, adjacency, schema).await?;
             stats.vertices_written += 1;
         }
         // Existing row: no create needed, count as read.
@@ -4691,27 +4691,38 @@ async fn execute_merge(
     })
 }
 
-async fn write_explicit_adjacency_entries(
-    write_path: &dyn GraphWrite,
+/// The adjacency entries an edge row implies. Derived from the borrowed row,
+/// so a caller derives first and then moves the row into its base write
+/// instead of cloning it to keep it alive for the derive.
+fn explicit_adjacency_for(
+    schema: Option<&Schema>,
     table_id: &TableId,
     key: &DecoratedKey,
     row: &Row,
     timestamp: i64,
+) -> Vec<Mutation> {
+    schema.map_or_else(Vec::new, |schema| {
+        derive_adjacency_row_mutations(schema, table_id, key, row, timestamp)
+    })
+}
+
+/// Write the entries [`explicit_adjacency_for`] derived, once their base row
+/// has landed.
+async fn write_explicit_adjacency_entries(
+    write_path: &dyn GraphWrite,
+    table_id: &TableId,
+    derived_entries: Vec<Mutation>,
     schema: Option<&Schema>,
 ) -> Result<()> {
     let Some(schema) = schema else {
+        debug_assert!(
+            derived_entries.is_empty(),
+            "entries need a schema to derive"
+        );
         return Ok(());
     };
 
-    let mutation = Mutation::new(
-        table_id.keyspace.clone(),
-        table_id.table.clone(),
-        key.clone(),
-        vec![row.clone()],
-        timestamp,
-    );
-
-    for derived in derive_adjacency_mutations(schema, table_id, &mutation) {
+    for derived in derived_entries {
         let adj_table_id = TableId::new(&derived.keyspace, &derived.table);
         let strategy = graph_replication_strategy(Some(schema), &derived.keyspace)?;
         for derived_row in derived.rows {
@@ -6774,15 +6785,10 @@ async fn execute_delete(
                     // The edge's OUT and IN adjacency entries go with it, as
                     // MERGE writes them explicitly; otherwise every hop over
                     // the adjacency index still finds the deleted edge.
-                    write_explicit_adjacency_entries(
-                        write_path,
-                        &table_id,
-                        &key,
-                        &tombstone_row,
-                        timestamp,
-                        schema,
-                    )
-                    .await?;
+                    let adjacency =
+                        explicit_adjacency_for(schema, &table_id, &key, &tombstone_row, timestamp);
+                    write_explicit_adjacency_entries(write_path, &table_id, adjacency, schema)
+                        .await?;
                     restore_entries_shared_with_live_edges(
                         write_path,
                         &table_id,
@@ -7006,10 +7012,13 @@ async fn execute_aggregate(
                 )));
             }
 
-            let state = match groups.entry(group_key_str) {
-                std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
+            // A new group keeps its first row for the GroupKey projections. It
+            // starts empty and receives the row by move once the accumulators
+            // below have read it, so the row is never cloned.
+            let (state, new_group) = match groups.entry(group_key_str) {
+                std::collections::btree_map::Entry::Occupied(e) => (e.into_mut(), false),
                 std::collections::btree_map::Entry::Vacant(v) => {
-                    v.insert(new_group_state(row.clone())?)
+                    (v.insert(new_group_state(Vec::new())?), true)
                 }
             };
 
@@ -7026,6 +7035,9 @@ async fn execute_aggregate(
                         acc.accumulate(&value);
                     }
                 }
+            }
+            if new_group {
+                state.first_row = row;
             }
         }
     }
@@ -8812,8 +8824,15 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn execute_merge_writes_adjacency_rows_without_registered_observer() {
+    /// A merged `(a:Entity)-[r:TYPED_EDGE]->(b:Entity)` on agent_memory, written
+    /// through a direct write path with no adjacency observer registered.
+    async fn merged_typed_edge_fixture() -> (
+        tempfile::TempDir,
+        Arc<ferrosa_schema::Schema>,
+        ferrosa_cluster::write_path::WritePath,
+        uuid::Uuid,
+        uuid::Uuid,
+    ) {
         let tmp = tempfile::tempdir().unwrap();
         let storage = test_storage_engine(tmp.path());
         let schema = Arc::new(
@@ -9005,6 +9024,81 @@ mod tests {
         .await
         .unwrap();
 
+        (tmp, schema, write_path, src_id, dst_id)
+    }
+
+    /// CREATE/MERGE/DELETE derive an edge's adjacency entries from the row they
+    /// write. They used to copy that row twice to do it: `row.clone()` into the
+    /// base write so the row survived for the derive, and `vec![row.clone()]`
+    /// inside the helper to build a Mutation it only read. Deriving from the
+    /// borrowed row must produce exactly what the Mutation-based derive does,
+    /// so the caller can derive first and move the row into its write.
+    #[tokio::test]
+    async fn adjacency_derived_from_a_borrowed_row_matches_the_mutation_derive() {
+        let (_tmp, schema, write_path, src_id, dst_id) = merged_typed_edge_fixture().await;
+        let edge_tid = TableId::new("agent_memory", "typed_edges");
+        // typed_edges is partitioned by (tenant_id, session_id), as the fixture writes it.
+        let edge_key = DecoratedKey::new(PartitionKey::new(encode_partition_components(&[
+            uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001")
+                .unwrap()
+                .as_bytes()
+                .to_vec(),
+            uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111")
+                .unwrap()
+                .as_bytes()
+                .to_vec(),
+        ])));
+        let edge = write_path
+            .read(&edge_tid, &edge_key)
+            .await
+            .unwrap()
+            .expect("the merged edge partition");
+        let row = edge.rows.first().expect("the merged edge row");
+
+        let borrowed = explicit_adjacency_for(Some(&schema), &edge_tid, &edge.key, row, 7);
+        let via_mutation = derive_adjacency_mutations(
+            &schema,
+            &edge_tid,
+            &Mutation::new(
+                "agent_memory".into(),
+                "typed_edges".into(),
+                edge.key.clone(),
+                vec![row.clone()],
+                7,
+            ),
+        );
+
+        let shape = |ms: &[Mutation]| {
+            ms.iter()
+                .map(|m| {
+                    (
+                        m.keyspace.clone(),
+                        m.table.clone(),
+                        m.key.clone(),
+                        m.rows.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&borrowed), shape(&via_mutation));
+        let keys: Vec<Vec<u8>> = borrowed
+            .iter()
+            .map(|m| m.key.key.as_bytes().to_vec())
+            .collect();
+        assert!(
+            keys.contains(&src_id.as_bytes().to_vec())
+                && keys.contains(&dst_id.as_bytes().to_vec()),
+            "an edge derives an OUT entry on its source and an IN entry on its target: {keys:?}"
+        );
+        assert!(
+            explicit_adjacency_for(None, &edge_tid, &edge.key, row, 7).is_empty(),
+            "no schema, no adjacency"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_merge_writes_adjacency_rows_without_registered_observer() {
+        let (_tmp, _schema, write_path, src_id, dst_id) = merged_typed_edge_fixture().await;
         let adj_tid = TableId::new(adjacency_keyspace_name("agent_memory"), "adjacency");
         let src_adj = write_path
             .read(
