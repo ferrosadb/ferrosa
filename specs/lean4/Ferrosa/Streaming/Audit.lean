@@ -85,6 +85,9 @@ def sites : List Site := [
   ⟨"system tables", "the system-table walk visits one partition at a time", .streaming,
    "ferrosa-cluster/src/system_table_loader.rs:78",
    "`walk_all_partitions` delegates to `walk_token_range`, which streams the merged memtable and SSTable view."⟩,
+  ⟨"repair", "the apply path moves each chunk of partitions to its replica without copying it", .streaming,
+   "ferrosa-cluster/src/repair/rpc.rs:443",
+   "The executor hands its apply queue over with `mem::take` once it reaches `REPAIR_APPLY_CHUNK_PARTITIONS` (64); `apply_wire_chunks` moves each partition into its wire form, and the per-leaf diff borrows the partitions it compares instead of cloning them."⟩,
   ⟨"cql", "a result cursor holds a node-wide permit or is refused", .serialized,
    "ferrosa-cql/src/result_cursor.rs:513",
    "`admit` CAS-increments the open count under `max_open` (default 256), sweeps expired cursors first, and returns Overloaded rather than queueing."⟩,
@@ -165,8 +168,8 @@ def sites : List Site := [
    "No rewrap operator exists in the tree: the only PITR path is `run_pitr_replay_e2e`, a replay test, so there is no transform to inspect."⟩
 ]
 
-/-- Thirty-two sites were read. -/
-theorem site_count : sites.length = 32 := by decide
+/-- Thirty-three sites were read. -/
+theorem site_count : sites.length = 33 := by decide
 
 /-- **Every site names a file and line.**  A row without a location is a mood, not an audit finding, so
     each `site` field has to contain a `file.rs:line`. -/
@@ -180,8 +183,8 @@ theorem every_config_bound_names_its_knob :
       | .boundedByConfig knob => !knob.isEmpty
       | _ => true) = true := by native_decide
 
-/-- Six sites are bounded by construction. -/
-theorem streaming_sites : (sites.filter fun s => s.klass == .streaming).length = 6 := by decide
+/-- Seven sites are bounded by construction. -/
+theorem streaming_sites : (sites.filter fun s => s.klass == .streaming).length = 7 := by decide
 
 /-- Three are bounded by a permit. -/
 theorem serialized_sites : (sites.filter fun s => match s.klass with
@@ -217,7 +220,7 @@ theorem classes_partition_the_sites :
       + (sites.filter fun s => match s.klass with | .spilling _ => true | _ => false).length
       + (sites.filter fun s => match s.klass with | .boundedByConfig _ => true | _ => false).length
       + (sites.filter fun s => match s.klass with | .unbounded _ => true | _ => false).length
-      + (sites.filter fun s => s.klass == .unresolved).length = 32 := by decide
+      + (sites.filter fun s => s.klass == .unresolved).length = 33 := by decide
 
 /-- The layers the audit covers, so the table can be printed by layer. -/
 def layers : List String := ["cql", "commit log", "compaction", "flush", "graph", "permits",

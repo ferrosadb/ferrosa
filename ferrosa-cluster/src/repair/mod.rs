@@ -498,12 +498,22 @@ fn row_content_hash(row: &ferrosa_sstable::types::Row) -> u64 {
 /// observability, not a blocker: repair converges those rows too, because
 /// leaving them alone left replicas divergent forever while reporting success.
 pub fn diff_partition_sets(a: &[Partition], b: &[Partition]) -> RepairPlan {
+    diff_partition_refs(a, b)
+}
+
+/// [`diff_partition_sets`] over borrowed partitions, so a caller that filters
+/// a larger slice (one Merkle leaf of it) does not have to copy the matches
+/// into a new Vec first. Only partitions the plan streams are cloned.
+pub fn diff_partition_refs<'p>(
+    a: impl IntoIterator<Item = &'p Partition>,
+    b: impl IntoIterator<Item = &'p Partition>,
+) -> RepairPlan {
     use std::collections::HashMap;
     // Key the lookups by raw partition-key bytes — DecoratedKey isn't Hash.
     let a_by_key: HashMap<&[u8], &Partition> =
-        a.iter().map(|p| (p.key.key.as_bytes(), p)).collect();
+        a.into_iter().map(|p| (p.key.key.as_bytes(), p)).collect();
     let b_by_key: HashMap<&[u8], &Partition> =
-        b.iter().map(|p| (p.key.key.as_bytes(), p)).collect();
+        b.into_iter().map(|p| (p.key.key.as_bytes(), p)).collect();
     let mut plan = RepairPlan::default();
 
     for (key, p_a) in &a_by_key {
@@ -645,7 +655,7 @@ where
 /// 1. Build a Merkle tree on each side.
 /// 2. Find the leaves where the trees diverge.
 /// 3. For each divergent leaf, filter partitions to that sub-range and
-///    diff with [`diff_partition_sets`].
+///    diff the borrowed matches with [`diff_partition_refs`].
 /// 4. Union the per-leaf diffs.
 ///
 /// Pure function — does no I/O. Storage-side callers should first
@@ -676,17 +686,11 @@ pub fn compute_repair_plan(
 
     let mut plan = RepairPlan::default();
     for (sub_start, sub_end) in divergent {
-        let a_in_leaf: Vec<Partition> = parts_a
-            .iter()
-            .filter(|p| p.key.token.0 >= sub_start && p.key.token.0 < sub_end)
-            .cloned()
-            .collect();
-        let b_in_leaf: Vec<Partition> = parts_b
-            .iter()
-            .filter(|p| p.key.token.0 >= sub_start && p.key.token.0 < sub_end)
-            .cloned()
-            .collect();
-        let sub_plan = diff_partition_sets(&a_in_leaf, &b_in_leaf);
+        let in_leaf = |p: &&Partition| p.key.token.0 >= sub_start && p.key.token.0 < sub_end;
+        let sub_plan = diff_partition_refs(
+            parts_a.iter().filter(in_leaf),
+            parts_b.iter().filter(in_leaf),
+        );
         plan.a_to_b.extend(sub_plan.a_to_b);
         plan.b_to_a.extend(sub_plan.b_to_a);
         plan.timestamp_ties.extend(sub_plan.timestamp_ties);
@@ -995,6 +999,49 @@ mod tests {
             plan.timestamp_ties.len(),
             1,
             "the genuine conflict must still be surfaced"
+        );
+    }
+
+    /// The per-leaf diff in `compute_repair_plan` must work on borrowed
+    /// partitions. It used to `.cloned()` every partition in every divergent
+    /// leaf into a fresh Vec only to hand out a slice, so a dense leaf held two
+    /// copies of its data. The borrowed diff must decide exactly what the
+    /// slice-based one decides.
+    #[test]
+    fn the_borrowed_diff_decides_exactly_what_the_slice_diff_decides() {
+        let a = vec![
+            multi_row_partition(
+                b"k1",
+                vec![
+                    row_at(b"agreed", b"same", 900),
+                    row_at(b"tied", b"a-version", 500),
+                ],
+            ),
+            multi_row_partition(b"only-a", vec![row_at(b"x", b"a", 10)]),
+        ];
+        let b = vec![
+            multi_row_partition(
+                b"k1",
+                vec![
+                    row_at(b"agreed", b"same", 900),
+                    row_at(b"tied", b"b-version", 500),
+                    row_at(b"only-b", b"new-row", 400),
+                ],
+            ),
+            multi_row_partition(b"only-b", vec![row_at(b"y", b"b", 20)]),
+        ];
+
+        let owned = diff_partition_sets(&a, &b);
+        let borrowed = diff_partition_refs(a.iter(), b.iter());
+
+        assert_eq!(streamed(&borrowed.a_to_b), streamed(&owned.a_to_b));
+        assert_eq!(streamed(&borrowed.b_to_a), streamed(&owned.b_to_a));
+        assert_eq!(borrowed.a_to_b.len(), owned.a_to_b.len());
+        assert_eq!(borrowed.b_to_a.len(), owned.b_to_a.len());
+        assert_eq!(borrowed.timestamp_ties.len(), owned.timestamp_ties.len());
+        assert!(
+            !owned.a_to_b.is_empty() && !owned.b_to_a.is_empty(),
+            "fixture must exercise both directions, or the comparison is vacuous"
         );
     }
 
