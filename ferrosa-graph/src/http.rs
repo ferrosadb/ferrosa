@@ -530,7 +530,7 @@ async fn handle_subscribe(State(state): State<AppState>, req: Request<Body>) -> 
     );
 
     // Parse and execute initial snapshot, extracting interval and delta flag.
-    let (initial_result, interval, delta) = match state
+    let (initial, interval, delta) = match state
         .engine
         .execute_subscribe(&query_req.query, &query_req.keyspace, &auth)
         .await
@@ -553,7 +553,7 @@ async fn handle_subscribe(State(state): State<AppState>, req: Request<Body>) -> 
         query_req.query,
         query_req.keyspace,
         auth,
-        initial_result,
+        initial,
         interval,
         delta,
     );
@@ -668,12 +668,84 @@ fn stream_graph_rows(
         })
 }
 
+/// A 32-byte fingerprint of one result row (BLAKE3 of its JSON), used by
+/// `SUBSCRIBE { delta: true }` to remember the previous tick's rows without
+/// holding them.
+type RowFingerprint = [u8; 32];
+
+/// One SUBSCRIBE tick, serialized into one SSE event payload.
+struct SubscriptionPayload {
+    json: String,
+    rows: usize,
+    fingerprints: Option<std::collections::HashSet<RowFingerprint>>,
+}
+
+/// Pull one SUBSCRIBE execution and serialize it into an SSE event payload,
+/// exactly the JSON `GraphResult` would serialize to
+/// (`{"columns":…,"rows":[…],"stats":…}`).
+///
+/// With `previous` set (delta mode), only rows whose fingerprint is not in
+/// `previous` are written, and the fingerprints of EVERY row of this tick are
+/// returned as the next baseline.
+///
+/// # Memory
+///
+/// Rows are never held as values: each is serialized into the payload as it
+/// is pulled. What remains is inherent to the SSE framing — one event carries
+/// one whole result, so the payload text is as large as the result — plus one
+/// 32-byte fingerprint per row in delta mode (it used to keep every row of the
+/// previous tick and compare them pairwise).
+async fn subscription_payload(
+    columns: &[String],
+    mut rows: crate::executor::stream::RowStream<'_>,
+    stats: crate::executor::QueryStats,
+    previous: Option<&std::collections::HashSet<RowFingerprint>>,
+) -> Result<SubscriptionPayload, GraphError> {
+    use futures::stream::StreamExt as _;
+
+    let encode = |e: serde_json::Error| GraphError::Internal(format!("encode subscription: {e}"));
+    let mut json = format!(
+        "{{\"columns\":{},\"rows\":[",
+        serde_json::to_string(columns).map_err(encode)?
+    );
+    let mut fingerprints = previous.map(|_| std::collections::HashSet::new());
+    let mut written = 0usize;
+    while let Some(row) = rows.next().await {
+        let encoded = serde_json::to_string(&row?).map_err(encode)?;
+        if let Some(seen) = fingerprints.as_mut() {
+            let fingerprint = *blake3::hash(encoded.as_bytes()).as_bytes();
+            let is_new = previous.is_some_and(|previous| !previous.contains(&fingerprint));
+            seen.insert(fingerprint);
+            if !is_new {
+                continue;
+            }
+        }
+        let separator = if written > 0 { "," } else { "" };
+        json.push_str(separator);
+        json.push_str(&encoded);
+        written += 1;
+    }
+    json.push_str(&format!(
+        "],\"stats\":{}}}",
+        serde_json::to_string(&stats).map_err(encode)?
+    ));
+    Ok(SubscriptionPayload {
+        json,
+        rows: written,
+        fingerprints,
+    })
+}
+
 fn make_subscribe_stream(
     engine: Arc<GraphEngine>,
     query: String,
     keyspace: String,
     auth: AuthContext,
-    initial_result: crate::executor::result::GraphResult,
+    initial: (
+        Vec<String>,
+        crate::executor::stream::RowStream<'static>,
+        crate::executor::QueryStats,
+    ),
     interval: Duration,
     delta: bool,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
@@ -690,21 +762,30 @@ fn make_subscribe_stream(
 
     // Spawn the subscription background task.
     let task = tokio::spawn(async move {
-        // Send initial snapshot.
-        let initial_json = serde_json::to_string(&initial_result).unwrap_or_default();
-        let event = Event::default().event("snapshot").data(initial_json);
-        if tx.send(Ok(event)).await.is_err() {
-            return; // Client disconnected.
-        }
-
-        let mut previous_rows = if delta {
-            // MOVED, not cloned: `initial_result` is not used again after this
-            // point (the snapshot already serialized above), so the baseline
-            // row set transfers ownership into `previous_rows` for free instead
-            // of deep-copying every row on every SUBSCRIBE { delta: true }.
-            Some(initial_result.rows)
-        } else {
-            None
+        // Send the initial snapshot. Every row is in it (no baseline yet); in
+        // delta mode its fingerprints become the first baseline.
+        let (columns, rows, stats) = initial;
+        let empty_baseline = std::collections::HashSet::new();
+        let baseline = delta.then_some(&empty_baseline);
+        let mut previous = match subscription_payload(&columns, rows, stats, baseline).await {
+            Ok(payload) => {
+                let event = Event::default().event("snapshot").data(payload.json);
+                if tx.send(Ok(event)).await.is_err() {
+                    return; // Client disconnected.
+                }
+                payload.fingerprints
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "subscription snapshot failed");
+                let event = Event::default()
+                    .event("error")
+                    .data(format!("query error: {e}"));
+                // The subscription ends here either way: there is no baseline.
+                if tx.send(Ok(event)).await.is_err() {
+                    tracing::debug!("subscriber left before the snapshot error was delivered");
+                }
+                return;
+            }
         };
 
         let mut ticker = tokio::time::interval(interval);
@@ -713,35 +794,24 @@ fn make_subscribe_stream(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    // Re-execute the query.
-                    let result = engine.execute(&query, &keyspace, &auth).await;
-                    match result {
-                        Ok(current) => {
-                            if delta {
-                                // Compute delta: rows in current that were not in previous.
-                                let prev = previous_rows.as_ref().unwrap();
-                                let new_rows: Vec<&Vec<serde_json::Value>> = current
-                                    .rows
-                                    .iter()
-                                    .filter(|row| !prev.contains(row))
-                                    .collect();
-
-                                if !new_rows.is_empty() {
-                                    let delta_result = serde_json::json!({
-                                        "columns": current.columns,
-                                        "rows": new_rows,
-                                        "stats": current.stats,
-                                    });
-                                    let json = serde_json::to_string(&delta_result).unwrap_or_default();
-                                    let event = Event::default().event("delta").data(json);
-                                    if tx.send(Ok(event)).await.is_err() {
-                                        break; // Client disconnected.
-                                    }
-                                }
-                                previous_rows = Some(current.rows);
+                    // Re-execute the query and stream it into the event payload.
+                    let tick = async {
+                        let (columns, rows, stats) = engine
+                            .execute_stream_with_params(&query, &keyspace, &auth, &HashMap::new())
+                            .await?;
+                        subscription_payload(&columns, rows, stats, previous.as_ref()).await
+                    };
+                    match tick.await {
+                        Ok(payload) => {
+                            let event = if delta {
+                                previous = payload.fingerprints;
+                                // Only rows that were not in the previous tick.
+                                (payload.rows > 0)
+                                    .then(|| Event::default().event("delta").data(payload.json))
                             } else {
-                                let json = serde_json::to_string(&current).unwrap_or_default();
-                                let event = Event::default().event("data").data(json);
+                                Some(Event::default().event("data").data(payload.json))
+                            };
+                            if let Some(event) = event {
                                 if tx.send(Ok(event)).await.is_err() {
                                     break; // Client disconnected.
                                 }
