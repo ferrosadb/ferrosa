@@ -6245,20 +6245,14 @@ impl StorageEngine {
             return Ok(IndexReloadOutcome::default());
         }
 
-        // Full scan of system_schema.indexes. This table holds one row per
-        // index cluster-wide; it is tiny. Bound the scan at the engine's
-        // range-read materialization cap and warn loudly if we hit it, so a
-        // truncated reload is visible rather than silently dropping indexes.
-        const MAX_INDEXES_TO_RELOAD: usize = 10_000;
-        let partitions = self.read_range(&indexes_tid, None, None, MAX_INDEXES_TO_RELOAD)?;
-
+        // Walk every row of system_schema.indexes, one keyspace at a time. The
+        // capped `read_range(.., 10_000)` this replaces read only the first
+        // 10_000 keyspaces and warned, so later registrations never came back.
         let mut restored = 0usize;
         let mut skipped = 0usize;
-        let mut rows_seen = 0usize;
-        for partition in &partitions {
-            let keyspace = String::from_utf8_lossy(partition.key.key.as_bytes()).to_string();
+        self.walk_token_range(&indexes_tid, i64::MIN, i64::MAX, |partition| {
+            let keyspace = String::from_utf8_lossy(partition.key.key.as_bytes());
             for row in &partition.rows {
-                rows_seen += 1;
                 // A row fully shadowed by a DROP INDEX / DROP TABLE tombstone
                 // surfaces from the merge with its cells suppressed and the
                 // row-level deletion set. That is a *normal* deleted
@@ -6274,14 +6268,8 @@ impl StorageEngine {
                     skipped += 1;
                 }
             }
-        }
-        if rows_seen >= MAX_INDEXES_TO_RELOAD {
-            tracing::warn!(
-                rows_seen,
-                cap = MAX_INDEXES_TO_RELOAD,
-                "system_schema.indexes reload hit the read cap — some indexes may not have been restored"
-            );
-        }
+            Ok(())
+        })?;
         if skipped > 0 {
             // One summary warn instead of a warn per orphan — dangling
             // registrations (DROP TABLE debris predating the tombstone
@@ -35980,6 +35968,44 @@ mod tests {
             ],
             "fields (incl. nested list<text>) must round-trip losslessly"
         );
+    }
+
+    /// The boot-time index reload reads every `system_schema.indexes` row. It
+    /// used to read at most 10_000 keyspaces and only warn, so registrations
+    /// past the cap were never restored. Every row here is unresolvable (its
+    /// table is not registered), so each one must be counted as skipped.
+    #[test]
+    fn index_reload_visits_more_keyspaces_than_the_old_cap() {
+        use ferrosa_schema::metadata::index::IndexMetadata;
+        use ferrosa_schema::system::persistence;
+
+        const KEYSPACES: usize = 10_001;
+        let dir = tempfile::tempdir().unwrap();
+        let indexes_tid = TableId::new("system_schema", "indexes");
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_system_tables().unwrap();
+        let ts = now_micros_for_test();
+        for i in 0..KEYSPACES {
+            let index = IndexMetadata {
+                keyspace: format!("ks{i:05}"),
+                table: "unregistered".to_string(),
+                name: "idx".to_string(),
+                index_type: ferrosa_index::IndexType::BTree,
+                target_columns: vec!["v".to_string()],
+                filter_predicate: None,
+                options: Default::default(),
+            };
+            let row = persistence::index_to_rows(&index);
+            engine.write(&indexes_tid, &row.key, row.row, ts).unwrap();
+        }
+
+        let outcome = engine
+            .reload_indexes_from_system_schema(&PartitionKeyColumns::new())
+            .unwrap();
+
+        assert_eq!(outcome.restored, 0);
+        assert_eq!(outcome.skipped, KEYSPACES, "every registration is visited");
     }
 
     /// The schema loaders read the whole system table. They used to ask for at

@@ -7009,10 +7009,11 @@ mod tests {
         for batch in 0..8u32 {
             for i in 0..4_000u32 {
                 let pk = (batch * 4_000 + i).to_be_bytes().to_vec();
-                let key = DecoratedKey {
-                    token: Token((batch * 4_000 + i) as i64),
-                    key: PartitionKey::new(pk),
-                };
+                // The real partitioner token: SSTables do not store tokens, so a
+                // forged one is recomputed on read and no longer matches the
+                // order the file was written in, which the bounded multi-pass
+                // merge (8 SSTables > the merge fan-in) then rejects.
+                let key = DecoratedKey::new(PartitionKey::new(pk));
                 storage
                     .write(&table_id, &key, test_row(i as i64), i as i64)
                     .unwrap();

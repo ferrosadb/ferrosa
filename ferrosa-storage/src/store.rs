@@ -186,7 +186,6 @@ impl PartitionSource {
 /// inbound LIMIT/paging contract and must not turn a large, valid edge lookup
 /// into an empty result.
 const INDEX_RESULT_CAP: usize = 10_000;
-const RANGE_READ_MATERIALIZATION_CAP: usize = 10_000;
 const QVEC_HNSW_MAGIC: &[u8] = b"FERROSA-QVEC-HNSW-V1\n";
 
 fn build_quantized_vector_artifact<V: AsRef<[f32]>>(
@@ -7280,10 +7279,8 @@ impl<F: FlushTarget> TableStore<F> {
     /// same-key partitions merged and deletions suppressed inline.
     ///
     /// Memory profile: peak is O(num_sources) partitions held by
-    /// the merger, regardless of total table size. Unlike
-    /// `read_range_limited_rows` there is no
-    /// `RANGE_READ_MATERIALIZATION_CAP`; the caller drives the rate
-    /// of consumption via mpsc back-pressure (`STREAM_BUFFER` items).
+    /// the merger, regardless of total table size; the caller drives the
+    /// rate of consumption via mpsc back-pressure (`STREAM_BUFFER` items).
     pub fn range_iter(
         &self,
         start: Option<&DecoratedKey>,
@@ -8450,6 +8447,25 @@ impl<F: FlushTarget> TableStore<F> {
     where
         Cb: FnMut(&Partition) -> Result<()>,
     {
+        self.walk_token_range_owned_once(start_token, end_token, delivered, |partition| {
+            cb(&partition)?;
+            Ok(std::ops::ControlFlow::Continue(()))
+        })
+    }
+
+    /// One pass of the token-range walk, handing each merged partition to
+    /// `cb` by value (the walk is done with it) and stopping early when `cb`
+    /// returns [`std::ops::ControlFlow::Break`].
+    fn walk_token_range_owned_once<Cb>(
+        &self,
+        start_token: i64,
+        end_token: i64,
+        delivered: &std::cell::Cell<bool>,
+        mut cb: Cb,
+    ) -> Result<()>
+    where
+        Cb: FnMut(Partition) -> Result<std::ops::ControlFlow<()>>,
+    {
         let guard = self.view.load();
         let schema = self.schema.load();
 
@@ -8597,23 +8613,30 @@ impl<F: FlushTarget> TableStore<F> {
                 }
             }
 
-            let merged = if group.len() == 1 {
+            let mut merged = if group.len() == 1 {
                 group.into_iter().next().expect("len 1")
             } else {
-                let mut m = crate::merge::merge_partitions(group);
-                crate::merge::apply_deletions(&mut m);
-                m
+                crate::merge::merge_partitions(group)
             };
+            // A partition from ONE source needs suppression too: the
+            // memtable's merge-on-write sets deletion markers without
+            // suppressing the cells they cover, so a single-source partition
+            // reached the callback with deleted rows still in it.
+            crate::merge::apply_deletions(&mut merged);
             delivered.set(true);
-            cb(&merged)?;
-            drop(merged);
+            if cb(merged)?.is_break() {
+                return Ok(());
+            }
         }
         Ok(())
     }
 
-    /// Materializing range read. An SSTable in the view that cannot be opened
-    /// or read fails the read (typed [`ferrosa_common::Error::CorruptSstable`])
-    /// after the fresh-view retry bound; it never returns fewer rows as `Ok`.
+    /// Range read of the first `limit` partitions of `[start, end]` in key
+    /// order, merged across the memtables and every SSTable, each trimmed to
+    /// `row_limit` rows when `row_limit > 0`. The caller's `limit` is the only
+    /// bound. An SSTable in the view that cannot be opened or read fails the
+    /// read (typed [`ferrosa_common::Error::CorruptSstable`]) after the
+    /// fresh-view retry bound; it never returns fewer rows as `Ok`.
     pub fn read_range_limited_rows(
         &self,
         start: Option<&DecoratedKey>,
@@ -8621,16 +8644,16 @@ impl<F: FlushTarget> TableStore<F> {
         limit: usize,
         row_limit: usize,
     ) -> Result<Vec<Partition>> {
-        if limit > RANGE_READ_MATERIALIZATION_CAP {
-            return Err(ferrosa_common::Error::InvalidData(format!(
-                "range read limit {limit} exceeds materialization cap {RANGE_READ_MATERIALIZATION_CAP}; use a paged/streaming read path"
-            )));
-        }
         self.with_retried_scan("read_range_limited_rows", || {
             self.read_range_limited_rows_once(start, end, limit, row_limit)
         })
     }
 
+    /// One attempt of [`Self::read_range_limited_rows`]: the token-range walk
+    /// over the key bounds, stopped after `limit` partitions. It used to read
+    /// each source's first partitions under a shrinking budget and sort
+    /// afterwards, so the memtable took the whole budget and lower keys on
+    /// disk were never returned.
     fn read_range_limited_rows_once(
         &self,
         start: Option<&DecoratedKey>,
@@ -8638,80 +8661,16 @@ impl<F: FlushTarget> TableStore<F> {
         limit: usize,
         row_limit: usize,
     ) -> Result<Vec<Partition>> {
-        let guard = self.view.load();
-        let schema = self.schema.load();
-
-        // Collect partitions from bounded sources only. This is still a
-        // materializing read path, so fail closed once the requested window is
-        // exhausted instead of continuing to decode arbitrary table volume.
-        let mut all_partitions: Vec<Partition> = Vec::new();
-
-        let trim_rows = |partitions: &mut Vec<Partition>| {
-            if row_limit > 0 {
-                for partition in partitions {
-                    partition.rows.truncate(row_limit);
-                }
-            }
-        };
-
-        // Active memtable: clone only the requested window, not the whole
-        // active memtable. This keeps CQL LIMIT/page-size scans from hanging
-        // behind full-table materialization.
-        let mut active = guard.active.snapshot_range_limited(start, end, limit);
-        trim_rows(&mut active);
-        all_partitions.extend(active);
-
-        // Flushing memtable
-        if all_partitions.len() < limit {
-            for flushing in guard.flushing.iter().map(|sealed| &sealed.memtable) {
-                let remaining = limit.saturating_sub(all_partitions.len());
-                let mut flushing_parts = flushing.snapshot_range_limited(start, end, remaining);
-                trim_rows(&mut flushing_parts);
-                all_partitions.extend(flushing_parts);
-            }
+        let mut out = Vec::new();
+        // The walk is half-open by token; `end` is an inclusive key, so walk
+        // through its token. (A key at token `i64::MAX` is not reachable by a
+        // half-open walk: t_83e3a0d5.)
+        let start_token = start.map_or(i64::MIN, |k| k.token.0);
+        let end_token = end.map_or(i64::MAX, |k| k.token.0.saturating_add(1));
+        if limit == 0 || start_token >= end_token {
+            return Ok(out);
         }
-
-        // SSTables — read only the remaining budget from each, and when a row
-        // cap is requested skip unretained rows while decoding instead of
-        // materializing full wide partitions and truncating afterwards.
-        for desc in guard.sstables.iter() {
-            let remaining = limit.saturating_sub(all_partitions.len());
-            if remaining == 0 {
-                break;
-            }
-            // One reader open at a time — opened, drained, dropped per loop.
-            let sstable = self
-                .open_reader(desc)
-                .map_err(|e| self.unreadable_sstable("read_range", "open", desc, &e))?;
-            let mut parts = sstable
-                .read_partitions_limited_rows(remaining, row_limit)
-                .map_err(|e| self.unreadable_sstable("read_range", "read", desc, &e))?;
-            let mapping = ColumnOrdinalMapping::for_header(&schema, sstable.header());
-            for partition in &mut parts {
-                mapping.remap_partition(partition);
-            }
-            all_partitions.extend(parts);
-        }
-
-        // Deduplicate and merge partitions with the same key
-        all_partitions.sort_by(|a, b| a.key.cmp(&b.key));
-        let mut merged: Vec<Partition> = Vec::new();
-        for p in all_partitions {
-            if let Some(last) = merged.last_mut() {
-                if last.key == p.key {
-                    *last = merge::merge_partitions(vec![last.clone(), p]);
-                    continue;
-                }
-            }
-            merged.push(p);
-        }
-
-        // Apply deletion suppression to all partitions. Partitions that
-        // came from a single source (no multi-source merge above) still
-        // need row-level and partition-level deletions applied because
-        // the memtable's merge-on-write sets deletion markers but does
-        // not suppress the covered cells.
-        let (table_delete, probe_corrupt) = self.table_deletion(&guard)?;
+        let (table_delete, probe_corrupt) = self.table_deletion(&self.view.load())?;
         if let Some(c) = probe_corrupt {
             // `with_retried_scan` retries this typed error against a fresh view:
             // the retired input's merged output holds the rows.
@@ -8721,33 +8680,33 @@ impl<F: FlushTarget> TableStore<F> {
                 c.max_token,
             ));
         }
-        for p in &mut merged {
-            merge::apply_table_deletion(p, table_delete);
-        }
-
-        // Apply range filter and limit
-        let filtered: Vec<Partition> = merged
-            .into_iter()
-            .filter(|p| {
-                if crate::table_tombstone::is_table_tombstone_key(&p.key) {
-                    return false;
-                }
-                if let Some(s) = start {
-                    if p.key < *s {
-                        return false;
-                    }
-                }
-                if let Some(e) = end {
-                    if p.key > *e {
-                        return false;
-                    }
-                }
-                true
+        let delivered = std::cell::Cell::new(false);
+        self.walk_token_range_owned_once(start_token, end_token, &delivered, |mut partition| {
+            use std::ops::ControlFlow::{Break, Continue};
+            if end.is_some_and(|e| partition.key > *e) {
+                return Ok(Break(()));
+            }
+            if crate::table_tombstone::is_table_tombstone_key(&partition.key)
+                || start.is_some_and(|s| partition.key < *s)
+            {
+                return Ok(Continue(()));
+            }
+            merge::apply_table_deletion(&mut partition, table_delete);
+            if row_limit > 0 {
+                partition.rows.truncate(row_limit);
+            }
+            out.push(partition);
+            Ok(if out.len() >= limit {
+                Break(())
+            } else {
+                Continue(())
             })
-            .take(limit)
-            .collect();
-
-        Ok(filtered)
+        })?;
+        debug_assert!(
+            out.len() <= limit,
+            "never more partitions than the caller asked for"
+        );
+        Ok(out)
     }
 
     /// Visit every row matching a secondary-index key, in row order. See
@@ -14221,18 +14180,51 @@ mod tests {
         assert_eq!(cells[0][1].1.value.as_deref(), Some(b"bee".as_slice()));
     }
 
+    /// A limited range read returns the FIRST `limit` partitions in key order
+    /// across every source. It used to give the memtable the whole budget,
+    /// then each SSTable what was left, and sort afterwards: with the low keys
+    /// on disk and high keys in the memtable it returned the high keys.
     #[test]
-    fn range_read_rejects_unbounded_materialization_limit() {
+    fn a_limited_range_read_returns_the_lowest_keys_across_sources() {
         let store = test_store();
+        let mut keys: Vec<DecoratedKey> = (0..20).map(|i| make_key(&format!("k{i:02}"))).collect();
+        keys.sort();
+        for k in &keys[..10] {
+            store.write(k, make_row(b"disk", 1000)).unwrap();
+        }
+        store.flush().unwrap();
+        for k in &keys[10..] {
+            store.write(k, make_row(b"mem", 1000)).unwrap();
+        }
 
-        let err = store
-            .read_range(None, None, RANGE_READ_MATERIALIZATION_CAP + 1)
-            .expect_err("range reads above the materialization cap must fail closed");
+        let got: Vec<DecoratedKey> = store
+            .read_range(None, None, 3)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.key)
+            .collect();
 
-        assert!(
-            err.to_string().contains("paged/streaming read path"),
-            "error should direct callers away from materializing scans: {err}"
+        assert_eq!(
+            got,
+            keys[..3].to_vec(),
+            "the three lowest keys, from the SSTable"
         );
+    }
+
+    /// The only bound is the caller's limit: no server-side materialization
+    /// cap refuses a read, and a limit beyond the data returns all of it.
+    #[test]
+    fn a_range_read_is_bounded_only_by_its_limit() {
+        let store = test_store();
+        for i in 0..5 {
+            store
+                .write(&make_key(&format!("k{i}")), make_row(b"v", 1000))
+                .unwrap();
+        }
+
+        let all = store.read_range(None, None, 10_001).unwrap();
+
+        assert_eq!(all.len(), 5);
     }
 
     /// Regression for the COUNT(*) undercount bug (t_8c4e44e8): a bare

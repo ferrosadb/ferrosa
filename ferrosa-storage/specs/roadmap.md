@@ -124,9 +124,6 @@ open work lives in specs and the items below.
   README "Bound policy" census). Still to convert — each needs a
   streaming/spill replacement, so removing the bound alone would allow
   unbounded materialization:
-  - **Range read materialization cap (10k).** `read_range` refuses a limit
-    above `RANGE_READ_MATERIALIZATION_CAP`; re-point the materializing path at
-    the existing streaming twin `range_iter`.
   - **Index result cap (10k).** Partition-scoped and geo index consults refuse
     above `INDEX_RESULT_CAP`; stream/spill the postings (as
     `read_by_index_each` already does) instead of erroring.

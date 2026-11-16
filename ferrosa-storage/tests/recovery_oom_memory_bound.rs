@@ -155,6 +155,20 @@ fn read_component(table_dir: &Path, gen_str: &str, comp: &str) -> Option<Vec<u8>
     None
 }
 
+/// Every partition of `reader` collected into one `Vec`: the materializing
+/// baseline (the old recovery shape). Test-only — the reader no longer has a
+/// vector-returning scan.
+fn materialize<R: ferrosa_sstable::io::ReadAt>(
+    reader: &SSTableReader<R>,
+) -> ferrosa_common::Result<Vec<ferrosa_sstable::types::Partition>> {
+    let mut iter = reader.partitions_iter()?;
+    let mut all = Vec::new();
+    while let Some(p) = iter.next_partition()? {
+        all.push(p);
+    }
+    Ok(all)
+}
+
 /// Open a `Vec`-backed reader for the generation. Component bytes are read into
 /// memory *before* the caller arms the tracker, so the backing buffers count as
 /// baseline rather than as per-call allocation.
@@ -222,8 +236,7 @@ fn measure_recovery_peaks(n: usize) -> Peaks {
     let gen = *gens
         .iter()
         .max_by_key(|g| {
-            open_vec_reader(&table_dir, &g.to_string())
-                .read_partitions_limited(usize::MAX)
+            materialize(&open_vec_reader(&table_dir, &g.to_string()))
                 .map(|p| p.len())
                 .unwrap_or(0)
         })
@@ -236,11 +249,8 @@ fn measure_recovery_peaks(n: usize) -> Peaks {
 
     // Baseline: materialize every partition — the OLD recovery behavior
     // (`read_all_partitions`) whose peak scales with partition count.
-    let (materialized, materialize) = measure_peak(|| {
-        reader
-            .read_partitions_limited(usize::MAX)
-            .expect("materialize all partitions")
-    });
+    let (materialized, materialize) =
+        measure_peak(|| materialize(&reader).expect("materialize all partitions"));
     assert!(
         !materialized.is_empty() && materialized.len() <= n,
         "the largest generation must hold a non-empty subset of the {n} written partitions \
