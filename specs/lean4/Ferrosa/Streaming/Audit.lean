@@ -91,6 +91,9 @@ def sites : List Site := [
   ⟨"cql", "a local LWT evaluates its IF clause on the row in place", .streaming,
    "ferrosa-cql/src/router.rs:10150",
    "`eval_local_condition` reads the one row it locked and passes `if_conditions_hold` a lookup over the positional cells (`columns.get_index_of`), so no name-keyed copy of the row is built; the owned `eval_if_conditions` wraps the same evaluator."⟩,
+  ⟨"sstable", "the decoded-chunk cache shares a chunk by refcount and evicts to a byte budget", .boundedByConfig "FERROSA_SSTABLE_CHUNK_CACHE_BYTES",
+   "ferrosa-sstable/src/reader.rs:148",
+   "`ChunkCache::insert` stores `Arc::clone(&chunk)` (a refcount bump, never a copy of the bytes) and pops LRU entries until the resident charge fits `max_bytes` (default 128 x 64 KiB, capped at 1 GiB)."⟩,
   ⟨"cql", "a result cursor holds a node-wide permit or is refused", .serialized,
    "ferrosa-cql/src/result_cursor.rs:513",
    "`admit` CAS-increments the open count under `max_open` (default 256), sweeps expired cursors first, and returns Overloaded rather than queueing."⟩,
@@ -171,8 +174,8 @@ def sites : List Site := [
    "No rewrap operator exists in the tree: the only PITR path is `run_pitr_replay_e2e`, a replay test, so there is no transform to inspect."⟩
 ]
 
-/-- Thirty-four sites were read. -/
-theorem site_count : sites.length = 34 := by decide
+/-- Thirty-five sites were read. -/
+theorem site_count : sites.length = 35 := by decide
 
 /-- **Every site names a file and line.**  A row without a location is a mood, not an audit finding, so
     each `site` field has to contain a `file.rs:line`. -/
@@ -197,9 +200,9 @@ theorem serialized_sites : (sites.filter fun s => match s.klass with
 theorem spilling_sites : (sites.filter fun s => match s.klass with
     | .spilling _ => true | _ => false).length = 3 := by decide
 
-/-- Seven are bounded only by a setting. -/
+/-- Eight are bounded only by a setting. -/
 theorem config_bounded_sites : (sites.filter fun s => match s.klass with
-    | .boundedByConfig _ => true | _ => false).length = 7 := by decide
+    | .boundedByConfig _ => true | _ => false).length = 8 := by decide
 
 /-- Eight are bounded by nothing in the dataset size. -/
 theorem unbounded_sites : (sites.filter fun s => match s.klass with
@@ -223,7 +226,7 @@ theorem classes_partition_the_sites :
       + (sites.filter fun s => match s.klass with | .spilling _ => true | _ => false).length
       + (sites.filter fun s => match s.klass with | .boundedByConfig _ => true | _ => false).length
       + (sites.filter fun s => match s.klass with | .unbounded _ => true | _ => false).length
-      + (sites.filter fun s => s.klass == .unresolved).length = 34 := by decide
+      + (sites.filter fun s => s.klass == .unresolved).length = 35 := by decide
 
 /-- The layers the audit covers, so the table can be printed by layer. -/
 def layers : List String := ["cql", "commit log", "compaction", "flush", "graph", "permits",

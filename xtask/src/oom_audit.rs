@@ -1199,7 +1199,14 @@ impl<'a> Auditor<'a> {
 
         // Rule 8 (UFCS form): `Partition::clone(&p)` / `Clone::clone(&partition)`
         // — the explicit-path spelling of a row-data clone.
-        if last == Some("clone") {
+        // `Arc::clone(x)` / `Rc::clone(x)` only type-check when `x` already is
+        // the shared handle, so they bump a refcount and never copy row data.
+        let refcount_clone = segs
+            .len()
+            .checked_sub(2)
+            .and_then(|i| segs.get(i))
+            .is_some_and(|s| s == "Arc" || s == "Rc");
+        if last == Some("clone") && !refcount_clone {
             let type_seg_is_row = segs
                 .iter()
                 .any(|s| ROW_DATA_STRUCT_IDENTS.contains(&s.as_str()));
@@ -3788,6 +3795,37 @@ mod tests {
             .filter(|x| x.rule == rule::COPIES_ROW_DATA_ARG)
             .count();
         assert_eq!(count, 2, "UFCS clones of row data fire: {f:?}");
+    }
+
+    /// `Arc::clone(&chunk)` / `Rc::clone(&rows)` bump a refcount: the call only
+    /// type-checks when the argument already is that shared handle, so it can
+    /// never copy the data behind it. A real UFCS row copy in the same fn must
+    /// still fire, or the exclusion would be a blind spot rather than a fix.
+    #[test]
+    fn rule_copies_row_data_arg_ignores_refcount_clones_but_not_row_clones() {
+        let src = r#"
+            fn a(chunk: Arc<Vec<u8>>, rows: Rc<Vec<R>>, partition: Arc<P>, p: &P) {
+                let h1 = Arc::clone(&chunk);
+                let h2 = Rc::clone(&rows);
+                let h3 = std::sync::Arc::clone(&partition);
+                let h4 = std::rc::Rc::clone(&rows);
+                let copy = Partition::clone(p);
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        let hits: Vec<_> = f
+            .iter()
+            .filter(|x| x.rule == rule::COPIES_ROW_DATA_ARG)
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "only the Partition::clone copies data: {hits:?}"
+        );
+        assert_eq!(
+            hits[0].line, 7,
+            "the surviving finding is the real copy: {hits:?}"
+        );
     }
 
     #[test]
