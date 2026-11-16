@@ -2138,6 +2138,12 @@ impl ModeController {
         // and have the in-flight producer stop between batches. Without this
         // registration the cancel frame arrives with no handler and is
         // dropped, leaking a whole-table scan onto the Bulk lane.
+        // And the streaming keyed index read: its windows share the producer
+        // and the cancellation map above.
+        self.registry.register(
+            MsgType::IndexReadInPartitionStreamRequest,
+            stream_request_handler.clone(),
+        );
         self.registry
             .register(MsgType::RangeReadStreamCancel, stream_request_handler);
 

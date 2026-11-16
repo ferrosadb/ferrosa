@@ -2,6 +2,24 @@
 
 use super::*;
 
+/// What a row's indexed value is checked against: a query term, encoded the
+/// way the index encodes values before comparing, or a key already in the
+/// index's key space (a posting's own key).
+#[derive(Clone, Copy)]
+enum IndexProbe<'a> {
+    Term(&'a [u8]),
+    Encoded(&'a [u8]),
+}
+
+impl<'a> IndexProbe<'a> {
+    /// The probe's bytes. Identity-encoded families compare them as they are.
+    fn bytes(self) -> &'a [u8] {
+        match self {
+            Self::Term(bytes) | Self::Encoded(bytes) => bytes,
+        }
+    }
+}
+
 impl<F: FlushTarget> TableStore<F> {
     /// Refuse an index consult while a generation overlapping it is
     /// quarantined. `token` narrows the check to one partition's token; `None`
@@ -222,6 +240,21 @@ impl<F: FlushTarget> TableStore<F> {
         key: &DecoratedKey,
         row: &Row,
     ) -> Result<bool> {
+        self.index_row_has_key(index_name, IndexProbe::Term(&query.0), key, row)
+    }
+
+    /// Whether `row`'s current indexed value encodes to `encoded` — the key
+    /// space postings are filed under. [`Self::index_row_matches`] encodes a
+    /// query term and asks this; a posting walk asks it with the posting's
+    /// own key, which is how a posting that outlived its value (the row was
+    /// updated to a value filed under another key) is told from a live one.
+    fn index_row_has_key(
+        &self,
+        index_name: &str,
+        probe: IndexProbe<'_>,
+        key: &DecoratedKey,
+        row: &Row,
+    ) -> Result<bool> {
         let catalog = self.catalog();
         let (family, position, kind, predicate) =
             catalog.scalar_definition(index_name).ok_or_else(|| {
@@ -281,16 +314,24 @@ impl<F: FlushTarget> TableStore<F> {
             // These index families use identity encoding. Equality borrows both
             // sides; allocating two full cell copies here adds no information.
             IndexType::BTree | IndexType::Hash | IndexType::Composite | IndexType::Filtered => {
-                Ok(value == query.0.as_slice())
+                Ok(value == probe.bytes())
             }
             IndexType::Phonetic | IndexType::Geo => {
-                let encoded_query = crate::index::scheduler::encode_index_key(kind, &query.0)
-                    .map_err(ferrosa_common::Error::InvalidData)?;
-                let Some(encoded_query) = encoded_query else {
-                    return Ok(false);
+                let encoded_query = match probe {
+                    IndexProbe::Encoded(encoded) => std::borrow::Cow::Borrowed(encoded),
+                    IndexProbe::Term(term) => {
+                        match crate::index::scheduler::encode_index_key(kind, term)
+                            .map_err(ferrosa_common::Error::InvalidData)?
+                        {
+                            Some(encoded) => std::borrow::Cow::Owned(encoded.0),
+                            None => return Ok(false),
+                        }
+                    }
                 };
                 crate::index::scheduler::encode_index_key(kind, value)
-                    .map(|encoded| encoded.as_ref() == Some(&encoded_query))
+                    .map(|value_key| {
+                        value_key.is_some_and(|value_key| value_key.0 == *encoded_query)
+                    })
                     .map_err(ferrosa_common::Error::InvalidData)
             }
             IndexType::Vector | IndexType::FullText => Err(ferrosa_common::Error::InvalidData(
@@ -347,245 +388,339 @@ impl<F: FlushTarget> TableStore<F> {
         }
     }
 
-    /// Query by secondary index restricted to ONE partition (t_430c4188):
-    /// looks up the index key in the memtable index and all SSTable sidecar
-    /// indexes, keeps only the postings whose `RowPosition.partition_key`
-    /// equals `partition_key`, and point-reads exactly those rows.
+    /// Visit the rows of ONE partition that match a secondary-index key
+    /// (t_430c4188), in clustering order, strictly after the clustering
+    /// `after` when given. Serves the fully keyed CQL shape `WHERE <full
+    /// partition key> AND <indexed_col> = ?`.
     ///
-    /// This serves the fully-keyed CQL shape `WHERE <full partition key> AND
-    /// <indexed_col> = ?`: work and memory are O(rows matching the value in
-    /// the partition), never O(partition rows). Postings from other partitions
-    /// are dropped per batch BEFORE retention, so a value that is hot globally
-    /// cannot blow the `INDEX_RESULT_CAP` bound (or memory) for a keyed query
-    /// that matches only a few rows in its partition. Postings retained after
-    /// keying are still capped by `INDEX_RESULT_CAP` — the same fail-loud
-    /// bound as the geo candidate consult, never a silent truncation.
+    /// Every source's postings are seeked to the partition and merged in row
+    /// order ([`OrderedPostings`]); the walk ends at the first posting of
+    /// another partition. Each row posting is point-read as it is reached and
+    /// re-checked against the index (a posting can outlive its value), so
+    /// memory is O(posting sources) however many rows match, and the
+    /// visitor's [`std::ops::ControlFlow::Break`] stops the walk at once.
+    /// A partition-key index files one partition posting `(pk, [])`, which
+    /// streams the partition's rows in bounded chunks.
     ///
-    /// The secondary index is keyed globally by value (not by `(partition,
-    /// value)`), so this consult still walks the per-node postings list for
-    /// the value; only the retained set is partition-scoped. Staleness
-    /// semantics match the global streaming consult — both read the same
-    /// memtable index + sidecar layers.
-    pub fn read_by_index_in_partition(
+    /// The index is keyed by value, not by `(partition, value)`, so the seek
+    /// is a binary search per source; postings of other partitions are never
+    /// walked.
+    pub fn read_by_index_in_partition_each_after(
         &self,
         index_name: &str,
         key: &IndexKey,
         partition_key: &[u8],
-    ) -> Result<Vec<Partition>> {
+        after: Option<&[u8]>,
+        visitor: &mut dyn FnMut(Partition) -> std::ops::ControlFlow<()>,
+    ) -> Result<()> {
         if !self.secondary_index_declared(index_name) {
-            return Ok(Vec::new());
+            return Ok(());
         }
-
         let guard = self.view.load();
-        let partition_token = DecoratedKey::new(ferrosa_common::key::PartitionKey::new(
-            partition_key.to_vec(),
-        ))
-        .token
-        .0;
-        self.refuse_index_read_over_quarantine(
-            &guard,
-            Some(partition_token),
-            "read_by_index_in_partition",
-        )?;
-
-        // Same per-type key encoding as `read_by_index` (see there for why a
-        // phonetic index must be probed by code, not raw bytes).
-        let index_type = self.index_type_for(index_name);
-        let lookup_key = match crate::index::scheduler::encode_index_key(index_type, &key.0) {
-            Ok(Some(encoded)) => encoded,
-            Ok(None) => return Ok(Vec::new()),
-            Err(e) => {
-                return Err(ferrosa_common::Error::InvalidFormat(format!(
-                    "secondary index '{index_name}' read key encoding failed: {e}"
-                )));
-            }
-        };
-        let query_key = key;
-        let key = &lookup_key;
-
-        let mut positions: Vec<RowPosition> = Vec::new();
-        let mut append_in_partition = |batch: Vec<RowPosition>| -> Result<()> {
-            for pos in batch {
-                if pos.partition_key != partition_key {
-                    continue;
-                }
-                if positions.len() >= INDEX_RESULT_CAP {
-                    return Err(ferrosa_common::Error::InvalidFormat(format!(
-                        "secondary index query exceeded {} row limit; \
-                         use ALLOW FILTERING for unbounded scans",
-                        INDEX_RESULT_CAP
-                    )));
-                }
-                positions.push(pos);
-            }
-            Ok(())
-        };
-
-        // 1. Memtable indexes: the active memtable's and the flushing one's.
-        for idx in memtable_indexes_named(&guard, index_name) {
-            append_in_partition(idx.lookup(key))?;
-        }
-
-        // 2. SSTable sidecar indexes (same lenient per-sidecar error handling
-        // as `read_by_index`: a missing/failed sidecar contributes nothing).
-        for sidecar in guard.sidecar_indexes.iter() {
-            if let Some(reader) = sidecar.get(index_name) {
-                let results = reader.lookup(key).map_err(|e| {
-                    ferrosa_common::Error::InvalidFormat(format!(
-                        "secondary index '{index_name}' read failed: {e}"
-                    ))
-                })?;
-                append_in_partition(results)?;
-            }
-        }
-
-        // 3. Deduplicate by clustering key (the partition key is fixed).
-        let mut seen = std::collections::HashSet::new();
-        positions.retain(|p| seen.insert(p.clustering_key.clone()));
-
-        // 4. Point-read exactly the matching rows — never the whole partition.
-        let dk = DecoratedKey::new(ferrosa_common::key::PartitionKey::new(
+        let decorated = DecoratedKey::new(ferrosa_common::key::PartitionKey::new(
             partition_key.to_vec(),
         ));
+        self.refuse_index_read_over_quarantine(
+            &guard,
+            Some(decorated.token.0),
+            "read_by_index_in_partition_each_after",
+        )?;
+        let Some(lookup_key) = self.encode_index_lookup_key(index_name, key)? else {
+            return Ok(());
+        };
+        let memtables = memtable_posting_lists(&guard, index_name, &lookup_key);
         let partition_wide = self.partition_key_index_def(index_name).is_some();
+        // Seek every source straight to the cursor (inclusive; the cursor
+        // row itself is dropped below), so a resumed window never re-walks
+        // the postings it already delivered. A partition-key index files its
+        // one posting at `(pk, [])`, which is where its seek must land.
+        let seek = RowPosition {
+            partition_key: partition_key.to_vec(),
+            clustering_key: match after {
+                Some(cursor) if !partition_wide => cursor.to_vec(),
+                _ => Vec::new(),
+            },
+        };
+        let sources =
+            index_posting_sources(&guard, &memtables, index_name, &lookup_key, Some(&seek));
+        let mut postings = OrderedPostings::new(sources)
+            .take_while(|position| position.partition_key == partition_key);
+
+        let mut failure = None;
+        let mut checked = |candidate: Partition| {
+            self.visit_matching_rows(candidate, &mut failure, visitor, |store, dk, row| {
+                store.index_row_has_key(index_name, IndexProbe::Term(&key.0), dk, row)
+            })
+        };
+        if partition_wide {
+            // A partition-key index names whole partitions: one posting means
+            // every row of this partition matches.
+            if postings.next().is_some() {
+                // `Break` means the visitor (or a failed check) stopped the
+                // walk; either way the partition was the whole walk.
+                let _stopped: std::ops::ControlFlow<()> =
+                    self.stream_partition_rows(partition_key, after, &mut checked)?;
+            }
+            return failure.map_or(Ok(()), Err);
+        }
         let clustered = self.clustering_column_count() > 0;
-        let mut partitions = Vec::new();
-        for pos in &positions {
-            if clustered && pos.clustering_key.is_empty() && !partition_wide {
+        for position in postings {
+            if clustered && position.clustering_key.is_empty() {
                 return Err(ferrosa_common::Error::InvalidData(
                     "empty clustered index posting is unsupported; refusing a partition-wide fallback".into(),
                 ));
             }
-            let read = if partition_wide {
-                self.read(&dk)
-            } else {
-                self.read_clustering_row(&dk, &pos.clustering_key)
-            };
-            let partition = read?;
-            if let Some(mut partition) = partition {
-                let mut matching = Vec::with_capacity(partition.rows.len());
-                for row in partition.rows.drain(..) {
-                    if self.index_row_matches(index_name, query_key, &dk, &row)? {
-                        matching.push(row);
-                    }
-                }
-                partition.rows = matching;
-                if !partition.rows.is_empty() {
-                    partitions.push(partition);
-                }
+            if after.is_some_and(|cursor| position.clustering_key <= cursor) {
+                continue;
+            }
+            let flow = self.visit_indexed_row(position, &mut checked)?;
+            if flow.is_break() {
+                break;
             }
         }
-
-        Ok(partitions)
+        failure.map_or(Ok(()), Err)
     }
 
-    /// Query a geo (cell-id) secondary index by a set of `[start, end]` cell-id
-    /// ranges, returning the matching base-table partitions.
+    /// Hand `visitor` the rows of `candidate` that `matches` accepts, as one
+    /// partition; nothing when none do. An error from `matches` stops the
+    /// walk and is parked in `failure` for the caller to return.
+    fn visit_matching_rows(
+        &self,
+        mut candidate: Partition,
+        failure: &mut Option<ferrosa_common::Error>,
+        visitor: &mut dyn FnMut(Partition) -> std::ops::ControlFlow<()>,
+        mut matches: impl FnMut(&Self, &DecoratedKey, &Row) -> Result<bool>,
+    ) -> std::ops::ControlFlow<()> {
+        let mut verdicts = Ok(());
+        let key = candidate.key.clone();
+        candidate
+            .rows
+            .retain(|row| match (&verdicts, matches(self, &key, row)) {
+                (Ok(()), Ok(keep)) => keep,
+                (Ok(()), Err(error)) => {
+                    verdicts = Err(error);
+                    false
+                }
+                (Err(_), _) => false,
+            });
+        if let Err(error) = verdicts {
+            *failure = Some(error);
+            return std::ops::ControlFlow::Break(());
+        }
+        if candidate.rows.is_empty() {
+            return std::ops::ControlFlow::Continue(());
+        }
+        visitor(candidate)
+    }
+
+    /// Visit the rows a geo (cell-id) secondary index files under any of the
+    /// inclusive `[start, end]` cell-id `ranges`, each once.
     ///
-    /// Unlike a keyed secondary-index lookup — which does a point lookup on an
-    /// exact key — a geo index is keyed by an 8-byte big-endian
-    /// space-filling-curve cell id, so a spatial query maps to a small bounded
-    /// set of contiguous cell-id ranges (produced by `ferrosa_index::geo::cover_*`).
-    /// Each `(start, end)` is an **inclusive** range of `u64` cell ids; this
-    /// scans the ordered memtable index and every SSTable sidecar for entries
-    /// whose big-endian key falls inside any range, deduplicates by
-    /// `(partition_key, clustering_key)`, and fetches the rows.
+    /// A geo index keys each point by its own 64-bit cell id, so one cover
+    /// range spans many keys and its postings come in `(key, row)` order,
+    /// not row order. The walk therefore:
+    /// 1. normalizes the ranges (sorted, overlaps merged), so every posting
+    ///    falls in at most one and the ranges are walked in key order;
+    /// 2. merges each range's sources (the memtables' pinned posting lists
+    ///    and every sidecar's entries, both lazy) in `(key, row)` order,
+    ///    advancing every source that holds the smallest head together, so a
+    ///    posting two sources share is read once;
+    /// 3. point-reads the row and keeps it only when its CURRENT value still
+    ///    encodes to the posting's cell. A point that moved left its old
+    ///    posting behind; that posting names a row now filed under another
+    ///    cell, which is either visited through its own posting or lies
+    ///    outside the ranges. So each row is visited at most once, with no
+    ///    set of the rows seen.
     ///
-    /// The same fail-loud `INDEX_RESULT_CAP` bound as the keyed consult applies:
-    /// the candidate set is never silently truncated — exceeding the cap returns
-    /// an error suggesting `ALLOW FILTERING`. The geo cover ranges are already
-    /// bounded (<= a few thousand cells), so the candidate count is bounded by
-    /// the data that actually lives in those cells. Refinement with exact
-    /// distance / containment is the caller's responsibility (the cover is an
-    /// over-approximation).
-    pub fn read_by_index_cell_ranges(
+    /// Memory is O(sources + ranges); the visitor's `Break` stops the walk.
+    /// Refinement by exact distance / containment is the caller's: the cover
+    /// over-approximates.
+    pub fn read_by_index_cell_ranges_each(
         &self,
         index_name: &str,
         ranges: &[(u64, u64)],
-    ) -> Result<Vec<Partition>> {
+        visitor: &mut dyn FnMut(Partition) -> std::ops::ControlFlow<()>,
+    ) -> Result<()> {
         if !self.secondary_index_declared(index_name) {
-            return Ok(Vec::new());
+            return Ok(());
         }
-
         let guard = self.view.load();
-        self.refuse_index_read_over_quarantine(&guard, None, "read_by_index_cell_ranges")?;
-
-        let mut positions: Vec<RowPosition> = Vec::new();
-        let mut append_positions = |batch: Vec<RowPosition>| -> Result<()> {
-            if positions.len().saturating_add(batch.len()) > INDEX_RESULT_CAP {
-                return Err(ferrosa_common::Error::InvalidFormat(format!(
-                    "geo index query exceeded {} row limit; \
-                     use ALLOW FILTERING for unbounded scans",
-                    INDEX_RESULT_CAP
-                )));
-            }
-            positions.extend(batch);
-            Ok(())
-        };
-
-        // Encode each (start, end) cell id to its big-endian key bounds once.
-        let key_ranges: Vec<(IndexKey, IndexKey)> = ranges
+        self.refuse_index_read_over_quarantine(&guard, None, "read_by_index_cell_ranges_each")?;
+        let memtables = memtable_indexes_named(&guard, index_name);
+        let sidecars: Vec<&SidecarReader> = guard
+            .sidecar_indexes
             .iter()
-            .map(|(start, end)| {
-                (
-                    IndexKey(start.to_be_bytes().to_vec()),
-                    IndexKey(end.to_be_bytes().to_vec()),
-                )
-            })
+            .filter_map(|sidecar| sidecar.get(index_name))
             .collect();
-
-        // 1. Memtable indexes (active and flushing): ordered range scan per range.
-        for idx in memtable_indexes_named(&guard, index_name) {
-            for (start_key, end_key) in &key_ranges {
-                append_positions(idx.range(start_key, end_key))?;
-            }
-        }
-
-        // 2. SSTable sidecar indexes: ordered range scan per range.
-        //
-        // A failing range read is REPORTED, not skipped. This used to be
-        // `if let Ok(results) = ...` with no else, so an unreadable sidecar —
-        // a short read, a truncated file, a decode failure — contributed no
-        // positions and the query returned the rows it could find as though
-        // they were all of them. A caller cannot tell that from a genuinely
-        // smaller result, which is how unreadable data gets reported as absent
-        // data.
-        for sidecar in guard.sidecar_indexes.iter() {
-            if let Some(reader) = sidecar.get(index_name) {
-                for (start_key, end_key) in &key_ranges {
-                    let results = reader.range(start_key, end_key).map_err(|e| {
-                        ferrosa_common::Error::InvalidFormat(format!(
-                            "geo index '{index_name}' range read failed: {e}"
-                        ))
-                    })?;
-                    append_positions(results)?;
+        let mut head = GeoHead::default();
+        let mut failure = None;
+        for (start, end) in normalize_cell_ranges(ranges) {
+            let start = IndexKey(start.to_be_bytes().to_vec());
+            let end = IndexKey(end.to_be_bytes().to_vec());
+            let mut cursors: Vec<GeoCursor<'_>> =
+                memtables
+                    .iter()
+                    .map(|index| GeoCursor::memtable(index.posting_lists_in_range(&start, &end)))
+                    .chain(sidecars.iter().map(|reader| {
+                        GeoCursor::sidecar(reader.entries_in_range(&start.0, &end.0))
+                    }))
+                    .collect();
+            while head.take_smallest(&mut cursors) {
+                let position = RowPositionRef {
+                    partition_key: &head.partition_key,
+                    clustering_key: &head.clustering_key,
+                };
+                let cell = head.key.as_slice();
+                let mut checked = |candidate: Partition| {
+                    self.visit_matching_rows(candidate, &mut failure, visitor, |store, dk, row| {
+                        store.index_row_has_key(index_name, IndexProbe::Encoded(cell), dk, row)
+                    })
+                };
+                let flow =
+                    if position.clustering_key.is_empty() && self.clustering_column_count() > 0 {
+                        self.stream_partition_rows(position.partition_key, None, &mut checked)?
+                    } else {
+                        self.visit_indexed_row(position, &mut checked)?
+                    };
+                if flow.is_break() {
+                    return failure.map_or(Ok(()), Err);
                 }
             }
         }
+        failure.map_or(Ok(()), Err)
+    }
+}
 
-        // 3. Deduplicate by (partition_key, clustering_key). A point may appear
-        //    in overlapping ranges and across memtable + sidecars.
-        let mut seen = std::collections::HashSet::new();
-        positions.retain(|p| seen.insert((p.partition_key.clone(), p.clustering_key.clone())));
+/// Sort `ranges` and merge the ones that overlap or touch, so the result is
+/// ascending and disjoint. Memory is O(ranges) — the cover, never the data.
+fn normalize_cell_ranges(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut sorted: Vec<(u64, u64)> = ranges
+        .iter()
+        .copied()
+        .filter(|(start, end)| start <= end)
+        .collect();
+    sorted.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(sorted.len());
+    for (start, end) in sorted {
+        match merged.last_mut() {
+            Some(last) if start <= last.1.saturating_add(1) => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+}
 
-        // 4. Fetch base-table rows, carrying the clustering key so wide clustered
-        //    tables do not materialize the whole partition per hit.
-        let mut partitions = Vec::new();
-        for pos in &positions {
-            let dk = DecoratedKey::new(ferrosa_common::key::PartitionKey::new(
-                pos.partition_key.clone(),
-            ));
-            let read = if pos.clustering_key.is_empty() {
-                self.read(&dk)
-            } else {
-                self.read_clustering_row(&dk, &pos.clustering_key)
-            };
-            let partition = read?;
-            if let Some(partition) = partition {
-                partitions.push(partition);
+/// One lazy `(key, row)`-ordered source of geo postings within one range.
+enum GeoCursor<'a> {
+    /// A memtable's keys in the range, each a pinned posting list, and the
+    /// position reached in the current one.
+    Memtable {
+        lists: crate::memtable::index::PostingListRange,
+        current: Option<crate::memtable::index::PostingList>,
+        at: usize,
+    },
+    /// A sidecar's entries in the range, borrowed from its mapping.
+    Sidecar {
+        entries: Box<dyn Iterator<Item = (&'a [u8], RowPositionRef<'a>)> + 'a>,
+        current: Option<(&'a [u8], RowPositionRef<'a>)>,
+    },
+}
+
+impl<'a> GeoCursor<'a> {
+    fn memtable(mut lists: crate::memtable::index::PostingListRange) -> Self {
+        // A posting list is never empty (an insert is the only way to make
+        // one), but skip any that were rather than trust it.
+        let current = lists.find(|list| !list.as_slice().is_empty());
+        Self::Memtable {
+            lists,
+            current,
+            at: 0,
+        }
+    }
+
+    fn sidecar(entries: impl Iterator<Item = (&'a [u8], RowPositionRef<'a>)> + 'a) -> Self {
+        let mut entries: Box<dyn Iterator<Item = (&'a [u8], RowPositionRef<'a>)> + 'a> =
+            Box::new(entries);
+        let current = entries.next();
+        Self::Sidecar { entries, current }
+    }
+
+    /// The cursor's current posting, or `None` once exhausted.
+    fn head(&self) -> Option<(&[u8], RowPositionRef<'_>)> {
+        match self {
+            Self::Memtable { current, at, .. } => current.as_ref().map(|list| {
+                (
+                    list.key().0.as_slice(),
+                    RowPositionRef::from(&list.as_slice()[*at]),
+                )
+            }),
+            Self::Sidecar { current, .. } => *current,
+        }
+    }
+
+    /// Step past the current posting.
+    fn advance(&mut self) {
+        match self {
+            Self::Memtable { lists, current, at } => {
+                let Some(list) = current else {
+                    return;
+                };
+                *at += 1;
+                if *at >= list.as_slice().len() {
+                    *current = lists.find(|list| !list.as_slice().is_empty());
+                    *at = 0;
+                }
+            }
+            Self::Sidecar { entries, current } => {
+                let previous = *current;
+                *current = entries.next();
+                debug_assert!(
+                    current.is_none() || *current > previous,
+                    "sidecar range out of (key, row) order"
+                );
             }
         }
+    }
+}
 
-        Ok(partitions)
+/// The smallest posting across a range's cursors, copied into buffers that
+/// are reused for every posting (so the walk allocates once, not per row).
+#[derive(Default)]
+struct GeoHead {
+    key: Vec<u8>,
+    partition_key: Vec<u8>,
+    clustering_key: Vec<u8>,
+}
+
+impl GeoHead {
+    /// Copy the smallest head among `cursors` into `self` and advance every
+    /// cursor that holds it, so a posting present in several sources is
+    /// taken once. `false` when every cursor is exhausted. Each call
+    /// advances at least one cursor, so the walk is bounded by the postings.
+    fn take_smallest(&mut self, cursors: &mut [GeoCursor<'_>]) -> bool {
+        let smallest = cursors.iter().filter_map(GeoCursor::head).min();
+        let Some((key, position)) = smallest else {
+            return false;
+        };
+        self.key.clear();
+        self.key.extend_from_slice(key);
+        self.partition_key.clear();
+        self.partition_key.extend_from_slice(position.partition_key);
+        self.clustering_key.clear();
+        self.clustering_key
+            .extend_from_slice(position.clustering_key);
+        let taken = (
+            self.key.as_slice(),
+            RowPositionRef {
+                partition_key: &self.partition_key,
+                clustering_key: &self.clustering_key,
+            },
+        );
+        for cursor in cursors.iter_mut() {
+            if cursor.head() == Some(taken) {
+                cursor.advance();
+            }
+        }
+        true
     }
 }

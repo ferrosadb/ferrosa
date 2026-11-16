@@ -151,54 +151,94 @@ impl StorageEngine {
             .index_row_matches(index_name, query, key, row)
     }
 
-    /// Query by secondary index restricted to ONE partition (t_430c4188).
-    ///
-    /// Delegates to [`TableStore::read_by_index_in_partition`], which keeps
-    /// only the postings for `partition_key` and point-reads exactly those
-    /// rows — O(matching rows in the partition), never O(partition rows).
+    /// Visit the rows of ONE partition matching a secondary-index key
+    /// (t_430c4188), in clustering order, strictly after the clustering
+    /// `after` when given. Delegates to
+    /// [`TableStore::read_by_index_in_partition_each_after`]: O(posting
+    /// sources) memory, one point read per row as it is reached, and the
+    /// visitor's `Break` stops the walk.
     ///
     /// This fails loud on an unregistered table: the keyed CQL path only
     /// reaches here after schema validation, so a missing table is an internal
     /// inconsistency, not an empty result.
-    pub fn read_by_index_in_partition(
+    pub fn read_by_index_in_partition_each_after(
         &self,
         table_id: &TableId,
         index_name: &str,
         key: &ferrosa_index::IndexKey,
         partition_key: &[u8],
-    ) -> ferrosa_common::Result<Vec<Partition>> {
-        match self.table_state(table_id) {
-            Some(state) => {
-                state.note_foreground_read();
-                state
-                    .store
-                    .read_by_index_in_partition(index_name, key, partition_key)
-            }
-            None => Err(ferrosa_common::Error::InvalidData(format!(
+        after: Option<&[u8]>,
+        visitor: &mut dyn FnMut(Partition) -> std::ops::ControlFlow<()>,
+    ) -> ferrosa_common::Result<()> {
+        let Some(state) = self.table_state(table_id) else {
+            return Err(ferrosa_common::Error::InvalidData(format!(
                 "read_by_index_in_partition: table {table_id:?} not registered"
-            ))),
-        }
+            )));
+        };
+        state.note_foreground_read();
+        state.store.read_by_index_in_partition_each_after(
+            index_name,
+            key,
+            partition_key,
+            after,
+            visitor,
+        )
     }
 
-    /// Query a geo (cell-id) secondary index by inclusive `[start, end]` cell-id
-    /// ranges across the memtable index and SSTable sidecars.
-    ///
-    /// Delegates to [`TableStore::read_by_index_cell_ranges`]. Returns an empty
-    /// vec if the table is not registered. The fail-loud `INDEX_RESULT_CAP`
-    /// bound applies — an unbounded candidate set returns an error rather than
-    /// silently truncating.
-    pub fn read_by_index_cell_ranges(
+    /// [`Self::read_by_index_in_partition_each_after`] as a bounded
+    /// asynchronous stream: the walk runs on a blocking worker and hands rows
+    /// through a bounded channel, so a slow consumer stalls the walk and a
+    /// dropped one stops it.
+    pub fn read_by_index_in_partition_stream_after(
+        self: &Arc<Self>,
+        table_id: &TableId,
+        index_name: &str,
+        key: &ferrosa_index::IndexKey,
+        partition_key: &[u8],
+        after: Option<Vec<u8>>,
+    ) -> std::pin::Pin<
+        Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Partition>> + Send>,
+    > {
+        let table_id = table_id.clone();
+        let index_name = index_name.to_string();
+        let key = key.clone();
+        let partition_key = partition_key.to_vec();
+        let engine = Arc::clone(self);
+        let label = format!("{table_id} keyed index {index_name}");
+        spawn_index_stream(label, move |visit| {
+            engine.read_by_index_in_partition_each_after(
+                &table_id,
+                &index_name,
+                &key,
+                &partition_key,
+                after.as_deref(),
+                visit,
+            )
+        })
+    }
+
+    /// Visit the rows a geo (cell-id) secondary index files under the
+    /// inclusive `[start, end]` cell-id `ranges`, each once. Delegates to
+    /// [`TableStore::read_by_index_cell_ranges_each`]: lazy over the memtable
+    /// index and every sidecar, O(sources + ranges) memory, and the
+    /// visitor's `Break` stops the walk. An unregistered table is refused:
+    /// the geo CQL path resolves the table first, so answering "no points"
+    /// for it would hide an inconsistency.
+    pub fn read_by_index_cell_ranges_each(
         &self,
         table_id: &TableId,
         index_name: &str,
         ranges: &[(u64, u64)],
-    ) -> ferrosa_common::Result<Vec<Partition>> {
-        match self.table_state(table_id) {
-            Some(state) => {
-                state.note_foreground_read();
-                state.store.read_by_index_cell_ranges(index_name, ranges)
-            }
-            None => Ok(vec![]),
-        }
+        visitor: &mut dyn FnMut(Partition) -> std::ops::ControlFlow<()>,
+    ) -> ferrosa_common::Result<()> {
+        let Some(state) = self.table_state(table_id) else {
+            return Err(ferrosa_common::Error::InvalidData(format!(
+                "read_by_index_cell_ranges: table {table_id:?} not registered"
+            )));
+        };
+        state.note_foreground_read();
+        state
+            .store
+            .read_by_index_cell_ranges_each(index_name, ranges, visitor)
     }
 }

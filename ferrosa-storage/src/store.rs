@@ -183,11 +183,6 @@ impl PartitionSource {
     }
 }
 
-/// Maximum number of row positions retained by partition-scoped and geo index
-/// reads. Global index reads are consumed by the CQL layer, which owns the
-/// inbound LIMIT/paging contract and must not turn a large, valid edge lookup
-/// into an empty result.
-const INDEX_RESULT_CAP: usize = 10_000;
 const QVEC_HNSW_MAGIC: &[u8] = b"FERROSA-QVEC-HNSW-V1\n";
 
 fn build_quantized_vector_artifact<V: AsRef<[f32]>>(
@@ -11671,9 +11666,13 @@ mod tests {
             },
         );
         assert!(
-            store
-                .read_by_index_in_partition("val_idx", &IndexKey(b"X".to_vec()), key.key.as_bytes())
-                .is_err(),
+            collect_keyed(
+                &store,
+                "val_idx",
+                &IndexKey(b"X".to_vec()),
+                key.key.as_bytes()
+            )
+            .is_err(),
             "an unsupported empty clustered posting must refuse, never broaden its read"
         );
     }
@@ -11695,9 +11694,13 @@ mod tests {
         let mut row = make_row(b"X", 10);
         row.clustering.clear();
         store.write(&key, row).unwrap();
-        let found = store
-            .read_by_index_in_partition("val_idx", &IndexKey(b"X".to_vec()), key.key.as_bytes())
-            .unwrap();
+        let found = collect_keyed(
+            &store,
+            "val_idx",
+            &IndexKey(b"X".to_vec()),
+            key.key.as_bytes(),
+        )
+        .unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].rows.len(), 1);
     }
@@ -11757,6 +11760,41 @@ mod tests {
             static_row: None,
             rows: vec![make_row(value, timestamp)],
         }
+    }
+
+    /// A keyed index read's partitions, collected — test-only.
+    fn collect_keyed(
+        store: &TableStore<InMemoryFlushTarget>,
+        index_name: &str,
+        key: &IndexKey,
+        partition_key: &[u8],
+    ) -> Result<Vec<Partition>> {
+        let mut results = Vec::new();
+        store.read_by_index_in_partition_each_after(
+            index_name,
+            key,
+            partition_key,
+            None,
+            &mut |partition| {
+                results.push(partition);
+                std::ops::ControlFlow::Continue(())
+            },
+        )?;
+        Ok(results)
+    }
+
+    /// A geo index read's partitions, collected — test-only.
+    fn collect_geo(
+        store: &TableStore<InMemoryFlushTarget>,
+        index_name: &str,
+        ranges: &[(u64, u64)],
+    ) -> Result<Vec<Partition>> {
+        let mut results = Vec::new();
+        store.read_by_index_cell_ranges_each(index_name, ranges, &mut |partition| {
+            results.push(partition);
+            std::ops::ControlFlow::Continue(())
+        })?;
+        Ok(results)
     }
 
     fn collect_index_results(
@@ -14733,12 +14771,10 @@ mod tests {
         let err = collect_index_results(&store, "val_idx", &IndexKey(b"missing".to_vec()))
             .expect_err("an index read over a table with a quarantined generation must not be Ok");
         assert_names_sstable(&err, "missing-gen");
-        let err = store
-            .read_by_index_in_partition("val_idx", &IndexKey(b"missing".to_vec()), b"c")
+        let err = collect_keyed(&store, "val_idx", &IndexKey(b"missing".to_vec()), b"c")
             .expect_err("a partition-scoped index read must refuse too");
         assert_names_sstable(&err, "missing-gen");
-        let err = store
-            .read_by_index_cell_ranges("val_idx", &[(0, u64::MAX)])
+        let err = collect_geo(&store, "val_idx", &[(0, u64::MAX)])
             .expect_err("a cell-range index read must refuse too");
         assert_names_sstable(&err, "missing-gen");
     }
@@ -16090,7 +16126,7 @@ mod tests {
             .iter()
             .map(|r| (r.start, r.end))
             .collect();
-        let partitions = store.read_by_index_cell_ranges("loc_geo", &ranges).unwrap();
+        let partitions = collect_geo(&store, "loc_geo", &ranges).unwrap();
 
         // The cover is an over-approximation, but it must contain both SF cells
         // and must not contain NYC's cell.
@@ -16108,42 +16144,263 @@ mod tests {
     }
 
     #[test]
-    fn read_by_index_cell_ranges_dedups_and_bounds() {
+    fn read_by_index_cell_ranges_unknown_index_is_empty() {
         let store = geo_store();
-        // Insert one well-formed point, then >cap raw entries at one cell id to
-        // trip the fail-loud bound.
-        write_geo_point(&store, "p1", 0.0, 0.0);
+        write_geo_point(&store, "p1", 1.0, 2.0);
+        let result = collect_geo(&store, "nonexistent", &[(0, u64::MAX)]).unwrap();
+        assert!(result.is_empty());
+    }
 
-        let idx = store.get_memtable_index("loc_geo").unwrap();
-        let cell = ferrosa_index::geo::encode_point(0.0, 0.0);
-        let key = IndexKey(cell.to_be_bytes().to_vec());
-        for i in 0..(INDEX_RESULT_CAP as u32 + 1) {
-            idx.insert(
-                key.clone(),
-                RowPosition {
-                    partition_key: format!("pk{i}").into_bytes(),
-                    clustering_key: vec![],
-                },
-            );
+    // =========================================================================
+    // Streaming keyed (in-partition) and geo index reads: no result cap.
+    // =========================================================================
+
+    /// Every row a keyed index read hands its visitor, as `(pk, ck)`.
+    fn keyed_rows(
+        store: &TableStore<InMemoryFlushTarget>,
+        index_name: &str,
+        key: &[u8],
+        partition_key: &[u8],
+        after: Option<&[u8]>,
+    ) -> Result<Vec<RowPosition>> {
+        let mut delivered = Vec::new();
+        store.read_by_index_in_partition_each_after(
+            index_name,
+            &IndexKey(key.to_vec()),
+            partition_key,
+            after,
+            &mut |partition| {
+                delivered.extend(partition.rows.iter().map(|row| RowPosition {
+                    partition_key: partition.key.key.as_bytes().to_vec(),
+                    clustering_key: row.clustering.clone(),
+                }));
+                std::ops::ControlFlow::Continue(())
+            },
+        )?;
+        Ok(delivered)
+    }
+
+    fn keyed_val_store() -> TableStore<InMemoryFlushTarget> {
+        TableStore::new_with_indexes(
+            test_schema(),
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+            vec![("val_idx".into(), 0)],
+        )
+    }
+
+    #[test]
+    fn keyed_index_read_streams_more_matches_than_the_old_cap() {
+        let store = keyed_val_store();
+        let hot = make_key("hot");
+        let other = make_key("other");
+        let total = 10_001_i32;
+        for ck in 0..total {
+            store.write(&hot, make_row_with_ck(ck, b"X", 10)).unwrap();
+            if ck == total / 2 {
+                // Half the postings come from a sidecar, half from the memtable.
+                store.flush().unwrap();
+            }
         }
-        let ranges = vec![(cell, cell)];
-        let result = store.read_by_index_cell_ranges("loc_geo", &ranges);
-        assert!(result.is_err(), "should fail loud when cap exceeded");
-        let msg = format!("{}", result.unwrap_err());
+        store.write(&other, make_row_with_ck(1, b"X", 10)).unwrap();
+        store
+            .write(&hot, make_row_with_ck(total, b"Y", 10))
+            .unwrap();
+
+        let delivered = keyed_rows(&store, "val_idx", b"X", hot.key.as_bytes(), None)
+            .expect("a keyed read past 10,000 matches must stream, not refuse");
+        assert_eq!(delivered.len(), total as usize, "every match, once");
         assert!(
-            msg.contains("10000") || msg.contains("ALLOW FILTERING"),
-            "error should mention the cap or ALLOW FILTERING, got: {msg}"
+            delivered
+                .iter()
+                .all(|p| p.partition_key == hot.key.as_bytes()),
+            "only the keyed partition"
+        );
+        assert!(
+            delivered.windows(2).all(|w| w[0] < w[1]),
+            "in clustering order, no duplicates"
+        );
+
+        // Resuming strictly after a row yields exactly the remainder.
+        let cursor = 9_000_i32.to_be_bytes();
+        let rest = keyed_rows(&store, "val_idx", b"X", hot.key.as_bytes(), Some(&cursor)).unwrap();
+        assert_eq!(rest.len(), (total - 9_001) as usize);
+        assert_eq!(rest[0].clustering_key, 9_001_i32.to_be_bytes().to_vec());
+    }
+
+    #[test]
+    fn keyed_index_read_stops_when_its_consumer_stops() {
+        let store = keyed_val_store();
+        let hot = make_key("hot");
+        for ck in 0..500 {
+            store.write(&hot, make_row_with_ck(ck, b"X", 10)).unwrap();
+        }
+        INDEX_POINT_READS.with(|count| count.set(0));
+        let mut seen = 0;
+        store
+            .read_by_index_in_partition_each_after(
+                "val_idx",
+                &IndexKey(b"X".to_vec()),
+                hot.key.as_bytes(),
+                None,
+                &mut |_| {
+                    seen += 1;
+                    std::ops::ControlFlow::Break(())
+                },
+            )
+            .unwrap();
+        assert_eq!(seen, 1);
+        assert_eq!(
+            INDEX_POINT_READS.with(|count| count.get()),
+            1,
+            "an early-stopping consumer must not drive the walk to the end"
         );
     }
 
     #[test]
-    fn read_by_index_cell_ranges_unknown_index_is_empty() {
+    fn keyed_partition_key_index_read_streams_the_partition_in_chunks() {
+        let store = clustered_entity_store();
+        write_session(&store, "tenant-a", "s1", 6);
+        write_session(&store, "tenant-a", "s2", 3);
+        let pk = make_composite_key(&["tenant-a", "s1"]);
+        INDEX_POINT_READS.with(|count| count.set(0));
+        let delivered = keyed_rows(
+            &store,
+            "idx_by_tenant",
+            b"tenant-a",
+            pk.key.as_bytes(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(delivered.len(), 6, "every row of s1 and none of s2");
+        assert_eq!(INDEX_POINT_READS.with(|count| count.get()), 0);
+        let after = 4_i32.to_be_bytes();
+        let rest = keyed_rows(
+            &store,
+            "idx_by_tenant",
+            b"tenant-a",
+            pk.key.as_bytes(),
+            Some(&after),
+        )
+        .unwrap();
+        assert_eq!(rest.len(), 2, "resumes strictly after entity 4");
+    }
+
+    fn geo_cover(lat: f64, lon: f64, radius_m: f64) -> Vec<(u64, u64)> {
+        ferrosa_index::geo::cover_radius(
+            lat,
+            lon,
+            radius_m,
+            ferrosa_index::geo::DEFAULT_COVER_LEVEL,
+        )
+        .iter()
+        .map(|r| (r.start, r.end))
+        .collect()
+    }
+
+    fn geo_keys(
+        store: &TableStore<InMemoryFlushTarget>,
+        ranges: &[(u64, u64)],
+    ) -> Result<Vec<Vec<u8>>> {
+        let mut keys = Vec::new();
+        store.read_by_index_cell_ranges_each("loc_geo", ranges, &mut |partition| {
+            keys.push(partition.key.key.as_bytes().to_vec());
+            std::ops::ControlFlow::Continue(())
+        })?;
+        Ok(keys)
+    }
+
+    #[test]
+    fn geo_index_read_streams_more_candidates_than_the_old_cap() {
         let store = geo_store();
-        write_geo_point(&store, "p1", 1.0, 2.0);
-        let result = store
-            .read_by_index_cell_ranges("nonexistent", &[(0, u64::MAX)])
+        let total = 10_001_u32;
+        for i in 0..total {
+            let jitter = f64::from(i) * 1e-7;
+            write_geo_point(&store, &format!("p{i:05}"), 37.7955 + jitter, -122.3937);
+            if i == total / 2 {
+                store.flush().unwrap();
+            }
+        }
+        let keys = geo_keys(&store, &geo_cover(37.7955, -122.3937, 3000.0))
+            .expect("a geo read past 10,000 candidates must stream, not refuse");
+        assert_eq!(keys.len(), total as usize, "every candidate, once");
+        let mut sorted = keys.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), keys.len(), "no candidate twice");
+    }
+
+    #[test]
+    fn geo_index_read_drops_postings_a_moved_point_left_behind() {
+        let store = geo_store();
+        // `moved` starts in range and moves elsewhere in range; `left` starts
+        // in range and moves out of it. Their old postings outlive the move.
+        write_geo_point(&store, "moved", 37.7955, -122.3937);
+        write_geo_point(&store, "left", 37.7880, -122.4074);
+        store.flush().unwrap();
+        let key = make_key("moved");
+        store
+            .write(
+                &key,
+                Row {
+                    clustering: vec![],
+                    cells: vec![(
+                        0,
+                        CellValue::live(geo_tuple_bytes(37.7900, -122.4000), 2000),
+                    )],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(2000),
+                },
+            )
             .unwrap();
-        assert!(result.is_empty());
+        let key = make_key("left");
+        store
+            .write(
+                &key,
+                Row {
+                    clustering: vec![],
+                    cells: vec![(0, CellValue::live(geo_tuple_bytes(40.7580, -73.9855), 2000))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(2000),
+                },
+            )
+            .unwrap();
+        let keys = geo_keys(&store, &geo_cover(37.7955, -122.3937, 3000.0)).unwrap();
+        assert_eq!(
+            keys,
+            vec![b"moved".to_vec()],
+            "the moved point once, the departed point not at all"
+        );
+    }
+
+    #[test]
+    fn geo_index_read_stops_when_its_consumer_stops() {
+        let store = geo_store();
+        for i in 0..200_u32 {
+            write_geo_point(
+                &store,
+                &format!("p{i:03}"),
+                37.7955 + f64::from(i) * 1e-6,
+                -122.3937,
+            );
+        }
+        INDEX_POINT_READS.with(|count| count.set(0));
+        let mut seen = 0;
+        store
+            .read_by_index_cell_ranges_each(
+                "loc_geo",
+                &geo_cover(37.7955, -122.3937, 3000.0),
+                &mut |_| {
+                    seen += 1;
+                    std::ops::ControlFlow::Break(())
+                },
+            )
+            .unwrap();
+        assert_eq!(seen, 1);
+        assert_eq!(INDEX_POINT_READS.with(|count| count.get()), 1);
     }
 
     // =========================================================================

@@ -1858,6 +1858,31 @@ pub struct IndexReadInPartitionRequestPayload {
     pub partition_key: Vec<u8>,
 }
 
+/// Payload for a STREAMING keyed index read
+/// (`Message::IndexReadInPartitionStreamRequest`): the same consult as
+/// [`IndexReadInPartitionRequestPayload`], answered with ADR-020
+/// `RangeReadStream*` frames under `request_id` — bounded windows of
+/// `max_chunks`, each ended by a `Done` whose resume position the coordinator
+/// re-requests from — instead of one reply holding every match. A new type
+/// rather than new fields, so the legacy request keeps its bincode layout and
+/// a mixed-version cluster keeps working.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexReadInPartitionStreamRequestPayload {
+    /// Correlation id carried by every response frame of this window.
+    pub request_id: u32,
+    pub keyspace: String,
+    pub table: String,
+    pub index_name: String,
+    pub index_key: Vec<u8>,
+    /// Raw partition key bytes the postings are restricted to.
+    pub partition_key: Vec<u8>,
+    /// Resume strictly after this clustering (a window continuation);
+    /// `None` reads the partition's matches from the start.
+    pub after_clustering: Option<Vec<u8>>,
+    /// Producer flow-control window in chunk frames; must be > 0.
+    pub max_chunks: u32,
+}
+
 /// Response shared by keyed index-read replicas.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexReadResponsePayload {
@@ -1898,18 +1923,25 @@ impl RpcHandler for IndexReadInPartitionHandler {
         let table_id = ferrosa_storage::TableId::new(&req.keyspace, &req.table);
         let index_key = IndexKey(req.index_key);
 
-        let partitions = match self.storage.read_by_index_in_partition(
+        // The legacy reply is one message, so it holds every match; the walk
+        // that fills it streams with no cap, and each row moves straight into
+        // its wire form. A coordinator that wants back-pressure sends
+        // `IndexReadInPartitionStreamRequest` instead.
+        let mut wire_partitions = Vec::new();
+        if let Err(e) = self.storage.read_by_index_in_partition_each_after(
             &table_id,
             &req.index_name,
             &index_key,
             &req.partition_key,
+            None,
+            &mut |partition| {
+                wire_partitions.push(partition_to_wire(partition));
+                std::ops::ControlFlow::Continue(())
+            },
         ) {
-            Ok(ps) => ps,
             // An empty reply would read as "no row matches" (t_9113289f).
-            Err(e) => return storage_failure(HANDLER, "index read", e),
-        };
-
-        let wire_partitions = partitions.into_iter().map(partition_to_wire).collect();
+            return storage_failure(HANDLER, "index read", e);
+        }
         let payload = IndexReadResponsePayload {
             partitions: wire_partitions,
         };
