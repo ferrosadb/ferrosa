@@ -23,6 +23,8 @@ use crate::error::ClusterError;
 use crate::pair::coordinator::PairCoordinator;
 use crate::ring::strategy::ReplicationStrategy;
 use ferrosa_net::task_pool::TaskPool;
+mod index_read;
+mod write;
 
 /// Per-replica scan window for the LEGACY single-shot range RPC.
 ///
@@ -1321,84 +1323,6 @@ impl WritePath {
         }
     }
 
-    /// Stream a global secondary-index lookup in row order — `(partition
-    /// key, clustering)` — strictly after `after` when given, without
-    /// materializing the matching partitions. Every layer holds O(sources):
-    /// each node merges its posting sources in row order, and the cluster path
-    /// merges the nodes in row order, dropping replica copies by adjacency.
-    /// A page resumes by passing the last row it delivered as `after`.
-    pub async fn index_read_stream(
-        &self,
-        table_id: &TableId,
-        index_name: &str,
-        index_key: &ferrosa_index::IndexKey,
-        after: Option<&ferrosa_index::RowPosition>,
-    ) -> crate::error::Result<PartitionResultStream> {
-        match self {
-            Self::Direct(engine) => Ok(Box::pin(
-                engine
-                    .read_by_index_stream_after(table_id, index_name, index_key, after.cloned())
-                    .map(|item| item.map_err(ClusterError::Storage)),
-            )),
-            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => Ok(Box::pin(
-                coordinator
-                    .local_storage()
-                    .read_by_index_stream_after(table_id, index_name, index_key, after.cloned())
-                    .map(|item| item.map_err(ClusterError::Storage)),
-            )),
-            Self::Cluster(coordinator) => {
-                coordinator
-                    .coordinate_index_read_stream(table_id, index_name, index_key, after)
-                    .await
-            }
-            Self::Unavailable => Err(ClusterError::Internal(
-                "index read stream unavailable: write path is in degraded mode".into(),
-            )),
-        }
-    }
-
-    /// KEYED secondary-index read (t_430c4188): consult the index for
-    /// `index_key` restricted to the partition `key`.
-    ///
-    /// - `Direct` / `Pair`: local `read_by_index_in_partition`.
-    /// - `Cluster`: routes to the PARTITION'S replicas under `strategy` (normal
-    ///   keyed routing) — never the global scatter-gather of
-    ///   [`index_read_stream`](Self::index_read_stream).
-    /// - `Unavailable`: returns error.
-    ///
-    /// Per-node work is O(rows matching the indexed value), never O(partition
-    /// rows) — this is what serves `WHERE <full partition key> AND
-    /// <indexed_col> = ?` without a full-partition filtering scan.
-    pub async fn index_read_in_partition(
-        &self,
-        table_id: &TableId,
-        key: &DecoratedKey,
-        index_name: &str,
-        index_key: &ferrosa_index::IndexKey,
-        cl: ConsistencyLevel,
-        strategy: &ReplicationStrategy,
-    ) -> crate::error::Result<Vec<ferrosa_sstable::types::Partition>> {
-        match self {
-            Self::Direct(engine) => engine
-                .read_by_index_in_partition(table_id, index_name, index_key, key.key.as_bytes())
-                .map_err(crate::error::ClusterError::Storage),
-            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => coordinator
-                .local_storage()
-                .read_by_index_in_partition(table_id, index_name, index_key, key.key.as_bytes())
-                .map_err(crate::error::ClusterError::Storage),
-            Self::Cluster(coordinator) => {
-                coordinator
-                    .coordinate_index_read_in_partition(
-                        table_id, key, index_name, index_key, cl, strategy,
-                    )
-                    .await
-            }
-            Self::Unavailable => Err(crate::error::ClusterError::Internal(
-                "keyed index read unavailable: write path is in degraded mode".into(),
-            )),
-        }
-    }
-
     /// Full-text (`fts_match`) index lookup, returning matching partition keys.
     ///
     /// In standalone/pair mode this hits local storage. In cluster mode the
@@ -1644,91 +1568,6 @@ impl WritePath {
             Self::Unavailable => Err(ferrosa_common::Error::InvalidData(
                 "pair mode: primary unavailable, truncate rejected until operator promotes".into(),
             )),
-        }
-    }
-
-    /// Write a row. In standalone mode this goes directly to storage.
-    /// In pair mode this goes through the PairCoordinator which handles
-    /// replication (primary) or forwarding (secondary).
-    /// In cluster mode the replication strategy determines whether to use
-    /// SimpleStrategy or NetworkTopologyStrategy DC-aware coordination.
-    pub async fn write(
-        &self,
-        table_id: &TableId,
-        key: &DecoratedKey,
-        row: Row,
-        timestamp: i64,
-        cl: ConsistencyLevel,
-        strategy: &ReplicationStrategy,
-    ) -> ferrosa_common::Result<()> {
-        self.await_write_admission(table_id).await?;
-        match self {
-            Self::Direct(engine) => engine.write(table_id, key, row, timestamp),
-            Self::Unavailable => Err(ferrosa_common::Error::InvalidData(
-                "pair mode: primary unavailable, writes rejected until operator promotes".into(),
-            )),
-            Self::DegradedPair(_) => Err(ferrosa_common::Error::InvalidData(
-                "pair mode: primary unavailable, writes rejected until operator promotes".into(),
-            )),
-            Self::Pair(coordinator) => {
-                let mutation = Mutation::new(
-                    table_id.keyspace.clone(),
-                    table_id.table.clone(),
-                    key.clone(),
-                    vec![row],
-                    timestamp,
-                );
-                let res = coordinator
-                    .coordinate_write_with(&mutation, cl, strategy.replication_factor())
-                    .await
-                    .map_err(cluster_error_to_common);
-                if res.is_ok() {
-                    if let Some((bus, ev)) = committed_cdc_event(
-                        coordinator.local_storage(),
-                        table_id,
-                        &mutation.key,
-                        &mutation.rows,
-                        mutation.timestamp,
-                    ) {
-                        bus.publish(ev);
-                    }
-                }
-                res
-            }
-            Self::Cluster(coordinator) => {
-                // Capture the committed-CDC payload before `row` is moved into
-                // the coordinate call; clones only if a subscriber is listening.
-                let pending = committed_cdc_event(
-                    &coordinator.storage,
-                    table_id,
-                    key,
-                    std::slice::from_ref(&row),
-                    timestamp,
-                );
-                let res = match strategy {
-                    ReplicationStrategy::Simple { replication_factor } => coordinator
-                        .coordinate_write_with(
-                            table_id,
-                            key,
-                            row,
-                            timestamp,
-                            cl,
-                            *replication_factor,
-                        )
-                        .await
-                        .map_err(cluster_error_to_common),
-                    ReplicationStrategy::NetworkTopology { .. } => coordinator
-                        .coordinate_write_nts(table_id, key, row, timestamp, cl, strategy)
-                        .await
-                        .map_err(cluster_error_to_common),
-                };
-                if res.is_ok() {
-                    if let Some((bus, ev)) = pending {
-                        bus.publish(ev);
-                    }
-                }
-                res
-            }
         }
     }
 }
@@ -2062,10 +1901,14 @@ mod tests {
             !range_read_body.contains("coordinate_range_read_stream_all(table_id, 0)"),
             "cluster range_read must not call the Vec-returning unbounded streaming coordinator"
         );
+        let stream_all_with_body = source
+            .split("pub async fn range_read_stream_all_with(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    pub ").next())
+            .expect("range_read_stream_all_with body must be present");
         assert!(
-            source.contains("pub async fn range_read_stream_all_with")
-                && source.contains("strategy.replication_factor()")
-                && source.contains("coordinate_range_read_stream_all_with"),
+            stream_all_with_body
+                .contains("coordinate_range_read_stream_all_with(table_id, row_limit, cl, strategy)"),
             "cluster streaming full scans must carry caller consistency and keyspace replication into the coordinator"
         );
         assert!(
