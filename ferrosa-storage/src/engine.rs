@@ -14920,23 +14920,30 @@ impl StorageEngine {
         // Swallowing this error is what let 36,572 of them accumulate unnoticed.
         if component_dir != table_dir {
             if let Err(e) = std::fs::remove_dir(&component_dir) {
-                let leftovers: Vec<String> = std::fs::read_dir(&component_dir)
-                    .map(|entries| {
-                        entries
-                            .flatten()
-                            .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
-                            .take(8)
-                            .collect()
-                    })
-                    .unwrap_or_default();
                 tracing::error!(
                     dir = %component_dir.display(),
                     error = %e,
-                    ?leftovers,
                     "delete_sstable_files: SSTable component directory survived deletion — \
                      it will be re-examined by compaction planning on every cycle and can \
                      never be compacted. This is an SSTable husk leak."
                 );
+                // Name every leftover, one line each, rather than collecting a sample.
+                match std::fs::read_dir(&component_dir) {
+                    Ok(entries) => {
+                        for entry in entries.flatten() {
+                            tracing::error!(
+                                dir = %component_dir.display(),
+                                leftover = %entry.file_name().to_string_lossy(),
+                                "delete_sstable_files: file left in the SSTable husk"
+                            );
+                        }
+                    }
+                    Err(e) => tracing::error!(
+                        dir = %component_dir.display(),
+                        error = %e,
+                        "delete_sstable_files: could not list the SSTable husk"
+                    ),
+                }
             }
         }
 
@@ -16113,7 +16120,6 @@ impl StorageEngine {
         // Shared with `ObjectStoreConfig::build_object_store`, which warns
         // when the in-flight limit is below it.
         const FETCH_CONCURRENCY: usize = crate::upload::config::STARTUP_FETCH_CONCURRENCY;
-        const LISTED_FAILURES: usize = 10;
 
         let evicted = Self::evicted_generations(&data_dir.join("sstables"));
         if evicted.is_empty() {
@@ -16139,22 +16145,10 @@ impl StorageEngine {
             "storage-engine: registering evicted SSTables as remote-backed (index components only, no Data.db download)"
         );
         let started = Instant::now();
-        // Only LISTED_FAILURES messages are ever shown, so retain exactly that
-        // many: a max-heap capped at LISTED_FAILURES yields the same lowest-N
-        // sorted sample the old `sort().take(N)` produced, in O(N) memory rather
-        // than one string per failed generation (352-373 per node on 2026-09-29).
-        // `failure_count` carries the true total into the error message.
-        let mut failures: std::collections::BinaryHeap<String> =
-            std::collections::BinaryHeap::new();
-        let mut failure_count = 0usize;
-        let note_failure =
-            |heap: &mut std::collections::BinaryHeap<String>, count: &mut usize, msg: String| {
-                *count += 1;
-                heap.push(msg);
-                if heap.len() > LISTED_FAILURES {
-                    heap.pop();
-                }
-            };
+        // Every failure is logged as it happens (352-373 per node on
+        // 2026-09-29); the tally keeps only the count and the lowest message
+        // for the refusal, so nothing here grows with the number of failures.
+        let mut failures = FailureTally::default();
         let mut jobs = Vec::new();
         for (dir_name, gens) in &evicted {
             let table_dir = data_dir.join("sstables").join(dir_name);
@@ -16173,11 +16167,7 @@ impl StorageEngine {
                 } else if listed {
                     jobs.push((dir_name.clone(), gen.clone(), table_dir.clone()));
                 } else {
-                    note_failure(
-                        &mut failures,
-                        &mut failure_count,
-                        format!("{dir_name} generation {gen}: not in the manifest"),
-                    );
+                    failures.note(format!("{dir_name} generation {gen}: not in the manifest"));
                 }
             }
         }
@@ -16207,7 +16197,7 @@ impl StorageEngine {
                     let now = Instant::now();
                     let bytes = reads.index_bytes_fetched();
                     if progress.report_due(now, watch.progress_every) {
-                        progress.log(now, bytes, failure_count);
+                        progress.log(now, bytes, failures.count());
                     }
                     if let Some(stall) = progress.stalled(now, watch.stall_after) {
                         tracing::error!("storage-engine: {stall}");
@@ -16224,37 +16214,25 @@ impl StorageEngine {
             // Also report here: the fetches write and fsync components on
             // this thread, which can hold the ticker off for seconds.
             if progress.report_due(now, watch.progress_every) {
-                progress.log(now, reads.index_bytes_fetched(), failure_count);
+                progress.log(now, reads.index_bytes_fetched(), failures.count());
             }
             match outcome {
                 Ok(crate::evicted_read::QueryFetch::Ready) => registered += 1,
-                Ok(crate::evicted_read::QueryFetch::IndexArtifactsLost(message)) => note_failure(
-                    &mut failures,
-                    &mut failure_count,
-                    format!("{dir_name} generation {gen}: {message}"),
-                ),
-                Ok(other) => note_failure(
-                    &mut failures,
-                    &mut failure_count,
-                    format!(
-                        "{dir_name} generation {gen}: objects unavailable in the store ({other:?})"
-                    ),
-                ),
-                Err(e) => note_failure(
-                    &mut failures,
-                    &mut failure_count,
-                    format!("{dir_name} generation {gen}: {e}"),
-                ),
+                Ok(crate::evicted_read::QueryFetch::IndexArtifactsLost(message)) => {
+                    failures.note(format!("{dir_name} generation {gen}: {message}"))
+                }
+                Ok(other) => failures.note(format!(
+                    "{dir_name} generation {gen}: objects unavailable in the store ({other:?})"
+                )),
+                Err(e) => failures.note(format!("{dir_name} generation {gen}: {e}")),
             }
         }
-        if failure_count > 0 {
-            let mut shown = failures.into_sorted_vec();
-            shown.truncate(LISTED_FAILURES);
+        if let Some(first) = failures.first() {
             return Err(ferrosa_common::Error::InvalidFormat(format!(
                 "{} evicted SSTable generation(s) are neither local nor resolvable from the \
-                 object store; refusing to start and serve their tables without them: {}",
-                failure_count,
-                shown.join("; ")
+                 object store; refusing to start and serve their tables without them. \
+                 First: {first}. Every one is logged above.",
+                failures.count(),
             )));
         }
         tracing::info!(
@@ -41684,4 +41662,58 @@ mod tests {
         }
     }
     include!("engine_backpressure_tests.rs");
+}
+
+/// Count of failures plus the lowest message, for a refusal that has already
+/// logged each failure. Constant size whatever the failure count.
+#[derive(Default)]
+struct FailureTally {
+    count: usize,
+    first: Option<String>,
+}
+
+impl FailureTally {
+    /// Log `msg` and fold it into the tally.
+    fn note(&mut self, msg: String) {
+        tracing::error!(failure = %msg, "storage-engine: evicted SSTable generation unresolvable");
+        self.count += 1;
+        if self.first.as_ref().is_none_or(|first| msg < *first) {
+            self.first = Some(msg);
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.count
+    }
+
+    fn first(&self) -> Option<&str> {
+        self.first.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod failure_tally_tests {
+    use super::FailureTally;
+
+    /// Startup registration used to keep the first ten failure messages in a
+    /// capped heap for its error text. Every failure is now logged as it
+    /// happens, and the tally keeps only the count and the lowest message (so
+    /// the error text is deterministic): nothing grows with the failure count.
+    #[test]
+    fn a_failure_tally_keeps_the_count_and_the_lowest_message_only() {
+        let mut tally = FailureTally::default();
+        assert_eq!(tally.count(), 0);
+        assert_eq!(tally.first(), None);
+
+        for msg in [
+            "t2 generation 9: gone",
+            "t1 generation 3: gone",
+            "t3 generation 1: gone",
+        ] {
+            tally.note(msg.to_string());
+        }
+
+        assert_eq!(tally.count(), 3);
+        assert_eq!(tally.first(), Some("t1 generation 3: gone"));
+    }
 }
