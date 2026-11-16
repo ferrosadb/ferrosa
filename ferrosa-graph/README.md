@@ -105,7 +105,10 @@ use those same stored endpoint keys.
   `max_groups` / `max_collect_size` / `max_var_path_visited` in aggregation and
   var-length paths). `max_result_rows` is a deprecated field that no
   executor path enforces: result truncation was removed and an unbounded
-  `ORDER BY` spills instead (`executor/spill.rs`).
+  `ORDER BY` spills instead (`executor/spill.rs`). Results stream end to end;
+  write operators (SET/REMOVE/DELETE) and the MATCH anchor frontier spill past
+  `spill_threshold_bytes`. `GraphEngine::execute` is test-only — use
+  `execute_stream_with_params`.
 - **Streaming entry point** (`executor/stream.rs`, `executor/expand.rs`) —
   `execute_streaming()` returns `(columns, RowStream<'a>, QueryStats)`;
   `execute()` is a thin `collect` over it, so there is one executor, not two.

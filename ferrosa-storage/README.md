@@ -1590,7 +1590,6 @@ so they are deferred rather than removed unsafely. They are tracked here and in
 
 | Bound | Where | Exceeding it | Needed replacement |
 |---|---|---|---|
-| `INDEX_RESULT_CAP` (10000) | `store.rs` | an index query is REFUSED | stream / spill index postings instead of materializing them |
 | `DEFAULT_MAX_BYTES` | `schema_snapshot.rs` | a schema-snapshot persist/load is REFUSED | externalize the bound and stream the registry document |
 | `MAX_RECORD_BYTES` | `eviction_audit.rs` | one audit record is REFUSED (that pass is lost) | drop the per-record cap; the ring already bounds the total |
 | RRD ring memory budget | `timeseries/aggregator.rs` | a rollup ring is SKIPPED when the budget is exhausted | spill rollups to disk instead of skipping the ring |

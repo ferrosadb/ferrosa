@@ -106,6 +106,33 @@ def sites : List Site := [
   ⟨"system tables", "the storage schema loaders walk system_schema one keyspace at a time", .streaming,
    "ferrosa-storage/src/engine.rs:6311",
    "`decode_system_schema_rows` drives `walk_token_range` over the table and decodes each partition's rows as it arrives; the capped `read_range(.., 10_000)` it replaces dropped every keyspace past the cap."⟩,
+  ⟨"storage", "a keyed index read streams the partition's matches in row order", .streaming,
+   "ferrosa-storage/src/store/index_read.rs:408",
+   "`read_by_index_in_partition_each_after` seeks every posting source to `(pk, after)`, merges them in row order through `OrderedPostings`, point-reads each row as it is reached and stops at the first posting of another partition; `INDEX_RESULT_CAP` is gone."⟩,
+  ⟨"storage", "a geo index read streams its candidates without a seen-set", .streaming,
+   "ferrosa-storage/src/store/index_read.rs:538",
+   "`read_by_index_cell_ranges_each` merges the memtable and sidecar range iterators lazily in (key, row) order, takes a duplicated posting once, and drops a moved point's stale posting by re-checking its encoded cell: no HashSet of positions."⟩,
+  ⟨"cluster", "a keyed index read merges replica streams one row at a time", .streaming,
+   "ferrosa-cluster/src/coordinator/read.rs:2432",
+   "`coordinate_index_read_in_partition_stream` opens replicas local-first until CL is covered and merges one row per replica by clustering; remote replicas answer `IndexReadInPartitionStreamRequest` (0x6A) with ADR-020 stream frames."⟩,
+  ⟨"cluster", "the write path exposes the keyed index read as a stream", .streaming,
+   "ferrosa-cluster/src/write_path/index_read.rs:58",
+   "`index_read_in_partition_stream` returns a stream for Direct, Pair and Cluster; the Vec-returning `index_read_in_partition` was deleted."⟩,
+  ⟨"sparql", "SPARQL solutions stream to the response", .streaming,
+   "ferrosa-sparql/src/response.rs:166",
+   "Solutions are a lazy stream written into a chunked HTTP body about 64 KiB at a time; there is no row bound (`DEFAULT_MAX_ROWS` was deleted)."⟩,
+  ⟨"sparql", "SPARQL ORDER BY, DISTINCT and grouped COUNT spill", .spilling true,
+   "ferrosa-sparql/src/executor.rs:102",
+   "`select_stream` pulls solutions lazily; ORDER BY uses `ExternalSorter`, DISTINCT `SpillingDedup`, and grouped COUNT flushes partial groups into an external sort past `spill_threshold_bytes`."⟩,
+  ⟨"sparql", "property-path closure expands by lookup and spills its frontier", .spilling true,
+   "ferrosa-sparql/src/property_path.rs:279",
+   "`bfs` expands each node with a point lookup of its partition; the visited set and each frontier level spill to disk, so no predicate adjacency is held."⟩,
+  ⟨"graph", "the MATCH anchor frontier spills instead of being collected", .spilling true,
+   "ferrosa-graph/src/executor/expand.rs:1664",
+   "`expand_to_states` writes anchor states to a spill-backed `StateRun` in scan order; hops, OPTIONAL MATCH, WITH and the projection pull them one at a time."⟩,
+  ⟨"graph", "a write's match set spills before the first write", .spilling true,
+   "ferrosa-graph/src/executor/spill.rs:757",
+   "SET / REMOVE / DELETE read the whole match set into `spill_run` (the ORDER BY `ExternalSorter` in arrival order) before writing, then replay it: Halloween-safe and memory-bounded."⟩,
   ⟨"cql", "a result cursor holds a node-wide permit or is refused", .serialized,
    "ferrosa-cql/src/result_cursor.rs:513",
    "`admit` CAS-increments the open count under `max_open` (default 256), sweeps expired cursors first, and returns Overloaded rather than queueing."⟩,
@@ -186,8 +213,8 @@ def sites : List Site := [
    "No rewrap operator exists in the tree: the only PITR path is `run_pitr_replay_e2e`, a replay test, so there is no transform to inspect."⟩
 ]
 
-/-- Thirty-nine sites were read. -/
-theorem site_count : sites.length = 39 := by decide
+/-- Forty-eight sites were read. -/
+theorem site_count : sites.length = 48 := by decide
 
 /-- **Every site names a file and line.**  A row without a location is a mood, not an audit finding, so
     each `site` field has to contain a `file.rs:line`. -/
@@ -201,16 +228,16 @@ theorem every_config_bound_names_its_knob :
       | .boundedByConfig knob => !knob.isEmpty
       | _ => true) = true := by native_decide
 
-/-- Eleven sites are bounded by construction. -/
-theorem streaming_sites : (sites.filter fun s => s.klass == .streaming).length = 11 := by decide
+/-- Sixteen sites are bounded by construction. -/
+theorem streaming_sites : (sites.filter fun s => s.klass == .streaming).length = 16 := by decide
 
 /-- Three are bounded by a permit. -/
 theorem serialized_sites : (sites.filter fun s => match s.klass with
     | .serialized => true | _ => false).length = 3 := by decide
 
-/-- Three are bounded because they spill. -/
+/-- Seven are bounded because they spill. -/
 theorem spilling_sites : (sites.filter fun s => match s.klass with
-    | .spilling _ => true | _ => false).length = 3 := by decide
+    | .spilling _ => true | _ => false).length = 7 := by decide
 
 /-- Nine are bounded only by a setting. -/
 theorem config_bounded_sites : (sites.filter fun s => match s.klass with
@@ -238,7 +265,7 @@ theorem classes_partition_the_sites :
       + (sites.filter fun s => match s.klass with | .spilling _ => true | _ => false).length
       + (sites.filter fun s => match s.klass with | .boundedByConfig _ => true | _ => false).length
       + (sites.filter fun s => match s.klass with | .unbounded _ => true | _ => false).length
-      + (sites.filter fun s => s.klass == .unresolved).length = 39 := by decide
+      + (sites.filter fun s => s.klass == .unresolved).length = 48 := by decide
 
 /-- The layers the audit covers, so the table can be printed by layer. -/
 def layers : List String := ["cql", "commit log", "compaction", "flush", "graph", "permits",

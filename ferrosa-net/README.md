@@ -62,6 +62,10 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   the outbound pool's snapshot, taken when WE dialled, or the peer's most
   recent INBOUND handshake, recorded by the accept path
   (`InboundPeerCallback::on_inbound_peer` → `PeerManager::record_inbound_capabilities`).
+  `CAP_INDEX_PARTITION_STREAM` (1<<10) gates `IndexReadInPartitionStreamRequest`
+  (MsgType 0x6A, Stream family): the keyed index read answered with range-read
+  stream frames. A peer without the bit is never sent 0x6A, because an unknown
+  type byte drops the connection.
   An inbound handshake proves the peer runs that build NOW, so a peer that
   restarts with a newer build is visible without the observer restarting
   (t_d853fa2a); latest-wins keeps it fail-closed, because a peer on a build
