@@ -44,6 +44,62 @@ impl PostingList {
     pub fn as_slice(&self) -> &[RowPosition] {
         &self.node.values
     }
+
+    /// The index key these postings are filed under.
+    pub fn key(&self) -> &IndexKey {
+        &self.node.key
+    }
+}
+
+/// A lazy, in-order walk of the keys in an inclusive `[start, end]` range,
+/// one pinned [`PostingList`] per key (see [`MemtableIndex::posting_lists_in_range`]).
+///
+/// Concurrency: the walk starts from the root loaded once at construction
+/// and holds `Arc`s to the nodes on its path. The tree is persistent — an
+/// insert path-copies and swaps in a new root, never mutating a node — so
+/// the nodes held here, and every node reachable from them, are immutable
+/// for as long as the walk holds them. Inserts that land meanwhile are not
+/// seen (the same snapshot semantics as [`MemtableIndex::range`]).
+///
+/// Memory: the stack holds the left spine of the unvisited part of the
+/// range, O(tree height) node pointers; postings are lent, never copied.
+pub struct PostingListRange {
+    stack: Vec<Arc<Node>>,
+    end: IndexKey,
+}
+
+impl PostingListRange {
+    /// Push `node` and its left descendants that may still hold keys
+    /// `>= start`; a subtree whose root is below `start` contributes only
+    /// its right side.
+    fn descend(&mut self, mut node: Option<Arc<Node>>, start: Option<&IndexKey>) {
+        while let Some(n) = node {
+            if start.is_some_and(|start| n.key < *start) {
+                node = n.right.clone();
+            } else {
+                node = n.left.clone();
+                self.stack.push(n);
+            }
+        }
+    }
+}
+
+impl Iterator for PostingListRange {
+    type Item = PostingList;
+
+    /// Each call pops one node and pushes at most the left spine of its
+    /// right subtree, so the walk is bounded by the nodes in the range.
+    fn next(&mut self) -> Option<PostingList> {
+        let node = self.stack.pop()?;
+        if node.key > self.end {
+            self.stack.clear();
+            return None;
+        }
+        // Every key in the right subtree is above `node.key`, which is
+        // already at or after `start`, so no lower bound applies there.
+        self.descend(node.right.clone(), None);
+        Some(PostingList { node })
+    }
 }
 
 /// Lock-free persistent red-black tree for memtable secondary indexing.
@@ -117,6 +173,23 @@ impl MemtableIndex {
             };
         }
         None
+    }
+
+    /// The keys in `[start, end]` (inclusive), in key order, each as its
+    /// pinned posting list — lazily, without copying a posting. Prefer this
+    /// to [`range`](Self::range) on a read path: a consumer that stops early
+    /// pays only for what it walked. See [`PostingListRange`] for why a
+    /// concurrent insert cannot disturb the walk.
+    pub fn posting_lists_in_range(&self, start: &IndexKey, end: &IndexKey) -> PostingListRange {
+        let root: Option<Arc<Node>> = (**self.root.load()).clone();
+        let mut walk = PostingListRange {
+            stack: Vec::new(),
+            end: end.clone(),
+        };
+        if start <= end {
+            walk.descend(root, Some(start));
+        }
+        walk
     }
 
     /// Range query: returns all RowPositions for keys in [start, end] inclusive.
@@ -518,6 +591,43 @@ mod tests {
             partition_key: pk.to_vec(),
             clustering_key: ck.to_vec(),
         }
+    }
+
+    /// The lazy range walk yields exactly what `range` collects, in the same
+    /// order, and a walk opened before an insert does not see it.
+    #[test]
+    fn posting_lists_in_range_matches_range_and_holds_its_snapshot() {
+        let index = MemtableIndex::new();
+        for key in 0u8..64 {
+            for row in 0u8..3 {
+                index.insert(IndexKey(vec![key]), pos(&[row], &[key]));
+            }
+        }
+        for (start, end) in [(0u8, 63u8), (10, 20), (20, 20), (63, 63), (30, 10)] {
+            let (start, end) = (IndexKey(vec![start]), IndexKey(vec![end]));
+            let lazy: Vec<RowPosition> = index
+                .posting_lists_in_range(&start, &end)
+                .flat_map(|list| list.as_slice().to_vec())
+                .collect();
+            assert_eq!(lazy, index.range(&start, &end), "range {start:?}..={end:?}");
+        }
+        let mut walk = index.posting_lists_in_range(&IndexKey(vec![5]), &IndexKey(vec![7]));
+        assert_eq!(
+            walk.next().map(|list| list.key().clone()),
+            Some(IndexKey(vec![5]))
+        );
+        index.insert(IndexKey(vec![6]), pos(b"late", b""));
+        let six = walk.next().expect("key 6");
+        assert_eq!(
+            six.as_slice().len(),
+            3,
+            "the insert after the walk began is not seen"
+        );
+        assert_eq!(
+            walk.next().map(|list| list.key().clone()),
+            Some(IndexKey(vec![7]))
+        );
+        assert!(walk.next().is_none());
     }
 
     #[test]

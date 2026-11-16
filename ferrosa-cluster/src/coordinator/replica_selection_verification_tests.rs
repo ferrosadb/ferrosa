@@ -221,6 +221,7 @@ async fn exercise(topology: Topology, operation: Operation) -> crate::error::Res
             4,
         ));
         registry.register(MsgType::RangeReadStreamRequest, handler.clone());
+        registry.register(MsgType::IndexReadInPartitionStreamRequest, handler.clone());
         registry.register(MsgType::RangeReadStreamCancel, handler);
         let server = Arc::new(RpcServer::new(net_config(), host, registry));
         let addr = server.start_and_get_addr().await.unwrap();
@@ -335,16 +336,16 @@ async fn exercise(topology: Topology, operation: Operation) -> crate::error::Res
                 } else {
                     b"a-0".as_slice()
                 };
-                let rows = coordinator
-                    .coordinate_index_read_in_partition(
-                        &table,
-                        &key,
-                        "v0_idx",
-                        &ferrosa_index::IndexKey(value.to_vec()),
-                        ConsistencyLevel::Quorum,
-                        &strategy,
-                    )
-                    .await?;
+                let rows = crate::coordinator::read::collect_keyed_index_read(
+                    &coordinator,
+                    &table,
+                    &key,
+                    "v0_idx",
+                    &ferrosa_index::IndexKey(value.to_vec()),
+                    ConsistencyLevel::Quorum,
+                    &strategy,
+                )
+                .await?;
                 assert_eq!(rows.len(), 1);
             }
             Operation::Range => {

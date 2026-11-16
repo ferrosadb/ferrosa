@@ -126,7 +126,7 @@ const DEFAULT_MERGE_SOURCE_FRAGMENT_TIMEOUT: Duration = STREAMING_IDLE_TIMEOUT;
 /// through [`set_merge_source_fragment_timeout_for_test`]; production always
 /// reads the default, so the override does not exist there at all.
 #[cfg(test)]
-fn merge_source_fragment_timeout() -> Duration {
+pub(crate) fn merge_source_fragment_timeout() -> Duration {
     match MERGE_SOURCE_FRAGMENT_TIMEOUT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
         0 => DEFAULT_MERGE_SOURCE_FRAGMENT_TIMEOUT,
         ms => Duration::from_millis(ms),
@@ -134,7 +134,7 @@ fn merge_source_fragment_timeout() -> Duration {
 }
 
 #[cfg(not(test))]
-fn merge_source_fragment_timeout() -> Duration {
+pub(crate) fn merge_source_fragment_timeout() -> Duration {
     DEFAULT_MERGE_SOURCE_FRAGMENT_TIMEOUT
 }
 
@@ -1570,6 +1570,10 @@ struct WindowedReplicaForwarder {
     wanted: Option<Vec<u16>>,
     index_name: Option<String>,
     index_key: Option<Vec<u8>>,
+    /// `Some(pk)` for a keyed index read: every window is an
+    /// `IndexReadInPartitionStreamRequest` scoped to this partition rather
+    /// than a global index or range request.
+    keyed_partition: Option<Vec<u8>>,
     window_chunks: u32,
     /// Set true ONLY when this replica's logical stream ends for a reason that
     /// makes a silent `remote_tx` close SAFE for the merge to read as "this
@@ -1583,6 +1587,45 @@ struct WindowedReplicaForwarder {
 }
 
 impl WindowedReplicaForwarder {
+    /// The request message for one window starting at the given resume
+    /// position: the keyed index request when this forwarder is scoped to a
+    /// partition, otherwise the range/global-index stream request.
+    fn window_request(
+        &self,
+        request_id: u32,
+        start_key: Option<Vec<u8>>,
+        start_clustering: Option<Vec<u8>>,
+    ) -> crate::error::Result<Message> {
+        let Some(partition_key) = &self.keyed_partition else {
+            return self
+                .encode_request(request_id, start_key, start_clustering)
+                .map(Message::RangeReadStreamRequest);
+        };
+        if start_key.as_ref().is_some_and(|key| key != partition_key) {
+            return Err(ClusterError::Internal(
+                "keyed index stream: a window ended outside its partition".into(),
+            ));
+        }
+        let (Some(index_name), Some(index_key)) = (&self.index_name, &self.index_key) else {
+            return Err(ClusterError::Internal(
+                "keyed index stream: forwarder has no index to read".into(),
+            ));
+        };
+        let payload = crate::raft::handlers::IndexReadInPartitionStreamRequestPayload {
+            request_id,
+            keyspace: self.keyspace.clone(),
+            table: self.table.clone(),
+            index_name: index_name.clone(),
+            index_key: index_key.clone(),
+            partition_key: partition_key.clone(),
+            after_clustering: start_clustering,
+            max_chunks: self.window_chunks,
+        };
+        bincode::serialize(&payload)
+            .map(|body| Message::IndexReadInPartitionStreamRequest(Bytes::from(body)))
+            .map_err(|e| ClusterError::Internal(format!("keyed index stream: encode request: {e}")))
+    }
+
     fn encode_request(
         &self,
         request_id: u32,
@@ -1674,27 +1717,19 @@ impl WindowedReplicaForwarder {
                 .next_request_id
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             receiver = self.router.register(request_id, STREAM_RECEIVER_BUFFER);
-            let body = match self.encode_request(
+            let request = match self.window_request(
                 request_id,
                 Some(resume.partition_key),
                 Some(resume.clustering),
             ) {
-                Ok(body) => body,
+                Ok(request) => request,
                 Err(e) => {
                     self.router.unregister(request_id);
                     let _ = remote_tx.send(Err(e)).await;
                     return;
                 }
             };
-            if let Err(e) = self
-                .peers
-                .fire(
-                    self.host_id,
-                    Message::RangeReadStreamRequest(body),
-                    Lane::Bulk,
-                )
-                .await
-            {
+            if let Err(e) = self.peers.fire(self.host_id, request, Lane::Bulk).await {
                 // A continuation fire failure mid-scan is a hard, loud error:
                 // the consumer already holds a prefix, so silently ending the
                 // stream here would return PARTIAL data as success.
@@ -1757,7 +1792,7 @@ impl ClusterCoordinator {
     /// windowed continuation forwarder. Returns the bounded, consumer-paced
     /// partition stream for that replica, or `Err` when the initial fire
     /// fails (the caller counts fan-out failures).
-    async fn spawn_replica_fragment_stream(
+    pub(crate) async fn spawn_replica_fragment_stream(
         &self,
         table_id: &TableId,
         host_id: uuid::Uuid,
@@ -1775,12 +1810,6 @@ impl ClusterCoordinator {
                  {host_id}; the local replica must be served from the local engine"
             )));
         }
-        let request_id = self.next_stream_request_id();
-        let receiver = self
-            .stream_router
-            .register(request_id, STREAM_RECEIVER_BUFFER);
-
-        let clean_end = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let forwarder = WindowedReplicaForwarder {
             router: self.stream_router.clone(),
             peers: self.peer_manager.clone(),
@@ -1791,21 +1820,74 @@ impl ClusterCoordinator {
             wanted: projected_regular_ordinals.map(|w| w.to_vec()),
             index_name: index.map(|(name, _)| name.to_string()),
             index_key: index.map(|(_, key)| key.to_vec()),
+            keyed_partition: None,
             window_chunks,
-            clean_end: clean_end.clone(),
+            clean_end: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
-        let body = forwarder
-            .encode_request(
-                request_id,
-                resume.map(|r| r.key.key.as_bytes().to_vec()),
-                resume.and_then(|r| r.clustering.clone()),
-            )
+        self.launch_windowed_forwarder(
+            forwarder,
+            resume.map(|r| r.key.key.as_bytes().to_vec()),
+            resume.and_then(|r| r.clustering.clone()),
+        )
+        .await
+    }
+
+    /// Open a STREAMING keyed index read of one partition on remote replica
+    /// `host_id`: `IndexReadInPartitionStreamRequest` windows of
+    /// `STREAM_WINDOW_CHUNKS` frames, each continued from the last row the
+    /// previous one delivered once the consumer drains it. Dropping the
+    /// returned stream cancels the producer. The peer must have advertised
+    /// `CAP_INDEX_PARTITION_STREAM`; the caller checks.
+    pub(crate) async fn spawn_replica_keyed_index_stream(
+        &self,
+        table_id: &TableId,
+        host_id: uuid::Uuid,
+        index_name: &str,
+        index_key: &[u8],
+        partition_key: &[u8],
+    ) -> crate::error::Result<ClusterPartitionStream> {
+        if host_id == self.peer_manager.local_host_id() {
+            return Err(ClusterError::Internal(format!(
+                "keyed index stream: refusing to fire a stream request to the local host_id \
+                 {host_id}; the local replica must be served from the local engine"
+            )));
+        }
+        let forwarder = WindowedReplicaForwarder {
+            router: self.stream_router.clone(),
+            peers: self.peer_manager.clone(),
+            next_request_id: self.next_request_id.clone(),
+            host_id,
+            keyspace: table_id.keyspace.clone(),
+            table: table_id.table.clone(),
+            wanted: None,
+            index_name: Some(index_name.to_string()),
+            index_key: Some(index_key.to_vec()),
+            keyed_partition: Some(partition_key.to_vec()),
+            window_chunks: STREAM_WINDOW_CHUNKS,
+            clean_end: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        self.launch_windowed_forwarder(forwarder, None, None).await
+    }
+
+    /// Fire `forwarder`'s first window from the given resume position and
+    /// spawn its continuation loop. Returns the bounded, consumer-paced
+    /// stream for that replica, or `Err` when the first fire fails.
+    async fn launch_windowed_forwarder(
+        &self,
+        forwarder: WindowedReplicaForwarder,
+        start_key: Option<Vec<u8>>,
+        start_clustering: Option<Vec<u8>>,
+    ) -> crate::error::Result<ClusterPartitionStream> {
+        let host_id = forwarder.host_id;
+        let clean_end = forwarder.clean_end.clone();
+        let request_id = self.next_stream_request_id();
+        let receiver = self
+            .stream_router
+            .register(request_id, STREAM_RECEIVER_BUFFER);
+        let request = forwarder
+            .window_request(request_id, start_key, start_clustering)
             .inspect_err(|_| self.stream_router.unregister(request_id))?;
-        if let Err(e) = self
-            .peer_manager
-            .fire(host_id, Message::RangeReadStreamRequest(body), Lane::Bulk)
-            .await
-        {
+        if let Err(e) = self.peer_manager.fire(host_id, request, Lane::Bulk).await {
             self.stream_router.unregister(request_id);
             return Err(ClusterError::Internal(format!(
                 "streaming range read: failed to fire request to {host_id}: {e}"
@@ -2729,7 +2811,7 @@ fn index_hit_position(partition: &Partition) -> (&[u8], &[u8]) {
 /// Only the local source is wrapped: a remote whose walk is slow but
 /// progressing (an R2 rehydrate) keeps its stream open through progress-gated
 /// heartbeats, and a per-row bound on it would undo that.
-fn bounded_local_index_source(
+pub(crate) fn bounded_local_index_source(
     source: ClusterPartitionStream,
     budget: Duration,
 ) -> ClusterPartitionStream {

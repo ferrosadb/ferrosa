@@ -28067,6 +28067,29 @@ mod tests {
     }
 
     // ── read_by_index_in_partition (t_430c4188) ──────────────────────────────
+
+    /// A keyed index read's partitions, collected — test-only.
+    fn keyed_hits(
+        engine: &StorageEngine,
+        table_id: &TableId,
+        index_name: &str,
+        key: &ferrosa_index::IndexKey,
+        partition_key: &[u8],
+    ) -> ferrosa_common::Result<Vec<Partition>> {
+        let mut hits = Vec::new();
+        engine.read_by_index_in_partition_each_after(
+            table_id,
+            index_name,
+            key,
+            partition_key,
+            None,
+            &mut |partition| {
+                hits.push(partition);
+                std::ops::ControlFlow::Continue(())
+            },
+        )?;
+        Ok(hits)
+    }
     //
     // Keyed secondary-index consult: postings for the indexed value are
     // restricted to ONE specified partition, so a full-partition-key +
@@ -28112,9 +28135,14 @@ mod tests {
             .write(&tid, &make_key("p1"), row_ck(3, b"alice", 1003), 1003)
             .unwrap();
 
-        let hits = engine
-            .read_by_index_in_partition(&tid, "val_idx", &IndexKey(b"alice".to_vec()), b"p1")
-            .unwrap();
+        let hits = keyed_hits(
+            &engine,
+            &tid,
+            "val_idx",
+            &IndexKey(b"alice".to_vec()),
+            b"p1",
+        )
+        .unwrap();
 
         assert!(
             hits.iter().all(|p| p.key.key.as_bytes() == b"p1"),
@@ -28157,15 +28185,25 @@ mod tests {
             .unwrap();
 
         // Value exists but not in the requested partition.
-        let hits = engine
-            .read_by_index_in_partition(&tid, "val_idx", &IndexKey(b"alice".to_vec()), b"p9")
-            .unwrap();
+        let hits = keyed_hits(
+            &engine,
+            &tid,
+            "val_idx",
+            &IndexKey(b"alice".to_vec()),
+            b"p9",
+        )
+        .unwrap();
         assert!(hits.is_empty(), "no matches in partition → empty result");
 
         // Value absent everywhere.
-        let hits = engine
-            .read_by_index_in_partition(&tid, "val_idx", &IndexKey(b"nobody".to_vec()), b"p1")
-            .unwrap();
+        let hits = keyed_hits(
+            &engine,
+            &tid,
+            "val_idx",
+            &IndexKey(b"nobody".to_vec()),
+            b"p1",
+        )
+        .unwrap();
         assert!(hits.is_empty(), "absent value → empty result");
 
         let mut visitor = |_partition| std::ops::ControlFlow::Continue(());
@@ -28181,7 +28219,8 @@ mod tests {
         );
 
         // Unknown table fails loud (mirrors read_by_index).
-        let err = engine.read_by_index_in_partition(
+        let err = keyed_hits(
+            &engine,
             &TableId::new("nope", "nope"),
             "val_idx",
             &IndexKey(b"alice".to_vec()),
@@ -28236,18 +28275,14 @@ mod tests {
         );
 
         // Keyed consult restricted to p1 returns only p1's ck=7 row.
-        let keyed = engine
-            .read_by_index_in_partition(&tid, "ck_idx", &key7, b"p1")
-            .unwrap();
+        let keyed = keyed_hits(&engine, &tid, "ck_idx", &key7, b"p1").unwrap();
         assert_eq!(keyed.len(), 1, "one matching row in p1");
         assert_eq!(keyed[0].key.key.as_bytes(), b"p1");
         assert_eq!(keyed[0].rows[0].clustering, 7_i32.to_be_bytes().to_vec());
 
         // Memtable layer: the post-flush ck=9 write is indexed too.
         let key9 = IndexKey(9_i32.to_be_bytes().to_vec());
-        let keyed9 = engine
-            .read_by_index_in_partition(&tid, "ck_idx", &key9, b"p1")
-            .unwrap();
+        let keyed9 = keyed_hits(&engine, &tid, "ck_idx", &key9, b"p1").unwrap();
         assert_eq!(keyed9.len(), 1, "memtable-resident clustering entry found");
         assert_eq!(keyed9[0].rows[0].clustering, 9_i32.to_be_bytes().to_vec());
     }
@@ -29957,8 +29992,12 @@ mod tests {
             .iter()
             .map(|r| (r.start, r.end))
             .collect();
-        let partitions = engine
-            .read_by_index_cell_ranges(&tid, "loc_geo", &ranges)
+        let mut partitions = Vec::new();
+        engine
+            .read_by_index_cell_ranges_each(&tid, "loc_geo", &ranges, &mut |partition| {
+                partitions.push(partition);
+                std::ops::ControlFlow::Continue(())
+            })
             .unwrap();
         // The two SF points are inside the 3km cover; NYC is far away.
         assert!(
@@ -29977,14 +30016,25 @@ mod tests {
     }
 
     #[test]
-    fn engine_read_by_index_cell_ranges_unknown_table_is_empty() {
+    fn engine_read_by_index_cell_ranges_unknown_table_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let config = StorageEngineConfig::test_config(dir.path());
         let engine = StorageEngine::new(config, None).unwrap();
-        let result = engine
-            .read_by_index_cell_ranges(&TableId::new("nope", "nope"), "idx", &[(0, u64::MAX)])
-            .unwrap();
-        assert!(result.is_empty());
+        let mut visited = 0;
+        let result = engine.read_by_index_cell_ranges_each(
+            &TableId::new("nope", "nope"),
+            "idx",
+            &[(0, u64::MAX)],
+            &mut |_| {
+                visited += 1;
+                std::ops::ControlFlow::Continue(())
+            },
+        );
+        assert!(
+            result.is_err(),
+            "an unregistered table must be refused, not answered with no points"
+        );
+        assert_eq!(visited, 0);
         engine.shutdown().unwrap();
     }
 

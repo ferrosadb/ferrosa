@@ -6268,27 +6268,37 @@ async fn route_geo_select(
         .position(|n| n == &geo_column)
         .ok_or_else(|| CqlError::Invalid(format!("geo column {geo_column} not found")))?;
 
-    // Fetch candidate partitions for a set of covering cell ranges, convert to
-    // rows. Geo candidate reads remain fail-loud and bounded by the storage
-    // layer's keyed/geo candidate guard.
-    let fetch_rows = |ranges: Vec<(u64, u64)>| -> Result<Vec<Vec<Option<CqlValue>>>, CqlError> {
-        let partitions = state
+    // Stream the candidate rows for a set of covering cell ranges into `sink`,
+    // one row at a time as storage reaches it: the index walk is lazy and holds
+    // O(sources) memory, so only the rows `sink` keeps (the refined result)
+    // accumulate here — never the candidate set.
+    let visit_rows = |ranges: Vec<(u64, u64)>,
+                      sink: &mut dyn FnMut(Vec<Option<CqlValue>>)|
+     -> Result<(), CqlError> {
+        let mut failure = None;
+        state
             .engine
-            .read_by_index_cell_ranges(table_id, &index_name, &ranges)
+            .read_by_index_cell_ranges_each(table_id, &index_name, &ranges, &mut |partition| {
+                match bridge::partition_to_rows_with_storage_mapping(
+                    &partition,
+                    rowctx.all_col_names,
+                    rowctx.all_col_types,
+                    rowctx.pk_indices,
+                    rowctx.ck_indices,
+                    rowctx.storage_to_table,
+                ) {
+                    Ok(rows) => {
+                        rows.into_iter().for_each(&mut *sink);
+                        std::ops::ControlFlow::Continue(())
+                    }
+                    Err(error) => {
+                        failure = Some(CqlError::from(error));
+                        std::ops::ControlFlow::Break(())
+                    }
+                }
+            })
             .map_err(|e| CqlError::Invalid(format!("geo index read failed: {e}")))?;
-        let mut rows = Vec::new();
-        for partition in &partitions {
-            let mut prows = bridge::partition_to_rows_with_storage_mapping(
-                partition,
-                rowctx.all_col_names,
-                rowctx.all_col_types,
-                rowctx.pk_indices,
-                rowctx.ck_indices,
-                rowctx.storage_to_table,
-            )?;
-            rows.append(&mut prows);
-        }
-        Ok(rows)
+        failure.map_or(Ok(()), Err)
     };
 
     // Build the final, refined row set for the specific geo operation.
@@ -6311,29 +6321,37 @@ async fn route_geo_select(
         // the primary key, so distinct rows never collide).
         let mut seen_rows: Vec<Vec<Option<CqlValue>>> = Vec::new();
         let mut row_ids: HashMap<Vec<u8>, usize> = HashMap::new();
+        // A ring whose read fails ends the search and fails the query: an
+        // empty ring would read as "no points here" and rank wrong neighbours.
+        let mut ring_failure: Option<CqlError> = None;
         let candidates = geo::nearest_k(gn.lat, gn.lon, k, |ranges| {
-            let pairs = cover_ranges_to_pairs(ranges);
-            let rows = match fetch_rows(pairs) {
-                Ok(r) => r,
-                Err(_) => return Vec::new(),
-            };
             let mut out = Vec::new();
-            for row in rows {
+            if ring_failure.is_some() {
+                return out;
+            }
+            let pairs = cover_ranges_to_pairs(ranges);
+            let visited = visit_rows(pairs, &mut |row| {
                 if let Some((lat, lon)) = row_geo_point(&row, geo_col_idx) {
                     let row_key = encode_row_identity(&row);
                     let id = *row_ids.entry(row_key).or_insert_with(|| {
                         let next = seen_rows.len();
-                        seen_rows.push(row.clone());
+                        seen_rows.push(row);
                         next
                     });
                     out.push(geo::GeoCandidate { id, lat, lon });
                 }
+            });
+            if let Err(error) = visited {
+                ring_failure = Some(error);
             }
             out
         });
+        if let Some(error) = ring_failure {
+            return Err(error);
+        }
         candidates
             .into_iter()
-            .map(|c| seen_rows[c.id].clone())
+            .map(|c| std::mem::take(&mut seen_rows[c.id]))
             .collect()
     } else {
         match &s.geo_predicates[0] {
@@ -6346,29 +6364,32 @@ async fn route_geo_select(
                     *radius_m,
                     geo::DEFAULT_COVER_LEVEL,
                 ));
-                let rows = fetch_rows(ranges)?;
-                // Refine: keep rows whose exact haversine distance is within the
-                // radius (the cover is an over-approximation).
-                rows.into_iter()
-                    .filter(|row| {
-                        row_geo_point(row, geo_col_idx)
-                            .map(|(la, lo)| geo::within_radius(*lat, *lon, *radius_m, la, lo))
-                            .unwrap_or(false)
-                    })
-                    .collect()
+                // Refine as rows arrive: keep rows whose exact haversine
+                // distance is within the radius (the cover over-approximates).
+                let mut kept = Vec::new();
+                visit_rows(ranges, &mut |row| {
+                    if row_geo_point(&row, geo_col_idx)
+                        .is_some_and(|(la, lo)| geo::within_radius(*lat, *lon, *radius_m, la, lo))
+                    {
+                        kept.push(row);
+                    }
+                })?;
+                kept
             }
             GeoPredicate::WithinBbox { sw, ne, .. } => {
                 let ranges =
                     cover_ranges_to_pairs(&geo::cover_bbox(*sw, *ne, geo::DEFAULT_COVER_LEVEL));
-                let rows = fetch_rows(ranges)?;
-                // Refine: exact axis-aligned (antimeridian-aware) containment.
-                rows.into_iter()
-                    .filter(|row| {
-                        row_geo_point(row, geo_col_idx)
-                            .map(|(la, lo)| geo::within_bbox(sw.0, sw.1, ne.0, ne.1, la, lo))
-                            .unwrap_or(false)
-                    })
-                    .collect()
+                // Refine as rows arrive: exact axis-aligned
+                // (antimeridian-aware) containment.
+                let mut kept = Vec::new();
+                visit_rows(ranges, &mut |row| {
+                    if row_geo_point(&row, geo_col_idx)
+                        .is_some_and(|(la, lo)| geo::within_bbox(sw.0, sw.1, ne.0, ne.1, la, lo))
+                    {
+                        kept.push(row);
+                    }
+                })?;
+                kept
             }
             GeoPredicate::WithinPolygon { vertices, .. } => {
                 let polygon = geo::Polygon::new(vertices.clone());
@@ -6394,7 +6415,17 @@ async fn route_geo_select(
                             ne,
                             geo::DEFAULT_COVER_LEVEL,
                         ));
-                        let rows = fetch_rows(ranges)?;
+                        // Only candidates inside the polygon's exact bbox can
+                        // be inside the polygon, so the coarse cover's other
+                        // rows are dropped as they arrive.
+                        let mut rows = Vec::new();
+                        visit_rows(ranges, &mut |row| {
+                            if row_geo_point(&row, geo_col_idx).is_some_and(|(la, lo)| {
+                                geo::within_bbox(sw.0, sw.1, ne.0, ne.1, la, lo)
+                            }) {
+                                rows.push(row);
+                            }
+                        })?;
                         // Each candidate carries its row index as the opaque id so
                         // the R-tree survivors map straight back to source rows.
                         let candidates: Vec<geo::GeoPoint<usize>> =
@@ -6409,7 +6440,9 @@ async fn route_geo_select(
                         // Stable, deterministic output order (R-tree traversal is
                         // not input order).
                         kept.sort_unstable();
-                        kept.into_iter().map(|i| rows[i].clone()).collect()
+                        kept.into_iter()
+                            .map(|i| std::mem::take(&mut rows[i]))
+                            .collect()
                     }
                     None => Vec::new(),
                 }
@@ -7150,10 +7183,13 @@ async fn route_select_user_table_inner(
             state
                 .index_usage_tracker
                 .record(ks, &s.table, &index_name, "PartitionIndexLookup");
-            let consulted = state
+            // The keyed read streams one matching row per item with
+            // back-pressure; this select arm still assembles its rows for the
+            // shared conversion and paging tail below.
+            let keyed_matches = state
                 .write_path
                 .load()
-                .index_read_in_partition(
+                .index_read_in_partition_stream(
                     &table_id,
                     &decorated_key,
                     &index_name,
@@ -7162,6 +7198,8 @@ async fn route_select_user_table_inner(
                     &read_strategy,
                 )
                 .await?;
+            let consulted: Vec<ferrosa_sstable::types::Partition> =
+                futures::TryStreamExt::try_collect(keyed_matches).await?;
             let keyed_index_current = {
                 let write_path = state.write_path.load();
                 let local_tracker_authoritative = matches!(
