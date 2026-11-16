@@ -12288,6 +12288,27 @@ fn consolidation_fn_name(
     f.extension_name()
 }
 
+/// The table's current params with `patch` applied, or `None` when the ALTER
+/// named no `WITH` options (params are then left untouched).
+fn merged_table_params(
+    schema: &Schema,
+    ks: &str,
+    table: &str,
+    patch: &crate::table_options::TableOptionPatch,
+) -> Result<Option<TableParams>, CqlError> {
+    if patch.is_empty() {
+        return Ok(None);
+    }
+    let snap = schema.snapshot();
+    let current = snap
+        .tables
+        .get(&(ks.to_string(), table.to_string()))
+        .ok_or_else(|| {
+            CqlError::Invalid(format!("ALTER TABLE {ks}.{table}: table does not exist"))
+        })?;
+    Ok(Some(patch.apply_to(&current.params)))
+}
+
 async fn route_alter_table(
     state: &SharedState,
     ctx: &RequestContext<'_>,
@@ -12329,9 +12350,15 @@ async fn route_alter_table(
         })
         .collect();
 
+    // `WITH <option> = <value>`: validate every option before anything is
+    // applied, so an unknown option or bad value changes nothing. The paths
+    // below replace the table's params wholesale with `updates.params`, so it
+    // must carry the CURRENT params with the patch merged on.
+    let option_patch = crate::table_options::TableOptionPatch::parse(&s.table_options)?;
+
     let extensions = s.extensions.map(|pairs| pairs.into_iter().collect());
 
-    let updates = TableUpdates {
+    let mut updates = TableUpdates {
         params: None,
         add_columns,
         drop_columns: s.drop_columns.clone(),
@@ -12351,6 +12378,9 @@ async fn route_alter_table(
             let table = s.table.clone();
             run_direct_table_change(state, ctx.auth, SchemaChangeType::Updated, move |core, auth| {
                 let ks = keyspace.as_str();
+            // Merge under the DDL lifecycle fence so a concurrent direct ALTER
+            // cannot interleave between the read and the write.
+            updates.params = merged_table_params(&core.schema, ks, &table, &option_patch)?;
             core.schema.alter_table(ks, &table, updates, auth)?;
             // Propagate the post-ALTER column set to the storage engine,
             // mirroring what CreateTable's Direct arm does. Without this,
@@ -12397,6 +12427,7 @@ async fn route_alter_table(
             ));
         }
         DdlPath::Pair(coordinator) => {
+            updates.params = merged_table_params(&state.schema, ks, &s.table, &option_patch)?;
             let op = DdlOperation::AlterTable {
                 keyspace: ks.to_string(),
                 table: s.table.clone(),
@@ -12405,6 +12436,10 @@ async fn route_alter_table(
             coordinator.coordinate_ddl(op).await?;
         }
         DdlPath::Cluster { .. } => {
+            // Merged against this node's applied schema. Two concurrent ALTERs
+            // of different options on different coordinators can still lose
+            // one (t_6309dc1b); the Raft op carries whole params.
+            updates.params = merged_table_params(&state.schema, ks, &s.table, &option_patch)?;
             let op = DdlOperation::AlterTable {
                 keyspace: ks.to_string(),
                 table: s.table.clone(),
@@ -23520,6 +23555,237 @@ mod tests {
             "ALTER TABLE DROP must succeed, got: {:?}",
             result.err()
         );
+    }
+
+    // ── ALTER TABLE ... WITH <option> (t_970e689b) ─────────────────────────
+    //
+    // `route_alter_table` used to build `TableUpdates { params: None, .. }`
+    // and never read `s.table_options`, so every `ALTER TABLE ... WITH`
+    // returned success and changed nothing.
+
+    fn alter_options_ctx(auth: &AuthContext) -> RequestContext<'_> {
+        RequestContext {
+            auth,
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        }
+    }
+
+    /// A table whose every option a test might check is set away from its
+    /// default, so "left unchanged" cannot pass by coincidence.
+    async fn alter_options_fixture() -> (SharedState, TempDir) {
+        let (state, dir) = setup();
+        let auth = dev_auth();
+        let ctx = alter_options_ctx(&auth);
+        for cql in [
+            "CREATE KEYSPACE ks WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE ks.t (k int PRIMARY KEY, v text) \
+             WITH compaction = {'class': 'LeveledCompactionStrategy', 'sstable_size_in_mb': '64'} \
+             AND compression = {'class': 'LZ4Compressor', 'chunk_length_in_kb': '16'} \
+             AND default_time_to_live = 77 \
+             AND comment = 'keep me' \
+             AND bloom_filter_fp_chance = 0.05 \
+             AND gc_grace_seconds = 3600",
+        ] {
+            let stmt = crate::parser::parse(cql).unwrap();
+            route(&state, &ctx, stmt).await.unwrap();
+        }
+        (state, dir)
+    }
+
+    fn alter_options_params(state: &SharedState) -> TableParams {
+        state
+            .schema
+            .snapshot()
+            .tables
+            .get(&("ks".to_string(), "t".to_string()))
+            .expect("ks.t exists")
+            .params
+            .clone()
+    }
+
+    /// Compare whole `TableParams` without depending on `HashMap` order.
+    fn params_json(params: &TableParams) -> serde_json::Value {
+        serde_json::to_value(params).expect("TableParams serializes")
+    }
+
+    async fn run_alter(state: &SharedState, cql: &str) -> Result<(), CqlError> {
+        let auth = dev_auth();
+        let ctx = alter_options_ctx(&auth);
+        let stmt = crate::parser::parse(cql)?;
+        route(state, &ctx, stmt).await.map(|_| ())
+    }
+
+    /// The red at the real entry point: ALTER, then read the options back from
+    /// both the schema registry and the storage engine (compaction reads its
+    /// purge horizon from the engine's schema).
+    #[tokio::test]
+    async fn alter_table_with_options_applies_them_and_keeps_the_rest() {
+        let (state, _dir) = alter_options_fixture().await;
+        let before = alter_options_params(&state);
+        assert_eq!(before.gc_grace_seconds, 3600, "fixture precondition");
+        let tid = ferrosa_storage::TableId::new("ks", "t");
+        let engine_gc_grace = |state: &SharedState| {
+            state
+                .engine
+                .table_schema(&tid)
+                .expect("ks.t registered with the engine")
+                .gc_grace_seconds()
+        };
+        assert_eq!(
+            engine_gc_grace(&state),
+            Ok(Some(3600)),
+            "fixture precondition"
+        );
+
+        run_alter(
+            &state,
+            "ALTER TABLE ks.t WITH gc_grace_seconds = 4500 AND default_time_to_live = 600",
+        )
+        .await
+        .expect("ALTER ... WITH must succeed");
+
+        let after = alter_options_params(&state);
+        assert_eq!(after.gc_grace_seconds, 4500, "gc_grace_seconds not applied");
+        assert_eq!(
+            after.default_time_to_live, 600,
+            "default_time_to_live not applied"
+        );
+        let mut expected = before.clone();
+        expected.gc_grace_seconds = 4500;
+        expected.default_time_to_live = 600;
+        assert_eq!(
+            params_json(&after),
+            params_json(&expected),
+            "ALTER must merge onto the current options, not reset the rest to defaults"
+        );
+        assert_eq!(
+            engine_gc_grace(&state),
+            Ok(Some(4500)),
+            "engine schema not updated"
+        );
+    }
+
+    #[tokio::test]
+    async fn alter_table_with_unknown_option_is_refused_and_changes_nothing() {
+        let (state, _dir) = alter_options_fixture().await;
+        let before = alter_options_params(&state);
+
+        // A known option beside the unknown one must not be applied either.
+        let err = run_alter(
+            &state,
+            "ALTER TABLE ks.t WITH gc_grace_seconds = 10 AND no_such_option = 5",
+        )
+        .await
+        .expect_err("an unknown option must be refused");
+        match &err {
+            CqlError::Invalid(msg) => {
+                assert!(
+                    msg.contains("no_such_option"),
+                    "error must name the option: {msg}"
+                )
+            }
+            other => panic!("expected CqlError::Invalid, got {other:?}"),
+        }
+        assert_eq!(
+            params_json(&alter_options_params(&state)),
+            params_json(&before)
+        );
+    }
+
+    #[tokio::test]
+    async fn alter_table_with_invalid_values_is_refused_and_changes_nothing() {
+        let (state, _dir) = alter_options_fixture().await;
+        let before = alter_options_params(&state);
+
+        for (cql, option) in [
+            (
+                "ALTER TABLE ks.t WITH gc_grace_seconds = 'abc'",
+                "gc_grace_seconds",
+            ),
+            (
+                "ALTER TABLE ks.t WITH gc_grace_seconds = '-1'",
+                "gc_grace_seconds",
+            ),
+            (
+                "ALTER TABLE ks.t WITH gc_grace_seconds = 1.5",
+                "gc_grace_seconds",
+            ),
+            (
+                "ALTER TABLE ks.t WITH default_time_to_live = '-5'",
+                "default_time_to_live",
+            ),
+            (
+                "ALTER TABLE ks.t WITH bloom_filter_fp_chance = 0",
+                "bloom_filter_fp_chance",
+            ),
+            (
+                "ALTER TABLE ks.t WITH compaction = 'LeveledCompactionStrategy'",
+                "compaction",
+            ),
+            (
+                "ALTER TABLE ks.t WITH gc_grace_seconds = 1 AND gc_grace_seconds = 2",
+                "gc_grace_seconds",
+            ),
+        ] {
+            let err = run_alter(&state, cql)
+                .await
+                .expect_err(&format!("{cql} must be refused"));
+            match &err {
+                CqlError::Invalid(msg) => assert!(
+                    msg.contains(option),
+                    "{cql}: error must name `{option}`: {msg}"
+                ),
+                other => panic!("{cql}: expected CqlError::Invalid, got {other:?}"),
+            }
+            assert_eq!(
+                params_json(&alter_options_params(&state)),
+                params_json(&before),
+                "{cql} changed the table's options although it was refused"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn alter_table_add_column_and_options_in_one_statement_applies_both() {
+        // CQL's grammar has no `ADD ... WITH` form, but the AST carries both
+        // and the router must not drop either half when both are present.
+        let (state, _dir) = alter_options_fixture().await;
+        let before = alter_options_params(&state);
+        let mut stmt = crate::parser::parse("ALTER TABLE ks.t ADD extra text").unwrap();
+        let Statement::AlterTable(alter) = &mut stmt else {
+            panic!("expected ALTER TABLE, got {stmt:?}");
+        };
+        alter.table_options = vec![("gc_grace_seconds".to_string(), "120".to_string())];
+
+        let auth = dev_auth();
+        route(&state, &alter_options_ctx(&auth), stmt)
+            .await
+            .expect("ADD + WITH must succeed");
+
+        let snap = state.schema.snapshot();
+        let tbl = snap
+            .tables
+            .get(&("ks".to_string(), "t".to_string()))
+            .unwrap();
+        assert!(tbl.columns.contains_key("extra"), "ADD was dropped");
+        let mut expected = before.clone();
+        expected.gc_grace_seconds = 120;
+        assert_eq!(params_json(&tbl.params), params_json(&expected));
+        let engine_schema = state
+            .engine
+            .table_schema(&ferrosa_storage::TableId::new("ks", "t"))
+            .unwrap();
+        assert!(engine_schema
+            .regular_columns
+            .iter()
+            .any(|c| c.name == "extra"));
+        assert_eq!(engine_schema.gc_grace_seconds(), Ok(Some(120)));
     }
 
     /// PREPARE for a SELECT must include result column metadata so gocql's

@@ -456,6 +456,24 @@ key and `set<jsonb>`, `map<jsonb, _>`, `vector<jsonb, n>` as InvalidRequest
 (0x2200), naming the column and the rule. The check runs before the direct,
 pair or Raft path sees the statement.
 
+### ALTER TABLE ... WITH table options
+
+`ALTER TABLE ks.t WITH <option> = <value> [AND ...]` applies the options
+`CREATE TABLE` stores: `compaction`, `compression`, `comment`,
+`default_time_to_live`, `gc_grace_seconds` and `bloom_filter_fp_chance`
+(`src/table_options.rs`). The named options are merged onto the table's current
+params; every other option keeps its value, and a map option (`compaction`,
+`compression`) is replaced whole, as in Cassandra. The whole statement is
+validated first: an unknown option, a value that does not parse or is out of
+range (negative seconds, `default_time_to_live` over 20 years,
+`bloom_filter_fp_chance` outside (0, 1], a compaction map with no `class`), or
+an option given twice is InvalidRequest naming the option, and changes nothing.
+The new params reach the storage engine through `update_table_schema`, so
+compaction purges with the new `gc_grace_seconds`. Until this change the router
+passed `params: None` and every `ALTER ... WITH` was acknowledged as a no-op
+(t_970e689b). `CREATE TABLE` still ignores unknown options and bad values
+(t_3505b66b).
+
 ### jsonb DDL is standalone-only for now (T-300)
 
 `CREATE TABLE`, `ALTER TABLE ADD`, `CREATE TYPE` and `ALTER TYPE ADD` that

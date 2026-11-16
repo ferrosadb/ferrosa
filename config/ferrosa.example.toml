@@ -198,6 +198,11 @@ bind = "127.0.0.1:9090"
 #   To supply your own admin password at first bootstrap (e.g. from a
 #   secrets manager), set: FERROSA_SEED_ADMIN_PASSWORD=<your-password>
 #   Subsequent startups are idempotent — existing roles are never overwritten.
+#   If the stored ferrosa_admin no longer verifies against that password,
+#   startup logs a WARN saying so. To recover, set
+#   FERROSA_RESET_ADMIN_PASSWORD=1 for one restart: it re-persists
+#   FERROSA_SEED_ADMIN_PASSWORD over the stored admin (logged at WARN), and
+#   does nothing once they match. Unset it afterwards.
 #
 # WEB CONSOLE (/metrics)
 # ----------------------

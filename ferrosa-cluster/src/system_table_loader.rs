@@ -246,13 +246,13 @@ impl SystemTableLoader {
         let Some(admin) = schema.snapshot().roles.get(SEED_ADMIN_USER).cloned() else {
             return Ok(false);
         };
-        if !role_verifies(&admin, SEED_ADMIN_PASSWORD) {
-            return Ok(false);
-        }
         let configured = config
             .admin_password
             .as_deref()
             .filter(|pw| *pw != SEED_ADMIN_PASSWORD);
+        if !role_verifies(&admin, SEED_ADMIN_PASSWORD) {
+            return self.reconcile_drifted_admin(schema, config, admin, configured);
+        }
         let Some(configured) = configured else {
             if config.mode == DeploymentMode::Production {
                 tracing::error!(
@@ -265,14 +265,7 @@ impl SystemTableLoader {
             }
             return Ok(false);
         };
-        let mut repaired = admin;
-        repaired.salted_hash = Some(schema.password_hasher().hash_password(configured).map_err(
-            |e| FerrosaError::InvalidData(format!("hash configured admin password: {e}")),
-        )?);
-        repaired.scram = Some(ferrosa_schema::auth::scram::derive_with_random_salt(
-            configured,
-        ));
-        self.persist_and_restore(schema, repaired)?;
+        self.persist_admin_password(schema, admin, configured)?;
         tracing::warn!(
             role = SEED_ADMIN_USER,
             "repaired ferrosa_admin: the persisted system_auth.roles row held the well-known \
@@ -280,6 +273,67 @@ impl SystemTableLoader {
              configured password (t_d0e5e6e5)"
         );
         Ok(true)
+    }
+
+    /// The stored admin is not the well-known default. When a configured
+    /// password exists and the stored one does not verify against it, the
+    /// operator is locked out of every admin surface: report that on every
+    /// startup, and re-persist the configured password only when the
+    /// break-glass `FERROSA_RESET_ADMIN_PASSWORD` asks for it (t_8d381050).
+    fn reconcile_drifted_admin(
+        &self,
+        schema: &Schema,
+        config: &SeedConfig,
+        admin: RoleMetadata,
+        configured: Option<&str>,
+    ) -> ferrosa_common::Result<bool> {
+        let Some(configured) = configured else {
+            if config.reset_admin_password {
+                tracing::error!(
+                    role = SEED_ADMIN_USER,
+                    "FERROSA_RESET_ADMIN_PASSWORD is set but FERROSA_SEED_ADMIN_PASSWORD is not, \
+                     so there is no password to reset ferrosa_admin to; nothing was changed"
+                );
+            }
+            return Ok(false);
+        };
+        if role_verifies(&admin, configured) {
+            return Ok(false);
+        }
+        if !config.reset_admin_password {
+            tracing::warn!(
+                role = SEED_ADMIN_USER,
+                "ferrosa_admin's stored credential does not verify against \
+                 FERROSA_SEED_ADMIN_PASSWORD, so that secret cannot log in. Set \
+                 FERROSA_RESET_ADMIN_PASSWORD=1 for one restart to re-persist it (t_8d381050)"
+            );
+            return Ok(false);
+        }
+        self.persist_admin_password(schema, admin, configured)?;
+        tracing::warn!(
+            role = SEED_ADMIN_USER,
+            "reset ferrosa_admin to FERROSA_SEED_ADMIN_PASSWORD because \
+             FERROSA_RESET_ADMIN_PASSWORD is set; unset it once the cluster is back (t_8d381050)"
+        );
+        Ok(true)
+    }
+
+    /// Re-hash `password` onto `admin` (bcrypt + SCRAM), keeping every other
+    /// attribute, and persist it row-first.
+    fn persist_admin_password(
+        &self,
+        schema: &Schema,
+        admin: RoleMetadata,
+        password: &str,
+    ) -> ferrosa_common::Result<()> {
+        let mut repaired = admin;
+        repaired.salted_hash = Some(schema.password_hasher().hash_password(password).map_err(
+            |e| FerrosaError::InvalidData(format!("hash configured admin password: {e}")),
+        )?);
+        repaired.scram = Some(ferrosa_schema::auth::scram::derive_with_random_salt(
+            password,
+        ));
+        self.persist_and_restore(schema, repaired)
     }
 
     fn disable_default_service_login(
@@ -1936,6 +1990,107 @@ mod tests {
         assert!(log.contains(
             tracing::Level::ERROR,
             "FERROSA_SEED_ADMIN_PASSWORD is not set"
+        ));
+    }
+
+    /// The stored admin is not the default and does not verify against the
+    /// configured password (it was rotated, or seeded before the secret was
+    /// set). Without the reset flag nothing changes, but startup must say so:
+    /// an operator holding the configured secret is otherwise locked out of
+    /// every admin endpoint with no hint why. Observed on dev control,
+    /// 2026-11-11 (t_8d381050).
+    #[test]
+    fn drifted_admin_without_reset_flag_is_reported_and_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        write_role_row(&engine, SEED_ADMIN_USER, "rotated-admin-pw", true);
+
+        let config = SeedConfig::from_parts(
+            DeploymentMode::Production,
+            Some(MANAGED_ADMIN_PASSWORD.to_string()),
+        );
+        let log = CapturedLog::default();
+        let (schema, report) =
+            tracing::subscriber::with_default(log.clone(), || restart(&engine, &config));
+
+        assert!(!report.admin_reseeded);
+        assert!(schema
+            .authenticate(SEED_ADMIN_USER, "rotated-admin-pw")
+            .is_ok());
+        assert!(role_verifies(
+            &persisted(&engine, SEED_ADMIN_USER),
+            "rotated-admin-pw"
+        ));
+        assert!(log.contains(
+            tracing::Level::WARN,
+            "does not verify against FERROSA_SEED_ADMIN_PASSWORD"
+        ));
+    }
+
+    /// FERROSA_RESET_ADMIN_PASSWORD is the break-glass: it re-persists the
+    /// configured password over a drifted admin, logs it, and is a no-op once
+    /// the stored credential already matches (so leaving it set does not
+    /// rewrite the row on every restart).
+    #[test]
+    fn reset_flag_repersists_configured_password_over_drifted_admin() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        write_role_row(&engine, SEED_ADMIN_USER, "rotated-admin-pw", true);
+
+        let config = SeedConfig::from_parts(
+            DeploymentMode::Production,
+            Some(MANAGED_ADMIN_PASSWORD.to_string()),
+        )
+        .with_admin_reset(true);
+        let log = CapturedLog::default();
+        let (schema, report) =
+            tracing::subscriber::with_default(log.clone(), || restart(&engine, &config));
+
+        assert!(report.admin_reseeded);
+        assert!(log.contains(tracing::Level::WARN, "reset ferrosa_admin"));
+        assert!(schema
+            .authenticate(SEED_ADMIN_USER, MANAGED_ADMIN_PASSWORD)
+            .is_ok());
+        assert!(schema
+            .authenticate(SEED_ADMIN_USER, "rotated-admin-pw")
+            .is_err());
+        let row = persisted(&engine, SEED_ADMIN_USER);
+        assert!(role_verifies(&row, MANAGED_ADMIN_PASSWORD));
+        assert!(row.is_superuser, "the reset must keep superuser");
+        assert!(row.can_login, "the reset must keep LOGIN");
+
+        let (schema, report) = restart(&engine, &config);
+        assert_eq!(report, CredentialRepairReport::default());
+        assert!(schema
+            .authenticate(SEED_ADMIN_USER, MANAGED_ADMIN_PASSWORD)
+            .is_ok());
+    }
+
+    /// The reset flag with no configured password has nothing to restore: it
+    /// changes nothing and says so at ERROR.
+    #[test]
+    fn reset_flag_without_configured_password_changes_nothing_and_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        write_role_row(&engine, SEED_ADMIN_USER, "rotated-admin-pw", true);
+
+        let config =
+            SeedConfig::from_parts(DeploymentMode::Production, None).with_admin_reset(true);
+        let log = CapturedLog::default();
+        let (_schema, report) =
+            tracing::subscriber::with_default(log.clone(), || restart(&engine, &config));
+
+        assert!(!report.admin_reseeded);
+        assert!(role_verifies(
+            &persisted(&engine, SEED_ADMIN_USER),
+            "rotated-admin-pw"
+        ));
+        assert!(log.contains(
+            tracing::Level::ERROR,
+            "FERROSA_RESET_ADMIN_PASSWORD is set but FERROSA_SEED_ADMIN_PASSWORD is not"
         ));
     }
 
