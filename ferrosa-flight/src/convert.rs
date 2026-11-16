@@ -8,7 +8,7 @@
 //! column's declared type returns an error rather than silently producing wrong
 //! data. Every CQL type is covered — scalars, temporal, inet, varint, decimal
 //! (as exact text), `list`/`set`, `map`, `tuple`, `udt`, and `vector`. The
-//! reverse path ([`record_batch_to_rows`], for `DoPut`) covers the common
+//! reverse path ([`record_batch_rows`], for `DoPut`) covers the common
 //! scalar Arrow types and fails loud (`UnsupportedArrow`) on the rest.
 
 use std::sync::Arc;
@@ -40,6 +40,12 @@ pub enum ConvertError {
     Arrow(arrow::error::ArrowError),
     /// An Arrow `DataType` has no CQL mapping (reverse / `DoPut` path).
     UnsupportedArrow(DataType),
+    /// A decoded column did not hold one cell per batch row (reverse path).
+    RowCountMismatch {
+        column: usize,
+        cells: usize,
+        rows: usize,
+    },
 }
 
 impl std::fmt::Display for ConvertError {
@@ -58,6 +64,11 @@ impl std::fmt::Display for ConvertError {
             ConvertError::UnsupportedArrow(dt) => {
                 write!(f, "Arrow type {dt:?} has no CQL mapping (DoPut)")
             }
+            ConvertError::RowCountMismatch {
+                column,
+                cells,
+                rows,
+            } => write!(f, "column {column} decoded {cells} cells for {rows} rows"),
         }
     }
 }
@@ -196,13 +207,11 @@ pub fn record_batch_rows(batch: &RecordBatch) -> Result<DecodedRows, ConvertErro
     for c in 0..batch.num_columns() {
         let decoded = decode_column(batch.column(c), schema.field(c).data_type())?;
         if decoded.len() != batch.num_rows() {
-            return Err(ConvertError::Arrow(
-                arrow::error::ArrowError::InvalidArgumentError(format!(
-                    "column {c} decoded {} cells for {} rows",
-                    decoded.len(),
-                    batch.num_rows()
-                )),
-            ));
+            return Err(ConvertError::RowCountMismatch {
+                column: c,
+                cells: decoded.len(),
+                rows: batch.num_rows(),
+            });
         }
         columns.push(decoded.into_iter());
     }
@@ -217,7 +226,10 @@ pub fn record_batch_rows(batch: &RecordBatch) -> Result<DecodedRows, ConvertErro
 
 /// The rows of one decoded batch, yielded one at a time. Holds the decoded
 /// columns and drains them in step.
-#[derive(Debug)]
+///
+/// No `Debug` derive and no `size_hint`/`ExactSizeIterator`: each pulls the
+/// matching std impls for every iterator in the crate into the Lean extraction
+/// (`specs/lean/gaps`), and `len` below answers the only caller that asks.
 pub struct BatchRows {
     columns: Vec<std::vec::IntoIter<Option<CqlValue>>>,
     remaining: usize,
@@ -229,21 +241,27 @@ impl Iterator for BatchRows {
     fn next(&mut self) -> Option<Self::Item> {
         self.remaining = self.remaining.checked_sub(1)?;
         // Every column holds exactly the batch's row count (checked when the
-        // columns were decoded), so each yields a cell here.
-        Some(
-            self.columns
-                .iter_mut()
-                .map(|col| col.next().flatten())
-                .collect(),
-        )
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining, Some(self.remaining))
+        // columns were decoded), so each yields a cell here. An indexed loop
+        // rather than an iterator adapter keeps this extractable to Lean.
+        let mut row = Vec::with_capacity(self.columns.len());
+        for c in 0..self.columns.len() {
+            row.push(self.columns[c].next().flatten());
+        }
+        Some(row)
     }
 }
 
-impl ExactSizeIterator for BatchRows {}
+impl BatchRows {
+    /// Rows not yet yielded.
+    pub fn len(&self) -> usize {
+        self.remaining
+    }
+
+    /// Whether every row has been yielded.
+    pub fn is_empty(&self) -> bool {
+        self.remaining == 0
+    }
+}
 
 /// Decode one Arrow column into per-row `Option<CqlValue>` (NULL slot -> `None`).
 fn decode_column(arr: &ArrayRef, dt: &DataType) -> Result<Vec<Option<CqlValue>>, ConvertError> {
@@ -290,10 +308,15 @@ fn build_array(
 ) -> Result<ArrayRef, ConvertError> {
     // A column of borrows into the rows: the cells themselves are only read,
     // once, as Arrow copies them into its buffers.
-    let values: Vec<Option<&CqlValue>> = rows
-        .iter()
-        .map(|r| r.get(c).and_then(Option::as_ref))
-        .collect();
+    // Plain loops, not iterator adapters: closures returning borrows do not
+    // extract to Lean (specs/lean/gaps), and the loop states the same thing.
+    let mut values: Vec<Option<&CqlValue>> = Vec::with_capacity(rows.len());
+    for r in rows {
+        values.push(match r.get(c) {
+            Some(Some(cell)) => Some(cell),
+            _ => None,
+        });
+    }
     build_values(ct, &values, c)
 }
 
@@ -329,7 +352,7 @@ fn build_values(
     // String-valued columns: map the matching variant(s) to an owned String.
     macro_rules! string_col {
         ($exp:literal, $($variant:pat => $s:expr),+ $(,)?) => {{
-            let mut out: Vec<Option<std::borrow::Cow<'_, str>>> = Vec::with_capacity(values.len());
+            let mut out: Vec<Option<String>> = Vec::with_capacity(values.len());
             for v in values {
                 match *v {
                     None | Some(CqlValue::Null) => out.push(None),
@@ -337,7 +360,22 @@ fn build_values(
                     Some(_) => return Err(ConvertError::TypeMismatch { column, expected: $exp }),
                 }
             }
-            Arc::new(StringArray::from_iter(out.iter().map(|o| o.as_deref()))) as ArrayRef
+            Arc::new(StringArray::from(out)) as ArrayRef
+        }};
+    }
+
+    // Text columns: borrow each string straight into the Arrow array.
+    macro_rules! text_col {
+        ($exp:literal, $($variant:pat => $s:expr),+ $(,)?) => {{
+            let mut out: Vec<Option<&str>> = Vec::with_capacity(values.len());
+            for v in values {
+                match *v {
+                    None | Some(CqlValue::Null) => out.push(None),
+                    $(Some($variant) => out.push(Some($s)),)+
+                    Some(_) => return Err(ConvertError::TypeMismatch { column, expected: $exp }),
+                }
+            }
+            Arc::new(StringArray::from(out)) as ArrayRef
         }};
     }
 
@@ -355,21 +393,21 @@ fn build_values(
         CqlType::Timestamp => {
             prim!(TimestampMillisecondArray, CqlValue::Timestamp(v), v => *v, "timestamp")
         }
-        CqlType::Ascii | CqlType::Varchar => string_col!(
+        CqlType::Ascii | CqlType::Varchar => text_col!(
             "text",
-            CqlValue::Ascii(s) => std::borrow::Cow::Borrowed(&**s),
-            CqlValue::Text(s) => std::borrow::Cow::Borrowed(&**s),
+            CqlValue::Ascii(s) => &**s,
+            CqlValue::Text(s) => &**s,
         ),
         CqlType::Uuid | CqlType::Timeuuid => string_col!(
             "uuid",
-            CqlValue::Uuid(u) => std::borrow::Cow::Owned(u.to_string()),
-            CqlValue::Timeuuid(u) => std::borrow::Cow::Owned(u.to_string()),
+            CqlValue::Uuid(u) => u.to_string(),
+            CqlValue::Timeuuid(u) => u.to_string(),
         ),
         CqlType::Inet => {
-            string_col!("inet", CqlValue::Inet(ip) => std::borrow::Cow::Owned(ip.to_string()))
+            string_col!("inet", CqlValue::Inet(ip) => ip.to_string())
         }
         CqlType::Varint => {
-            string_col!("varint", CqlValue::Varint(v) => std::borrow::Cow::Owned(v.to_string()))
+            string_col!("varint", CqlValue::Varint(v) => v.to_string())
         }
         // Typed refusal until the Arrow Variant export lands (T-150).
         CqlType::Jsonb => return Err(ConvertError::Unsupported(CqlType::Jsonb)),
@@ -430,9 +468,7 @@ fn build_values(
         } => build_udt(udt_fields, values, column)?,
         CqlType::Decimal => string_col!(
             "decimal",
-            CqlValue::Decimal { scale, unscaled } => {
-                std::borrow::Cow::Owned(format_decimal(*scale, &unscaled.to_string()))
-            }
+            CqlValue::Decimal { scale, unscaled } => format_decimal(*scale, &unscaled.to_string()),
         ),
     })
 }
@@ -470,9 +506,10 @@ fn build_tuple(
     column: usize,
 ) -> Result<ArrayRef, ConvertError> {
     let arity = elem_types.len();
-    let mut per_field: Vec<Vec<Option<&CqlValue>>> = (0..arity)
-        .map(|_| Vec::with_capacity(values.len()))
-        .collect();
+    let mut per_field: Vec<Vec<Option<&CqlValue>>> = Vec::with_capacity(arity);
+    for _ in 0..arity {
+        per_field.push(Vec::with_capacity(values.len()));
+    }
     let mut valid = Vec::with_capacity(values.len());
 
     for v in values {
@@ -485,7 +522,10 @@ fn build_tuple(
             }
             Some(CqlValue::Tuple(elems)) => {
                 for (i, col) in per_field.iter_mut().enumerate() {
-                    col.push(elems.get(i).and_then(Option::as_ref));
+                    col.push(match elems.get(i) {
+                        Some(Some(e)) => Some(e),
+                        _ => None,
+                    });
                 }
                 valid.push(true);
             }
@@ -514,8 +554,10 @@ fn build_udt(
     column: usize,
 ) -> Result<ArrayRef, ConvertError> {
     let n = field_defs.len();
-    let mut per_field: Vec<Vec<Option<&CqlValue>>> =
-        (0..n).map(|_| Vec::with_capacity(values.len())).collect();
+    let mut per_field: Vec<Vec<Option<&CqlValue>>> = Vec::with_capacity(n);
+    for _ in 0..n {
+        per_field.push(Vec::with_capacity(values.len()));
+    }
     let mut valid = Vec::with_capacity(values.len());
 
     for v in values {
@@ -528,7 +570,10 @@ fn build_udt(
             }
             Some(CqlValue::Udt(entries)) => {
                 for (i, col) in per_field.iter_mut().enumerate() {
-                    col.push(entries.get(i).and_then(|(_, val)| val.as_ref()));
+                    col.push(match entries.get(i) {
+                        Some((_, Some(val))) => Some(val),
+                        _ => None,
+                    });
                 }
                 valid.push(true);
             }
@@ -850,7 +895,9 @@ mod tests {
             &[vec![Some(CqlValue::Date(2_147_483_648))]],
         )
         .unwrap();
-        let err = record_batch_rows(&batch).unwrap_err();
+        let Err(err) = record_batch_rows(&batch) else {
+            panic!("a Date32 column has no DoPut mapping and must be refused");
+        };
         assert!(matches!(err, ConvertError::UnsupportedArrow(_)));
     }
 
