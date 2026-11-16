@@ -6302,6 +6302,30 @@ impl StorageEngine {
         Ok(IndexReloadOutcome { restored, skipped })
     }
 
+    /// Decode every live row of a `system_schema` table, walking it one
+    /// partition (keyspace) at a time. The capped `read_range(.., 10_000)` this
+    /// replaces silently dropped every keyspace past the cap on boot.
+    ///
+    /// The walk is `[i64::MIN, i64::MAX)`, the same span the cluster's
+    /// system-table loader walks.
+    fn decode_system_schema_rows<T>(
+        &self,
+        table_id: &TableId,
+        decode: fn(&str, &Row) -> Option<T>,
+    ) -> ferrosa_common::Result<Vec<T>> {
+        let mut out = Vec::new();
+        self.walk_token_range(table_id, i64::MIN, i64::MAX, |partition| {
+            let keyspace = String::from_utf8_lossy(partition.key.key.as_bytes());
+            for row in &partition.rows {
+                if let Some(decoded) = decode(&keyspace, row) {
+                    out.push(decoded);
+                }
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
     /// Reads every live row of the persisted `system_schema.indexes` table and
     /// decodes it into [`PersistedIndexRow`]s.
     ///
@@ -6316,19 +6340,7 @@ impl StorageEngine {
             return Ok(Vec::new());
         }
 
-        const MAX_INDEXES_TO_READ: usize = 10_000;
-        let partitions = self.read_range(&indexes_tid, None, None, MAX_INDEXES_TO_READ)?;
-
-        let mut out = Vec::new();
-        for partition in &partitions {
-            let keyspace = String::from_utf8_lossy(partition.key.key.as_bytes()).to_string();
-            for row in &partition.rows {
-                if let Some(decoded) = decode_persisted_index_row(&keyspace, row) {
-                    out.push(decoded);
-                }
-            }
-        }
-        Ok(out)
+        self.decode_system_schema_rows(&indexes_tid, decode_persisted_index_row)
     }
 
     /// Reads every live row of the persisted `system_schema.types` table and
@@ -6344,19 +6356,7 @@ impl StorageEngine {
             return Ok(Vec::new());
         }
 
-        const MAX_TYPES_TO_READ: usize = 10_000;
-        let partitions = self.read_range(&types_tid, None, None, MAX_TYPES_TO_READ)?;
-
-        let mut out = Vec::new();
-        for partition in &partitions {
-            let keyspace = String::from_utf8_lossy(partition.key.key.as_bytes()).to_string();
-            for row in &partition.rows {
-                if let Some(decoded) = decode_persisted_type_row(&keyspace, row) {
-                    out.push(decoded);
-                }
-            }
-        }
-        Ok(out)
+        self.decode_system_schema_rows(&types_tid, decode_persisted_type_row)
     }
 
     /// Reads every live row of the persisted `system_schema.functions` table and
@@ -6372,19 +6372,7 @@ impl StorageEngine {
             return Ok(Vec::new());
         }
 
-        const MAX_FUNCTIONS_TO_READ: usize = 10_000;
-        let partitions = self.read_range(&functions_tid, None, None, MAX_FUNCTIONS_TO_READ)?;
-
-        let mut out = Vec::new();
-        for partition in &partitions {
-            let keyspace = String::from_utf8_lossy(partition.key.key.as_bytes()).to_string();
-            for row in &partition.rows {
-                if let Some(decoded) = decode_persisted_function_row(&keyspace, row) {
-                    out.push(decoded);
-                }
-            }
-        }
-        Ok(out)
+        self.decode_system_schema_rows(&functions_tid, decode_persisted_function_row)
     }
 
     /// Tombstones a `system_schema.indexes` row (DROP INDEX) using the same
@@ -35992,6 +35980,40 @@ mod tests {
             ],
             "fields (incl. nested list<text>) must round-trip losslessly"
         );
+    }
+
+    /// The schema loaders read the whole system table. They used to ask for at
+    /// most 10_000 partitions (one per keyspace), so the 10_001st keyspace's
+    /// UDTs, indexes and functions silently vanished on boot.
+    #[test]
+    fn read_persisted_types_reads_more_keyspaces_than_the_old_cap() {
+        use ferrosa_common::CqlType;
+        use ferrosa_schema::metadata::user_type::UserTypeMetadata;
+        use ferrosa_schema::system::persistence;
+
+        const KEYSPACES: usize = 10_001;
+        let dir = tempfile::tempdir().unwrap();
+        let types_tid = TableId::new("system_schema", "types");
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_system_tables().unwrap();
+        let ts = now_micros_for_test();
+        for i in 0..KEYSPACES {
+            let udt = UserTypeMetadata {
+                keyspace: format!("ks{i:05}"),
+                name: "t".to_string(),
+                fields: vec![("f".to_string(), CqlType::Int)],
+            };
+            let row = persistence::type_to_row(&udt);
+            engine.write(&types_tid, &row.key, row.row, ts).unwrap();
+        }
+
+        let stored = engine.read_persisted_types().unwrap();
+        assert_eq!(stored.len(), KEYSPACES, "every keyspace's UDT must load");
+        let mut names: Vec<&str> = stored.iter().map(|r| r.keyspace_name.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), KEYSPACES, "each keyspace exactly once");
     }
 
     /// A tombstoned `system_schema.types` row (DROP TYPE) masks the live row:

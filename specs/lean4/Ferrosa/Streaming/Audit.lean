@@ -103,6 +103,9 @@ def sites : List Site := [
   ⟨"flight", "Arrow conversion reads CQL values in place and DoPut yields one row at a time", .streaming,
    "ferrosa-flight/src/convert.rs:192",
    "Every Arrow builder takes `&[Option<&CqlValue>]` (text and blobs borrowed into the array, no per-cell clone); `record_batch_rows` returns `BatchRows`, which moves each row out of the decoded columns instead of building a row matrix."⟩,
+  ⟨"system tables", "the storage schema loaders walk system_schema one keyspace at a time", .streaming,
+   "ferrosa-storage/src/engine.rs:6311",
+   "`decode_system_schema_rows` drives `walk_token_range` over the table and decodes each partition's rows as it arrives; the capped `read_range(.., 10_000)` it replaces dropped every keyspace past the cap."⟩,
   ⟨"cql", "a result cursor holds a node-wide permit or is refused", .serialized,
    "ferrosa-cql/src/result_cursor.rs:513",
    "`admit` CAS-increments the open count under `max_open` (default 256), sweeps expired cursors first, and returns Overloaded rather than queueing."⟩,
@@ -183,8 +186,8 @@ def sites : List Site := [
    "No rewrap operator exists in the tree: the only PITR path is `run_pitr_replay_e2e`, a replay test, so there is no transform to inspect."⟩
 ]
 
-/-- Thirty-eight sites were read. -/
-theorem site_count : sites.length = 38 := by decide
+/-- Thirty-nine sites were read. -/
+theorem site_count : sites.length = 39 := by decide
 
 /-- **Every site names a file and line.**  A row without a location is a mood, not an audit finding, so
     each `site` field has to contain a `file.rs:line`. -/
@@ -198,8 +201,8 @@ theorem every_config_bound_names_its_knob :
       | .boundedByConfig knob => !knob.isEmpty
       | _ => true) = true := by native_decide
 
-/-- Ten sites are bounded by construction. -/
-theorem streaming_sites : (sites.filter fun s => s.klass == .streaming).length = 10 := by decide
+/-- Eleven sites are bounded by construction. -/
+theorem streaming_sites : (sites.filter fun s => s.klass == .streaming).length = 11 := by decide
 
 /-- Three are bounded by a permit. -/
 theorem serialized_sites : (sites.filter fun s => match s.klass with
@@ -235,7 +238,7 @@ theorem classes_partition_the_sites :
       + (sites.filter fun s => match s.klass with | .spilling _ => true | _ => false).length
       + (sites.filter fun s => match s.klass with | .boundedByConfig _ => true | _ => false).length
       + (sites.filter fun s => match s.klass with | .unbounded _ => true | _ => false).length
-      + (sites.filter fun s => s.klass == .unresolved).length = 38 := by decide
+      + (sites.filter fun s => s.klass == .unresolved).length = 39 := by decide
 
 /-- The layers the audit covers, so the table can be printed by layer. -/
 def layers : List String := ["cql", "commit log", "compaction", "flush", "graph", "permits",
