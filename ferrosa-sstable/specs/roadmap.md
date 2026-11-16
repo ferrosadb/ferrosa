@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-sstable
 doc: roadmap
-last_updated: 2026-09-26
+last_updated: 2026-11-15
 ---
 
 # ferrosa-sstable — Roadmap
@@ -40,6 +40,11 @@ Sourced from in-code deferral notes (`data.rs`, `writer.rs`), the FMEA gaps
   when upgrading `lz4_flex` or exposing a reusable
   hash table, would close the gap) — low priority since it's a bounded,
   non-scaling cost, not a leak.
+- **Bound chunk_length loaded from CompressionInfo.db.**
+  The value is currently checked for being greater than zero, but
+  does not have an independent maximum. The reader can therefore
+  allocate a large buffer based on corrupt metadata. The bounded
+  decompress fix does not address this remaining issue.
 - **Bloom filter sizing.** `SSTableWriter::new` sizes the bloom filter for a
   fixed 10 000-key default with a "production would resize" note. Make the size
   derive from the actual partition count (builder pattern or post-hoc resize) so
@@ -135,3 +140,15 @@ moves spans and their original validation indices with cell identities. The publ
 metadata cursor still validates spans eagerly. Large-cell, exact-tie, remapping,
 and corrupt losing/dropped-value tests cover this path alongside fully decoding
 output verification.
+
+### Completed: bounded decompression (2026-11-15)
+
+Updated `Compression::decompress(data, uncompressed_len)` to enforce
+the caller-provided output bound by delegating to `decompress_into`.
+Previously, the function ignored `uncompressed_len` and could return
+more bytes than the caller allowed. Regression tests now verify
+oversized-output rejection for None, Lz4, and Zstd.
+The change does not resolve the full Lean `Storage.Streaming` S3
+obligation because `decompress` still allocates and returns a new
+`Vec<u8>`. It also does not introduce a process-wide allocation
+budget.
