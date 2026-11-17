@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use ferrosa_common::cell::CellValue;
 use ferrosa_common::key::{DecoratedKey, PartitionKey};
 use ferrosa_common::schema::{ColumnDefinition, TableSchema};
-use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
 
 use ferrosa_storage::commitlog::TableId;
 use ferrosa_storage::engine::StorageEngine;
@@ -41,6 +41,36 @@ pub fn load_test_schema() -> TableSchema {
 
 fn make_key(s: &str) -> DecoratedKey {
     DecoratedKey::new(PartitionKey::new(s.as_bytes().to_vec()))
+}
+
+/// Record one read against the ground truth and the byte counter. The read's
+/// bytes are borrowed only inside this call, so the worker loop never holds a
+/// borrow into the result across iterations.
+fn observe_read(
+    ground_truth: &GroundTruth,
+    bytes_read: &AtomicU64,
+    key: &str,
+    result: &Option<Partition>,
+) {
+    let got = match result {
+        Some(partition) => first_value(partition),
+        None => None,
+    };
+    if let Some(v) = got {
+        bytes_read.fetch_add(v.len() as u64, Ordering::Relaxed);
+    }
+    ground_truth.record_read(key, got);
+}
+
+/// The first cell's bytes of the first row, borrowed from the shared row:
+/// nothing is cloned to measure or compare them. Written with `match` rather
+/// than closures so the function extracts to Lean without opaque closures.
+fn first_value(partition: &Partition) -> Option<&[u8]> {
+    let row = partition.rows.first()?;
+    match row.cells.first() {
+        Some((_, cell)) => cell.value.as_deref(),
+        None => None,
+    }
 }
 
 fn make_row(value: &[u8], timestamp: i64) -> Row {
@@ -185,17 +215,7 @@ fn run_load_test_inner(
                             match engine.read(tid, &dk) {
                                 Ok(result) => {
                                     let latency = t0.elapsed();
-                                    let got = result.and_then(|p| {
-                                        // Read the first cell's bytes from the
-                                        // shared row; the value is refcounted.
-                                        p.rows.first().and_then(|r| {
-                                            r.cells.first().and_then(|(_, c)| c.value.clone())
-                                        })
-                                    });
-                                    if let Some(ref v) = got {
-                                        br.fetch_add(v.len() as u64, Ordering::Relaxed);
-                                    }
-                                    gt.record_read(&key_str, got.as_deref());
+                                    observe_read(gt, br, &key_str, &result);
                                     sc.record_read(latency);
                                 }
                                 Err(_) => sc.record_read_error(),
