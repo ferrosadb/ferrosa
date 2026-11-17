@@ -23,13 +23,21 @@ Shrinking always passes and is recorded with `lean_gap_ratchet.py update`, which
 to raise a count. `.github/workflows/lean-gap-ratchet.yml` rebuilds the pinned toolchain,
 re-measures the gated crates and runs that check weekly.
 
-The pin is a commit on `ferrosadb/aeneas` main -- **aeneas `80b690a9`**, charon
+The pin is a commit on `ferrosadb/aeneas` -- **aeneas `943e2625`**, charon
 `7b462d9` (from that checkout's `charon-pin`), Lean 4.35.0 from the Aeneas backend's
 `lean-toolchain`. It has to be a fetchable commit: the identity recorded before this was
 `d8480a0e`, which is on no remote ref (it was replaced by the merged noncomputable-section
 change), so a CI job pinning it could never reproduce the numbers it was comparing. The
 records were re-measured under `80b690a9`; no Lean error class moved, and the only count
 that changed was `red-ledger`'s sorry holes (0 -> 3).
+
+`943e2625` is `80b690a9` plus two commits (ferrosadb/aeneas#6): a model of `Arc<T>` as `T`, the
+way `Box<T>` is modelled, and a fix to the check on a builtin's trait-clause filter that the
+model's `clone` needed. Storage partitions hold `Vec<Arc<Row>>` so rows are shared rather than
+copied, and without the model every crate naming `Arc` gained an opaque `sorry` per type and per
+method. Re-measured under `943e2625`, every gated crate held or shrank (26 sorry declarations
+closed across eight crates). `ferrosa-graph`, `ferrosa-sql` and `ferrosa-sstable` now conclude
+instead of crashing, so their rows are real ceilings rather than a single crash entry.
 
 The ceiling covers 451 of the 763 reds, over 19 crates. Five crates are measured but not
 gated, because one measurement of them does not fit a hosted runner;

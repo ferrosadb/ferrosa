@@ -1,36 +1,36 @@
 {
   "toolchain": {
     "charon": "7b462d9159db2ed3015162352183906a30bfafc6",
-    "aeneas": "80b690a9ad1ef1fb97fee23ef1e1c9486ff8f8b9",
+    "aeneas": "943e2625ff05a856b72ce197eeb5042f4302af25",
     "lean": "Lean (version 4.35.0, x86_64-unknown-linux-gnu, commit eb6cafb7290e8bd5f2937522d8d804f58f02bafc, Release)"
   },
   "budgets": {
-    "whole_seconds": 0,
-    "module_seconds": 0,
+    "whole_seconds": 1800,
+    "module_seconds": 900,
     "sample": false
   },
   "crates": {
     "ferrosa-alloc-count": {
-      "fingerprint": "308727f91718dc0e",
-      "measured_at": "2026-11-01T05:54:45+00:00",
+      "fingerprint": "708b44de914eb159",
+      "measured_at": "2026-11-17T18:38:16+00:00",
       "measurement": {
         "stage": "aeneas",
         "translation_errors": 0,
         "lean_errors": 0,
         "sorry": 12,
-        "seconds": 6,
+        "seconds": 3,
         "scope": "crate"
       }
     },
     "ferrosa-jsonb": {
-      "fingerprint": "85c204aab77ad5c9",
-      "measured_at": "2026-11-01T05:55:40+00:00",
+      "fingerprint": "cf0c4b1899c70218",
+      "measured_at": "2026-11-17T18:38:45+00:00",
       "measurement": {
         "stage": "aeneas",
         "translation_errors": 0,
         "lean_errors": 29,
-        "sorry": 373,
-        "seconds": 55,
+        "sorry": 369,
+        "seconds": 29,
         "scope": "crate"
       }
     },
@@ -47,32 +47,195 @@
       }
     },
     "ferrosa-sstable": {
-      "fingerprint": "1ce8d2613cd9f39b",
-      "measured_at": "2026-11-01T06:10:04+00:00",
+      "fingerprint": "dd08ead26cb52fc6",
+      "measured_at": "2026-11-17T18:43:07+00:00",
       "measurement": {
-        "stage": "aeneas-crash",
+        "scope": "modules (20/20)",
+        "stage": "modules",
         "translation_errors": null,
         "lean_errors": null,
         "sorry": null,
-        "seconds": 199,
-        "scope": "crate"
+        "seconds": 143,
+        "crate_level": "oom",
+        "modules": {
+          "bloom": {
+            "stage": "aeneas",
+            "translation_errors": 0,
+            "lean_errors": 0,
+            "sorry": 6,
+            "seconds": 3,
+            "scope": "module bloom"
+          },
+          "byte_comparable": {
+            "stage": "aeneas",
+            "translation_errors": 0,
+            "lean_errors": 0,
+            "sorry": 10,
+            "seconds": 4,
+            "scope": "module byte_comparable"
+          },
+          "checksum": {
+            "stage": "aeneas",
+            "translation_errors": 0,
+            "lean_errors": 0,
+            "sorry": 21,
+            "seconds": 4,
+            "scope": "module checksum"
+          },
+          "compression": {
+            "stage": "aeneas",
+            "translation_errors": 0,
+            "lean_errors": 1,
+            "sorry": 39,
+            "seconds": 3,
+            "scope": "module compression"
+          },
+          "data": {
+            "stage": "aeneas",
+            "translation_errors": 0,
+            "lean_errors": 0,
+            "sorry": 44,
+            "seconds": 4,
+            "scope": "module data"
+          },
+          "dio_align": {
+            "stage": "aeneas-crash",
+            "translation_errors": null,
+            "lean_errors": null,
+            "sorry": null,
+            "seconds": 2,
+            "scope": "module dio_align"
+          },
+          "direct": {
+            "stage": "aeneas",
+            "translation_errors": 0,
+            "lean_errors": 3,
+            "sorry": 113,
+            "seconds": 4,
+            "scope": "module direct"
+          },
+          "io": {
+            "stage": "aeneas",
+            "translation_errors": 0,
+            "lean_errors": 3,
+            "sorry": 96,
+            "seconds": 4,
+            "scope": "module io"
+          },
+          "marshal": {
+            "stage": "aeneas",
+            "translation_errors": 0,
+            "lean_errors": 0,
+            "sorry": 47,
+            "seconds": 4,
+            "scope": "module marshal"
+          },
+          "partition_index": {
+            "stage": "aeneas",
+            "translation_errors": 0,
+            "lean_errors": 1,
+            "sorry": 8,
+            "seconds": 3,
+            "scope": "module partition_index"
+          },
+          "pump": {
+            "stage": "aeneas",
+            "translation_errors": 0,
+            "lean_errors": 8,
+            "sorry": 147,
+            "seconds": 5,
+            "scope": "module pump"
+          },
+          "reader": {
+            "stage": "aeneas",
+            "translation_errors": 0,
+            "lean_errors": 7,
+            "sorry": 137,
+            "seconds": 7,
+            "scope": "module reader"
+          },
+          "row_index": {
+            "stage": "aeneas",
+            "translation_errors": 0,
+            "lean_errors": 1,
+            "sorry": 16,
+            "seconds": 6,
+            "scope": "module row_index"
+          },
+          "scan": {
+            "stage": "aeneas",
+            "translation_errors": 0,
+            "lean_errors": 2,
+            "sorry": 25,
+            "seconds": 4,
+            "scope": "module scan"
+          },
+          "statistics": {
+            "stage": "aeneas",
+            "translation_errors": 0,
+            "lean_errors": 0,
+            "sorry": 34,
+            "seconds": 8,
+            "scope": "module statistics"
+          },
+          "toc": {
+            "stage": "aeneas",
+            "translation_errors": 0,
+            "lean_errors": 1,
+            "sorry": 34,
+            "seconds": 3,
+            "scope": "module toc"
+          },
+          "trie": {
+            "stage": "aeneas",
+            "translation_errors": 0,
+            "lean_errors": 8,
+            "sorry": 49,
+            "seconds": 10,
+            "scope": "module trie"
+          },
+          "types": {
+            "stage": "aeneas",
+            "translation_errors": 0,
+            "lean_errors": 0,
+            "sorry": 2,
+            "seconds": 2,
+            "scope": "module types"
+          },
+          "varint": {
+            "stage": "aeneas",
+            "translation_errors": 0,
+            "lean_errors": 1,
+            "sorry": 10,
+            "seconds": 6,
+            "scope": "module varint"
+          },
+          "writer": {
+            "stage": "aeneas-crash",
+            "translation_errors": null,
+            "lean_errors": null,
+            "sorry": null,
+            "seconds": 57,
+            "scope": "module writer"
+          }
+        }
       }
     },
     "ferrosa-cdc": {
-      "fingerprint": "842fa4bc47af381e",
-      "measured_at": "2026-11-01T05:55:46+00:00",
+      "fingerprint": "882bd20dc5c27310",
+      "measured_at": "2026-11-17T18:43:11+00:00",
       "measurement": {
         "stage": "aeneas",
         "translation_errors": 0,
         "lean_errors": 0,
         "sorry": 4,
-        "seconds": 6,
+        "seconds": 4,
         "scope": "crate"
       }
     },
     "ferrosa-index": {
-      "fingerprint": "4c1e4609b1328644",
-      "measured_at": "2026-11-01T06:10:11+00:00",
+      "fingerprint": "73a97b08ab902112",
+      "measured_at": "2026-11-17T18:43:18+00:00",
       "measurement": {
         "stage": "aeneas-crash",
         "translation_errors": null,
@@ -158,25 +321,25 @@
       }
     },
     "ferrosa-row-bridge": {
-      "fingerprint": "003734c6d8e00427",
-      "measured_at": "2026-11-01T05:56:10+00:00",
+      "fingerprint": "ae1065b1b55bbfc9",
+      "measured_at": "2026-11-17T18:43:32+00:00",
       "measurement": {
         "stage": "aeneas",
         "translation_errors": 0,
         "lean_errors": 66,
         "sorry": 266,
-        "seconds": 24,
+        "seconds": 14,
         "scope": "crate"
       }
     },
     "ferrosa-sched": {
-      "fingerprint": "cfe8abc478606fb7",
-      "measured_at": "2026-11-01T05:56:26+00:00",
+      "fingerprint": "bf64b5f876376d03",
+      "measured_at": "2026-11-17T18:43:47+00:00",
       "measurement": {
         "stage": "aeneas",
         "translation_errors": 0,
         "lean_errors": 2,
-        "sorry": 130,
+        "sorry": 126,
         "seconds": 16,
         "scope": "crate"
       }
@@ -225,26 +388,26 @@
       }
     },
     "ferrosa-udf": {
-      "fingerprint": "8ed539b2f21cecf2",
-      "measured_at": "2026-11-09T01:15:39+00:00",
+      "fingerprint": "1dbdcc895f0a1f02",
+      "measured_at": "2026-11-17T18:45:09+00:00",
       "measurement": {
         "stage": "aeneas",
         "translation_errors": 0,
         "lean_errors": 62,
-        "sorry": 297,
-        "seconds": 23,
+        "sorry": 293,
+        "seconds": 81,
         "scope": "crate"
       }
     },
     "ferrosa-session": {
-      "fingerprint": "3ab83e35fa3df122",
-      "measured_at": "2026-11-01T05:57:54+00:00",
+      "fingerprint": "f013db59881c0d14",
+      "measured_at": "2026-11-17T18:46:53+00:00",
       "measurement": {
         "stage": "aeneas",
         "translation_errors": 0,
         "lean_errors": 16,
-        "sorry": 74,
-        "seconds": 50,
+        "sorry": 73,
+        "seconds": 104,
         "scope": "crate"
       }
     },
@@ -261,62 +424,62 @@
       }
     },
     "ferrosa-ctl": {
-      "fingerprint": "59e90e9ff1b5ddaa",
-      "measured_at": "2026-11-01T06:36:55+00:00",
+      "fingerprint": "139d4e3754c571a5",
+      "measured_at": "2026-11-17T18:48:31+00:00",
       "measurement": {
         "stage": "aeneas-crash",
         "translation_errors": null,
         "lean_errors": null,
         "sorry": null,
-        "seconds": 86,
-        "scope": "crate"
-      }
-    },
-    "ferrosa-flight": {
-      "fingerprint": "f6efb193ffd1fd3b",
-      "measured_at": "2026-11-01T05:59:31+00:00",
-      "measurement": {
-        "stage": "aeneas",
-        "translation_errors": 0,
-        "lean_errors": 29,
-        "sorry": 622,
         "seconds": 98,
         "scope": "crate"
       }
     },
-    "ferrosa-graph": {
-      "fingerprint": "c23c8d0db10d446a",
-      "measured_at": "2026-11-01T06:38:01+00:00",
+    "ferrosa-flight": {
+      "fingerprint": "8d63180635f36f82",
+      "measured_at": "2026-11-17T18:50:12+00:00",
       "measurement": {
-        "stage": "aeneas-crash",
-        "translation_errors": null,
-        "lean_errors": null,
-        "sorry": null,
-        "seconds": 66,
+        "stage": "aeneas",
+        "translation_errors": 0,
+        "lean_errors": 29,
+        "sorry": 619,
+        "seconds": 100,
+        "scope": "crate"
+      }
+    },
+    "ferrosa-graph": {
+      "fingerprint": "e81e37d055e0307d",
+      "measured_at": "2026-11-17T18:52:21+00:00",
+      "measurement": {
+        "stage": "aeneas",
+        "translation_errors": 0,
+        "lean_errors": 77,
+        "sorry": 639,
+        "seconds": 129,
         "scope": "crate"
       }
     },
     "ferrosa-index-builder": {
-      "fingerprint": "9dd7a63a47a7a711",
-      "measured_at": "2026-11-01T06:40:39+00:00",
+      "fingerprint": "4087b6ca6091b481",
+      "measured_at": "2026-11-17T18:54:35+00:00",
       "measurement": {
         "stage": "aeneas-crash",
         "translation_errors": null,
         "lean_errors": null,
         "sorry": null,
-        "seconds": 158,
+        "seconds": 134,
         "scope": "crate"
       }
     },
     "ferrosa-sim": {
-      "fingerprint": "9dc396d9f1a9bf9d",
-      "measured_at": "2026-11-01T05:59:52+00:00",
+      "fingerprint": "bab24550f8ec94e5",
+      "measured_at": "2026-11-17T18:54:54+00:00",
       "measurement": {
         "stage": "aeneas",
         "translation_errors": 0,
         "lean_errors": 85,
         "sorry": 149,
-        "seconds": 21,
+        "seconds": 19,
         "scope": "crate"
       }
     },
@@ -333,50 +496,50 @@
       }
     },
     "ferrosa-loadgen": {
-      "fingerprint": "e4bc7b86adab981a",
-      "measured_at": "2026-11-01T06:01:10+00:00",
+      "fingerprint": "e7b67959743fda98",
+      "measured_at": "2026-11-17T18:56:02+00:00",
       "measurement": {
         "stage": "aeneas",
         "translation_errors": 0,
         "lean_errors": 1,
-        "sorry": 396,
-        "seconds": 78,
+        "sorry": 393,
+        "seconds": 69,
         "scope": "crate"
       }
     },
     "ferrosa-sql": {
-      "fingerprint": "244528d5bb3a3147",
-      "measured_at": "2026-11-01T06:43:14+00:00",
+      "fingerprint": "38de35d2a3bfe697",
+      "measured_at": "2026-11-17T18:58:45+00:00",
       "measurement": {
-        "stage": "aeneas-crash",
-        "translation_errors": null,
-        "lean_errors": null,
-        "sorry": null,
-        "seconds": 155,
+        "stage": "aeneas",
+        "translation_errors": 0,
+        "lean_errors": 89,
+        "sorry": 626,
+        "seconds": 162,
         "scope": "crate"
       }
     },
     "ferrosa-postgres": {
-      "fingerprint": "3244fbd19e9ff86a",
-      "measured_at": "2026-11-09T01:21:49+00:00",
+      "fingerprint": "96773b59ce4c1ab9",
+      "measured_at": "2026-11-17T19:00:58+00:00",
       "measurement": {
         "stage": "aeneas",
         "translation_errors": 0,
         "lean_errors": 73,
-        "sorry": 893,
-        "seconds": 83,
+        "sorry": 890,
+        "seconds": 134,
         "scope": "crate"
       }
     },
     "ferrosa-sparql": {
-      "fingerprint": "36f40f1b4f39f208",
-      "measured_at": "2026-11-01T06:04:51+00:00",
+      "fingerprint": "a7b168519558f4ee",
+      "measured_at": "2026-11-17T19:02:23+00:00",
       "measurement": {
         "stage": "aeneas",
         "translation_errors": 0,
         "lean_errors": 83,
-        "sorry": 477,
-        "seconds": 89,
+        "sorry": 473,
+        "seconds": 85,
         "scope": "crate"
       }
     },
@@ -404,17 +567,17 @@
       }
     },
     "red-ledger": {
-      "fingerprint": "4877d5d017ce6959",
-      "measured_at": "2026-11-01T06:05:08+00:00",
+      "fingerprint": "2a00e07fc75d698c",
+      "measured_at": "2026-11-17T19:02:50+00:00",
       "measurement": {
         "stage": "aeneas",
         "translation_errors": 0,
         "lean_errors": 0,
         "sorry": 3,
-        "seconds": 17,
+        "seconds": 27,
         "scope": "crate"
       }
     }
   },
-  "updated_at": "2026-11-09T01:21:49+00:00"
+  "updated_at": "2026-11-17T19:02:50+00:00"
 }
