@@ -367,7 +367,7 @@ fn committed_cdc_event(
     storage: &StorageEngine,
     table_id: &TableId,
     key: &DecoratedKey,
-    rows: &[Row],
+    rows: &[Arc<Row>],
     timestamp: i64,
 ) -> Option<(Arc<ferrosa_cdc::CdcBus>, ferrosa_cdc::CdcEvent)> {
     let bus = storage.cdc_bus()?;
@@ -1509,7 +1509,7 @@ impl WritePath {
         &self,
         table_id: &TableId,
         key: &DecoratedKey,
-        rows: Vec<Row>,
+        rows: Vec<Arc<Row>>,
         timestamp: i64,
     ) -> ferrosa_common::Result<()> {
         match self {
@@ -1693,7 +1693,7 @@ mod tests {
             &wp,
             &table_id,
             &key,
-            row,
+            Arc::new(row),
             1000,
             ConsistencyLevel::One,
             &strategy,
@@ -1741,19 +1741,19 @@ mod tests {
 
         // No committed-stream subscriber → no event built (no allocation).
         assert!(
-            committed_cdc_event(&storage, &table_id, &key, std::slice::from_ref(&row), 1000)
+            committed_cdc_event(&storage, &table_id, &key, &[Arc::new(row.clone())], 1000)
                 .is_none()
         );
 
         // With a subscriber → event built with the right fields, accord_ts None.
         let _sub = bus.subscribe(ferrosa_cdc::CdcStream::CommittedToCluster);
         let (_bus, ev) =
-            committed_cdc_event(&storage, &table_id, &key, std::slice::from_ref(&row), 1000)
+            committed_cdc_event(&storage, &table_id, &key, &[Arc::new(row.clone())], 1000)
                 .expect("committed CDC event built when subscribed");
         assert_eq!(ev.stream, ferrosa_cdc::CdcStream::CommittedToCluster);
         assert_eq!(ev.keyspace, "ks");
         assert_eq!(ev.table, "t");
-        assert_eq!(ev.rows, vec![row]);
+        assert_eq!(ev.rows, vec![Arc::new(row)]);
         assert!(ev.accord_ts.is_none());
     }
 
@@ -1791,7 +1791,7 @@ mod tests {
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1000),
             };
-            storage.write(&table_id, &key, row, 1000).unwrap();
+            storage.write(&table_id, &key, Arc::new(row), 1000).unwrap();
         }
 
         // Verify base data is readable.
@@ -2135,7 +2135,11 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(key.to_vec())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: clusterings.iter().map(|c| resume_row(c)).collect(),
+            rows: clusterings
+                .iter()
+                .map(|c| resume_row(c))
+                .map(Arc::new)
+                .collect(),
         }
     }
 
@@ -2228,7 +2232,7 @@ mod tests {
             key,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows,
+            rows: rows.into_iter().map(Arc::new).collect(),
         }
     }
 

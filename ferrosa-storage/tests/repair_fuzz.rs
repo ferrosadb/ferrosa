@@ -141,7 +141,7 @@ fn build_store(
             // order; the merged result is then the highest-generation copy.
             let mut p = base.clone();
             bump_all_ts(&mut p, s as i64 * 1000);
-            store.write(&p.key, only_row(&p)).unwrap();
+            store.write(&p.key, Arc::new(only_row(&p))).unwrap();
         }
         store.flush().unwrap();
     }
@@ -152,7 +152,7 @@ fn build_store(
 /// path (the store's `write` takes one `Row`). Falls back to a synthetic row.
 fn only_row(p: &Partition) -> ferrosa_sstable::types::Row {
     if let Some(r) = p.rows.first() {
-        r.clone()
+        ferrosa_sstable::types::Row::clone(r)
     } else if let Some(r) = p.static_row.clone() {
         r
     } else {
@@ -170,6 +170,7 @@ fn only_row(p: &Partition) -> ferrosa_sstable::types::Row {
 fn bump_all_ts(p: &mut Partition, delta: i64) {
     let bump = |t: &mut i64| *t = t.saturating_add(delta).max(1);
     for r in &mut p.rows {
+        let r = std::sync::Arc::make_mut(r);
         if r.primary_key_liveness.timestamp != i64::MIN {
             bump(&mut r.primary_key_liveness.timestamp);
         }

@@ -229,12 +229,12 @@ impl Fixture {
             .write(
                 &TableId::new("bolt_auto", "scalar_v"),
                 &key,
-                Row {
+                Arc::new(Row {
                     clustering: vec![],
                     cells,
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
-                },
+                }),
                 timestamp,
             )
             .unwrap();

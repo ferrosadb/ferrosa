@@ -2403,7 +2403,7 @@ pub(crate) async fn execute_truncate(
             keyspace,
             table,
             ferrosa_storage::table_tombstone::table_tombstone_key(),
-            vec![marker],
+            vec![Arc::new(marker)],
             marked_for_delete_at,
         );
         if let Err(messages) = apply_or_buffer_silent(
@@ -3535,7 +3535,7 @@ pub(crate) async fn execute_insert(
                 ks.to_string(),
                 ins.table.table.clone(),
                 key,
-                vec![row],
+                vec![Arc::new(row)],
                 timestamp,
             ),
             meta.id,
@@ -4338,7 +4338,7 @@ fn build_update_mutation(
         ctx.ks.to_string(),
         ctx.table.to_string(),
         key,
-        vec![row],
+        vec![Arc::new(row)],
         timestamp,
     );
     Ok((mutation, assigned_sql))
@@ -4828,7 +4828,7 @@ pub(crate) fn build_delete_mutation(
         ks.to_string(),
         table.to_string(),
         key,
-        vec![row],
+        vec![Arc::new(row)],
         timestamp,
     ))
 }
@@ -7773,14 +7773,14 @@ mod txn_buffer_tests {
             .write(
                 &table,
                 &key,
-                ferrosa_sstable::types::Row {
+                Arc::new(ferrosa_sstable::types::Row {
                     clustering: vec![],
                     cells: vec![(0, ferrosa_common::cell::CellValue::live(vec![0xff], 1000))],
                     deletion: ferrosa_sstable::types::DeletionTime::LIVE,
                     primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
                         1000,
                     ),
-                },
+                }),
                 1000,
             )
             .unwrap();
@@ -7862,12 +7862,12 @@ mod txn_buffer_tests {
                 .write(
                     &table,
                     &key,
-                    StoredRow {
+                    Arc::new(StoredRow {
                         clustering: vec![],
                         cells: vec![(0, cell)],
                         deletion,
                         primary_key_liveness: liveness,
-                    },
+                    }),
                     4000,
                 )
                 .unwrap();
@@ -8799,7 +8799,7 @@ mod txn_buffer_tests {
                 "public".into(),
                 "kv".into(),
                 key,
-                vec![row],
+                vec![Arc::new(row)],
                 1,
             ));
         }
@@ -8843,7 +8843,7 @@ mod txn_buffer_tests {
                         meta.keyspace.clone(),
                         meta.name.clone(),
                         key.clone(),
-                        vec![row],
+                        vec![Arc::new(row)],
                         1,
                     ),
                     meta.id,

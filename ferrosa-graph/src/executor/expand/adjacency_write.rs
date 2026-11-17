@@ -3,6 +3,7 @@
 //! entries a deleted edge shared with live siblings.
 
 use super::*;
+use std::sync::Arc;
 
 /// The adjacency entries an edge row implies. Derived from the borrowed row,
 /// so a caller derives first and then moves the row into its base write
@@ -81,7 +82,7 @@ pub(super) async fn restore_entries_shared_with_live_edges(
             table_id.keyspace.clone(),
             table_id.table.clone(),
             key.clone(),
-            vec![row.clone()],
+            vec![Arc::new(row.clone())],
             ts,
         );
         derive_adjacency_mutations(schema, table_id, &edge)
@@ -158,7 +159,7 @@ async fn adjacency_write_with_retry(
     write_path: &dyn GraphWrite,
     adj_table_id: &TableId,
     key: &DecoratedKey,
-    row: Row,
+    row: Arc<Row>,
     timestamp: i64,
     strategy: &ReplicationStrategy,
     edge_table_id: &TableId,
@@ -173,7 +174,9 @@ async fn adjacency_write_with_retry(
             .write(
                 adj_table_id,
                 key,
-                row.clone(),
+                // Every attempt shares the one derived row; it reaches the
+                // memtable as this same allocation.
+                Arc::clone(&row),
                 timestamp,
                 graph_write_consistency(),
                 strategy,
@@ -236,4 +239,163 @@ pub(super) fn is_transient_replica_lag(e: &ferrosa_common::Error) -> bool {
     }
     let msg = e.to_string();
     msg.contains("cluster: write timeout") || msg.contains("table not registered")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrosa_cluster::consistency::ConsistencyLevel;
+    use ferrosa_cluster::write_path::{PartitionResultStream, WritePath};
+    use ferrosa_common::schema::TableSchema;
+    use ferrosa_common::PartitionKey;
+    use ferrosa_sstable::types::{DeletionTime, LivenessInfo};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Delegates to a real `WritePath`, except that the first `lagging`
+    /// writes fail with the typed write timeout a lagging follower produces.
+    struct LaggingFollower {
+        inner: WritePath,
+        lagging: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl GraphWrite for LaggingFollower {
+        async fn read(
+            &self,
+            table_id: &TableId,
+            key: &DecoratedKey,
+        ) -> ferrosa_common::Result<Option<ferrosa_sstable::types::Partition>> {
+            GraphWrite::read(&self.inner, table_id, key).await
+        }
+        async fn pk_read(
+            &self,
+            table_id: &TableId,
+            key: &DecoratedKey,
+            cl: ConsistencyLevel,
+            strategy: &ReplicationStrategy,
+        ) -> ferrosa_common::Result<Option<ferrosa_sstable::types::Partition>> {
+            GraphWrite::pk_read(&self.inner, table_id, key, cl, strategy).await
+        }
+        async fn range_read_stream_all(
+            &self,
+            table_id: &TableId,
+            row_limit: usize,
+        ) -> ferrosa_cluster::error::Result<PartitionResultStream> {
+            GraphWrite::range_read_stream_all(&self.inner, table_id, row_limit).await
+        }
+        async fn count_range_with(
+            &self,
+            table_id: &TableId,
+            cl: ConsistencyLevel,
+            strategy: &ReplicationStrategy,
+        ) -> ferrosa_cluster::error::Result<u64> {
+            GraphWrite::count_range_with(&self.inner, table_id, cl, strategy).await
+        }
+        fn declares_index_locally(&self, table_id: &TableId, index_name: &str) -> bool {
+            GraphWrite::declares_index_locally(&self.inner, table_id, index_name)
+        }
+        fn index_is_current(&self, table_id: &TableId, index_name: &str) -> bool {
+            GraphWrite::index_is_current(&self.inner, table_id, index_name)
+        }
+        async fn index_read_stream(
+            &self,
+            table_id: &TableId,
+            index_name: &str,
+            index_key: &ferrosa_index::IndexKey,
+            after: Option<&ferrosa_index::RowPosition>,
+        ) -> ferrosa_cluster::error::Result<PartitionResultStream> {
+            GraphWrite::index_read_stream(&self.inner, table_id, index_name, index_key, after).await
+        }
+        async fn write(
+            &self,
+            table_id: &TableId,
+            key: &DecoratedKey,
+            row: Arc<Row>,
+            timestamp: i64,
+            cl: ConsistencyLevel,
+            strategy: &ReplicationStrategy,
+        ) -> ferrosa_common::Result<()> {
+            let lagging = self.lagging.load(Ordering::SeqCst);
+            if lagging > 0 {
+                self.lagging.store(lagging - 1, Ordering::SeqCst);
+                return Err(ferrosa_common::Error::WriteTimeout {
+                    consistency: "QUORUM".to_string(),
+                    received: 1,
+                    required: 2,
+                });
+            }
+            GraphWrite::write(&self.inner, table_id, key, row, timestamp, cl, strategy).await
+        }
+        async fn write_batch(
+            &self,
+            mutations: Vec<Mutation>,
+            cl: ConsistencyLevel,
+            rf: usize,
+        ) -> ferrosa_common::Result<()> {
+            GraphWrite::write_batch(&self.inner, mutations, cl, rf).await
+        }
+    }
+
+    /// RED for p0-oom-audit clone-on-row-data at `adjacency_write_with_retry`:
+    /// every attempt used to deep-copy the derived row. Now each attempt
+    /// shares the caller's allocation, so the row the memtable stores IS the
+    /// caller's row (pointer identity), even after a retried attempt.
+    #[tokio::test]
+    async fn a_retried_adjacency_write_shares_one_row_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(
+            ferrosa_storage::StorageEngine::new(
+                ferrosa_storage::StorageEngineConfig::test_config(dir.path()),
+                None,
+            )
+            .unwrap(),
+        );
+        storage
+            .register_table(TableSchema {
+                keyspace: "adj_ks".to_string(),
+                table: "adjacency".to_string(),
+                key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                clustering_columns: vec![],
+                static_columns: vec![],
+                regular_columns: vec![],
+                extensions: Default::default(),
+            })
+            .unwrap();
+        let table = TableId::new("adj_ks", "adjacency");
+        let key = DecoratedKey::new(PartitionKey::new(b"vertex".to_vec()));
+        let row = Arc::new(Row {
+            clustering: vec![],
+            cells: vec![],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(7),
+        });
+        let lagging = LaggingFollower {
+            inner: WritePath::direct(Arc::clone(&storage)),
+            lagging: AtomicUsize::new(1),
+        };
+        adjacency_write_with_retry(
+            &lagging,
+            &table,
+            &key,
+            Arc::clone(&row),
+            7,
+            &ReplicationStrategy::Simple {
+                replication_factor: 1,
+            },
+            &table,
+        )
+        .await
+        .expect("the write lands after one lagging attempt");
+        assert_eq!(lagging.lagging.load(Ordering::SeqCst), 0, "one retry ran");
+
+        let stored = storage
+            .read(&table, &key)
+            .unwrap()
+            .expect("the adjacency row was written");
+        assert_eq!(stored.rows.len(), 1);
+        assert!(
+            Arc::ptr_eq(&stored.rows[0], &row),
+            "the memtable must hold the caller's row allocation, not a per-attempt copy"
+        );
+    }
 }

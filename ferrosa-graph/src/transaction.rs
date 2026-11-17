@@ -258,7 +258,7 @@ impl GraphWrite for LocalTransaction {
         &self,
         table_id: &TableId,
         key: &DecoratedKey,
-        row: Row,
+        row: Arc<Row>,
         timestamp: i64,
         _cl: ConsistencyLevel,
         _strategy: &ReplicationStrategy,

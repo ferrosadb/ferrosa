@@ -600,7 +600,7 @@ mod tests {
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };
         let key = DecoratedKey::new(PartitionKey::new(b"d0".to_vec()));
-        storage.write(&tid, &key, row, 1000).unwrap();
+        storage.write(&tid, &key, Arc::new(row), 1000).unwrap();
         storage.flush(&tid).unwrap();
         storage
             .add_vector_index(&tid, "idx_embedding", 0, 3)
@@ -1082,7 +1082,7 @@ what made this failure invisible"
                     "aside_ks".into(),
                     "aside_t".into(),
                     key,
-                    vec![row],
+                    vec![Arc::new(row)],
                     5,
                 ))
                 .expect("append set-aside mutation");

@@ -1521,6 +1521,7 @@ fn format_json_float_f64(f: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     // Encoders moved to ferrosa-row-bridge (re-exported above); the tests below
     // still reference these directly.
     use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
@@ -2236,7 +2237,7 @@ mod tests {
             key: dk,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row],
+            rows: vec![Arc::new(row)],
         };
 
         let column_names = vec!["id".into(), "name".into()];
@@ -2275,7 +2276,7 @@ mod tests {
             key: dk,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![tombstone_row],
+            rows: vec![Arc::new(tombstone_row)],
         };
 
         let rows =
@@ -2302,7 +2303,7 @@ mod tests {
             key: dk,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row],
+            rows: vec![Arc::new(row)],
         };
 
         let rows = partition_to_rows(
@@ -2341,7 +2342,7 @@ mod tests {
             key: dk,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row],
+            rows: vec![Arc::new(row)],
         };
 
         let rows = partition_to_rows(
@@ -2378,7 +2379,7 @@ mod tests {
             key: dk,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row],
+            rows: vec![Arc::new(row)],
         };
 
         let rows = partition_to_rows(
@@ -2416,7 +2417,7 @@ mod tests {
             key: dk,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row],
+            rows: vec![Arc::new(row)],
         };
 
         let rows = partition_to_rows(
@@ -3249,7 +3250,7 @@ mod tests {
             key: dk,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row],
+            rows: vec![Arc::new(row)],
         };
 
         let column_names = vec!["id".into(), "name".into()];
@@ -3313,7 +3314,7 @@ mod tests {
             key: dk,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row],
+            rows: vec![Arc::new(row)],
         };
 
         let column_names = vec!["id".into(), "v".into()];
@@ -3376,7 +3377,7 @@ mod tests {
             key: dk,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row],
+            rows: vec![Arc::new(row)],
         };
 
         let column_names = vec!["id".into(), "v".into()];
@@ -3418,7 +3419,7 @@ mod tests {
             key: dk,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row],
+            rows: vec![Arc::new(row)],
         };
 
         let column_names = vec!["id".into(), "v".into()];

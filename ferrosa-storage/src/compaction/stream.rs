@@ -478,18 +478,21 @@ fn write_row(
     header: &SerializationHeader,
     table: &str,
     p: &mut Partition,
-    scratch: &mut Vec<Row>,
+    scratch: &mut Vec<Arc<Row>>,
     row: Row,
 ) -> std::result::Result<Row, String> {
     // Legacy whole-value collections can expand into several cells in this ONE row.
     p.rows = std::mem::take(scratch);
-    p.rows.push(row);
+    p.rows.push(Arc::new(row));
     crate::memtable::expand_collection_blobs_in_place(p, header, table)
         .map_err(|e| e.to_string())?;
     let row = &p.rows[0];
     validate_row_writable(row, false, p, header)?;
     writer.write_partition_row(row).map_err(|e| e.to_string())?;
-    let row = p.rows.pop().expect("one output row");
+    // The row was moved in above and nothing else took a reference, so it
+    // comes back by move for the next merge to reuse its buffers.
+    let row = Arc::try_unwrap(p.rows.pop().expect("one output row"))
+        .map_err(|_| "compaction output row is unexpectedly shared".to_string())?;
     *scratch = std::mem::take(&mut p.rows);
     Ok(row)
 }

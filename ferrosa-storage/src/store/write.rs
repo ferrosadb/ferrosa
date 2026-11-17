@@ -23,7 +23,7 @@ impl<F: FlushTarget> TableStore<F> {
     /// Legacy nanosecond timestamps are normalised to microseconds before the
     /// row reaches the indexes or the memtable (t_cf637b6e), so no producer can
     /// put one where a comparison would see it.
-    pub fn write(&self, key: &DecoratedKey, mut row: Row) -> Result<()> {
+    pub fn write(&self, key: &DecoratedKey, mut row: Arc<Row>) -> Result<()> {
         if self.retired.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(ferrosa_common::Error::InvalidData(
                 "write refused: store is retired".into(),
@@ -70,7 +70,7 @@ impl<F: FlushTarget> TableStore<F> {
         &self,
         guard: &StoreView,
         key: &DecoratedKey,
-        row: Row,
+        row: Arc<Row>,
     ) -> Result<()> {
         crate::memtable::validate_legacy_collection_blobs(&row, &guard.indexes.schema)?;
         let catalog = Arc::clone(&guard.indexes.catalog);

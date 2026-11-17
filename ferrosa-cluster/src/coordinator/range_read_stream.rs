@@ -1026,7 +1026,8 @@ where
         &mut self,
         token: i64,
         first: bool,
-    ) -> Result<Option<(Option<TokenHeader>, Vec<ferrosa_sstable::types::Row>)>, ClusterError> {
+    ) -> Result<Option<(Option<TokenHeader>, Vec<Arc<ferrosa_sstable::types::Row>>)>, ClusterError>
+    {
         self.ensure_peeked().await?;
         match self.peeked.as_ref() {
             Some(p) if p.key.token.0 == token => {
@@ -1055,7 +1056,7 @@ where
 struct TokenRowPuller<'c, S> {
     cursor: &'c mut FragmentCursor<S>,
     token: i64,
-    rows: std::vec::IntoIter<ferrosa_sstable::types::Row>,
+    rows: std::vec::IntoIter<Arc<ferrosa_sstable::types::Row>>,
     first: bool,
     exhausted: bool,
     header: Option<TokenHeader>,
@@ -1090,7 +1091,7 @@ where
     }
 
     /// Next row of this token, or `None` when the token is exhausted.
-    async fn next_row(&mut self) -> Result<Option<ferrosa_sstable::types::Row>, ClusterError> {
+    async fn next_row(&mut self) -> Result<Option<Arc<ferrosa_sstable::types::Row>>, ClusterError> {
         loop {
             if let Some(row) = self.rows.next() {
                 return Ok(Some(row));
@@ -1207,16 +1208,19 @@ fn suppress_static_under_partition_deletion(header: &mut TokenHeader) {
 /// `ferrosa_storage::merge::apply_deletions`. Returns `true` if the row survives
 /// (caller emits it), `false` if it is suppressed by the partition tombstone.
 fn suppress_row_deletions(
-    row: &mut ferrosa_sstable::types::Row,
+    row: &mut Arc<ferrosa_sstable::types::Row>,
     partition_deleted: bool,
     partition_cut: i64,
 ) -> bool {
     if partition_deleted && row.primary_key_liveness.timestamp < partition_cut {
         return false;
     }
-    if !row.deletion.is_live() {
-        let cut = row.deletion.marked_for_delete_at;
-        row.cells.retain(|(_c, cell)| cell.timestamp >= cut);
+    let cut = row.deletion.marked_for_delete_at;
+    // Copy on write only a shared row that actually loses a cell.
+    if !row.deletion.is_live() && row.cells.iter().any(|(_c, cell)| cell.timestamp < cut) {
+        Arc::make_mut(row)
+            .cells
+            .retain(|(_c, cell)| cell.timestamp >= cut);
     }
     true
 }
@@ -1331,7 +1335,8 @@ async fn run_fragment_merge_nway_inner<S>(
         let partition_cut = header.deletion.marked_for_delete_at;
 
         // Prime one head row per live source.
-        let mut heads: Vec<Option<ferrosa_sstable::types::Row>> = Vec::with_capacity(pullers.len());
+        let mut heads: Vec<Option<Arc<ferrosa_sstable::types::Row>>> =
+            Vec::with_capacity(pullers.len());
         for p in pullers.iter_mut() {
             let head = match p {
                 Some(puller) => try_or_forward!(puller.next_row().await),
@@ -1340,7 +1345,7 @@ async fn run_fragment_merge_nway_inner<S>(
             heads.push(head);
         }
 
-        let mut out_rows: Vec<ferrosa_sstable::types::Row> = Vec::with_capacity(k);
+        let mut out_rows: Vec<Arc<ferrosa_sstable::types::Row>> = Vec::with_capacity(k);
         let mut first_fragment = true;
 
         loop {
@@ -1363,12 +1368,12 @@ async fn run_fragment_merge_nway_inner<S>(
             // Fold every source whose head matches `ck`, advancing those
             // sources. `merge_rows` is order-independent, so left-fold across
             // the participating sources reproduces `merge_partitions`.
-            let mut merged: Option<ferrosa_sstable::types::Row> = None;
+            let mut merged: Option<Arc<ferrosa_sstable::types::Row>> = None;
             for (i, head) in heads.iter_mut().enumerate() {
                 if head.as_ref().map(|r| r.clustering == ck).unwrap_or(false) {
                     let row = head.take().expect("matched head");
                     merged = Some(match merged.take() {
-                        Some(prev) => ferrosa_storage::merge::merge_rows(prev, row),
+                        Some(prev) => ferrosa_storage::merge::merge_shared_rows(prev, row),
                         None => row,
                     });
                     if let Some(puller) = pullers[i].as_mut() {
@@ -1424,7 +1429,7 @@ async fn run_fragment_merge<L, R>(
 fn build_out_fragment(
     header: &mut TokenHeader,
     first_fragment: &mut bool,
-    out_rows: &mut Vec<ferrosa_sstable::types::Row>,
+    out_rows: &mut Vec<Arc<ferrosa_sstable::types::Row>>,
 ) -> Partition {
     let rows = std::mem::take(out_rows);
     if *first_fragment {
@@ -2909,12 +2914,12 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(pk.to_vec())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: ck.to_vec(),
                 cells: Vec::new(),
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1),
-            }],
+            })],
         })
     }
 
@@ -3017,7 +3022,7 @@ mod tests {
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1),
             };
-            engine.write(&tid, &key, row, 1).unwrap();
+            engine.write(&tid, &key, Arc::new(row), 1).unwrap();
         }
 
         let local: ClusterPartitionStream = Box::pin(
@@ -3199,12 +3204,12 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(pk.to_vec())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: Vec::new(),
                 cells: Vec::new(),
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1),
-            }],
+            })],
         }
     }
 
@@ -3764,13 +3769,13 @@ mod tests {
             key: dk(b"alpha"),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![trow(1, b"prefix", 1000)],
+            rows: vec![Arc::new(trow(1, b"prefix", 1000))],
         };
         let replica_prefix = Partition {
             key: dk(b"bravo"),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![trow(1, b"replica-prefix", 1000)],
+            rows: vec![Arc::new(trow(1, b"replica-prefix", 1000))],
         };
         let failing: BoxedFragmentStream = Box::pin(futures::stream::iter(vec![
             Ok(replica_prefix),
@@ -3823,7 +3828,7 @@ mod tests {
             key: dk(b"alpha"),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![trow(1, b"v", 1)],
+            rows: vec![Arc::new(trow(1, b"v", 1))],
         }))
         .await
         .unwrap();
@@ -3859,7 +3864,7 @@ mod tests {
             key: dk(b"alpha"),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![trow(1, b"v", 1)],
+            rows: vec![Arc::new(trow(1, b"v", 1))],
         }))
         .await
         .unwrap();
@@ -3983,6 +3988,7 @@ mod tests {
             static_row: None,
             rows: (0..30)
                 .map(|c| trow(c, format!("L{c}").as_bytes(), 1000))
+                .map(Arc::new)
                 .collect(),
         };
         let remote0 = Partition {
@@ -3992,6 +3998,7 @@ mod tests {
             rows: (0..30)
                 .filter(|c| c % 2 == 0)
                 .map(|c| trow(c, format!("R{c}").as_bytes(), 2000))
+                .map(Arc::new)
                 .collect(),
         };
         // key1: local-only (disjoint token from remote).
@@ -4001,6 +4008,7 @@ mod tests {
             static_row: None,
             rows: (0..12)
                 .map(|c| trow(c, format!("x{c}").as_bytes(), 1500))
+                .map(Arc::new)
                 .collect(),
         };
         // key2: remote-only.
@@ -4010,6 +4018,7 @@ mod tests {
             static_row: None,
             rows: (0..7)
                 .map(|c| trow(c, format!("y{c}").as_bytes(), 1500))
+                .map(Arc::new)
                 .collect(),
         };
         // key3: both sides, with a static row on local and a partition
@@ -4025,6 +4034,7 @@ mod tests {
             }),
             rows: (0..20)
                 .map(|c| trow(c, format!("o{c}").as_bytes(), 1000))
+                .map(Arc::new)
                 .collect(),
         };
         local3.rows.sort_by(|a, b| a.clustering.cmp(&b.clustering));
@@ -4034,6 +4044,7 @@ mod tests {
             static_row: None,
             rows: (20..40)
                 .map(|c| trow(c, format!("n{c}").as_bytes(), 3000))
+                .map(Arc::new)
                 .collect(),
         };
 
@@ -4135,13 +4146,13 @@ mod tests {
             key: keys[0].clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![trow(0, b"prefix", 1000)],
+            rows: vec![Arc::new(trow(0, b"prefix", 1000))],
         };
         let stalled = Partition {
             key: keys[1].clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![trow(0, b"stalled", 1000)],
+            rows: vec![Arc::new(trow(0, b"stalled", 1000))],
         };
         let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
         let stalled_stream = OneFragmentThenPending {
@@ -4405,6 +4416,7 @@ mod tests {
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
                 })
+                .map(Arc::new)
                 .collect(),
         };
 
@@ -4488,7 +4500,7 @@ mod tests {
             key: key.clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: (0..n_rows).map(|c| mk_row(c, ts)).collect(),
+            rows: (0..n_rows).map(|c| mk_row(c, ts)).map(Arc::new).collect(),
         };
         // Three replicas, identical row SET, but each fragmented at a DIFFERENT
         // k so boundaries never line up. The coordinator merge k is yet another
@@ -4546,7 +4558,7 @@ mod tests {
                         key: key.clone(),
                         deletion: DeletionTime::LIVE,
                         static_row: None,
-                        rows,
+                        rows: rows.into_iter().map(Arc::new).collect(),
                     };
                     fragment_partition(&whole, k)
                 })
@@ -4594,6 +4606,7 @@ mod tests {
             static_row: None,
             rows: (0..30)
                 .map(|c| trow(c, format!("a{c}").as_bytes(), 1000))
+                .map(Arc::new)
                 .collect(),
         };
         let s1k0 = Partition {
@@ -4603,6 +4616,7 @@ mod tests {
             rows: (0..30)
                 .filter(|c| c % 2 == 0)
                 .map(|c| trow(c, format!("b{c}").as_bytes(), 2000))
+                .map(Arc::new)
                 .collect(),
         };
         let s2k0 = Partition {
@@ -4612,6 +4626,7 @@ mod tests {
             rows: (0..30)
                 .filter(|c| c % 3 == 0)
                 .map(|c| trow(c, format!("c{c}").as_bytes(), 3000))
+                .map(Arc::new)
                 .collect(),
         };
         // key1: only s1 has it (disjoint).
@@ -4621,6 +4636,7 @@ mod tests {
             static_row: None,
             rows: (0..9)
                 .map(|c| trow(c, format!("d{c}").as_bytes(), 1500))
+                .map(Arc::new)
                 .collect(),
         };
         // key2: s0 + s2, with a partition tombstone on s2 suppressing s0's old rows.
@@ -4635,6 +4651,7 @@ mod tests {
             }),
             rows: (0..20)
                 .map(|c| trow(c, format!("o{c}").as_bytes(), 1000))
+                .map(Arc::new)
                 .collect(),
         };
         let s2k2 = Partition {
@@ -4643,6 +4660,7 @@ mod tests {
             static_row: None,
             rows: (20..36)
                 .map(|c| trow(c, format!("n{c}").as_bytes(), 3000))
+                .map(Arc::new)
                 .collect(),
         };
 
@@ -4690,7 +4708,7 @@ mod tests {
     /// simulation can compare against the whole-merge reference and apply the
     /// skip-≤-last cursor in true (token, clustering) order, exactly as the CQL
     /// paging collector does.
-    fn flatten_to_rows(parts: &[Partition]) -> Vec<(DecoratedKey, Vec<u8>, Row)> {
+    fn flatten_to_rows(parts: &[Partition]) -> Vec<(DecoratedKey, Vec<u8>, Arc<Row>)> {
         let mut out = Vec::new();
         for p in parts {
             for r in &p.rows {
@@ -4749,6 +4767,7 @@ mod tests {
             rows: (0..50)
                 .filter(|c| c % modulo == 0)
                 .map(|c| trow(c, format!("{tag}{c}").as_bytes(), ts))
+                .map(Arc::new)
                 .collect(),
         };
         let s0w = wide('a', 1, 1000); // every clustering
@@ -4762,6 +4781,7 @@ mod tests {
             static_row: None,
             rows: (0..9)
                 .map(|c| trow(c, format!("d{c}").as_bytes(), 1500))
+                .map(Arc::new)
                 .collect(),
         };
         let s0k2 = Partition {
@@ -4775,6 +4795,7 @@ mod tests {
             }),
             rows: (0..20)
                 .map(|c| trow(c, format!("o{c}").as_bytes(), 1000))
+                .map(Arc::new)
                 .collect(),
         };
         let s2k2 = Partition {
@@ -4783,6 +4804,7 @@ mod tests {
             static_row: None,
             rows: (20..36)
                 .map(|c| trow(c, format!("n{c}").as_bytes(), 3000))
+                .map(Arc::new)
                 .collect(),
         };
 
@@ -4809,7 +4831,7 @@ mod tests {
         for page_size in [1usize, 3, 7, 50] {
             for k in [1usize, 4, 8] {
                 let mut cursor: Option<(DecoratedKey, Vec<u8>)> = None;
-                let mut paged: Vec<(DecoratedKey, Vec<u8>, Row)> = Vec::new();
+                let mut paged: Vec<(DecoratedKey, Vec<u8>, Arc<Row>)> = Vec::new();
 
                 // Hard iteration cap: at most one page per reference row, plus a
                 // final empty page. Guards against a paging bug looping forever.
@@ -4904,6 +4926,7 @@ mod tests {
             static_row: None,
             rows: (0..40)
                 .map(|c| trow(c, format!("a{c}").as_bytes(), 1000))
+                .map(Arc::new)
                 .collect(),
         };
         let s1k0 = Partition {
@@ -4913,6 +4936,7 @@ mod tests {
             rows: (0..40)
                 .filter(|c| c % 2 == 0)
                 .map(|c| trow(c, format!("b{c}").as_bytes(), 2000))
+                .map(Arc::new)
                 .collect(),
         };
         let s1k1 = Partition {
@@ -4921,6 +4945,7 @@ mod tests {
             static_row: None,
             rows: (0..15)
                 .map(|c| trow(c, format!("d{c}").as_bytes(), 1500))
+                .map(Arc::new)
                 .collect(),
         };
         let s0k2 = Partition {
@@ -4934,6 +4959,7 @@ mod tests {
             }),
             rows: (0..10)
                 .map(|c| trow(c, format!("o{c}").as_bytes(), 1000))
+                .map(Arc::new)
                 .collect(),
         };
 

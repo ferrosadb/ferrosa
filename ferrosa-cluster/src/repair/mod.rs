@@ -41,6 +41,8 @@ pub use scheduler::{
 };
 pub use trigger::{ClusterRepairTrigger, ExecutorProvider};
 
+use std::sync::Arc;
+
 use ferrosa_sstable::types::Partition;
 use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::TableId;
@@ -338,9 +340,9 @@ fn reconcile_row(a: &ferrosa_sstable::types::Row, b: &ferrosa_sstable::types::Ro
 #[derive(Default)]
 struct PartitionMerge {
     /// Rows to stream A→B.
-    to_b: Vec<ferrosa_sstable::types::Row>,
+    to_b: Vec<Arc<ferrosa_sstable::types::Row>>,
     /// Rows to stream B→A.
-    to_a: Vec<ferrosa_sstable::types::Row>,
+    to_a: Vec<Arc<ferrosa_sstable::types::Row>>,
     /// At least one row was settled by comparing values at an equal timestamp
     /// rather than by timestamp alone, or partition-level state diverged.
     /// Reported as `timestamp_ties` for observability — the replicas still
@@ -380,12 +382,12 @@ fn merge_partition_rows(a: &Partition, b: &Partition) -> PartitionMerge {
         merge.partition_state_diverged = true;
     }
 
-    let rows_b: std::collections::BTreeMap<&[u8], &ferrosa_sstable::types::Row> = b
+    let rows_b: std::collections::BTreeMap<&[u8], &Arc<ferrosa_sstable::types::Row>> = b
         .rows
         .iter()
         .map(|r| (r.clustering.as_slice(), r))
         .collect();
-    let rows_a: std::collections::BTreeMap<&[u8], &ferrosa_sstable::types::Row> = a
+    let rows_a: std::collections::BTreeMap<&[u8], &Arc<ferrosa_sstable::types::Row>> = a
         .rows
         .iter()
         .map(|r| (r.clustering.as_slice(), r))
@@ -394,7 +396,7 @@ fn merge_partition_rows(a: &Partition, b: &Partition) -> PartitionMerge {
     for (clustering, row_a) in &rows_a {
         match rows_b.get(clustering) {
             // Present only on A — no ambiguity, B needs it.
-            None => merge.to_b.push((*row_a).clone()),
+            None => merge.to_b.push(Arc::clone(row_a)),
             Some(row_b) => match reconcile_row(row_a, row_b) {
                 RowVerdict::Agree => {}
                 RowVerdict::Stream {
@@ -403,10 +405,10 @@ fn merge_partition_rows(a: &Partition, b: &Partition) -> PartitionMerge {
                     tiebreak,
                 } => {
                     if to_a {
-                        merge.to_a.push((*row_b).clone());
+                        merge.to_a.push(Arc::clone(row_b));
                     }
                     if to_b {
-                        merge.to_b.push((*row_a).clone());
+                        merge.to_b.push(Arc::clone(row_a));
                     }
                     // The rows differ, yet neither carries anything that would
                     // change the other: row-level state diverged in a way
@@ -421,14 +423,14 @@ fn merge_partition_rows(a: &Partition, b: &Partition) -> PartitionMerge {
     }
     for (clustering, row_b) in &rows_b {
         if !rows_a.contains_key(clustering) {
-            merge.to_a.push((*row_b).clone());
+            merge.to_a.push(Arc::clone(row_b));
         }
     }
     merge
 }
 
 /// A copy of `src` carrying only `rows` — the trimmed partition to stream.
-fn partition_with_rows(src: &Partition, rows: Vec<ferrosa_sstable::types::Row>) -> Partition {
+fn partition_with_rows(src: &Partition, rows: Vec<Arc<ferrosa_sstable::types::Row>>) -> Partition {
     Partition {
         key: src.key.clone(),
         deletion: src.deletion,
@@ -828,7 +830,7 @@ mod tests {
             key: dk,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row],
+            rows: vec![Arc::new(row)],
         }
     }
 
@@ -853,7 +855,7 @@ mod tests {
             key: dk,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row],
+            rows: vec![Arc::new(row)],
         }
     }
 
@@ -940,7 +942,7 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(key.to_vec())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows,
+            rows: rows.into_iter().map(Arc::new).collect(),
         }
     }
 
@@ -1348,7 +1350,7 @@ mod tests {
                 key: DecoratedKey::new(PartitionKey::new(b"k1".to_vec())),
                 deletion: DeletionTime::LIVE,
                 static_row: None,
-                rows,
+                rows: rows.into_iter().map(Arc::new).collect(),
             }
         }
 
@@ -1403,7 +1405,7 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(b"k1".to_vec())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows,
+            rows: rows.into_iter().map(Arc::new).collect(),
         };
         let a = vec![part(vec![
             row(b"shared", b"same", 500),
@@ -1440,7 +1442,7 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(b"k1".to_vec())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows,
+            rows: rows.into_iter().map(Arc::new).collect(),
         };
         // Same clustering, same timestamp, different value: the timestamp alone
         // does not pick a winner.
@@ -1480,7 +1482,7 @@ mod tests {
             key: key.clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row(500)],
+            rows: vec![Arc::new(row(500))],
         }];
         let b = vec![Partition {
             key,
@@ -1489,7 +1491,7 @@ mod tests {
                 local_deletion_time: 1,
             },
             static_row: None,
-            rows: vec![row(500)],
+            rows: vec![Arc::new(row(500))],
         }];
 
         let plan = diff_partition_sets(&a, &b);

@@ -177,7 +177,7 @@ async fn seed_compacted_history(engine: &StorageEngine, stale: &str, current: &s
         }
         let ts = (doc + 1) as i64;
         engine
-            .write(&table, &doc_key(doc), row(&text, ts), ts)
+            .write(&table, &doc_key(doc), Arc::new(row(&text, ts)), ts)
             .unwrap();
     }
     let written = Instant::now();
@@ -190,7 +190,7 @@ async fn seed_compacted_history(engine: &StorageEngine, stale: &str, current: &s
         }
         let ts = (DOCS + rewrite) as i64;
         engine
-            .write(&table, &doc_key(0), row(&text, ts), ts)
+            .write(&table, &doc_key(0), Arc::new(row(&text, ts)), ts)
             .unwrap();
         engine.flush(&table).unwrap();
     }
@@ -732,7 +732,7 @@ fn repair_source_that_cannot_read(dir: &std::path::Path) -> Arc<StorageEngine> {
     let engine = engine(dir);
     let table = TableId::new(KS, TBL);
     engine
-        .write(&table, &doc_key(0), row("unreadable", 1), 1)
+        .write(&table, &doc_key(0), Arc::new(row("unreadable", 1)), 1)
         .unwrap();
     engine.flush(&table).unwrap();
     let mut damaged = 0usize;

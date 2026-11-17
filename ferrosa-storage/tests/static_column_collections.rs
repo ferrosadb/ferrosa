@@ -15,6 +15,7 @@
 //! pin the value landing on the right column after a write and read back.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ferrosa_common::cell::CellValue;
@@ -169,7 +170,7 @@ fn whole_list_then_element_append_keeps_every_column_on_its_own_ordinal() {
         .write(
             &tid,
             &key(),
-            row(
+            Arc::new(row(
                 vec![
                     (STATIC_S, CellValue::live(b"static".to_vec(), 1_000)),
                     (REGULAR_A, CellValue::live(b"plain".to_vec(), 1_000)),
@@ -179,7 +180,7 @@ fn whole_list_then_element_append_keeps_every_column_on_its_own_ordinal() {
                     ),
                 ],
                 1_000,
-            ),
+            )),
             1_000,
         )
         .unwrap();
@@ -187,14 +188,14 @@ fn whole_list_then_element_append_keeps_every_column_on_its_own_ordinal() {
         .write(
             &tid,
             &key(),
-            row(
+            Arc::new(row(
                 vec![(
                     REGULAR_L,
                     CellValue::live(b"third".to_vec(), 2_000)
                         .with_path(ferrosa_row_bridge::collection::list_cell_path(2_000, 0)),
                 )],
                 2_000,
-            ),
+            )),
             2_000,
         )
         .unwrap();
@@ -233,7 +234,7 @@ fn collection_deletion_then_whole_overwrite_leaves_only_the_new_value() {
         .write(
             &tid,
             &key(),
-            row(
+            Arc::new(row(
                 vec![
                     (STATIC_S, CellValue::live(b"static".to_vec(), 1_000)),
                     (REGULAR_A, CellValue::live(b"plain".to_vec(), 1_000)),
@@ -244,7 +245,7 @@ fn collection_deletion_then_whole_overwrite_leaves_only_the_new_value() {
                     ),
                 ],
                 1_000,
-            ),
+            )),
             1_000,
         )
         .unwrap();
@@ -253,10 +254,10 @@ fn collection_deletion_then_whole_overwrite_leaves_only_the_new_value() {
         .write(
             &tid,
             &key(),
-            row(
+            Arc::new(row(
                 vec![(REGULAR_L, CellValue::tombstone(2_000, 1_700_000_000))],
                 2_000,
-            ),
+            )),
             2_000,
         )
         .unwrap();
@@ -264,10 +265,10 @@ fn collection_deletion_then_whole_overwrite_leaves_only_the_new_value() {
         .write(
             &tid,
             &key(),
-            row(
+            Arc::new(row(
                 vec![(REGULAR_L, CellValue::live(blob(&[b"new"]), 3_000))],
                 3_000,
-            ),
+            )),
             3_000,
         )
         .unwrap();
@@ -303,13 +304,13 @@ fn whole_set_in_a_static_column_then_element_append_reads_back() {
         .write(
             &tid,
             &key(),
-            row(
+            Arc::new(row(
                 vec![
                     (0, CellValue::live(blob(&[b"k1"]), 1_000)),
                     (1, CellValue::live(b"plain".to_vec(), 1_000)),
                 ],
                 1_000,
-            ),
+            )),
             1_000,
         )
         .unwrap();
@@ -317,13 +318,13 @@ fn whole_set_in_a_static_column_then_element_append_reads_back() {
         .write(
             &tid,
             &key(),
-            row(
+            Arc::new(row(
                 vec![(
                     0,
                     CellValue::live(Vec::new(), 2_000).with_path(b"k2".to_vec()),
                 )],
                 2_000,
-            ),
+            )),
             2_000,
         )
         .unwrap();

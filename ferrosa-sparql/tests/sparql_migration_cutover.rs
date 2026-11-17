@@ -45,7 +45,12 @@ fn seed(dir: &std::path::Path, rows: Vec<Row>, flush: bool) {
     engine.flush(&source()).unwrap();
     for row in rows {
         engine
-            .write(&source(), &partition_key("urn:g", "urn:s"), row, 1)
+            .write(
+                &source(),
+                &partition_key("urn:g", "urn:s"),
+                Arc::new(row),
+                1,
+            )
             .unwrap();
     }
     if flush {
@@ -222,7 +227,7 @@ async fn fresh_populated_v2_is_never_claimed_as_partial_migration() {
             .write(
                 &triples_table_id(KS),
                 &partition_key("urn:g", "urn:s"),
-                Row {
+                Arc::new(Row {
                     clustering: encode_clustering("urn:p", &term).unwrap(),
                     cells: vec![
                         (
@@ -233,7 +238,7 @@ async fn fresh_populated_v2_is_never_claimed_as_partial_migration() {
                     ],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(2),
-                },
+                }),
                 2,
             )
             .unwrap();

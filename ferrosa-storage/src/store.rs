@@ -327,8 +327,21 @@ impl PlanningComponents {
 /// liveness, row deletion) from legacy nanoseconds to microseconds, and count
 /// them under `legacy_ns_timestamps_normalised_total{source="memtable_write"}`.
 /// TTL and local deletion times are seconds and untouched (t_cf637b6e).
-fn normalise_legacy_ns_row(row: &mut Row) {
+///
+/// The row is shared with its writer, so it is only written to (copied on
+/// write if still shared) when it actually carries a legacy timestamp.
+fn normalise_legacy_ns_row(shared: &mut Arc<Row>) {
     use ferrosa_common::{is_legacy_ns, normalize_cell_ts};
+    let legacy = is_legacy_ns(shared.primary_key_liveness.timestamp)
+        || is_legacy_ns(shared.deletion.marked_for_delete_at)
+        || shared
+            .cells
+            .iter()
+            .any(|(_, cell)| is_legacy_ns(cell.timestamp));
+    if !legacy {
+        return;
+    }
+    let row = Arc::make_mut(shared);
     let mut count = 0u64;
     let mut normalise = |ts: &mut i64| {
         if is_legacy_ns(*ts) {
@@ -1614,7 +1627,11 @@ fn scalar_index_from_rows(
         let pk_bytes = partition.key.key.as_bytes();
         if let Some(position) = find(&catalog.indexed_columns) {
             let predicate = catalog.index_filter_predicates.get(index_name);
-            for row in partition.static_row.iter().chain(partition.rows.iter()) {
+            for row in partition
+                .static_row
+                .iter()
+                .chain(partition.rows.iter().map(|row| &**row))
+            {
                 insert_scalar_memtable_index_row(
                     &index, index_name, position, index_type, predicate, pk_bytes, row,
                 );
@@ -1666,7 +1683,11 @@ fn vector_index_from_rows(
     for partition in partitions {
         // One scope per partition, shared by its rows' entries.
         let mut scope: Option<Arc<[u8]>> = None;
-        for row in partition.static_row.iter().chain(partition.rows.iter()) {
+        for row in partition
+            .static_row
+            .iter()
+            .chain(partition.rows.iter().map(|row| &**row))
+        {
             let Some(value) = row
                 .cells
                 .iter()
@@ -1980,34 +2001,47 @@ fn write_streamed_vector_sidecar<F: FlushTarget + ?Sized, V: AsRef<[f32]>>(
 /// is the vectors plus one row, not the vectors plus every row.
 fn partition_vectors(
     static_row: Option<Row>,
-    rows: Vec<Row>,
+    rows: Vec<Arc<Row>>,
     column_position: usize,
 ) -> Result<Vec<(ferrosa_index::vector::RowPosition, Vec<f32>)>> {
-    let rows = static_row.into_iter().chain(rows);
     // Sized once from the row count: growing by doubling would hold up to
     // twice the vectors' table while it reallocates.
-    let mut entries = Vec::with_capacity(rows.size_hint().0);
+    let mut entries = Vec::with_capacity(rows.len() + usize::from(static_row.is_some()));
+    if let Some(row) = static_row {
+        push_row_vector(&row, column_position, &mut entries)?;
+    }
+    // Consume the rows: each one is released as soon as its vector is out, so
+    // the rows are never held beside the vectors built from them.
     for row in rows {
-        if !row.deletion.is_live() {
-            continue;
-        }
-        let Some(value) = row
-            .cells
-            .iter()
-            .find(|(idx, _)| *idx as usize == column_position)
-            .and_then(|(_, cell)| cell.value.as_deref())
-        else {
-            continue;
-        };
-        let vector = ferrosa_index::bytes_to_vec_f32(value).map_err(|e| {
-            ferrosa_common::Error::InvalidData(format!(
-                "a vector-indexed cell does not hold a float vector: {e}"
-            ))
-        })?;
-        let position = ferrosa_index::vector::RowPosition::new(entries.len() as u64);
-        entries.push((position, vector));
+        push_row_vector(&row, column_position, &mut entries)?;
     }
     Ok(entries)
+}
+
+fn push_row_vector(
+    row: &Row,
+    column_position: usize,
+    entries: &mut Vec<(ferrosa_index::vector::RowPosition, Vec<f32>)>,
+) -> Result<()> {
+    if !row.deletion.is_live() {
+        return Ok(());
+    }
+    let Some(value) = row
+        .cells
+        .iter()
+        .find(|(idx, _)| *idx as usize == column_position)
+        .and_then(|(_, cell)| cell.value.as_deref())
+    else {
+        return Ok(());
+    };
+    let vector = ferrosa_index::bytes_to_vec_f32(value).map_err(|e| {
+        ferrosa_common::Error::InvalidData(format!(
+            "a vector-indexed cell does not hold a float vector: {e}"
+        ))
+    })?;
+    let position = ferrosa_index::vector::RowPosition::new(entries.len() as u64);
+    entries.push((position, vector));
+    Ok(())
 }
 
 /// How one delivery attempt by a pausable producer ended.
@@ -2990,11 +3024,11 @@ fn partition_with_matching_clustering(
     partition: &Partition,
     clustering: &[u8],
 ) -> Option<Partition> {
-    let rows: Vec<Row> = partition
+    let rows: Vec<Arc<Row>> = partition
         .rows
         .iter()
         .filter(|row| row.clustering == clustering)
-        .cloned()
+        .map(Arc::clone)
         .collect();
 
     if rows.is_empty() && partition.deletion.is_live() && partition.static_row.is_none() {
@@ -4874,7 +4908,7 @@ impl<F: FlushTarget> TableStore<F> {
         let guard = self.view.load();
         let schema = self.schema.load();
         let mut partition_delete_at = ferrosa_sstable::types::DeletionTime::LIVE;
-        let mut mem_row_iters: Vec<std::vec::IntoIter<Row>> = Vec::new();
+        let mut mem_row_iters: Vec<std::vec::IntoIter<Arc<Row>>> = Vec::new();
 
         if let Some(partition) = guard.active.get(key)? {
             if partition.deletion.marked_for_delete_at > partition_delete_at.marked_for_delete_at {
@@ -4949,11 +4983,11 @@ impl<F: FlushTarget> TableStore<F> {
             return Ok(0);
         }
 
-        let mut mem_heads: Vec<Option<Row>> =
+        let mut mem_heads: Vec<Option<Arc<Row>>> =
             mem_row_iters.iter_mut().map(|iter| iter.next()).collect();
-        let mut sst_heads: Vec<Option<Row>> = Vec::with_capacity(sst_sources.len());
+        let mut sst_heads: Vec<Option<Arc<Row>>> = Vec::with_capacity(sst_sources.len());
         for (iter, mapping) in sst_sources.iter_mut() {
-            sst_heads.push(next_remapped_clustered_row(iter, mapping)?);
+            sst_heads.push(next_remapped_clustered_row(iter, mapping)?.map(Arc::new));
         }
 
         let mut visited = 0;
@@ -4972,7 +5006,7 @@ impl<F: FlushTarget> TableStore<F> {
                 break;
             };
 
-            let mut merged_row: Option<Row> = None;
+            let mut merged_row: Option<Arc<Row>> = None;
             for (idx, head) in mem_heads.iter_mut().enumerate() {
                 if head
                     .as_ref()
@@ -4981,7 +5015,7 @@ impl<F: FlushTarget> TableStore<F> {
                 {
                     let row = head.take().expect("checked as present");
                     merged_row = match merged_row.take() {
-                        Some(prev) => Some(crate::merge::merge_rows(prev, row)),
+                        Some(prev) => Some(crate::merge::merge_shared_rows(prev, row)),
                         None => Some(row),
                     };
                     *head = mem_row_iters[idx].next();
@@ -4995,11 +5029,11 @@ impl<F: FlushTarget> TableStore<F> {
                 {
                     let row = head.take().expect("checked as present");
                     merged_row = match merged_row.take() {
-                        Some(prev) => Some(crate::merge::merge_rows(prev, row)),
+                        Some(prev) => Some(crate::merge::merge_shared_rows(prev, row)),
                         None => Some(row),
                     };
                     let (iter, mapping) = &mut sst_sources[idx];
-                    *head = next_remapped_clustered_row(iter, mapping)?;
+                    *head = next_remapped_clustered_row(iter, mapping)?.map(Arc::new);
                 }
             }
 
@@ -5011,8 +5045,16 @@ impl<F: FlushTarget> TableStore<F> {
             }
             if !row.deletion.is_live() {
                 let row_delete_at = row.deletion.marked_for_delete_at;
-                row.cells
-                    .retain(|(_column, cell)| cell.timestamp >= row_delete_at);
+                // Copy on write only a shared row that actually loses a cell.
+                if row
+                    .cells
+                    .iter()
+                    .any(|(_column, cell)| cell.timestamp < row_delete_at)
+                {
+                    Arc::make_mut(&mut row)
+                        .cells
+                        .retain(|(_column, cell)| cell.timestamp >= row_delete_at);
+                }
                 if row.cells.is_empty() {
                     continue;
                 }
@@ -7263,7 +7305,7 @@ impl<F: FlushTarget> TableStore<F> {
         }
         p.key.key.as_bytes().len()
             + p.static_row.as_ref().map_or(0, row_bytes)
-            + p.rows.iter().map(row_bytes).sum::<usize>()
+            + p.rows.iter().map(|row| row_bytes(row)).sum::<usize>()
     }
 
     /// Token-ordered, budget-bounded chunked read for anti-entropy repair.
@@ -8009,7 +8051,7 @@ impl<F: FlushTarget> TableStore<F> {
 
                 // Per-source memtable rows (sorted by clustering)
                 // and per-source SSTable iter indices.
-                let mut mem_row_iters: Vec<std::vec::IntoIter<ferrosa_sstable::types::Row>> =
+                let mut mem_row_iters: Vec<std::vec::IntoIter<Arc<ferrosa_sstable::types::Row>>> =
                     Vec::new();
                 let mut headers: Vec<(
                     DecoratedKey,
@@ -8018,9 +8060,8 @@ impl<F: FlushTarget> TableStore<F> {
                 )> = Vec::with_capacity(total_sources);
 
                 for &vi in &vec_match_indices {
-                    // Fragment/streaming path materialises owned rows anyway
-                    // (it sorts and consumes them), so unwrap the memtable's
-                    // `Arc` here rather than widening the merge signature.
+                    // Unwrapping the memtable's `Arc<Partition>` copies only
+                    // the row handles: the rows themselves stay shared.
                     let p = Arc::unwrap_or_clone(vec_sources[vi].next().expect("peeked"));
                     let key_p = p.key.clone();
                     let deletion = p.deletion;
@@ -8068,14 +8109,15 @@ impl<F: FlushTarget> TableStore<F> {
                     &ferrosa_sstable::types::Row,
                 ) -> Result<()>|
                  -> Result<()> {
-                    let mut mem_heads: Vec<Option<ferrosa_sstable::types::Row>> =
+                    let mut mem_heads: Vec<Option<Arc<ferrosa_sstable::types::Row>>> =
                         mem_row_iters.iter_mut().map(|it| it.next()).collect();
-                    let mut sst_heads: Vec<Option<ferrosa_sstable::types::Row>> =
+                    let mut sst_heads: Vec<Option<Arc<ferrosa_sstable::types::Row>>> =
                         Vec::with_capacity(sst_local_indices.len());
                     for &si in &sst_local_indices {
                         sst_heads.push(
                             next_remapped_clustered_row(&mut sst_iters[si], &sst_mappings[si])
-                                .map_err(|e| fail(si, "row", e))?,
+                                .map_err(|e| fail(si, "row", e))?
+                                .map(Arc::new),
                         );
                     }
                     loop {
@@ -8097,7 +8139,7 @@ impl<F: FlushTarget> TableStore<F> {
                         // Collect every source's row at that
                         // clustering, merging cells one pair at
                         // a time. Peak in-flight: two rows.
-                        let mut merged_row: Option<ferrosa_sstable::types::Row> = None;
+                        let mut merged_row: Option<Arc<ferrosa_sstable::types::Row>> = None;
                         for (i_local, _i_global) in mem_indices.iter().enumerate() {
                             if mem_heads[i_local]
                                 .as_ref()
@@ -8106,7 +8148,7 @@ impl<F: FlushTarget> TableStore<F> {
                             {
                                 let row = mem_heads[i_local].take().unwrap();
                                 merged_row = match merged_row.take() {
-                                    Some(prev) => Some(crate::merge::merge_rows(prev, row)),
+                                    Some(prev) => Some(crate::merge::merge_shared_rows(prev, row)),
                                     None => Some(row),
                                 };
                                 mem_heads[i_local] = mem_row_iters[i_local].next();
@@ -8120,14 +8162,15 @@ impl<F: FlushTarget> TableStore<F> {
                             {
                                 let row = sst_heads[h_idx].take().unwrap();
                                 merged_row = match merged_row.take() {
-                                    Some(prev) => Some(crate::merge::merge_rows(prev, row)),
+                                    Some(prev) => Some(crate::merge::merge_shared_rows(prev, row)),
                                     None => Some(row),
                                 };
                                 sst_heads[h_idx] = next_remapped_clustered_row(
                                     &mut sst_iters[si],
                                     &sst_mappings[si],
                                 )
-                                .map_err(|e| fail(si, "row", e))?;
+                                .map_err(|e| fail(si, "row", e))?
+                                .map(Arc::new);
                             }
                         }
                         let row = merged_row.expect("at least one source matched");
@@ -11289,7 +11332,7 @@ fn segment_partitions_by_window(
             static_row,
             rows,
         } = partition;
-        let mut by_window: std::collections::BTreeMap<i64, Vec<Row>> =
+        let mut by_window: std::collections::BTreeMap<i64, Vec<Arc<Row>>> =
             std::collections::BTreeMap::new();
         for row in rows {
             let Some(ts) = time_series_row_timestamp(&row, timestamp_unit) else {
@@ -11451,8 +11494,8 @@ fn segmented_partition_needs_replay(images: &[&Partition], late: &Partition) -> 
     {
         return true;
     }
-    let mut flushed_rows: Vec<&Row> = union.rows.iter().collect();
-    let mut late_rows: Vec<&Row> = late.rows.iter().collect();
+    let mut flushed_rows: Vec<&Row> = union.rows.iter().map(|row| &**row).collect();
+    let mut late_rows: Vec<&Row> = late.rows.iter().map(|row| &**row).collect();
     flushed_rows.sort_by(|x, y| x.clustering.cmp(&y.clustering));
     late_rows.sort_by(|x, y| x.clustering.cmp(&y.clustering));
     flushed_rows
@@ -11480,10 +11523,12 @@ mod tests {
             vec![],
         );
         let key = make_key("retired");
-        store.write(&key, make_row(b"before", 10)).unwrap();
+        store
+            .write(&key, Arc::new(make_row(b"before", 10)))
+            .unwrap();
         store.retire_checked(MEMTABLE_SEAL_DEADLINE).unwrap();
         assert!(
-            store.write(&key, make_row(b"after", 20)).is_err(),
+            store.write(&key, Arc::new(make_row(b"after", 20))).is_err(),
             "checked retirement must close store write admission"
         );
         let retained = store.read(&key).unwrap().unwrap();
@@ -11502,7 +11547,9 @@ mod tests {
             vec![],
         );
         let key = make_key("retained");
-        store.write(&key, make_row(b"before", 10)).unwrap();
+        store
+            .write(&key, Arc::new(make_row(b"before", 10)))
+            .unwrap();
         store.retire_checked(MEMTABLE_SEAL_DEADLINE).unwrap();
         assert!(
             store.truncate().is_err(),
@@ -11533,7 +11580,7 @@ mod tests {
             "unconfirmed writer drain must not return success"
         );
         assert!(store
-            .write(&make_key("closed"), make_row(b"late", 20))
+            .write(&make_key("closed"), Arc::new(make_row(b"late", 20)))
             .is_err());
         store.retire_checked(MEMTABLE_SEAL_DEADLINE).unwrap();
     }
@@ -11576,7 +11623,7 @@ mod tests {
             // ticket still prevents retirement from certifying completion.
             let key = make_key("old-view-writer");
             store
-                .write_admitted(&view, &key, make_row(b"completed", 30))
+                .write_admitted(&view, &key, Arc::new(make_row(b"completed", 30)))
                 .unwrap();
             drop(ticket);
             if early.is_none() && !finished_before_release {
@@ -11655,7 +11702,9 @@ mod tests {
             vec![("val_idx".into(), 0)],
         );
         let key = make_key("key");
-        store.write(&key, make_row_with_ck(7, b"X", 10)).unwrap();
+        store
+            .write(&key, Arc::new(make_row_with_ck(7, b"X", 10)))
+            .unwrap();
         // Simulate an unsupported/corrupt persisted posting, not an accepted
         // empty clustering write. It must not trigger a whole partition read.
         store.get_memtable_index("val_idx").unwrap().insert(
@@ -11693,7 +11742,7 @@ mod tests {
         let key = make_key("key");
         let mut row = make_row(b"X", 10);
         row.clustering.clear();
-        store.write(&key, row).unwrap();
+        store.write(&key, Arc::new(row)).unwrap();
         let found = collect_keyed(
             &store,
             "val_idx",
@@ -11758,7 +11807,7 @@ mod tests {
             key: make_key(key),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![make_row(value, timestamp)],
+            rows: vec![Arc::new(make_row(value, timestamp))],
         }
     }
 
@@ -11941,12 +11990,15 @@ mod tests {
         store
             .write(
                 &crate::table_tombstone::table_tombstone_key(),
-                crate::table_tombstone::table_tombstone_row(marked_for_delete_at, 1_700_000_000),
+                Arc::new(crate::table_tombstone::table_tombstone_row(
+                    marked_for_delete_at,
+                    1_700_000_000,
+                )),
             )
             .expect("write the table tombstone");
     }
 
-    fn visible_rows(store: &TableStore<InMemoryFlushTarget>, key: &DecoratedKey) -> Vec<Row> {
+    fn visible_rows(store: &TableStore<InMemoryFlushTarget>, key: &DecoratedKey) -> Vec<Arc<Row>> {
         store
             .read_limited_rows(key, 0)
             .expect("read")
@@ -11960,10 +12012,10 @@ mod tests {
     fn table_tombstone_hides_rows_written_before_it_immediately() {
         let store = test_store();
         store
-            .write(&make_key("a"), make_row(b"before", 100))
+            .write(&make_key("a"), Arc::new(make_row(b"before", 100)))
             .unwrap();
         store
-            .write(&make_key("b"), make_row(b"before", 100))
+            .write(&make_key("b"), Arc::new(make_row(b"before", 100)))
             .unwrap();
         assert_eq!(visible_rows(&store, &make_key("a")).len(), 1);
 
@@ -11981,11 +12033,11 @@ mod tests {
     fn a_row_written_after_the_table_tombstone_survives() {
         let store = test_store();
         store
-            .write(&make_key("a"), make_row(b"before", 100))
+            .write(&make_key("a"), Arc::new(make_row(b"before", 100)))
             .unwrap();
         write_table_tombstone(&store, 200);
         store
-            .write(&make_key("a"), make_row(b"after", 300))
+            .write(&make_key("a"), Arc::new(make_row(b"after", 300)))
             .unwrap();
 
         let rows = visible_rows(&store, &make_key("a"));
@@ -11996,7 +12048,7 @@ mod tests {
         // row at exactly the tombstone timestamp survives (>= predicate).
         let store2 = test_store();
         store2
-            .write(&make_key("e"), make_row(b"edge", 200))
+            .write(&make_key("e"), Arc::new(make_row(b"edge", 200)))
             .unwrap();
         write_table_tombstone(&store2, 200);
         assert_eq!(
@@ -12016,14 +12068,14 @@ mod tests {
     fn a_stale_older_copy_cannot_resurrect_a_truncated_row() {
         let store = test_store();
         store
-            .write(&make_key("a"), make_row(b"before", 100))
+            .write(&make_key("a"), Arc::new(make_row(b"before", 100)))
             .unwrap();
         write_table_tombstone(&store, 200);
 
         // A stale replica's copy of the pre-truncate row, replayed at its original
         // older timestamp (what repair / read-repair would write back).
         store
-            .write(&make_key("a"), make_row(b"before", 100))
+            .write(&make_key("a"), Arc::new(make_row(b"before", 100)))
             .unwrap();
 
         assert!(
@@ -12038,7 +12090,7 @@ mod tests {
     fn without_a_table_tombstone_an_earlier_row_stays_visible() {
         let store = test_store();
         store
-            .write(&make_key("a"), make_row(b"before", 100))
+            .write(&make_key("a"), Arc::new(make_row(b"before", 100)))
             .unwrap();
         assert_eq!(
             visible_rows(&store, &make_key("a")).len(),
@@ -12053,10 +12105,10 @@ mod tests {
     fn table_tombstone_hides_rows_from_scans_and_counts() {
         let store = test_store();
         store
-            .write(&make_key("a"), make_row(b"before", 100))
+            .write(&make_key("a"), Arc::new(make_row(b"before", 100)))
             .unwrap();
         store
-            .write(&make_key("b"), make_row(b"before", 100))
+            .write(&make_key("b"), Arc::new(make_row(b"before", 100)))
             .unwrap();
         write_table_tombstone(&store, 200);
 
@@ -12105,7 +12157,10 @@ mod tests {
     fn add_index_backfills_existing_active_memtable_rows() {
         let store = test_store();
         store
-            .write(&make_key("before-index"), make_row(b"match", 1000))
+            .write(
+                &make_key("before-index"),
+                Arc::new(make_row(b"match", 1000)),
+            )
             .unwrap();
 
         let _rotation: FlushOutcome = store
@@ -12143,7 +12198,10 @@ mod tests {
                 std::thread::spawn(move || {
                     for i in 0..ROWS_PER_WRITER {
                         store
-                            .write(&make_key(&format!("w{w}-{i:04}")), make_row(b"v", 1000))
+                            .write(
+                                &make_key(&format!("w{w}-{i:04}")),
+                                Arc::new(make_row(b"v", 1000)),
+                            )
                             .unwrap();
                     }
                     done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -12192,7 +12250,7 @@ mod tests {
         // One more row, so the final flush publishes an SSTable whose memtable
         // was created after every DDL above.
         store
-            .write(&make_key("zz-last"), make_row(b"v", 1000))
+            .write(&make_key("zz-last"), Arc::new(make_row(b"v", 1000)))
             .unwrap();
         store.flush().unwrap();
 
@@ -12262,7 +12320,10 @@ mod tests {
                 std::thread::spawn(move || {
                     (0..ROWS_PER_WRITER).for_each(|i| {
                         store
-                            .write(&make_key(&format!("w{w}-{i:05}")), make_row(b"v", 1000))
+                            .write(
+                                &make_key(&format!("w{w}-{i:05}")),
+                                Arc::new(make_row(b"v", 1000)),
+                            )
                             .unwrap();
                     });
                     done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -12310,7 +12371,9 @@ mod tests {
     #[test]
     fn flushes_queued_behind_a_running_flush_coalesce_into_one_rotation() {
         let store = Arc::new(test_store());
-        store.write(&make_key("a"), make_row(b"v", 1000)).unwrap();
+        store
+            .write(&make_key("a"), Arc::new(make_row(b"v", 1000)))
+            .unwrap();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let first = {
@@ -12328,8 +12391,12 @@ mod tests {
             .unwrap();
         assert_eq!(store.rotations_started(), 1);
 
-        store.write(&make_key("b"), make_row(b"v", 1000)).unwrap();
-        store.write(&make_key("c"), make_row(b"v", 1000)).unwrap();
+        store
+            .write(&make_key("b"), Arc::new(make_row(b"v", 1000)))
+            .unwrap();
+        store
+            .write(&make_key("c"), Arc::new(make_row(b"v", 1000)))
+            .unwrap();
         let queued: Vec<_> = (0..2)
             .map(|_| {
                 let store = Arc::clone(&store);
@@ -12375,7 +12442,7 @@ mod tests {
             .add_index("idx_main".to_string(), 0, IndexType::BTree)
             .unwrap();
         store
-            .write(&make_key("first"), make_row(b"v", 1000))
+            .write(&make_key("first"), Arc::new(make_row(b"v", 1000)))
             .unwrap();
         store.flush().unwrap();
         let first_gen = store.view.load().sstable_ids[0].0.clone();
@@ -12386,7 +12453,10 @@ mod tests {
             std::thread::spawn(move || {
                 (0..ROUNDS).for_each(|i| {
                     store
-                        .write(&make_key(&format!("k{i:04}")), make_row(b"v", 1000))
+                        .write(
+                            &make_key(&format!("k{i:04}")),
+                            Arc::new(make_row(b"v", 1000)),
+                        )
                         .unwrap();
                     store.flush().unwrap();
                 });
@@ -12522,7 +12592,9 @@ mod tests {
         let _rotation: FlushOutcome = store
             .add_index("val_idx".to_string(), 0, IndexType::BTree)
             .unwrap();
-        store.write(&make_key("k"), make_row(b"v", 1000)).unwrap();
+        store
+            .write(&make_key("k"), Arc::new(make_row(b"v", 1000)))
+            .unwrap();
 
         let before_drop =
             collect_index_results(&store, "val_idx", &IndexKey(b"v".to_vec())).unwrap();
@@ -12578,7 +12650,9 @@ mod tests {
     #[test]
     fn generation_ids_name_the_sstables_the_store_holds() {
         let store = test_store();
-        store.write(&make_key("k1"), make_row(b"v", 1000)).unwrap();
+        store
+            .write(&make_key("k1"), Arc::new(make_row(b"v", 1000)))
+            .unwrap();
         store.flush().unwrap();
         // Generations do not stay dense. `advance_gen_past` is called on
         // recovery and around compaction output so new files cannot collide
@@ -12586,7 +12660,9 @@ mod tests {
         // set is {1, 1001} while the arithmetic guess covers {1000, 1001}:
         // one id that never existed, one real SSTable never named.
         store.advance_gen_past(1000);
-        store.write(&make_key("k2"), make_row(b"v", 2000)).unwrap();
+        store
+            .write(&make_key("k2"), Arc::new(make_row(b"v", 2000)))
+            .unwrap();
         store.flush().unwrap();
 
         assert!(
@@ -12638,14 +12714,24 @@ mod tests {
             vec![("val_idx".to_string(), 0_usize)],
         );
         // Sidecar: k3, k1. Memtable afterwards: k4, k2, and k1 again.
-        store.write(&make_key("k3"), make_row(b"v", 1000)).unwrap();
-        store.write(&make_key("k1"), make_row(b"v", 1000)).unwrap();
-        store.flush().unwrap();
-        store.write(&make_key("k4"), make_row(b"v", 2000)).unwrap();
-        store.write(&make_key("k2"), make_row(b"v", 2000)).unwrap();
-        store.write(&make_key("k1"), make_row(b"v", 2000)).unwrap();
         store
-            .write(&make_key("x9"), make_row(b"other", 2000))
+            .write(&make_key("k3"), Arc::new(make_row(b"v", 1000)))
+            .unwrap();
+        store
+            .write(&make_key("k1"), Arc::new(make_row(b"v", 1000)))
+            .unwrap();
+        store.flush().unwrap();
+        store
+            .write(&make_key("k4"), Arc::new(make_row(b"v", 2000)))
+            .unwrap();
+        store
+            .write(&make_key("k2"), Arc::new(make_row(b"v", 2000)))
+            .unwrap();
+        store
+            .write(&make_key("k1"), Arc::new(make_row(b"v", 2000)))
+            .unwrap();
+        store
+            .write(&make_key("x9"), Arc::new(make_row(b"other", 2000)))
             .unwrap();
 
         let key = IndexKey(b"v".to_vec());
@@ -12713,7 +12799,9 @@ mod tests {
             },
             vec![("val_idx".to_string(), 0_usize)],
         );
-        store.write(&make_key("k"), make_row(b"v", 1000)).unwrap();
+        store
+            .write(&make_key("k"), Arc::new(make_row(b"v", 1000)))
+            .unwrap();
         store.flush().unwrap();
 
         assert_eq!(
@@ -12785,7 +12873,7 @@ mod tests {
     }
 
     impl Memtable for SnapshotMemtable {
-        fn put(&self, _key: &DecoratedKey, _row: Row, _schema: &TableSchema) -> Result<()> {
+        fn put(&self, _key: &DecoratedKey, _row: Arc<Row>, _schema: &TableSchema) -> Result<()> {
             panic!("SnapshotMemtable is read-only and only used as a legacy flush snapshot")
         }
 
@@ -12848,7 +12936,7 @@ mod tests {
                 key: make_key("pk_bad"),
                 deletion: DeletionTime::LIVE,
                 static_row: None,
-                rows: vec![bad_row],
+                rows: vec![Arc::new(bad_row)],
             }],
         );
 
@@ -12969,7 +13057,7 @@ mod tests {
                 ..WriteOptions::default()
             },
         );
-        legacy.write(key, row).unwrap();
+        legacy.write(key, Arc::new(row)).unwrap();
         legacy.flush().unwrap();
 
         let legacy_view = legacy.view.load();
@@ -13191,22 +13279,34 @@ mod tests {
             store
                 .write(
                     &make_key("hot"),
-                    make_row_with_ck(ck, format!("flushed{ck}").as_bytes(), 1000 + ck as i64),
+                    Arc::new(make_row_with_ck(
+                        ck,
+                        format!("flushed{ck}").as_bytes(),
+                        1000 + ck as i64,
+                    )),
                 )
                 .unwrap();
         }
-        store.write(&make_key("aaa"), make_row(b"a", 1000)).unwrap();
+        store
+            .write(&make_key("aaa"), Arc::new(make_row(b"a", 1000)))
+            .unwrap();
         store.flush().unwrap();
         // Memtable half (newer ts on even cks — LWW must keep these).
         for ck in (0..40i32).filter(|c| c % 2 == 0) {
             store
                 .write(
                     &make_key("hot"),
-                    make_row_with_ck(ck, format!("memtable{ck}").as_bytes(), 5000 + ck as i64),
+                    Arc::new(make_row_with_ck(
+                        ck,
+                        format!("memtable{ck}").as_bytes(),
+                        5000 + ck as i64,
+                    )),
                 )
                 .unwrap();
         }
-        store.write(&make_key("zzz"), make_row(b"z", 1000)).unwrap();
+        store
+            .write(&make_key("zzz"), Arc::new(make_row(b"z", 1000)))
+            .unwrap();
 
         // Whole-partition reference.
         let mut whole_stream = store.range_iter(None, None);
@@ -13413,11 +13513,11 @@ mod tests {
         let mut keys: Vec<DecoratedKey> = (0..20).map(|i| make_key(&format!("k{i:02}"))).collect();
         keys.sort();
         for k in &keys[..10] {
-            store.write(k, make_row(b"disk", 1000)).unwrap();
+            store.write(k, Arc::new(make_row(b"disk", 1000))).unwrap();
         }
         store.flush().unwrap();
         for k in &keys[10..] {
-            store.write(k, make_row(b"mem", 1000)).unwrap();
+            store.write(k, Arc::new(make_row(b"mem", 1000))).unwrap();
         }
 
         let got: Vec<DecoratedKey> = store
@@ -13441,7 +13541,7 @@ mod tests {
         let store = test_store();
         for i in 0..5 {
             store
-                .write(&make_key(&format!("k{i}")), make_row(b"v", 1000))
+                .write(&make_key(&format!("k{i}")), Arc::new(make_row(b"v", 1000)))
                 .unwrap();
         }
 
@@ -13488,7 +13588,7 @@ mod tests {
             store
                 .write(
                     &make_composite_key(&[owner, &format!("s{i}")]),
-                    make_row(b"v", 1000 + i),
+                    Arc::new(make_row(b"v", 1000 + i)),
                 )
                 .unwrap();
         }
@@ -13526,7 +13626,10 @@ mod tests {
         const N: i64 = 50;
         for i in 0..N {
             store
-                .write(&make_key(&format!("k{i:04}")), make_row(b"v", 1000 + i))
+                .write(
+                    &make_key(&format!("k{i:04}")),
+                    Arc::new(make_row(b"v", 1000 + i)),
+                )
                 .unwrap();
         }
         // Repeat to expose any per-call nondeterminism (the live repro
@@ -13548,7 +13651,10 @@ mod tests {
         const N: i64 = 50;
         for i in 0..N {
             store
-                .write(&make_key(&format!("k{i:04}")), make_row(b"v", 1000 + i))
+                .write(
+                    &make_key(&format!("k{i:04}")),
+                    Arc::new(make_row(b"v", 1000 + i)),
+                )
                 .unwrap();
         }
         store.flush().unwrap();
@@ -13560,7 +13666,10 @@ mod tests {
         // Add N more distinct partitions into the fresh active memtable.
         for i in N..(2 * N) {
             store
-                .write(&make_key(&format!("k{i:04}")), make_row(b"v", 1000 + i))
+                .write(
+                    &make_key(&format!("k{i:04}")),
+                    Arc::new(make_row(b"v", 1000 + i)),
+                )
                 .unwrap();
         }
         assert_eq!(
@@ -13597,7 +13706,7 @@ mod tests {
                 // identity (pk+clustering) is unchanged.
                 let ts = 1000 + copy as i64;
                 store
-                    .write(&make_key("p0"), make_row_with_ck(ck, b"v", ts))
+                    .write(&make_key("p0"), Arc::new(make_row_with_ck(ck, b"v", ts)))
                     .unwrap();
             }
             store.flush().unwrap();
@@ -13671,9 +13780,9 @@ mod tests {
                 deletion: DeletionTime::LIVE,
                 static_row: None,
                 rows: vec![
-                    make_row_with_ck(1, b"v", ts),
-                    make_row_with_ck(2, b"v", ts),
-                    make_row_with_ck(3, b"v", ts),
+                    Arc::new(make_row_with_ck(1, b"v", ts)),
+                    Arc::new(make_row_with_ck(2, b"v", ts)),
+                    Arc::new(make_row_with_ck(3, b"v", ts)),
                 ],
             }]
         };
@@ -14060,7 +14169,9 @@ mod tests {
         let schema = test_schema();
         let key = make_key("k-resolvable");
 
-        store.write(&key, make_row(b"live", 2000)).unwrap();
+        store
+            .write(&key, Arc::new(make_row(b"live", 2000)))
+            .unwrap();
 
         let truncated = Arc::new(sstable_reader_from_partitions(
             &schema,
@@ -14864,7 +14975,9 @@ mod tests {
     fn write_then_read_from_memtable() {
         let store = test_store();
         let key = make_key("pk1");
-        store.write(&key, make_row(b"hello", 1000)).unwrap();
+        store
+            .write(&key, Arc::new(make_row(b"hello", 1000)))
+            .unwrap();
 
         let result = store.read(&key).unwrap();
         assert!(result.is_some(), "expected Some partition");
@@ -14895,11 +15008,15 @@ mod tests {
         assert_eq!(store.memtable_partition_count(), 0);
         assert_eq!(store.memtable_size(), 0);
 
-        store.write(&make_key("k1"), make_row(b"v1", 1000)).unwrap();
+        store
+            .write(&make_key("k1"), Arc::new(make_row(b"v1", 1000)))
+            .unwrap();
         assert_eq!(store.memtable_partition_count(), 1);
         assert!(store.memtable_size() > 0);
 
-        store.write(&make_key("k2"), make_row(b"v2", 1000)).unwrap();
+        store
+            .write(&make_key("k2"), Arc::new(make_row(b"v2", 1000)))
+            .unwrap();
         assert_eq!(store.memtable_partition_count(), 2);
     }
 
@@ -14909,7 +15026,9 @@ mod tests {
     #[test]
     fn flush_creates_sstable() {
         let store = test_store();
-        store.write(&make_key("k1"), make_row(b"v1", 1000)).unwrap();
+        store
+            .write(&make_key("k1"), Arc::new(make_row(b"v1", 1000)))
+            .unwrap();
         assert_eq!(store.sstable_count(), 0);
 
         store.flush().unwrap();
@@ -14943,7 +15062,11 @@ mod tests {
             store
                 .write(
                     &key,
-                    make_row_with_ck(i as i32, format!("r{i}").as_bytes(), i as i64 + 1),
+                    Arc::new(make_row_with_ck(
+                        i as i32,
+                        format!("r{i}").as_bytes(),
+                        i as i64 + 1,
+                    )),
                 )
                 .unwrap();
         }
@@ -14971,15 +15094,15 @@ mod tests {
             key: key.clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![make_row_with_ck(1, b"before", 1000)],
+            rows: vec![Arc::new(make_row_with_ck(1, b"before", 1000))],
         };
         let late_same_key = Partition {
             key: key.clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
             rows: vec![
-                make_row_with_ck(1, b"before", 1000),
-                make_row_with_ck(2, b"late", 2000),
+                Arc::new(make_row_with_ck(1, b"before", 1000)),
+                Arc::new(make_row_with_ck(2, b"late", 2000)),
             ],
         };
         let flushed_by_key = std::collections::BTreeMap::from([(key.clone(), &flushed)]);
@@ -14997,7 +15120,7 @@ mod tests {
             key: key.clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![make_row_with_ck(1, b"before", 1000)],
+            rows: vec![Arc::new(make_row_with_ck(1, b"before", 1000))],
         };
         let flushed_by_key = std::collections::BTreeMap::from([(key.clone(), &flushed)]);
 
@@ -15014,7 +15137,9 @@ mod tests {
     fn read_after_flush_finds_partition() {
         let store = test_store();
         let key = make_key("pk_flushed");
-        store.write(&key, make_row(b"flushed_val", 2000)).unwrap();
+        store
+            .write(&key, Arc::new(make_row(b"flushed_val", 2000)))
+            .unwrap();
         store.flush().unwrap();
 
         let result = store.read(&key).unwrap();
@@ -15035,11 +15160,15 @@ mod tests {
         let key = make_key("shared_key");
 
         // Write old value and flush to SSTable.
-        store.write(&key, make_row(b"old_val", 1000)).unwrap();
+        store
+            .write(&key, Arc::new(make_row(b"old_val", 1000)))
+            .unwrap();
         store.flush().unwrap();
 
         // Write newer value — stays in memtable.
-        store.write(&key, make_row(b"new_val", 2000)).unwrap();
+        store
+            .write(&key, Arc::new(make_row(b"new_val", 2000)))
+            .unwrap();
 
         let result = store.read(&key).unwrap();
         assert!(result.is_some());
@@ -15060,12 +15189,16 @@ mod tests {
         let store = test_store();
 
         // First flush: k1
-        store.write(&make_key("k1"), make_row(b"v1", 1000)).unwrap();
+        store
+            .write(&make_key("k1"), Arc::new(make_row(b"v1", 1000)))
+            .unwrap();
         store.flush().unwrap();
         assert_eq!(store.sstable_count(), 1);
 
         // Second flush: k2
-        store.write(&make_key("k2"), make_row(b"v2", 2000)).unwrap();
+        store
+            .write(&make_key("k2"), Arc::new(make_row(b"v2", 2000)))
+            .unwrap();
         store.flush().unwrap();
         assert_eq!(store.sstable_count(), 2);
 
@@ -15090,7 +15223,7 @@ mod tests {
         let store = test_store();
         let key = make_key("k1");
 
-        store.write(&key, make_row(b"v1", 1000)).unwrap();
+        store.write(&key, Arc::new(make_row(b"v1", 1000))).unwrap();
         store.flush().unwrap();
 
         let view = store.view.load();
@@ -15110,7 +15243,7 @@ mod tests {
         for i in 0..5 {
             let key = make_key(&format!("k{i}"));
             store
-                .write(&key, make_row(format!("v{i}").as_bytes(), 1000))
+                .write(&key, Arc::new(make_row(format!("v{i}").as_bytes(), 1000)))
                 .unwrap();
         }
 
@@ -15130,7 +15263,7 @@ mod tests {
         let store = test_store();
         for i in 0..10 {
             store
-                .write(&make_key(&format!("k{i}")), make_row(b"v", 1000))
+                .write(&make_key(&format!("k{i}")), Arc::new(make_row(b"v", 1000)))
                 .unwrap();
         }
         let results = store.read_range(None, None, 3).unwrap();
@@ -15197,7 +15330,7 @@ mod tests {
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };
 
-        store.write(&key, row).unwrap();
+        store.write(&key, Arc::new(row)).unwrap();
 
         // The memtable index should contain the email value
         let index = store
@@ -15255,8 +15388,8 @@ mod tests {
             primary_key_liveness: LivenessInfo::with_timestamp(2000),
         };
 
-        store.write(&make_key("user1"), row1).unwrap();
-        store.write(&make_key("user2"), row2).unwrap();
+        store.write(&make_key("user1"), Arc::new(row1)).unwrap();
+        store.write(&make_key("user2"), Arc::new(row2)).unwrap();
 
         let index = store
             .get_memtable_index("city_idx")
@@ -15310,7 +15443,7 @@ mod tests {
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };
 
-        store.write(&make_key("user1"), row).unwrap();
+        store.write(&make_key("user1"), Arc::new(row)).unwrap();
 
         let index = store
             .get_memtable_index("val_idx")
@@ -15359,7 +15492,7 @@ mod tests {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };
-        store.write(&make_key("user1"), row).unwrap();
+        store.write(&make_key("user1"), Arc::new(row)).unwrap();
 
         // Verify index has the entry before flush
         let pre_flush_index = store
@@ -15394,7 +15527,9 @@ mod tests {
         // The original `new()` constructor should still work identically
         let store = test_store();
         let key = make_key("pk1");
-        store.write(&key, make_row(b"hello", 1000)).unwrap();
+        store
+            .write(&key, Arc::new(make_row(b"hello", 1000)))
+            .unwrap();
 
         let result = store.read(&key).unwrap();
         assert!(result.is_some());
@@ -15415,7 +15550,7 @@ mod tests {
             store
                 .write(
                     &make_key(&format!("k{i}")),
-                    make_row(format!("v{i}").as_bytes(), i as i64 * 1000),
+                    Arc::new(make_row(format!("v{i}").as_bytes(), i as i64 * 1000)),
                 )
                 .unwrap();
             store.flush().unwrap();
@@ -15424,7 +15559,7 @@ mod tests {
 
         // Create a new SSTable to be the compaction output (flush a new entry).
         store
-            .write(&make_key("compacted"), make_row(b"merged", 9000))
+            .write(&make_key("compacted"), Arc::new(make_row(b"merged", 9000)))
             .unwrap();
         store.flush().unwrap();
         let view = store.view.load();
@@ -15481,7 +15616,7 @@ mod tests {
             .add_index("idx_main".to_string(), 0, IndexType::BTree)
             .unwrap();
         store
-            .write(&make_key("before"), make_row(b"v", 1000))
+            .write(&make_key("before"), Arc::new(make_row(b"v", 1000)))
             .unwrap();
 
         let (rotated_tx, rotated_rx) = std::sync::mpsc::channel();
@@ -15520,9 +15655,13 @@ mod tests {
     #[test]
     fn a_compaction_swap_after_truncate_does_not_resurrect_rows() {
         let store = test_store();
-        store.write(&make_key("a"), make_row(b"va", 1000)).unwrap();
+        store
+            .write(&make_key("a"), Arc::new(make_row(b"va", 1000)))
+            .unwrap();
         store.flush().unwrap();
-        store.write(&make_key("b"), make_row(b"vb", 2000)).unwrap();
+        store
+            .write(&make_key("b"), Arc::new(make_row(b"vb", 2000)))
+            .unwrap();
         store.flush().unwrap();
         let inputs: Vec<(String, std::path::PathBuf)> =
             store.view.load().sstable_ids.iter().cloned().collect();
@@ -15576,7 +15715,7 @@ mod tests {
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
             primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(100),
         };
-        store.write(&key, row1).unwrap();
+        store.write(&key, Arc::new(row1)).unwrap();
         store.flush().unwrap();
 
         // Batch 2: write row with DIFFERENT clustering key "ck2" to SAME partition.
@@ -15586,7 +15725,7 @@ mod tests {
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
             primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(200),
         };
-        store.write(&key, row2).unwrap();
+        store.write(&key, Arc::new(row2)).unwrap();
         store.flush().unwrap();
 
         // Read: BOTH rows must be present.
@@ -15621,7 +15760,7 @@ mod tests {
                 deletion: ferrosa_sstable::types::DeletionTime::LIVE,
                 primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1000),
             };
-            store.write(&key, row).unwrap();
+            store.write(&key, Arc::new(row)).unwrap();
         }
         store.flush().unwrap();
 
@@ -15637,7 +15776,7 @@ mod tests {
                 deletion: ferrosa_sstable::types::DeletionTime::LIVE,
                 primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(2000),
             };
-            store.write(&key, row).unwrap();
+            store.write(&key, Arc::new(row)).unwrap();
         }
         store.flush().unwrap();
 
@@ -15679,7 +15818,11 @@ mod tests {
             store
                 .write(
                     &key,
-                    make_row_with_ck(ck, format!("batch1-{ck}").as_bytes(), 1000 + ck as i64),
+                    Arc::new(make_row_with_ck(
+                        ck,
+                        format!("batch1-{ck}").as_bytes(),
+                        1000 + ck as i64,
+                    )),
                 )
                 .unwrap();
         }
@@ -15689,7 +15832,11 @@ mod tests {
             store
                 .write(
                     &key,
-                    make_row_with_ck(ck, format!("batch2-{ck}").as_bytes(), 2000 + ck as i64),
+                    Arc::new(make_row_with_ck(
+                        ck,
+                        format!("batch2-{ck}").as_bytes(),
+                        2000 + ck as i64,
+                    )),
                 )
                 .unwrap();
         }
@@ -15714,7 +15861,11 @@ mod tests {
             store
                 .write(
                     &key,
-                    make_row_with_ck(ck, format!("mem-{ck}").as_bytes(), 1000 + ck as i64),
+                    Arc::new(make_row_with_ck(
+                        ck,
+                        format!("mem-{ck}").as_bytes(),
+                        1000 + ck as i64,
+                    )),
                 )
                 .unwrap();
         }
@@ -15738,14 +15889,14 @@ mod tests {
             store
                 .write(
                     &key,
-                    make_row_with_ck(ck, format!("sst-{ck}").as_bytes(), 1000),
+                    Arc::new(make_row_with_ck(ck, format!("sst-{ck}").as_bytes(), 1000)),
                 )
                 .unwrap();
         }
         store.flush().unwrap();
 
         store
-            .write(&key, make_row_with_ck(42, b"mem-newer", 2000))
+            .write(&key, Arc::new(make_row_with_ck(42, b"mem-newer", 2000)))
             .unwrap();
 
         let partition = store
@@ -15775,9 +15926,13 @@ mod tests {
         let store = test_store();
 
         // Flush 2 SSTables — they get PathBuf::new() in the view.
-        store.write(&make_key("a"), make_row(b"val_a", 1)).unwrap();
+        store
+            .write(&make_key("a"), Arc::new(make_row(b"val_a", 1)))
+            .unwrap();
         store.flush().unwrap();
-        store.write(&make_key("b"), make_row(b"val_b", 2)).unwrap();
+        store
+            .write(&make_key("b"), Arc::new(make_row(b"val_b", 2)))
+            .unwrap();
         store.flush().unwrap();
         assert_eq!(store.sstable_count(), 2);
 
@@ -15797,7 +15952,7 @@ mod tests {
 
         // Create a compaction output SSTable.
         store
-            .write(&make_key("merged"), make_row(b"merged", 3))
+            .write(&make_key("merged"), Arc::new(make_row(b"merged", 3)))
             .unwrap();
         store.flush().unwrap();
         let view = store.view.load();
@@ -15873,24 +16028,24 @@ mod tests {
         store
             .write(
                 &make_key("user1"),
-                Row {
+                Arc::new(Row {
                     clustering: vec![0x00, 0x00, 0x00, 0x01],
                     cells: vec![(0, CellValue::live(b"alice@test.com".to_vec(), 1000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                },
+                }),
             )
             .unwrap();
 
         store
             .write(
                 &make_key("user2"),
-                Row {
+                Arc::new(Row {
                     clustering: vec![0x00, 0x00, 0x00, 0x01],
                     cells: vec![(0, CellValue::live(b"bob@test.com".to_vec(), 1000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                },
+                }),
             )
             .unwrap();
 
@@ -15951,12 +16106,12 @@ mod tests {
             store
                 .write(
                     &make_key(&format!("edge-{i:06}")),
-                    Row {
+                    Arc::new(Row {
                         clustering: vec![0x00, 0x00, 0x00, 0x01],
                         cells: vec![(0, CellValue::live(b"t-1".to_vec(), 1000))],
                         deletion: DeletionTime::LIVE,
                         primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                    },
+                    }),
                 )
                 .unwrap();
         }
@@ -16004,24 +16159,24 @@ mod tests {
         store
             .write(
                 &make_key("user1"),
-                Row {
+                Arc::new(Row {
                     clustering: vec![0x00, 0x00, 0x00, 0x01],
                     cells: vec![(0, CellValue::live(b"NYC".to_vec(), 1000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                },
+                }),
             )
             .unwrap();
 
         store
             .write(
                 &make_key("user2"),
-                Row {
+                Arc::new(Row {
                     clustering: vec![0x00, 0x00, 0x00, 0x01],
                     cells: vec![(0, CellValue::live(b"NYC".to_vec(), 2000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(2000),
-                },
+                }),
             )
             .unwrap();
 
@@ -16040,7 +16195,9 @@ mod tests {
     fn read_by_index_unknown_index_is_refused_not_empty() {
         use ferrosa_index::IndexKey;
         let store = test_store();
-        store.write(&make_key("k"), make_row(b"v", 1000)).unwrap();
+        store
+            .write(&make_key("k"), Arc::new(make_row(b"v", 1000)))
+            .unwrap();
         let err = collect_index_results(&store, "nonexistent_idx", &IndexKey(b"anything".to_vec()))
             .expect_err("an undeclared index must not answer with zero rows");
         assert!(
@@ -16100,12 +16257,12 @@ mod tests {
         store
             .write(
                 &key,
-                Row {
+                Arc::new(Row {
                     clustering: vec![],
                     cells: vec![(0, CellValue::live(geo_tuple_bytes(lat, lon), 1000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                },
+                }),
             )
             .unwrap();
     }
@@ -16199,15 +16356,19 @@ mod tests {
         let other = make_key("other");
         let total = 10_001_i32;
         for ck in 0..total {
-            store.write(&hot, make_row_with_ck(ck, b"X", 10)).unwrap();
+            store
+                .write(&hot, Arc::new(make_row_with_ck(ck, b"X", 10)))
+                .unwrap();
             if ck == total / 2 {
                 // Half the postings come from a sidecar, half from the memtable.
                 store.flush().unwrap();
             }
         }
-        store.write(&other, make_row_with_ck(1, b"X", 10)).unwrap();
         store
-            .write(&hot, make_row_with_ck(total, b"Y", 10))
+            .write(&other, Arc::new(make_row_with_ck(1, b"X", 10)))
+            .unwrap();
+        store
+            .write(&hot, Arc::new(make_row_with_ck(total, b"Y", 10)))
             .unwrap();
 
         let delivered = keyed_rows(&store, "val_idx", b"X", hot.key.as_bytes(), None)
@@ -16236,7 +16397,9 @@ mod tests {
         let store = keyed_val_store();
         let hot = make_key("hot");
         for ck in 0..500 {
-            store.write(&hot, make_row_with_ck(ck, b"X", 10)).unwrap();
+            store
+                .write(&hot, Arc::new(make_row_with_ck(ck, b"X", 10)))
+                .unwrap();
         }
         INDEX_POINT_READS.with(|count| count.set(0));
         let mut seen = 0;
@@ -16345,7 +16508,7 @@ mod tests {
         store
             .write(
                 &key,
-                Row {
+                Arc::new(Row {
                     clustering: vec![],
                     cells: vec![(
                         0,
@@ -16353,19 +16516,19 @@ mod tests {
                     )],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(2000),
-                },
+                }),
             )
             .unwrap();
         let key = make_key("left");
         store
             .write(
                 &key,
-                Row {
+                Arc::new(Row {
                     clustering: vec![],
                     cells: vec![(0, CellValue::live(geo_tuple_bytes(40.7580, -73.9855), 2000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(2000),
-                },
+                }),
             )
             .unwrap();
         let keys = geo_keys(&store, &geo_cover(37.7955, -122.3937, 3000.0)).unwrap();
@@ -16443,7 +16606,7 @@ mod tests {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };
-        store.write(&key, row).unwrap();
+        store.write(&key, Arc::new(row)).unwrap();
 
         // Index should be empty (tombstone not indexed)
         let idx = store.get_memtable_index("email_idx").unwrap();
@@ -16500,7 +16663,7 @@ mod tests {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };
-        store.write(&key, row).unwrap();
+        store.write(&key, Arc::new(row)).unwrap();
 
         // Index should be empty — indexed column was not present
         let idx = store.get_memtable_index("email_idx").unwrap();
@@ -16549,12 +16712,12 @@ mod tests {
         store
             .write(
                 &make_key("user1"),
-                Row {
+                Arc::new(Row {
                     clustering: vec![0x00, 0x00, 0x00, 0x01],
                     cells: vec![(0, CellValue::live(b"NYC".to_vec(), 1000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                },
+                }),
             )
             .unwrap();
         store.flush().unwrap();
@@ -16611,12 +16774,12 @@ mod tests {
         store
             .write(
                 &make_key("user1"),
-                Row {
+                Arc::new(Row {
                     clustering: vec![0x00, 0x00, 0x00, 0x01],
                     cells: vec![(0, CellValue::live(b"NYC".to_vec(), 1000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                },
+                }),
             )
             .unwrap();
         store.flush().unwrap();
@@ -16625,12 +16788,12 @@ mod tests {
         store
             .write(
                 &make_key("user2"),
-                Row {
+                Arc::new(Row {
                     clustering: vec![0x00, 0x00, 0x00, 0x01],
                     cells: vec![(0, CellValue::live(b"NYC".to_vec(), 2000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(2000),
-                },
+                }),
             )
             .unwrap();
 
@@ -16687,12 +16850,12 @@ mod tests {
         store
             .write(
                 &make_key("user1"),
-                Row {
+                Arc::new(Row {
                     clustering: vec![0x00, 0x00, 0x00, 0x01],
                     cells: vec![(0, CellValue::live(b"John".to_vec(), 1000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                },
+                }),
             )
             .unwrap();
 
@@ -16759,13 +16922,13 @@ mod tests {
         store
             .write(
                 &make_key("user1"),
-                Row {
+                Arc::new(Row {
                     clustering: vec![0x00, 0x00, 0x00, 0x01],
                     // Post-ALTER layout: cell ordinal 1 is "name".
                     cells: vec![(1, CellValue::live(b"John".to_vec(), 1000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                },
+                }),
             )
             .unwrap();
 
@@ -16813,12 +16976,12 @@ mod tests {
         store
             .write(
                 &make_key("user1"),
-                Row {
+                Arc::new(Row {
                     clustering: vec![0x00, 0x00, 0x00, 0x01],
                     cells: vec![(0, CellValue::live(b"John".to_vec(), 1000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                },
+                }),
             )
             .unwrap();
         store.flush().unwrap();
@@ -16879,12 +17042,12 @@ mod tests {
         store
             .write(
                 &make_key("user1"),
-                Row {
+                Arc::new(Row {
                     clustering: vec![0x00, 0x00, 0x00, 0x01],
                     cells: vec![(0, CellValue::live(b"John".to_vec(), 1000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                },
+                }),
             )
             .unwrap();
         store.flush().unwrap();
@@ -16905,8 +17068,12 @@ mod tests {
     #[test]
     fn sstable_metadata_reports_nonzero_size() {
         let store = test_store();
-        store.write(&make_key("k1"), make_row(b"v1", 1000)).unwrap();
-        store.write(&make_key("k2"), make_row(b"v2", 2000)).unwrap();
+        store
+            .write(&make_key("k1"), Arc::new(make_row(b"v1", 1000)))
+            .unwrap();
+        store
+            .write(&make_key("k2"), Arc::new(make_row(b"v2", 2000)))
+            .unwrap();
         store.flush().unwrap();
 
         let table_dir = std::path::Path::new("/tmp/test_sstables");
@@ -16930,7 +17097,7 @@ mod tests {
             store
                 .write(
                     &make_key(&format!("bounded-{index:03}")),
-                    make_row(b"x", index as i64 + 1),
+                    Arc::new(make_row(b"x", index as i64 + 1)),
                 )
                 .unwrap();
             store.flush().unwrap();
@@ -16958,13 +17125,13 @@ mod tests {
 
         // Write multiple partitions with distinct keys to ensure different tokens
         store
-            .write(&make_key("alpha"), make_row(b"v1", 1000))
+            .write(&make_key("alpha"), Arc::new(make_row(b"v1", 1000)))
             .unwrap();
         store
-            .write(&make_key("beta"), make_row(b"v2", 2000))
+            .write(&make_key("beta"), Arc::new(make_row(b"v2", 2000)))
             .unwrap();
         store
-            .write(&make_key("gamma"), make_row(b"v3", 3000))
+            .write(&make_key("gamma"), Arc::new(make_row(b"v3", 3000)))
             .unwrap();
         store.flush().unwrap();
 
@@ -17014,7 +17181,7 @@ mod tests {
         store
             .write(
                 &make_key("still-readable-through-open-fd"),
-                make_row(b"v1", 1000),
+                Arc::new(make_row(b"v1", 1000)),
             )
             .unwrap();
         store.flush().unwrap();
@@ -17052,7 +17219,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = file_backed_test_store(tmp.path());
         store
-            .write(&make_key("evicted-planning"), make_row(b"v1", 1000))
+            .write(
+                &make_key("evicted-planning"),
+                Arc::new(make_row(b"v1", 1000)),
+            )
             .unwrap();
         store.flush().unwrap();
         let gen = store.last_flush_generation();
@@ -17107,7 +17277,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = file_backed_test_store(tmp.path());
         store
-            .write(&make_key("unplannable"), make_row(b"v1", 1000))
+            .write(&make_key("unplannable"), Arc::new(make_row(b"v1", 1000)))
             .unwrap();
         store.flush().unwrap();
         let gen = store.last_flush_generation();
@@ -17302,9 +17472,15 @@ mod tests {
     #[test]
     fn sstable_metadata_reports_max_timestamp() {
         let store = test_store();
-        store.write(&make_key("k1"), make_row(b"v1", 5000)).unwrap();
-        store.write(&make_key("k2"), make_row(b"v2", 3000)).unwrap();
-        store.write(&make_key("k3"), make_row(b"v3", 7000)).unwrap();
+        store
+            .write(&make_key("k1"), Arc::new(make_row(b"v1", 5000)))
+            .unwrap();
+        store
+            .write(&make_key("k2"), Arc::new(make_row(b"v2", 3000)))
+            .unwrap();
+        store
+            .write(&make_key("k3"), Arc::new(make_row(b"v3", 7000)))
+            .unwrap();
         store.flush().unwrap();
 
         let table_dir = std::path::Path::new("/tmp/test_sstables");
@@ -17444,13 +17620,22 @@ mod tests {
             .unwrap();
 
         store
-            .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+            .write(
+                &make_key("k0"),
+                Arc::new(make_vector_row(&[1.0, 0.0, 0.0], 1000)),
+            )
             .unwrap();
         store
-            .write(&make_key("k1"), make_vector_row(&[0.9, 0.1, 0.0], 1001))
+            .write(
+                &make_key("k1"),
+                Arc::new(make_vector_row(&[0.9, 0.1, 0.0], 1001)),
+            )
             .unwrap();
         store
-            .write(&make_key("k2"), make_vector_row(&[0.0, 1.0, 0.0], 1002))
+            .write(
+                &make_key("k2"),
+                Arc::new(make_vector_row(&[0.0, 1.0, 0.0], 1002)),
+            )
             .unwrap();
         store.flush().unwrap();
 
@@ -17517,7 +17702,7 @@ mod tests {
                 key: make_key(&format!("key{i}")),
                 deletion: ferrosa_sstable::types::DeletionTime::LIVE,
                 static_row: None,
-                rows: vec![make_row(b"value", 1000)],
+                rows: vec![Arc::new(make_row(b"value", 1000))],
             })
             .collect();
         partitions.sort_by(|a, b| a.key.cmp(&b.key));
@@ -17572,8 +17757,10 @@ mod tests {
                     static_row: None,
                     rows: Vec::new(),
                 };
-                p.rows
-                    .push(make_row(format!("val{i:05}").as_bytes(), 1000 + i));
+                p.rows.push(Arc::new(make_row(
+                    format!("val{i:05}").as_bytes(),
+                    1000 + i,
+                )));
                 p
             })
             .collect();
@@ -17638,7 +17825,10 @@ mod tests {
             let key = format!("key{i:05}");
             let val = format!("val{i:05}");
             store
-                .write(&make_key(&key), make_row(val.as_bytes(), 1000 + i as i64))
+                .write(
+                    &make_key(&key),
+                    Arc::new(make_row(val.as_bytes(), 1000 + i as i64)),
+                )
                 .unwrap();
         }
 
@@ -17708,13 +17898,13 @@ mod tests {
         store
             .write(
                 &make_key("flushed-0"),
-                make_vector_row(&[0.0, 1.0, 0.0], 1000),
+                Arc::new(make_vector_row(&[0.0, 1.0, 0.0], 1000)),
             )
             .unwrap();
         store
             .write(
                 &make_key("flushed-1"),
-                make_vector_row(&[0.0, 0.0, 1.0], 1001),
+                Arc::new(make_vector_row(&[0.0, 0.0, 1.0], 1001)),
             )
             .unwrap();
         store.flush().unwrap();
@@ -17725,7 +17915,7 @@ mod tests {
         store
             .write(
                 &make_key("active-exact"),
-                make_vector_row(&[1.0, 0.0, 0.0], 1002),
+                Arc::new(make_vector_row(&[1.0, 0.0, 0.0], 1002)),
             )
             .unwrap();
 
@@ -17768,13 +17958,22 @@ mod tests {
         //   k1 = [0.9, 0.1, 0.0]   small distance
         //   k2 = [0.0, 1.0, 0.0]   larger distance
         store
-            .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+            .write(
+                &make_key("k0"),
+                Arc::new(make_vector_row(&[1.0, 0.0, 0.0], 1000)),
+            )
             .unwrap();
         store
-            .write(&make_key("k1"), make_vector_row(&[0.9, 0.1, 0.0], 1001))
+            .write(
+                &make_key("k1"),
+                Arc::new(make_vector_row(&[0.9, 0.1, 0.0], 1001)),
+            )
             .unwrap();
         store
-            .write(&make_key("k2"), make_vector_row(&[0.0, 1.0, 0.0], 1002))
+            .write(
+                &make_key("k2"),
+                Arc::new(make_vector_row(&[0.0, 1.0, 0.0], 1002)),
+            )
             .unwrap();
 
         // Flush: this should drain the VectorMemtableIndex and persist a
@@ -17849,7 +18048,10 @@ mod tests {
             })
             .unwrap();
         store
-            .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+            .write(
+                &make_key("k0"),
+                Arc::new(make_vector_row(&[1.0, 0.0, 0.0], 1000)),
+            )
             .unwrap();
 
         let (rotated_tx, rotated_rx) = std::sync::mpsc::channel();
@@ -17902,10 +18104,16 @@ mod tests {
             },
         );
         store
-            .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+            .write(
+                &make_key("k0"),
+                Arc::new(make_vector_row(&[1.0, 0.0, 0.0], 1000)),
+            )
             .unwrap();
         store
-            .write(&make_key("k1"), make_vector_row(&[0.0, 1.0, 0.0], 1001))
+            .write(
+                &make_key("k1"),
+                Arc::new(make_vector_row(&[0.0, 1.0, 0.0], 1001)),
+            )
             .unwrap();
         let _rotation: FlushOutcome = store
             .add_vector_index(VectorIndexConfig {
@@ -17951,7 +18159,7 @@ mod tests {
             .unwrap();
         for (key, vector) in [("k0", [1.0, 0.0, 0.0]), ("k1", [0.0, 1.0, 0.0])] {
             store
-                .write(&make_key(key), make_vector_row(&vector, 1000))
+                .write(&make_key(key), Arc::new(make_vector_row(&vector, 1000)))
                 .unwrap();
         }
         store.flush().unwrap();
@@ -17995,7 +18203,7 @@ mod tests {
         );
         for (key, vector) in [("k0", [1.0, 0.0, 0.0]), ("k1", [0.0, 1.0, 0.0])] {
             store
-                .write(&make_key(key), make_vector_row(&vector, 1000))
+                .write(&make_key(key), Arc::new(make_vector_row(&vector, 1000)))
                 .unwrap();
         }
         store.flush().unwrap();
@@ -18076,13 +18284,22 @@ mod tests {
 
         // k0 is the exact match for the query, k1 close, k2 far.
         store
-            .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+            .write(
+                &make_key("k0"),
+                Arc::new(make_vector_row(&[1.0, 0.0, 0.0], 1000)),
+            )
             .unwrap();
         store
-            .write(&make_key("k1"), make_vector_row(&[0.9, 0.1, 0.0], 1001))
+            .write(
+                &make_key("k1"),
+                Arc::new(make_vector_row(&[0.9, 0.1, 0.0], 1001)),
+            )
             .unwrap();
         store
-            .write(&make_key("k2"), make_vector_row(&[0.0, 1.0, 0.0], 1002))
+            .write(
+                &make_key("k2"),
+                Arc::new(make_vector_row(&[0.0, 1.0, 0.0], 1002)),
+            )
             .unwrap();
 
         let partitions = store
@@ -18119,10 +18336,16 @@ mod tests {
             );
 
             store
-                .write(&make_key("near"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+                .write(
+                    &make_key("near"),
+                    Arc::new(make_vector_row(&[1.0, 0.0, 0.0], 1000)),
+                )
                 .unwrap();
             store
-                .write(&make_key("far"), make_vector_row(&[0.0, 1.0, 0.0], 1001))
+                .write(
+                    &make_key("far"),
+                    Arc::new(make_vector_row(&[0.0, 1.0, 0.0], 1001)),
+                )
                 .unwrap();
 
             let config = VectorIndexConfig {
@@ -18169,10 +18392,16 @@ mod tests {
             .unwrap();
 
         store
-            .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+            .write(
+                &make_key("k0"),
+                Arc::new(make_vector_row(&[1.0, 0.0, 0.0], 1000)),
+            )
             .unwrap();
         store
-            .write(&make_key("k1"), make_vector_row(&[0.0, 1.0, 0.0], 1001))
+            .write(
+                &make_key("k1"),
+                Arc::new(make_vector_row(&[0.0, 1.0, 0.0], 1001)),
+            )
             .unwrap();
         // Flush moves the vectors into the persisted (scoped) sidecars; the row
         // payloads live in the SSTable. The index-consult path must still recover
@@ -18209,11 +18438,17 @@ mod tests {
             .unwrap();
 
         store
-            .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+            .write(
+                &make_key("k0"),
+                Arc::new(make_vector_row(&[1.0, 0.0, 0.0], 1000)),
+            )
             .unwrap();
         store.flush().unwrap();
         store
-            .write(&make_key("k1"), make_vector_row(&[0.9, 0.1, 0.0], 1001))
+            .write(
+                &make_key("k1"),
+                Arc::new(make_vector_row(&[0.9, 0.1, 0.0], 1001)),
+            )
             .unwrap();
         store.flush().unwrap();
 
@@ -18256,10 +18491,10 @@ mod tests {
         let scope_a = make_key("tenant-a|session-1");
         let scope_b = make_key("tenant-b|session-1");
         store
-            .write(&scope_a, make_vector_row(&[0.0, 1.0, 0.0], 1000))
+            .write(&scope_a, Arc::new(make_vector_row(&[0.0, 1.0, 0.0], 1000)))
             .unwrap();
         store
-            .write(&scope_b, make_vector_row(&[1.0, 0.0, 0.0], 1001))
+            .write(&scope_b, Arc::new(make_vector_row(&[1.0, 0.0, 0.0], 1001)))
             .unwrap();
 
         let query = [1.0, 0.0, 0.0];
@@ -18315,12 +18550,15 @@ mod tests {
         let scope_a = make_key("tenant-a|session-1");
         let scope_b = make_key("tenant-b|session-1");
         store
-            .write(&scope_a, make_vector_row(&[0.0, 1.0, 0.0], 1000))
+            .write(&scope_a, Arc::new(make_vector_row(&[0.0, 1.0, 0.0], 1000)))
             .unwrap();
         for i in 0..16 {
             let x = 1.0 - (i as f32 * 0.01);
             store
-                .write(&scope_b, make_vector_row(&[x, 0.0, 0.0], 2000 + i))
+                .write(
+                    &scope_b,
+                    Arc::new(make_vector_row(&[x, 0.0, 0.0], 2000 + i)),
+                )
                 .unwrap();
         }
         store.flush().unwrap();
@@ -18400,12 +18638,12 @@ mod tests {
         store
             .write(
                 &key,
-                Row {
+                Arc::new(Row {
                     clustering: clustering.clone(),
                     cells: vec![(0, CellValue::live(b"compile-project".to_vec(), 1000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                },
+                }),
             )
             .unwrap();
         assert!(
@@ -18422,12 +18660,12 @@ mod tests {
         store
             .write(
                 &key,
-                Row {
+                Arc::new(Row {
                     clustering: clustering.clone(),
                     cells: vec![(1, CellValue::live(embedding.clone(), 2000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(2000),
-                },
+                }),
             )
             .unwrap();
 
@@ -18488,7 +18726,10 @@ mod tests {
         for i in 0..n_sstables {
             let key = make_key(&format!("pk-{}", i % distinct_keys.max(1)));
             store
-                .write(&key, make_row(format!("v{i}").as_bytes(), 1000 + i as i64))
+                .write(
+                    &key,
+                    Arc::new(make_row(format!("v{i}").as_bytes(), 1000 + i as i64)),
+                )
                 .unwrap();
             store.flush().unwrap();
         }
@@ -18874,7 +19115,7 @@ mod tests {
                     key: key.clone(),
                     deletion,
                     static_row: static_row.cloned(),
-                    rows,
+                    rows: rows.into_iter().map(Arc::new).collect(),
                 });
                 Ok(())
             })
@@ -18909,7 +19150,7 @@ mod tests {
                 store
                     .write(
                         &key,
-                        make_row(format!("v{s}-{k}").as_bytes(), 1000 + s as i64),
+                        Arc::new(make_row(format!("v{s}-{k}").as_bytes(), 1000 + s as i64)),
                     )
                     .unwrap();
             }
@@ -19171,7 +19412,7 @@ mod tests {
             store
                 .write(
                     &make_key(&format!("k{i}")),
-                    make_row(format!("v{i}").as_bytes(), 1000 + i as i64),
+                    Arc::new(make_row(format!("v{i}").as_bytes(), 1000 + i as i64)),
                 )
                 .unwrap();
             store.flush().unwrap();
@@ -19308,7 +19549,11 @@ mod tests {
             store
                 .write(
                     &key,
-                    make_row_with_ck(ck, format!("c{ck}").as_bytes(), 1000 + ck as i64),
+                    Arc::new(make_row_with_ck(
+                        ck,
+                        format!("c{ck}").as_bytes(),
+                        1000 + ck as i64,
+                    )),
                 )
                 .unwrap();
         }
@@ -19326,7 +19571,7 @@ mod tests {
 
         // Read the full partition through the held reader BEFORE eviction to get
         // the ground-truth row set.
-        let before: Vec<Row> = held.get_partition(&key).unwrap().unwrap().rows;
+        let before: Vec<Arc<Row>> = held.get_partition(&key).unwrap().unwrap().rows;
         assert_eq!(
             before.len(),
             16,
@@ -19344,7 +19589,7 @@ mod tests {
 
         // The held Arc must still read the COMPLETE, correct partition — no
         // panic, no truncation, no use-after-evict. Re-read mid/post eviction.
-        let after: Vec<Row> = held.get_partition(&key).unwrap().unwrap().rows;
+        let after: Vec<Arc<Row>> = held.get_partition(&key).unwrap().unwrap().rows;
         assert_eq!(
             after, before,
             "held reader must yield identical, complete results across eviction"
@@ -19426,12 +19671,12 @@ mod tests {
             store
                 .write(
                     &key,
-                    Row {
+                    Arc::new(Row {
                         clustering: vec![],
                         cells: vec![(0, CellValue::live(format!("row-{i}").into_bytes(), 1000))],
                         deletion: DeletionTime::LIVE,
                         primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                    },
+                    }),
                 )
                 .unwrap();
         }
@@ -19504,7 +19749,7 @@ mod tests {
         let key = make_composite_key(&[tenant, session]);
         for entity in 1..=rows {
             store
-                .write(&key, make_row_with_ck(entity, b"entity", 1000))
+                .write(&key, Arc::new(make_row_with_ck(entity, b"entity", 1000)))
                 .unwrap();
         }
     }
@@ -19680,12 +19925,12 @@ mod tests {
             store
                 .write(
                     &key,
-                    Row {
+                    Arc::new(Row {
                         clustering: vec![],
                         cells: vec![(0, CellValue::live(format!("row-{i}").into_bytes(), 1000))],
                         deletion: DeletionTime::LIVE,
                         primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                    },
+                    }),
                 )
                 .unwrap();
         }
@@ -19705,12 +19950,12 @@ mod tests {
             store
                 .write(
                     &key,
-                    Row {
+                    Arc::new(Row {
                         clustering: vec![],
                         cells: vec![(0, CellValue::live(format!("row-{i}").into_bytes(), 1000))],
                         deletion: DeletionTime::LIVE,
                         primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                    },
+                    }),
                 )
                 .unwrap();
         }
@@ -19786,12 +20031,12 @@ mod tests {
             store
                 .write(
                     &key,
-                    Row {
+                    Arc::new(Row {
                         clustering: vec![],
                         cells: vec![(0, CellValue::live(format!("row-{i}").into_bytes(), 1000))],
                         deletion: DeletionTime::LIVE,
                         primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                    },
+                    }),
                 )
                 .unwrap();
         }
@@ -19918,7 +20163,10 @@ mod tests {
         let store = test_store();
         for i in 0..partitions {
             store
-                .write(&make_key(&format!("k{i:05}")), make_row(b"v", 1000))
+                .write(
+                    &make_key(&format!("k{i:05}")),
+                    Arc::new(make_row(b"v", 1000)),
+                )
                 .unwrap();
             if i == partitions / 3 || i == 2 * partitions / 3 {
                 store.flush().unwrap();
@@ -20127,12 +20375,15 @@ mod tests {
                 // New partitions, overwrites of existing ones, and a flush, all
                 // while the scan is mid-range.
                 writer
-                    .write(&make_key(&format!("new{seen:05}")), make_row(b"n", 2000))
+                    .write(
+                        &make_key(&format!("new{seen:05}")),
+                        Arc::new(make_row(b"n", 2000)),
+                    )
                     .unwrap();
                 writer
                     .write(
                         &make_key(&format!("k{:05}", seen % N)),
-                        make_row(b"o", 3000),
+                        Arc::new(make_row(b"o", 3000)),
                     )
                     .unwrap();
                 if seen % 50 == 0 {
@@ -20168,7 +20419,7 @@ mod tests {
         store
             .write(
                 &make_key("old"),
-                make_two_column_row(b"match", b"kept", 1000),
+                Arc::new(make_two_column_row(b"match", b"kept", 1000)),
             )
             .unwrap();
         let mut new_schema = old_schema;
@@ -20225,7 +20476,7 @@ mod tests {
         for (position, _) in &mut row.cells {
             *position += 1;
         }
-        store.write(&make_key("old"), row).unwrap();
+        store.write(&make_key("old"), Arc::new(row)).unwrap();
         let mut new_schema = old_schema;
         new_schema.regular_columns.insert(
             1,
@@ -20279,7 +20530,7 @@ mod tests {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(2000),
         };
-        store.write(&make_key("new"), row).unwrap();
+        store.write(&make_key("new"), Arc::new(row)).unwrap();
         assert_eq!(
             collect_index_results(&store, "pk_idx", &IndexKey(b"fresh".to_vec()))
                 .unwrap()
@@ -20322,7 +20573,7 @@ mod scan_resume_tests {
             key: key(k),
             deletion: DeletionTime::new(5, 5),
             static_row: Some(row(0)),
-            rows: rows.iter().map(|c| row(*c)).collect(),
+            rows: rows.iter().map(|c| row(*c)).map(Arc::new).collect(),
         }
     }
 

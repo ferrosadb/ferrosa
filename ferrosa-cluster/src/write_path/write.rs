@@ -12,7 +12,7 @@ impl WritePath {
         &self,
         table_id: &TableId,
         key: &DecoratedKey,
-        row: Row,
+        row: Arc<Row>,
         timestamp: i64,
         cl: ConsistencyLevel,
         strategy: &ReplicationStrategy,

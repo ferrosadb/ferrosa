@@ -74,12 +74,12 @@ fn test_mutation() -> ferrosa_storage::Mutation {
             token: Token(42),
             key: PartitionKey::new(vec![1, 2, 3]),
         },
-        rows: vec![Row {
+        rows: vec![Arc::new(Row {
             clustering: vec![],
             cells: vec![(0, CellValue::live(b"hello".to_vec(), 1000))],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
-        }],
+        })],
         timestamp: 1000,
     }
 }

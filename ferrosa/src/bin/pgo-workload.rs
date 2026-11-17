@@ -52,6 +52,7 @@
 //! * `2` — a malformed environment knob, or the engine failed to start.
 
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ferrosa_common::cell::CellValue;
@@ -457,7 +458,7 @@ fn run(
             ts += 1;
             let value = rng.value(cfg.value_len);
             if engine
-                .write(table_id, &dk, make_row(&value, ts), ts)
+                .write(table_id, &dk, Arc::new(make_row(&value, ts)), ts)
                 .is_err()
             {
                 out.errors += 1;
@@ -465,7 +466,7 @@ fn run(
         } else if roll < 85 {
             ts += 1;
             if engine
-                .write(table_id, &dk, make_tombstone_row(ts), ts)
+                .write(table_id, &dk, Arc::new(make_tombstone_row(ts)), ts)
                 .is_err()
             {
                 out.errors += 1;

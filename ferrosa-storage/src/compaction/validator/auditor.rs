@@ -72,6 +72,7 @@ mod tests {
     use super::*;
     use ferrosa_common::key::{DecoratedKey, PartitionKey};
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo};
+    use std::sync::Arc;
 
     fn row(clustering: &[u8], cells: Vec<(u16, CellValue)>) -> Row {
         Row {
@@ -87,7 +88,7 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(b"k".to_vec())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows,
+            rows: rows.into_iter().map(Arc::new).collect(),
         }
     }
 

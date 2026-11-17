@@ -2156,35 +2156,37 @@ mod tests {
                 deletion: DeletionTime::LIVE,
                 static_row: None,
                 rows: vec![
-                    row(CellValue::live(b"alpha".to_vec(), 1000)),
-                    row(CellValue::live(b"zeta".to_vec(), 1000)),
+                    Arc::new(row(CellValue::live(b"alpha".to_vec(), 1000))),
+                    Arc::new(row(CellValue::live(b"zeta".to_vec(), 1000))),
                 ],
             },
             Partition {
                 key: key.clone(),
                 deletion: DeletionTime::LIVE,
                 static_row: None,
-                rows: vec![row(CellValue::live(b"bravo".to_vec(), 1000))],
+                rows: vec![Arc::new(row(CellValue::live(b"bravo".to_vec(), 1000)))],
             },
             Partition {
                 key: key.clone(),
                 deletion: DeletionTime::LIVE,
                 static_row: None,
-                rows: vec![row(CellValue::tombstone(1000, 10))],
+                rows: vec![Arc::new(row(CellValue::tombstone(1000, 10)))],
             },
         ];
         // Equal higher timestamps must retain ORIGINAL source ordering even
         // when a lower-index source exposes its winner in the next row batch.
-        parts[0].rows[1].primary_key_liveness = LivenessInfo::with_ttl(2000, 60, 200);
-        parts[1].rows[0].primary_key_liveness = LivenessInfo::with_ttl(2000, 90, 300);
-        parts[0].rows[1].deletion = DeletionTime::new(900, 20);
-        parts[1].rows[0].deletion = DeletionTime::new(900, 30);
+        Arc::make_mut(&mut parts[0].rows[1]).primary_key_liveness =
+            LivenessInfo::with_ttl(2000, 60, 200);
+        Arc::make_mut(&mut parts[1].rows[0]).primary_key_liveness =
+            LivenessInfo::with_ttl(2000, 90, 300);
+        Arc::make_mut(&mut parts[0].rows[1]).deletion = DeletionTime::new(900, 20);
+        Arc::make_mut(&mut parts[1].rows[0]).deletion = DeletionTime::new(900, 30);
         // Same timestamp/value/expiry cells use TTL as the next canonical
         // tie-breaker; this must also hold when values are deferred.
-        parts[0].rows[1]
+        Arc::make_mut(&mut parts[0].rows[1])
             .cells
             .push((1, CellValue::expiring(b"same".to_vec(), 2000, 60, 200)));
-        parts[1].rows[0]
+        Arc::make_mut(&mut parts[1].rows[0])
             .cells
             .push((1, CellValue::expiring(b"same".to_vec(), 2000, 90, 200)));
         let expected = crate::merge::merge_partitions(parts.clone());
@@ -2248,23 +2250,23 @@ mod tests {
                 key: key.clone(),
                 deletion: DeletionTime::LIVE,
                 static_row: None,
-                rows: vec![Row {
+                rows: vec![Arc::new(Row {
                     clustering: 1i32.to_be_bytes().to_vec(),
                     cells,
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                }],
+                })],
             };
             let new = Partition {
                 key,
                 deletion: DeletionTime::LIVE,
                 static_row: None,
-                rows: vec![Row {
+                rows: vec![Arc::new(Row {
                     clustering: 1i32.to_be_bytes().to_vec(),
                     cells: vec![(0, CellValue::live(b"fresh".to_vec(), 2000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(2000),
-                }],
+                })],
             };
             let old_dir = tmp.path().join("old");
             let new_dir = tmp.path().join("new");
@@ -2321,7 +2323,13 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(b"P".to_vec())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row(5), row(1), row(2), row(3), row(4)],
+            rows: vec![
+                Arc::new(row(5)),
+                Arc::new(row(1)),
+                Arc::new(row(2)),
+                Arc::new(row(3)),
+                Arc::new(row(4)),
+            ],
         };
 
         let dir = tmp.path().join("legacy");
@@ -2651,12 +2659,12 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(key.as_bytes().to_vec())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: b"\x00\x00\x00\x01".to_vec(),
                 cells: vec![(0, CellValue::live(value.as_bytes().to_vec(), timestamp))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
-            }],
+            })],
         }
     }
 
@@ -2704,12 +2712,12 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(key.as_bytes().to_vec())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![],
                 cells,
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
-            }],
+            })],
         }
     }
 
@@ -3194,7 +3202,7 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(key.as_bytes().to_vec())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows,
+            rows: rows.into_iter().map(Arc::new).collect(),
         }
     }
 
@@ -3612,12 +3620,12 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(b"bad".to_vec())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: 1i32.to_be_bytes().to_vec(),
                 cells: vec![(0, CellValue::live(b"missing-ts".to_vec(), NO_TIMESTAMP))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::NONE,
-            }],
+            })],
         };
 
         let err = validate_partition_writable(&partition, &header).unwrap_err();

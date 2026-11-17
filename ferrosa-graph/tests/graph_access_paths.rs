@@ -178,12 +178,12 @@ impl Fixture {
             .write(
                 &TableId::new("bench", "benchrow"),
                 &key,
-                Row {
+                Arc::new(Row {
                     clustering: vec![],
                     cells,
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
-                },
+                }),
                 timestamp,
             )
             .unwrap();

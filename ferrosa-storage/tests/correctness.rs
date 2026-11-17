@@ -8,6 +8,7 @@
 //! tests panic with setup instructions when cluster infrastructure is not available.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ferrosa_common::cell::CellValue;
@@ -90,7 +91,7 @@ fn make_mutation(id: [u8; 16], key: &str, value: &[u8], ts: i64) -> Mutation {
         keyspace: "ks".to_string(),
         table: "tbl".to_string(),
         key: make_key(key),
-        rows: vec![make_row(value, ts)],
+        rows: vec![Arc::new(make_row(value, ts))],
         timestamp: ts,
     }
 }

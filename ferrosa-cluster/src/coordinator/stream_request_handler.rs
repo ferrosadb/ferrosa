@@ -1097,7 +1097,11 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(pk.to_vec())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: cks.iter().map(|ck| clustered_row(ck)).collect(),
+            rows: cks
+                .iter()
+                .map(|ck| clustered_row(ck))
+                .map(Arc::new)
+                .collect(),
         }
     }
 

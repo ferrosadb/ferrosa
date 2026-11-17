@@ -13,6 +13,7 @@
 //! Last changed: Preserve scoped logical/physical identity in traversal, DELETE and DETACH.
 
 use crate::executor::io::GraphWrite;
+use std::sync::Arc;
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -4202,7 +4203,7 @@ async fn execute_create(
             .write(
                 &table_id,
                 &key,
-                row,
+                Arc::new(row),
                 timestamp,
                 graph_write_consistency(),
                 &strategy,
@@ -4521,7 +4522,7 @@ async fn execute_merge(
                 .write(
                     &table_id,
                     &key,
-                    row,
+                    Arc::new(row),
                     timestamp,
                     graph_write_consistency(),
                     &strategy,
@@ -4560,7 +4561,7 @@ async fn execute_merge(
                     key: shape.key.clone(),
                     deletion: DeletionTime::LIVE,
                     static_row: None,
-                    rows: vec![row.clone()],
+                    rows: vec![Arc::new(row.clone())],
                 };
                 Some(row_to_json(&meta, &partition, &row))
             }) {
@@ -4628,7 +4629,7 @@ async fn execute_merge(
             .write(
                 table_id,
                 key,
-                update_row,
+                Arc::new(update_row),
                 timestamp,
                 graph_write_consistency(),
                 &strategy,
@@ -5582,7 +5583,7 @@ async fn set_matched_row(
             .write(
                 &target.table_id,
                 &target.key,
-                update_row,
+                Arc::new(update_row),
                 statement.timestamp,
                 graph_write_consistency(),
                 &statement.strategy,
@@ -5867,7 +5868,7 @@ async fn execute_remove(
                 .write(
                     &target.table_id,
                     &target.key,
-                    update_row,
+                    Arc::new(update_row),
                     timestamp,
                     graph_write_consistency(),
                     &strategy,
@@ -5911,7 +5912,7 @@ fn tombstone_mutation(
         keyspace.to_string(),
         table.to_string(),
         key.clone(),
-        vec![row],
+        vec![Arc::new(row)],
         timestamp,
     )
 }
@@ -6570,7 +6571,7 @@ async fn execute_delete(
                     .write(
                         &table_id,
                         &key,
-                        tombstone_row.clone(),
+                        Arc::new(tombstone_row.clone()),
                         timestamp,
                         graph_write_consistency(),
                         &strategy,
@@ -8699,7 +8700,7 @@ mod tests {
             .write(
                 &entity_tid,
                 &DecoratedKey::new(PartitionKey::new(partition_key.clone())),
-                src_row,
+                Arc::new(src_row),
                 1000,
             )
             .unwrap();
@@ -8707,7 +8708,7 @@ mod tests {
             .write(
                 &entity_tid,
                 &DecoratedKey::new(PartitionKey::new(partition_key)),
-                dst_row,
+                Arc::new(dst_row),
                 1000,
             )
             .unwrap();

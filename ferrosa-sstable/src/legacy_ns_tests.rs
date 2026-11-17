@@ -4,6 +4,7 @@
 //! normalisation call turns exactly that path's test red.
 
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey, LEGACY_NS_THRESHOLD};
+use std::sync::Arc;
 
 use crate::reader::{SSTableComponents, SSTableReader};
 use crate::statistics::SerializationHeader;
@@ -56,12 +57,12 @@ fn legacy_partition() -> Partition {
         key: key(),
         deletion: DeletionTime::new(ns(T0_US - 10), LDT),
         static_row: None,
-        rows: vec![Row {
+        rows: vec![Arc::new(Row {
             clustering: CK.to_vec(),
             cells: vec![(0, CellValue::live(b"lwt".to_vec(), ns(T0_US + 1)))],
             deletion: DeletionTime::new(ns(T0_US - 5), LDT),
             primary_key_liveness: LivenessInfo::with_timestamp(ns(T0_US)),
-        }],
+        })],
     }
 }
 
@@ -169,7 +170,7 @@ fn a_complex_column_deletion_is_normalised() {
             key: key(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row],
+            rows: vec![Arc::new(row)],
         }],
     );
     let reader = open(&output);
@@ -195,12 +196,12 @@ fn the_reader_counts_the_legacy_stamps_it_holds() {
             key: key(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: CK.to_vec(),
                 cells: vec![(0, CellValue::live(b"v".to_vec(), T0_US))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(T0_US),
-            }],
+            })],
         }],
     );
     assert_eq!(open(&micros).count_legacy_ns_timestamps().unwrap(), 0);
@@ -237,7 +238,10 @@ fn a_mixed_file_reports_bounds_covering_every_normalised_cell() {
             key: key(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row(1, ns(T0_US)), row(2, T0_US + 1_000_000)],
+            rows: vec![
+                Arc::new(row(1, ns(T0_US))),
+                Arc::new(row(2, T0_US + 1_000_000)),
+            ],
         }],
     );
     let reader = open(&output);
@@ -266,12 +270,12 @@ fn a_microsecond_file_reports_its_stored_bounds() {
             key: key(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: CK.to_vec(),
                 cells: vec![(0, CellValue::live(b"v".to_vec(), T0_US + 5))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(T0_US),
-            }],
+            })],
         }],
     );
     let reader = open(&output);
@@ -292,12 +296,12 @@ fn sentinels_round_trip_unchanged() {
             key: key(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: CK.to_vec(),
                 cells: vec![(0, CellValue::live(b"v".to_vec(), T0_US))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::NONE,
-            }],
+            })],
         }],
     );
     let reader = open(&output);

@@ -105,7 +105,7 @@ mod tests {
             KS.to_string(),
             TABLE.to_string(),
             key.clone(),
-            vec![make_row(value, cell_ts)],
+            vec![Arc::new(make_row(value, cell_ts))],
             cell_ts,
         );
         let mut buf = vec![0u8; m.serialized_size()];

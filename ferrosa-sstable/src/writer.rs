@@ -3278,7 +3278,7 @@ mod tests {
     #[test]
     fn live_pathless_cell_on_complex_column_is_an_error_not_a_panic() {
         let mut partition = make_partition(b"pk-blob", &1i32.to_be_bytes(), b"v", 1_000_001);
-        partition.rows[0]
+        Arc::make_mut(&mut partition.rows[0])
             .cells
             .push((1, CellValue::live(b"whole-list-blob".to_vec(), 1_000_001)));
 
@@ -3295,7 +3295,7 @@ mod tests {
     #[test]
     fn path_on_simple_column_is_an_error_not_a_panic() {
         let mut partition = make_partition(b"pk-simple", &1i32.to_be_bytes(), b"v", 1_000_001);
-        partition.rows[0].cells[0].1.path = Some(b"p".to_vec());
+        Arc::make_mut(&mut partition.rows[0]).cells[0].1.path = Some(b"p".to_vec());
         let err = write_one(complex_list_header(), &partition)
             .expect_err("a path on a simple column must be refused");
         assert!(err.to_string().contains("val"), "got: {err}");
@@ -3306,7 +3306,7 @@ mod tests {
     #[test]
     fn sentinel_and_elements_on_complex_column_are_written() {
         let mut partition = make_partition(b"pk-ok", &1i32.to_be_bytes(), b"v", 1_000_001);
-        partition.rows[0].cells.extend([
+        Arc::make_mut(&mut partition.rows[0]).cells.extend([
             (1, CellValue::tombstone(1_000_000, 1_700_000_000)),
             (
                 1,
@@ -3322,12 +3322,12 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::from(key)),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: clustering.to_vec(),
                 cells: vec![(0, CellValue::live(value.to_vec(), timestamp))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
-            }],
+            })],
         }
     }
 
@@ -3349,6 +3349,7 @@ mod tests {
                         primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
                     }
                 })
+                .map(Arc::new)
                 .collect(),
         }
     }
@@ -3509,7 +3510,7 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(pk1.clone())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: uuid1.to_vec(),
                 cells: vec![
                     (
@@ -3520,7 +3521,7 @@ mod tests {
                 ],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
-            }],
+            })],
         };
 
         // Row 2: SHORT model_version (7 chars) — this one survives
@@ -3533,7 +3534,7 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(pk2.clone())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: uuid2.to_vec(),
                 cells: vec![
                     (0, CellValue::live(b"4".to_vec(), timestamp)),
@@ -3541,7 +3542,7 @@ mod tests {
                 ],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
-            }],
+            })],
         };
 
         // Sort by key (required by SSTableWriter)
@@ -3659,7 +3660,7 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(pk1_bytes.clone())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![0x11u8; 16], // UUID
                 cells: vec![
                     (0, CellValue::live(b"4".to_vec(), ts)),
@@ -3667,13 +3668,13 @@ mod tests {
                 ],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(ts),
-            }],
+            })],
         };
         let p2 = Partition {
             key: DecoratedKey::new(PartitionKey::new(pk2_bytes.clone())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![0x22u8; 16], // UUID
                 cells: vec![
                     (
@@ -3684,7 +3685,7 @@ mod tests {
                 ],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(ts),
-            }],
+            })],
         };
 
         // Sort by decorated key (token order)
@@ -4290,12 +4291,12 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::from(b"ts_test".as_slice())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![0x00, 0x00, 0x00, 0x01],
                 cells: vec![(0, CellValue::live(b"val".to_vec(), cell_ts))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(row_ts),
-            }],
+            })],
         };
 
         let mut writer = SSTableWriter::new(options, header.clone());
@@ -4344,12 +4345,12 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::from(b"tomb_test".as_slice())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![0x00, 0x00, 0x00, 0x03],
                 cells: vec![(0, CellValue::tombstone(cell_ts, ldt))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(row_ts),
-            }],
+            })],
         };
 
         let mut writer = SSTableWriter::new(options, header.clone());
@@ -4397,12 +4398,12 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(vec![0x00, 0x00, 0x00, 0x01])),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![], // empty — no clustering columns
                 cells: vec![(0, CellValue::live(b"hello".to_vec(), timestamp))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
-            }],
+            })],
         };
 
         let mut writer = SSTableWriter::new(options, header.clone());
@@ -4461,7 +4462,7 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(42i32.to_be_bytes().to_vec())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![],
                 cells: vec![(
                     0,
@@ -4469,7 +4470,7 @@ mod tests {
                 )],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
-            }],
+            })],
         };
 
         let mut writer = SSTableWriter::new(options, header.clone());
@@ -4541,23 +4542,23 @@ mod tests {
                 key: dk1.clone(),
                 deletion: DeletionTime::LIVE,
                 static_row: None,
-                rows: vec![Row {
+                rows: vec![Arc::new(Row {
                     clustering: vec![],
                     cells: vec![(0, CellValue::live(b"hello".to_vec(), 1000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                }],
+                })],
             },
             Partition {
                 key: dk2.clone(),
                 deletion: DeletionTime::LIVE,
                 static_row: None,
-                rows: vec![Row {
+                rows: vec![Arc::new(Row {
                     clustering: vec![],
                     cells: vec![(1, CellValue::live(42i32.to_be_bytes().to_vec(), 2000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(2000),
-                }],
+                })],
             },
         ];
         // Sort by token order, exactly like the compaction executor
@@ -4670,12 +4671,12 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::from(b"pk1".as_slice())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![],
                 cells: vec![(0, CellValue::live(b"hello".to_vec(), 1_005))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1_005),
-            }],
+            })],
         };
 
         let mut writer = SSTableWriter::new(options, header);
@@ -4739,12 +4740,12 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::from(b"pk2".as_slice())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![],
                 cells: vec![(0, CellValue::live(42i32.to_be_bytes().to_vec(), 1_005))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1_005),
-            }],
+            })],
         };
 
         let mut writer = SSTableWriter::new(options, header);
@@ -4802,12 +4803,12 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::from(b"pk1".as_slice())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![0x00, 0x00, 0x00, 0x01],
                 cells: vec![(0, CellValue::live(b"val".to_vec(), 1_000_000))],
                 deletion: DeletionTime::new(500, 100), // OLD deletion timestamp!
                 primary_key_liveness: LivenessInfo::with_timestamp(1_000_000),
-            }],
+            })],
         };
 
         let options = WriteOptions {
@@ -4880,12 +4881,12 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(vec![0x11; 16])),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: ck.clone(),
                 cells: vec![(0, CellValue::live(weight.to_be_bytes().to_vec(), timestamp))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
-            }],
+            })],
         };
 
         let mut writer = SSTableWriter::new(options, header.clone());
@@ -4943,7 +4944,7 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::from(b"pk".as_slice())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![0x00, 0x00, 0x00, 0x01],
                 cells: vec![
                     (0, CellValue::live(b"hello".to_vec(), timestamp)),
@@ -4951,7 +4952,7 @@ mod tests {
                 ],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
-            }],
+            })],
         };
 
         let mut writer = SSTableWriter::new(options, header.clone());
@@ -5010,7 +5011,7 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::from(b"pk".as_slice())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: [0xAAu8; 16].to_vec(),
                 cells: vec![
                     (0, CellValue::live(b"name".to_vec(), ts)),
@@ -5022,7 +5023,7 @@ mod tests {
                 ],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(ts),
-            }],
+            })],
         };
 
         let mut writer = SSTableWriter::new(options, header.clone());
@@ -5176,7 +5177,7 @@ mod tests {
                         key: DecoratedKey::new(PartitionKey::new(pk)),
                         deletion: DeletionTime::LIVE,
                         static_row: None,
-                        rows,
+                        rows: rows.into_iter().map(Arc::new).collect(),
                     }
                 })
                 .collect();
@@ -5539,12 +5540,12 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::from(b"pk_bad".as_slice())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![], // the bug: empty on a schema with Int32 clustering
                 cells: vec![(0, CellValue::live(b"v".to_vec(), 1_000_001))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1_000_001),
-            }],
+            })],
         };
         let mut writer = SSTableWriter::new(options, header);
         let result = writer.add_partition(&partition);

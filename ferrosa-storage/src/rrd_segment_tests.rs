@@ -47,7 +47,7 @@ fn write_partitions_and_flush(engine: &StorageEngine, table_id: &TableId, flushe
         let key = make_key(&format!("k{i:04}"));
         let ts = 1_000_000i64 + i as i64;
         engine
-            .write(table_id, &key, rrd_row(ts, format!("v{i}").as_bytes(), ts), ts)
+            .write(table_id, &key, Arc::new(rrd_row(ts, format!("v{i}").as_bytes(), ts)), ts)
             .expect("write");
         engine.flush(table_id).expect("flush");
     }
@@ -332,7 +332,7 @@ fn write_and_flush_once(
 ) {
     for (ts, value) in rows {
         engine
-            .write(table_id, key, rrd_row(*ts, value, *ts), *ts)
+            .write(table_id, key, Arc::new(rrd_row(*ts, value, *ts)), *ts)
             .expect("write");
     }
     engine.flush(table_id).expect("flush");
@@ -444,7 +444,7 @@ fn rrd_flush_writes_one_generation_per_window_touched() {
         (&a, 4 * SEGMENT_WINDOW_MICROS + 10, b"a4".as_slice()),
     ] {
         engine
-            .write(&table_id, key, rrd_row(ts, value, ts), ts)
+            .write(&table_id, key, Arc::new(rrd_row(ts, value, ts)), ts)
             .expect("write");
     }
     engine.flush(&table_id).expect("flush");
@@ -534,7 +534,7 @@ fn rrd_partition_spanning_two_windows_reads_across_both_in_order() {
         .read(&table_id, &key)
         .expect("read")
         .expect("the partition must be readable");
-    let timestamps: Vec<i64> = partition.rows.iter().map(clustered_ts).collect();
+    let timestamps: Vec<i64> = partition.rows.iter().map(|row| clustered_ts(row)).collect();
     let mut sorted = timestamps.clone();
     sorted.sort_unstable();
     assert_eq!(
@@ -642,7 +642,7 @@ fn rrd_flush_rejects_a_table_without_a_timestamp_clustering_component() {
 
     let key = make_key("s1");
     engine
-        .write(&table_id, &key, make_row(b"v", 1_000), 1_000)
+        .write(&table_id, &key, Arc::new(make_row(b"v", 1_000)), 1_000)
         .expect("write");
 
     let error = engine
@@ -676,7 +676,7 @@ fn rrd_flush_refuses_a_segmented_table_with_a_secondary_index() {
 
     let key = make_key("s1");
     engine
-        .write(&table_id, &key, rrd_row(1, b"a", 1), 1)
+        .write(&table_id, &key, Arc::new(rrd_row(1, b"a", 1)), 1)
         .expect("write");
 
     let error = engine

@@ -19,6 +19,8 @@
 //!
 //! [`SerializationHeader`]: crate::statistics::SerializationHeader
 
+use std::sync::Arc;
+
 use ferrosa_common::{
     CellBytes, CellReadBuffer, CellValue, DecoratedKey, Error, PartitionKey, Result,
 };
@@ -1041,7 +1043,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             if is_static {
                 static_row = Some(row);
             } else {
-                rows.push(row);
+                rows.push(Arc::new(row));
             }
         }
 
@@ -1201,7 +1203,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
 
     /// Read rows until `END_OF_PARTITION`, retaining at most `row_limit`
     /// clustered rows while still advancing to the next partition boundary.
-    fn read_rows_limited(&mut self, row_limit: usize) -> Result<(Option<Row>, Vec<Row>)> {
+    fn read_rows_limited(&mut self, row_limit: usize) -> Result<(Option<Row>, Vec<Arc<Row>>)> {
         let file_len = self.reader.len()?;
         let mut static_row = None;
         let mut rows = Vec::new();
@@ -1255,7 +1257,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             if is_static {
                 static_row = Some(row);
             } else {
-                rows.push(row);
+                rows.push(Arc::new(row));
             }
         }
 
@@ -1266,7 +1268,10 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
     /// row prefix is decoded. Unlike `read_rows_limited`, this deliberately
     /// does not skip the unretained tail of the partition because there is no
     /// subsequent partition iteration to keep aligned.
-    fn read_rows_prefix_limited(&mut self, row_limit: usize) -> Result<(Option<Row>, Vec<Row>)> {
+    fn read_rows_prefix_limited(
+        &mut self,
+        row_limit: usize,
+    ) -> Result<(Option<Row>, Vec<Arc<Row>>)> {
         let file_len = self.reader.len()?;
         let mut static_row = None;
         let mut rows = Vec::new();
@@ -1304,7 +1309,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             if is_static {
                 static_row = Some(row);
             } else {
-                rows.push(row);
+                rows.push(Arc::new(row));
                 if rows.len() >= row_limit {
                     break;
                 }
@@ -1318,7 +1323,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         &mut self,
         start_clustering: &[u8],
         row_limit: usize,
-    ) -> Result<(Option<Row>, Vec<Row>)> {
+    ) -> Result<(Option<Row>, Vec<Arc<Row>>)> {
         let file_len = self.reader.len()?;
         let mut static_row = None;
         let mut rows = Vec::new();
@@ -1350,7 +1355,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             if is_static {
                 static_row = Some(row);
             } else if row.clustering.as_slice() > start_clustering {
-                rows.push(row);
+                rows.push(Arc::new(row));
                 if rows.len() >= row_limit {
                     break;
                 }
@@ -1720,7 +1725,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             if is_static {
                 static_row = Some(row);
             } else {
-                rows.push(row);
+                rows.push(Arc::new(row));
             }
         }
 

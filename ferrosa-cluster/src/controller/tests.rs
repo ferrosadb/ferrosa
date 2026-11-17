@@ -3397,7 +3397,9 @@ fn bootstrap_streaming_produces_mutations_for_remote_nodes() {
             primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1000 + i),
         };
         let table_id = TableId::new("test_ks", "data");
-        storage.write(&table_id, &dk, row, 1000 + i).unwrap();
+        storage
+            .write(&table_id, &dk, Arc::new(row), 1000 + i)
+            .unwrap();
     }
 
     // Build a 3-node ring (simulating the ring built in transition_to_cluster).
@@ -5454,12 +5456,12 @@ fn verification_mutation() -> ferrosa_storage::Mutation {
             token: Token(42),
             key: PartitionKey::new(b"pair-key".to_vec()),
         },
-        vec![Row {
+        vec![Arc::new(Row {
             clustering: vec![],
             cells: vec![(0, CellValue::live(b"guaranteed".to_vec(), 1000))],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
-        }],
+        })],
         1000,
     )
 }
@@ -8133,12 +8135,12 @@ async fn failed_raft_drop_cold_start_enters_online_quarantine() {
         .write(
             &tid,
             &key,
-            ferrosa_sstable::types::Row {
+            Arc::new(ferrosa_sstable::types::Row {
                 clustering: vec![],
                 cells: vec![],
                 deletion: ferrosa_sstable::types::DeletionTime::LIVE,
                 primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
-            },
+            }),
             1,
         )
         .unwrap();
@@ -8239,12 +8241,12 @@ async fn cold_quarantine_retirement_uses_real_committed_and_purged_bounds() {
         .write(
             &tid,
             &key,
-            ferrosa_sstable::types::Row {
+            Arc::new(ferrosa_sstable::types::Row {
                 clustering: vec![],
                 cells: vec![],
                 deletion: ferrosa_sstable::types::DeletionTime::LIVE,
                 primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
-            },
+            }),
             1,
         )
         .unwrap();

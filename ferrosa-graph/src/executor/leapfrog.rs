@@ -564,6 +564,7 @@ async fn project_bindings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     /// Helper to build a clustering key for adjacency entries.
     #[allow(dead_code)]
@@ -654,7 +655,7 @@ mod tests {
             &self,
             table_id: &TableId,
             key: &DecoratedKey,
-            row: ferrosa_sstable::types::Row,
+            row: std::sync::Arc<ferrosa_sstable::types::Row>,
             timestamp: i64,
             cl: ferrosa_cluster::consistency::ConsistencyLevel,
             strategy: &ferrosa_cluster::ring::strategy::ReplicationStrategy,
@@ -699,12 +700,12 @@ mod tests {
             .write(
                 &TableId::new("test_ks", "person_v"),
                 &DecoratedKey::new(PartitionKey::new(b"A".to_vec())),
-                Row {
+                Arc::new(Row {
                     clustering: vec![],
                     cells: vec![],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1),
-                },
+                }),
                 1,
             )
             .unwrap();

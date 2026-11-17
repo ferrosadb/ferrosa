@@ -688,12 +688,12 @@ fn delete_as_prefix_build(node: &Node, e: &Edge) {
         .write(
             &TableId::new(KEYSPACE, "typed_edges"),
             &key,
-            Row {
+            Arc::new(Row {
                 clustering,
                 cells: vec![],
                 deletion: DeletionTime::new(ts, (ts / 1_000_000) as u32),
                 primary_key_liveness: LivenessInfo::NONE,
-            },
+            }),
             ts,
         )
         .unwrap();
@@ -703,7 +703,7 @@ fn delete_as_prefix_build(node: &Node, e: &Edge) {
             .write(
                 &adj,
                 &DecoratedKey::new(PartitionKey::new(vertex.as_bytes().to_vec())),
-                Row {
+                Arc::new(Row {
                     clustering: adjacency_clustering(direction, "TYPED_EDGE", neighbor.as_bytes()),
                     cells: vec![(
                         0,
@@ -711,7 +711,7 @@ fn delete_as_prefix_build(node: &Node, e: &Edge) {
                     )],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(ts + 1),
-                },
+                }),
                 ts + 1,
             )
             .unwrap();
@@ -758,7 +758,7 @@ mod old_build {
         wp.write(
             tid,
             key,
-            row,
+            Arc::new(row),
             ts,
             ferrosa_cluster::consistency::ConsistencyLevel::One,
             &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
@@ -1175,12 +1175,12 @@ fn insert_edge_as_cql(storage: &StorageEngine, e: &Edge) {
             .write(
                 &TableId::new(KEYSPACE, "entity_store"),
                 &key,
-                Row {
+                Arc::new(Row {
                     clustering: id.as_bytes().to_vec(),
                     cells: vec![(0, CellValue::live(format!("entity-{id}").into_bytes(), ts))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(ts),
-                },
+                }),
                 ts,
             )
             .unwrap();
@@ -1189,12 +1189,12 @@ fn insert_edge_as_cql(storage: &StorageEngine, e: &Edge) {
         .write(
             &TableId::new(KEYSPACE, "typed_edges"),
             &key,
-            Row {
+            Arc::new(Row {
                 clustering,
                 cells: vec![],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(ts),
-            },
+            }),
             ts,
         )
         .unwrap();
@@ -1716,7 +1716,7 @@ mod cluster {
                     .write(
                         &adj,
                         &DecoratedKey::new(PartitionKey::new(vertex.as_bytes().to_vec())),
-                        Row {
+                        Arc::new(Row {
                             clustering: adjacency_clustering(
                                 direction,
                                 "TYPED_EDGE",
@@ -1725,7 +1725,7 @@ mod cluster {
                             cells: vec![],
                             deletion: DeletionTime::new(ts, (ts / 1_000_000) as u32),
                             primary_key_liveness: LivenessInfo::NONE,
-                        },
+                        }),
                         ts,
                     )
                     .unwrap();
@@ -2130,7 +2130,12 @@ mod at_scale {
                 primary_key_liveness: LivenessInfo::with_timestamp(1),
             };
             node.storage
-                .write(&TableId::new(KEYSPACE, "entity_store"), &key, row, 1)
+                .write(
+                    &TableId::new(KEYSPACE, "entity_store"),
+                    &key,
+                    Arc::new(row),
+                    1,
+                )
                 .unwrap();
         }
 
@@ -2145,7 +2150,12 @@ mod at_scale {
                 primary_key_liveness: LivenessInfo::with_timestamp(ts),
             };
             node.storage
-                .write(&TableId::new(KEYSPACE, "typed_edges"), &key, row, ts)
+                .write(
+                    &TableId::new(KEYSPACE, "typed_edges"),
+                    &key,
+                    Arc::new(row),
+                    ts,
+                )
                 .unwrap();
         }
 

@@ -1179,7 +1179,7 @@ impl ClusterCoordinator {
         &self,
         table_id: &TableId,
         key: &DecoratedKey,
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         self.coordinate_read_with(table_id, key, self.default_cl, self.default_rf)
             .await
     }
@@ -1265,7 +1265,7 @@ impl ClusterCoordinator {
         key: &DecoratedKey,
         cl: ConsistencyLevel,
         rf: usize,
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         self.coordinate_read_with_limited_rows(table_id, key, cl, rf, 0)
             .await
     }
@@ -1284,7 +1284,7 @@ impl ClusterCoordinator {
         cl: ConsistencyLevel,
         rf: usize,
         row_limit: usize,
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         self.coordinate_read_with_filter(
             table_id,
             key,
@@ -1304,7 +1304,7 @@ impl ClusterCoordinator {
         rf: usize,
         row_limit: usize,
         start_clustering: &[u8],
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         self.coordinate_read_with_filter(
             table_id,
             key,
@@ -1322,7 +1322,7 @@ impl ClusterCoordinator {
         clustering: &[u8],
         cl: ConsistencyLevel,
         rf: usize,
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         self.coordinate_read_with_filter(
             table_id,
             key,
@@ -1340,7 +1340,7 @@ impl ClusterCoordinator {
         cl: ConsistencyLevel,
         rf: usize,
         slice: PartitionReadSlice,
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         let raw_replicas = {
             let ring = self.ring.load();
             ring.replicas(key.token.0, rf)
@@ -1370,7 +1370,7 @@ impl ClusterCoordinator {
         raw_replicas: Vec<u64>,
         requirement: ReadQuorumRequirement<'_>,
         slice: PartitionReadSlice,
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         let required = requirement.initial;
         let scope = requirement.scope.as_ref();
         let PartitionReadSlice {
@@ -1759,7 +1759,7 @@ impl ClusterCoordinator {
         ring: &crate::ring::TokenRing,
         cl: ConsistencyLevel,
         slice: PartitionReadSlice,
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         let row_limit = slice.row_limit;
         let clustering = slice.clustering.as_deref();
         let start_clustering = slice.start_clustering.as_deref();
@@ -1871,7 +1871,7 @@ impl ClusterCoordinator {
                 READ_PAGE_SIZE
             };
 
-            let mut all_rows: Vec<Row> = Vec::new();
+            let mut all_rows: Vec<Arc<Row>> = Vec::new();
             let mut page_state: Vec<u8> = vec![];
             let mut found_partition = false;
 
@@ -1964,7 +1964,7 @@ impl ClusterCoordinator {
         key: &DecoratedKey,
         replicas: &[u64],
         ring: &crate::ring::TokenRing,
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         self.read_one_replica_limited_rows(
             table_id,
             key,
@@ -1990,7 +1990,7 @@ impl ClusterCoordinator {
         key: &DecoratedKey,
         cl: ConsistencyLevel,
         strategy: &crate::ring::strategy::ReplicationStrategy,
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         self.coordinate_read_nts_limited_rows(table_id, key, cl, strategy, 0)
             .await
     }
@@ -2002,7 +2002,7 @@ impl ClusterCoordinator {
         cl: ConsistencyLevel,
         strategy: &crate::ring::strategy::ReplicationStrategy,
         row_limit: usize,
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         self.coordinate_read_nts_filtered(
             table_id,
             key,
@@ -2022,7 +2022,7 @@ impl ClusterCoordinator {
         strategy: &crate::ring::strategy::ReplicationStrategy,
         row_limit: usize,
         start_clustering: &[u8],
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         self.coordinate_read_nts_filtered(
             table_id,
             key,
@@ -2040,7 +2040,7 @@ impl ClusterCoordinator {
         clustering: &[u8],
         cl: ConsistencyLevel,
         strategy: &crate::ring::strategy::ReplicationStrategy,
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         self.coordinate_read_nts_filtered(
             table_id,
             key,
@@ -2058,7 +2058,7 @@ impl ClusterCoordinator {
         cl: ConsistencyLevel,
         strategy: &crate::ring::strategy::ReplicationStrategy,
         slice: PartitionReadSlice,
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         let PartitionReadSlice {
             row_limit,
             clustering,
@@ -2886,7 +2886,7 @@ pub(crate) fn read_repair_body(
     let rows: Vec<&ferrosa_sstable::types::Row> = deletion
         .iter()
         .chain(static_marker)
-        .chain(partition.rows.iter())
+        .chain(partition.rows.iter().map(|row| &**row))
         .collect();
     let newest = partition_write_timestamp(partition);
     let body = Mutation::serialize_borrowed_rows(
@@ -2925,7 +2925,7 @@ pub(crate) fn read_repair_body_for_target(
     let rows: Vec<&ferrosa_sstable::types::Row> = deletion
         .iter()
         .chain(static_marker)
-        .chain(partition.rows.iter())
+        .chain(partition.rows.iter().map(|row| &**row))
         .collect();
     let newest = partition_write_timestamp(partition);
     let body = Mutation::serialize_purged_rows(
@@ -3734,7 +3734,7 @@ mod tests {
         // Local node: an FTI row whose text matches → local returns key [1,2,3].
         storage.add_fulltext_index(&table_id, "val_fti", 0).unwrap();
         storage
-            .write(&table_id, &test_key(), test_row(1000), 1000)
+            .write(&table_id, &test_key(), Arc::new(test_row(1000)), 1000)
             .unwrap();
 
         // The local FTI now returns a full ROW-GRANULAR doc key (partition +
@@ -3894,7 +3894,7 @@ mod tests {
         let table_id = TableId::new("test_ks", "test_tbl");
         let key = test_key();
         storage
-            .write(&table_id, &key, test_row(1000), 1000)
+            .write(&table_id, &key, Arc::new(test_row(1000)), 1000)
             .unwrap();
         storage.flush(&table_id).unwrap();
 
@@ -4016,7 +4016,9 @@ mod tests {
         let row = test_row(1000);
 
         // Write directly to storage.
-        storage.write(&table_id, &key, row.clone(), 1000).unwrap();
+        storage
+            .write(&table_id, &key, Arc::new(row.clone()), 1000)
+            .unwrap();
 
         // Read via coordinator.
         let result = coordinator.coordinate_read(&table_id, &key).await.unwrap();
@@ -4100,7 +4102,7 @@ mod tests {
         let table_id = TableId::new("test_ks", "test_tbl");
         let key = test_key();
         let row = test_row(1000);
-        storage.write(&table_id, &key, row, 1000).unwrap();
+        storage.write(&table_id, &key, Arc::new(row), 1000).unwrap();
 
         // With CL=ONE the coordinator must succeed using only the local replica.
         let result = coordinator.coordinate_read(&table_id, &key).await.unwrap();
@@ -4252,8 +4254,12 @@ mod tests {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(9000),
         };
-        storage.write(&table_id, &key, older_row, 100).unwrap();
-        storage.write(&table_id, &key, newer_row, 9000).unwrap();
+        storage
+            .write(&table_id, &key, Arc::new(older_row), 100)
+            .unwrap();
+        storage
+            .write(&table_id, &key, Arc::new(newer_row), 9000)
+            .unwrap();
 
         let result = coordinator.coordinate_read(&table_id, &key).await.unwrap();
         assert!(result.is_some(), "should return data");
@@ -4317,7 +4323,7 @@ mod tests {
 
         // Write data locally so the local read succeeds.
         storage
-            .write(&table_id, &key, test_row(1000), 1000)
+            .write(&table_id, &key, Arc::new(test_row(1000)), 1000)
             .unwrap();
 
         // Quorum requires 2 responses; only local (1) will succeed.
@@ -4343,7 +4349,7 @@ mod tests {
             key: key.clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![test_row(1000)],
+            rows: vec![Arc::new(test_row(1000))],
         };
         storage
             .write(&table_id, &key, partition.rows[0].clone(), 1000)
@@ -4420,7 +4426,7 @@ mod tests {
         row: Row,
         ts: i64,
     ) {
-        storage.write(table_id, key, row, ts).unwrap();
+        storage.write(table_id, key, Arc::new(row), ts).unwrap();
         storage.flush(table_id).unwrap();
         let sstable_dir = dir.join("sstables").join(table_id.to_string());
         let mut corrupted = 0usize;
@@ -4459,7 +4465,7 @@ mod tests {
             key: key.clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![test_row(1234)],
+            rows: vec![Arc::new(test_row(1234))],
         };
         let (server, addr, remote_host_id) = start_rpc_server(
             MsgType::ReadRequest,
@@ -4539,7 +4545,7 @@ mod tests {
             key: key.clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![test_row(1234)],
+            rows: vec![Arc::new(test_row(1234))],
         };
         let (server, addr, remote_host_id) = start_rpc_server(
             MsgType::ReadRequest,
@@ -4621,7 +4627,7 @@ mod tests {
             key: key.clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![test_row(777)],
+            rows: vec![Arc::new(test_row(777))],
         };
         let (server, addr, remote_host_id) = start_rpc_server(
             MsgType::ReadRequest,
@@ -4751,7 +4757,7 @@ mod tests {
             key: key.clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![test_row(888)],
+            rows: vec![Arc::new(test_row(888))],
         };
         let poison = Partition {
             key: DecoratedKey {
@@ -4760,7 +4766,7 @@ mod tests {
             },
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![test_row(777)],
+            rows: vec![Arc::new(test_row(777))],
         };
 
         let (replica_server, replica_addr, replica_host_id) = start_rpc_server(
@@ -4874,13 +4880,15 @@ mod tests {
 
         let table_id = TableId::new("test_ks", "test_tbl");
         let key = test_key();
-        storage.write(&table_id, &key, test_row(10), 10).unwrap();
+        storage
+            .write(&table_id, &key, Arc::new(test_row(10)), 10)
+            .unwrap();
 
         let slow_partition = Partition {
             key: key.clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![test_row(9)],
+            rows: vec![Arc::new(test_row(9))],
         };
         let (slow_server, slow_addr, slow_host_id) = start_rpc_server(
             MsgType::IndexReadInPartitionRequest,
@@ -5017,7 +5025,9 @@ mod tests {
 
         let table_id = TableId::new("test_ks", "test_tbl");
         let key = test_key();
-        storage.write(&table_id, &key, test_row(10), 10).unwrap();
+        storage
+            .write(&table_id, &key, Arc::new(test_row(10)), 10)
+            .unwrap();
 
         let mut local = make_node("127.0.0.1:1");
         local.host_id = Uuid::new_v4();
@@ -5141,8 +5151,12 @@ mod tests {
         let table_id = TableId::new("test_ks", "test_tbl");
         let k1 = DecoratedKey::new(PartitionKey::new(b"pk1".to_vec()));
         let k2 = DecoratedKey::new(PartitionKey::new(b"pk2".to_vec()));
-        storage.write(&table_id, &k1, test_row(10), 10).unwrap();
-        storage.write(&table_id, &k2, test_row(11), 11).unwrap();
+        storage
+            .write(&table_id, &k1, Arc::new(test_row(10)), 10)
+            .unwrap();
+        storage
+            .write(&table_id, &k2, Arc::new(test_row(11)), 11)
+            .unwrap();
 
         let handler = IndexReadInPartitionHandler::new(storage);
         let req = IndexReadInPartitionRequestPayload {
@@ -5190,7 +5204,7 @@ mod tests {
             key: key.clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![test_row(999)],
+            rows: vec![Arc::new(test_row(999))],
         };
 
         let table_id = TableId::new("test_ks", "test_tbl");
@@ -5276,7 +5290,7 @@ mod tests {
         let table_id = TableId::new("test_ks", "test_tbl");
         let key = test_key();
         let row = test_row(1000);
-        storage.write(&table_id, &key, row, 1000).unwrap();
+        storage.write(&table_id, &key, Arc::new(row), 1000).unwrap();
 
         // Without override: QUORUM with 1 node in the ring should fail.
         let result = coordinator.coordinate_read(&table_id, &key).await;
@@ -5335,9 +5349,11 @@ mod tests {
         let key = test_key();
 
         // Write older then newer data to the same key.
-        storage.write(&table_id, &key, test_row(100), 100).unwrap();
         storage
-            .write(&table_id, &key, test_row(9000), 9000)
+            .write(&table_id, &key, Arc::new(test_row(100)), 100)
+            .unwrap();
+        storage
+            .write(&table_id, &key, Arc::new(test_row(9000)), 9000)
             .unwrap();
 
         // CL=ONE with 1 replica — fast path, no digest comparison.
@@ -5479,7 +5495,7 @@ mod tests {
             key: key.clone(),
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
             static_row: None,
-            rows: vec![test_row(1000)],
+            rows: vec![Arc::new(test_row(1000))],
         };
 
         // Attempt repair to unreachable replica.
@@ -5564,7 +5580,7 @@ mod tests {
             key: key.clone(),
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
             static_row: None,
-            rows: vec![test_row(1000)],
+            rows: vec![Arc::new(test_row(1000))],
         };
 
         coordinator
@@ -5671,7 +5687,7 @@ mod tests {
     /// inline repair wrote into the LOCAL replica's storage (remote repair writes
     /// go to a no-op peer manager).
     struct TwoReplicaRead {
-        rows: Vec<Row>,
+        rows: Vec<Arc<Row>>,
         coordinator: ClusterCoordinator,
         table_id: TableId,
         key: DecoratedKey,
@@ -5834,14 +5850,14 @@ mod tests {
         // bytes, so `test_key()`'s fixed token would make the remote miss.
         let key = DecoratedKey::new(PartitionKey::new(b"server-device".to_vec()));
         for row in local_rows {
-            local.write(&table_id, &key, row, 2_000).unwrap();
+            local.write(&table_id, &key, Arc::new(row), 2_000).unwrap();
         }
         for row in remote_rows {
-            remote.write(&table_id, &key, row, 2_000).unwrap();
+            remote.write(&table_id, &key, Arc::new(row), 2_000).unwrap();
         }
         if let Some(marker) = ferrosa_storage::partition_apply::deletion_marker(remote_deletion) {
             remote
-                .apply_partition_rows(&table_id, &key, vec![marker])
+                .apply_partition_rows(&table_id, &key, vec![Arc::new(marker)])
                 .unwrap();
         }
         let (server, addr, remote_host_id) = start_read_server(Arc::new(
@@ -5923,7 +5939,9 @@ mod tests {
         let table_id = register_ttl_table(&storage);
         let key = DecoratedKey::new(PartitionKey::new(b"server-device".to_vec()));
         for row in rows {
-            storage.write(&table_id, &key, row, 2_000).unwrap();
+            storage
+                .write(&table_id, &key, Arc::new(row), 2_000)
+                .unwrap();
         }
         let (server, addr, host_id) = start_read_server_advertising(
             Arc::new(crate::raft::handlers::ReadRequestHandler::new(storage)),
@@ -6268,7 +6286,7 @@ mod tests {
         let table_id = TableId::new("test_ks", "test_tbl");
         let key = test_key();
         storage
-            .write(&table_id, &key, test_row(1000), 1000)
+            .write(&table_id, &key, Arc::new(test_row(1000)), 1000)
             .unwrap();
 
         let result = coordinator.coordinate_read(&table_id, &key).await.unwrap();
@@ -6303,7 +6321,7 @@ mod tests {
             key: key.clone(),
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
             static_row: None,
-            rows: vec![test_row(1000)],
+            rows: vec![Arc::new(test_row(1000))],
         };
 
         coordinator
@@ -6359,7 +6377,7 @@ mod tests {
             key: key.clone(),
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
             static_row: None,
-            rows: vec![test_row(5000)],
+            rows: vec![Arc::new(test_row(5000))],
         };
 
         // Repair two stale replicas.
@@ -6427,7 +6445,7 @@ mod tests {
         let table_id = TableId::new("test_ks", "test_tbl");
         let key = test_key();
         let row = test_row(1000);
-        storage.write(&table_id, &key, row, 1000).unwrap();
+        storage.write(&table_id, &key, Arc::new(row), 1000).unwrap();
 
         let dc_rf = std::collections::HashMap::from([
             ("dc1".to_string(), 1usize),
@@ -6445,7 +6463,7 @@ mod tests {
         for clustering in [vec![1], vec![2], vec![3]] {
             let mut row = test_row(2000 + i64::from(clustering[0]));
             row.clustering = clustering;
-            storage.write(&table_id, &key, row, 2000).unwrap();
+            storage.write(&table_id, &key, Arc::new(row), 2000).unwrap();
         }
         let suffix = coordinator
             .coordinate_read_nts_limited_rows_from(
@@ -6750,7 +6768,7 @@ mod tests {
 
         // Now write data and verify it returns.
         storage
-            .write(&table_id, &key, test_row(1000), 1000)
+            .write(&table_id, &key, Arc::new(test_row(1000)), 1000)
             .unwrap();
         let result = coordinator
             .read_one_replica(&table_id, &key, &[local_node_id], &ring)
@@ -6789,7 +6807,7 @@ mod tests {
 
         // Write data to storage for this key.
         storage
-            .write(&table_id, &key, test_row(2000), 2000)
+            .write(&table_id, &key, Arc::new(test_row(2000)), 2000)
             .unwrap();
 
         // Pass replicas list where local is second — the function should
@@ -6859,7 +6877,7 @@ mod tests {
         let table_id = TableId::new("test_ks", "test_tbl");
         let key = test_key();
         storage
-            .write(&table_id, &key, test_row(1000), 1000)
+            .write(&table_id, &key, Arc::new(test_row(1000)), 1000)
             .unwrap();
 
         let result = coordinator.coordinate_range_read(&table_id).await;
@@ -6898,7 +6916,7 @@ mod tests {
         let table_id = TableId::new("test_ks", "test_tbl");
         let key = test_key();
         storage
-            .write(&table_id, &key, test_row(1000), 1000)
+            .write(&table_id, &key, Arc::new(test_row(1000)), 1000)
             .unwrap();
 
         let result = coordinator.coordinate_range_read(&table_id).await;
@@ -6984,7 +7002,7 @@ mod tests {
 
         let table_id = TableId::new("test_ks", "test_tbl");
         storage
-            .write(&table_id, &test_key(), test_row(1000), 1000)
+            .write(&table_id, &test_key(), Arc::new(test_row(1000)), 1000)
             .unwrap();
 
         // Baseline: at the node's own default (ONE) the local count is a
@@ -7058,7 +7076,7 @@ mod tests {
         // Write a partition locally. The OLD code would have happily returned
         // count=1 here — but that is only the LOCAL view; node2 may hold more.
         storage
-            .write(&table_id, &test_key(), test_row(1000), 1000)
+            .write(&table_id, &test_key(), Arc::new(test_row(1000)), 1000)
             .unwrap();
 
         let result = coordinator.coordinate_range_count(&table_id).await;
@@ -7099,7 +7117,7 @@ mod tests {
 
         let table_id = TableId::new("test_ks", "test_tbl");
         storage
-            .write(&table_id, &test_key(), test_row(1000), 1000)
+            .write(&table_id, &test_key(), Arc::new(test_row(1000)), 1000)
             .unwrap();
 
         let count = coordinator
@@ -7154,7 +7172,7 @@ mod tests {
         );
         let table_id = TableId::new("test_ks", "test_tbl");
         storage
-            .write(&table_id, &test_key(), test_row(1000), 1000)
+            .write(&table_id, &test_key(), Arc::new(test_row(1000)), 1000)
             .unwrap();
 
         let mut stream = coordinator
@@ -7201,6 +7219,7 @@ mod tests {
                         row.clustering = (i as u32).to_be_bytes().to_vec();
                         row
                     })
+                    .map(Arc::new)
                     .collect(),
             }])
         }
@@ -7245,7 +7264,9 @@ mod tests {
         for i in 0..2_000u32 {
             let mut row = test_row(i as i64);
             row.clustering = i.to_be_bytes().to_vec();
-            storage.write(&table_id, &key, row, i as i64).unwrap();
+            storage
+                .write(&table_id, &key, Arc::new(row), i as i64)
+                .unwrap();
         }
         storage.flush(&table_id).unwrap();
 
@@ -7305,7 +7326,7 @@ mod tests {
                 // merge (8 SSTables > the merge fan-in) then rejects.
                 let key = DecoratedKey::new(PartitionKey::new(pk));
                 storage
-                    .write(&table_id, &key, test_row(i as i64), i as i64)
+                    .write(&table_id, &key, Arc::new(test_row(i as i64)), i as i64)
                     .unwrap();
             }
             storage.flush(&table_id).unwrap();
@@ -7379,7 +7400,7 @@ mod tests {
             key,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![test_row(4321)],
+            rows: vec![Arc::new(test_row(4321))],
         };
         let (server, addr, remote_host_id) = start_rpc_server(
             MsgType::RangeReadRequest,
@@ -7432,7 +7453,7 @@ mod tests {
             key: key.clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![test_row(4321)],
+            rows: vec![Arc::new(test_row(4321))],
         };
         let (server, addr, remote_host_id) = start_rpc_server(
             MsgType::ReadRequest,
@@ -7531,7 +7552,7 @@ mod tests {
         let table_id = TableId::new("test_ks", "test_tbl");
         let key = test_key();
         storage
-            .write(&table_id, &key, test_row(1000), 1000)
+            .write(&table_id, &key, Arc::new(test_row(1000)), 1000)
             .unwrap();
 
         let result = coordinator.coordinate_read(&table_id, &key).await;
@@ -7569,7 +7590,7 @@ mod tests {
         let table_id = TableId::new("test_ks", "test_tbl");
         let key = test_key();
         storage
-            .write(&table_id, &key, test_row(1000), 1000)
+            .write(&table_id, &key, Arc::new(test_row(1000)), 1000)
             .unwrap();
 
         let dc_rf = std::collections::HashMap::from([("dc1".to_string(), 1usize)]);
@@ -7616,7 +7637,7 @@ mod tests {
         let table_id = TableId::new("test_ks", "test_tbl");
         let key = test_key();
         storage
-            .write(&table_id, &key, test_row(1000), 1000)
+            .write(&table_id, &key, Arc::new(test_row(1000)), 1000)
             .unwrap();
 
         // Use CL=ONE (non-LOCAL) with NTS strategy -- takes the regular path
@@ -7665,7 +7686,7 @@ mod tests {
         .await
         .expect("origin and remote-majority digests must launch together")
         .unwrap();
-        assert_eq!(rows, vec![test_row(1000)]);
+        assert_eq!(rows, vec![Arc::new(test_row(1000))]);
     }
 
     fn verification_nts_newest_row() -> Row {
@@ -7680,7 +7701,7 @@ mod tests {
         newest: Option<u64>,
         index: bool,
         rendezvous: Option<std::sync::Arc<tokio::sync::Barrier>>,
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         let dir = tempfile::tempdir().unwrap();
         let storage = test_storage(dir.path());
         if index {
@@ -7710,7 +7731,7 @@ mod tests {
             key: key.clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![test_row(1000)],
+            rows: vec![Arc::new(test_row(1000))],
         };
         storage
             .write(&table, &key, partition.rows[0].clone(), 1000)
@@ -7741,7 +7762,7 @@ mod tests {
                         Arc::new(StaticDigestReadHandler {
                             partition: if newest == Some(id) {
                                 Partition {
-                                    rows: vec![verification_nts_newest_row()],
+                                    rows: vec![Arc::new(verification_nts_newest_row())],
                                     ..partition.clone()
                                 }
                             } else {
@@ -7805,7 +7826,7 @@ mod tests {
     async fn verification_nts_read_case(
         live: &[u64],
         cl: ConsistencyLevel,
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         verification_nts_read_case_with_newest(live, cl, None, false, None).await
     }
 
@@ -7823,7 +7844,7 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(rows, vec![verification_nts_newest_row()]);
+        assert_eq!(rows, vec![Arc::new(verification_nts_newest_row())]);
     }
 
     #[tokio::test]
@@ -7838,7 +7859,7 @@ mod tests {
         .await
         .expect("nested keyed-index certificate")
         .unwrap();
-        assert_eq!(rows, vec![test_row(1000)]);
+        assert_eq!(rows, vec![Arc::new(test_row(1000))]);
     }
 
     #[tokio::test]
@@ -7873,7 +7894,7 @@ mod tests {
             .await
             .expect("origin + remote majorities must suffice while dc3 is absent")
             .unwrap();
-        assert_eq!(rows, vec![test_row(1000)]);
+        assert_eq!(rows, vec![Arc::new(test_row(1000))]);
     }
 
     #[tokio::test]
@@ -7912,7 +7933,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(rows, vec![test_row(1000)]);
+        assert_eq!(rows, vec![Arc::new(test_row(1000))]);
     }
 
     #[tokio::test]
@@ -7936,7 +7957,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap(),
-            vec![test_row(1000)]
+            vec![Arc::new(test_row(1000))]
         );
     }
 

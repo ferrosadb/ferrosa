@@ -18,6 +18,7 @@
 //!   newer deletion timestamp wins.
 
 use ferrosa_sstable::types::{DeletionTime, Partition, Row};
+use std::sync::Arc;
 
 /// Merge multiple partitions (from different SSTables/memtable) into one.
 ///
@@ -59,7 +60,7 @@ fn merge_partition_metadata(sources: Vec<Partition>, suppress_deletions: bool) -
     let result_key = first.key;
     let mut result_deletion = first.deletion;
     let mut result_static_row = first.static_row;
-    let mut all_rows: Vec<Row> = first.rows;
+    let mut all_rows: Vec<Arc<Row>> = first.rows;
 
     for source in iter {
         // Partition-level deletion: newest wins
@@ -101,13 +102,18 @@ fn merge_partition_metadata(sources: Vec<Partition>, suppress_deletions: bool) -
 /// Shared by [`merge_partitions`] (multi source) and
 /// [`ensure_partition_rows_sorted`] (single-source compaction rewrite) so the
 /// two paths produce identical row order.
-fn sort_and_fold_rows(rows: &mut Vec<Row>) {
+///
+/// Rows are shared: a row with no same-clustering peer is passed through as
+/// the source's own `Arc`. Folding two versions is a genuine mutation, so the
+/// surviving row is copied on write only if another owner (the memtable, a
+/// reader) still holds it.
+fn sort_and_fold_rows(rows: &mut Vec<Arc<Row>>) {
     rows.sort_by(|a, b| a.clustering.cmp(&b.clustering));
     rows.dedup_by(|later, earlier| {
         if later.clustering != earlier.clustering {
             return false;
         }
-        merge_rows_into(earlier, later);
+        merge_rows_into(Arc::make_mut(earlier), Arc::make_mut(later));
         true
     });
 }
@@ -144,6 +150,15 @@ pub fn ensure_partition_rows_sorted(partition: &mut Partition) {
 /// without ever materialising the full multi-source partition.
 pub fn merge_rows(mut a: Row, mut b: Row) -> Row {
     merge_rows_into(&mut a, &mut b);
+    a
+}
+
+/// [`merge_rows`] over shared rows: the result reuses `a`'s allocation when
+/// no one else holds it, and copies on write otherwise (a merge of two
+/// versions is a genuine mutation; neither source row is changed in place
+/// while shared).
+pub fn merge_shared_rows(mut a: Arc<Row>, mut b: Arc<Row>) -> Arc<Row> {
+    merge_rows_into(Arc::make_mut(&mut a), Arc::make_mut(&mut b));
     a
 }
 
@@ -208,9 +223,16 @@ pub(crate) fn apply_deletions(partition: &mut Partition) {
 
     // Apply row-level deletions to cells within each row
     for row in &mut partition.rows {
-        if !row.deletion.is_live() {
-            let row_delete_at = row.deletion.marked_for_delete_at;
-            row.cells
+        let row_delete_at = row.deletion.marked_for_delete_at;
+        // Copy on write only a shared row that actually loses a cell.
+        if !row.deletion.is_live()
+            && row
+                .cells
+                .iter()
+                .any(|(_col, cell)| cell.timestamp < row_delete_at)
+        {
+            Arc::make_mut(row)
+                .cells
                 .retain(|(_col, cell)| cell.timestamp >= row_delete_at);
         }
     }
@@ -293,7 +315,7 @@ mod tests {
             key: make_key(key),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows,
+            rows: rows.into_iter().map(Arc::new).collect(),
         }
     }
 
@@ -316,14 +338,14 @@ mod tests {
                 .read(&tid, &make_key(name))
                 .unwrap()
                 .and_then(|p| p.rows.into_iter().next())
-                .and_then(|r| r.cells.into_iter().next())
+                .and_then(|r| Arc::unwrap_or_clone(r).cells.into_iter().next())
                 .map(|(_, cell)| cell)
         };
         engine
             .write(
                 &tid,
                 &make_key("memory"),
-                row(CellValue::live(b"SELECT".to_vec(), 42)),
+                Arc::new(row(CellValue::live(b"SELECT".to_vec(), 42))),
                 42,
             )
             .unwrap();
@@ -335,7 +357,7 @@ mod tests {
             .write(
                 &tid,
                 &make_key("memory"),
-                row(CellValue::tombstone(42, local_delete)),
+                Arc::new(row(CellValue::tombstone(42, local_delete))),
                 42,
             )
             .unwrap();
@@ -348,7 +370,7 @@ mod tests {
             .write(
                 &tid,
                 &make_key("flushed"),
-                row(CellValue::live(b"SELECT".to_vec(), 42)),
+                Arc::new(row(CellValue::live(b"SELECT".to_vec(), 42))),
                 42,
             )
             .unwrap();
@@ -356,7 +378,7 @@ mod tests {
             .write(
                 &tid,
                 &make_key("unrelated"),
-                row(CellValue::live(b"keep".to_vec(), 42)),
+                Arc::new(row(CellValue::live(b"keep".to_vec(), 42))),
                 42,
             )
             .unwrap();
@@ -369,7 +391,7 @@ mod tests {
             .write(
                 &tid,
                 &make_key("flushed"),
-                row(CellValue::tombstone(42, local_delete)),
+                Arc::new(row(CellValue::tombstone(42, local_delete))),
                 42,
             )
             .unwrap();

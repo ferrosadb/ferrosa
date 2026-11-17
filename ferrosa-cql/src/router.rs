@@ -3144,7 +3144,7 @@ fn build_lwt_mutation(
         table_id.keyspace.clone(),
         table_id.table.clone(),
         key,
-        vec![row],
+        vec![Arc::new(row)],
         ts,
     );
     let mut mutation_bytes = vec![0u8; mutation.serialized_size()];
@@ -3273,7 +3273,7 @@ fn build_transaction_write(
         table_id.keyspace.clone(),
         table_id.table.clone(),
         key,
-        vec![row],
+        vec![Arc::new(row)],
         ts,
     );
     let mut mutation_bytes = vec![0u8; mutation.serialized_size()];
@@ -8922,7 +8922,7 @@ pub(crate) fn cdc_event_to_result_frame(
     ks: &str,
     select: &SelectStatement,
     key: ferrosa_common::DecoratedKey,
-    rows: Vec<ferrosa_sstable::types::Row>,
+    rows: Vec<std::sync::Arc<ferrosa_sstable::types::Row>>,
 ) -> Result<Option<BytesMut>, CqlError> {
     let snap = schema.snapshot();
     let table_meta = match snap.tables.get(&(ks.to_string(), select.table.clone())) {
@@ -9659,7 +9659,7 @@ pub async fn route_prepared_insert_fast(
             .write(
                 &table_id,
                 &decorated_key,
-                row,
+                Arc::new(row),
                 timestamp,
                 ctx.consistency,
                 &strategy,
@@ -9902,7 +9902,7 @@ async fn route_insert(
         .write(
             &table_id,
             &decorated_key,
-            row,
+            Arc::new(row),
             timestamp,
             ctx.consistency,
             &strategy,
@@ -10763,7 +10763,7 @@ async fn route_update(
         .write(
             &table_id,
             &decorated_key,
-            row,
+            Arc::new(row),
             timestamp,
             ctx.consistency,
             &strategy,
@@ -11002,7 +11002,7 @@ async fn route_delete(
         .write(
             &table_id,
             &decorated_key,
-            row,
+            Arc::new(row),
             timestamp,
             ctx.consistency,
             &strategy,
@@ -11134,7 +11134,7 @@ async fn route_logged_batch(
                     table_id.keyspace.clone(),
                     table_id.table.clone(),
                     key,
-                    vec![row],
+                    vec![Arc::new(row)],
                     ts,
                 ));
             }
@@ -11148,7 +11148,7 @@ async fn route_logged_batch(
                     table_id.keyspace.clone(),
                     table_id.table.clone(),
                     key,
-                    vec![row],
+                    vec![Arc::new(row)],
                     ts,
                 ));
             }
@@ -11158,7 +11158,7 @@ async fn route_logged_batch(
                     table_id.keyspace.clone(),
                     table_id.table.clone(),
                     key,
-                    vec![row],
+                    vec![Arc::new(row)],
                     ts,
                 ));
             }
@@ -15822,7 +15822,7 @@ fn persist_index_row_direct(engine: &StorageEngine, index: &IndexMetadata) {
         .map(|d| d.as_micros() as i64)
         .unwrap_or(0);
     let tid = TableId::new("system_schema", "indexes");
-    if let Err(e) = engine.write(&tid, &row.key, row.row, ts) {
+    if let Err(e) = engine.write(&tid, &row.key, Arc::new(row.row), ts) {
         tracing::warn!(
             %e,
             keyspace = %index.keyspace,
@@ -16738,7 +16738,7 @@ async fn route_alter_type(
                 .unwrap_or(0);
             let tid = TableId::new("system_schema", "types");
             core.engine
-                .write(&tid, &row.key, row.row, ts)
+                .write(&tid, &row.key, Arc::new(row.row), ts)
                 .map_err(|e| CqlError::ServerError(format!("persist altered type: {e}")))?;
         }
 
@@ -21267,7 +21267,10 @@ mod tests {
             .unwrap()
             .as_micros() as i64;
         let tid = TableId::new("system_schema", "indexes");
-        state.engine.write(&tid, &row.key, row.row, ts).unwrap();
+        state
+            .engine
+            .write(&tid, &row.key, Arc::new(row.row), ts)
+            .unwrap();
 
         // The Registry has no such index, yet the SELECT returns it.
         assert!(
@@ -21318,7 +21321,10 @@ mod tests {
             primary_key_liveness: ferrosa_sstable::LivenessInfo::with_timestamp(5_000_000),
         };
         let tid = TableId::new("cc_ks", "t");
-        state.engine.write(&tid, &key, row, 5_000_000).unwrap();
+        state
+            .engine
+            .write(&tid, &key, Arc::new(row), 5_000_000)
+            .unwrap();
     }
 
     /// CQL-Tcf7ca2cc: a partition with one corrupt simple cell fails the SELECT
@@ -21400,7 +21406,10 @@ mod tests {
                 primary_key_liveness: ferrosa_sstable::LivenessInfo::with_timestamp(5_000_000),
             };
             let tid = TableId::new("cj_ks", "t");
-            state.engine.write(&tid, &key, row, 5_000_000).unwrap();
+            state
+                .engine
+                .write(&tid, &key, Arc::new(row), 5_000_000)
+                .unwrap();
 
             let cql = format!("SELECT * FROM cj_ks.t WHERE id = {id}");
             let stmt = crate::parser::parse(&cql).unwrap();
@@ -21516,7 +21525,10 @@ mod tests {
             .unwrap()
             .as_micros() as i64;
         let tid = TableId::new("system_schema", "types");
-        state.engine.write(&tid, &row.key, row.row, ts).unwrap();
+        state
+            .engine
+            .write(&tid, &row.key, Arc::new(row.row), ts)
+            .unwrap();
 
         // The Registry has no such type, yet the SELECT returns it.
         assert!(
@@ -21576,7 +21588,10 @@ mod tests {
             .unwrap()
             .as_micros() as i64;
         let tid = TableId::new("system_schema", "functions");
-        state.engine.write(&tid, &row.key, row.row, ts).unwrap();
+        state
+            .engine
+            .write(&tid, &row.key, Arc::new(row.row), ts)
+            .unwrap();
 
         // The Registry has no such function, yet the SELECT returns it.
         assert!(
@@ -21612,7 +21627,10 @@ mod tests {
             deletion: ferrosa_sstable::types::DeletionTime::new(ts2, (ts2 / 1_000_000) as u32),
             primary_key_liveness: ferrosa_sstable::types::LivenessInfo::NONE,
         };
-        state.engine.write(&tid, &key, tombstone, ts2).unwrap();
+        state
+            .engine
+            .write(&tid, &key, Arc::new(tombstone), ts2)
+            .unwrap();
 
         let stmt = crate::parser::parse("SELECT * FROM system_schema.functions").unwrap();
         let RouteResult::Result(body) = route(&state, &ctx, stmt).await.unwrap() else {
@@ -25703,12 +25721,12 @@ mod tests {
                 )),
                 deletion: ferrosa_sstable::types::DeletionTime::LIVE,
                 static_row: None,
-                rows: vec![ferrosa_sstable::types::Row {
+                rows: vec![Arc::new(ferrosa_sstable::types::Row {
                     clustering: bridge::encode_clustering(&[CqlValue::Int(clustering)]),
                     cells: Vec::new(),
                     deletion: ferrosa_sstable::types::DeletionTime::LIVE,
                     primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
-                }],
+                })],
             }
         }
 
@@ -30669,7 +30687,7 @@ mod tests {
             deletion: ferrosa_sstable::DeletionTime::LIVE,
             primary_key_liveness: ferrosa_sstable::LivenessInfo::with_timestamp(1),
         };
-        engine.write(&table_id, &key1, row1, 1).unwrap();
+        engine.write(&table_id, &key1, Arc::new(row1), 1).unwrap();
         engine.flush(&table_id).unwrap();
 
         // Discover the generation number from the SSTable directory.
@@ -31429,7 +31447,7 @@ mod tests {
                     table_id.keyspace.clone(),
                     table_id.table.clone(),
                     key.clone(),
-                    chunk.to_vec(),
+                    chunk.iter().cloned().map(Arc::new).collect(),
                     n as i64,
                 )
             })
@@ -31514,7 +31532,7 @@ mod tests {
                     table_id.keyspace.clone(),
                     table_id.table.clone(),
                     key.clone(),
-                    chunk.to_vec(),
+                    chunk.iter().cloned().map(Arc::new).collect(),
                     1,
                 )
             })
@@ -36690,7 +36708,7 @@ mod tests {
                     table_id.keyspace.clone(),
                     table_id.table.clone(),
                     key.clone(),
-                    chunk.to_vec(),
+                    chunk.iter().cloned().map(Arc::new).collect(),
                     n as i64,
                 )
             })

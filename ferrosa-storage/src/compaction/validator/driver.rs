@@ -205,6 +205,7 @@ mod tests {
     use ferrosa_common::schema::{ColumnDefinition, TableSchema};
     use ferrosa_common::CellValue;
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+    use std::sync::Arc;
 
     fn test_schema() -> TableSchema {
         TableSchema {
@@ -229,12 +230,12 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(key.as_bytes().to_vec())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: clustering.to_vec(),
                 cells: vec![(0, cell)],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1),
-            }],
+            })],
         }
     }
 

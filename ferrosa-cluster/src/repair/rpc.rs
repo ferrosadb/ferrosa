@@ -597,6 +597,7 @@ mod tests {
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(12_345 + i as i64),
                 })
+                .map(Arc::new)
                 .collect(),
         }
     }

@@ -225,7 +225,7 @@ fn build_writeset(cell_ts: i64) -> Vec<ApplyMutation> {
                 KS.to_string(),
                 TABLE.to_string(),
                 make_key(i),
-                vec![row],
+                vec![Arc::new(row)],
                 cell_ts,
             );
             let mut buf = vec![0u8; m.serialized_size()];
@@ -357,7 +357,7 @@ fn build_payloads(cell_ts: i64) -> Vec<Vec<u8>> {
                 KS.to_string(),
                 TABLE.to_string(),
                 make_key(i),
-                vec![row],
+                vec![Arc::new(row)],
                 cell_ts,
             );
             let mut buf = vec![0u8; m.serialized_size()];

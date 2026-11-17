@@ -19,6 +19,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use ferrosa_common::cell::CellValue;
@@ -216,7 +217,9 @@ fn measure_recovery_peaks(n: usize) -> Peaks {
         for i in 0..n {
             let key = DecoratedKey::new(PartitionKey::new(format!("pk{i:06}").into_bytes()));
             let ts = 1_000 + i as i64;
-            engine.write(&tid, &key, big_row(i, ts), ts).unwrap();
+            engine
+                .write(&tid, &key, Arc::new(big_row(i, ts)), ts)
+                .unwrap();
         }
         engine.flush(&tid).unwrap();
     }

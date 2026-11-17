@@ -512,7 +512,12 @@ async fn pg_jsonb_corrupt_stored_cell_is_an_error_not_null() {
         primary_key_liveness: LivenessInfo::with_timestamp(i64::MAX / 2),
     };
     fx.engine
-        .write(&TableId::new("public", "j"), &key, row, i64::MAX / 2)
+        .write(
+            &TableId::new("public", "j"),
+            &key,
+            Arc::new(row),
+            i64::MAX / 2,
+        )
         .expect("raw engine write");
 
     let text = fx.client.simple_query("SELECT doc FROM j").await;

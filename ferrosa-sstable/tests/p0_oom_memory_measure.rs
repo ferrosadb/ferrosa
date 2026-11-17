@@ -13,6 +13,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::Arc;
 
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
 use ferrosa_sstable::io::FileReadAt;
@@ -108,7 +109,7 @@ fn partition(idx: usize, rows: usize) -> Partition {
         key,
         deletion: DeletionTime::LIVE,
         static_row: None,
-        rows: body,
+        rows: body.into_iter().map(Arc::new).collect(),
     }
 }
 

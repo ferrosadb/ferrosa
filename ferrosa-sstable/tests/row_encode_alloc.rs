@@ -28,6 +28,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
 use ferrosa_sstable::statistics::SerializationHeader;
@@ -170,7 +171,7 @@ fn partition(k: u32, rows: Vec<Row>) -> Partition {
         key: key(k),
         deletion: DeletionTime::LIVE,
         static_row: None,
-        rows,
+        rows: rows.into_iter().map(Arc::new).collect(),
     }
 }
 

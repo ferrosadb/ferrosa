@@ -708,12 +708,12 @@ async fn cluster_anchor_full_primary_key_match_reads_remote_vertex_without_range
         )),
         deletion: DeletionTime::LIVE,
         static_row: None,
-        rows: vec![Row {
+        rows: vec![Arc::new(Row {
             clustering: vec![],
             cells: vec![(1, ferrosa_common::CellValue::live(b"Alice".to_vec(), 1000))],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
-        }],
+        })],
     };
 
     let (server, addr, remote_host_id) =
@@ -4389,7 +4389,12 @@ fn seed_agent_memory_entity(
         primary_key_liveness: LivenessInfo::with_timestamp(1),
     };
     storage
-        .write(&TableId::new("agent_memory", "entity_store"), &key, row, 1)
+        .write(
+            &TableId::new("agent_memory", "entity_store"),
+            &key,
+            Arc::new(row),
+            1,
+        )
         .unwrap();
 }
 
@@ -6095,12 +6100,12 @@ async fn inline_merge_reuses_legacy_destination_storage_identity() {
         .write(
             &TableId::new("social", "person_v"),
             &legacy_key,
-            Row {
+            Arc::new(Row {
                 clustering: vec![],
                 cells: vec![(1, CellValue::live(b"LegacyDst".to_vec(), 1))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1),
-            },
+            }),
             1,
         )
         .expect("seed the existing legacy vertex");

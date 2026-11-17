@@ -631,7 +631,7 @@ mod tests {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1),
         };
-        storage.write(&table_id, &dk, row, 1).unwrap();
+        storage.write(&table_id, &dk, Arc::new(row), 1).unwrap();
     }
 
     /// Build an adjacency row clustering key in standard composite layout:
@@ -668,7 +668,7 @@ mod tests {
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1),
             };
-            storage.write(&adj_table_id, &dk, row, 1).unwrap();
+            storage.write(&adj_table_id, &dk, Arc::new(row), 1).unwrap();
         }
     }
 
@@ -840,7 +840,9 @@ mod tests {
             deletion: DeletionTime::new(2, 0),
             primary_key_liveness: LivenessInfo::NONE,
         };
-        storage.write(&adj_table_id, &dk, tombstone, 2).unwrap();
+        storage
+            .write(&adj_table_id, &dk, Arc::new(tombstone), 2)
+            .unwrap();
         let wp = WritePath::direct(storage);
 
         let result = execute_var_length(

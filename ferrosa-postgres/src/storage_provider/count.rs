@@ -230,7 +230,7 @@ mod tests {
             .unwrap();
         for name in ["old", "other"] {
             engine
-                .write(&table, &key(name), stored(false), 1000)
+                .write(&table, &key(name), Arc::new(stored(false)), 1000)
                 .unwrap();
         }
         let ctx = Arc::new(ScanContext {
@@ -365,7 +365,7 @@ mod tests {
                             before: Some(logical("old")),
                             after: None,
                         }],
-                        || engine.write(&table, &key("old"), stored(true), 3000),
+                        || engine.write(&table, &key("old"), Arc::new(stored(true)), 3000),
                     )
                     .unwrap();
             });

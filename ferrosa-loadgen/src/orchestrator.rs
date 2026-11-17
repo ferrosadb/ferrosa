@@ -1,6 +1,7 @@
 //! Load test orchestrator — spawns writers, readers, stats, integrity tasks.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ferrosa_common::cell::CellValue;
@@ -135,7 +136,12 @@ fn run_load_test_inner(
                             local_ts += 1;
                             let dk = make_key(&key_str);
                             let t0 = Instant::now();
-                            match engine.write(tid, &dk, make_row(&value, local_ts), local_ts) {
+                            match engine.write(
+                                tid,
+                                &dk,
+                                Arc::new(make_row(&value, local_ts)),
+                                local_ts,
+                            ) {
                                 Ok(()) => {
                                     let latency = t0.elapsed();
                                     gt.record_write(&key_str, &value, local_ts);
@@ -156,7 +162,12 @@ fn run_load_test_inner(
                             local_ts += 1;
                             let dk = make_key(&key_str);
                             let t0 = Instant::now();
-                            match engine.write(tid, &dk, make_tombstone_row(local_ts), local_ts) {
+                            match engine.write(
+                                tid,
+                                &dk,
+                                Arc::new(make_tombstone_row(local_ts)),
+                                local_ts,
+                            ) {
                                 Ok(()) => {
                                     let latency = t0.elapsed();
                                     gt.record_delete(&key_str, local_ts);
@@ -174,10 +185,13 @@ fn run_load_test_inner(
                             match engine.read(tid, &dk) {
                                 Ok(result) => {
                                     let latency = t0.elapsed();
-                                    let got = result
-                                        .and_then(|p| p.rows.into_iter().next())
-                                        .and_then(|r| r.cells.into_iter().next())
-                                        .and_then(|(_, c)| c.value);
+                                    let got = result.and_then(|p| {
+                                        // Read the first cell's bytes from the
+                                        // shared row; the value is refcounted.
+                                        p.rows.first().and_then(|r| {
+                                            r.cells.first().and_then(|(_, c)| c.value.clone())
+                                        })
+                                    });
                                     if let Some(ref v) = got {
                                         br.fetch_add(v.len() as u64, Ordering::Relaxed);
                                     }

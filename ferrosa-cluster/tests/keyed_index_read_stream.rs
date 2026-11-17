@@ -101,12 +101,12 @@ fn write_rows(engine: &StorageEngine, partition: &str, value: &[u8], rows: std::
             .write(
                 &table(),
                 &key,
-                Row {
+                Arc::new(Row {
                     clustering: ck.to_be_bytes().to_vec(),
                     cells: vec![(0, CellValue::live(value.to_vec(), 1000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                },
+                }),
                 1000,
             )
             .unwrap();
@@ -332,7 +332,7 @@ async fn drain(
         let item = item.expect("keyed index stream item");
         assert_eq!(item.key.key.as_bytes(), partition.as_bytes());
         assert_eq!(item.rows.len(), 1, "one row per item");
-        clusterings.extend(item.rows.into_iter().map(|row| row.clustering));
+        clusterings.extend(item.rows.iter().map(|row| row.clustering.clone()));
     }
 }
 
