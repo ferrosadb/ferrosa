@@ -334,6 +334,14 @@ mod tests {
         ) -> ferrosa_common::Result<()> {
             GraphWrite::write_batch(&self.inner, mutations, cl, rf).await
         }
+        async fn write_staged_batch(
+            &self,
+            batch: ferrosa_storage::write_set_stage::StagedWriteSet,
+            cl: ferrosa_cluster::consistency::ConsistencyLevel,
+            rf: usize,
+        ) -> ferrosa_common::Result<()> {
+            GraphWrite::write_staged_batch(&self.inner, batch, cl, rf).await
+        }
     }
 
     /// RED for p0-oom-audit clone-on-row-data at `adjacency_write_with_retry`:
