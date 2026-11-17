@@ -45,9 +45,11 @@ fn make_key(s: &str) -> DecoratedKey {
 
 /// Record one read against the ground truth and the byte counter. The read's
 /// bytes are borrowed only inside this call, so the worker loop never holds a
-/// borrow into the result across iterations.
+/// borrow into the result across iterations. The ground truth is `truth`, not
+/// `ground_truth`: a parameter named after its module shadows the module in the
+/// extracted Lean and turns the method call into a field projection.
 fn observe_read(
-    ground_truth: &GroundTruth,
+    truth: &GroundTruth,
     bytes_read: &AtomicU64,
     key: &str,
     result: &Option<Partition>,
@@ -59,7 +61,7 @@ fn observe_read(
     if let Some(v) = got {
         bytes_read.fetch_add(v.len() as u64, Ordering::Relaxed);
     }
-    ground_truth.record_read(key, got);
+    truth.record_read(key, got);
 }
 
 /// The first cell's bytes of the first row, borrowed from the shared row:
