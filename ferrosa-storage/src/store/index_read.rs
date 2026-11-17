@@ -394,7 +394,7 @@ impl<F: FlushTarget> TableStore<F> {
     /// partition key> AND <indexed_col> = ?`.
     ///
     /// Every source's postings are seeked to the partition and merged in row
-    /// order ([`OrderedPostings`]); the walk ends at the first posting of
+    /// order (the private `OrderedPostings` merge); the walk ends at the first posting of
     /// another partition. Each row posting is point-read as it is reached and
     /// re-checked against the index (a posting can outlive its value), so
     /// memory is O(posting sources) however many rows match, and the
