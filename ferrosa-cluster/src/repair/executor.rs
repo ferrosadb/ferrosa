@@ -583,7 +583,7 @@ impl InMemoryRepairStore {
                 Some(i) => {
                     let existing = dst.rows.remove(i);
                     dst.rows
-                        .insert(i, ferrosa_storage::merge::merge_rows(existing, row));
+                        .insert(i, ferrosa_storage::merge::merge_shared_rows(existing, row));
                 }
                 None => dst.rows.push(row),
             }
@@ -674,7 +674,7 @@ mod tests {
             key: dk,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row],
+            rows: vec![Arc::new(row)],
         }
     }
 

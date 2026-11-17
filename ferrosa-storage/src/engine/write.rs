@@ -9,6 +9,10 @@ impl StorageEngine {
     /// Mirrors the pattern in `dispatch_sync_observers`. Errors are logged at
     /// ERROR level and the write is skipped; derived mutation failures must
     /// not crash the engine.
+    ///
+    /// The derived rows are shared with the memtable, never copied: a caller
+    /// that also hands the same mutation to async observers (the timeseries
+    /// materializer) keeps one allocation per row.
     pub(super) fn apply_derived_mutation(&self, dm: &Mutation) {
         if let Err(e) = self.check_write_admission() {
             tracing::error!(
@@ -32,7 +36,7 @@ impl StorageEngine {
         let tables = self.tables.load();
         if let Some(state) = tables.get(&dtid) {
             for row in &dm.rows {
-                if let Err(e) = state.store.write(&dm.key, row.clone()) {
+                if let Err(e) = state.store.write(&dm.key, Arc::clone(row)) {
                     tracing::error!(
                         %e,
                         keyspace = %dm.keyspace,
@@ -55,7 +59,7 @@ impl StorageEngine {
         &self,
         table_id: &TableId,
         key: &DecoratedKey,
-        row: Row,
+        row: Arc<Row>,
         timestamp: i64,
     ) -> ferrosa_common::Result<()> {
         let total_start = Instant::now();
@@ -156,13 +160,13 @@ impl StorageEngine {
             phase_start.elapsed(),
         );
         let observer_mutation = if self.has_observers_for_table(table_id) {
-            // Clone row metadata for the observer lifetime. CellBytes shares
-            // immutable payloads with the row moved into the memtable.
+            // The observer shares the row the memtable stores (one `Arc`,
+            // no copy of its cells).
             Some(Mutation::new(
                 table_id.keyspace.clone(),
                 table_id.table.clone(),
                 key.clone(),
-                vec![row.clone()],
+                vec![Arc::clone(&row)],
                 timestamp,
             ))
         } else {
@@ -268,5 +272,64 @@ impl StorageEngine {
             self.commit_log.max_entry_size(),
         )?;
         self.write_atomic_batch_inner(mutations, Some(record))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+    use ferrosa_common::{CellValue, PartitionKey};
+    use ferrosa_sstable::types::{DeletionTime, LivenessInfo};
+
+    /// RED for p0-oom-audit clone-on-row-data at `apply_derived_mutation`:
+    /// each derived row used to be deep-copied into the memtable. The derived
+    /// mutation now shares its rows with the memtable, so the stored row is
+    /// the mutation's own allocation (pointer identity).
+    #[test]
+    fn apply_derived_mutation_stores_the_derived_row_without_copying_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine
+            .register_table(TableSchema {
+                keyspace: "derived_ks".to_string(),
+                table: "target".to_string(),
+                key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                clustering_columns: vec![],
+                static_columns: vec![],
+                regular_columns: vec![ColumnDefinition {
+                    name: "v".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                }],
+                extensions: Default::default(),
+            })
+            .unwrap();
+        let key = DecoratedKey::new(PartitionKey::new(b"k".to_vec()));
+        let row = Arc::new(Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(b"derived".to_vec(), 11))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(11),
+        });
+        let derived = Mutation::new(
+            "derived_ks".to_string(),
+            "target".to_string(),
+            key.clone(),
+            vec![Arc::clone(&row)],
+            11,
+        );
+
+        engine.apply_derived_mutation(&derived);
+
+        let stored = engine
+            .read(&TableId::new("derived_ks", "target"), &key)
+            .unwrap()
+            .expect("the derived row was applied");
+        assert_eq!(stored.rows.len(), 1);
+        assert!(
+            Arc::ptr_eq(&stored.rows[0], &row),
+            "the memtable must hold the derived mutation's row, not a copy of it"
+        );
     }
 }

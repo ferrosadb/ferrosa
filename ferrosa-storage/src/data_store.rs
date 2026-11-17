@@ -75,7 +75,7 @@ impl DataStore for LocalDataStore {
         row: Row,
         timestamp: i64,
     ) -> Result<()> {
-        self.engine.write(table_id, key, row, timestamp)
+        self.engine.write(table_id, key, Arc::new(row), timestamp)
     }
 
     async fn read_range(

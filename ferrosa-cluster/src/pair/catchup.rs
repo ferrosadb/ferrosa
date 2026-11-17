@@ -174,7 +174,7 @@ mod tests {
             keyspace: "ks".to_string(),
             table: "tbl".to_string(),
             key,
-            rows: vec![row],
+            rows: vec![Arc::new(row)],
             timestamp: ts,
         }
     }

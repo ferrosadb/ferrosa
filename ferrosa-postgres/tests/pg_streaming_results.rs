@@ -258,7 +258,9 @@ fn seed(engine: &StorageEngine) {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(ts),
         };
-        engine.write(&tid, &key, row, ts).expect("write row");
+        engine
+            .write(&tid, &key, Arc::new(row), ts)
+            .expect("write row");
     }
 }
 

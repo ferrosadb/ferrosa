@@ -11,6 +11,7 @@
 //! `StorageEngine` and `Schema`; the DDL is proposed once, on the leader, and
 //! every node applies it from its own log.
 
+use std::sync::Arc;
 mod common;
 
 use std::collections::HashMap;
@@ -163,7 +164,7 @@ async fn replicated_create_index_builds_on_receiving_node() {
                 .write(
                     &tid,
                     &DecoratedKey::new(PartitionKey::new(pk.as_bytes().to_vec())),
-                    row(value.as_bytes(), ts),
+                    Arc::new(row(value.as_bytes(), ts)),
                     ts,
                 )
                 .unwrap_or_else(|e| {

@@ -97,12 +97,12 @@ fn make_mutation(key_id: u64, timestamp: i64) -> Mutation {
             token: Token(key_id as i64),
             key: PartitionKey::new(key_bytes),
         },
-        rows: vec![Row {
+        rows: vec![Arc::new(Row {
             clustering: vec![],
             cells: vec![(0, CellValue::live(b"value".to_vec(), timestamp))],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
-        }],
+        })],
         timestamp,
     }
 }

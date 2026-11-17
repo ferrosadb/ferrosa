@@ -17,6 +17,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
 use ferrosa_sstable::io::FileReadAt;
@@ -93,7 +94,7 @@ fn partition(idx: usize, rows: usize) -> Partition {
         key: DecoratedKey::new(PartitionKey::new(format!("pk-{idx:016}").into_bytes())),
         deletion: DeletionTime::LIVE,
         static_row: None,
-        rows: (0..rows as i32).map(row).collect(),
+        rows: (0..rows as i32).map(row).map(Arc::new).collect(),
     }
 }
 
@@ -169,10 +170,20 @@ fn sstable_scan_steady_state_allocation_count() {
     // not remove them; only a caller-owned/pooled decode could, which is a
     // separate API change.
     //
-    // Guard budget: 6/row, tightened so it catches EITHER regression — the
-    // `col_meta` table (+3/row -> 8.25) and the `present_columns` Vec (+1/row ->
-    // 6.25) each trip it, while the current 5.25 clears it.
-    const BUDGET_PER_ROW: usize = 5;
+    //   under 5 per row                           (compaction value cursors; the
+    //                                             budget was tightened to 5)
+    //   2016 allocs / 384 rows = 5.250 per row   (rows are shared: `Partition.rows`
+    //                                             is `Vec<Arc<Row>>`, design A,
+    //                                             2026-11-16 — one `Arc` header
+    //                                             per decoded row, the price of
+    //                                             every later reader and writer
+    //                                             sharing the row instead of
+    //                                             deep-copying it)
+    //
+    // Guard budget: 6/row, so it catches EITHER regression — the `col_meta`
+    // table (+3/row -> 8.25) and the `present_columns` Vec (+1/row -> 6.25)
+    // each trip it, while the current 5.25 clears it.
+    const BUDGET_PER_ROW: usize = 6;
     let budget = rows_scanned * BUDGET_PER_ROW;
     assert!(
         steady <= budget,

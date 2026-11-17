@@ -262,7 +262,12 @@ impl History {
             // The next client Y write reaches a different durable quorum.
             if id == 3 {
                 storage
-                    .write(&table(), &key(), row_for(clustering, b"X", 10), 10)
+                    .write(
+                        &table(),
+                        &key(),
+                        Arc::new(row_for(clustering, b"X", 10)),
+                        10,
+                    )
                     .unwrap();
             }
             let handler = Arc::new(IndexedReplica {
@@ -346,7 +351,7 @@ impl History {
             .coordinate_write_with(
                 &table(),
                 &key(),
-                row_for(&self.clustering, b"Y", 20),
+                Arc::new(row_for(&self.clustering, b"Y", 20)),
                 20,
                 ConsistencyLevel::Quorum,
                 3,
@@ -544,7 +549,7 @@ async fn keyed_index_healthy_positive_quorum_needs_no_extra_row_rpcs() {
     // Complete the third replica's ordinary catch-up so this is the healthy
     // query case, while the write history above still has a real quorum ACK.
     history.engines[2]
-        .write(&table(), &key(), row(b"Y", 20), 20)
+        .write(&table(), &key(), Arc::new(row(b"Y", 20)), 20)
         .unwrap();
     let current = keyed_read(&history.reader, &b"Y"[..], ConsistencyLevel::Quorum, 3)
         .await
@@ -592,7 +597,7 @@ async fn keyed_index_empty_clustered_remote_candidate_refuses_before_row_rpc() {
                 key: key(),
                 deletion: DeletionTime::LIVE,
                 static_row: None,
-                rows: vec![row_for(&[], b"X", 10)],
+                rows: vec![Arc::new(row_for(&[], b"X", 10))],
             };
             Ok(Box::pin(futures::stream::iter([Ok(partition)])))
         }
@@ -691,7 +696,7 @@ async fn keyed_index_empty_clustered_values_remain_explicitly_unsupported() {
     let unsupported = row_for(&[], b"X", 10);
     assert!(
         storage
-            .write(&table(), &key(), unsupported.clone(), 10)
+            .write(&table(), &key(), Arc::new(unsupported.clone()), 10)
             .is_err(),
         "the existing writer contract does not accept empty clustered values"
     );
@@ -722,7 +727,9 @@ async fn keyed_index_geo_verification_uses_the_backend_cell_key_encoding() {
     };
     let point = encode_point(1.0, 1.0);
     let current = row(&point, 20);
-    storage.write(&geo, &key(), current.clone(), 20).unwrap();
+    storage
+        .write(&geo, &key(), Arc::new(current.clone()), 20)
+        .unwrap();
     assert_eq!(
         local_keyed(
             storage,
@@ -756,7 +763,9 @@ async fn keyed_index_local_postings_do_not_resurrect_tombstones_or_expired_cells
     let storage = &history.engines[2];
     let mut deleted = row(b"X", 20);
     deleted.cells[0].1 = CellValue::tombstone(20, 1);
-    storage.write(&table(), &key(), deleted, 20).unwrap();
+    storage
+        .write(&table(), &key(), Arc::new(deleted), 20)
+        .unwrap();
     assert!(local_keyed(
         storage,
         &table(),
@@ -768,7 +777,9 @@ async fn keyed_index_local_postings_do_not_resurrect_tombstones_or_expired_cells
     .is_empty());
     let mut expired = row(b"X", 30);
     expired.cells[0].1 = CellValue::expiring(b"X".to_vec(), 30, 1, 1);
-    storage.write(&table(), &key(), expired, 30).unwrap();
+    storage
+        .write(&table(), &key(), Arc::new(expired), 30)
+        .unwrap();
     assert!(local_keyed(
         storage,
         &table(),
@@ -778,7 +789,9 @@ async fn keyed_index_local_postings_do_not_resurrect_tombstones_or_expired_cells
     )
     .unwrap()
     .is_empty());
-    storage.write(&table(), &key(), row(b"X", 40), 40).unwrap();
+    storage
+        .write(&table(), &key(), Arc::new(row(b"X", 40)), 40)
+        .unwrap();
     assert_eq!(
         local_keyed(
             storage,
@@ -798,7 +811,7 @@ async fn keyed_index_local_postings_do_not_resurrect_tombstones_or_expired_cells
 async fn keyed_index_local_value_change_filters_stale_insert_only_postings() {
     let history = History::new().await;
     history.engines[2]
-        .write(&table(), &key(), row(b"Y", 20), 20)
+        .write(&table(), &key(), Arc::new(row(b"Y", 20)), 20)
         .unwrap();
     let old = local_keyed(
         &history.engines[2],

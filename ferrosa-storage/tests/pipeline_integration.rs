@@ -7,6 +7,7 @@ use ferrosa_common::cell::CellValue;
 use ferrosa_common::key::{DecoratedKey, PartitionKey};
 use ferrosa_common::schema::{ColumnDefinition, TableSchema};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+use std::sync::Arc;
 use std::time::Duration;
 
 use ferrosa_storage::{
@@ -87,7 +88,7 @@ fn write_flush_read_all() {
     for i in 0..n {
         let key = make_key(&format!("partition_{i:04}"));
         let row = make_row(format!("value_{i}").as_bytes(), 1000 + i);
-        engine.write(&tid, &key, row, 1000 + i).unwrap();
+        engine.write(&tid, &key, Arc::new(row), 1000 + i).unwrap();
     }
 
     engine.flush(&tid).unwrap();
@@ -121,7 +122,7 @@ fn write_flush_write_merge() {
     for i in 0..10 {
         let key = make_key(&format!("k{i:04}"));
         engine
-            .write(&tid, &key, make_row(b"old", 1000), 1000)
+            .write(&tid, &key, Arc::new(make_row(b"old", 1000)), 1000)
             .unwrap();
     }
     engine.flush(&tid).unwrap();
@@ -130,7 +131,7 @@ fn write_flush_write_merge() {
     for i in 0..10 {
         let key = make_key(&format!("k{i:04}"));
         engine
-            .write(&tid, &key, make_row(b"new", 2000), 2000)
+            .write(&tid, &key, Arc::new(make_row(b"new", 2000)), 2000)
             .unwrap();
     }
 
@@ -162,7 +163,7 @@ fn multiple_flushes_read_all() {
         for i in 0..5 {
             let key = make_key(&format!("r{round}_k{i}"));
             engine
-                .write(&tid, &key, make_row(b"v", 1000), 1000)
+                .write(&tid, &key, Arc::new(make_row(b"v", 1000)), 1000)
                 .unwrap();
         }
         engine.flush(&tid).unwrap();
@@ -199,7 +200,7 @@ fn wal_replay_after_crash() {
         for i in 0..5 {
             let key = make_key(&format!("crash_k{i}"));
             engine
-                .write(&tid, &key, make_row(b"recoverable", 1000), 1000)
+                .write(&tid, &key, Arc::new(make_row(b"recoverable", 1000)), 1000)
                 .unwrap();
         }
         // Drop engine without calling shutdown — simulates crash.
@@ -246,7 +247,7 @@ fn concurrent_writers_during_flush() {
                 for i in 0..20 {
                     let key = make_key(&format!("t{t}_k{i}"));
                     engine
-                        .write(&tid, &key, make_row(b"v", 1000 + t), 1000 + t)
+                        .write(&tid, &key, Arc::new(make_row(b"v", 1000 + t)), 1000 + t)
                         .unwrap();
                 }
             })
@@ -303,7 +304,7 @@ proptest! {
         for i in 0..count {
             let key = make_key(&format!("prop_k{i:06}"));
             let row = make_row(format!("val_{i}").as_bytes(), base_ts + i as i64);
-            engine.write(&tid, &key, row, base_ts + i as i64).unwrap();
+            engine.write(&tid, &key, Arc::new(row), base_ts + i as i64).unwrap();
             keys.push(key);
         }
 

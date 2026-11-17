@@ -93,7 +93,7 @@ mod tests {
                 let ts = 1000 + (gen * 10 + i) as i64;
                 let value = format!("v-{k}").into_bytes();
                 engine
-                    .write(&tid, &key(k), row(&value, ts), ts)
+                    .write(&tid, &key(k), Arc::new(row(&value, ts)), ts)
                     .expect("write");
                 oracle.record_write(&key(k), &1i32.to_be_bytes(), &value, ts);
             }
@@ -214,7 +214,9 @@ mod tests {
 
         let mut oracle = WriteOracle::new();
         let k = key("clean");
-        engine.write(&tid, &k, row(b"v1", 1000), 1000).unwrap();
+        engine
+            .write(&tid, &k, Arc::new(row(b"v1", 1000)), 1000)
+            .unwrap();
         oracle.record_write(&k, &1i32.to_be_bytes(), b"v1", 1000);
         engine.flush(&tid).unwrap();
 

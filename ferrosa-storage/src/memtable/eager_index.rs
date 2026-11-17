@@ -198,7 +198,7 @@ mod tests {
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1000 + i),
             };
-            store.write(&key, row).unwrap();
+            store.write(&key, Arc::new(row)).unwrap();
         }
 
         // Before flush: memtable index should have 10 entries.
@@ -225,7 +225,7 @@ mod tests {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(2000),
         };
-        store.write(&key, row).unwrap();
+        store.write(&key, Arc::new(row)).unwrap();
 
         let final_count = store.memtable_index_entry_count("idx_val");
         assert!(

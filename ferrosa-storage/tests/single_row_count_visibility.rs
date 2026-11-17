@@ -4,6 +4,7 @@ use ferrosa_common::schema::{ColumnDefinition, TableSchema};
 use ferrosa_common::{DecoratedKey, PartitionKey};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 use ferrosa_storage::{StorageEngine, StorageEngineConfig, TableId};
+use std::sync::Arc;
 
 fn schema(names: &[&str]) -> TableSchema {
     TableSchema {
@@ -58,7 +59,9 @@ fn single_row_count_retains_value_tie_winner_in_either_source_order() {
                 [loser, winner]
             };
             for cell in cells {
-                engine.write(&table, &key, row(0, cell), 2000).unwrap();
+                engine
+                    .write(&table, &key, Arc::new(row(0, cell)), 2000)
+                    .unwrap();
                 engine.flush_all().unwrap();
             }
             let stored = engine.read(&table, &key).unwrap().unwrap();
@@ -94,7 +97,7 @@ fn single_row_count_remaps_old_column_ordinals_before_cell_ties() {
         .write(
             &table,
             &key,
-            row(0, CellValue::live(b"a".to_vec(), 2000)),
+            Arc::new(row(0, CellValue::live(b"a".to_vec(), 2000))),
             2000,
         )
         .unwrap();
@@ -106,7 +109,7 @@ fn single_row_count_remaps_old_column_ordinals_before_cell_ties() {
         .write(
             &table,
             &key,
-            row(1, CellValue::expiring(b"z".to_vec(), 2000, 1, 1)),
+            Arc::new(row(1, CellValue::expiring(b"z".to_vec(), 2000, 1, 1))),
             2000,
         )
         .unwrap();
@@ -141,7 +144,7 @@ fn single_row_count_rereads_before_disjoint_run_rollover() {
             .write(
                 &table,
                 key,
-                row(0, CellValue::live(b"live".to_vec(), 2000)),
+                Arc::new(row(0, CellValue::live(b"live".to_vec(), 2000))),
                 2000,
             )
             .unwrap();
@@ -151,7 +154,7 @@ fn single_row_count_rereads_before_disjoint_run_rollover() {
         .write(
             &table,
             &keys[2],
-            row(0, CellValue::expiring(b"dead".to_vec(), 2000, 1, 1)),
+            Arc::new(row(0, CellValue::expiring(b"dead".to_vec(), 2000, 1, 1))),
             2000,
         )
         .unwrap();
@@ -178,13 +181,15 @@ fn single_row_count_applies_table_delete_and_later_insert() {
     let key = DecoratedKey::new(PartitionKey::new(b"key".to_vec()));
     let mut original = row(0, CellValue::live(b"old".to_vec(), 1000));
     original.primary_key_liveness = LivenessInfo::with_timestamp(1000);
-    engine.write(&table, &key, original, 1000).unwrap();
+    engine
+        .write(&table, &key, Arc::new(original), 1000)
+        .unwrap();
     engine.flush_all().unwrap();
     engine
         .write(
             &table,
             &table_tombstone_key(),
-            table_tombstone_row(3000, 1),
+            Arc::new(table_tombstone_row(3000, 1)),
             3000,
         )
         .unwrap();
@@ -192,7 +197,7 @@ fn single_row_count_applies_table_delete_and_later_insert() {
         if resurrected {
             let mut newer = row(0, CellValue::live(b"new".to_vec(), 4000));
             newer.primary_key_liveness = LivenessInfo::with_timestamp(4000);
-            engine.write(&table, &key, newer, 4000).unwrap();
+            engine.write(&table, &key, Arc::new(newer), 4000).unwrap();
         }
         for flushed in [false, true] {
             if flushed {

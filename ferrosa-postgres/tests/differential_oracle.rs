@@ -961,7 +961,12 @@ fn seed_engine(dir: &Path, schema: &Schema) -> StorageEngine {
             cells.push((u_email, e.as_bytes().to_vec()));
         }
         engine
-            .write(&users_tid, &pk(u.id), row_with_cells(cells, ts), ts)
+            .write(
+                &users_tid,
+                &pk(u.id),
+                Arc::new(row_with_cells(cells, ts)),
+                ts,
+            )
             .unwrap();
         ts += 1;
     }
@@ -972,7 +977,12 @@ fn seed_engine(dir: &Path, schema: &Schema) -> StorageEngine {
             (o_price, o.price.to_bits().to_be_bytes().to_vec()),
         ];
         engine
-            .write(&orders_tid, &pk(o.oid), row_with_cells(cells, ts), ts)
+            .write(
+                &orders_tid,
+                &pk(o.oid),
+                Arc::new(row_with_cells(cells, ts)),
+                ts,
+            )
             .unwrap();
         ts += 1;
     }
@@ -996,7 +1006,12 @@ fn seed_engine(dir: &Path, schema: &Schema) -> StorageEngine {
             (e_amt, cql_bytes(&cql_decimal(e.amt))),
         ];
         engine
-            .write(&events_tid, &pk(e.id), row_with_cells(cells, ts), ts)
+            .write(
+                &events_tid,
+                &pk(e.id),
+                Arc::new(row_with_cells(cells, ts)),
+                ts,
+            )
             .unwrap();
         ts += 1;
     }

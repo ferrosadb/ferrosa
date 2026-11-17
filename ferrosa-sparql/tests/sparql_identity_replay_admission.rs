@@ -7,6 +7,7 @@ use ferrosa_common::CellValue;
 use ferrosa_sparql::triple_store::partition_key;
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 use ferrosa_storage::{CommitLog, Mutation, StorageEngine, StorageEngineConfig, TableId};
+use std::sync::Arc;
 
 fn legacy_schema() -> TableSchema {
     let column = |name: &str| ColumnDefinition {
@@ -73,7 +74,7 @@ fn legacy_replay_failure_must_block_cutover_admission() {
             "rdf".into(),
             "rdf_triples".into(),
             key.clone(),
-            vec![survivor.clone(), malformed],
+            vec![Arc::new(survivor.clone()), Arc::new(malformed)],
             1,
         ))
         .unwrap();
@@ -100,7 +101,7 @@ fn legacy_replay_failure_must_block_cutover_admission() {
             let rows = storage.read(&table, &key).unwrap().unwrap().rows;
             assert_eq!(
                 rows,
-                vec![survivor],
+                vec![Arc::new(survivor)],
                 "the valid original survivor must remain exact"
             );
             let status = storage.replay_set_aside_status();

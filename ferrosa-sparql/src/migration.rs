@@ -382,7 +382,7 @@ impl OfflineMigration {
                 self.storage.write(
                     &target,
                     &fragment.key,
-                    migrated_row(&predicate, &term, timestamp)?,
+                    Arc::new(migrated_row(&predicate, &term, timestamp)?),
                     timestamp,
                 )?;
                 count += 1;

@@ -308,7 +308,7 @@ fn seed_and_flush(engine: &StorageEngine, n: usize, doc_bytes: usize) {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };
-        engine.write(&table_id, &dk, row, 1000).unwrap();
+        engine.write(&table_id, &dk, Arc::new(row), 1000).unwrap();
     }
     engine.flush(&table_id).unwrap();
 }

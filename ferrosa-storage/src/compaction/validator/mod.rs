@@ -20,18 +20,19 @@ mod tests {
     use ferrosa_common::key::{DecoratedKey, PartitionKey};
     use ferrosa_common::CellValue;
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
+    use std::sync::Arc;
 
     fn partition(cells: Vec<(u16, CellValue)>, ts: i64) -> Partition {
         Partition {
             key: DecoratedKey::new(PartitionKey::new(b"k".to_vec())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: b"c".to_vec(),
                 cells,
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(ts),
-            }],
+            })],
         }
     }
 
@@ -102,6 +103,7 @@ mod prop_tests {
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
     use proptest::prelude::*;
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     // A live cell or a tombstone, at a small timestamp to force conflicts.
     fn arb_cell() -> impl Strategy<Value = CellValue> {
@@ -151,7 +153,7 @@ mod prop_tests {
                     deletion: part_del
                         .map_or(DeletionTime::LIVE, |t| DeletionTime::new(t, t as u32)),
                     static_row: None,
-                    rows: by_clustering.into_values().collect(),
+                    rows: by_clustering.into_values().map(Arc::new).collect(),
                 }
             })
     }

@@ -766,7 +766,7 @@ mod tests {
         let row = test_row();
 
         coordinator
-            .coordinate_write(&table_id, &key, row, 1000)
+            .coordinate_write(&table_id, &key, Arc::new(row), 1000)
             .await
             .unwrap();
 
@@ -802,7 +802,7 @@ mod tests {
         let row = test_row();
 
         let result = coordinator
-            .coordinate_write(&table_id, &key, row, 1000)
+            .coordinate_write(&table_id, &key, Arc::new(row), 1000)
             .await;
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -844,7 +844,9 @@ mod tests {
         let table_id = TableId::new("test_ks", "test_tbl");
         let key = test_key();
         let row = test_row();
-        storage.write(&table_id, &key, row.clone(), 1000).unwrap();
+        storage
+            .write(&table_id, &key, Arc::new(row.clone()), 1000)
+            .unwrap();
 
         // Read via coordinator
         let result = coordinator.coordinate_read(&table_id, &key).await.unwrap();
@@ -866,7 +868,7 @@ mod tests {
             keyspace: "test_ks".to_string(),
             table: "test_tbl".to_string(),
             key: test_key(),
-            rows: vec![test_row()],
+            rows: vec![Arc::new(test_row())],
             timestamp: 1000,
         };
         let body = encode_mutation(&mutation);
@@ -908,7 +910,7 @@ mod tests {
             keyspace: "test_ks".to_string(),
             table: "test_tbl".to_string(),
             key: test_key(),
-            rows: vec![test_row()],
+            rows: vec![Arc::new(test_row())],
             timestamp: 1000,
         };
         let msg = Message::MutationForward(encode_mutation(&mutation));
@@ -936,7 +938,7 @@ mod tests {
             keyspace: "test_ks".to_string(),
             table: "never_created".to_string(),
             key: test_key(),
-            rows: vec![test_row()],
+            rows: vec![Arc::new(test_row())],
             timestamp: 1000,
         };
         let msg = Message::MutationForward(encode_mutation(&mutation));
@@ -974,7 +976,7 @@ mod tests {
         // Write some data first
         let table_id = TableId::new("test_ks", "test_tbl");
         storage
-            .write(&table_id, &test_key(), test_row(), 1000)
+            .write(&table_id, &test_key(), Arc::new(test_row()), 1000)
             .unwrap();
         assert!(storage.read(&table_id, &test_key()).unwrap().is_some());
 
@@ -1038,7 +1040,7 @@ mod tests {
         // Write data
         let table_id = TableId::new("test_ks", "test_tbl");
         storage
-            .write(&table_id, &test_key(), test_row(), 1000)
+            .write(&table_id, &test_key(), Arc::new(test_row()), 1000)
             .unwrap();
         assert!(storage.read(&table_id, &test_key()).unwrap().is_some());
 
@@ -1078,7 +1080,7 @@ mod tests {
             keyspace: "nonexistent_ks".to_string(),
             table: "nonexistent_tbl".to_string(),
             key: test_key(),
-            rows: vec![test_row()],
+            rows: vec![Arc::new(test_row())],
             timestamp: 1000,
         };
         let body = encode_mutation(&mutation);
@@ -1162,7 +1164,7 @@ mod tests {
             keyspace: "test_ks".to_string(),
             table: "test_tbl".to_string(),
             key: test_key(),
-            rows: vec![test_row()],
+            rows: vec![Arc::new(test_row())],
             timestamp: 1000,
         };
         let body = encode_mutation(&mutation);
@@ -1290,7 +1292,7 @@ mod tests {
         let row = test_row();
 
         coordinator
-            .coordinate_write(&table_id, &key, row, 1000)
+            .coordinate_write(&table_id, &key, Arc::new(row), 1000)
             .await
             .unwrap();
         coordinator.coordinate_read(&table_id, &key).await.unwrap();

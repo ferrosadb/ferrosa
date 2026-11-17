@@ -1112,7 +1112,7 @@ impl<R: ReadAt> SSTableReader<R> {
                 key: partition_key,
                 deletion,
                 static_row,
-                rows: vec![row],
+                rows: vec![Arc::new(row)],
             }));
         }
 
@@ -1140,7 +1140,7 @@ impl<R: ReadAt> SSTableReader<R> {
                         key: partition_key,
                         deletion,
                         static_row,
-                        rows: vec![row],
+                        rows: vec![Arc::new(row)],
                     }));
                 }
                 std::cmp::Ordering::Greater => return Ok(None),
@@ -2608,6 +2608,7 @@ mod tests {
                         primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
                     }
                 })
+                .map(Arc::new)
                 .collect();
             let partition = Partition {
                 key: dk.clone(),
@@ -2695,6 +2696,7 @@ mod tests {
                     primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
                 }
             })
+            .map(Arc::new)
             .collect();
         let partition = Partition {
             key: dk.clone(),
@@ -2779,6 +2781,7 @@ mod tests {
                     primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
                 }
             })
+            .map(Arc::new)
             .collect();
         let partition = Partition {
             key: dk.clone(),
@@ -2859,6 +2862,7 @@ mod tests {
                     primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
                 }
             })
+            .map(Arc::new)
             .collect();
         let partition = Partition {
             key: dk.clone(),
@@ -3271,7 +3275,7 @@ mod tests {
             assert_eq!(p.static_row, *static_row);
             assert_eq!(p.rows.len(), rows.len());
             for (a, b) in p.rows.iter().zip(rows.iter()) {
-                assert_eq!(a, b);
+                assert_eq!(**a, *b);
             }
         }
     }
@@ -3323,8 +3327,8 @@ mod tests {
             streamed.push(row);
         }
         assert_eq!(streamed.len(), 7, "the fixture partition holds 7 rows");
-        assert_eq!(
-            streamed, whole.rows,
+        assert!(
+            streamed.iter().eq(whole.rows.iter().map(|r| &**r)),
             "rows read one at a time must equal the whole-partition rows"
         );
     }
@@ -3404,7 +3408,7 @@ mod tests {
             assert_eq!(p.static_row, *static_row);
             assert_eq!(p.rows.len(), rows.len());
             for (a, b) in p.rows.iter().zip(rows.iter()) {
-                assert_eq!(a, b);
+                assert_eq!(**a, *b);
             }
         }
     }
@@ -3827,7 +3831,7 @@ mod tests {
                     key: k.clone(),
                     deletion: DeletionTime::LIVE,
                     static_row: None,
-                    rows,
+                    rows: rows.into_iter().map(Arc::new).collect(),
                 })
                 .unwrap();
         }
@@ -3940,6 +3944,7 @@ mod tests {
                     primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
                 }
             })
+            .map(Arc::new)
             .collect();
         let partition = Partition {
             key: dk.clone(),

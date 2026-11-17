@@ -408,6 +408,54 @@ impl From<Row> for RowWire {
     }
 }
 
+/// Encode a borrowed row. The wire form owns its fields, but a cell's payload
+/// is a [`CellBytes`], whose clone shares the bytes (one refcount), so a row
+/// still shared with the memtable or a reader is encoded without copying any
+/// cell payload; only the clustering key and a complex cell's path are owned
+/// copies.
+impl From<&Row> for RowWire {
+    fn from(r: &Row) -> Self {
+        Self {
+            clustering: r.clustering.as_slice().to_vec(),
+            cells: r
+                .cells
+                .iter()
+                .map(|(i, c)| (*i, shared_cell_wire(c)))
+                .collect(),
+            deletion: r.deletion.into(),
+            primary_key_liveness: r.primary_key_liveness.into(),
+        }
+    }
+}
+
+/// The wire form of a borrowed cell, sharing its payload bytes.
+fn shared_cell_wire(cell: &CellValue) -> CellValueWire {
+    CellValueWire {
+        value: cell.value.clone(),
+        timestamp: cell.timestamp,
+        ttl: cell.ttl,
+        local_deletion_time: cell.local_deletion_time,
+        path: cell.path.as_deref().map(<[u8]>::to_vec),
+    }
+}
+
+/// Encode a shared row: moved when this is the last handle, borrowed otherwise.
+impl From<Arc<Row>> for RowWire {
+    fn from(r: Arc<Row>) -> Self {
+        match Arc::try_unwrap(r) {
+            Ok(owned) => Self::from(owned),
+            Err(shared) => Self::from(&*shared),
+        }
+    }
+}
+
+/// Decode into a fresh shared row.
+impl From<RowWire> for Arc<Row> {
+    fn from(w: RowWire) -> Self {
+        Arc::new(Row::from(w))
+    }
+}
+
 impl From<RowWire> for Row {
     fn from(w: RowWire) -> Self {
         Row {
@@ -2102,6 +2150,40 @@ mod tests {
 
     use ferrosa_common::schema::{ColumnDefinition, TableSchema};
 
+    /// Sharing rows must not change the internode wire: a partition whose rows
+    /// are still shared with the memtable encodes to the same bincode frame as
+    /// one whose rows are owned outright, and decodes into fresh `Arc`s.
+    #[test]
+    fn a_partition_frame_is_byte_identical_whether_its_rows_are_shared_or_owned() {
+        let row = || Row {
+            clustering: vec![1, 2],
+            cells: vec![(0, CellValue::live(b"payload".to_vec(), 9))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(9),
+        };
+        let partition = |rows| Partition {
+            key: DecoratedKey::new(PartitionKey::new(b"pk".to_vec())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows,
+        };
+        let shared = Arc::new(row());
+        let held = Arc::clone(&shared);
+        let shared_frame = bincode::serialize(&partition_to_wire(partition(vec![shared]))).unwrap();
+        let owned_frame =
+            bincode::serialize(&partition_to_wire(partition(vec![Arc::new(row())]))).unwrap();
+        assert_eq!(
+            shared_frame, owned_frame,
+            "the wire frame depends on sharing"
+        );
+        assert_eq!(Arc::strong_count(&held), 1, "encoding released its handle");
+
+        let wire: PartitionWire = bincode::deserialize(&shared_frame).unwrap();
+        let decoded = partition_from_wire(wire);
+        assert_eq!(*decoded.rows[0], *held);
+        assert_eq!(Arc::strong_count(&decoded.rows[0]), 1);
+    }
+
     // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
@@ -2236,12 +2318,12 @@ mod tests {
             key,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![],
                 cells: vec![(0, CellValue::live(b"value".to_vec(), ts))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(ts),
-            }],
+            })],
         }
     }
 
@@ -2288,7 +2370,7 @@ mod tests {
         // CellValue, Vec<(u16, _)>).
         let mut original = make_partition(b"borrowed-eq", 12_345);
         for i in 1..5 {
-            original.rows.push(Row {
+            original.rows.push(Arc::new(Row {
                 clustering: vec![i as u8, 0, 0, 0],
                 cells: vec![(
                     0,
@@ -2296,7 +2378,7 @@ mod tests {
                 )],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(12_345 + i as i64),
-            });
+            }));
         }
 
         let legacy_wire = partition_to_wire(original.clone());
@@ -2324,7 +2406,7 @@ mod tests {
     /// Cells are in (col_idx, path) order, as storage keeps them.
     fn make_complex_partition(element_path: &[u8]) -> Partition {
         let mut p = make_partition(b"complex", 5_000);
-        p.rows[0].cells = vec![
+        Arc::make_mut(&mut p.rows[0]).cells = vec![
             (0, CellValue::live(b"scalar".to_vec(), 5_000)),
             (1, CellValue::tombstone(4_999, 1_700_000_000)),
             (1, CellValue::live(Vec::new(), 5_000).with_path(Vec::new())),
@@ -2630,7 +2712,7 @@ mod tests {
         // make_partition builds a single-row partition; extend it
         // so the streaming row-iteration path is exercised.
         for i in 1..5 {
-            p.rows.push(Row {
+            p.rows.push(Arc::new(Row {
                 clustering: vec![i as u8],
                 cells: vec![(
                     0,
@@ -2638,7 +2720,7 @@ mod tests {
                 )],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(12_345 + i as i64),
-            });
+            }));
         }
         let legacy = compute_partition_digest(&p).unwrap();
         let mut stream = super::PartitionDigestStream::new(
@@ -2674,7 +2756,7 @@ mod tests {
             primary_key_liveness: LivenessInfo::NONE,
         });
         for i in 1..4u8 {
-            p.rows.push(Row {
+            p.rows.push(Arc::new(Row {
                 clustering: vec![i],
                 cells: vec![(
                     0,
@@ -2682,9 +2764,9 @@ mod tests {
                 )],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_ttl(4_000, 60, old_ldt),
-            });
+            }));
         }
-        p.rows.push(Row {
+        p.rows.push(Arc::new(Row {
             clustering: vec![9],
             cells: vec![
                 (0, CellValue::live(b"keep".to_vec(), 5_000)),
@@ -2692,7 +2774,7 @@ mod tests {
             ],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(5_000),
-        });
+        }));
         p
     }
 
@@ -2742,7 +2824,7 @@ mod tests {
         let p1 = make_partition(b"abc", 999);
         let mut p2 = make_partition(b"abc", 999);
         // Change the cell value
-        p2.rows[0].cells[0].1.value = Some(b"different".to_vec().into());
+        Arc::make_mut(&mut p2.rows[0]).cells[0].1.value = Some(b"different".to_vec().into());
 
         let d1 = compute_partition_digest(&p1).unwrap();
         let d2 = compute_partition_digest(&p2).unwrap();
@@ -2769,12 +2851,12 @@ mod tests {
         let mut p2 = make_partition(b"abc", 500);
 
         // Add a second row to p2 so it has more rows than p1.
-        p2.rows.push(Row {
+        p2.rows.push(Arc::new(Row {
             clustering: vec![1],
             cells: vec![(0, CellValue::live(b"extra".to_vec(), 500))],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(500),
-        });
+        }));
 
         // Sanity: the same partition is equal to itself.
         assert_eq!(
@@ -2794,12 +2876,12 @@ mod tests {
         );
 
         // Conversely, adding the same row to p1 must make the digests agree.
-        p1.rows.push(Row {
+        p1.rows.push(Arc::new(Row {
             clustering: vec![1],
             cells: vec![(0, CellValue::live(b"extra".to_vec(), 500))],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(500),
-        });
+        }));
         assert_eq!(
             compute_partition_digest(&p1).unwrap(),
             compute_partition_digest(&p2).unwrap(),
@@ -2827,7 +2909,7 @@ mod tests {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(5000),
         };
-        storage.write(&table_id, &dk, row, 5000).unwrap();
+        storage.write(&table_id, &dk, Arc::new(row), 5000).unwrap();
 
         let handler = ReadRequestHandler::new(storage);
         let req = ReadRequestPayload {
@@ -2895,7 +2977,9 @@ mod tests {
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1000 + i as i64),
             };
-            storage.write(&table_id, &dk, row, 1000 + i as i64).unwrap();
+            storage
+                .write(&table_id, &dk, Arc::new(row), 1000 + i as i64)
+                .unwrap();
         }
 
         let handler = ReadRequestHandler::new(storage);
@@ -2957,12 +3041,12 @@ mod tests {
                 .write(
                     &table_id,
                     &dk,
-                    Row {
+                    Arc::new(Row {
                         clustering: i.to_be_bytes().to_vec(),
                         cells: vec![(0, CellValue::live(vec![i as u8], 1000 + i as i64))],
                         deletion: DeletionTime::LIVE,
                         primary_key_liveness: LivenessInfo::with_timestamp(1000 + i as i64),
-                    },
+                    }),
                     1000 + i as i64,
                 )
                 .unwrap();
@@ -3053,7 +3137,7 @@ mod tests {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(9000),
         };
-        storage.write(&table_id, &dk, row, 9000).unwrap();
+        storage.write(&table_id, &dk, Arc::new(row), 9000).unwrap();
 
         let handler = ReadRequestHandler::new(storage);
         let req = ReadRequestPayload {
@@ -3198,7 +3282,7 @@ mod tests {
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };
         let dk = DecoratedKey::new(PartitionKey::new(pk.to_vec()));
-        storage.write(&table_id, &dk, row, 1000).unwrap();
+        storage.write(&table_id, &dk, Arc::new(row), 1000).unwrap();
         storage.flush(&table_id).unwrap();
         let mut damaged = 0usize;
         let mut pending = vec![dir.join("sstables").join(table_id.to_string())];
@@ -3348,7 +3432,7 @@ mod tests {
             deletion: DeletionTime::LIVE,
             static_row: None,
             rows: vec![
-                Row {
+                Arc::new(Row {
                     clustering: vec![],
                     cells: vec![
                         (0, CellValue::live(b"a".to_vec(), 100)),
@@ -3356,13 +3440,13 @@ mod tests {
                     ],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(200),
-                },
-                Row {
+                }),
+                Arc::new(Row {
                     clustering: vec![1],
                     cells: vec![(0, CellValue::live(b"c".to_vec(), 300))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(300),
-                },
+                }),
             ],
         };
 

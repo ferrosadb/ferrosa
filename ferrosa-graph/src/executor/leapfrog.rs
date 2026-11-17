@@ -564,6 +564,7 @@ async fn project_bindings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     /// Helper to build a clustering key for adjacency entries.
     #[allow(dead_code)]
@@ -654,7 +655,7 @@ mod tests {
             &self,
             table_id: &TableId,
             key: &DecoratedKey,
-            row: ferrosa_sstable::types::Row,
+            row: std::sync::Arc<ferrosa_sstable::types::Row>,
             timestamp: i64,
             cl: ferrosa_cluster::consistency::ConsistencyLevel,
             strategy: &ferrosa_cluster::ring::strategy::ReplicationStrategy,
@@ -668,6 +669,14 @@ mod tests {
             rf: usize,
         ) -> ferrosa_common::Result<()> {
             GraphWrite::write_batch(&self.inner, mutations, cl, rf).await
+        }
+        async fn write_staged_batch(
+            &self,
+            batch: ferrosa_storage::write_set_stage::StagedWriteSet,
+            cl: ferrosa_cluster::consistency::ConsistencyLevel,
+            rf: usize,
+        ) -> ferrosa_common::Result<()> {
+            GraphWrite::write_staged_batch(&self.inner, batch, cl, rf).await
         }
     }
 
@@ -699,12 +708,12 @@ mod tests {
             .write(
                 &TableId::new("test_ks", "person_v"),
                 &DecoratedKey::new(PartitionKey::new(b"A".to_vec())),
-                Row {
+                Arc::new(Row {
                     clustering: vec![],
                     cells: vec![],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1),
-                },
+                }),
                 1,
             )
             .unwrap();

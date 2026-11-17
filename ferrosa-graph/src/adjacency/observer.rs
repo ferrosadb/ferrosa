@@ -81,7 +81,7 @@ pub(crate) fn derive_adjacency_into(
         schema,
         table,
         &mutation.key,
-        &mutation.rows,
+        mutation.rows.iter().map(|row| &**row),
         mutation.timestamp,
         out,
     );
@@ -101,18 +101,18 @@ pub(crate) fn derive_adjacency_row_mutations(
         schema,
         table,
         key,
-        std::slice::from_ref(row),
+        std::iter::once(row),
         timestamp,
         &mut out,
     );
     out
 }
 
-fn derive_adjacency_rows_into(
+fn derive_adjacency_rows_into<'r>(
     schema: &Schema,
     table: &TableId,
     partition_key: &ferrosa_common::DecoratedKey,
-    rows: &[ferrosa_sstable::types::Row],
+    rows: impl ExactSizeIterator<Item = &'r ferrosa_sstable::types::Row>,
     timestamp: i64,
     out: &mut Vec<Mutation>,
 ) {
@@ -180,6 +180,8 @@ fn derive_adjacency_rows_into(
             // from the edge's tombstone would keep the edge traversable.
             if crate::adjacency::schema::row_is_deleted(row) {
                 for adjacency_row in &mut entry.rows {
+                    // Built just above, so this is the only handle: no copy.
+                    let adjacency_row = std::sync::Arc::make_mut(adjacency_row);
                     adjacency_row.cells.clear();
                     adjacency_row.deletion = row.deletion;
                     adjacency_row.primary_key_liveness = ferrosa_sstable::types::LivenessInfo::NONE;
@@ -234,7 +236,7 @@ pub(crate) fn make_adjacency_mutation(
         adj_keyspace.to_string(),
         "adjacency".to_string(),
         key,
-        vec![row],
+        vec![Arc::new(row)],
         timestamp,
     )
 }

@@ -159,7 +159,7 @@ fn static_and_regular_cells_survive_a_flush_on_their_own_columns() {
         .write(
             &tid,
             &key(),
-            insert(1, &[(S, b"s1"), (A, &a), (B, b"b1")], 100),
+            Arc::new(insert(1, &[(S, b"s1"), (A, &a), (B, b"b1")], 100)),
             100,
         )
         .unwrap();
@@ -196,7 +196,7 @@ async fn static_and_regular_cells_survive_compaction_and_a_memtable_overlay() {
         .write(
             &tid,
             &key(),
-            insert(1, &[(S, b"s-old"), (A, &a1), (B, b"b1")], 100),
+            Arc::new(insert(1, &[(S, b"s-old"), (A, &a1), (B, b"b1")], 100)),
             100,
         )
         .unwrap();
@@ -205,7 +205,7 @@ async fn static_and_regular_cells_survive_compaction_and_a_memtable_overlay() {
         .write(
             &tid,
             &key(),
-            insert(2, &[(S, b"s-new"), (A, &a2)], 200),
+            Arc::new(insert(2, &[(S, b"s-new"), (A, &a2)], 200)),
             200,
         )
         .unwrap();

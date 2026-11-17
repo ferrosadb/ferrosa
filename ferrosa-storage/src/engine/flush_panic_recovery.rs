@@ -66,7 +66,12 @@ fn engine(dir: &std::path::Path) -> StorageEngine {
 
 fn write(engine: &StorageEngine, name: &str, timestamp: i64) {
     engine
-        .write(&tid(), &key(name), row(name, timestamp), timestamp)
+        .write(
+            &tid(),
+            &key(name),
+            Arc::new(row(name, timestamp)),
+            timestamp,
+        )
         .expect("write");
 }
 
@@ -203,7 +208,7 @@ fn two_failed_flushes_then_a_success_write_every_row_exactly_once() {
     panicked_flush(&engine);
     write(&engine, "two", 2_000);
     engine
-        .write(&tid(), &key("both"), row("newer", 2_000), 2_000)
+        .write(&tid(), &key("both"), Arc::new(row("newer", 2_000)), 2_000)
         .expect("write");
     panicked_flush(&engine);
     write(&engine, "three", 3_000);
@@ -389,7 +394,7 @@ fn a_crash_between_segment_generations_leaves_the_finished_ones_readable() {
             (&a, 2 * SEGMENT_WINDOW_MICROS + 10, "a2"),
         ] {
             engine
-                .write(&segmented_tid(), key, tier_row(ts, value), ts)
+                .write(&segmented_tid(), key, Arc::new(tier_row(ts, value)), ts)
                 .expect("write");
         }
 
@@ -465,7 +470,7 @@ fn a_crash_between_segment_generations_leaves_the_finished_ones_readable() {
             .read(&segmented_tid(), &a)
             .expect("read")
             .expect("partition");
-        let mut timestamps: Vec<i64> = partition.rows.iter().map(clustered_ts).collect();
+        let mut timestamps: Vec<i64> = partition.rows.iter().map(|row| clustered_ts(row)).collect();
         timestamps.sort_unstable();
         assert!(
             timestamps.contains(&10) && timestamps.contains(&(SEGMENT_WINDOW_MICROS + 10)),

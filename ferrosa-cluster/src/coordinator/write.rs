@@ -248,7 +248,7 @@ impl ClusterCoordinator {
         &self,
         table_id: &TableId,
         key: &DecoratedKey,
-        row: Row,
+        row: Arc<Row>,
         timestamp: i64,
     ) -> crate::error::Result<()> {
         self.coordinate_write_with(
@@ -269,7 +269,7 @@ impl ClusterCoordinator {
         &self,
         table_id: &TableId,
         key: &DecoratedKey,
-        row: Row,
+        row: Arc<Row>,
         timestamp: i64,
         cl: ConsistencyLevel,
         rf: usize,
@@ -610,7 +610,7 @@ impl ClusterCoordinator {
         &self,
         table_id: &TableId,
         key: &DecoratedKey,
-        row: Row,
+        row: Arc<Row>,
         timestamp: i64,
         cl: ConsistencyLevel,
     ) -> crate::error::Result<()> {
@@ -784,7 +784,7 @@ impl ClusterCoordinator {
         &self,
         table_id: &TableId,
         key: &DecoratedKey,
-        row: Row,
+        row: Arc<Row>,
         timestamp: i64,
         cl: ConsistencyLevel,
         strategy: &crate::ring::strategy::ReplicationStrategy,
@@ -1404,7 +1404,7 @@ mod tests {
         let row = test_row();
 
         coordinator
-            .coordinate_write(&table_id, &key, row, 1000)
+            .coordinate_write(&table_id, &key, Arc::new(row), 1000)
             .await
             .unwrap();
 
@@ -1435,7 +1435,7 @@ mod tests {
         let row = test_row();
 
         let result = coordinator
-            .coordinate_write(&table_id, &key, row, 1000)
+            .coordinate_write(&table_id, &key, Arc::new(row), 1000)
             .await;
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -1494,7 +1494,7 @@ mod tests {
         let row = test_row();
 
         coordinator
-            .coordinate_write_with(&table_id, &key, row, 1000, ConsistencyLevel::LocalQuorum, 3)
+            .coordinate_write_with(&table_id, &key, Arc::new(row), 1000, ConsistencyLevel::LocalQuorum, 3)
             .await
             .expect("RF=3 LOCAL_QUORUM should succeed with local + one remote ACK when exactly one replica is down");
 
@@ -1544,7 +1544,14 @@ mod tests {
         let row = test_row();
 
         coordinator
-            .coordinate_write_with(&table_id, &key, row, 1000, ConsistencyLevel::All, 2)
+            .coordinate_write_with(
+                &table_id,
+                &key,
+                Arc::new(row),
+                1000,
+                ConsistencyLevel::All,
+                2,
+            )
             .await
             .unwrap();
 
@@ -1589,7 +1596,7 @@ mod tests {
             .coordinate_write_with(
                 &table_id,
                 &key,
-                test_row(),
+                Arc::new(test_row()),
                 1000,
                 ConsistencyLevel::EachQuorum,
                 1,
@@ -1671,7 +1678,14 @@ mod tests {
         let row = test_row();
 
         coordinator
-            .coordinate_write_with(&table_id, &key, row, 1000, ConsistencyLevel::All, 3)
+            .coordinate_write_with(
+                &table_id,
+                &key,
+                Arc::new(row),
+                1000,
+                ConsistencyLevel::All,
+                3,
+            )
             .await
             .expect("CL=ALL with all replicas up should succeed");
 
@@ -1765,7 +1779,7 @@ mod tests {
             let row = test_row();
 
             coordinator
-                .coordinate_write(&table_id, &key, row, 1000)
+                .coordinate_write(&table_id, &key, Arc::new(row), 1000)
                 .await
                 .unwrap();
 
@@ -1825,7 +1839,7 @@ mod tests {
 
             // With no real connections, remote replicas fail. Local ACK=1, required=2.
             let result = coordinator
-                .coordinate_write(&table_id, &key, row, 1000)
+                .coordinate_write(&table_id, &key, Arc::new(row), 1000)
                 .await;
 
             // The write should time out (only 1 ACK from local, need 2 for QUORUM).
@@ -1896,7 +1910,7 @@ mod tests {
 
             // CL=ONE: local ACK satisfies the requirement immediately.
             coordinator
-                .coordinate_write(&table_id, &key, row, 1000)
+                .coordinate_write(&table_id, &key, Arc::new(row), 1000)
                 .await
                 .unwrap();
 
@@ -1998,7 +2012,7 @@ mod tests {
 
         // Write should succeed (local ACK meets CL=ONE).
         coordinator
-            .coordinate_write(&table_id, &key, row, 1000)
+            .coordinate_write(&table_id, &key, Arc::new(row), 1000)
             .await
             .unwrap();
 
@@ -2064,7 +2078,7 @@ mod tests {
         let row = test_row();
 
         let result = coordinator
-            .coordinate_write(&table_id, &key, row, 1000)
+            .coordinate_write(&table_id, &key, Arc::new(row), 1000)
             .await;
 
         assert!(
@@ -2156,7 +2170,7 @@ mod tests {
                     .write(
                         &TableId::new("test_ks", "test_tbl"),
                         &history_key,
-                        stale,
+                        Arc::new(stale),
                         2000,
                     )
                     .unwrap();
@@ -2218,7 +2232,7 @@ mod tests {
             .coordinate_write_nts(
                 &table,
                 &history_key,
-                test_row(),
+                Arc::new(test_row()),
                 1000,
                 ConsistencyLevel::LocalQuorum,
                 &strategy,
@@ -2300,7 +2314,7 @@ mod tests {
             .coordinate_write_nts(
                 &TableId::new("test_ks", "test_tbl"),
                 &test_key(),
-                test_row(),
+                Arc::new(test_row()),
                 1000,
                 cl,
                 &strategy,
@@ -2438,7 +2452,7 @@ mod tests {
             .coordinate_write_nts(
                 &table_id,
                 &key,
-                row,
+                Arc::new(row),
                 1000,
                 ConsistencyLevel::LocalQuorum,
                 &strategy,
@@ -2508,7 +2522,7 @@ mod tests {
             .coordinate_write_nts(
                 &table_id,
                 &key,
-                row,
+                Arc::new(row),
                 1000,
                 ConsistencyLevel::EachQuorum,
                 &strategy,
@@ -2571,7 +2585,14 @@ mod tests {
         let row = test_row();
 
         coordinator
-            .coordinate_write_nts(&table_id, &key, row, 1000, ConsistencyLevel::All, &strategy)
+            .coordinate_write_nts(
+                &table_id,
+                &key,
+                Arc::new(row),
+                1000,
+                ConsistencyLevel::All,
+                &strategy,
+            )
             .await
             .unwrap();
 
@@ -2633,7 +2654,14 @@ mod tests {
         // CL=ALL with RF=2: both nodes must ACK. Remote node has no real
         // connection, so MutationForward fails. Only local ACK (1/2).
         let result = coordinator
-            .coordinate_write_with(&table_id, &key, row, 1000, ConsistencyLevel::All, 2)
+            .coordinate_write_with(
+                &table_id,
+                &key,
+                Arc::new(row),
+                1000,
+                ConsistencyLevel::All,
+                2,
+            )
             .await;
 
         assert!(
@@ -2680,14 +2708,14 @@ mod tests {
             "test_ks".to_string(),
             "test_tbl".to_string(),
             test_key(),
-            vec![test_row()],
+            vec![Arc::new(test_row())],
             1000,
         );
         let bad_mutation = ferrosa_storage::Mutation::new(
             "nonexistent_ks".to_string(),
             "nonexistent_tbl".to_string(),
             test_key(),
-            vec![test_row()],
+            vec![Arc::new(test_row())],
             2000,
         );
 

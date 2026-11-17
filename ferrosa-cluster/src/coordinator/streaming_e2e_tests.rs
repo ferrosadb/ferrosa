@@ -394,7 +394,12 @@ fn write_sessions(engine: &ferrosa_storage::StorageEngine, sessions: &[(u8, u8)]
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };
         engine
-            .write(&table_id, &tenant_session_key(tenant, session), row, 1000)
+            .write(
+                &table_id,
+                &tenant_session_key(tenant, session),
+                Arc::new(row),
+                1000,
+            )
             .unwrap();
     }
     engine.flush(&table_id).unwrap();
@@ -455,7 +460,7 @@ fn restarted_tenant_node(
             options: std::collections::HashMap::new(),
         });
         engine
-            .write(&indexes_tid, &row.key, row.row, 1_000_000)
+            .write(&indexes_tid, &row.key, Arc::new(row.row), 1_000_000)
             .unwrap();
         write_sessions(&engine, sessions);
         engine.flush(&indexes_tid).unwrap();

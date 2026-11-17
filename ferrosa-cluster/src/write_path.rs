@@ -354,6 +354,30 @@ fn cluster_error_to_common(err: ClusterError) -> ferrosa_common::Error {
     }
 }
 
+/// Staged write-sets decoded into the resident cluster batchlog (see
+/// [`WritePath::write_staged_batch`]).
+static STAGED_BATCHES_DECODED_FOR_BATCHLOG: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many staged write-sets the cluster write path had to decode into its
+/// resident logged-batch protocol (observability for the one resident step).
+pub fn staged_batches_decoded_for_batchlog() -> u64 {
+    STAGED_BATCHES_DECODED_FOR_BATCHLOG.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Decode entry `index` of a staged write-set; a frame that does not decode
+/// is an error, never an empty mutation.
+fn decode_staged(
+    batch: &ferrosa_storage::write_set_stage::StagedWriteSet,
+    index: usize,
+) -> ferrosa_common::Result<Mutation> {
+    Mutation::deserialize_from(batch.entry(index)?).map_err(|e| {
+        ferrosa_common::Error::InvalidData(format!(
+            "staged write-set entry {index} is not a decodable mutation frame: {e}"
+        ))
+    })
+}
+
 /// Build a `CommittedToCluster` CDC event for a regular-CL write, if the
 /// engine's shared CDC bus has a committed-stream subscriber.
 ///
@@ -367,7 +391,7 @@ fn committed_cdc_event(
     storage: &StorageEngine,
     table_id: &TableId,
     key: &DecoratedKey,
-    rows: &[Row],
+    rows: &[Arc<Row>],
     timestamp: i64,
 ) -> Option<(Arc<ferrosa_cdc::CdcBus>, ferrosa_cdc::CdcEvent)> {
     let bus = storage.cdc_bus()?;
@@ -589,6 +613,92 @@ impl WritePath {
                     }
                 }
                 res
+            }
+        }
+    }
+
+    /// Commit a STAGED write-set (see
+    /// [`ferrosa_storage::write_set_stage::WriteSetStage`]) as one logged batch,
+    /// decoding one mutation at a time out of the stage instead of holding the
+    /// batch as a `Vec<Mutation>`.
+    ///
+    /// - `Direct`: [`StorageEngine::write_atomic_batch`] over the staged set:
+    ///   all-or-nothing, and the set is never resident.
+    /// - `Pair`: each mutation is forwarded in turn, exactly as
+    ///   [`Self::write_batch`] does (atomicity comes from the batchlog).
+    /// - `Cluster`: the batchlog protocol (`coordinate_logged_batch`) holds
+    ///   its entry resident by design (an in-memory batchlog map plus one
+    ///   serialized entry per replica), so the staged set is decoded into it.
+    ///   This is the one resident step left; it is logged at WARN once and
+    ///   counted by [`staged_batches_decoded_for_batchlog`], never silent.
+    pub async fn write_staged_batch(
+        &self,
+        batch: ferrosa_storage::write_set_stage::StagedWriteSet,
+        cl: ConsistencyLevel,
+        rf: usize,
+    ) -> ferrosa_common::Result<()> {
+        use ferrosa_storage::write_set_stage::WriteSetSource as _;
+        if let Some(storage) = self.admission_storage() {
+            // One admission wait per target table; a batch names few tables.
+            let mut tables: Vec<(String, String)> = Vec::new();
+            batch.for_each_mutation(&mut |m| {
+                if !tables
+                    .iter()
+                    .any(|(keyspace, table)| *keyspace == m.keyspace && *table == m.table)
+                {
+                    tables.push((m.keyspace.clone(), m.table.clone()));
+                }
+                Ok(())
+            })?;
+            for (keyspace, table) in &tables {
+                storage
+                    .await_write_admission(&TableId::new(keyspace, table))
+                    .await?;
+            }
+        }
+        match self {
+            Self::Direct(engine) => engine.write_atomic_batch(batch),
+            Self::Unavailable | Self::DegradedPair(_) => Err(ferrosa_common::Error::InvalidData(
+                "pair mode: primary unavailable, writes rejected until operator promotes".into(),
+            )),
+            Self::Pair(coordinator) => {
+                for index in 0..batch.len() {
+                    let mutation = decode_staged(&batch, index)?;
+                    coordinator
+                        .coordinate_write_with(&mutation, cl, rf)
+                        .await
+                        .map_err(|e| ferrosa_common::Error::InvalidData(format!("pair: {e}")))?;
+                    if let Some((bus, event)) = committed_cdc_event(
+                        coordinator.local_storage(),
+                        &TableId::new(&mutation.keyspace, &mutation.table),
+                        &mutation.key,
+                        &mutation.rows,
+                        mutation.timestamp,
+                    ) {
+                        bus.publish(event);
+                    }
+                }
+                Ok(())
+            }
+            Self::Cluster(_) => {
+                let prior = STAGED_BATCHES_DECODED_FOR_BATCHLOG
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if prior == 0 {
+                    tracing::warn!(
+                        entries = batch.len(),
+                        "a staged write-set is being decoded into the resident cluster \
+                         batchlog: the logged-batch protocol holds its entry in memory. \
+                         Further occurrences are counted by \
+                         staged_batches_decoded_for_batchlog()"
+                    );
+                }
+                let mut mutations = Vec::with_capacity(batch.len());
+                batch.for_each_owned_mutation(&mut |m| {
+                    mutations.push(m);
+                    Ok(())
+                })?;
+                drop(batch);
+                self.write_batch(mutations, cl, rf).await
             }
         }
     }
@@ -1509,7 +1619,7 @@ impl WritePath {
         &self,
         table_id: &TableId,
         key: &DecoratedKey,
-        rows: Vec<Row>,
+        rows: Vec<Arc<Row>>,
         timestamp: i64,
     ) -> ferrosa_common::Result<()> {
         match self {
@@ -1693,7 +1803,7 @@ mod tests {
             &wp,
             &table_id,
             &key,
-            row,
+            Arc::new(row),
             1000,
             ConsistencyLevel::One,
             &strategy,
@@ -1741,19 +1851,19 @@ mod tests {
 
         // No committed-stream subscriber → no event built (no allocation).
         assert!(
-            committed_cdc_event(&storage, &table_id, &key, std::slice::from_ref(&row), 1000)
+            committed_cdc_event(&storage, &table_id, &key, &[Arc::new(row.clone())], 1000)
                 .is_none()
         );
 
         // With a subscriber → event built with the right fields, accord_ts None.
         let _sub = bus.subscribe(ferrosa_cdc::CdcStream::CommittedToCluster);
         let (_bus, ev) =
-            committed_cdc_event(&storage, &table_id, &key, std::slice::from_ref(&row), 1000)
+            committed_cdc_event(&storage, &table_id, &key, &[Arc::new(row.clone())], 1000)
                 .expect("committed CDC event built when subscribed");
         assert_eq!(ev.stream, ferrosa_cdc::CdcStream::CommittedToCluster);
         assert_eq!(ev.keyspace, "ks");
         assert_eq!(ev.table, "t");
-        assert_eq!(ev.rows, vec![row]);
+        assert_eq!(ev.rows, vec![Arc::new(row)]);
         assert!(ev.accord_ts.is_none());
     }
 
@@ -1791,7 +1901,7 @@ mod tests {
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1000),
             };
-            storage.write(&table_id, &key, row, 1000).unwrap();
+            storage.write(&table_id, &key, Arc::new(row), 1000).unwrap();
         }
 
         // Verify base data is readable.
@@ -2135,7 +2245,11 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(key.to_vec())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: clusterings.iter().map(|c| resume_row(c)).collect(),
+            rows: clusterings
+                .iter()
+                .map(|c| resume_row(c))
+                .map(Arc::new)
+                .collect(),
         }
     }
 
@@ -2228,7 +2342,7 @@ mod tests {
             key,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows,
+            rows: rows.into_iter().map(Arc::new).collect(),
         }
     }
 

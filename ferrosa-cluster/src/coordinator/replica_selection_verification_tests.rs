@@ -108,7 +108,7 @@ fn partition(i: usize) -> Partition {
         key: dk,
         deletion: DeletionTime::LIVE,
         static_row: None,
-        rows: vec![Row {
+        rows: vec![Arc::new(Row {
             clustering: vec![],
             cells: vec![
                 (0, CellValue::live(format!("a-{i}").into_bytes(), 1000)),
@@ -116,7 +116,7 @@ fn partition(i: usize) -> Partition {
             ],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
-        }],
+        })],
     }
 }
 
@@ -169,7 +169,7 @@ async fn exercise(topology: Topology, operation: Operation) -> crate::error::Res
     if matches!(topology, Topology::LocalAlias) {
         seed_local(&storage, 4);
         let mut p = partition(0);
-        p.rows[0].cells[0].1 = CellValue::live(b"local-only".to_vec(), 2000);
+        Arc::make_mut(&mut p.rows[0]).cells[0].1 = CellValue::live(b"local-only".to_vec(), 2000);
         storage
             .write(&TableId::new(KS, TBL), &p.key, p.rows[0].clone(), 2000)
             .unwrap();

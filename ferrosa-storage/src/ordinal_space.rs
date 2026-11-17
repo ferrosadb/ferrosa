@@ -21,6 +21,7 @@
 
 use ferrosa_common::{Error, Result};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
+use std::sync::Arc;
 
 /// Convert a memtable partition from flat ordinals to SSTable ordinals, in
 /// place: static cells found in clustered rows are merged (cell
@@ -55,6 +56,11 @@ pub fn flat_into_sstable_space(partition: &mut Partition, static_count: usize) -
     })?;
     let mut lifted: Vec<(u16, ferrosa_common::CellValue)> = Vec::new();
     for row in &mut partition.rows {
+        // Re-basing ordinals rewrites the row. A flush snapshot shares its rows
+        // with the sealed memtable, so this copies on write; the SSTable writer
+        // needs the storage ordinals, and readers of the memtable keep the flat
+        // ones until it is dropped.
+        let row = Arc::make_mut(row);
         if !row.cells.iter().any(|(idx, _)| *idx < shift) {
             for (idx, _) in &mut row.cells {
                 *idx -= shift;
@@ -123,7 +129,7 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(b"k".to_vec())),
             deletion: DeletionTime::LIVE,
             static_row,
-            rows,
+            rows: rows.into_iter().map(Arc::new).collect(),
         }
     }
 
@@ -166,7 +172,7 @@ mod tests {
         let rows = vec![row(1, vec![(0, CellValue::live(b"a".to_vec(), 1))])];
         let mut p = partition(None, rows.clone());
         flat_into_sstable_space(&mut p, 0).unwrap();
-        assert_eq!(p.rows, rows);
+        assert_eq!(p.rows, rows.into_iter().map(Arc::new).collect::<Vec<_>>());
         assert!(p.static_row.is_none());
     }
 

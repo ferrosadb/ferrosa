@@ -161,7 +161,7 @@ fn scan_cursor_parity_allocation_pull_and_failure_contracts() {
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::NONE,
                 }),
-                rows: (0..1024).map(|i| row(i, complex)).collect(),
+                rows: (0..1024).map(|i| row(i, complex)).map(Arc::new).collect(),
             };
             let options = WriteOptions {
                 compression: compression.clone(),
@@ -197,7 +197,7 @@ fn scan_cursor_parity_allocation_pull_and_failure_contracts() {
             );
             let mut decoded = row(0, complex);
             assert!(it.next_clustered_row_into(&mut decoded).unwrap());
-            assert_eq!(decoded, expected.rows[0]);
+            assert_eq!(decoded, *expected.rows[0]);
             assert!(
                 reads.load(Ordering::Relaxed) < size,
                 "cursor read the full data before its first row"
@@ -205,13 +205,13 @@ fn scan_cursor_parity_allocation_pull_and_failure_contracts() {
             // Warm several chunks to cover codec state and maximum compressed size.
             for e in &expected.rows[1..128] {
                 assert!(it.next_clustered_row_into(&mut decoded).unwrap());
-                assert_eq!(&decoded, e);
+                assert_eq!(&decoded, &**e);
             }
             let process_before = EVENTS.load(Ordering::Relaxed);
             let before = decoder_events();
             for e in &expected.rows[128..] {
                 assert!(it.next_clustered_row_into(&mut decoded).unwrap());
-                assert_eq!(&decoded, e);
+                assert_eq!(&decoded, &**e);
             }
             let events = decoder_events() - before;
             let process_events = EVENTS.load(Ordering::Relaxed) - process_before;

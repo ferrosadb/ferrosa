@@ -74,6 +74,7 @@ fn check_deferred_scan(prefetch: bool) {
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::NONE,
                 })
+                .map(Arc::new)
                 .collect(),
         })
         .unwrap();

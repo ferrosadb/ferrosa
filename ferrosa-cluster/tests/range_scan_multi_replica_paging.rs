@@ -185,7 +185,7 @@ fn partition(i: usize) -> Partition {
         key: dk,
         deletion: DeletionTime::LIVE,
         static_row: None,
-        rows: vec![Row {
+        rows: vec![Arc::new(Row {
             clustering: vec![],
             cells: vec![
                 (0, CellValue::live(format!("a-{i}").into_bytes(), 1000)),
@@ -193,7 +193,7 @@ fn partition(i: usize) -> Partition {
             ],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
-        }],
+        })],
     }
 }
 
@@ -511,7 +511,9 @@ fn seed_wide(engine: &StorageEngine, pks: &[&str], rows_per: usize) {
     for pk in pks {
         let dk = DecoratedKey::new(PartitionKey::new(pk.as_bytes().to_vec()));
         for j in 0..rows_per {
-            engine.write(&table_id, &dk, wide_row(j), 1000).unwrap();
+            engine
+                .write(&table_id, &dk, Arc::new(wide_row(j)), 1000)
+                .unwrap();
         }
     }
     engine.flush(&table_id).unwrap();
@@ -761,7 +763,7 @@ async fn page_rows_like_cql_collector(
                     break 'page;
                 }
                 out.push((pk.clone(), row.clustering.clone()));
-                page_cursor = Some((pk.clone(), row.clustering));
+                page_cursor = Some((pk.clone(), row.clustering.clone()));
                 accepted += 1;
             }
         }

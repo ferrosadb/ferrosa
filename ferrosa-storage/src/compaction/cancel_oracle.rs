@@ -315,6 +315,7 @@ mod tests {
     use super::*;
     use ferrosa_common::cell::CellValue;
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+    use std::sync::Arc;
 
     use crate::engine::StorageEngineConfig;
 
@@ -359,7 +360,9 @@ mod tests {
 
         let mut oracle = WriteOracle::new();
         let k = key("p1");
-        engine.write(&tid, &k, row(1, b"v1", 1000), 1000).unwrap();
+        engine
+            .write(&tid, &k, Arc::new(row(1, b"v1", 1000)), 1000)
+            .unwrap();
         oracle.record_write(&k, &1i32.to_be_bytes(), b"v1", 1000);
         engine.flush(&tid).unwrap();
 
@@ -397,7 +400,7 @@ mod tests {
         let tid = TableId::new("ks", "t");
         engine.register_table(test_schema()).unwrap();
         engine
-            .write(&tid, &key("p1"), row(1, b"v1", 1000), 1000)
+            .write(&tid, &key("p1"), Arc::new(row(1, b"v1", 1000)), 1000)
             .unwrap();
         engine.flush(&tid).unwrap();
 

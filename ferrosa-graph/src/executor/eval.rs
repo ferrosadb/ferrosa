@@ -684,7 +684,10 @@ pub fn partition_to_json(
     map.insert("_id".to_string(), Value::String(hex_id.to_string()));
 
     // Collect cell values, keyed by column name from schema metadata.
-    let all_rows = partition.static_row.iter().chain(partition.rows.iter());
+    let all_rows = partition
+        .static_row
+        .iter()
+        .chain(partition.rows.iter().map(|row| &**row));
     for row in all_rows {
         for (col_idx, cell) in &row.cells {
             let key = column_names

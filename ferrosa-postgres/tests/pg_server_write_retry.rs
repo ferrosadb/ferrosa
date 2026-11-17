@@ -13,6 +13,7 @@
 //! update the sync thread's health, so `unsynced_for` stays set until the thread's own next
 //! sync.)
 
+use std::sync::Arc;
 #[path = "common/pg_server.rs"]
 mod pg_server;
 
@@ -56,7 +57,7 @@ fn stall_the_commit_log(engine: &StorageEngine) {
     let tid = TableId::new("ks", "t");
     let key = DecoratedKey::new(PartitionKey::new(b"stall".to_vec()));
     engine
-        .write(&tid, &key, seeded_row(0, 1), 1)
+        .write(&tid, &key, Arc::new(seeded_row(0, 1)), 1)
         .expect("the first write is younger than the deadline");
     let mut expired = deadline_after(Duration::from_secs(10));
     loop {

@@ -217,7 +217,7 @@ pub fn write_row_with(
     let ts = 1000 + i as i64;
     let mut refusals = Vec::new();
     for attempt in 1..=WRITE_ATTEMPTS {
-        match engine.write(&tid, &key, seeded_row(i, ts), ts) {
+        match engine.write(&tid, &key, Arc::new(seeded_row(i, ts)), ts) {
             Ok(_) => return refusals,
             Err(ferrosa_common::Error::CommitLogNotDurable { reason }) => {
                 eprintln!("write row {i}: refused (attempt {attempt}): {reason}");

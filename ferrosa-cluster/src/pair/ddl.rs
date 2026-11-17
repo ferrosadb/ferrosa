@@ -1963,7 +1963,7 @@ mod tests {
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };
         engine
-            .write(&kv, &key, row, 1000)
+            .write(&kv, &key, Arc::new(row), 1000)
             .expect("catch-up replay of key1 must apply");
 
         let local = engine.table_schema(&kv).expect("kv registered");

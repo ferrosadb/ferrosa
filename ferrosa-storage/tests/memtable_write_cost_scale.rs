@@ -88,6 +88,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ferrosa_common::cell::CellValue;
@@ -178,7 +179,7 @@ fn filled(make: &dyn Fn() -> Box<dyn Memtable>, rows: i32) -> Box<dyn Memtable> 
     let (schema, key) = (schema(), partition_key());
     let mem = make();
     for ck in 0..rows {
-        mem.put(&key, row(ck, 1), &schema).unwrap();
+        mem.put(&key, Arc::new(row(ck, 1)), &schema).unwrap();
     }
     mem
 }
@@ -195,7 +196,7 @@ fn time_batch(mem: &dyn Memtable, rows: i32, rep: usize) -> (Duration, usize) {
     ARMED.store(true, Ordering::Relaxed);
     let started = Instant::now();
     for r in batch {
-        mem.put(&key, r, &schema).unwrap();
+        mem.put(&key, Arc::new(r), &schema).unwrap();
     }
     let took = started.elapsed();
     ARMED.store(false, Ordering::Relaxed);

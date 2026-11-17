@@ -17,6 +17,7 @@ use ferrosa_common::cell::CellValue;
 use ferrosa_common::key::{DecoratedKey, PartitionKey};
 use ferrosa_common::schema::{ColumnDefinition, TableSchema};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+use std::sync::Arc;
 
 use std::path::Path;
 use std::time::Duration;
@@ -141,7 +142,7 @@ fn apply_batch_writes_and_tombstone_all_visible() {
             keyspace: "ks".into(),
             table: "t".into(),
             key: key.clone(),
-            row: live_row(ck(3), b"to_delete", 100),
+            row: Arc::new(live_row(ck(3), b"to_delete", 100)),
             timestamp: 100,
         }])
         .unwrap();
@@ -157,14 +158,14 @@ fn apply_batch_writes_and_tombstone_all_visible() {
                 keyspace: "ks".into(),
                 table: "t".into(),
                 key: key.clone(),
-                row: live_row(ck(1), b"alpha", 200),
+                row: Arc::new(live_row(ck(1), b"alpha", 200)),
                 timestamp: 200,
             },
             BatchOp::Write {
                 keyspace: "ks".into(),
                 table: "t".into(),
                 key: key.clone(),
-                row: live_row(ck(2), b"beta", 200),
+                row: Arc::new(live_row(ck(2), b"beta", 200)),
                 timestamp: 200,
             },
             BatchOp::Tombstone {
@@ -210,14 +211,14 @@ fn apply_batch_all_or_nothing_on_injected_failure() {
             keyspace: "ks".into(),
             table: "good".into(),
             key: key.clone(),
-            row: live_row(ck(1), b"should_not_persist", 100),
+            row: Arc::new(live_row(ck(1), b"should_not_persist", 100)),
             timestamp: 100,
         },
         BatchOp::Write {
             keyspace: "ks".into(),
             table: "bad".into(), // unregistered → forces the batch to fail
             key: key.clone(),
-            row: live_row(ck(2), b"x", 100),
+            row: Arc::new(live_row(ck(2), b"x", 100)),
             timestamp: 100,
         },
     ]);
@@ -251,14 +252,14 @@ fn apply_batch_survives_restart() {
                     keyspace: "ks".into(),
                     table: "t".into(),
                     key: key.clone(),
-                    row: live_row(ck(1), b"durable_a", 100),
+                    row: Arc::new(live_row(ck(1), b"durable_a", 100)),
                     timestamp: 100,
                 },
                 BatchOp::Write {
                     keyspace: "ks".into(),
                     table: "t".into(),
                     key: key.clone(),
-                    row: live_row(ck(2), b"durable_b", 100),
+                    row: Arc::new(live_row(ck(2), b"durable_b", 100)),
                     timestamp: 100,
                 },
             ])
@@ -303,7 +304,7 @@ fn apply_batch_unregistered_table_errors_clearly() {
             keyspace: "ks".into(),
             table: "missing".into(),
             key: make_key("p1"),
-            row: live_row(ck(1), b"x", 100),
+            row: Arc::new(live_row(ck(1), b"x", 100)),
             timestamp: 100,
         }])
         .unwrap_err();
@@ -331,7 +332,7 @@ fn batch_txn_commit_applies_abort_discards() {
             keyspace: "ks".into(),
             table: "t".into(),
             key: key.clone(),
-            row: live_row(ck(9), b"rolled_back", 50),
+            row: Arc::new(live_row(ck(9), b"rolled_back", 50)),
             timestamp: 50,
         });
         assert_eq!(txn.len(), 1);
@@ -350,14 +351,14 @@ fn batch_txn_commit_applies_abort_discards() {
             keyspace: "ks".into(),
             table: "t".into(),
             key: key.clone(),
-            row: live_row(ck(1), b"committed_a", 100),
+            row: Arc::new(live_row(ck(1), b"committed_a", 100)),
             timestamp: 100,
         });
         txn.stage(BatchOp::Write {
             keyspace: "ks".into(),
             table: "t".into(),
             key: key.clone(),
-            row: live_row(ck(2), b"committed_b", 100),
+            row: Arc::new(live_row(ck(2), b"committed_b", 100)),
             timestamp: 100,
         });
         txn.commit().unwrap();
@@ -400,14 +401,14 @@ fn apply_batch_is_synchronously_durable_under_periodic_sync() {
                     keyspace: "ks".into(),
                     table: "t".into(),
                     key: key.clone(),
-                    row: live_row(ck(1), b"acked_a", 100),
+                    row: Arc::new(live_row(ck(1), b"acked_a", 100)),
                     timestamp: 100,
                 },
                 BatchOp::Write {
                     keyspace: "ks".into(),
                     table: "t".into(),
                     key: key.clone(),
-                    row: live_row(ck(2), b"acked_b", 100),
+                    row: Arc::new(live_row(ck(2), b"acked_b", 100)),
                     timestamp: 100,
                 },
             ])
@@ -460,14 +461,14 @@ fn apply_batch_oversized_entry_applies_nothing() {
                 keyspace: "ks".into(),
                 table: "t".into(),
                 key: key.clone(),
-                row: live_row(ck(1), b"small_first", 100),
+                row: Arc::new(live_row(ck(1), b"small_first", 100)),
                 timestamp: 100,
             },
             BatchOp::Write {
                 keyspace: "ks".into(),
                 table: "t".into(),
                 key: key.clone(),
-                row: live_row(ck(2), &huge, 100),
+                row: Arc::new(live_row(ck(2), &huge, 100)),
                 timestamp: 100,
             },
         ]);
@@ -519,14 +520,14 @@ fn apply_batch_partition_tombstone_deletes_all_rows() {
                 keyspace: "ks".into(),
                 table: "t".into(),
                 key: key.clone(),
-                row: live_row(ck(1), b"r1", 100),
+                row: Arc::new(live_row(ck(1), b"r1", 100)),
                 timestamp: 100,
             },
             BatchOp::Write {
                 keyspace: "ks".into(),
                 table: "t".into(),
                 key: key.clone(),
-                row: live_row(ck(2), b"r2", 100),
+                row: Arc::new(live_row(ck(2), b"r2", 100)),
                 timestamp: 100,
             },
         ])
@@ -585,7 +586,7 @@ fn apply_batch_torn_log_does_not_replay_prefix() {
             keyspace: "ks".into(),
             table: "t".into(),
             key: make_key("p1"),
-            row: live_row(ck(i), &[b'x'; 1024], 100),
+            row: Arc::new(live_row(ck(i), &[b'x'; 1024], 100)),
             timestamp: 100,
         })
         .collect();
@@ -630,7 +631,7 @@ fn batch_txn_publishes_real_cdc_events_only_after_commit() {
             keyspace: "ks".into(),
             table: "t".into(),
             key: make_key("p1"),
-            row: live_row(ck(i), b"value", 100),
+            row: Arc::new(live_row(ck(i), b"value", 100)),
             timestamp: 100,
         });
     }
@@ -660,7 +661,7 @@ fn batch_txn_cdc_cursor_resumes_between_envelope_members() {
                     keyspace: "ks".into(),
                     table: "t".into(),
                     key: make_key("p1"),
-                    row: live_row(ck(i), b"value", 100),
+                    row: Arc::new(live_row(ck(i), b"value", 100)),
                     timestamp: 100,
                 })
                 .collect(),

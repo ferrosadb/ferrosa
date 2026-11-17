@@ -413,7 +413,7 @@ fn fixture(n: usize, with_edges: bool) -> Fixture {
             .write(
                 &person_tid,
                 &key,
-                Row {
+                Arc::new(Row {
                     clustering: vec![],
                     cells: vec![
                         (name_idx, CellValue::live(name.into_bytes(), ts)),
@@ -421,7 +421,7 @@ fn fixture(n: usize, with_edges: bool) -> Fixture {
                     ],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(ts),
-                },
+                }),
                 ts,
             )
             .unwrap();
@@ -437,7 +437,7 @@ fn fixture(n: usize, with_edges: bool) -> Fixture {
                 .write(
                     &edge_tid,
                     &key,
-                    Row {
+                    Arc::new(Row {
                         clustering: dst.into_bytes(),
                         cells: vec![
                             (edge_payload_idx, CellValue::live(payload_bytes(i + 7), ts)),
@@ -445,7 +445,7 @@ fn fixture(n: usize, with_edges: bool) -> Fixture {
                         ],
                         deletion: DeletionTime::LIVE,
                         primary_key_liveness: LivenessInfo::with_timestamp(ts),
-                    },
+                    }),
                     ts,
                 )
                 .unwrap();

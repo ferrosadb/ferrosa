@@ -1,6 +1,7 @@
 //! Integration test: compaction produces sidecar index files via IndexBuildScheduler.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ferrosa_common::cell::CellValue;
@@ -100,7 +101,7 @@ fn flush_produces_sidecar_index_files_via_scheduler() {
             .write(
                 &table_id,
                 &key,
-                make_row(email.as_bytes(), (i + 1) * 1000),
+                Arc::new(make_row(email.as_bytes(), (i + 1) * 1000)),
                 (i + 1) * 1000,
             )
             .unwrap();
@@ -115,7 +116,7 @@ fn flush_produces_sidecar_index_files_via_scheduler() {
             .write(
                 &table_id,
                 &key,
-                make_row(email.as_bytes(), (i + 1) * 1000),
+                Arc::new(make_row(email.as_bytes(), (i + 1) * 1000)),
                 (i + 1) * 1000,
             )
             .unwrap();
@@ -180,7 +181,7 @@ fn add_index_registers_in_tracker() {
             .write(
                 &table_id,
                 &key,
-                make_row(format!("v{i}").as_bytes(), (i + 1) * 1000),
+                Arc::new(make_row(format!("v{i}").as_bytes(), (i + 1) * 1000)),
                 (i + 1) * 1000,
             )
             .unwrap();

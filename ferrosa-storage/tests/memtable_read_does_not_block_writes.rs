@@ -66,6 +66,7 @@ use ferrosa_common::schema::{ColumnDefinition, TableSchema};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
 use ferrosa_storage::memtable::skiplist::SkipListMemtable;
 use ferrosa_storage::memtable::Memtable;
+use std::sync::Arc;
 
 fn schema() -> TableSchema {
     TableSchema {
@@ -103,11 +104,12 @@ const ROWS: i32 = 400;
 
 fn fill(mem: &SkipListMemtable, k: &DecoratedKey, s: &TableSchema) {
     for ck in 0..ROWS {
-        mem.put(k, row(ck, b"payload-bytes", i64::from(ck)), s)
+        mem.put(k, Arc::new(row(ck, b"payload-bytes", i64::from(ck))), s)
             .expect("put must succeed");
     }
     // Settle the row Vec so amortized growth is not attributed to the probe.
-    mem.put(k, row(9_000, b"warm", 9_000), s).expect("warm put");
+    mem.put(k, Arc::new(row(9_000, b"warm", 9_000)), s)
+        .expect("warm put");
 }
 
 /// NEGATIVE CONTROL: the defect, pinned — **without** the allocation counter.
@@ -137,7 +139,8 @@ fn a_held_arc_makes_the_next_write_copy_on_write_and_stale() {
     let held: std::sync::Arc<Partition> = mem.get(&k).unwrap().expect("partition present");
     assert!(std::sync::Arc::strong_count(&held) > 1);
 
-    mem.put(&k, row(9_002, b"with-reader", 9_002), &s).unwrap();
+    mem.put(&k, Arc::new(row(9_002, b"with-reader", 9_002)), &s)
+        .unwrap();
 
     assert_eq!(
         held.rows.len(),
@@ -166,7 +169,8 @@ fn a_write_with_no_holder_is_visible_immediately() {
     fill(&mem, &k, &s);
     let rows_before = mem.get(&k).unwrap().unwrap().rows.len();
 
-    mem.put(&k, row(9_002, b"no-reader", 9_002), &s).unwrap();
+    mem.put(&k, Arc::new(row(9_002, b"no-reader", 9_002)), &s)
+        .unwrap();
 
     assert_eq!(
         mem.get(&k).unwrap().unwrap().rows.len(),
@@ -262,7 +266,7 @@ fn for_each_partition_stops_a_bounded_consumer_early() {
     let mem = SkipListMemtable::new();
     let s = schema();
     for i in 0..500 {
-        mem.put(&key(&format!("k_{i:04}")), row(0, b"v", 1000), &s)
+        mem.put(&key(&format!("k_{i:04}")), Arc::new(row(0, b"v", 1000)), &s)
             .unwrap();
     }
 
@@ -287,7 +291,7 @@ fn for_each_partition_visits_everything_when_never_stopped() {
     let mem = SkipListMemtable::new();
     let s = schema();
     for i in 0..200 {
-        mem.put(&key(&format!("k_{i:04}")), row(0, b"v", 1000), &s)
+        mem.put(&key(&format!("k_{i:04}")), Arc::new(row(0, b"v", 1000)), &s)
             .unwrap();
     }
     let mut seen = 0usize;
@@ -327,7 +331,7 @@ fn cloned_visit_releases_the_guard_before_the_callback() {
         }
         // Safe only because the guard was released before we got here: if it were
         // still held, parking_lot's non-reentrant `RwLock` would deadlock here.
-        mem.put(&k, row(9_004, b"during-cloned-scan", 9_004), &s)
+        mem.put(&k, Arc::new(row(9_004, b"during-cloned-scan", 9_004)), &s)
             .unwrap();
         writes += 1;
     });
@@ -357,7 +361,7 @@ fn cloned_visit_is_not_a_materialization() {
     let mem = SkipListMemtable::new();
     let s = schema();
     for i in 0..200 {
-        mem.put(&key(&format!("k_{i:04}")), row(0, b"v", 1000), &s)
+        mem.put(&key(&format!("k_{i:04}")), Arc::new(row(0, b"v", 1000)), &s)
             .unwrap();
     }
 
@@ -381,7 +385,7 @@ fn for_each_partition_sees_every_partition_in_token_order() {
     let mem = SkipListMemtable::new();
     let s = schema();
     for i in 0..25 {
-        mem.put(&key(&format!("k_{i:03}")), row(0, b"v", 1000), &s)
+        mem.put(&key(&format!("k_{i:03}")), Arc::new(row(0, b"v", 1000)), &s)
             .unwrap();
     }
 
@@ -414,7 +418,7 @@ fn for_each_partition_honors_bounds() {
     let mem = SkipListMemtable::new();
     let s = schema();
     for i in 0..25 {
-        mem.put(&key(&format!("k_{i:03}")), row(0, b"v", 1000), &s)
+        mem.put(&key(&format!("k_{i:03}")), Arc::new(row(0, b"v", 1000)), &s)
             .unwrap();
     }
     let all: Vec<DecoratedKey> = mem
@@ -442,14 +446,16 @@ fn write_epoch_advances_only_on_accepted_writes() {
     let s = schema();
     let before = mem.write_epoch();
 
-    mem.put(&key("a"), row(0, b"v", 1000), &s).unwrap();
+    mem.put(&key("a"), Arc::new(row(0, b"v", 1000)), &s)
+        .unwrap();
     let after_one = mem.write_epoch();
     assert_ne!(
         before, after_one,
         "an accepted write must advance the epoch (I-1)"
     );
 
-    mem.put(&key("a"), row(1, b"v2", 2000), &s).unwrap();
+    mem.put(&key("a"), Arc::new(row(1, b"v2", 2000)), &s)
+        .unwrap();
     assert_ne!(
         after_one,
         mem.write_epoch(),
@@ -467,7 +473,7 @@ fn write_epoch_advances_only_on_accepted_writes() {
     let mut bad_schema = schema();
     bad_schema.regular_columns[0].type_name =
         "org.apache.cassandra.db.marshal.TimeUUIDType".to_string();
-    assert!(mem.put(&key("a"), bad, &bad_schema).is_err());
+    assert!(mem.put(&key("a"), Arc::new(bad), &bad_schema).is_err());
     assert_eq!(
         epoch_before_reject,
         mem.write_epoch(),

@@ -15,6 +15,7 @@
 //! `ferrosa-sstable` types — this module is that consumer.
 
 use std::fmt;
+use std::sync::Arc;
 
 use ferrosa_common::test_generators::arb_decorated_key;
 use ferrosa_common::CellValue;
@@ -477,7 +478,7 @@ fn arb_partition(schema: Schema, profile: SizeProfile) -> BoxedStrategy<Partitio
                 key,
                 deletion,
                 static_row,
-                rows,
+                rows: rows.into_iter().map(Arc::new).collect(),
             }
         })
         .boxed()

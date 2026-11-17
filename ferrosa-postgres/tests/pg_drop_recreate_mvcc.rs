@@ -4,6 +4,7 @@
 //! recreation and pending writer through the shared CQL DDL execution boundary.
 //! No CQL wire parser is involved: the latter tests invoke its shared DdlPath.
 
+use std::sync::Arc;
 #[path = "common/pg_server.rs"]
 mod pg_server;
 
@@ -314,7 +315,7 @@ fn replica_write(
         table.keyspace.clone(),
         table.name.clone(),
         key,
-        vec![row],
+        vec![Arc::new(row)],
         1,
     );
     let mut bytes = vec![0; mutation.serialized_size()];

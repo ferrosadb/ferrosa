@@ -3,6 +3,7 @@
 use super::mutation::Mutation;
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+use std::sync::Arc;
 
 const KEYSPACE: &str = "\0ferrosa.transaction.v1";
 const TABLE: &str = "batch";
@@ -34,12 +35,12 @@ pub(crate) fn encode(mutations: &[Mutation], maximum: usize) -> ferrosa_common::
         KEYSPACE.into(),
         TABLE.into(),
         DecoratedKey::new(PartitionKey::new(Vec::new())),
-        vec![Row {
+        vec![Arc::new(Row {
             clustering: Vec::new(),
             cells: vec![(0, CellValue::live(payload, 0))],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::NONE,
-        }],
+        })],
         0,
     ))
 }

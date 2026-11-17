@@ -87,7 +87,7 @@ impl Default for SkipListMemtable {
 }
 
 impl Memtable for SkipListMemtable {
-    fn put(&self, key: &DecoratedKey, row: Row, schema: &TableSchema) -> Result<()> {
+    fn put(&self, key: &DecoratedKey, row: Arc<Row>, schema: &TableSchema) -> Result<()> {
         // Fail-loud guard: reject mis-sized cells before they reach the
         // memtable (mirrors the check in `ShardedBTreeMemtable::put`). Runs
         // before any lock is taken, so a rejected row never mutates the table.
@@ -355,7 +355,8 @@ mod tests {
         let mem = SkipListMemtable::new();
         let schema = test_schema();
         let key = make_key("pk1");
-        mem.put(&key, make_row(0, b"hello", 1000), &schema).unwrap();
+        mem.put(&key, Arc::new(make_row(0, b"hello", 1000)), &schema)
+            .unwrap();
         let result = mem.get(&key).unwrap();
         assert!(result.is_some());
         let partition = result.unwrap();
@@ -376,8 +377,10 @@ mod tests {
         let mem = SkipListMemtable::new();
         let schema = test_schema();
         let key = make_key("pk1");
-        mem.put(&key, make_row(0, b"old", 1000), &schema).unwrap();
-        mem.put(&key, make_row(0, b"new", 2000), &schema).unwrap();
+        mem.put(&key, Arc::new(make_row(0, b"old", 1000)), &schema)
+            .unwrap();
+        mem.put(&key, Arc::new(make_row(0, b"new", 2000)), &schema)
+            .unwrap();
         let partition = mem.get(&key).unwrap().unwrap();
         assert_eq!(
             partition.rows[0].cells[0].1.value.as_deref(),
@@ -392,8 +395,10 @@ mod tests {
         let mem = SkipListMemtable::new();
         let schema = test_schema();
         let key = make_key("pk1");
-        mem.put(&key, make_row(0, b"new", 2000), &schema).unwrap();
-        mem.put(&key, make_row(0, b"old", 1000), &schema).unwrap();
+        mem.put(&key, Arc::new(make_row(0, b"new", 2000)), &schema)
+            .unwrap();
+        mem.put(&key, Arc::new(make_row(0, b"old", 1000)), &schema)
+            .unwrap();
         let partition = mem.get(&key).unwrap().unwrap();
         assert_eq!(
             partition.rows[0].cells[0].1.value.as_deref(),
@@ -406,8 +411,10 @@ mod tests {
         let mem = SkipListMemtable::new();
         let schema = test_schema();
         let key = make_key("pk1");
-        mem.put(&key, make_row(0, b"v0", 1000), &schema).unwrap();
-        mem.put(&key, make_row(1, b"v1", 1000), &schema).unwrap();
+        mem.put(&key, Arc::new(make_row(0, b"v0", 1000)), &schema)
+            .unwrap();
+        mem.put(&key, Arc::new(make_row(1, b"v1", 1000)), &schema)
+            .unwrap();
         let partition = mem.get(&key).unwrap().unwrap();
         assert_eq!(partition.rows[0].cells.len(), 2);
     }
@@ -418,8 +425,12 @@ mod tests {
         let schema = test_schema();
         for i in 0..20 {
             let key = make_key(&format!("key_{i}"));
-            mem.put(&key, make_row(0, format!("v{i}").as_bytes(), 1000), &schema)
-                .unwrap();
+            mem.put(
+                &key,
+                Arc::new(make_row(0, format!("v{i}").as_bytes(), 1000)),
+                &schema,
+            )
+            .unwrap();
         }
         let snapshot = mem.snapshot();
         assert_eq!(snapshot.len(), 20);
@@ -437,8 +448,12 @@ mod tests {
         let schema = test_schema();
         for i in 0..20 {
             let key = make_key(&format!("key_{i:02}"));
-            mem.put(&key, make_row(0, format!("v{i}").as_bytes(), 1000), &schema)
-                .unwrap();
+            mem.put(
+                &key,
+                Arc::new(make_row(0, format!("v{i}").as_bytes(), 1000)),
+                &schema,
+            )
+            .unwrap();
         }
         // Unbounded → all 20.
         let all: Vec<_> = mem.range_iter(None, None).collect();
@@ -467,8 +482,12 @@ mod tests {
         let schema = test_schema();
         for i in 0..20 {
             let key = make_key(&format!("key_{i:02}"));
-            mem.put(&key, make_row(0, format!("v{i}").as_bytes(), 1000), &schema)
-                .unwrap();
+            mem.put(
+                &key,
+                Arc::new(make_row(0, format!("v{i}").as_bytes(), 1000)),
+                &schema,
+            )
+            .unwrap();
         }
 
         // `Arc::as_ptr` is the address of the shared allocation. If the scan
@@ -509,8 +528,12 @@ mod tests {
         let schema = test_schema();
         for i in 0..20 {
             let key = make_key(&format!("key_{i:02}"));
-            mem.put(&key, make_row(0, format!("v{i}").as_bytes(), 1000), &schema)
-                .unwrap();
+            mem.put(
+                &key,
+                Arc::new(make_row(0, format!("v{i}").as_bytes(), 1000)),
+                &schema,
+            )
+            .unwrap();
         }
 
         let snapshot = mem.snapshot();
@@ -534,7 +557,7 @@ mod tests {
         let schema = test_schema();
         assert_eq!(mem.partition_count(), 0);
         assert_eq!(mem.size_bytes(), 0);
-        mem.put(&make_key("k1"), make_row(0, b"v1", 1000), &schema)
+        mem.put(&make_key("k1"), Arc::new(make_row(0, b"v1", 1000)), &schema)
             .unwrap();
         assert_eq!(mem.partition_count(), 1);
         assert!(mem.size_bytes() > 0);
@@ -555,7 +578,7 @@ mod tests {
                     for k in 0..keys_per_thread {
                         let key = make_key(&format!("t{t}_k{k}"));
                         let row = make_row(0, format!("v{t}_{k}").as_bytes(), 1000 + t as i64);
-                        mem.put(&key, row, &schema).unwrap();
+                        mem.put(&key, Arc::new(row), &schema).unwrap();
                     }
                 })
             })

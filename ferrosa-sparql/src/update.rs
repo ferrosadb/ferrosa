@@ -926,14 +926,14 @@ async fn write_row(
     match path {
         WritePath::Cluster(coordinator) => {
             coordinator
-                .coordinate_write(table, key, row, timestamp)
+                .coordinate_write(table, key, Arc::new(row), timestamp)
                 .await?;
         }
         _ => {
             path.write(
                 table,
                 key,
-                row,
+                Arc::new(row),
                 timestamp,
                 ferrosa_cluster::consistency::ConsistencyLevel::Quorum,
                 &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {

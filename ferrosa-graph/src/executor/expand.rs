@@ -13,6 +13,7 @@
 //! Last changed: Preserve scoped logical/physical identity in traversal, DELETE and DETACH.
 
 use crate::executor::io::GraphWrite;
+use std::sync::Arc;
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -42,6 +43,7 @@ use crate::parser::{
 };
 use crate::planner::physical::{AggregateProjection, Anchor, CreateOp, Hop, MergeOp, PhysicalPlan};
 mod adjacency_write;
+pub mod detach_delete;
 #[cfg(test)]
 use adjacency_write::is_transient_replica_lag;
 use adjacency_write::{
@@ -4202,7 +4204,7 @@ async fn execute_create(
             .write(
                 &table_id,
                 &key,
-                row,
+                Arc::new(row),
                 timestamp,
                 graph_write_consistency(),
                 &strategy,
@@ -4521,7 +4523,7 @@ async fn execute_merge(
                 .write(
                     &table_id,
                     &key,
-                    row,
+                    Arc::new(row),
                     timestamp,
                     graph_write_consistency(),
                     &strategy,
@@ -4560,7 +4562,7 @@ async fn execute_merge(
                     key: shape.key.clone(),
                     deletion: DeletionTime::LIVE,
                     static_row: None,
-                    rows: vec![row.clone()],
+                    rows: vec![Arc::new(row.clone())],
                 };
                 Some(row_to_json(&meta, &partition, &row))
             }) {
@@ -4628,7 +4630,7 @@ async fn execute_merge(
             .write(
                 table_id,
                 key,
-                update_row,
+                Arc::new(update_row),
                 timestamp,
                 graph_write_consistency(),
                 &strategy,
@@ -5582,7 +5584,7 @@ async fn set_matched_row(
             .write(
                 &target.table_id,
                 &target.key,
-                update_row,
+                Arc::new(update_row),
                 statement.timestamp,
                 graph_write_consistency(),
                 &statement.strategy,
@@ -5867,7 +5869,7 @@ async fn execute_remove(
                 .write(
                     &target.table_id,
                     &target.key,
-                    update_row,
+                    Arc::new(update_row),
                     timestamp,
                     graph_write_consistency(),
                     &strategy,
@@ -5911,13 +5913,10 @@ fn tombstone_mutation(
         keyspace.to_string(),
         table.to_string(),
         key.clone(),
-        vec![row],
+        vec![Arc::new(row)],
         timestamp,
     )
 }
-
-type AdjacencyEntryKey = (Vec<u8>, Vec<u8>);
-type PhysicalEdgeRowKey = (String, Vec<u8>, Vec<u8>);
 
 struct VertexDeleteTarget<'a> {
     table: &'a TableId,
@@ -5925,13 +5924,6 @@ struct VertexDeleteTarget<'a> {
     key: &'a DecoratedKey,
     clustering: &'a [u8],
     logical_key: &'a DecoratedKey,
-}
-
-#[derive(Default)]
-struct IncidentEdgeDeletes {
-    mutations: Vec<Mutation>,
-    index_updates: HashMap<AdjacencyEntryKey, Mutation>,
-    removed_rows: HashSet<PhysicalEdgeRowKey>,
 }
 
 /// Match the declared endpoint and its relationship scope back to one exact
@@ -5981,115 +5973,6 @@ async fn edge_is_incident(
         }
     }
     Ok(false)
-}
-
-/// Stream declared legacy tables, retaining only incident row/index mutations.
-async fn collect_incident_edge_deletes(
-    write_path: &dyn GraphWrite,
-    schema: &Schema,
-    edges: &[ferrosa_schema::metadata::table::TableMetadata],
-    target: &VertexDeleteTarget<'_>,
-    timestamp: i64,
-) -> Result<IncidentEdgeDeletes> {
-    let mut batch = IncidentEdgeDeletes::default();
-    for edge in edges {
-        let table = TableId::new(&edge.keyspace, &edge.name);
-        let mut partitions = write_path.range_read_stream_all(&table, 0).await?;
-        while let Some(partition) = partitions.next().await {
-            let partition = partition?;
-            if is_partition_dead(&partition) {
-                continue;
-            }
-            for row in &partition.rows {
-                if crate::adjacency::schema::row_is_deleted(row)
-                    || !edge_is_incident(write_path, schema, target, edge, &partition, row).await?
-                {
-                    continue;
-                }
-                for entry in
-                    derive_adjacency_row_mutations(schema, &table, &partition.key, row, timestamp)
-                {
-                    let key = (
-                        entry.key.key.as_bytes().to_vec(),
-                        entry.rows[0].clustering.clone(),
-                    );
-                    let deleted = tombstone_mutation(
-                        &entry.keyspace,
-                        &entry.table,
-                        &entry.key,
-                        Some(entry.rows[0].clustering.clone()),
-                        timestamp,
-                    );
-                    batch.index_updates.insert(key, deleted);
-                }
-                batch.removed_rows.insert((
-                    edge.name.clone(),
-                    partition.key.key.as_bytes().to_vec(),
-                    row.clustering.clone(),
-                ));
-                batch.mutations.push(tombstone_mutation(
-                    &edge.keyspace,
-                    &edge.name,
-                    &partition.key,
-                    Some(row.clustering.clone()),
-                    timestamp,
-                ));
-            }
-        }
-    }
-    Ok(batch)
-}
-
-/// Index tuples omit tenant scope. Replace candidate tombstones with live
-/// entries supported by surviving physical rows, outranking observer-derived
-/// tombstones at timestamp+1. Memory stays proportional to the deletion batch.
-async fn protect_shared_index_entries(
-    write_path: &dyn GraphWrite,
-    schema: &Schema,
-    edges: &[ferrosa_schema::metadata::table::TableMetadata],
-    batch: &mut IncidentEdgeDeletes,
-    timestamp: i64,
-) -> Result<()> {
-    if batch.index_updates.is_empty() {
-        return Ok(());
-    }
-    for edge in edges {
-        let table = TableId::new(&edge.keyspace, &edge.name);
-        let mut partitions = write_path.range_read_stream_all(&table, 0).await?;
-        while let Some(partition) = partitions.next().await {
-            let partition = partition?;
-            if is_partition_dead(&partition) {
-                continue;
-            }
-            for row in &partition.rows {
-                if crate::adjacency::schema::row_is_deleted(row)
-                    || batch.removed_rows.contains(&(
-                        edge.name.clone(),
-                        partition.key.key.as_bytes().to_vec(),
-                        row.clustering.clone(),
-                    ))
-                {
-                    continue;
-                }
-                for entry in derive_adjacency_row_mutations(
-                    schema,
-                    &table,
-                    &partition.key,
-                    row,
-                    timestamp.saturating_add(1),
-                ) {
-                    let key = (
-                        entry.key.key.as_bytes().to_vec(),
-                        entry.rows[0].clustering.clone(),
-                    );
-                    if let Some(update) = batch.index_updates.get_mut(&key) {
-                        *update = entry;
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 fn graph_edge_tables(
@@ -6228,6 +6111,10 @@ async fn scoped_vertex_has_incident_edges(
 
 /// Delete exact physical edge/vertex rows in one atomic batch. Neither legacy
 /// edges nor a clustered vertex may be reconstructed from a logical UUID alone.
+///
+/// The batch is staged and committed through
+/// [`GraphWrite::write_staged_batch`], never held as a `Vec<Mutation>`; see
+/// [`detach_delete`] for how it is built in bounded memory.
 #[allow(clippy::too_many_arguments)]
 async fn delete_with_adjacency(
     write_path: &dyn GraphWrite,
@@ -6238,6 +6125,7 @@ async fn delete_with_adjacency(
     timestamp: i64,
     strategy: &ReplicationStrategy,
     schema: Option<&Schema>,
+    config: &GraphEngineConfig,
 ) -> Result<usize> {
     let schema = schema.ok_or_else(|| {
         GraphError::Validation("DETACH DELETE requires vertex and edge schema metadata".into())
@@ -6263,21 +6151,13 @@ async fn delete_with_adjacency(
         logical_key: &logical_key,
     };
     let edges = graph_edge_tables(schema, keyspace);
-    let mut batch =
-        collect_incident_edge_deletes(write_path, schema, &edges, &target, timestamp).await?;
-    protect_shared_index_entries(write_path, schema, &edges, &mut batch, timestamp).await?;
-    let edges_deleted = batch.removed_rows.len();
-    batch.mutations.extend(batch.index_updates.into_values());
-    batch.mutations.push(tombstone_mutation(
-        &vertex_table.keyspace,
-        &vertex_table.table,
-        vertex_key,
-        Some(vertex_clustering.to_vec()),
-        timestamp,
-    ));
+    let staged =
+        detach_delete::stage_detach_delete(write_path, schema, &edges, &target, timestamp, config)
+            .await?;
+    let edges_deleted = staged.edges_deleted;
     write_path
-        .write_batch(
-            batch.mutations,
+        .write_staged_batch(
+            staged.batch,
             graph_write_consistency(),
             strategy.replication_factor(),
         )
@@ -6547,6 +6427,7 @@ async fn execute_delete(
                         timestamp,
                         &strategy,
                         schema,
+                        config,
                     )
                     .await?;
                     stats.edges_deleted += edges_deleted;
@@ -6570,7 +6451,7 @@ async fn execute_delete(
                     .write(
                         &table_id,
                         &key,
-                        tombstone_row.clone(),
+                        Arc::new(tombstone_row.clone()),
                         timestamp,
                         graph_write_consistency(),
                         &strategy,
@@ -8699,7 +8580,7 @@ mod tests {
             .write(
                 &entity_tid,
                 &DecoratedKey::new(PartitionKey::new(partition_key.clone())),
-                src_row,
+                Arc::new(src_row),
                 1000,
             )
             .unwrap();
@@ -8707,7 +8588,7 @@ mod tests {
             .write(
                 &entity_tid,
                 &DecoratedKey::new(PartitionKey::new(partition_key)),
-                dst_row,
+                Arc::new(dst_row),
                 1000,
             )
             .unwrap();
@@ -11023,6 +10904,336 @@ mod tests {
         assert!(
             !is_transient_replica_lag(&unavailable),
             "unavailability is final for this retry"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // DETACH DELETE as one spilled, atomic batch (p0-oom-audit
+    // stream-push-accumulation at collect_incident_edge_deletes)
+    // ---------------------------------------------------------------------
+
+    const DETACH_TENANT: u128 = 0x0000_0000_0000_0000_0000_0000_0000_0001;
+    const DETACH_SESSION: u128 = 0x1111_1111_1111_1111_1111_1111_1111_1111;
+
+    fn detach_scope_key() -> DecoratedKey {
+        DecoratedKey::new(PartitionKey::new(encode_partition_components(&[
+            uuid::Uuid::from_u128(DETACH_TENANT).as_bytes().to_vec(),
+            uuid::Uuid::from_u128(DETACH_SESSION).as_bytes().to_vec(),
+        ])))
+    }
+
+    /// One more `src -[TYPED_EDGE {edge_type}]-> dst`, through the real MERGE
+    /// path so its adjacency entries are derived exactly as production does.
+    async fn merge_typed_edge(
+        write_path: &WritePath,
+        schema: &ferrosa_schema::Schema,
+        src: uuid::Uuid,
+        dst: uuid::Uuid,
+        edge_type: &str,
+    ) {
+        let entity = |var: &str, id: uuid::Uuid| MergeOp {
+            var: Some(var.to_string()),
+            table: crate::planner::logical::ResolvedTable {
+                keyspace: "agent_memory".to_string(),
+                table: "entity_store".to_string(),
+                label: "Entity".to_string(),
+                graph_type: "vertex".to_string(),
+            },
+            match_props: vec![(
+                "entity_id".to_string(),
+                Expr::Literal(Literal::String(id.to_string())),
+            )],
+            create_props: vec![],
+            src_match_props: None,
+            src_var: None,
+            dst_match_props: None,
+            dst_var: None,
+        };
+        let merges = vec![
+            entity("a", src),
+            entity("b", dst),
+            MergeOp {
+                var: Some("r".to_string()),
+                table: crate::planner::logical::ResolvedTable {
+                    keyspace: "agent_memory".to_string(),
+                    table: "typed_edges".to_string(),
+                    label: "TYPED_EDGE".to_string(),
+                    graph_type: "edge".to_string(),
+                },
+                match_props: vec![(
+                    "edge_type".to_string(),
+                    Expr::Literal(Literal::String(edge_type.to_string())),
+                )],
+                create_props: vec![],
+                src_match_props: Some(vec![(
+                    "entity_id".to_string(),
+                    Expr::Literal(Literal::String(src.to_string())),
+                )]),
+                src_var: Some("a".to_string()),
+                dst_match_props: Some(vec![(
+                    "entity_id".to_string(),
+                    Expr::Literal(Literal::String(dst.to_string())),
+                )]),
+                dst_var: Some("b".to_string()),
+            },
+        ];
+        execute_merge(
+            write_path,
+            &merges,
+            &[],
+            None,
+            &GraphEngineConfig::default(),
+            Instant::now(),
+            Some(schema),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// The fixture's one edge plus `extra` parallel edges src -> dst: every one
+    /// derives the same two adjacency entries, so the protect pass has real
+    /// candidates to decide.
+    async fn detach_fixture(
+        extra: usize,
+    ) -> (
+        tempfile::TempDir,
+        Arc<ferrosa_schema::Schema>,
+        WritePath,
+        uuid::Uuid,
+        uuid::Uuid,
+    ) {
+        let (tmp, schema, write_path, src, dst) = merged_typed_edge_fixture().await;
+        for i in 0..extra {
+            merge_typed_edge(&write_path, &schema, src, dst, &format!("kind-{i:03}")).await;
+        }
+        (tmp, schema, write_path, src, dst)
+    }
+
+    /// DETACH DELETE `src` with `config`; returns the deleted-edge count.
+    async fn detach_src(
+        write_path: &dyn GraphWrite,
+        schema: &ferrosa_schema::Schema,
+        src: uuid::Uuid,
+        config: &GraphEngineConfig,
+    ) -> Result<usize> {
+        let entity = TableId::new("agent_memory", "entity_store");
+        let strategy = graph_replication_strategy(Some(schema), "agent_memory").unwrap();
+        delete_with_adjacency(
+            write_path,
+            "agent_memory",
+            &detach_scope_key(),
+            &encode_clustering_components(&[src.as_bytes().to_vec()]),
+            &entity,
+            2_000_000_000_000_000,
+            &strategy,
+            Some(schema),
+            config,
+        )
+        .await
+    }
+
+    /// Every row the delete can touch, as (table, partition, clustering, live).
+    async fn detach_snapshot(
+        write_path: &dyn GraphWrite,
+        src: uuid::Uuid,
+        dst: uuid::Uuid,
+    ) -> Vec<(String, Vec<u8>, Vec<u8>, bool)> {
+        let adjacency = TableId::new(adjacency_keyspace_name("agent_memory"), "adjacency");
+        let reads = [
+            (
+                TableId::new("agent_memory", "entity_store"),
+                detach_scope_key(),
+            ),
+            (
+                TableId::new("agent_memory", "typed_edges"),
+                detach_scope_key(),
+            ),
+            (
+                adjacency.clone(),
+                DecoratedKey::new(PartitionKey::new(src.as_bytes().to_vec())),
+            ),
+            (
+                adjacency,
+                DecoratedKey::new(PartitionKey::new(dst.as_bytes().to_vec())),
+            ),
+        ];
+        let mut out = Vec::new();
+        for (table, key) in reads {
+            let Some(partition) = write_path.read(&table, &key).await.unwrap() else {
+                continue;
+            };
+            for row in &partition.rows {
+                out.push((
+                    table.to_string(),
+                    key.key.as_bytes().to_vec(),
+                    row.clustering.clone(),
+                    !is_partition_dead(&partition)
+                        && !crate::adjacency::schema::row_is_deleted(row),
+                ));
+            }
+        }
+        out
+    }
+
+    /// RED for the stream-push-accumulation finding: a DETACH DELETE whose
+    /// vertex degree exceeds the spill threshold stages its batch on disk,
+    /// commits it as ONE batch, and ends in exactly the state the resident
+    /// build produces.
+    #[tokio::test]
+    async fn a_detach_delete_past_the_spill_threshold_spills_and_matches_the_resident_build() {
+        use crate::executor::spill::test_support::{spilling_config, TempDirReserver};
+        const EXTRA: usize = 24;
+
+        let (_tmp, schema, write_path, src, dst) = detach_fixture(EXTRA).await;
+        let spill_dir = tempfile::tempdir().unwrap();
+        let reserver = TempDirReserver::new(spill_dir.path());
+        let spilling = spilling_config(Arc::clone(&reserver), GraphEngineConfig::default());
+        let spilled_before = detach_delete::detach_delete_spilled_batches();
+        let deleted = detach_src(&write_path, &schema, src, &spilling)
+            .await
+            .unwrap();
+        assert_eq!(deleted, EXTRA + 1, "every parallel edge is deleted");
+        assert!(
+            detach_delete::detach_delete_spilled_batches() > spilled_before,
+            "a batch past the spill threshold must be staged on disk"
+        );
+        assert!(
+            !reserver.reserved_paths().is_empty(),
+            "the spill backend was used"
+        );
+        let spilled = detach_snapshot(&write_path, src, dst).await;
+
+        let (_tmp2, schema2, write_path2, src2, dst2) = detach_fixture(EXTRA).await;
+        assert_eq!((src2, dst2), (src, dst), "the fixture ids are fixed");
+        let resident = detach_src(&write_path2, &schema2, src, &GraphEngineConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(resident, deleted);
+        assert_eq!(
+            spilled,
+            detach_snapshot(&write_path2, src, dst).await,
+            "spilling must change memory, not the result"
+        );
+        assert!(
+            spilled.iter().all(|(table, _, clustering, live)| {
+                !*live
+                    || (table.ends_with("entity_store")
+                        && *clustering != encode_clustering_components(&[src.as_bytes().to_vec()]))
+            }),
+            "only the other vertex survives: {spilled:?}"
+        );
+    }
+
+    /// Delegates reads to a real `WritePath`; every write fails the test except
+    /// the one staged commit, which fails like a storage error would.
+    struct RefusingCommit {
+        inner: WritePath,
+    }
+
+    #[async_trait::async_trait]
+    impl GraphWrite for RefusingCommit {
+        async fn read(
+            &self,
+            table_id: &TableId,
+            key: &DecoratedKey,
+        ) -> ferrosa_common::Result<Option<ferrosa_sstable::types::Partition>> {
+            GraphWrite::read(&self.inner, table_id, key).await
+        }
+        async fn pk_read(
+            &self,
+            table_id: &TableId,
+            key: &DecoratedKey,
+            cl: ConsistencyLevel,
+            strategy: &ReplicationStrategy,
+        ) -> ferrosa_common::Result<Option<ferrosa_sstable::types::Partition>> {
+            GraphWrite::pk_read(&self.inner, table_id, key, cl, strategy).await
+        }
+        async fn range_read_stream_all(
+            &self,
+            table_id: &TableId,
+            row_limit: usize,
+        ) -> ferrosa_cluster::error::Result<PartitionResultStream> {
+            GraphWrite::range_read_stream_all(&self.inner, table_id, row_limit).await
+        }
+        async fn count_range_with(
+            &self,
+            table_id: &TableId,
+            cl: ConsistencyLevel,
+            strategy: &ReplicationStrategy,
+        ) -> ferrosa_cluster::error::Result<u64> {
+            GraphWrite::count_range_with(&self.inner, table_id, cl, strategy).await
+        }
+        fn declares_index_locally(&self, table_id: &TableId, index_name: &str) -> bool {
+            GraphWrite::declares_index_locally(&self.inner, table_id, index_name)
+        }
+        fn index_is_current(&self, table_id: &TableId, index_name: &str) -> bool {
+            GraphWrite::index_is_current(&self.inner, table_id, index_name)
+        }
+        async fn index_read_stream(
+            &self,
+            table_id: &TableId,
+            index_name: &str,
+            index_key: &ferrosa_index::IndexKey,
+            after: Option<&ferrosa_index::RowPosition>,
+        ) -> ferrosa_cluster::error::Result<PartitionResultStream> {
+            GraphWrite::index_read_stream(&self.inner, table_id, index_name, index_key, after).await
+        }
+        async fn write(
+            &self,
+            _table_id: &TableId,
+            _key: &DecoratedKey,
+            _row: Arc<Row>,
+            _timestamp: i64,
+            _cl: ConsistencyLevel,
+            _strategy: &ReplicationStrategy,
+        ) -> ferrosa_common::Result<()> {
+            panic!("DETACH DELETE must write only through its one staged batch");
+        }
+        async fn write_batch(
+            &self,
+            _mutations: Vec<Mutation>,
+            _cl: ConsistencyLevel,
+            _rf: usize,
+        ) -> ferrosa_common::Result<()> {
+            panic!("DETACH DELETE must not build a resident batch");
+        }
+        async fn write_staged_batch(
+            &self,
+            _batch: ferrosa_storage::write_set_stage::StagedWriteSet,
+            _cl: ConsistencyLevel,
+            _rf: usize,
+        ) -> ferrosa_common::Result<()> {
+            Err(ferrosa_common::Error::InvalidData(
+                "injected commit failure".to_string(),
+            ))
+        }
+    }
+
+    /// A DETACH DELETE whose commit fails leaves nothing applied: it writes
+    /// nothing before its one atomic commit.
+    #[tokio::test]
+    async fn a_failed_detach_delete_commit_leaves_nothing_applied() {
+        use crate::executor::spill::test_support::{spilling_config, TempDirReserver};
+        let (_tmp, schema, write_path, src, dst) = detach_fixture(8).await;
+        let before = detach_snapshot(&write_path, src, dst).await;
+        assert!(
+            before.iter().filter(|(_, _, _, live)| *live).count() > 4,
+            "positive control: edges, entries and vertices are live: {before:?}"
+        );
+        let spill_dir = tempfile::tempdir().unwrap();
+        let spilling = spilling_config(
+            TempDirReserver::new(spill_dir.path()),
+            GraphEngineConfig::default(),
+        );
+        let refusing = RefusingCommit { inner: write_path };
+        let err = detach_src(&refusing, &schema, src, &spilling)
+            .await
+            .expect_err("the injected commit failure surfaces");
+        assert!(err.to_string().contains("injected commit failure"), "{err}");
+        assert_eq!(
+            detach_snapshot(&refusing.inner, src, dst).await,
+            before,
+            "a failed commit must leave every row as it was"
         );
     }
 }
