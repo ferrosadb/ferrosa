@@ -3093,7 +3093,7 @@ impl AggregateSlot {
         Ok(Self {
             arg: arg.cloned(),
             count_star,
-            seen: distinct.then(HashSet::new),
+            seen: if distinct { Some(HashSet::new()) } else { None },
             acc: create_accumulator(name, count_star, max_collect_size)?,
         })
     }
@@ -3105,7 +3105,7 @@ impl AggregateSlot {
             Some(e) => eval_expr(e, binding)?,
             None => Value::Null,
         };
-        if let Some(seen) = self.seen.as_mut() {
+        if let Some(seen) = &mut self.seen {
             if !seen.insert(serde_json::to_string(&value).unwrap_or_default()) {
                 return Ok(());
             }
@@ -3117,13 +3117,15 @@ impl AggregateSlot {
 
 impl TrailingGroups {
     fn new(rc: &ReturnClause, config: &GraphEngineConfig) -> Self {
-        let item_is_aggregate: Vec<bool> = rc
-            .items
-            .iter()
-            .map(|item| expr_contains_aggregate(&item.expr))
-            .collect();
+        let mut item_is_aggregate = Vec::with_capacity(rc.items.len());
+        let mut has_group_keys = false;
+        for item in &rc.items {
+            let is_aggregate = expr_contains_aggregate(&item.expr);
+            has_group_keys |= !is_aggregate;
+            item_is_aggregate.push(is_aggregate);
+        }
         Self {
-            has_group_keys: item_is_aggregate.iter().any(|agg| !agg),
+            has_group_keys,
             item_is_aggregate,
             index: HashMap::new(),
             groups: Vec::new(),
@@ -3133,28 +3135,26 @@ impl TrailingGroups {
     }
 
     fn new_group(&self, rc: &ReturnClause, key_vals: Vec<Value>) -> Result<TrailingGroup> {
-        let slots = rc
-            .items
-            .iter()
-            .zip(&self.item_is_aggregate)
-            .map(|(item, is_agg)| {
-                is_agg
-                    .then(|| AggregateSlot::new(&item.expr, self.max_collect_size))
-                    .transpose()
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let mut slots = Vec::with_capacity(rc.items.len());
+        for (item, is_agg) in rc.items.iter().zip(&self.item_is_aggregate) {
+            let slot = if *is_agg {
+                Some(AggregateSlot::new(&item.expr, self.max_collect_size)?)
+            } else {
+                None
+            };
+            slots.push(slot);
+        }
         Ok(TrailingGroup { key_vals, slots })
     }
 
     fn feed(&mut self, rc: &ReturnClause, binding: &HashMap<String, Value>) -> Result<()> {
         // The grouping key is the tuple of evaluated non-aggregate items.
-        let key_vals = rc
-            .items
-            .iter()
-            .zip(&self.item_is_aggregate)
-            .filter(|(_, is_agg)| !**is_agg)
-            .map(|(item, _)| eval_expr(&item.expr, binding))
-            .collect::<Result<Vec<_>>>()?;
+        let mut key_vals = Vec::new();
+        for (item, is_agg) in rc.items.iter().zip(&self.item_is_aggregate) {
+            if !*is_agg {
+                key_vals.push(eval_expr(&item.expr, binding)?);
+            }
+        }
         let key_str = serde_json::to_string(&key_vals).unwrap_or_default();
         let at = match self.index.get(&key_str) {
             Some(at) => *at,
@@ -3172,11 +3172,11 @@ impl TrailingGroups {
                 self.groups.len() - 1
             }
         };
-        self.groups[at]
-            .slots
-            .iter_mut()
-            .flatten()
-            .try_for_each(|slot| slot.accumulate(binding))
+        for slot in self.groups[at].slots.iter_mut() {
+            let Some(slot) = slot else { continue };
+            slot.accumulate(binding)?;
+        }
+        Ok(())
     }
 
     /// One row per group, in first-seen key order.
@@ -3188,31 +3188,25 @@ impl TrailingGroups {
             let implicit = self.new_group(rc, Vec::new())?;
             self.groups = vec![implicit];
         }
-        Ok(self
-            .groups
-            .into_iter()
-            .map(|group| {
-                let mut keys = group.key_vals.into_iter();
-                group
-                    .slots
-                    .into_iter()
-                    .map(|slot| match slot {
-                        Some(slot) => slot.acc.finish(),
-                        None => keys.next().unwrap_or(Value::Null),
-                    })
-                    .collect()
-            })
-            .collect())
+        let mut rows = Vec::with_capacity(self.groups.len());
+        for group in self.groups {
+            let mut keys = group.key_vals.into_iter();
+            let mut row = Vec::with_capacity(group.slots.len());
+            for slot in group.slots {
+                row.push(match slot {
+                    Some(slot) => slot.acc.finish(),
+                    None => keys.next().unwrap_or(Value::Null),
+                });
+            }
+            rows.push(row);
+        }
+        Ok(rows)
     }
 }
 
 impl<'r> TrailingReturn<'r> {
     fn new(rc: &'r ReturnClause, config: &GraphEngineConfig) -> Result<Self> {
-        if rc
-            .items
-            .iter()
-            .any(|item| expr_contains_aggregate(&item.expr))
-        {
+        if return_has_aggregate(rc) {
             return Ok(Self::Aggregate {
                 rc,
                 groups: TrailingGroups::new(rc, config),
@@ -3228,11 +3222,10 @@ impl<'r> TrailingReturn<'r> {
     fn feed(&mut self, binding: &HashMap<String, Value>) -> Result<()> {
         match self {
             Self::Rows { rc, acc } => {
-                let row = rc
-                    .items
-                    .iter()
-                    .map(|item| eval_expr(&item.expr, binding))
-                    .collect::<Result<Vec<_>>>()?;
+                let mut row = Vec::with_capacity(rc.items.len());
+                for item in &rc.items {
+                    row.push(eval_expr(&item.expr, binding)?);
+                }
                 acc.push(row, binding)
             }
             Self::Aggregate { rc, groups } => groups.feed(rc, binding),
@@ -3264,15 +3257,25 @@ impl<'r> TrailingReturn<'r> {
             Self::Aggregate { rc, groups } => {
                 let mut acc = trailing_acc(rc, config)?;
                 let no_bindings = HashMap::new();
-                groups
-                    .finish(rc)?
-                    .into_iter()
-                    .try_for_each(|row| acc.push(row, &no_bindings))?;
+                for row in groups.finish(rc)? {
+                    acc.push(row, &no_bindings)?;
+                }
                 (rc, acc)
             }
         };
         Ok((build_columns(rc), acc.into_stream(rc)?))
     }
+}
+
+/// Whether any RETURN item contains an aggregate: such a RETURN groups and
+/// aggregates instead of projecting one row per binding.
+fn return_has_aggregate(rc: &ReturnClause) -> bool {
+    for item in &rc.items {
+        if expr_contains_aggregate(&item.expr) {
+            return true;
+        }
+    }
+    false
 }
 
 /// The spill-backed accumulator a trailing RETURN's rows go into, with the

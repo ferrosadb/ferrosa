@@ -1244,13 +1244,13 @@ fn execute_unwind(
     };
     // The list is a literal of the query itself, so these states are bounded
     // by the request, not by stored data.
-    let mut states: Vec<ExpandState> = values
-        .into_iter()
-        .map(|value| ExpandState {
+    let mut states: Vec<ExpandState> = Vec::with_capacity(values.len());
+    for value in values {
+        states.push(ExpandState {
             current_key: DecoratedKey::new(PartitionKey::new(Vec::new())),
             bindings: HashMap::from([(var.to_string(), value)]),
-        })
-        .collect();
+        });
+    }
     if let Some(with_pipeline) = with_pipeline {
         states = apply_with_pipeline(states, with_pipeline)?;
     }
@@ -1266,10 +1266,10 @@ fn execute_unwind(
     // projection and LIMIT stream: rows are produced on pull and `take(limit)`
     // stops pulling.
     if return_clause.order_by.is_empty() {
-        let limit = return_clause
-            .limit
-            .map(|l| l.max(0) as usize)
-            .unwrap_or(usize::MAX);
+        let limit = match return_clause.limit {
+            Some(l) => l.max(0) as usize,
+            None => usize::MAX,
+        };
         let rows: RowStream<'static> = Box::pin(
             futures::stream::iter(states)
                 .map(move |state| eval_return_items(&return_clause.items, &state.bindings))
@@ -1277,10 +1277,10 @@ fn execute_unwind(
         );
         return Ok((columns, rows, stats));
     }
-    let mut rows = states
-        .iter()
-        .map(|state| eval_return_items(&return_clause.items, &state.bindings))
-        .collect::<Result<Vec<_>>>()?;
+    let mut rows = Vec::with_capacity(states.len());
+    for state in &states {
+        rows.push(eval_return_items(&return_clause.items, &state.bindings)?);
+    }
     sort_projected_rows_by_bindings(&mut rows, &states, &return_clause)?;
     if let Some(limit) = return_clause.limit {
         rows.truncate(limit.max(0) as usize);
@@ -1346,6 +1346,9 @@ impl Frontier {
     }
 }
 
+/// Tests hand a plain list of states where a frontier is expected; production
+/// code builds `Frontier::Resident` or `Frontier::Spilled` itself.
+#[cfg(test)]
 impl From<Vec<ExpandState>> for Frontier {
     fn from(states: Vec<ExpandState>) -> Self {
         Self::Resident(states)
@@ -1359,14 +1362,36 @@ fn state_run_columns() -> [String; 2] {
 }
 
 fn encode_state(state: ExpandState) -> crate::executor::stream::RowVals {
-    vec![
-        serde_json::Value::String(hex::encode(state.current_key.key.as_bytes())),
-        serde_json::Value::Object(state.bindings.into_iter().collect()),
-    ]
+    let key = serde_json::Value::String(hex::encode(state.current_key.key.as_bytes()));
+    // Each binding moves into the spilled object; nothing is copied.
+    let mut bindings = serde_json::Map::new();
+    for (name, value) in state.bindings {
+        bindings.insert(name, value);
+    }
+    vec![key, serde_json::Value::Object(bindings)]
 }
 
 /// Rebuild a state from its spilled row. The key is re-decorated with the
 /// engine's partitioner (Murmur3), which is how it was decorated on read.
+/// Move a spilled bindings object back into a binding map.
+fn bindings_from_object(
+    object: serde_json::Map<String, serde_json::Value>,
+) -> HashMap<String, serde_json::Value> {
+    let mut bindings = HashMap::new();
+    for (name, value) in object {
+        bindings.insert(name, value);
+    }
+    bindings
+}
+
+/// [`decode_state`] over a spilled run's item, passing a read error through.
+fn decode_state_row(row: Result<crate::executor::stream::RowVals>) -> Result<ExpandState> {
+    match row {
+        Ok(row) => decode_state(row),
+        Err(e) => Err(e),
+    }
+}
+
 fn decode_state(row: crate::executor::stream::RowVals) -> Result<ExpandState> {
     let mut values = row.into_iter();
     let (Some(serde_json::Value::String(key_hex)), Some(serde_json::Value::Object(bindings)), None) =
@@ -1376,11 +1401,18 @@ fn decode_state(row: crate::executor::stream::RowVals) -> Result<ExpandState> {
             "spilled expand state is not [key, bindings]".to_string(),
         ));
     };
-    let key = hex::decode(&key_hex)
-        .map_err(|e| GraphError::Internal(format!("spilled expand state key: {e}")))?;
+    let key = match hex::decode(&key_hex) {
+        Ok(key) => key,
+        Err(e) => {
+            return Err(GraphError::Internal(format!(
+                "spilled expand state key: {}",
+                hex_error_text(&e)
+            )))
+        }
+    };
     Ok(ExpandState {
         current_key: DecoratedKey::new(PartitionKey::new(key)),
-        bindings: bindings.into_iter().collect(),
+        bindings: bindings_from_object(bindings),
     })
 }
 
@@ -1400,7 +1432,7 @@ impl StateRun {
     fn finish(self) -> Result<StateStream> {
         use futures::StreamExt as _;
         let rows = self.0.finish()?;
-        Ok(Box::pin(rows.map(|row| row.and_then(decode_state))))
+        Ok(Box::pin(rows.map(decode_state_row)))
     }
 }
 
@@ -1444,13 +1476,13 @@ fn with_project_state(
     with_pipeline: &crate::parser::WithPipeline,
     state: ExpandState,
 ) -> Result<Option<ExpandState>> {
-    let mut bindings = HashMap::with_capacity(with_pipeline.clause.items.len());
+    let mut bindings = HashMap::new();
     for item in &with_pipeline.clause.items {
         let value = eval::eval_expr(&item.expr, &state.bindings)?;
-        let name = item
-            .alias
-            .clone()
-            .unwrap_or_else(|| expr_to_column_name(&item.expr));
+        let name = match &item.alias {
+            Some(alias) => alias.clone(),
+            None => expr_to_column_name(&item.expr),
+        };
         bindings.insert(name, value);
     }
     if let Some(where_clause) = &with_pipeline.where_clause {
@@ -1513,7 +1545,7 @@ async fn with_pipeline_stream(
                 futures::future::ready(keyed)
             })
             .await?;
-        states = Box::pin(sink.finish_stream()?.map(|row| row.and_then(decode_state)));
+        states = Box::pin(sink.finish_stream()?.map(decode_state_row));
     }
     if let Some(limit) = clause.limit {
         states = Box::pin(states.take(limit.max(0) as usize));
@@ -2576,21 +2608,30 @@ fn apply_with_pipeline(
 
     if with_pipeline.clause.distinct {
         let mut seen = std::collections::HashSet::new();
-        projected.retain(|state| seen.insert(canonical_bindings_key(&state.bindings)));
+        let mut distinct = Vec::with_capacity(projected.len());
+        for state in projected {
+            if seen.insert(canonical_bindings_key(&state.bindings)) {
+                distinct.push(state);
+            }
+        }
+        projected = distinct;
     }
 
     if !with_pipeline.clause.order_by.is_empty() {
         let order_by = &with_pipeline.clause.order_by;
         let mut keyed = Vec::with_capacity(projected.len());
         for state in projected {
-            let keys = order_by
-                .iter()
-                .map(|order| eval::eval_expr(&order.expr, &state.bindings))
-                .collect::<Result<Vec<_>>>()?;
+            let mut keys = Vec::with_capacity(order_by.len());
+            for order in order_by {
+                keys.push(eval::eval_expr(&order.expr, &state.bindings)?);
+            }
             keyed.push((keys, state));
         }
         keyed.sort_by(|(a, _), (b, _)| compare_order_keys(a, b, order_by));
-        projected = keyed.into_iter().map(|(_, state)| state).collect();
+        projected = Vec::with_capacity(keyed.len());
+        for (_, state) in keyed {
+            projected.push(state);
+        }
     }
 
     if let Some(limit) = with_pipeline.clause.limit {
@@ -5376,42 +5417,25 @@ fn matched_target<'v>(
 ) -> Result<Option<MatchedTarget<'v>>> {
     let hex_id = match value {
         Some(serde_json::Value::String(s)) => s.as_str(),
-        Some(serde_json::Value::Object(map)) => match map.get("_id").and_then(|v| v.as_str()) {
+        Some(serde_json::Value::Object(_)) => match object_str(value, "_id") {
             Some(id) => id,
             None => return Ok(None),
         },
         _ => return Ok(None),
     };
-    let table_name = variable_tables
-        .get(col_name)
-        .map(String::as_str)
-        .unwrap_or(col_name);
-    let is_edge_table = table_metadata_for(schema, keyspace, table_name).is_some_and(|meta| {
-        meta.extensions
-            .get("graph.type")
-            .is_some_and(|graph_type| graph_type == "edge")
-    });
-    let physical = |field: &str| {
-        value
-            .and_then(|value| value.as_object())
-            .and_then(|map| map.get(field))
-            .and_then(|value| value.as_str())
+    let table_name = match variable_tables.get(col_name) {
+        Some(table) => table.as_str(),
+        None => col_name,
     };
-    let key_hex = if is_edge_table {
-        physical("__ferrosa_key").unwrap_or(hex_id)
-    } else {
-        hex_id
+    let is_edge_table = is_edge_table(schema, keyspace, table_name);
+    let key_hex = match object_str(value, "__ferrosa_key") {
+        Some(physical) if is_edge_table => physical,
+        _ => hex_id,
     };
-    let key_bytes = hex::decode(key_hex)
-        .map_err(|e| GraphError::Internal(format!("invalid hex storage key: {e}")))?;
-    let clustering = if is_edge_table {
-        physical("__ferrosa_clustering")
-            .map(hex::decode)
-            .transpose()
-            .map_err(|e| GraphError::Internal(format!("invalid hex storage clustering: {e}")))?
-            .unwrap_or_default()
-    } else {
-        Vec::new()
+    let key_bytes = decode_storage_hex(key_hex, "key")?;
+    let clustering = match object_str(value, "__ferrosa_clustering") {
+        Some(physical) if is_edge_table => decode_storage_hex(physical, "clustering")?,
+        _ => Vec::new(),
     };
     Ok(Some(MatchedTarget {
         table_name,
@@ -5419,6 +5443,49 @@ fn matched_target<'v>(
         key: DecoratedKey::new(PartitionKey::new(key_bytes)),
         clustering,
     }))
+}
+
+/// A string field of a JSON object binding; `None` for any other shape.
+fn object_str<'a>(value: Option<&'a serde_json::Value>, field: &str) -> Option<&'a str> {
+    let Some(serde_json::Value::Object(map)) = value else {
+        return None;
+    };
+    match map.get(field) {
+        Some(serde_json::Value::String(s)) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+/// Whether `table_name` is a graph edge table (`graph.type = 'edge'`).
+fn is_edge_table(schema: Option<&Schema>, keyspace: &str, table_name: &str) -> bool {
+    let Some(meta) = table_metadata_for(schema, keyspace, table_name) else {
+        return false;
+    };
+    matches!(meta.extensions.get("graph.type"), Some(graph_type) if graph_type == "edge")
+}
+
+/// `hex::FromHexError`'s message, word for word as its `Display` writes it.
+/// Spelled out here so the decode paths extract to Lean without `hex`'s
+/// formatting instance, which the Lean backend cannot synthesize.
+fn hex_error_text(e: &hex::FromHexError) -> String {
+    match e {
+        hex::FromHexError::InvalidHexCharacter { c, index } => {
+            format!("Invalid character {c:?} at position {index}")
+        }
+        hex::FromHexError::OddLength => "Odd number of digits".to_string(),
+        hex::FromHexError::InvalidStringLength => "Invalid string length".to_string(),
+    }
+}
+
+/// Decode a hex storage key or clustering from a binding, failing loud on bad hex.
+fn decode_storage_hex(hex_text: &str, what: &str) -> Result<Vec<u8>> {
+    match hex::decode(hex_text) {
+        Ok(bytes) => Ok(bytes),
+        Err(e) => Err(GraphError::Internal(format!(
+            "invalid hex storage {what}: {}",
+            hex_error_text(&e)
+        ))),
+    }
 }
 
 /// Read the inner expand's WHOLE match set into a spill-backed run before the
@@ -5475,40 +5542,36 @@ fn set_cells(
     row_assignments: &[(&str, serde_json::Value)],
 ) -> Result<Vec<(u16, CellValue)>> {
     let (keyspace, schema) = (statement.keyspace, statement.schema);
-    row_assignments
-        .iter()
-        .filter_map(|(prop, value)| {
-            let Some(column_idx) =
-                regular_column_index_for_property(schema, keyspace, table_name, prop)
-            else {
-                if matches!(
-                    column_kind_for_property(schema, keyspace, table_name, prop),
-                    Some(
-                        ferrosa_schema::metadata::column::ColumnKind::PartitionKey
-                            | ferrosa_schema::metadata::column::ColumnKind::Clustering
-                    )
-                ) {
-                    return None;
-                }
-                return Some(Err(GraphError::Validation(format!(
-                    "execute_set: SET references unknown property '{}' on table '{}.{}'",
-                    prop, keyspace, table_name
-                ))));
-            };
-            let cell = json_value_to_expr(value)
-                .ok_or_else(|| {
-                    GraphError::Validation(format!(
-                        "execute_set: SET {col_name}.{prop} evaluated to {value}, which is \
-                         not a scalar property value"
-                    ))
-                })
-                .and_then(|value_expr| {
-                    encode_property_value_for_table(schema, keyspace, table_name, prop, &value_expr)
-                })
-                .map(|bytes| (column_idx, CellValue::live(bytes, statement.timestamp)));
-            Some(cell)
-        })
-        .collect()
+    let mut cells = Vec::with_capacity(row_assignments.len());
+    for (prop, value) in row_assignments {
+        let Some(column_idx) =
+            regular_column_index_for_property(schema, keyspace, table_name, prop)
+        else {
+            if matches!(
+                column_kind_for_property(schema, keyspace, table_name, prop),
+                Some(
+                    ferrosa_schema::metadata::column::ColumnKind::PartitionKey
+                        | ferrosa_schema::metadata::column::ColumnKind::Clustering
+                )
+            ) {
+                continue;
+            }
+            return Err(GraphError::Validation(format!(
+                "execute_set: SET references unknown property '{}' on table '{}.{}'",
+                prop, keyspace, table_name
+            )));
+        };
+        let Some(value_expr) = json_value_to_expr(value) else {
+            return Err(GraphError::Validation(format!(
+                "execute_set: SET {col_name}.{prop} evaluated to {value}, which is \
+                 not a scalar property value"
+            )));
+        };
+        let bytes =
+            encode_property_value_for_table(schema, keyspace, table_name, prop, &value_expr)?;
+        cells.push((column_idx, CellValue::live(bytes, statement.timestamp)));
+    }
+    Ok(cells)
 }
 
 /// Apply the SET to one row of the (already fully read) match set.
@@ -5738,35 +5801,34 @@ fn remove_cells(
     timestamp: i64,
     local_deletion_time: i32,
 ) -> Result<Vec<(u16, CellValue)>> {
-    props
-        .iter()
-        .map(|prop| {
-            let Some(column_idx) =
-                regular_column_index_for_property(schema, keyspace, table_name, prop)
-            else {
-                if matches!(
-                    column_kind_for_property(schema, keyspace, table_name, prop),
-                    Some(
-                        ferrosa_schema::metadata::column::ColumnKind::PartitionKey
-                            | ferrosa_schema::metadata::column::ColumnKind::Clustering
-                    )
-                ) {
-                    return Err(GraphError::Validation(format!(
-                        "execute_remove: REMOVE cannot unset key column '{}' on table '{}.{}'",
-                        prop, keyspace, table_name
-                    )));
-                }
+    let mut cells = Vec::with_capacity(props.len());
+    for prop in props {
+        let Some(column_idx) =
+            regular_column_index_for_property(schema, keyspace, table_name, prop)
+        else {
+            if matches!(
+                column_kind_for_property(schema, keyspace, table_name, prop),
+                Some(
+                    ferrosa_schema::metadata::column::ColumnKind::PartitionKey
+                        | ferrosa_schema::metadata::column::ColumnKind::Clustering
+                )
+            ) {
                 return Err(GraphError::Validation(format!(
-                    "execute_remove: REMOVE references unknown property '{}' on table '{}.{}'",
+                    "execute_remove: REMOVE cannot unset key column '{}' on table '{}.{}'",
                     prop, keyspace, table_name
                 )));
-            };
-            Ok((
-                column_idx,
-                CellValue::tombstone(timestamp, local_deletion_time),
-            ))
-        })
-        .collect()
+            }
+            return Err(GraphError::Validation(format!(
+                "execute_remove: REMOVE references unknown property '{}' on table '{}.{}'",
+                prop, keyspace, table_name
+            )));
+        };
+        cells.push((
+            column_idx,
+            CellValue::tombstone(timestamp, local_deletion_time),
+        ));
+    }
+    Ok(cells)
 }
 
 /// Execute a REMOVE plan: read the inner expand's whole match set, then for
@@ -7206,13 +7268,18 @@ pub(crate) fn extract_neighbor_id_for_direction(
 /// deletion with no surviving cells and no live static row). Such
 /// partitions represent deleted vertices that have not yet been purged
 /// by compaction and must be skipped during graph traversal.
+/// Whether the partition has no static row, or one with no cells.
+fn static_row_is_empty(partition: &ferrosa_sstable::types::Partition) -> bool {
+    match &partition.static_row {
+        Some(static_row) => static_row.cells.is_empty(),
+        None => true,
+    }
+}
+
 fn is_partition_dead(partition: &ferrosa_sstable::types::Partition) -> bool {
     // Partition-level deletion with no surviving rows.
     if !partition.deletion.is_live() && partition.rows.is_empty() {
-        return partition
-            .static_row
-            .as_ref()
-            .is_none_or(|sr| sr.cells.is_empty());
+        return static_row_is_empty(partition);
     }
 
     // If there are no rows at all and no static row, the partition is empty
@@ -7223,20 +7290,14 @@ fn is_partition_dead(partition: &ferrosa_sstable::types::Partition) -> bool {
 
     // Check whether every row is tombstoned: the row has a deletion marker
     // and no surviving cells.
-    let all_rows_dead = partition
-        .rows
-        .iter()
-        .all(|row| !row.deletion.is_live() && row.cells.is_empty());
-
-    if !all_rows_dead {
-        return false;
+    for row in &partition.rows {
+        if row.deletion.is_live() || !row.cells.is_empty() {
+            return false;
+        }
     }
 
     // If all rows are dead, also check the static row.
-    partition
-        .static_row
-        .as_ref()
-        .is_none_or(|sr| sr.cells.is_empty())
+    static_row_is_empty(partition)
 }
 
 /// Check whether the query has exceeded its timeout.
@@ -9529,6 +9590,23 @@ mod tests {
         assert_eq!(rows[0][0], serde_json::Value::String("Charlie".into()));
         assert_eq!(rows[1][0], serde_json::Value::String("Bob".into()));
         assert_eq!(rows[2][0], serde_json::Value::String("Alice".into()));
+    }
+
+    #[test]
+    fn hex_error_text_matches_hex_display_for_every_variant() {
+        let errors = [
+            hex::FromHexError::InvalidHexCharacter { c: 'g', index: 3 },
+            hex::FromHexError::OddLength,
+            hex::FromHexError::InvalidStringLength,
+        ];
+        for error in errors {
+            assert_eq!(hex_error_text(&error), error.to_string());
+        }
+        // And the decode path really reports it.
+        let Err(GraphError::Internal(msg)) = decode_storage_hex("abc", "key") else {
+            panic!("odd-length hex must fail loud");
+        };
+        assert_eq!(msg, "invalid hex storage key: Odd number of digits");
     }
 
     #[test]

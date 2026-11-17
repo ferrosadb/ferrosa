@@ -683,29 +683,39 @@ pub fn partition_to_json(
     let mut map = serde_json::Map::new();
     map.insert("_id".to_string(), Value::String(hex_id.to_string()));
 
-    // Collect cell values, keyed by column name from schema metadata.
-    let all_rows = partition
-        .static_row
-        .iter()
-        .chain(partition.rows.iter().map(|row| &**row));
-    for row in all_rows {
-        for (col_idx, cell) in &row.cells {
-            let key = column_names
-                .get(*col_idx as usize)
-                .cloned()
-                .unwrap_or_else(|| format!("col_{col_idx}"));
-            let val = match &cell.value {
-                Some(bytes) => match std::str::from_utf8(bytes) {
-                    Ok(s) => Value::String(s.to_string()),
-                    Err(_) => Value::String(hex::encode(bytes)),
-                },
-                None => Value::Null,
-            };
-            map.insert(key, val);
-        }
+    // Collect cell values, keyed by column name from schema metadata; a
+    // regular row's cell overwrites a static cell of the same column.
+    if let Some(static_row) = &partition.static_row {
+        insert_row_cells(&mut map, static_row, column_names);
+    }
+    for row in &partition.rows {
+        insert_row_cells(&mut map, row, column_names);
     }
 
     Value::Object(map)
+}
+
+/// Insert one row's cells into a vertex's JSON map, keyed by column name
+/// (`col_<n>` for a column the schema does not name).
+fn insert_row_cells(
+    map: &mut serde_json::Map<String, Value>,
+    row: &ferrosa_sstable::types::Row,
+    column_names: &[String],
+) {
+    for (col_idx, cell) in &row.cells {
+        let key = match column_names.get(*col_idx as usize) {
+            Some(name) => name.clone(),
+            None => format!("col_{col_idx}"),
+        };
+        let val = match &cell.value {
+            Some(bytes) => match std::str::from_utf8(bytes) {
+                Ok(s) => Value::String(s.to_string()),
+                Err(_) => Value::String(hex::encode(bytes)),
+            },
+            None => Value::Null,
+        };
+        map.insert(key, val);
+    }
 }
 
 #[cfg(test)]

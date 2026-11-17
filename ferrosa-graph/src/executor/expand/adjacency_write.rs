@@ -15,9 +15,10 @@ pub(super) fn explicit_adjacency_for(
     row: &Row,
     timestamp: i64,
 ) -> Vec<Mutation> {
-    schema.map_or_else(Vec::new, |schema| {
-        derive_adjacency_row_mutations(schema, table_id, key, row, timestamp)
-    })
+    match schema {
+        Some(schema) => derive_adjacency_row_mutations(schema, table_id, key, row, timestamp),
+        None => Vec::new(),
+    }
 }
 
 /// Write the entries [`explicit_adjacency_for`] derived, once their base row

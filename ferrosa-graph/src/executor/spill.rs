@@ -304,7 +304,7 @@ impl OrderKeys {
                 row.len()
             )));
         }
-        if let Some(next) = self.next_arrival.as_mut() {
+        if let Some(next) = &mut self.next_arrival {
             row.push(serde_json::Value::from(*next));
             *next += 1;
             return Ok(row);
@@ -476,9 +476,10 @@ impl SpillSortSink {
     fn push_keyed(&mut self, row: RowVals, keys: Vec<serde_json::Value>) -> Result<()> {
         let keyed = self.keys.attach_keys(row, keys)?;
         self.rows_pushed += 1;
-        self.sorter
-            .push(GraphRow(keyed))
-            .map_err(|e| GraphError::Internal(format!("ORDER BY spill: {e}")))
+        match self.sorter.push(GraphRow(keyed)) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(GraphError::Internal(format!("ORDER BY spill: {e}"))),
+        }
     }
 
     /// Finish the sort and stream the merged output WITHOUT re-materializing
@@ -770,7 +771,6 @@ pub(crate) async fn spill_run(
 /// outer row — and that is replayed once, in the order it was written.
 ///
 /// See [`spill_run`] for the single-producer form and the memory contract.
-#[derive(Debug)]
 pub(crate) struct RowRun {
     acc: RowAcc,
 }

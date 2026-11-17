@@ -57,22 +57,58 @@ const CANDIDATE: u8 = 0;
 const PROTECTOR: u8 = 1;
 
 /// One record of the protect sort-merge.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct EntryRecord {
     /// The adjacency entry: keyspace, table, partition key, clustering.
     keyspace: String,
     table: String,
     key: Vec<u8>,
     clustering: Vec<u8>,
-    /// The physical edge row it was derived from: edge table, partition key,
-    /// clustering.
-    source: (String, Vec<u8>, Vec<u8>),
+    /// The physical edge row it was derived from.
+    source: EdgeSource,
     /// [`CANDIDATE`] or [`PROTECTOR`].
     kind: u8,
     /// Scan order. Among the protectors of one entry the highest wins.
     seq: u64,
     /// A protector's serialized live entry mutation; empty for a candidate.
     entry: Vec<u8>,
+}
+
+/// The physical edge row an adjacency entry was derived from.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct EdgeSource {
+    edge_table: String,
+    key: Vec<u8>,
+    clustering: Vec<u8>,
+}
+
+impl EdgeSource {
+    fn empty() -> Self {
+        Self {
+            edge_table: String::new(),
+            key: Vec::new(),
+            clustering: Vec::new(),
+        }
+    }
+
+    /// Edge table, then partition key, then clustering.
+    fn compare(&self, other: &EdgeSource) -> Ordering {
+        let edge_table = self.edge_table.cmp(&other.edge_table);
+        if edge_table != Ordering::Equal {
+            return edge_table;
+        }
+        let key = self.key.cmp(&other.key);
+        if key != Ordering::Equal {
+            return key;
+        }
+        self.clustering.cmp(&other.clustering)
+    }
+
+    fn same_row(&self, other: &EdgeSource) -> bool {
+        self.edge_table == other.edge_table
+            && self.key == other.key
+            && self.clustering == other.clustering
+    }
 }
 
 impl EntryRecord {
@@ -91,25 +127,45 @@ impl SpillRow for EntryRecord {
             + self.table.capacity()
             + self.key.capacity()
             + self.clustering.capacity()
-            + self.source.0.capacity()
-            + self.source.1.capacity()
-            + self.source.2.capacity()
+            + self.source.edge_table.capacity()
+            + self.source.key.capacity()
+            + self.source.clustering.capacity()
             + self.entry.capacity()
     }
 }
 
 /// Entry, then source row, then kind, then scan order: a total order, so the
 /// merge is deterministic whether or not it spilled.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct EntryOrder;
 
 impl SpillOrder<EntryRecord> for EntryOrder {
     fn compare(&self, a: &EntryRecord, b: &EntryRecord) -> Ordering {
-        (&a.keyspace, &a.table, &a.key, &a.clustering)
-            .cmp(&(&b.keyspace, &b.table, &b.key, &b.clustering))
-            .then_with(|| a.source.cmp(&b.source))
-            .then_with(|| a.kind.cmp(&b.kind))
-            .then_with(|| a.seq.cmp(&b.seq))
+        let keyspace = a.keyspace.cmp(&b.keyspace);
+        if keyspace != Ordering::Equal {
+            return keyspace;
+        }
+        let table = a.table.cmp(&b.table);
+        if table != Ordering::Equal {
+            return table;
+        }
+        let key = a.key.cmp(&b.key);
+        if key != Ordering::Equal {
+            return key;
+        }
+        let clustering = a.clustering.cmp(&b.clustering);
+        if clustering != Ordering::Equal {
+            return clustering;
+        }
+        let source = a.source.compare(&b.source);
+        if source != Ordering::Equal {
+            return source;
+        }
+        let kind = a.kind.cmp(&b.kind);
+        if kind != Ordering::Equal {
+            return kind;
+        }
+        a.seq.cmp(&b.seq)
     }
 }
 
@@ -121,6 +177,19 @@ struct DetachSpill {
     sort_dir: Option<ferrosa_storage::TempSortTableReservation>,
     stage: WriteSetStage,
     sorter: ExternalSorter<EntryRecord, EntryOrder>,
+}
+
+/// Reserve one DETACH DELETE spill directory, failing loud if it cannot.
+fn reserve_spill_dir(
+    reserver: &dyn crate::executor::spill::SpillReserver,
+    label: &str,
+) -> Result<ferrosa_storage::TempSortTableReservation> {
+    match reserver.reserve(label) {
+        Ok(reservation) => Ok(reservation),
+        Err(e) => Err(GraphError::Internal(format!(
+            "DETACH DELETE spill setup failed: {e}"
+        ))),
+    }
 }
 
 impl DetachSpill {
@@ -143,13 +212,8 @@ impl DetachSpill {
                 sorter: ExternalSorter::new(unused, EntryOrder, u64::MAX),
             });
         };
-        let reserve = |label: &str| {
-            reserver
-                .reserve(label)
-                .map_err(|e| GraphError::Internal(format!("DETACH DELETE spill setup failed: {e}")))
-        };
-        let stage_dir = reserve("detach-delete-batch")?;
-        let sort_dir = reserve("detach-delete-entries")?;
+        let stage_dir = reserve_spill_dir(reserver.as_ref(), "detach-delete-batch")?;
+        let sort_dir = reserve_spill_dir(reserver.as_ref(), "detach-delete-entries")?;
         Ok(Self {
             stage: WriteSetStage::with_threshold(stage_dir.path(), config.spill_threshold_bytes),
             sorter: ExternalSorter::new(sort_dir.path(), EntryOrder, config.spill_threshold_bytes),
@@ -261,11 +325,11 @@ async fn stage_incident_edges(
                 {
                     continue;
                 }
-                let source = (
-                    edge.name.clone(),
-                    partition.key.key.as_bytes().to_vec(),
-                    row.clustering.clone(),
-                );
+                let source = EdgeSource {
+                    edge_table: edge.name.clone(),
+                    key: partition.key.key.as_bytes().to_vec(),
+                    clustering: row.clustering.clone(),
+                };
                 for entry in
                     derive_adjacency_row_mutations(schema, &table, &partition.key, row, timestamp)
                 {
@@ -320,11 +384,11 @@ async fn record_protectors(
                 if !entries.iter().any(|e| e.key.key.as_bytes() == vertex) {
                     continue;
                 }
-                let source = (
-                    edge.name.clone(),
-                    partition.key.key.as_bytes().to_vec(),
-                    row.clustering.clone(),
-                );
+                let source = EdgeSource {
+                    edge_table: edge.name.clone(),
+                    key: partition.key.key.as_bytes().to_vec(),
+                    clustering: row.clustering.clone(),
+                };
                 for entry in entries {
                     // The record owns its encoded entry: it may outlive this
                     // loop in a sorted run on disk.
@@ -341,7 +405,7 @@ async fn record_protectors(
 
 fn entry_record(
     entry: &Mutation,
-    source: &(String, Vec<u8>, Vec<u8>),
+    source: &EdgeSource,
     kind: u8,
     seq: u64,
     payload: Vec<u8>,
@@ -373,7 +437,7 @@ struct EntryDecision {
     best: Option<EntryRecord>,
     /// Source of the last candidate seen; that edge's own protector record
     /// follows it immediately and does not count.
-    deleted_source: Option<(String, Vec<u8>, Vec<u8>)>,
+    deleted_source: Option<EdgeSource>,
 }
 
 impl EntryDecision {
@@ -384,7 +448,7 @@ impl EntryDecision {
                 table: record.table.clone(),
                 key: record.key.clone(),
                 clustering: record.clustering.clone(),
-                source: (String::new(), Vec::new(), Vec::new()),
+                source: EdgeSource::empty(),
                 kind: CANDIDATE,
                 seq: 0,
                 entry: Vec::new(),
@@ -403,10 +467,16 @@ impl EntryDecision {
             self.deleted_source = Some(record.source);
             return;
         }
-        if self.deleted_source.as_ref() == Some(&record.source) {
-            return;
+        if let Some(deleted) = &self.deleted_source {
+            if deleted.same_row(&record.source) {
+                return;
+            }
         }
-        if self.best.as_ref().is_none_or(|best| record.seq > best.seq) {
+        let newer = match &self.best {
+            Some(best) => record.seq > best.seq,
+            None => true,
+        };
+        if newer {
             self.best = Some(record);
         }
     }
@@ -445,7 +515,7 @@ fn stage_decided_entries(
     let mut current: Option<EntryDecision> = None;
     for record in sorter.finish().map_err(GraphError::Storage)? {
         let record = record.map_err(GraphError::Storage)?;
-        match current.as_mut() {
+        match &mut current {
             Some(decision) if decision.first.same_entry(&record) => decision.observe(record),
             _ => {
                 if let Some(done) = current.replace(EntryDecision::new(record)) {
