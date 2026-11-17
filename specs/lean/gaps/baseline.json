@@ -35,42 +35,42 @@
       "classes": {
         "lean.synthInstanceFailed": 13,
         "lean.unknownIdentifier": 16,
-        "sorry.declaration": 622
+        "sorry.declaration": 619
       },
       "concluded": true,
       "instances": {
         "lean.synthInstanceFailed": [
-          "FerrosaFlight.lean:12077:75",
-          "FerrosaFlight.lean:12088:5",
-          "FerrosaFlight.lean:12098:37",
-          "FerrosaFlight.lean:12108:38",
-          "FerrosaFlight.lean:12118:68",
-          "FerrosaFlight.lean:12998:32",
-          "FerrosaFlight.lean:13414:32",
-          "FerrosaFlight.lean:13478:64",
-          "FerrosaFlight.lean:13498:66",
-          "FerrosaFlight.lean:13507:24",
-          "FerrosaFlight.lean:13516:24",
-          "FerrosaFlight.lean:13602:76",
-          "FerrosaFlight.lean:13612:68"
+          "FerrosaFlight.lean:12054:75",
+          "FerrosaFlight.lean:12065:5",
+          "FerrosaFlight.lean:12075:37",
+          "FerrosaFlight.lean:12085:38",
+          "FerrosaFlight.lean:12095:68",
+          "FerrosaFlight.lean:12975:32",
+          "FerrosaFlight.lean:13392:32",
+          "FerrosaFlight.lean:13456:64",
+          "FerrosaFlight.lean:13476:66",
+          "FerrosaFlight.lean:13485:24",
+          "FerrosaFlight.lean:13494:24",
+          "FerrosaFlight.lean:13580:76",
+          "FerrosaFlight.lean:13590:68"
         ],
         "lean.unknownIdentifier": [
-          "FerrosaFlight.lean:11414:31",
-          "FerrosaFlight.lean:11444:31",
-          "FerrosaFlight.lean:11480:31",
-          "FerrosaFlight.lean:11492:22",
-          "FerrosaFlight.lean:11503:22",
-          "FerrosaFlight.lean:11583:19",
-          "FerrosaFlight.lean:11595:17",
-          "FerrosaFlight.lean:11596:19",
-          "FerrosaFlight.lean:11612:17",
-          "FerrosaFlight.lean:11613:19",
-          "FerrosaFlight.lean:11614:22",
-          "FerrosaFlight.lean:11696:2",
-          "FerrosaFlight.lean:11767:35",
-          "FerrosaFlight.lean:11784:35",
-          "FerrosaFlight.lean:11800:2",
-          "FerrosaFlight.lean:11802:12"
+          "FerrosaFlight.lean:11391:31",
+          "FerrosaFlight.lean:11421:31",
+          "FerrosaFlight.lean:11457:31",
+          "FerrosaFlight.lean:11469:22",
+          "FerrosaFlight.lean:11480:22",
+          "FerrosaFlight.lean:11560:19",
+          "FerrosaFlight.lean:11572:17",
+          "FerrosaFlight.lean:11573:19",
+          "FerrosaFlight.lean:11589:17",
+          "FerrosaFlight.lean:11590:19",
+          "FerrosaFlight.lean:11591:22",
+          "FerrosaFlight.lean:11673:2",
+          "FerrosaFlight.lean:11744:35",
+          "FerrosaFlight.lean:11761:35",
+          "FerrosaFlight.lean:11777:2",
+          "FerrosaFlight.lean:11779:12"
         ]
       },
       "scope": "crate",
@@ -78,16 +78,96 @@
     },
     "ferrosa-graph": {
       "classes": {
-        "crash.Invalid_argument": 1
+        "lean.synthInstanceFailed": 31,
+        "lean.unknownIdentifier": 46,
+        "sorry.declaration": 639
       },
       "concluded": true,
       "instances": {
-        "crash.Invalid_argument": [
-          "ferrosa-graph"
+        "lean.synthInstanceFailed": [
+          "FerrosaGraph.lean:10616:40",
+          "FerrosaGraph.lean:10653:71",
+          "FerrosaGraph.lean:10704:41",
+          "FerrosaGraph.lean:10714:75",
+          "FerrosaGraph.lean:10725:5",
+          "FerrosaGraph.lean:10762:32",
+          "FerrosaGraph.lean:10772:32",
+          "FerrosaGraph.lean:10782:52",
+          "FerrosaGraph.lean:10815:37",
+          "FerrosaGraph.lean:10906:32",
+          "FerrosaGraph.lean:10923:64",
+          "FerrosaGraph.lean:11030:38",
+          "FerrosaGraph.lean:11040:38",
+          "FerrosaGraph.lean:11050:66",
+          "FerrosaGraph.lean:11087:45",
+          "FerrosaGraph.lean:11245:66",
+          "FerrosaGraph.lean:11390:64",
+          "FerrosaGraph.lean:11409:36",
+          "FerrosaGraph.lean:11478:5",
+          "FerrosaGraph.lean:11495:69",
+          "FerrosaGraph.lean:11512:72",
+          "FerrosaGraph.lean:11540:5",
+          "FerrosaGraph.lean:11562:18",
+          "FerrosaGraph.lean:11585:34",
+          "FerrosaGraph.lean:11640:60",
+          "FerrosaGraph.lean:11662:54",
+          "FerrosaGraph.lean:11863:78",
+          "FerrosaGraph.lean:11871:60",
+          "FerrosaGraph.lean:11881:44",
+          "FerrosaGraph.lean:11992:74",
+          "FerrosaGraph.lean:5193:14"
+        ],
+        "lean.unknownIdentifier": [
+          "FerrosaGraph.lean:10065:2",
+          "FerrosaGraph.lean:10127:39",
+          "FerrosaGraph.lean:10144:35",
+          "FerrosaGraph.lean:10161:35",
+          "FerrosaGraph.lean:10177:2",
+          "FerrosaGraph.lean:10179:12",
+          "FerrosaGraph.lean:11076:4",
+          "FerrosaGraph.lean:11291:31",
+          "FerrosaGraph.lean:11898:2",
+          "FerrosaGraph.lean:11906:40",
+          "FerrosaGraph.lean:11914:40",
+          "FerrosaGraph.lean:11922:42",
+          "FerrosaGraph.lean:11933:2",
+          "FerrosaGraph.lean:11943:21",
+          "FerrosaGraph.lean:11943:52",
+          "FerrosaGraph.lean:11954:2",
+          "FerrosaGraph.lean:11954:33",
+          "FerrosaGraph.lean:11965:47",
+          "FerrosaGraph.lean:11967:2",
+          "FerrosaGraph.lean:11967:33",
+          "FerrosaGraph.lean:11979:21",
+          "FerrosaGraph.lean:11981:2",
+          "FerrosaGraph.lean:11983:2",
+          "FerrosaGraph.lean:12001:2",
+          "FerrosaGraph.lean:12009:40",
+          "FerrosaGraph.lean:12017:39",
+          "FerrosaGraph.lean:12025:39",
+          "FerrosaGraph.lean:12033:41",
+          "FerrosaGraph.lean:12042:39",
+          "FerrosaGraph.lean:12050:39",
+          "FerrosaGraph.lean:12058:39",
+          "FerrosaGraph.lean:12067:55",
+          "FerrosaGraph.lean:1496:4",
+          "FerrosaGraph.lean:2485:18",
+          "FerrosaGraph.lean:7101:20",
+          "FerrosaGraph.lean:7495:45",
+          "FerrosaGraph.lean:7505:40",
+          "FerrosaGraph.lean:9783:31",
+          "FerrosaGraph.lean:9784:32",
+          "FerrosaGraph.lean:9813:31",
+          "FerrosaGraph.lean:9814:32",
+          "FerrosaGraph.lean:9849:31",
+          "FerrosaGraph.lean:9850:32",
+          "FerrosaGraph.lean:9952:19",
+          "FerrosaGraph.lean:9965:19",
+          "FerrosaGraph.lean:9982:19"
         ]
       },
       "scope": "crate",
-      "stage": "aeneas-crash"
+      "stage": "aeneas"
     },
     "ferrosa-index": {
       "classes": {
@@ -120,44 +200,44 @@
         "lean.invalidField": 13,
         "lean.synthInstanceFailed": 1,
         "lean.unknownIdentifier": 15,
-        "sorry.declaration": 373
+        "sorry.declaration": 369
       },
       "concluded": true,
       "instances": {
         "lean.invalidField": [
-          "FerrosaJsonb.lean:10071:10",
-          "FerrosaJsonb.lean:10132:34",
-          "FerrosaJsonb.lean:10217:38",
-          "FerrosaJsonb.lean:10226:42",
-          "FerrosaJsonb.lean:10229:42",
-          "FerrosaJsonb.lean:10238:38",
-          "FerrosaJsonb.lean:10253:38",
-          "FerrosaJsonb.lean:10276:42",
-          "FerrosaJsonb.lean:10278:42",
-          "FerrosaJsonb.lean:10281:42",
-          "FerrosaJsonb.lean:10283:42",
-          "FerrosaJsonb.lean:14569:17",
-          "FerrosaJsonb.lean:6489:24"
+          "FerrosaJsonb.lean:10037:10",
+          "FerrosaJsonb.lean:10098:34",
+          "FerrosaJsonb.lean:10183:38",
+          "FerrosaJsonb.lean:10192:42",
+          "FerrosaJsonb.lean:10195:42",
+          "FerrosaJsonb.lean:10204:38",
+          "FerrosaJsonb.lean:10219:38",
+          "FerrosaJsonb.lean:10242:42",
+          "FerrosaJsonb.lean:10244:42",
+          "FerrosaJsonb.lean:10247:42",
+          "FerrosaJsonb.lean:10249:42",
+          "FerrosaJsonb.lean:14529:17",
+          "FerrosaJsonb.lean:6455:24"
         ],
         "lean.synthInstanceFailed": [
-          "FerrosaJsonb.lean:15090:56"
+          "FerrosaJsonb.lean:15050:56"
         ],
         "lean.unknownIdentifier": [
-          "FerrosaJsonb.lean:12172:7",
-          "FerrosaJsonb.lean:12178:5",
+          "FerrosaJsonb.lean:12138:7",
+          "FerrosaJsonb.lean:12144:5",
+          "FerrosaJsonb.lean:12166:7",
+          "FerrosaJsonb.lean:12171:7",
+          "FerrosaJsonb.lean:12175:7",
+          "FerrosaJsonb.lean:12181:7",
           "FerrosaJsonb.lean:12200:7",
-          "FerrosaJsonb.lean:12205:7",
-          "FerrosaJsonb.lean:12209:7",
-          "FerrosaJsonb.lean:12215:7",
-          "FerrosaJsonb.lean:12234:7",
-          "FerrosaJsonb.lean:12406:7",
-          "FerrosaJsonb.lean:16556:2",
-          "FerrosaJsonb.lean:16576:52",
+          "FerrosaJsonb.lean:12372:7",
+          "FerrosaJsonb.lean:16516:2",
+          "FerrosaJsonb.lean:16536:52",
           "FerrosaJsonb.lean:1774:18",
           "FerrosaJsonb.lean:296:18",
-          "FerrosaJsonb.lean:3945:2",
-          "FerrosaJsonb.lean:6255:7",
-          "FerrosaJsonb.lean:6707:7"
+          "FerrosaJsonb.lean:3911:2",
+          "FerrosaJsonb.lean:6221:7",
+          "FerrosaJsonb.lean:6673:7"
         ]
       },
       "scope": "crate",
@@ -166,12 +246,12 @@
     "ferrosa-loadgen": {
       "classes": {
         "lean.invalidField": 1,
-        "sorry.declaration": 396
+        "sorry.declaration": 393
       },
       "concluded": true,
       "instances": {
         "lean.invalidField": [
-          "FerrosaLoadgen.lean:7553:30"
+          "FerrosaLoadgen.lean:7530:30"
         ]
       },
       "scope": "crate",
@@ -182,86 +262,86 @@
         "lean.invalidField": 2,
         "lean.synthInstanceFailed": 55,
         "lean.unknownIdentifier": 16,
-        "sorry.declaration": 893
+        "sorry.declaration": 890
       },
       "concluded": true,
       "instances": {
         "lean.invalidField": [
-          "FerrosaPostgres.lean:10850:26",
-          "FerrosaPostgres.lean:10885:27"
+          "FerrosaPostgres.lean:10794:26",
+          "FerrosaPostgres.lean:10829:27"
         ],
         "lean.synthInstanceFailed": [
-          "FerrosaPostgres.lean:14952:40",
-          "FerrosaPostgres.lean:15194:37",
-          "FerrosaPostgres.lean:15265:37",
-          "FerrosaPostgres.lean:15297:33",
-          "FerrosaPostgres.lean:15320:5",
-          "FerrosaPostgres.lean:15330:37",
-          "FerrosaPostgres.lean:15340:37",
-          "FerrosaPostgres.lean:15375:37",
-          "FerrosaPostgres.lean:15385:38",
-          "FerrosaPostgres.lean:15395:38",
-          "FerrosaPostgres.lean:15464:32",
-          "FerrosaPostgres.lean:15474:32",
-          "FerrosaPostgres.lean:15507:66",
-          "FerrosaPostgres.lean:15517:68",
-          "FerrosaPostgres.lean:15527:60",
-          "FerrosaPostgres.lean:15601:36",
-          "FerrosaPostgres.lean:15630:37",
-          "FerrosaPostgres.lean:15741:68",
-          "FerrosaPostgres.lean:15809:61",
-          "FerrosaPostgres.lean:15964:66",
-          "FerrosaPostgres.lean:16004:68",
-          "FerrosaPostgres.lean:16172:32",
-          "FerrosaPostgres.lean:16314:32",
-          "FerrosaPostgres.lean:16469:37",
-          "FerrosaPostgres.lean:16479:37",
-          "FerrosaPostgres.lean:16496:39",
-          "FerrosaPostgres.lean:16513:39",
-          "FerrosaPostgres.lean:16564:64",
-          "FerrosaPostgres.lean:16574:62",
-          "FerrosaPostgres.lean:16647:38",
-          "FerrosaPostgres.lean:16664:68",
-          "FerrosaPostgres.lean:16674:74",
-          "FerrosaPostgres.lean:16684:78",
-          "FerrosaPostgres.lean:16694:64",
-          "FerrosaPostgres.lean:16704:66",
-          "FerrosaPostgres.lean:16714:63",
-          "FerrosaPostgres.lean:16724:65",
-          "FerrosaPostgres.lean:16768:44",
-          "FerrosaPostgres.lean:16778:61",
-          "FerrosaPostgres.lean:18181:31",
-          "FerrosaPostgres.lean:18190:31",
-          "FerrosaPostgres.lean:18199:31",
-          "FerrosaPostgres.lean:18220:32",
-          "FerrosaPostgres.lean:18230:32",
-          "FerrosaPostgres.lean:18239:32",
-          "FerrosaPostgres.lean:18249:32",
-          "FerrosaPostgres.lean:18258:32",
-          "FerrosaPostgres.lean:18268:32",
-          "FerrosaPostgres.lean:18277:29",
-          "FerrosaPostgres.lean:18286:29",
-          "FerrosaPostgres.lean:18295:32",
-          "FerrosaPostgres.lean:18305:32",
-          "FerrosaPostgres.lean:18314:32",
-          "FerrosaPostgres.lean:18324:32",
+          "FerrosaPostgres.lean:14896:40",
+          "FerrosaPostgres.lean:15138:37",
+          "FerrosaPostgres.lean:15209:37",
+          "FerrosaPostgres.lean:15241:33",
+          "FerrosaPostgres.lean:15264:5",
+          "FerrosaPostgres.lean:15274:37",
+          "FerrosaPostgres.lean:15284:37",
+          "FerrosaPostgres.lean:15319:37",
+          "FerrosaPostgres.lean:15329:38",
+          "FerrosaPostgres.lean:15339:38",
+          "FerrosaPostgres.lean:15408:32",
+          "FerrosaPostgres.lean:15418:32",
+          "FerrosaPostgres.lean:15451:66",
+          "FerrosaPostgres.lean:15461:68",
+          "FerrosaPostgres.lean:15471:60",
+          "FerrosaPostgres.lean:15545:36",
+          "FerrosaPostgres.lean:15574:37",
+          "FerrosaPostgres.lean:15685:68",
+          "FerrosaPostgres.lean:15753:61",
+          "FerrosaPostgres.lean:15908:66",
+          "FerrosaPostgres.lean:15948:68",
+          "FerrosaPostgres.lean:16117:32",
+          "FerrosaPostgres.lean:16259:32",
+          "FerrosaPostgres.lean:16414:37",
+          "FerrosaPostgres.lean:16424:37",
+          "FerrosaPostgres.lean:16441:39",
+          "FerrosaPostgres.lean:16458:39",
+          "FerrosaPostgres.lean:16509:64",
+          "FerrosaPostgres.lean:16519:62",
+          "FerrosaPostgres.lean:16592:38",
+          "FerrosaPostgres.lean:16609:68",
+          "FerrosaPostgres.lean:16619:74",
+          "FerrosaPostgres.lean:16629:78",
+          "FerrosaPostgres.lean:16639:64",
+          "FerrosaPostgres.lean:16649:66",
+          "FerrosaPostgres.lean:16659:63",
+          "FerrosaPostgres.lean:16669:65",
+          "FerrosaPostgres.lean:16713:44",
+          "FerrosaPostgres.lean:16723:61",
+          "FerrosaPostgres.lean:18126:31",
+          "FerrosaPostgres.lean:18135:31",
+          "FerrosaPostgres.lean:18144:31",
+          "FerrosaPostgres.lean:18165:32",
+          "FerrosaPostgres.lean:18175:32",
+          "FerrosaPostgres.lean:18184:32",
+          "FerrosaPostgres.lean:18194:32",
+          "FerrosaPostgres.lean:18203:32",
+          "FerrosaPostgres.lean:18213:32",
+          "FerrosaPostgres.lean:18222:29",
+          "FerrosaPostgres.lean:18231:29",
+          "FerrosaPostgres.lean:18240:32",
+          "FerrosaPostgres.lean:18250:32",
+          "FerrosaPostgres.lean:18259:32",
+          "FerrosaPostgres.lean:18269:32",
           "FerrosaPostgres.lean:8242:63"
         ],
         "lean.unknownIdentifier": [
-          "FerrosaPostgres.lean:14535:31",
-          "FerrosaPostgres.lean:14536:32",
-          "FerrosaPostgres.lean:14565:31",
-          "FerrosaPostgres.lean:14566:32",
-          "FerrosaPostgres.lean:14601:31",
-          "FerrosaPostgres.lean:14602:32",
-          "FerrosaPostgres.lean:14704:19",
-          "FerrosaPostgres.lean:14717:19",
-          "FerrosaPostgres.lean:14734:19",
-          "FerrosaPostgres.lean:14817:2",
-          "FerrosaPostgres.lean:14888:35",
-          "FerrosaPostgres.lean:14905:35",
-          "FerrosaPostgres.lean:14921:2",
-          "FerrosaPostgres.lean:14923:12",
+          "FerrosaPostgres.lean:14479:31",
+          "FerrosaPostgres.lean:14480:32",
+          "FerrosaPostgres.lean:14509:31",
+          "FerrosaPostgres.lean:14510:32",
+          "FerrosaPostgres.lean:14545:31",
+          "FerrosaPostgres.lean:14546:32",
+          "FerrosaPostgres.lean:14648:19",
+          "FerrosaPostgres.lean:14661:19",
+          "FerrosaPostgres.lean:14678:19",
+          "FerrosaPostgres.lean:14761:2",
+          "FerrosaPostgres.lean:14832:35",
+          "FerrosaPostgres.lean:14849:35",
+          "FerrosaPostgres.lean:14865:2",
+          "FerrosaPostgres.lean:14867:12",
           "FerrosaPostgres.lean:3489:18",
           "FerrosaPostgres.lean:6122:4"
         ]
@@ -351,7 +431,7 @@
     "ferrosa-sched": {
       "classes": {
         "lean.unknownIdentifier": 2,
-        "sorry.declaration": 130
+        "sorry.declaration": 126
       },
       "concluded": true,
       "instances": {
@@ -366,27 +446,27 @@
     "ferrosa-session": {
       "classes": {
         "lean.unknownIdentifier": 16,
-        "sorry.declaration": 74
+        "sorry.declaration": 73
       },
       "concluded": true,
       "instances": {
         "lean.unknownIdentifier": [
-          "FerrosaSession.lean:1438:31",
-          "FerrosaSession.lean:1468:31",
-          "FerrosaSession.lean:1504:31",
-          "FerrosaSession.lean:1516:22",
-          "FerrosaSession.lean:1527:22",
-          "FerrosaSession.lean:1607:19",
-          "FerrosaSession.lean:1619:17",
-          "FerrosaSession.lean:1620:19",
-          "FerrosaSession.lean:1636:17",
-          "FerrosaSession.lean:1637:19",
-          "FerrosaSession.lean:1638:22",
-          "FerrosaSession.lean:1720:2",
-          "FerrosaSession.lean:1791:35",
-          "FerrosaSession.lean:1808:35",
-          "FerrosaSession.lean:1824:2",
-          "FerrosaSession.lean:1826:12"
+          "FerrosaSession.lean:1431:31",
+          "FerrosaSession.lean:1461:31",
+          "FerrosaSession.lean:1497:31",
+          "FerrosaSession.lean:1509:22",
+          "FerrosaSession.lean:1520:22",
+          "FerrosaSession.lean:1600:19",
+          "FerrosaSession.lean:1612:17",
+          "FerrosaSession.lean:1613:19",
+          "FerrosaSession.lean:1629:17",
+          "FerrosaSession.lean:1630:19",
+          "FerrosaSession.lean:1631:22",
+          "FerrosaSession.lean:1713:2",
+          "FerrosaSession.lean:1784:35",
+          "FerrosaSession.lean:1801:35",
+          "FerrosaSession.lean:1817:2",
+          "FerrosaSession.lean:1819:12"
         ]
       },
       "scope": "crate",
@@ -497,12 +577,12 @@
         "lean.invalidField": 1,
         "lean.synthInstanceFailed": 3,
         "lean.unknownIdentifier": 79,
-        "sorry.declaration": 477
+        "sorry.declaration": 473
       },
       "concluded": true,
       "instances": {
         "lean.invalidField": [
-          "FerrosaSparql.lean:5332:34"
+          "FerrosaSparql.lean:5286:34"
         ],
         "lean.synthInstanceFailed": [
           "FerrosaSparql.lean:2959:40",
@@ -510,85 +590,85 @@
           "FerrosaSparql.lean:3042:14"
         ],
         "lean.unknownIdentifier": [
-          "FerrosaSparql.lean:4570:20",
-          "FerrosaSparql.lean:4927:45",
-          "FerrosaSparql.lean:4937:40",
-          "FerrosaSparql.lean:7260:45",
-          "FerrosaSparql.lean:8026:2",
-          "FerrosaSparql.lean:8039:2",
-          "FerrosaSparql.lean:8047:41",
-          "FerrosaSparql.lean:8061:2",
-          "FerrosaSparql.lean:8069:39",
-          "FerrosaSparql.lean:8083:2",
-          "FerrosaSparql.lean:8091:40",
-          "FerrosaSparql.lean:8105:2",
-          "FerrosaSparql.lean:8115:2",
-          "FerrosaSparql.lean:8130:2",
-          "FerrosaSparql.lean:8130:51",
-          "FerrosaSparql.lean:8141:2",
-          "FerrosaSparql.lean:8141:33",
-          "FerrosaSparql.lean:8157:21",
-          "FerrosaSparql.lean:8158:2",
-          "FerrosaSparql.lean:8158:52",
-          "FerrosaSparql.lean:8168:21",
-          "FerrosaSparql.lean:8169:2",
-          "FerrosaSparql.lean:8169:34",
-          "FerrosaSparql.lean:8241:2",
-          "FerrosaSparql.lean:8252:2",
-          "FerrosaSparql.lean:8264:2",
-          "FerrosaSparql.lean:8276:2",
-          "FerrosaSparql.lean:8288:25",
-          "FerrosaSparql.lean:8289:19",
-          "FerrosaSparql.lean:8300:25",
-          "FerrosaSparql.lean:8301:19",
-          "FerrosaSparql.lean:8312:2",
-          "FerrosaSparql.lean:8313:2",
-          "FerrosaSparql.lean:8324:2",
-          "FerrosaSparql.lean:8325:2",
-          "FerrosaSparql.lean:8336:2",
-          "FerrosaSparql.lean:8337:2",
-          "FerrosaSparql.lean:8390:2",
-          "FerrosaSparql.lean:8401:40",
-          "FerrosaSparql.lean:8426:2",
-          "FerrosaSparql.lean:8437:38",
-          "FerrosaSparql.lean:8462:2",
-          "FerrosaSparql.lean:8473:39",
-          "FerrosaSparql.lean:8498:2",
-          "FerrosaSparql.lean:8509:39",
-          "FerrosaSparql.lean:8534:2",
-          "FerrosaSparql.lean:8546:55",
-          "FerrosaSparql.lean:8572:2",
-          "FerrosaSparql.lean:8572:48",
-          "FerrosaSparql.lean:8586:34",
-          "FerrosaSparql.lean:8586:4",
-          "FerrosaSparql.lean:8612:2",
-          "FerrosaSparql.lean:8612:48",
-          "FerrosaSparql.lean:8625:2",
-          "FerrosaSparql.lean:8625:32",
-          "FerrosaSparql.lean:8650:2",
-          "FerrosaSparql.lean:8650:48",
-          "FerrosaSparql.lean:8664:2",
-          "FerrosaSparql.lean:8664:32",
-          "FerrosaSparql.lean:8691:19",
-          "FerrosaSparql.lean:8692:2",
-          "FerrosaSparql.lean:8692:48",
-          "FerrosaSparql.lean:8707:53",
-          "FerrosaSparql.lean:8708:23",
-          "FerrosaSparql.lean:8708:53",
-          "FerrosaSparql.lean:8735:2",
-          "FerrosaSparql.lean:8735:48",
-          "FerrosaSparql.lean:8748:2",
-          "FerrosaSparql.lean:8748:32",
-          "FerrosaSparql.lean:8774:2",
-          "FerrosaSparql.lean:8774:48",
-          "FerrosaSparql.lean:8787:2",
-          "FerrosaSparql.lean:8787:32",
-          "FerrosaSparql.lean:8807:25",
-          "FerrosaSparql.lean:8825:46",
-          "FerrosaSparql.lean:8928:45",
-          "FerrosaSparql.lean:8941:2",
-          "FerrosaSparql.lean:8951:2",
-          "FerrosaSparql.lean:9129:45"
+          "FerrosaSparql.lean:4524:20",
+          "FerrosaSparql.lean:4881:45",
+          "FerrosaSparql.lean:4891:40",
+          "FerrosaSparql.lean:7215:45",
+          "FerrosaSparql.lean:7981:2",
+          "FerrosaSparql.lean:7994:2",
+          "FerrosaSparql.lean:8002:41",
+          "FerrosaSparql.lean:8016:2",
+          "FerrosaSparql.lean:8024:39",
+          "FerrosaSparql.lean:8038:2",
+          "FerrosaSparql.lean:8046:40",
+          "FerrosaSparql.lean:8060:2",
+          "FerrosaSparql.lean:8070:2",
+          "FerrosaSparql.lean:8085:2",
+          "FerrosaSparql.lean:8085:51",
+          "FerrosaSparql.lean:8096:2",
+          "FerrosaSparql.lean:8096:33",
+          "FerrosaSparql.lean:8112:21",
+          "FerrosaSparql.lean:8113:2",
+          "FerrosaSparql.lean:8113:52",
+          "FerrosaSparql.lean:8123:21",
+          "FerrosaSparql.lean:8124:2",
+          "FerrosaSparql.lean:8124:34",
+          "FerrosaSparql.lean:8196:2",
+          "FerrosaSparql.lean:8207:2",
+          "FerrosaSparql.lean:8219:2",
+          "FerrosaSparql.lean:8231:2",
+          "FerrosaSparql.lean:8243:25",
+          "FerrosaSparql.lean:8244:19",
+          "FerrosaSparql.lean:8255:25",
+          "FerrosaSparql.lean:8256:19",
+          "FerrosaSparql.lean:8267:2",
+          "FerrosaSparql.lean:8268:2",
+          "FerrosaSparql.lean:8279:2",
+          "FerrosaSparql.lean:8280:2",
+          "FerrosaSparql.lean:8291:2",
+          "FerrosaSparql.lean:8292:2",
+          "FerrosaSparql.lean:8345:2",
+          "FerrosaSparql.lean:8356:40",
+          "FerrosaSparql.lean:8381:2",
+          "FerrosaSparql.lean:8392:38",
+          "FerrosaSparql.lean:8417:2",
+          "FerrosaSparql.lean:8428:39",
+          "FerrosaSparql.lean:8453:2",
+          "FerrosaSparql.lean:8464:39",
+          "FerrosaSparql.lean:8489:2",
+          "FerrosaSparql.lean:8501:55",
+          "FerrosaSparql.lean:8527:2",
+          "FerrosaSparql.lean:8527:48",
+          "FerrosaSparql.lean:8541:34",
+          "FerrosaSparql.lean:8541:4",
+          "FerrosaSparql.lean:8567:2",
+          "FerrosaSparql.lean:8567:48",
+          "FerrosaSparql.lean:8580:2",
+          "FerrosaSparql.lean:8580:32",
+          "FerrosaSparql.lean:8605:2",
+          "FerrosaSparql.lean:8605:48",
+          "FerrosaSparql.lean:8619:2",
+          "FerrosaSparql.lean:8619:32",
+          "FerrosaSparql.lean:8646:19",
+          "FerrosaSparql.lean:8647:2",
+          "FerrosaSparql.lean:8647:48",
+          "FerrosaSparql.lean:8662:53",
+          "FerrosaSparql.lean:8663:23",
+          "FerrosaSparql.lean:8663:53",
+          "FerrosaSparql.lean:8690:2",
+          "FerrosaSparql.lean:8690:48",
+          "FerrosaSparql.lean:8703:2",
+          "FerrosaSparql.lean:8703:32",
+          "FerrosaSparql.lean:8729:2",
+          "FerrosaSparql.lean:8729:48",
+          "FerrosaSparql.lean:8742:2",
+          "FerrosaSparql.lean:8742:32",
+          "FerrosaSparql.lean:8762:25",
+          "FerrosaSparql.lean:8780:46",
+          "FerrosaSparql.lean:8883:45",
+          "FerrosaSparql.lean:8896:2",
+          "FerrosaSparql.lean:8906:2",
+          "FerrosaSparql.lean:9084:45"
         ]
       },
       "scope": "crate",
@@ -596,103 +676,496 @@
     },
     "ferrosa-sql": {
       "classes": {
-        "crash.Not_found": 1
+        "lean.unknownIdentifier": 89,
+        "sorry.declaration": 626
       },
       "concluded": true,
       "instances": {
-        "crash.Not_found": [
-          "ferrosa-sql"
+        "lean.unknownIdentifier": [
+          "FerrosaSql.lean:10015:2",
+          "FerrosaSql.lean:2792:18",
+          "FerrosaSql.lean:6828:2",
+          "FerrosaSql.lean:6842:2",
+          "FerrosaSql.lean:7130:2",
+          "FerrosaSql.lean:7141:2",
+          "FerrosaSql.lean:7377:2",
+          "FerrosaSql.lean:7391:2",
+          "FerrosaSql.lean:7414:2",
+          "FerrosaSql.lean:7425:2",
+          "FerrosaSql.lean:7819:2",
+          "FerrosaSql.lean:7833:2",
+          "FerrosaSql.lean:7855:2",
+          "FerrosaSql.lean:7866:2",
+          "FerrosaSql.lean:7952:20",
+          "FerrosaSql.lean:7961:31",
+          "FerrosaSql.lean:8451:2",
+          "FerrosaSql.lean:8465:2",
+          "FerrosaSql.lean:8487:2",
+          "FerrosaSql.lean:8497:2",
+          "FerrosaSql.lean:9295:2",
+          "FerrosaSql.lean:9296:2",
+          "FerrosaSql.lean:9312:32",
+          "FerrosaSql.lean:9313:2",
+          "FerrosaSql.lean:9338:33",
+          "FerrosaSql.lean:9339:34",
+          "FerrosaSql.lean:9352:33",
+          "FerrosaSql.lean:9353:2",
+          "FerrosaSql.lean:9368:2",
+          "FerrosaSql.lean:9389:2",
+          "FerrosaSql.lean:9400:2",
+          "FerrosaSql.lean:9415:2",
+          "FerrosaSql.lean:9423:41",
+          "FerrosaSql.lean:9437:2",
+          "FerrosaSql.lean:9445:40",
+          "FerrosaSql.lean:9459:2",
+          "FerrosaSql.lean:9467:40",
+          "FerrosaSql.lean:9481:2",
+          "FerrosaSql.lean:9489:40",
+          "FerrosaSql.lean:9503:2",
+          "FerrosaSql.lean:9511:40",
+          "FerrosaSql.lean:9525:2",
+          "FerrosaSql.lean:9535:2",
+          "FerrosaSql.lean:9550:2",
+          "FerrosaSql.lean:9550:51",
+          "FerrosaSql.lean:9561:21",
+          "FerrosaSql.lean:9561:52",
+          "FerrosaSql.lean:9577:2",
+          "FerrosaSql.lean:9577:51",
+          "FerrosaSql.lean:9588:2",
+          "FerrosaSql.lean:9588:33",
+          "FerrosaSql.lean:9604:2",
+          "FerrosaSql.lean:9614:2",
+          "FerrosaSql.lean:9629:2",
+          "FerrosaSql.lean:9629:51",
+          "FerrosaSql.lean:9639:2",
+          "FerrosaSql.lean:9639:33",
+          "FerrosaSql.lean:9654:2",
+          "FerrosaSql.lean:9654:51",
+          "FerrosaSql.lean:9665:26",
+          "FerrosaSql.lean:9666:2",
+          "FerrosaSql.lean:9738:2",
+          "FerrosaSql.lean:9749:2",
+          "FerrosaSql.lean:9761:2",
+          "FerrosaSql.lean:9773:2",
+          "FerrosaSql.lean:9785:25",
+          "FerrosaSql.lean:9786:22",
+          "FerrosaSql.lean:9797:25",
+          "FerrosaSql.lean:9798:19",
+          "FerrosaSql.lean:9809:25",
+          "FerrosaSql.lean:9810:19",
+          "FerrosaSql.lean:9821:52",
+          "FerrosaSql.lean:9822:35",
+          "FerrosaSql.lean:9834:2",
+          "FerrosaSql.lean:9835:2",
+          "FerrosaSql.lean:9846:2",
+          "FerrosaSql.lean:9847:2",
+          "FerrosaSql.lean:9858:2",
+          "FerrosaSql.lean:9859:2",
+          "FerrosaSql.lean:9870:28",
+          "FerrosaSql.lean:9871:38",
+          "FerrosaSql.lean:9882:2",
+          "FerrosaSql.lean:9883:2",
+          "FerrosaSql.lean:9907:2",
+          "FerrosaSql.lean:9918:40",
+          "FerrosaSql.lean:9943:2",
+          "FerrosaSql.lean:9954:39",
+          "FerrosaSql.lean:9979:2",
+          "FerrosaSql.lean:9990:39"
         ]
       },
       "scope": "crate",
-      "stage": "aeneas-crash"
+      "stage": "aeneas"
     },
     "ferrosa-sstable": {
       "classes": {
-        "crash.Failure": 1
+        "crash.Failure": 2,
+        "lean.synthInstanceFailed": 26,
+        "lean.unknownIdentifier": 10,
+        "sorry.declaration": 838
       },
       "concluded": true,
       "instances": {
         "crash.Failure": [
-          "ferrosa-sstable"
-        ]
+          "dio_align:ferrosa-sstable",
+          "writer:ferrosa-sstable"
+        ],
+        "lean.synthInstanceFailed": [
+          "compression:FerrosaSstable.lean:161:33",
+          "direct:FerrosaSstable.lean:1769:23",
+          "direct:FerrosaSstable.lean:1805:46",
+          "io:FerrosaSstable.lean:975:36",
+          "partition_index:FerrosaSstable.lean:118:36",
+          "pump:FerrosaSstable.lean:1114:36",
+          "pump:FerrosaSstable.lean:2439:14",
+          "pump:FerrosaSstable.lean:2482:23",
+          "pump:FerrosaSstable.lean:2518:46",
+          "pump:FerrosaSstable.lean:2561:14",
+          "pump:FerrosaSstable.lean:2576:5",
+          "pump:FerrosaSstable.lean:2596:61",
+          "pump:FerrosaSstable.lean:2604:63",
+          "reader:FerrosaSstable.lean:960:36",
+          "reader:FerrosaSstable.lean:2767:32",
+          "reader:FerrosaSstable.lean:2783:78",
+          "reader:FerrosaSstable.lean:2799:32",
+          "reader:FerrosaSstable.lean:2815:32",
+          "reader:FerrosaSstable.lean:2937:29",
+          "reader:FerrosaSstable.lean:2958:29",
+          "row_index:FerrosaSstable.lean:177:36",
+          "scan:FerrosaSstable.lean:273:36",
+          "scan:FerrosaSstable.lean:282:33",
+          "toc:FerrosaSstable.lean:442:63",
+          "trie:FerrosaSstable.lean:499:36",
+          "varint:FerrosaSstable.lean:126:36"
+        ],
+        "lean.unknownIdentifier": [
+          "direct:FerrosaSstable.lean:1910:9",
+          "io:FerrosaSstable.lean:328:2",
+          "io:FerrosaSstable.lean:350:2",
+          "trie:FerrosaSstable.lean:1312:7",
+          "trie:FerrosaSstable.lean:1389:7",
+          "trie:FerrosaSstable.lean:1400:7",
+          "trie:FerrosaSstable.lean:1438:11",
+          "trie:FerrosaSstable.lean:1453:11",
+          "trie:FerrosaSstable.lean:2402:7",
+          "trie:FerrosaSstable.lean:2408:5"
+        ],
+        "sorry.declaration": []
       },
-      "scope": "crate",
-      "stage": "aeneas-crash"
+      "modules": {
+        "bloom": {
+          "classes": {
+            "sorry.declaration": 6
+          },
+          "concluded": true,
+          "instances": {},
+          "stage": "aeneas"
+        },
+        "byte_comparable": {
+          "classes": {
+            "sorry.declaration": 10
+          },
+          "concluded": true,
+          "instances": {},
+          "stage": "aeneas"
+        },
+        "checksum": {
+          "classes": {
+            "sorry.declaration": 21
+          },
+          "concluded": true,
+          "instances": {},
+          "stage": "aeneas"
+        },
+        "compression": {
+          "classes": {
+            "lean.synthInstanceFailed": 1,
+            "sorry.declaration": 39
+          },
+          "concluded": true,
+          "instances": {
+            "lean.synthInstanceFailed": [
+              "FerrosaSstable.lean:161:33"
+            ]
+          },
+          "stage": "aeneas"
+        },
+        "data": {
+          "classes": {
+            "sorry.declaration": 44
+          },
+          "concluded": true,
+          "instances": {},
+          "stage": "aeneas"
+        },
+        "dio_align": {
+          "classes": {
+            "crash.Failure": 1
+          },
+          "concluded": true,
+          "instances": {
+            "crash.Failure": [
+              "ferrosa-sstable"
+            ]
+          },
+          "stage": "aeneas-crash"
+        },
+        "direct": {
+          "classes": {
+            "lean.synthInstanceFailed": 2,
+            "lean.unknownIdentifier": 1,
+            "sorry.declaration": 113
+          },
+          "concluded": true,
+          "instances": {
+            "lean.synthInstanceFailed": [
+              "FerrosaSstable.lean:1769:23",
+              "FerrosaSstable.lean:1805:46"
+            ],
+            "lean.unknownIdentifier": [
+              "FerrosaSstable.lean:1910:9"
+            ]
+          },
+          "stage": "aeneas"
+        },
+        "io": {
+          "classes": {
+            "lean.synthInstanceFailed": 1,
+            "lean.unknownIdentifier": 2,
+            "sorry.declaration": 96
+          },
+          "concluded": true,
+          "instances": {
+            "lean.synthInstanceFailed": [
+              "FerrosaSstable.lean:975:36"
+            ],
+            "lean.unknownIdentifier": [
+              "FerrosaSstable.lean:328:2",
+              "FerrosaSstable.lean:350:2"
+            ]
+          },
+          "stage": "aeneas"
+        },
+        "marshal": {
+          "classes": {
+            "sorry.declaration": 47
+          },
+          "concluded": true,
+          "instances": {},
+          "stage": "aeneas"
+        },
+        "partition_index": {
+          "classes": {
+            "lean.synthInstanceFailed": 1,
+            "sorry.declaration": 8
+          },
+          "concluded": true,
+          "instances": {
+            "lean.synthInstanceFailed": [
+              "FerrosaSstable.lean:118:36"
+            ]
+          },
+          "stage": "aeneas"
+        },
+        "pump": {
+          "classes": {
+            "lean.synthInstanceFailed": 8,
+            "sorry.declaration": 147
+          },
+          "concluded": true,
+          "instances": {
+            "lean.synthInstanceFailed": [
+              "FerrosaSstable.lean:1114:36",
+              "FerrosaSstable.lean:2439:14",
+              "FerrosaSstable.lean:2482:23",
+              "FerrosaSstable.lean:2518:46",
+              "FerrosaSstable.lean:2561:14",
+              "FerrosaSstable.lean:2576:5",
+              "FerrosaSstable.lean:2596:61",
+              "FerrosaSstable.lean:2604:63"
+            ]
+          },
+          "stage": "aeneas"
+        },
+        "reader": {
+          "classes": {
+            "lean.synthInstanceFailed": 7,
+            "sorry.declaration": 137
+          },
+          "concluded": true,
+          "instances": {
+            "lean.synthInstanceFailed": [
+              "FerrosaSstable.lean:2767:32",
+              "FerrosaSstable.lean:2783:78",
+              "FerrosaSstable.lean:2799:32",
+              "FerrosaSstable.lean:2815:32",
+              "FerrosaSstable.lean:2937:29",
+              "FerrosaSstable.lean:2958:29",
+              "FerrosaSstable.lean:960:36"
+            ]
+          },
+          "stage": "aeneas"
+        },
+        "row_index": {
+          "classes": {
+            "lean.synthInstanceFailed": 1,
+            "sorry.declaration": 16
+          },
+          "concluded": true,
+          "instances": {
+            "lean.synthInstanceFailed": [
+              "FerrosaSstable.lean:177:36"
+            ]
+          },
+          "stage": "aeneas"
+        },
+        "scan": {
+          "classes": {
+            "lean.synthInstanceFailed": 2,
+            "sorry.declaration": 25
+          },
+          "concluded": true,
+          "instances": {
+            "lean.synthInstanceFailed": [
+              "FerrosaSstable.lean:273:36",
+              "FerrosaSstable.lean:282:33"
+            ]
+          },
+          "stage": "aeneas"
+        },
+        "statistics": {
+          "classes": {
+            "sorry.declaration": 34
+          },
+          "concluded": true,
+          "instances": {},
+          "stage": "aeneas"
+        },
+        "toc": {
+          "classes": {
+            "lean.synthInstanceFailed": 1,
+            "sorry.declaration": 34
+          },
+          "concluded": true,
+          "instances": {
+            "lean.synthInstanceFailed": [
+              "FerrosaSstable.lean:442:63"
+            ]
+          },
+          "stage": "aeneas"
+        },
+        "trie": {
+          "classes": {
+            "lean.synthInstanceFailed": 1,
+            "lean.unknownIdentifier": 7,
+            "sorry.declaration": 49
+          },
+          "concluded": true,
+          "instances": {
+            "lean.synthInstanceFailed": [
+              "FerrosaSstable.lean:499:36"
+            ],
+            "lean.unknownIdentifier": [
+              "FerrosaSstable.lean:1312:7",
+              "FerrosaSstable.lean:1389:7",
+              "FerrosaSstable.lean:1400:7",
+              "FerrosaSstable.lean:1438:11",
+              "FerrosaSstable.lean:1453:11",
+              "FerrosaSstable.lean:2402:7",
+              "FerrosaSstable.lean:2408:5"
+            ]
+          },
+          "stage": "aeneas"
+        },
+        "types": {
+          "classes": {
+            "sorry.declaration": 2
+          },
+          "concluded": true,
+          "instances": {},
+          "stage": "aeneas"
+        },
+        "varint": {
+          "classes": {
+            "lean.synthInstanceFailed": 1,
+            "sorry.declaration": 10
+          },
+          "concluded": true,
+          "instances": {
+            "lean.synthInstanceFailed": [
+              "FerrosaSstable.lean:126:36"
+            ]
+          },
+          "stage": "aeneas"
+        },
+        "writer": {
+          "classes": {
+            "crash.Failure": 1
+          },
+          "concluded": true,
+          "instances": {
+            "crash.Failure": [
+              "ferrosa-sstable"
+            ]
+          },
+          "stage": "aeneas-crash"
+        }
+      },
+      "scope": "modules (20/20)",
+      "stage": "modules"
     },
     "ferrosa-udf": {
       "classes": {
         "lean.synthInstanceFailed": 46,
         "lean.unknownIdentifier": 16,
-        "sorry.declaration": 297
+        "sorry.declaration": 293
       },
       "concluded": true,
       "instances": {
         "lean.synthInstanceFailed": [
-          "FerrosaUdf.lean:5632:51",
-          "FerrosaUdf.lean:5646:20",
-          "FerrosaUdf.lean:5660:20",
-          "FerrosaUdf.lean:5667:73",
-          "FerrosaUdf.lean:5674:77",
-          "FerrosaUdf.lean:5696:26",
-          "FerrosaUdf.lean:5704:26",
-          "FerrosaUdf.lean:5746:26",
-          "FerrosaUdf.lean:5806:75",
-          "FerrosaUdf.lean:5843:30",
-          "FerrosaUdf.lean:5876:29",
-          "FerrosaUdf.lean:5884:29",
-          "FerrosaUdf.lean:5899:78",
-          "FerrosaUdf.lean:5915:5",
-          "FerrosaUdf.lean:5930:40",
-          "FerrosaUdf.lean:5943:76",
-          "FerrosaUdf.lean:5958:61",
-          "FerrosaUdf.lean:5973:61",
-          "FerrosaUdf.lean:6010:12",
-          "FerrosaUdf.lean:6031:27",
-          "FerrosaUdf.lean:6051:61",
-          "FerrosaUdf.lean:6066:77",
-          "FerrosaUdf.lean:6094:61",
-          "FerrosaUdf.lean:6108:20",
-          "FerrosaUdf.lean:6122:20",
-          "FerrosaUdf.lean:6146:20",
-          "FerrosaUdf.lean:6162:5",
-          "FerrosaUdf.lean:6178:21",
-          "FerrosaUdf.lean:6207:21",
-          "FerrosaUdf.lean:6234:43",
-          "FerrosaUdf.lean:6270:20",
-          "FerrosaUdf.lean:6285:61",
-          "FerrosaUdf.lean:6300:20",
-          "FerrosaUdf.lean:6315:61",
-          "FerrosaUdf.lean:6332:30",
-          "FerrosaUdf.lean:6346:20",
-          "FerrosaUdf.lean:6361:25",
-          "FerrosaUdf.lean:6376:61",
-          "FerrosaUdf.lean:6391:25",
-          "FerrosaUdf.lean:6417:5",
-          "FerrosaUdf.lean:6432:5",
-          "FerrosaUdf.lean:6446:25",
-          "FerrosaUdf.lean:6454:27",
-          "FerrosaUdf.lean:6503:27",
-          "FerrosaUdf.lean:6511:27",
-          "FerrosaUdf.lean:6519:27"
+          "FerrosaUdf.lean:5598:51",
+          "FerrosaUdf.lean:5612:20",
+          "FerrosaUdf.lean:5626:20",
+          "FerrosaUdf.lean:5633:73",
+          "FerrosaUdf.lean:5640:77",
+          "FerrosaUdf.lean:5662:26",
+          "FerrosaUdf.lean:5670:26",
+          "FerrosaUdf.lean:5712:26",
+          "FerrosaUdf.lean:5772:75",
+          "FerrosaUdf.lean:5809:30",
+          "FerrosaUdf.lean:5842:29",
+          "FerrosaUdf.lean:5850:29",
+          "FerrosaUdf.lean:5865:78",
+          "FerrosaUdf.lean:5881:5",
+          "FerrosaUdf.lean:5896:40",
+          "FerrosaUdf.lean:5909:76",
+          "FerrosaUdf.lean:5924:61",
+          "FerrosaUdf.lean:5939:61",
+          "FerrosaUdf.lean:5976:12",
+          "FerrosaUdf.lean:5997:27",
+          "FerrosaUdf.lean:6017:61",
+          "FerrosaUdf.lean:6032:77",
+          "FerrosaUdf.lean:6060:61",
+          "FerrosaUdf.lean:6074:20",
+          "FerrosaUdf.lean:6088:20",
+          "FerrosaUdf.lean:6112:20",
+          "FerrosaUdf.lean:6128:5",
+          "FerrosaUdf.lean:6144:21",
+          "FerrosaUdf.lean:6173:21",
+          "FerrosaUdf.lean:6200:43",
+          "FerrosaUdf.lean:6236:20",
+          "FerrosaUdf.lean:6251:61",
+          "FerrosaUdf.lean:6266:20",
+          "FerrosaUdf.lean:6281:61",
+          "FerrosaUdf.lean:6298:30",
+          "FerrosaUdf.lean:6312:20",
+          "FerrosaUdf.lean:6327:25",
+          "FerrosaUdf.lean:6342:61",
+          "FerrosaUdf.lean:6357:25",
+          "FerrosaUdf.lean:6383:5",
+          "FerrosaUdf.lean:6398:5",
+          "FerrosaUdf.lean:6412:25",
+          "FerrosaUdf.lean:6420:27",
+          "FerrosaUdf.lean:6469:27",
+          "FerrosaUdf.lean:6477:27",
+          "FerrosaUdf.lean:6485:27"
         ],
         "lean.unknownIdentifier": [
-          "FerrosaUdf.lean:4586:8",
-          "FerrosaUdf.lean:4591:8",
-          "FerrosaUdf.lean:4596:33",
-          "FerrosaUdf.lean:4597:8",
-          "FerrosaUdf.lean:4602:8",
-          "FerrosaUdf.lean:4608:8",
-          "FerrosaUdf.lean:4692:31",
-          "FerrosaUdf.lean:4697:31",
-          "FerrosaUdf.lean:4707:31",
-          "FerrosaUdf.lean:5336:10",
-          "FerrosaUdf.lean:5368:10",
-          "FerrosaUdf.lean:5400:10",
-          "FerrosaUdf.lean:5401:10",
-          "FerrosaUdf.lean:5433:10",
-          "FerrosaUdf.lean:5466:10",
-          "FerrosaUdf.lean:6478:19"
+          "FerrosaUdf.lean:4552:8",
+          "FerrosaUdf.lean:4557:8",
+          "FerrosaUdf.lean:4562:33",
+          "FerrosaUdf.lean:4563:8",
+          "FerrosaUdf.lean:4568:8",
+          "FerrosaUdf.lean:4574:8",
+          "FerrosaUdf.lean:4658:31",
+          "FerrosaUdf.lean:4663:31",
+          "FerrosaUdf.lean:4673:31",
+          "FerrosaUdf.lean:5302:10",
+          "FerrosaUdf.lean:5334:10",
+          "FerrosaUdf.lean:5366:10",
+          "FerrosaUdf.lean:5367:10",
+          "FerrosaUdf.lean:5399:10",
+          "FerrosaUdf.lean:5432:10",
+          "FerrosaUdf.lean:6444:19"
         ]
       },
       "scope": "crate",
@@ -712,9 +1185,9 @@
   "schema": 1,
   "toolchain": {
     "aeneas": {
-      "commit": "80b690a9ad1ef1fb97fee23ef1e1c9486ff8f8b9",
+      "commit": "943e2625ff05a856b72ce197eeb5042f4302af25",
       "repo": "https://github.com/ferrosadb/aeneas",
-      "tree": "09f2adfadc85f5cf55f286aa2de4ead835e31cc1"
+      "tree": "5c090cd8fe90cca4cfff5aad0032252e31aafda0"
     },
     "charon": {
       "commit": "7b462d9159db2ed3015162352183906a30bfafc6",
