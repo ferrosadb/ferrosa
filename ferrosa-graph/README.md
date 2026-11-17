@@ -461,7 +461,10 @@ stops at the first owned relationship. A foreign tenant's matching UUID does not
 prohibit deletion of this vertex.
 
 `DETACH DELETE` streams declared edge tables and deletes exact incident edge
-and vertex rows in one batch, preserving sibling rows. Shared adjacency entries
+and vertex rows in one atomic batch, preserving sibling rows. The batch is
+staged and spills past the spill threshold (`expand/detach_delete.rs`; counters
+`detach_delete_spilled_batches` / `detach_delete_in_memory_batches`); in Cluster
+mode the batchlog still holds it in memory (t_1ce56235, logged at WARN). Shared adjacency entries
 remain live while another physical edge supports them, including edges in other
 tenant partitions. Reconciliation checks that support before deleting entries
 from legacy layouts whose physical keys cannot be recovered from adjacency.

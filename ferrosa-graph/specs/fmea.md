@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-graph
 doc: fmea
-last_updated: 2026-11-16 (G-20)
+last_updated: 2026-11-16 (G-22)
 ---
 
 # ferrosa-graph — FMEA / Known Issues
@@ -54,6 +54,8 @@ network listeners, so consistency and DoS modes dominate.
 | G-18 | **A write's match set was held in memory and could be re-read during its own writes.** SET / REMOVE / DELETE collected matches into Vecs (and interleaved projections read storage between writes). | OOM on a large match set, or a write changing the rows the same query was still reading (Halloween). | 8 | 4 | 6 | 192 → 32 | **Fixed (bc3a54b9).** The whole match set goes into a spill-backed run (`spill::spill_run`, the ORDER BY `ExternalSorter` in arrival order) before the first write, then replays. SET ... RETURN rows go to a spill-backed `RowAcc`. Tests: `write_spill_tests::set_spills_its_match_set_before_the_first_write`, `remove_spills_*`, `delete_spills_*`. |
 | G-19 | **The MATCH anchor frontier was held in memory.** `expand_to_states` drained the anchor scan into a Vec of states before expanding. | OOM on a broad anchor. | 7 | 5 | 6 | 210 → 28 | **Fixed (bc3a54b9).** Anchor states go to a spill-backed `StateRun` in scan order; hops, OPTIONAL MATCH, WITH and the projection pull them one at a time, and WITH ORDER BY uses `OrderBySink::push_keyed`. Test: `anchor_spill_tests::spilled_anchor_states_match_the_in_memory_frontier`. |
 | G-20 | **Results were collected before reaching the transport.** `collect_to_graph_result` / `collect_rows` and `execute_buffered` built whole results. | First row delayed until the last was produced; whole result in memory. | 6 | 4 | 1 | 24 | **Fixed (bc3a54b9).** Every dispatch is one streaming match; the collectors are test-only. UNION dedups as rows are pulled; CALL {} / UNWIND-write / FOREACH consume streams into spill-backed runs. Test: `union_distinct_yields_first_row_before_later_arms_are_produced`. Open: DETACH DELETE incident-edge batch (t_70c8e6ae) and SUBSCRIBE per-result SSE payload (t_1fc4dce9). |
+| G-21 | **DETACH DELETE built a high-degree vertex's batch in memory.** `collect_incident_edge_deletes` collected every incident tombstone and adjacency update into a `Vec<Mutation>` plus HashMap/HashSet key maps, then wrote one atomic `write_batch`. | OOM on a vertex with very many incident edges. | 7 | 4 | 6 | 168 → 28 | **Fixed (8e2ccfb1).** `expand/detach_delete.rs` stages tombstones into a `WriteSetStage` that spills past the threshold; the protect pass is a sort-merge through `ExternalSorter` with O(1) state per adjacency entry and the same decisions as before; the batch commits atomically through `GraphWrite::write_staged_batch` (Direct: `write_atomic_batch` over the staged set). Tests: `a_detach_delete_past_the_spill_threshold_spills_and_matches_the_resident_build`, `a_failed_detach_delete_commit_leaves_nothing_applied`. |
+| G-22 | **In Cluster mode a staged DETACH DELETE batch is decoded into the resident batchlog.** The batchlog holds a batch in memory by design (in-memory map, u16 mutation count). | A very high-degree DETACH DELETE in Cluster mode still holds its batch in memory at the batchlog. | 6 | 3 | 4 | 72 | **Open (t_1ce56235)**, never silent: logged once at WARN and counted (`staged_batches_decoded_for_batchlog()`). Needs a staged/spilled batchlog. |
 
 
 ## Top risks to act on

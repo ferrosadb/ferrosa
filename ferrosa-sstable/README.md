@@ -37,7 +37,10 @@ resolution beyond the serialization header, or cluster routing.
   point lookups (`get_partition`, `get_partition_limited_rows`,
   `get_clustering_row`), bloom/bounds pre-checks (`may_contain_key`), and
   streaming iteration in token order (`partitions_iter` → `PartitionIter`) with
-  token-seek (`seek_to_token`) and projection variants.
+  token-seek (`seek_to_token`) and projection variants. `Partition.rows` is
+  `Vec<Arc<Row>>`: rows are shared, not copied, between the reader, the
+  memtable and every consumer; a merge copies a row only to change one that is
+  still shared.
 - **Component output (T-040)** — every physical SSTable component write uses
   `AlignedPump`, including metadata and buffered Data.db output from the memory
   writer. Metadata uses depth 0: one aligned segment, exact logical-length

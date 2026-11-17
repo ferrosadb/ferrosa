@@ -133,6 +133,15 @@ def sites : List Site := [
   ⟨"graph", "a write's match set spills before the first write", .spilling true,
    "ferrosa-graph/src/executor/spill.rs:757",
    "SET / REMOVE / DELETE read the whole match set into `spill_run` (the ORDER BY `ExternalSorter` in arrival order) before writing, then replay it: Halloween-safe and memory-bounded."⟩,
+  ⟨"graph", "DETACH DELETE stages its batch and spills instead of collecting it", .spilling true,
+   "ferrosa-graph/src/executor/expand/detach_delete.rs:239",
+   "`stage_incident_edges` writes tombstones into a spilling `WriteSetStage`; `record_protectors` is a sort-merge through `ExternalSorter` with O(1) state per adjacency entry; the batch commits atomically through `write_staged_batch`."⟩,
+  ⟨"graph", "a retried adjacency write shares one row", .streaming,
+   "ferrosa-graph/src/executor/expand/adjacency_write.rs:158",
+   "`adjacency_write_with_retry` holds one `Arc<Row>` and passes `Arc::clone` per attempt all the way into the memtable: no copy per attempt."⟩,
+  ⟨"storage", "an observer-derived mutation is applied without copying its rows", .streaming,
+   "ferrosa-storage/src/engine/write.rs:16",
+   "`apply_derived_mutation` hands each derived `Arc<Row>` to the store; with `Partition.rows` / `Mutation.rows` as `Vec<Arc<Row>>`, the memtable and the async observers share the same rows."⟩,
   ⟨"cql", "a result cursor holds a node-wide permit or is refused", .serialized,
    "ferrosa-cql/src/result_cursor.rs:513",
    "`admit` CAS-increments the open count under `max_open` (default 256), sweeps expired cursors first, and returns Overloaded rather than queueing."⟩,
@@ -213,8 +222,8 @@ def sites : List Site := [
    "No rewrap operator exists in the tree: the only PITR path is `run_pitr_replay_e2e`, a replay test, so there is no transform to inspect."⟩
 ]
 
-/-- Forty-eight sites were read. -/
-theorem site_count : sites.length = 48 := by decide
+/-- Fifty-one sites were read. -/
+theorem site_count : sites.length = 51 := by decide
 
 /-- **Every site names a file and line.**  A row without a location is a mood, not an audit finding, so
     each `site` field has to contain a `file.rs:line`. -/
@@ -228,16 +237,16 @@ theorem every_config_bound_names_its_knob :
       | .boundedByConfig knob => !knob.isEmpty
       | _ => true) = true := by native_decide
 
-/-- Sixteen sites are bounded by construction. -/
-theorem streaming_sites : (sites.filter fun s => s.klass == .streaming).length = 16 := by decide
+/-- Eighteen sites are bounded by construction. -/
+theorem streaming_sites : (sites.filter fun s => s.klass == .streaming).length = 18 := by decide
 
 /-- Three are bounded by a permit. -/
 theorem serialized_sites : (sites.filter fun s => match s.klass with
     | .serialized => true | _ => false).length = 3 := by decide
 
-/-- Seven are bounded because they spill. -/
+/-- Eight are bounded because they spill. -/
 theorem spilling_sites : (sites.filter fun s => match s.klass with
-    | .spilling _ => true | _ => false).length = 7 := by decide
+    | .spilling _ => true | _ => false).length = 8 := by decide
 
 /-- Nine are bounded only by a setting. -/
 theorem config_bounded_sites : (sites.filter fun s => match s.klass with
@@ -265,7 +274,7 @@ theorem classes_partition_the_sites :
       + (sites.filter fun s => match s.klass with | .spilling _ => true | _ => false).length
       + (sites.filter fun s => match s.klass with | .boundedByConfig _ => true | _ => false).length
       + (sites.filter fun s => match s.klass with | .unbounded _ => true | _ => false).length
-      + (sites.filter fun s => s.klass == .unresolved).length = 48 := by decide
+      + (sites.filter fun s => s.klass == .unresolved).length = 51 := by decide
 
 /-- The layers the audit covers, so the table can be printed by layer. -/
 def layers : List String := ["cql", "commit log", "compaction", "flush", "graph", "permits",
