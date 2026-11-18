@@ -49,7 +49,19 @@ exclude = ["ferrosa-jsonb-conformance"]
 # `sprint-03-engine-prevote` acceptance tests in ferrosa-cluster depend on
 # it. Fork README and rationale:
 #   https://github.com/ferrosadb/openraft/blob/main/README-FERROSADB.md
-openraft = { git = "https://github.com/ferrosadb/openraft.git", rev = "ecb9efa3" }
+#
+# `098874df` (branch `ferrosa/no-chrono`) is `ecb9efa3` plus one commit that
+# replaces chrono with jiff in openraft's instant display and `since` macro:
+# RUSTSEC-2026-0543 marks every chrono release unmaintained.
+openraft = { git = "https://github.com/ferrosadb/openraft.git", rev = "098874df" }
+
+# chrono and humantime are unmaintained (RUSTSEC-2026-0543, RUSTSEC-2026-0542)
+# and every object_store release requires both. The ferrosadb/arrow-rs fork's
+# `ferrosa/object_store-0.11.2-jiff` branch is object_store 0.11.2 with chrono
+# replaced by jiff and humantime's duration grammar ported in-crate; date
+# parsing, SigV4 signing and duration text are checked byte-for-byte against
+# the original crates in its tests.
+object_store = { git = "https://github.com/ferrosadb/arrow-rs.git", rev = "8d32810b" }
 
 # Keep line-table debug info in release builds so container crashes produce a readable backtrace
 # without bloating the binary to full DWARF. Required for gdb backtraces inside the runtime image.
