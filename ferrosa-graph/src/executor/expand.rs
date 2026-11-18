@@ -5350,11 +5350,15 @@ fn encode_expr_for_column_type(expr: &Expr, column_type: &str) -> Result<Vec<u8>
         Expr::Literal(Literal::String(s))
             if lower == "timestamp" || lower.ends_with("timestamptype") =>
         {
-            let ms = ferrosa_common::temporal::parse::rfc3339(s)
-                .map_err(|e| {
-                    GraphError::Validation(format!("invalid timestamp literal '{s}': {e}"))
-                })?
-                .timestamp_millis();
+            let ms = match ferrosa_common::temporal::parse::rfc3339(s) {
+                Ok(instant) => instant.timestamp_millis(),
+                Err(e) => {
+                    let reason = e.message();
+                    return Err(GraphError::Validation(format!(
+                        "invalid timestamp literal '{s}': {reason}"
+                    )));
+                }
+            };
             Ok(ms.to_be_bytes().to_vec())
         }
         Expr::Literal(Literal::Integer(i))

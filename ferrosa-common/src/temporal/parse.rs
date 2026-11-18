@@ -37,16 +37,25 @@ pub enum ParseError {
     TooLong,
 }
 
-impl fmt::Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+impl ParseError {
+    /// chrono's message for this error kind. Callers that only need the text
+    /// use this rather than `Display`, which keeps them free of a trait
+    /// instance (the Lean extraction cannot elaborate opaque ones).
+    pub fn message(self) -> &'static str {
+        match self {
             ParseError::OutOfRange => "input is out of range",
             ParseError::Impossible => "no possible date and time matching input",
             ParseError::NotEnough => "input is not enough for unique date and time",
             ParseError::Invalid => "input contains invalid characters",
             ParseError::TooShort => "premature end of input",
             ParseError::TooLong => "trailing input",
-        })
+        }
+    }
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.message())
     }
 }
 
