@@ -6,7 +6,7 @@
   "error": "aeneas killed at the 9600M memory ceiling",
   "crate": "ferrosa-sstable",
   "prefix": "ferrosa_sstable::*",
-  "generated_at": "2026-11-17T18:38:45+00:00",
+  "generated_at": "2026-11-18T06:50:31+00:00",
   "toolchain": {
     "charon": "/tmp/oomcat/aeneas-arc/charon/bin/charon",
     "aeneas": "/tmp/oomcat/aeneas-arc/src/_build/default/main.exe",
