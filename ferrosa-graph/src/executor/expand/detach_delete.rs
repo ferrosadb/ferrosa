@@ -52,9 +52,9 @@ pub fn detach_delete_in_memory_batches() -> u64 {
 /// Record kind: an entry an edge being deleted derives (a candidate
 /// tombstone). Sorts before [`PROTECTOR`] for the same source row, so a
 /// deleted edge's own live derivation is recognised and skipped.
-const CANDIDATE: u8 = 0;
+const CANDIDATE: u32 = 0;
 /// Record kind: an entry a live edge derives at `timestamp + 1`.
-const PROTECTOR: u8 = 1;
+const PROTECTOR: u32 = 1;
 
 /// One record of the protect sort-merge.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -64,18 +64,21 @@ struct EntryRecord {
     table: String,
     key: Vec<u8>,
     clustering: Vec<u8>,
-    /// The physical edge row it was derived from.
-    source: EdgeSource,
+    /// The physical edge row it was derived from: edge table, partition key,
+    /// clustering. Stored as plain fields so the record serializes without a
+    /// nested type.
+    source_table: String,
+    source_key: Vec<u8>,
+    source_clustering: Vec<u8>,
     /// [`CANDIDATE`] or [`PROTECTOR`].
-    kind: u8,
+    kind: u32,
     /// Scan order. Among the protectors of one entry the highest wins.
-    seq: u64,
+    seq: usize,
     /// A protector's serialized live entry mutation; empty for a candidate.
     entry: Vec<u8>,
 }
 
 /// The physical edge row an adjacency entry was derived from.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct EdgeSource {
     edge_table: String,
     key: Vec<u8>,
@@ -83,35 +86,37 @@ struct EdgeSource {
 }
 
 impl EdgeSource {
-    fn empty() -> Self {
+    /// Take a record's source row out of it.
+    fn of(record: EntryRecord) -> Self {
         Self {
-            edge_table: String::new(),
-            key: Vec::new(),
-            clustering: Vec::new(),
+            edge_table: record.source_table,
+            key: record.source_key,
+            clustering: record.source_clustering,
         }
     }
 
-    /// Edge table, then partition key, then clustering.
-    fn compare(&self, other: &EdgeSource) -> Ordering {
-        let edge_table = self.edge_table.cmp(&other.edge_table);
-        if edge_table != Ordering::Equal {
-            return edge_table;
-        }
-        let key = self.key.cmp(&other.key);
-        if key != Ordering::Equal {
-            return key;
-        }
-        self.clustering.cmp(&other.clustering)
-    }
-
-    fn same_row(&self, other: &EdgeSource) -> bool {
-        self.edge_table == other.edge_table
-            && self.key == other.key
-            && self.clustering == other.clustering
+    /// Whether `record` was derived from this edge row.
+    fn is_source_of(&self, record: &EntryRecord) -> bool {
+        self.edge_table == record.source_table
+            && self.key == record.source_key
+            && self.clustering == record.source_clustering
     }
 }
 
 impl EntryRecord {
+    /// Source row order: edge table, then partition key, then clustering.
+    fn compare_source(&self, other: &EntryRecord) -> Ordering {
+        let edge_table = self.source_table.cmp(&other.source_table);
+        if edge_table != Ordering::Equal {
+            return edge_table;
+        }
+        let key = self.source_key.cmp(&other.source_key);
+        if key != Ordering::Equal {
+            return key;
+        }
+        self.source_clustering.cmp(&other.source_clustering)
+    }
+
     fn same_entry(&self, other: &EntryRecord) -> bool {
         self.keyspace == other.keyspace
             && self.table == other.table
@@ -127,9 +132,9 @@ impl SpillRow for EntryRecord {
             + self.table.capacity()
             + self.key.capacity()
             + self.clustering.capacity()
-            + self.source.edge_table.capacity()
-            + self.source.key.capacity()
-            + self.source.clustering.capacity()
+            + self.source_table.capacity()
+            + self.source_key.capacity()
+            + self.source_clustering.capacity()
             + self.entry.capacity()
     }
 }
@@ -157,7 +162,7 @@ impl SpillOrder<EntryRecord> for EntryOrder {
         if clustering != Ordering::Equal {
             return clustering;
         }
-        let source = a.source.compare(&b.source);
+        let source = a.compare_source(b);
         if source != Ordering::Equal {
             return source;
         }
@@ -257,7 +262,7 @@ pub(super) async fn stage_detach_delete(
 ) -> Result<StagedDetach> {
     let mut spill = DetachSpill::new(config)?;
     let mut buf = Vec::new();
-    let mut seq = 0u64;
+    let mut seq = 0usize;
     let edges_deleted = stage_incident_edges(
         write_path, schema, edges, target, timestamp, &mut spill, &mut buf, &mut seq,
     )
@@ -308,7 +313,7 @@ async fn stage_incident_edges(
     timestamp: i64,
     spill: &mut DetachSpill,
     buf: &mut Vec<u8>,
-    seq: &mut u64,
+    seq: &mut usize,
 ) -> Result<usize> {
     let mut deleted = 0usize;
     for edge in edges {
@@ -363,7 +368,7 @@ async fn record_protectors(
     target: &VertexDeleteTarget<'_>,
     timestamp: i64,
     spill: &mut DetachSpill,
-    seq: &mut u64,
+    seq: &mut usize,
 ) -> Result<()> {
     let vertex = target.logical_key.key.as_bytes();
     let restore_at = timestamp.saturating_add(1);
@@ -406,8 +411,8 @@ async fn record_protectors(
 fn entry_record(
     entry: &Mutation,
     source: &EdgeSource,
-    kind: u8,
-    seq: u64,
+    kind: u32,
+    seq: usize,
     payload: Vec<u8>,
 ) -> Result<EntryRecord> {
     let [row] = entry.rows.as_slice() else {
@@ -421,7 +426,9 @@ fn entry_record(
         table: entry.table.clone(),
         key: entry.key.key.as_bytes().to_vec(),
         clustering: row.clustering.clone(),
-        source: source.clone(),
+        source_table: source.edge_table.clone(),
+        source_key: source.key.clone(),
+        source_clustering: source.clustering.clone(),
         kind,
         seq,
         entry: payload,
@@ -448,7 +455,9 @@ impl EntryDecision {
                 table: record.table.clone(),
                 key: record.key.clone(),
                 clustering: record.clustering.clone(),
-                source: EdgeSource::empty(),
+                source_table: String::new(),
+                source_key: Vec::new(),
+                source_clustering: Vec::new(),
                 kind: CANDIDATE,
                 seq: 0,
                 entry: Vec::new(),
@@ -464,11 +473,11 @@ impl EntryDecision {
     fn observe(&mut self, record: EntryRecord) {
         if record.kind == CANDIDATE {
             self.has_candidate = true;
-            self.deleted_source = Some(record.source);
+            self.deleted_source = Some(EdgeSource::of(record));
             return;
         }
         if let Some(deleted) = &self.deleted_source {
-            if deleted.same_row(&record.source) {
+            if deleted.is_source_of(&record) {
                 return;
             }
         }
