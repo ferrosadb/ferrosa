@@ -470,6 +470,10 @@ pub struct Segment {
     /// completion. `flush_to_disk()` waits for this to reach zero before
     /// reading the buffer, ensuring no partially-written entries are captured.
     in_flight_writers: AtomicU64,
+
+    /// Flushers queued on `file_handle`: the depth of the group a single
+    /// flush can make durable together.
+    flush_waiters: AtomicU64,
     sealed: std::sync::atomic::AtomicBool,
 
     /// Persistent file handle for incremental flush. Opened on first flush,
@@ -610,6 +614,7 @@ impl Segment {
             path,
             dirty_tables: DashMap::new(),
             in_flight_writers: AtomicU64::new(0),
+            flush_waiters: AtomicU64::new(0),
             sealed: std::sync::atomic::AtomicBool::new(false),
             file_handle: Mutex::new(None),
             last_flushed: AtomicU64::new(0),
@@ -933,6 +938,12 @@ impl Segment {
         marker[4..8].copy_from_slice(&crc.to_be_bytes());
     }
 
+    /// Flushers currently queued on the flush/file mutex.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn flush_waiters_for_test(&self) -> u64 {
+        self.flush_waiters.load(Ordering::Acquire)
+    }
+
     /// Hold the real flush/file mutex while a deterministic cross-crate test runs.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn with_flush_held_for_test(&self, hold: impl FnOnce()) {
@@ -947,12 +958,35 @@ impl Segment {
     /// `end` comes from [`close_section`](Self::close_section). Bytes below
     /// `last_flushed` are never written again. Waits for all in-flight
     /// writers before reading the buffer.
+    ///
+    /// Group commit: the section is closed only AFTER this flusher holds
+    /// `file_handle`. Every caller that queued behind an in-flight flush has
+    /// already appended its entry, so the first of them to get the lock closes
+    /// one section covering the whole queue and pays one fsync for all of
+    /// them; the rest find `end <= last_flushed` and return without writing.
+    /// Closing before the lock gave every queued caller its own section and
+    /// its own serial fsync.
     pub fn flush_to_disk(&self) -> ferrosa_common::Result<()> {
+        // File I/O happens under the file_handle mutex so concurrent flushers
+        // never write the same range twice. `release_buffer()` also takes
+        // this lock, so once we hold it the buffer's (ptr, len, cap) is
+        // stable for the duration of this flush. Lock order: file_handle,
+        // then marker_link (inside `close_section`), as in `release_buffer`.
+        let lock_start = Instant::now();
+        self.flush_waiters.fetch_add(1, Ordering::AcqRel);
+        let mut handle = self.file_handle.lock();
+        self.flush_waiters.fetch_sub(1, Ordering::AcqRel);
+        let file_lock_wait = lock_start.elapsed();
         let end = self.close_section()?;
-        self.write_through(end as usize)
+        self.write_through(&mut handle, end as usize, file_lock_wait)
     }
 
-    fn write_through(&self, end: usize) -> ferrosa_common::Result<()> {
+    fn write_through(
+        &self,
+        handle: &mut Option<std::fs::File>,
+        end: usize,
+        file_lock_wait: Duration,
+    ) -> ferrosa_common::Result<()> {
         let sync_start = Instant::now();
         let _span = tracing::info_span!("commitlog.sync", segment_id = self.id,).entered();
         // Every byte below `end` was allocated before `end` was chosen, so
@@ -960,17 +994,10 @@ impl Segment {
         // buffer[..end] is fully written.
         let mut phases = SyncPhaseDurations {
             wait_writers: self.wait_for_writers(),
+            file_lock_wait,
             ..SyncPhaseDurations::default()
         };
         observe_wait_writers(phases.wait_writers);
-
-        // File I/O happens under the file_handle mutex so concurrent flushers
-        // never write the same range twice. `release_buffer()` also takes
-        // this lock, so once we hold it the buffer's (ptr, len, cap) is
-        // stable for the duration of this flush.
-        let lock_start = Instant::now();
-        let mut handle = self.file_handle.lock();
-        phases.file_lock_wait = lock_start.elapsed();
         observe_phase(
             &SYNC_FILE_LOCK_WAIT_MICROS_TOTAL,
             &SYNC_FILE_LOCK_WAIT_MICROS_MAX,
@@ -1237,16 +1264,16 @@ impl Segment {
         // the buffer either.
         //
         // `marker_link` is taken too, because `close_section` writes head
-        // markers into the buffer under it. Lock order is marker_link then
-        // file_handle; flushers never hold both at once.
+        // markers into the buffer under it. Lock order is file_handle then
+        // marker_link, the order a flusher takes them (`flush_to_disk`).
         //
         // `last_flushed` is left alone: it must never claim bytes durable
         // that are not. After the final flush the watermark already covers
         // everything a later flush could ask for (the chain is closed, or the
         // last section is empty), so a post-release flush is a no-op; one that
         // is not finds the buffer gone and fails loudly.
-        let _linking = self.marker_link.lock();
         let _handle = self.file_handle.lock();
+        let _linking = self.marker_link.lock();
         // SAFETY: `marker_link` and `file_handle` are held for the duration, so no
         // flusher can be inside a prefix view and no marker writer inside a range
         // view; `release` is atomic (it zeroes the published length `Release` before

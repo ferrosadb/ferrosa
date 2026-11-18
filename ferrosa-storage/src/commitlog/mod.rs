@@ -3145,6 +3145,75 @@ mod tests {
         cl.shutdown().unwrap();
     }
 
+    /// Group commit: callers queued behind an in-flight flush are made durable
+    /// by ONE later flush, not by one fsync each.
+    ///
+    /// A pair write calls `force_sync` after every mutation, so without this
+    /// N concurrent writers pay N serial device flushes and throughput stays
+    /// flat however many writers there are (the CI `bulk_write_stability`
+    /// failures on 2026-11-18). The process-global sync counters race with the
+    /// rest of this binary, so the proof is in the file: every flush closes a
+    /// section and writes exactly one `SYNC_MARKER_SIZE` head marker.
+    #[test]
+    fn force_sync_callers_queued_behind_a_flush_share_one_sync() {
+        const CALLERS: u64 = 16;
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig {
+            segment_size: 1024 * 1024,
+            // Batch has no sync thread; explicit-sync appends do not fsync inline.
+            ..CommitLogConfig::test_config(dir.path())
+        };
+        let cl = Arc::new(CommitLog::new(config).unwrap());
+        let path = cl.active.load().path().to_path_buf();
+        cl.append_for_explicit_sync(&simple_mutation()).unwrap();
+        cl.force_sync().unwrap();
+        let before = std::fs::metadata(&path).unwrap().len();
+        let entry = Segment::entry_total_size(&simple_mutation()) as u64;
+
+        let mut callers = Vec::new();
+        cl.with_flush_held_for_test(|| {
+            for _ in 0..CALLERS {
+                let cl = Arc::clone(&cl);
+                callers.push(std::thread::spawn(move || {
+                    cl.append_for_explicit_sync(&simple_mutation())?;
+                    cl.force_sync()
+                }));
+            }
+            let segment = cl.active.load();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while segment.flush_waiters_for_test() < CALLERS {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "only {} of {CALLERS} callers queued on the held flush",
+                    segment.flush_waiters_for_test()
+                );
+                std::thread::yield_now();
+            }
+        });
+        for caller in callers {
+            caller.join().unwrap().unwrap();
+        }
+
+        let grown = std::fs::metadata(&path).unwrap().len() - before;
+        let entries = CALLERS * entry;
+        assert!(
+            grown >= entries,
+            "only {grown} B reached the file for {entries} B of entries"
+        );
+        let markers = (grown - entries) / segment::SYNC_MARKER_SIZE as u64;
+        assert_eq!(
+            grown,
+            entries + markers * segment::SYNC_MARKER_SIZE as u64,
+            "the growth is not whole entries plus whole markers"
+        );
+        assert_eq!(
+            markers, 1,
+            "{CALLERS} callers queued behind one flush wrote {markers} sections, one fsync \
+             each; a single flush must make the whole queue durable"
+        );
+        cl.shutdown().unwrap();
+    }
+
     /// No byte a flush made durable is ever written again.
     ///
     /// After flush N the file holds `[0, watermark_N)`. Flush N+1 may only
