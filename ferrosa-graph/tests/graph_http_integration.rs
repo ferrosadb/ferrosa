@@ -7285,14 +7285,21 @@ mod bolt_rmw_regressions {
     async fn bolt_rmw_gate_expired_stream_releases_before_error_is_dropped() {
         use futures::StreamExt;
         tokio::time::timeout(HANG_GUARD, async {
-            let fixture = Fixture::with_query_timeout(std::time::Duration::from_millis(100)).await;
+            // The fixture's normal 30 s timeout applies to every query here.
+            // FIRST's deadline is expired on tokio's clock, not by racing a
+            // real-time budget: with a 100 ms fixture timeout SECOND had to fit
+            // its own real write (a commit-log fsync) into 100 ms too, and one
+            // slow device flush on CI failed it (run 44390667223).
+            let fixture = Fixture::start().await;
             let (_, mut rows, _) = fixture
                 .engine
                 .execute_stream_with_params(FIRST, "neo4j", &superuser_auth(), &HashMap::new())
                 .await
                 .unwrap();
             // Deadline expiry is the behavior under test, not an overlap guess.
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            tokio::time::pause();
+            tokio::time::advance(std::time::Duration::from_secs(31)).await;
+            tokio::time::resume();
             assert!(
                 matches!(
                     rows.next().await,
