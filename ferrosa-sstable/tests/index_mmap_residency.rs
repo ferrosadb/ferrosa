@@ -24,7 +24,7 @@
 //! `pages_dirtied` for the component under test.
 #![cfg(target_os = "macos")]
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
 use ferrosa_sstable::io::{FileReadAt, ReadAt};
@@ -270,12 +270,12 @@ fn partition(idx: usize) -> Partition {
         key,
         deletion: DeletionTime::LIVE,
         static_row: None,
-        rows: vec![Row {
+        rows: vec![Arc::new(Row {
             clustering: 1i32.to_be_bytes().to_vec(),
             cells: vec![(0, CellValue::live(vec![b'x'; 16], 1))],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1),
-        }],
+        })],
     }
 }
 
