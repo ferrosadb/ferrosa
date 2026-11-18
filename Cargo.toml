@@ -72,6 +72,29 @@ object_store = { git = "https://github.com/ferrosadb/arrow-rs.git", rev = "8d328
 scylla = { git = "https://github.com/ferrosadb/scylla-rust-driver.git", rev = "05460867" }
 scylla-cql = { git = "https://github.com/ferrosadb/scylla-rust-driver.git", rev = "05460867" }
 
+# arrow (ferrosa-flight) requires chrono in every release, 60.x included. The
+# ferrosadb/arrow-rs fork's `ferrosa/53.4.1-jiff` branch is 53.4.1 with chrono
+# replaced by an in-crate port of its calendar, strftime and parsing
+# (`arrow_array::calendar`, checked against chrono in its tests) and jiff for
+# named time zones. Every arrow crate in the graph is patched to the same
+# commit: the fork's crates depend on their siblings by path, so mixing fork
+# and registry arrow crates would duplicate types.
+arrow = { git = "https://github.com/ferrosadb/arrow-rs.git", rev = "6e38b194" }
+arrow-arith = { git = "https://github.com/ferrosadb/arrow-rs.git", rev = "6e38b194" }
+arrow-array = { git = "https://github.com/ferrosadb/arrow-rs.git", rev = "6e38b194" }
+arrow-buffer = { git = "https://github.com/ferrosadb/arrow-rs.git", rev = "6e38b194" }
+arrow-cast = { git = "https://github.com/ferrosadb/arrow-rs.git", rev = "6e38b194" }
+arrow-csv = { git = "https://github.com/ferrosadb/arrow-rs.git", rev = "6e38b194" }
+arrow-data = { git = "https://github.com/ferrosadb/arrow-rs.git", rev = "6e38b194" }
+arrow-flight = { git = "https://github.com/ferrosadb/arrow-rs.git", rev = "6e38b194" }
+arrow-ipc = { git = "https://github.com/ferrosadb/arrow-rs.git", rev = "6e38b194" }
+arrow-json = { git = "https://github.com/ferrosadb/arrow-rs.git", rev = "6e38b194" }
+arrow-ord = { git = "https://github.com/ferrosadb/arrow-rs.git", rev = "6e38b194" }
+arrow-row = { git = "https://github.com/ferrosadb/arrow-rs.git", rev = "6e38b194" }
+arrow-schema = { git = "https://github.com/ferrosadb/arrow-rs.git", rev = "6e38b194" }
+arrow-select = { git = "https://github.com/ferrosadb/arrow-rs.git", rev = "6e38b194" }
+arrow-string = { git = "https://github.com/ferrosadb/arrow-rs.git", rev = "6e38b194" }
+
 # Keep line-table debug info in release builds so container crashes produce a readable backtrace
 # without bloating the binary to full DWARF. Required for gdb backtraces inside the runtime image.
 [profile.release]

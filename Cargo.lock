@@ -252,8 +252,7 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 [[package]]
 name = "arrow"
 version = "53.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3a3ec4fe573f9d1f59d99c085197ef669b00b088ba1d7bb75224732d9357a74"
+source = "git+https://github.com/ferrosadb/arrow-rs.git?rev=6e38b194#6e38b1940ed373eb5e0c9b759505a18c539bd7f5"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -273,39 +272,36 @@ dependencies = [
 [[package]]
 name = "arrow-arith"
 version = "53.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6dcf19f07792d8c7f91086c67b574a79301e367029b17fcf63fb854332246a10"
+source = "git+https://github.com/ferrosadb/arrow-rs.git?rev=6e38b194#6e38b1940ed373eb5e0c9b759505a18c539bd7f5"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-data",
  "arrow-schema",
- "chrono",
  "half",
+ "jiff",
  "num",
 ]
 
 [[package]]
 name = "arrow-array"
 version = "53.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7845c32b41f7053e37a075b3c2f29c6f5ea1b3ca6e5df7a2d325ee6e1b4a63cf"
+source = "git+https://github.com/ferrosadb/arrow-rs.git?rev=6e38b194#6e38b1940ed373eb5e0c9b759505a18c539bd7f5"
 dependencies = [
  "ahash 0.8.12",
  "arrow-buffer",
  "arrow-data",
  "arrow-schema",
- "chrono",
  "half",
  "hashbrown 0.15.5",
+ "jiff",
  "num",
 ]
 
 [[package]]
 name = "arrow-buffer"
 version = "53.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b5c681a99606f3316f2a99d9c8b6fa3aad0b1d34d8f6d7a1b471893940219d8"
+source = "git+https://github.com/ferrosadb/arrow-rs.git?rev=6e38b194#6e38b1940ed373eb5e0c9b759505a18c539bd7f5"
 dependencies = [
  "bytes",
  "half",
@@ -315,8 +311,7 @@ dependencies = [
 [[package]]
 name = "arrow-cast"
 version = "53.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6365f8527d4f87b133eeb862f9b8093c009d41a210b8f101f91aa2392f61daac"
+source = "git+https://github.com/ferrosadb/arrow-rs.git?rev=6e38b194#6e38b1940ed373eb5e0c9b759505a18c539bd7f5"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -325,8 +320,8 @@ dependencies = [
  "arrow-select",
  "atoi",
  "base64 0.22.1",
- "chrono",
  "half",
+ "jiff",
  "lexical-core",
  "num",
  "ryu",
@@ -335,15 +330,13 @@ dependencies = [
 [[package]]
 name = "arrow-csv"
 version = "53.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30dac4d23ac769300349197b845e0fd18c7f9f15d260d4659ae6b5a9ca06f586"
+source = "git+https://github.com/ferrosadb/arrow-rs.git?rev=6e38b194#6e38b1940ed373eb5e0c9b759505a18c539bd7f5"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-cast",
  "arrow-data",
  "arrow-schema",
- "chrono",
  "csv",
  "csv-core",
  "lazy_static",
@@ -354,8 +347,7 @@ dependencies = [
 [[package]]
 name = "arrow-data"
 version = "53.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd962fc3bf7f60705b25bcaa8eb3318b2545aa1d528656525ebdd6a17a6cd6fb"
+source = "git+https://github.com/ferrosadb/arrow-rs.git?rev=6e38b194#6e38b1940ed373eb5e0c9b759505a18c539bd7f5"
 dependencies = [
  "arrow-buffer",
  "arrow-schema",
@@ -366,8 +358,7 @@ dependencies = [
 [[package]]
 name = "arrow-flight"
 version = "53.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51e3a40b6ef36f4c17d1fae5af3438c3d6c660401f9ac8a4d921c27d368b8dee"
+source = "git+https://github.com/ferrosadb/arrow-rs.git?rev=6e38b194#6e38b1940ed373eb5e0c9b759505a18c539bd7f5"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -387,8 +378,7 @@ dependencies = [
 [[package]]
 name = "arrow-ipc"
 version = "53.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3527365b24372f9c948f16e53738eb098720eea2093ae73c7af04ac5e30a39b"
+source = "git+https://github.com/ferrosadb/arrow-rs.git?rev=6e38b194#6e38b1940ed373eb5e0c9b759505a18c539bd7f5"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -401,15 +391,13 @@ dependencies = [
 [[package]]
 name = "arrow-json"
 version = "53.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "acdec0024749fc0d95e025c0b0266d78613727b3b3a5d4cf8ea47eb6d38afdd1"
+source = "git+https://github.com/ferrosadb/arrow-rs.git?rev=6e38b194#6e38b1940ed373eb5e0c9b759505a18c539bd7f5"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-cast",
  "arrow-data",
  "arrow-schema",
- "chrono",
  "half",
  "indexmap 2.14.0",
  "lexical-core",
@@ -421,8 +409,7 @@ dependencies = [
 [[package]]
 name = "arrow-ord"
 version = "53.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "79af2db0e62a508d34ddf4f76bfd6109b6ecc845257c9cba6f939653668f89ac"
+source = "git+https://github.com/ferrosadb/arrow-rs.git?rev=6e38b194#6e38b1940ed373eb5e0c9b759505a18c539bd7f5"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -436,8 +423,7 @@ dependencies = [
 [[package]]
 name = "arrow-row"
 version = "53.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da30e9d10e9c52f09ea0cf15086d6d785c11ae8dcc3ea5f16d402221b6ac7735"
+source = "git+https://github.com/ferrosadb/arrow-rs.git?rev=6e38b194#6e38b1940ed373eb5e0c9b759505a18c539bd7f5"
 dependencies = [
  "ahash 0.8.12",
  "arrow-array",
@@ -450,14 +436,12 @@ dependencies = [
 [[package]]
 name = "arrow-schema"
 version = "53.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35b0f9c0c3582dd55db0f136d3b44bfa0189df07adcf7dc7f2f2e74db0f52eb8"
+source = "git+https://github.com/ferrosadb/arrow-rs.git?rev=6e38b194#6e38b1940ed373eb5e0c9b759505a18c539bd7f5"
 
 [[package]]
 name = "arrow-select"
 version = "53.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92fc337f01635218493c23da81a364daf38c694b05fc20569c3193c11c561984"
+source = "git+https://github.com/ferrosadb/arrow-rs.git?rev=6e38b194#6e38b1940ed373eb5e0c9b759505a18c539bd7f5"
 dependencies = [
  "ahash 0.8.12",
  "arrow-array",
@@ -470,8 +454,7 @@ dependencies = [
 [[package]]
 name = "arrow-string"
 version = "53.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d596a9fc25dae556672d5069b090331aca8acb93cae426d8b7dcdf1c558fa0ce"
+source = "git+https://github.com/ferrosadb/arrow-rs.git?rev=6e38b194#6e38b1940ed373eb5e0c9b759505a18c539bd7f5"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -2217,7 +2200,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3876,7 +3859,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4502,7 +4485,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5042,7 +5025,7 @@ checksum = "0afd5c28e4a399c57ee2bc3accd40c7b671fdc7b6537499f14e95b265af7d7e0"
 dependencies = [
  "oxilangtag",
  "oxiri",
- "rand 0.8.6",
+ "rand 0.9.4",
  "thiserror 1.0.69",
 ]
 
@@ -5747,7 +5730,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -6687,7 +6670,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6746,7 +6729,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7446,7 +7429,7 @@ dependencies = [
  "oxiri",
  "oxrdf",
  "peg",
- "rand 0.8.6",
+ "rand 0.9.4",
  "thiserror 1.0.69",
 ]
 
@@ -7697,7 +7680,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9249,7 +9232,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
