@@ -188,7 +188,7 @@
   },
   "toolchain": {
     "charon": "7b462d9159db2ed3015162352183906a30bfafc6",
-    "aeneas": "943e2625ff05a856b72ce197eeb5042f4302af25",
+    "aeneas": "0d04b2ae12b7dab9970e88cca8af07430a529da7",
     "lean": "Lean (version 4.35.0, x86_64-unknown-linux-gnu, commit eb6cafb7290e8bd5f2937522d8d804f58f02bafc, Release)"
   }
 }

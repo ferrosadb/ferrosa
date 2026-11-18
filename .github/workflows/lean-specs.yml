@@ -189,7 +189,7 @@ jobs:
       # check fails when these disagree with it -- comparing counts across toolchains is
       # meaningless, and a meaningless comparison must not pass.
       AENEAS_REPO: https://github.com/ferrosadb/aeneas
-      AENEAS_COMMIT: 943e2625ff05a856b72ce197eeb5042f4302af25
+      AENEAS_COMMIT: 0d04b2ae12b7dab9970e88cca8af07430a529da7
       CHARON_REPO: https://github.com/AeneasVerif/charon
       CHARON_COMMIT: 7b462d9159db2ed3015162352183906a30bfafc6
       # The inventory defaults REPO to the maintainer's checkout; on a runner it has to be
