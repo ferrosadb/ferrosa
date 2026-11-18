@@ -119,18 +119,28 @@ impl PairCoordinator {
                 alive: available,
             });
         }
-        self.apply_locally_async(mutation.clone(), Some(Arc::clone(&_admitted_write)))
-            .await?;
-        let replicated = if available > 1 {
-            let result = self.replicate_to_peer(mutation).await;
-            if required > 1 {
+        // The local apply (memtable + commit-log fsync) and the replica round
+        // trip (which fsyncs on the secondary) run concurrently: latency is the
+        // slower of the two device flushes instead of their sum. The ack still
+        // waits for both, so durability is unchanged; a failure on either side
+        // is returned exactly as before. A single mutation has no atomicity to
+        // tear, so the secondary may apply it before the primary's sync lands,
+        // the same unknown outcome a timed-out write already has.
+        let local = self.apply_locally_async(mutation.clone(), Some(Arc::clone(&_admitted_write)));
+        let (local, replica) = if available > 1 {
+            let (local, replica) = tokio::join!(local, self.replicate_to_peer(mutation));
+            (local, Some(replica))
+        } else {
+            (local.await, None)
+        };
+        local?;
+        let replicated = match replica {
+            Some(result) if required > 1 => {
                 result?;
                 true
-            } else {
-                result.is_ok()
             }
-        } else {
-            false
+            Some(result) => result.is_ok(),
+            None => false,
         };
         if self.strict_quorum
             && rf == 2

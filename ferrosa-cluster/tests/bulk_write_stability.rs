@@ -404,3 +404,49 @@ async fn bulk_writes_do_not_starve_probe_latency() {
          followers would miss heartbeats under this write load"
     );
 }
+
+/// A pair write replicates while the primary's own commit-log sync is still
+/// in flight, so its latency is the SLOWER of the two device flushes, not
+/// their sum.
+///
+/// Both nodes must still be durable before the write is acknowledged; only
+/// the order changes. Until 2026-11-18 the primary fsynced, and only then sent
+/// the mutation to the secondary, which fsynced again. Two serial flushes on a
+/// disk shared with other writers put p99 at 137 ms and a probe at 384 ms on
+/// CI (run 44390667223), past the 100 ms and 300 ms bounds above.
+///
+/// Holding the primary's real flush mutex stalls its local sync
+/// deterministically; the secondary must receive and apply the row anyway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn replication_proceeds_while_the_primary_sync_is_blocked() {
+    let (node1, _node2, storage1, storage2) = setup_pair().await;
+    let mutation = make_mutation(42, 42_000);
+    let table_id = TableId::new("test_ks", "test_tbl");
+    let runtime = tokio::runtime::Handle::current();
+
+    let mut write = None;
+    let mut replicated_while_blocked = false;
+    storage1.with_commit_log_flush_held_for_test(|| {
+        let coordinator = node1.coordinator().clone();
+        let sent = mutation.clone();
+        write = Some(runtime.spawn(async move { coordinator.coordinate_write(&sent).await }));
+        // Bounded poll for the positive event; 5 s is the failure verdict.
+        for _ in 0..5_000 {
+            if storage2.read(&table_id, &mutation.key).unwrap().is_some() {
+                replicated_while_blocked = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+
+    let acked = write.expect("write spawned").await.expect("write task");
+    assert!(
+        replicated_while_blocked,
+        "the secondary did not receive the write within 5 s while the primary's \
+         sync was blocked: replication waits for the primary's local fsync"
+    );
+    assert!(acked.is_ok(), "write failed after both syncs: {acked:?}");
+    assert!(storage1.read(&table_id, &mutation.key).unwrap().is_some());
+}
