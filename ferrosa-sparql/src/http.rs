@@ -389,12 +389,14 @@ async fn handle_health(State(state): State<AppState>) -> Response {
     }
 }
 
-/// Execute a SPARQL query and build the HTTP response.
+/// Execute a SPARQL query and STREAM the HTTP response.
 ///
-/// Parses the `Accept` header to determine the response format. Supports:
-/// - `text/turtle` -> Turtle serialization
-/// - `application/n-triples` -> N-Triples serialization
-/// - Default -> `application/sparql-results+json`
+/// The format is negotiated from the `Accept` header and the result's shape,
+/// which is known before any row exists. The first item is pulled before the
+/// status line is sent, so an error that surfaces immediately (an unsupported
+/// expression, a failed ORDER BY / COUNT input, a storage failure on the first
+/// read) is still a proper 4xx/5xx; an error after rows have been sent aborts
+/// the body (see [`crate::response`]).
 async fn execute_and_respond(
     state: &AppState,
     query: &str,
@@ -402,15 +404,39 @@ async fn execute_and_respond(
     accept: &str,
     base: Option<&str>,
 ) -> Response {
-    match state.engine.execute_with_base(query, keyspace, base).await {
-        Ok(result) => {
-            let Some(format) = crate::negotiation::negotiate(accept, &result) else {
-                return error_response(
-                    StatusCode::NOT_ACCEPTABLE,
-                    "no acceptable representation for this query form and RDF terms",
-                );
-            };
-            match result.serialize(format) {
+    use crate::engine::SparqlStream;
+    use crate::negotiation::{negotiate, ResultShape};
+    let result = match state
+        .engine
+        .execute_stream_with_base(query, keyspace, base)
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => return sparql_error_response(e),
+    };
+    let shape = match &result {
+        SparqlStream::Select { may_bind_rdf12, .. } => ResultShape {
+            graph: false,
+            rdf12: *may_bind_rdf12,
+        },
+        SparqlStream::Ask(_) => ResultShape {
+            graph: false,
+            rdf12: false,
+        },
+        SparqlStream::Graph(_) => ResultShape {
+            graph: true,
+            rdf12: false,
+        },
+    };
+    let Some(format) = negotiate(accept, shape) else {
+        return error_response(
+            StatusCode::NOT_ACCEPTABLE,
+            "no acceptable representation for this query form and RDF terms",
+        );
+    };
+    let body = match result {
+        SparqlStream::Ask(ask) => {
+            return match crate::engine::SparqlResult::Ask(ask).serialize(format) {
                 Ok(bytes) => (
                     StatusCode::OK,
                     [(header::CONTENT_TYPE, format.content_type())],
@@ -421,11 +447,53 @@ async fn execute_and_respond(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     &format!("serialization error: {e}"),
                 ),
-            }
+            };
         }
-        Err(crate::error::SparqlError::Parse(msg)) => error_response(StatusCode::BAD_REQUEST, &msg),
-        Err(crate::error::SparqlError::Plan(msg)) => error_response(StatusCode::BAD_REQUEST, &msg),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        SparqlStream::Select {
+            vars,
+            may_bind_rdf12,
+            rows,
+        } => match first_item_ok(rows).await {
+            Ok(rows) => crate::response::select_body(format, &vars, may_bind_rdf12, rows),
+            Err(e) => return sparql_error_response(e),
+        },
+        SparqlStream::Graph(triples) => match first_item_ok(triples).await {
+            Ok(triples) => crate::response::graph_body(triples),
+            Err(e) => return sparql_error_response(e),
+        },
+    };
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, format.content_type())],
+        axum::body::Body::from_stream(body),
+    )
+        .into_response()
+}
+
+/// Pull the first item; return its error, or the stream with it put back.
+async fn first_item_ok<T: Send + 'static>(
+    items: futures::stream::BoxStream<'static, Result<T, crate::error::SparqlError>>,
+) -> Result<
+    futures::stream::BoxStream<'static, Result<T, crate::error::SparqlError>>,
+    crate::error::SparqlError,
+> {
+    use futures::StreamExt;
+    let mut items = items.peekable();
+    if let Some(Err(_)) = std::pin::Pin::new(&mut items).peek().await {
+        if let Some(Err(e)) = items.next().await {
+            return Err(e);
+        }
+    }
+    Ok(items.boxed())
+}
+
+/// A parse or plan error is the client's (400); anything else the server's.
+fn sparql_error_response(e: crate::error::SparqlError) -> Response {
+    match e {
+        crate::error::SparqlError::Parse(msg) | crate::error::SparqlError::Plan(msg) => {
+            error_response(StatusCode::BAD_REQUEST, &msg)
+        }
+        e => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
 

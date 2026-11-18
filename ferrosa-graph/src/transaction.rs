@@ -81,18 +81,16 @@ impl LocalTransaction {
 
     fn stage(&self, mutations: Vec<Mutation>) -> ferrosa_common::Result<()> {
         self.check_deadline()?;
-        let bytes = mutations.iter().try_fold(0usize, |total, m| {
-            let overhead = 512usize.saturating_add(
-                m.rows
-                    .iter()
-                    .map(|r| 128usize.saturating_add(r.cells.len().saturating_mul(128)))
-                    .sum::<usize>(),
-            );
-            total
-                .checked_add(m.serialized_size().saturating_mul(2))
-                .and_then(|n| n.checked_add(overhead))
-                .ok_or_else(|| invalid("transaction pending memory limit exceeded"))
-        })?;
+        let mut bytes = 0usize;
+        for m in &mutations {
+            let Some(total) = bytes.checked_add(m.serialized_size().saturating_mul(2)) else {
+                return Err(invalid("transaction pending memory limit exceeded"));
+            };
+            let Some(total) = total.checked_add(pending_overhead(m)) else {
+                return Err(invalid("transaction pending memory limit exceeded"));
+            };
+            bytes = total;
+        }
         let mut pending = self.pending.lock().unwrap();
         if pending.bytes.saturating_add(bytes) > MAX_PENDING_BYTES {
             return Err(invalid("transaction pending memory limit exceeded (8 MiB)"));
@@ -146,6 +144,17 @@ impl LocalTransaction {
     }
 }
 
+/// Estimated in-memory overhead of one staged mutation beyond its serialized
+/// bytes: a fixed 512 plus 128 per row and 128 per cell.
+fn pending_overhead(m: &Mutation) -> usize {
+    let mut overhead = 512usize;
+    for r in &m.rows {
+        overhead =
+            overhead.saturating_add(128usize.saturating_add(r.cells.len().saturating_mul(128)));
+    }
+    overhead
+}
+
 fn merged(base: Option<Partition>, mutations: Vec<Arc<Mutation>>, limit: usize) -> Partition {
     let mut parts: Vec<_> = base.into_iter().collect();
     // The overlay retains shared handles only. Materialize the consumed key,
@@ -160,9 +169,13 @@ fn merged(base: Option<Partition>, mutations: Vec<Arc<Mutation>>, limit: usize) 
         });
     }
     let mut partition = ferrosa_storage::merge_partitions(parts);
-    partition
-        .rows
-        .retain(|row| !crate::adjacency::schema::row_is_deleted(row));
+    // Keep the live rows; each is moved, never copied.
+    let rows = std::mem::take(&mut partition.rows);
+    for row in rows {
+        if !crate::adjacency::schema::row_is_deleted(&row) {
+            partition.rows.push(row);
+        }
+    }
     if limit != 0 {
         partition.rows.truncate(limit);
     }
@@ -258,7 +271,7 @@ impl GraphWrite for LocalTransaction {
         &self,
         table_id: &TableId,
         key: &DecoratedKey,
-        row: Row,
+        row: Arc<Row>,
         timestamp: i64,
         _cl: ConsistencyLevel,
         _strategy: &ReplicationStrategy,
@@ -278,5 +291,28 @@ impl GraphWrite for LocalTransaction {
         _rf: usize,
     ) -> ferrosa_common::Result<()> {
         self.stage(mutations)
+    }
+    /// The explicit transaction's overlay is its own bounded resident buffer
+    /// (`MAX_PENDING_BYTES`); the staged set is moved into it one mutation at a
+    /// time. All or nothing, like [`Self::write_batch`]: if the bound is reached
+    /// partway, the mutations this call staged are taken back out.
+    async fn write_staged_batch(
+        &self,
+        batch: ferrosa_storage::write_set_stage::StagedWriteSet,
+        _cl: ConsistencyLevel,
+        _rf: usize,
+    ) -> ferrosa_common::Result<()> {
+        use ferrosa_storage::write_set_stage::WriteSetSource as _;
+        let (staged_before, bytes_before) = {
+            let pending = self.pending.lock().unwrap();
+            (pending.mutations.len(), pending.bytes)
+        };
+        let staged = batch.for_each_owned_mutation(&mut |mutation| self.stage(vec![mutation]));
+        if staged.is_err() {
+            let mut pending = self.pending.lock().unwrap();
+            pending.mutations.truncate(staged_before);
+            pending.bytes = bytes_before;
+        }
+        staged
     }
 }

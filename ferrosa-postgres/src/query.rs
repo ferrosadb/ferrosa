@@ -36,6 +36,8 @@
 
 use std::sync::Arc;
 
+use ferrosa_common::temporal::parse::{self, formats};
+use ferrosa_common::temporal::{Date, DateTime};
 use ferrosa_common::timeuuid::is_synthetic_key_column;
 use ferrosa_common::{CqlType, CqlValue};
 use ferrosa_schema::{ColumnKind, Schema};
@@ -300,20 +302,19 @@ pub(crate) fn encode_error_response(error: &EncodeError) -> BackendMessage {
 /// microsecond part is zero (e.g. `2024-01-15 10:30:00`, `2024-01-15 10:30:00.5`).
 fn render_timestamp_text(micros: i64) -> String {
     let (secs, sub_micros) = div_floor_rem(micros, 1_000_000);
-    let dt = chrono::DateTime::from_timestamp(secs, 0).expect("timestamp micros in chrono range");
-    let date_time = dt.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string();
+    let date_time = DateTime::from_timestamp(secs, 0)
+        .expect("timestamp micros in the calendar range")
+        .format_ymd_hms();
     format!("{date_time}{}", fractional_suffix(sub_micros as u32))
 }
 
 /// Render a [`SqlValue::Date`] (days since the Unix epoch) as Postgres `date`
 /// text: `YYYY-MM-DD`.
 fn render_date_text(days: i32) -> String {
-    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch is valid");
     // Signed day offset (works for pre-1970 negative days too).
-    let d = epoch
-        .checked_add_signed(chrono::Duration::days(i64::from(days)))
-        .expect("date days in chrono range");
-    d.format("%Y-%m-%d").to_string()
+    Date::from_days_since_epoch(i64::from(days))
+        .expect("date days in the calendar range")
+        .to_string()
 }
 
 /// Render a [`SqlValue::Time`] (microseconds since midnight) as Postgres `time`
@@ -636,12 +637,8 @@ fn decode_param_text(type_oid: i32, raw: &[u8]) -> Result<SqlValue, ParamError> 
 /// micros, UTC). Returns `None` on a malformed value (lenient, no panic).
 fn parse_timestamp_text(s: &str) -> Option<SqlValue> {
     let s = s.trim();
-    let naive = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
-        .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f"))
-        .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
-        .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"))
-        .ok()?;
-    let micros = naive.and_utc().timestamp_micros();
+    let naive = parse::first_naive_datetime(s, parse::SQL_TIMESTAMP)?;
+    let micros = naive.timestamp_micros();
     Some(SqlValue::Timestamp(micros))
 }
 
@@ -649,8 +646,8 @@ fn parse_timestamp_text(s: &str) -> Option<SqlValue> {
 /// session timezone; named timezone/session conversion is not implemented.
 fn parse_timestamptz_text(s: &str) -> Option<SqlValue> {
     let s = s.trim();
-    chrono::DateTime::parse_from_rfc3339(s)
-        .or_else(|_| chrono::DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f%#z"))
+    parse::rfc3339(s)
+        .or_else(|_| parse::datetime_with_offset(s, formats::YMD_HMS_FRAC_OFFSET_PERMISSIVE))
         .map(|instant| SqlValue::Timestamp(instant.timestamp_micros()))
         .ok()
         .or_else(|| parse_timestamp_text(s))
@@ -659,20 +656,15 @@ fn parse_timestamptz_text(s: &str) -> Option<SqlValue> {
 /// Parse Postgres `date` text (`YYYY-MM-DD`) into [`SqlValue::Date`] (days since
 /// the Unix epoch).
 fn parse_date_text(s: &str) -> Option<SqlValue> {
-    let date = chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok()?;
-    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)?;
-    let days = (date - epoch).num_days();
+    let days = parse::date(s.trim(), formats::YMD).ok()?.days_since_epoch();
     Some(SqlValue::Date(i32::try_from(days).ok()?))
 }
 
 /// Parse Postgres `time` text (`HH:MM:SS[.ffffff]`) into [`SqlValue::Time`]
 /// (microseconds since midnight).
 fn parse_time_text(s: &str) -> Option<SqlValue> {
-    let t = chrono::NaiveTime::parse_from_str(s.trim(), "%H:%M:%S%.f")
-        .or_else(|_| chrono::NaiveTime::parse_from_str(s.trim(), "%H:%M:%S"))
-        .ok()?;
-    let midnight = chrono::NaiveTime::from_hms_opt(0, 0, 0)?;
-    let micros = (t - midnight).num_microseconds()?;
+    let t = parse::time(s.trim(), formats::HMS_FRAC).ok()?;
+    let micros = t.nanos_since_midnight() / 1000;
     Some(SqlValue::Time(micros))
 }
 
@@ -2403,7 +2395,7 @@ pub(crate) async fn execute_truncate(
             keyspace,
             table,
             ferrosa_storage::table_tombstone::table_tombstone_key(),
-            vec![marker],
+            vec![Arc::new(marker)],
             marked_for_delete_at,
         );
         if let Err(messages) = apply_or_buffer_silent(
@@ -3535,7 +3527,7 @@ pub(crate) async fn execute_insert(
                 ks.to_string(),
                 ins.table.table.clone(),
                 key,
-                vec![row],
+                vec![Arc::new(row)],
                 timestamp,
             ),
             meta.id,
@@ -4338,7 +4330,7 @@ fn build_update_mutation(
         ctx.ks.to_string(),
         ctx.table.to_string(),
         key,
-        vec![row],
+        vec![Arc::new(row)],
         timestamp,
     );
     Ok((mutation, assigned_sql))
@@ -4828,7 +4820,7 @@ pub(crate) fn build_delete_mutation(
         ks.to_string(),
         table.to_string(),
         key,
-        vec![row],
+        vec![Arc::new(row)],
         timestamp,
     ))
 }
@@ -7773,14 +7765,14 @@ mod txn_buffer_tests {
             .write(
                 &table,
                 &key,
-                ferrosa_sstable::types::Row {
+                Arc::new(ferrosa_sstable::types::Row {
                     clustering: vec![],
                     cells: vec![(0, ferrosa_common::cell::CellValue::live(vec![0xff], 1000))],
                     deletion: ferrosa_sstable::types::DeletionTime::LIVE,
                     primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
                         1000,
                     ),
-                },
+                }),
                 1000,
             )
             .unwrap();
@@ -7862,12 +7854,12 @@ mod txn_buffer_tests {
                 .write(
                     &table,
                     &key,
-                    StoredRow {
+                    Arc::new(StoredRow {
                         clustering: vec![],
                         cells: vec![(0, cell)],
                         deletion,
                         primary_key_liveness: liveness,
-                    },
+                    }),
                     4000,
                 )
                 .unwrap();
@@ -8799,7 +8791,7 @@ mod txn_buffer_tests {
                 "public".into(),
                 "kv".into(),
                 key,
-                vec![row],
+                vec![Arc::new(row)],
                 1,
             ));
         }
@@ -8843,7 +8835,7 @@ mod txn_buffer_tests {
                         meta.keyspace.clone(),
                         meta.name.clone(),
                         key.clone(),
-                        vec![row],
+                        vec![Arc::new(row)],
                         1,
                     ),
                     meta.id,

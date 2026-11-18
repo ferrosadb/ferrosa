@@ -6166,7 +6166,7 @@ pub(crate) mod txn_atomicity_tests {
             .write(
                 &ferrosa_storage::TableId::new("public", "kv"),
                 &key,
-                row,
+                Arc::new(row),
                 i64::MAX - 1,
             )
             .unwrap();
@@ -6203,7 +6203,7 @@ pub(crate) mod txn_atomicity_tests {
             .write(
                 &ferrosa_storage::TableId::new("public", "kv"),
                 &key,
-                row,
+                Arc::new(row),
                 9000,
             )
             .unwrap();
@@ -6331,14 +6331,14 @@ pub(crate) mod txn_atomicity_tests {
             .write(
                 &ferrosa_storage::TableId::new("public", "kv"),
                 &key,
-                ferrosa_sstable::types::Row {
+                Arc::new(ferrosa_sstable::types::Row {
                     clustering: vec![],
                     cells: vec![(0, ferrosa_common::CellValue::live(b"before".to_vec(), 9000))],
                     deletion: ferrosa_sstable::types::DeletionTime::LIVE,
                     primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
                         9000,
                     ),
-                },
+                }),
                 9000,
             )
             .unwrap();
@@ -6413,7 +6413,7 @@ pub(crate) mod txn_atomicity_tests {
             .write(
                 &ferrosa_storage::TableId::new("public", "float_keys"),
                 &key,
-                ferrosa_sstable::types::Row {
+                Arc::new(ferrosa_sstable::types::Row {
                     clustering: vec![],
                     cells: vec![(
                         0,
@@ -6423,7 +6423,7 @@ pub(crate) mod txn_atomicity_tests {
                     primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
                         9000,
                     ),
-                },
+                }),
                 9000,
             )
             .unwrap();

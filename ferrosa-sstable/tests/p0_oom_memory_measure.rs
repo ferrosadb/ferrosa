@@ -13,6 +13,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::Arc;
 
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
 use ferrosa_sstable::io::FileReadAt;
@@ -64,6 +65,18 @@ fn measure_peak<R>(f: impl FnOnce() -> R) -> (R, i64) {
 
 const VALUE_BYTES: usize = 1000;
 
+/// The materializing baseline the streaming reads are measured against:
+/// every partition collected into one `Vec`, as a vector-returning read would.
+/// Test-only — the reader itself no longer has a vector-returning scan.
+fn materialize<R: ferrosa_sstable::io::ReadAt>(reader: &SSTableReader<R>) -> Vec<Partition> {
+    let mut iter = reader.partitions_iter().expect("iter");
+    let mut all = Vec::new();
+    while let Some(p) = iter.next_partition().expect("next") {
+        all.push(p);
+    }
+    all
+}
+
 fn header() -> SerializationHeader {
     SerializationHeader {
         complex_collections: false,
@@ -96,7 +109,7 @@ fn partition(idx: usize, rows: usize) -> Partition {
         key,
         deletion: DeletionTime::LIVE,
         static_row: None,
-        rows: body,
+        rows: body.into_iter().map(Arc::new).collect(),
     }
 }
 
@@ -159,7 +172,7 @@ fn report(
 }
 
 /// The core question: does the SSTable read path's peak heap scale with the
-/// FILE SIZE? Materializing (`read_partitions_limited_rows`) SHOULD; streaming
+/// FILE SIZE? Materializing (collecting every partition) SHOULD; streaming
 /// (`partitions_iter` + `next_partition`, dropping each) should NOT.
 #[test]
 fn sstable_read_peak_scales_with_file_only_for_the_materializing_path() {
@@ -197,18 +210,8 @@ fn sstable_read_peak_scales_with_file_only_for_the_materializing_path() {
     });
 
     // Materializing baseline: peak should track the whole file.
-    let (small_count, small_mat) = measure_peak(|| {
-        small
-            .read_partitions_limited_rows(SMALL, 0)
-            .expect("bounded read")
-            .len()
-    });
-    let (large_count, large_mat) = measure_peak(|| {
-        large
-            .read_partitions_limited_rows(LARGE, 0)
-            .expect("bounded read")
-            .len()
-    });
+    let (small_count, small_mat) = measure_peak(|| materialize(&small).len());
+    let (large_count, large_mat) = measure_peak(|| materialize(&large).len());
     assert_eq!(small_count, SMALL);
     assert_eq!(large_count, LARGE);
 

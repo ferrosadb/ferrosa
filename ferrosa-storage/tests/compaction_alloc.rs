@@ -11,6 +11,7 @@ use ferrosa_storage::{
 };
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 struct Counter;
 static EVENTS: AtomicUsize = AtomicUsize::new(0);
@@ -49,7 +50,7 @@ fn partition(rows: Vec<Row>) -> Partition {
         key: DecoratedKey::new(PartitionKey::new(b"p".to_vec())),
         deletion: DeletionTime::LIVE,
         static_row: None,
-        rows,
+        rows: rows.into_iter().map(Arc::new).collect(),
     }
 }
 

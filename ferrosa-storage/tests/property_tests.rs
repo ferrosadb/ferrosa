@@ -1,6 +1,7 @@
 //! Property-based tests for ferrosa-storage.
 
 use proptest::prelude::*;
+use std::sync::Arc;
 
 use ferrosa_common::cell::CellValue;
 use ferrosa_common::key::{DecoratedKey, PartitionKey};
@@ -41,12 +42,12 @@ fn make_partition(key: &str, value: &[u8], ts: i64) -> Partition {
         key: make_key(key),
         deletion: DeletionTime::LIVE,
         static_row: None,
-        rows: vec![Row {
+        rows: vec![Arc::new(Row {
             clustering: vec![0x00, 0x00, 0x00, 0x01],
             cells: vec![(0, CellValue::live(value.to_vec(), ts))],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(ts),
-        }],
+        })],
     }
 }
 
@@ -67,7 +68,7 @@ proptest! {
             primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
         };
 
-        mem.put(&key, row, &schema).unwrap();
+        mem.put(&key, Arc::new(row), &schema).unwrap();
         let result = mem.get(&key).unwrap();
         prop_assert!(result.is_some());
         let partition = result.unwrap();
@@ -119,7 +120,7 @@ proptest! {
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1000 + i as i64),
             };
-            store.write(&key, row).unwrap();
+            store.write(&key, Arc::new(row)).unwrap();
             keys.push(key);
         }
 

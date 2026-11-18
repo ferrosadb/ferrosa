@@ -550,14 +550,14 @@ async fn write_batch(
     table: &str,
     batch: &RecordBatch,
 ) -> Result<i64, Status> {
-    let (names, rows) = crate::convert::record_batch_to_rows(batch)
+    let (names, rows) = crate::convert::record_batch_rows(batch)
         .map_err(|e| Status::invalid_argument(format!("Arrow conversion failed: {e}")))?;
     // Render every INSERT before writing any: an unrenderable column fails the
     // whole batch up front, so no row lands without it. O(batch) memory; the
     // upload itself still streams batch by batch.
     let mut statements = Vec::with_capacity(rows.len());
-    for row in &rows {
-        if let Some(sql) = build_insert(table, &names, row)? {
+    for row in rows {
+        if let Some(sql) = build_insert(table, &names, &row)? {
             statements.push(sql);
         }
     }

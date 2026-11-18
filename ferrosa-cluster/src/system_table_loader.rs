@@ -902,12 +902,13 @@ mod tests {
             "positive create control: {tid}"
         );
         let future = i64::MAX - 4096;
-        for mut row in initial.rows {
+        for mut shared in initial.rows {
+            let row = std::sync::Arc::make_mut(&mut shared);
             row.primary_key_liveness.timestamp = future;
             for (_, cell) in &mut row.cells {
                 cell.timestamp = future;
             }
-            engine.write(&tid, &key, row, future).unwrap();
+            engine.write(&tid, &key, shared, future).unwrap();
         }
         writer.apply(drop_mutation).unwrap();
         let deleted = engine.read(&tid, &key).unwrap().unwrap();
@@ -1006,12 +1007,13 @@ mod tests {
         let initial = engine.read(&columns, &key).unwrap().unwrap();
         assert!(!initial.rows.is_empty());
         let future = i64::MAX - 4096;
-        for mut row in initial.rows {
+        for mut shared in initial.rows {
+            let row = std::sync::Arc::make_mut(&mut shared);
             row.primary_key_liveness.timestamp = future;
             for (_, cell) in &mut row.cells {
                 cell.timestamp = future;
             }
-            engine.write(&columns, &key, row, future).unwrap();
+            engine.write(&columns, &key, shared, future).unwrap();
         }
         writer
             .apply(SystemTableMutation::TableDropped {
@@ -1067,12 +1069,12 @@ mod tests {
             .write(
                 &members,
                 &key,
-                Row {
+                Arc::new(Row {
                     clustering: b"old_parent".to_vec(),
                     cells: vec![],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(i64::MAX),
-                },
+                }),
                 i64::MAX,
             )
             .unwrap();
@@ -1221,7 +1223,7 @@ mod tests {
             .write(
                 &TableId::new("system_auth", "roles"),
                 &key,
-                row,
+                Arc::new(row),
                 earlier_timestamp,
             )
             .unwrap();
@@ -1283,7 +1285,7 @@ mod tests {
         }
         let roles = TableId::new("system_auth", "roles");
         let permissions = TableId::new("system_auth", "role_permissions");
-        engine.write(&roles, &key, row, future).unwrap();
+        engine.write(&roles, &key, Arc::new(row), future).unwrap();
         let mut writer = SystemTableWriter::new(Arc::clone(&engine));
         writer.set_permission_timestamp_for_test(future);
         writer
@@ -1342,12 +1344,12 @@ mod tests {
             .write(
                 &tid,
                 &key,
-                Row {
+                Arc::new(Row {
                     clustering: grant.resource.to_string().into_bytes(),
                     cells: vec![],
                     deletion: DeletionTime::new(8_000_000, 8),
                     primary_key_liveness: LivenessInfo::NONE,
-                },
+                }),
                 8_000_000,
             )
             .unwrap();
@@ -1355,12 +1357,12 @@ mod tests {
             .write(
                 &tid,
                 &key,
-                Row {
+                Arc::new(Row {
                     clustering: vec![],
                     cells: vec![],
                     deletion: DeletionTime::new(3_000_000, 3),
                     primary_key_liveness: LivenessInfo::NONE,
-                },
+                }),
                 3_000_000,
             )
             .unwrap();
@@ -1442,12 +1444,12 @@ mod tests {
             .write(
                 &tid,
                 &key,
-                Row {
+                Arc::new(Row {
                     clustering: vec![],
                     cells: vec![],
                     deletion: DeletionTime::new(3_000_000, 3),
                     primary_key_liveness: LivenessInfo::NONE,
-                },
+                }),
                 3_000_000,
             )
             .unwrap();

@@ -17,6 +17,7 @@ use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 use ferrosa_storage::Mutation;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::sync::Arc;
 
 struct Counter;
 thread_local! {
@@ -132,7 +133,7 @@ fn single_row_encode_matches_the_mutation_encoder_and_copies_no_row() {
         keyspace.to_string(),
         table.to_string(),
         key.clone(),
-        vec![row.clone()],
+        vec![Arc::new(row.clone())],
         timestamp,
     );
     let from_owned = encode_mutation(&owned);
@@ -152,7 +153,7 @@ fn single_row_encode_matches_the_mutation_encoder_and_copies_no_row() {
     let decoded = decode_mutation(&borrowed).expect("decode the encoded single-row mutation");
     assert_eq!(
         decoded.rows,
-        vec![row.clone()],
+        vec![Arc::new(row.clone())],
         "row bytes changed on the wire"
     );
     assert_eq!(decoded.key, key, "partition key changed on the wire");

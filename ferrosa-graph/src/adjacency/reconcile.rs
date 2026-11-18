@@ -639,8 +639,8 @@ async fn complete_shared_entry_support(
                 derive_adjacency_row_mutations(schema, edge_tid, &partition.key, row, written_at)
             {
                 for row in derived.rows {
-                    let Some(entry) =
-                        expected.get_mut(&(derived.key.key.as_bytes().to_vec(), row.clustering))
+                    let Some(entry) = expected
+                        .get_mut(&(derived.key.key.as_bytes().to_vec(), row.clustering.clone()))
                     else {
                         continue;
                     };
@@ -1036,7 +1036,7 @@ async fn reconcile_entry(
         index.table_id.keyspace.clone(),
         index.table_id.table.clone(),
         entry.vertex_key.clone(),
-        vec![row],
+        vec![Arc::new(row)],
         at,
     );
     match write_mutation(write_path, index, repair).await {
@@ -1129,7 +1129,7 @@ async fn write_tombstone(
         .write(
             &index.table_id,
             vertex_key,
-            tombstone_row,
+            Arc::new(tombstone_row),
             now_us,
             INDEX_CONSISTENCY,
             &index.strategy,
@@ -1442,7 +1442,7 @@ mod tests {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };
-        storage.write(&edge_tid, &key, row, 1000).unwrap();
+        storage.write(&edge_tid, &key, Arc::new(row), 1000).unwrap();
     }
 
     #[test]
@@ -1588,7 +1588,7 @@ mod tests {
         };
         let key = DecoratedKey::new(PartitionKey::new(source.to_vec()));
         storage
-            .write(&TableId::new("social", table), &key, row, ts)
+            .write(&TableId::new("social", table), &key, Arc::new(row), ts)
             .unwrap();
     }
 
@@ -1633,7 +1633,7 @@ mod tests {
             primary_key_liveness: LivenessInfo::NONE,
         };
         storage
-            .write(&adj_tid, &entry.key, tombstone, now_micros())
+            .write(&adj_tid, &entry.key, Arc::new(tombstone), now_micros())
             .unwrap();
         let second = reconcile_once(&schema, &wp, "social").await;
         assert_eq!(

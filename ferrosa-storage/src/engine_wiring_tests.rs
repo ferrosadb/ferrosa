@@ -32,7 +32,7 @@ async fn wiring_flush_compaction_restart_components() {
                     .write(
                         &tid,
                         &make_key(&format!("k{n}")),
-                        make_row(&value, 1000 + n),
+                        Arc::new(make_row(&value, 1000 + n)),
                         1000 + n,
                     )
                     .unwrap();
@@ -128,7 +128,7 @@ fn wiring_runtime_settings_preserve_component_bytes() {
                 .write(
                     &tid,
                     &make_key("wide"),
-                    make_row(&vec![b'x'; 300_000], 1000),
+                    Arc::new(make_row(&vec![b'x'; 300_000], 1000)),
                     1000,
                 )
                 .unwrap();

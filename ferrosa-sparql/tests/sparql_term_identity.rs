@@ -128,7 +128,7 @@ impl Fixture {
         .await
     }
 
-    fn raw_rows(&self, graph: &str) -> Vec<Row> {
+    fn raw_rows(&self, graph: &str) -> Vec<std::sync::Arc<Row>> {
         self.storage
             .read(&triples_table_id(KS), &partition_key(graph, S))
             .expect("read real stored partition")
@@ -315,7 +315,7 @@ async fn legacy_two_component_row_preserves_literal_metadata_after_flush() {
         .write(
             &ferrosa_storage::TableId::new(KS, "rdf_triples"),
             &partition_key(G, S),
-            Row {
+            Arc::new(Row {
                 clustering,
                 // Historic ordinals: object_type=0, datatype=1, language=2.
                 cells: vec![
@@ -324,7 +324,7 @@ async fn legacy_two_component_row_preserves_literal_metadata_after_flush() {
                 ],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
-            },
+            }),
             timestamp,
         )
         .unwrap();

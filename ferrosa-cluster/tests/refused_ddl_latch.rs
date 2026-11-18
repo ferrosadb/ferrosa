@@ -15,6 +15,7 @@
 //! this file covers the keyspace-level DROP and the CREATE that trips over the
 //! directory such a DROP could not remove.
 
+use std::sync::Arc;
 mod common;
 
 use std::collections::HashMap;
@@ -191,7 +192,7 @@ async fn a_refused_drop_keyspace_surfaces_and_leaves_the_core_serving() {
                 .write(
                     &tid,
                     &DecoratedKey::new(PartitionKey::new(format!("old{i}").into_bytes())),
-                    row(b"stale", 1),
+                    Arc::new(row(b"stale", 1)),
                     1,
                 )
                 .unwrap_or_else(|e| panic!("seed row on leader: {e}"));
@@ -337,7 +338,7 @@ async fn a_create_over_an_unremovable_directory_surfaces_and_leaves_the_core_ser
                 .write(
                     &tid,
                     &DecoratedKey::new(PartitionKey::new(format!("old{i}").into_bytes())),
-                    row(b"stale", 1),
+                    Arc::new(row(b"stale", 1)),
                     1,
                 )
                 .unwrap_or_else(|e| panic!("seed row on leader: {e}"));

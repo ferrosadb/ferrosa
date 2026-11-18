@@ -21,6 +21,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -234,7 +235,7 @@ where
 {
     let static_count = schema.static_columns.len();
     let mut quarantined = 0usize;
-    let mut surviving: Vec<Row> = Vec::with_capacity(partition.rows.len());
+    let mut surviving: Vec<Arc<Row>> = Vec::with_capacity(partition.rows.len());
     let mut writer_factory = Some(make_writer);
 
     for row in std::mem::take(&mut partition.rows) {
@@ -385,9 +386,9 @@ mod tests {
             deletion: DeletionTime::LIVE,
             static_row: None,
             rows: vec![
-                row_with_cell(0, &[0u8; 16]), // good
-                row_with_cell(0, &[0u8; 8]),  // bad
-                row_with_cell(0, &[0u8; 16]), // good
+                Arc::new(row_with_cell(0, &[0u8; 16])), // good
+                Arc::new(row_with_cell(0, &[0u8; 8])),  // bad
+                Arc::new(row_with_cell(0, &[0u8; 16])), // good
             ],
         };
 
@@ -423,7 +424,10 @@ mod tests {
             key,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row_with_cell(0, &[0u8; 16]), row_with_cell(0, &[0u8; 16])],
+            rows: vec![
+                Arc::new(row_with_cell(0, &[0u8; 16])),
+                Arc::new(row_with_cell(0, &[0u8; 16])),
+            ],
         };
 
         let mut writer: Option<QuarantineWriter> = None;

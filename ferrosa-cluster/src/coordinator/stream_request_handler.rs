@@ -35,8 +35,8 @@ use ferrosa_storage::TableId;
 
 use super::stream_producer::ChunkSink;
 use crate::raft::handlers::{
-    RangeReadStreamCancelPayload, RangeReadStreamDonePayload, RangeReadStreamHeartbeatPayload,
-    RangeReadStreamRequestPayload,
+    IndexReadInPartitionStreamRequestPayload, RangeReadStreamCancelPayload,
+    RangeReadStreamDonePayload, RangeReadStreamHeartbeatPayload, RangeReadStreamRequestPayload,
 };
 
 /// How often to emit a `RangeReadStreamHeartbeat` while a slow
@@ -119,6 +119,24 @@ pub trait StreamRangeReader: Send + Sync {
         ))
     }
 
+    /// Open a lazy stream over the rows of ONE partition matching a
+    /// secondary-index key, in clustering order, strictly after the
+    /// clustering `after` when given. Same contract as
+    /// [`Self::index_iter`]: postings are visited incrementally, never
+    /// collected.
+    fn index_partition_iter<'a>(
+        &'a self,
+        _table_id: &TableId,
+        _index_name: &str,
+        _index_key: &[u8],
+        _partition_key: &[u8],
+        _after: Option<&[u8]>,
+    ) -> ferrosa_common::Result<PartitionStream<'a>> {
+        Err(ferrosa_common::Error::InvalidData(
+            "streaming keyed index reads are not supported by this reader".into(),
+        ))
+    }
+
     /// Monotonic I/O progress behind this reader's walks (bytes downloaded by
     /// rehydration, for the engine). A walk that yields no rows while this
     /// advances is waiting on I/O, not stuck, and may still heartbeat.
@@ -181,6 +199,24 @@ impl StreamRangeReader for Arc<ferrosa_storage::StorageEngine> {
         Ok(self.read_by_index_stream_after(table_id, index_name, &key, after.cloned()))
     }
 
+    fn index_partition_iter<'a>(
+        &'a self,
+        table_id: &TableId,
+        index_name: &str,
+        index_key: &[u8],
+        partition_key: &[u8],
+        after: Option<&[u8]>,
+    ) -> ferrosa_common::Result<PartitionStream<'a>> {
+        let key = ferrosa_index::IndexKey(index_key.to_vec());
+        Ok(self.read_by_index_in_partition_stream_after(
+            table_id,
+            index_name,
+            &key,
+            partition_key,
+            after.map(<[u8]>::to_vec),
+        ))
+    }
+
     fn io_progress(&self) -> u64 {
         ferrosa_storage::metrics::object_store_download_progress()
     }
@@ -208,6 +244,77 @@ pub async fn handle_stream_request<R, S>(
 
 pub async fn handle_stream_request_with_cancel<R, S>(
     req: RangeReadStreamRequestPayload,
+    reader: Arc<R>,
+    sink: &S,
+    chunk_size: usize,
+    cancel: CancellationToken,
+) where
+    R: StreamRangeReader + 'static,
+    S: ChunkSink,
+{
+    pump_stream_request(req, None, reader, sink, chunk_size, cancel).await;
+}
+
+/// Serve a streaming KEYED index read (`IndexReadInPartitionStreamRequest`)
+/// through the same producer as a range or global index stream: bounded
+/// chunk frames, progress-gated heartbeats, a `max_chunks` window ended by a
+/// `Done` carrying the resume position, and cancellation. The partition's
+/// matches stream from [`StreamRangeReader::index_partition_iter`]; a
+/// continuation's `after_clustering` resumes strictly after the last row the
+/// previous window delivered.
+pub async fn handle_keyed_index_stream_request_with_cancel<R, S>(
+    keyed: IndexReadInPartitionStreamRequestPayload,
+    reader: Arc<R>,
+    sink: &S,
+    chunk_size: usize,
+    cancel: CancellationToken,
+) where
+    R: StreamRangeReader + 'static,
+    S: ChunkSink,
+{
+    let IndexReadInPartitionStreamRequestPayload {
+        request_id,
+        keyspace,
+        table,
+        index_name,
+        index_key,
+        partition_key,
+        after_clustering,
+        max_chunks,
+    } = keyed;
+    // The framing is the range stream's; its resume fields carry the cursor
+    // so the shared within-partition filter and the Done resume position
+    // apply unchanged.
+    let req = RangeReadStreamRequestPayload {
+        request_id,
+        keyspace,
+        table,
+        index_name: Some(index_name),
+        index_key: Some(index_key),
+        projected_regular_ordinals: None,
+        start_key: after_clustering.as_ref().map(|_| partition_key.clone()),
+        start_clustering: after_clustering,
+        max_chunks,
+    };
+    if max_chunks == 0 {
+        // An unbounded window fire-hoses the coordinator's bounded route;
+        // refuse it loudly rather than serve it.
+        tracing::warn!(
+            request_id,
+            "keyed index stream request without a window (max_chunks = 0); refusing"
+        );
+        send_truncated_done(&req, sink, &cancel).await;
+        return;
+    }
+    pump_stream_request(req, Some(partition_key), reader, sink, chunk_size, cancel).await;
+}
+
+/// The producer behind every stream request: open the source `req` names —
+/// scoped to `keyed_partition` for a keyed index read — and pump it out in
+/// bounded, windowed chunk frames.
+async fn pump_stream_request<R, S>(
+    req: RangeReadStreamRequestPayload,
+    keyed_partition: Option<Vec<u8>>,
     reader: Arc<R>,
     sink: &S,
     chunk_size: usize,
@@ -244,11 +351,18 @@ pub async fn handle_stream_request_with_cancel<R, S>(
 
     // Open the lazy partition stream. Errors here are open-time
     // (table not found, etc.) — emit a truncated Done and bail.
-    let stream_result = match (&req.index_name, &req.index_key) {
-        (Some(index_name), Some(index_key)) => {
+    let stream_result = match (&req.index_name, &req.index_key, &keyed_partition) {
+        (Some(index_name), Some(index_key), Some(partition_key)) => reader.index_partition_iter(
+            &table_id,
+            index_name,
+            index_key,
+            partition_key,
+            req.start_clustering.as_deref(),
+        ),
+        (Some(index_name), Some(index_key), None) => {
             reader.index_iter(&table_id, index_name, index_key, index_after.as_ref())
         }
-        (None, None) => reader.range_iter(
+        (None, None, None) => reader.range_iter(
             &table_id,
             req.projected_regular_ordinals.as_deref(),
             start_key.as_ref(),
@@ -698,6 +812,35 @@ where
             cancellations: Arc::new(DashMap::new()),
         }
     }
+
+    /// Start the producer for one window of a streaming keyed index read.
+    /// It shares this handler's cancellation map, so the coordinator's
+    /// `RangeReadStreamCancel` for the request stops it like any stream.
+    fn spawn_keyed_index_stream(&self, from: PeerId, bytes: &Bytes) {
+        let keyed: IndexReadInPartitionStreamRequestPayload = match bincode::deserialize(bytes) {
+            Ok(keyed) => keyed,
+            Err(e) => {
+                // No request id to answer under: the requester's idle
+                // watchdog fails its read.
+                tracing::warn!(
+                    "RangeReadStreamRequestHandler: keyed index request decode failed: {e}"
+                );
+                return;
+            }
+        };
+        let sink = self.sink_factory.for_peer(from, keyed.request_id);
+        let reader = self.reader.clone();
+        let chunk_size = self.chunk_size;
+        let token = CancellationToken::new();
+        self.cancellations.insert(keyed.request_id, token.clone());
+        let cancellations = self.cancellations.clone();
+        TaskPool::current("keyed-index-stream-request").spawn(async move {
+            let request_id = keyed.request_id;
+            handle_keyed_index_stream_request_with_cancel(keyed, reader, &sink, chunk_size, token)
+                .await;
+            cancellations.remove(&request_id);
+        });
+    }
 }
 
 #[async_trait]
@@ -709,6 +852,10 @@ where
     async fn handle(&self, from: PeerId, msg: Message) -> Option<Message> {
         let bytes = match msg {
             Message::RangeReadStreamRequest(b) => b,
+            Message::IndexReadInPartitionStreamRequest(b) => {
+                self.spawn_keyed_index_stream(from, &b);
+                return None;
+            }
             Message::RangeReadStreamCancel(b) => {
                 let cancel: RangeReadStreamCancelPayload = match bincode::deserialize(&b) {
                     Ok(cancel) => cancel,
@@ -950,7 +1097,11 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(pk.to_vec())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: cks.iter().map(|ck| clustered_row(ck)).collect(),
+            rows: cks
+                .iter()
+                .map(|ck| clustered_row(ck))
+                .map(Arc::new)
+                .collect(),
         }
     }
 

@@ -12,11 +12,12 @@
 //!   stop reading once it has `n` solutions instead of reading the whole table
 //!   and discarding the rest.
 //!
-//! These are asserted WITHOUT timing or instrumentation. The executor's row
-//! bound (`ExecutionLimits::max_rows`) is set below the table size, which makes
-//! "did this query read the whole table?" directly observable: a query that
-//! reads past the bound errors, and a query that stops early succeeds. A test
-//! that cannot tell the difference is not testing boundedness.
+//! These are asserted WITHOUT timing. The executor has no row bound any more
+//! (solutions stream and blocking operators spill), so "did this query read the
+//! whole table?" is observed through the query's own counter,
+//! `ExecutionStats::storage_rows_read`: a query that stops early reads fewer
+//! rows than the table holds, and its unlimited control reads all of them. A
+//! test that cannot tell the difference is not testing boundedness.
 //!
 //! Keyspace note: these tests use `KS = "default"`, matching the graph
 //! component `INSERT DATA` writes, because they are about HOW MUCH data the
@@ -29,8 +30,7 @@ use std::sync::Arc;
 
 use ferrosa_cluster::write_path::WritePath;
 use ferrosa_sparql::engine::{SparqlConfig, SparqlEngine};
-use ferrosa_sparql::error::SparqlError;
-use ferrosa_sparql::executor::{self, ExecutionLimits, DEFAULT_MAX_ROWS};
+use ferrosa_sparql::executor::{self, ExecutionContext, ExecutionStats};
 use ferrosa_sparql::planner;
 use ferrosa_sparql::results::Binding;
 use ferrosa_storage::{
@@ -41,13 +41,12 @@ use tempfile::TempDir;
 
 const KS: &str = "default";
 
-/// Rows written by [`Fixture::seed`]. Chosen so a bound of
-/// [`BOUND`] sits strictly between a `LIMIT` window and the table size.
+/// Rows written by [`Fixture::seed`], one per partition.
 const TABLE_ROWS: usize = 20;
 
-/// The row bound under test — well below `TABLE_ROWS`, so any query that reads
-/// the whole table trips it.
-const BOUND: usize = 8;
+/// The executor's former row bound in these tests: well below `TABLE_ROWS`.
+/// Every query below reads or buffers more than this and must still succeed.
+const OLD_BOUND: usize = 8;
 
 fn storage_config(dir: &TempDir) -> StorageEngineConfig {
     StorageEngineConfig {
@@ -116,195 +115,178 @@ impl Fixture {
             .expect("INSERT DATA must succeed");
     }
 
-    /// Run `query` through `executor::execute` under an explicit row bound.
-    async fn run(
+    /// Run `query` through `executor::execute`, returning its rows and how many
+    /// storage rows it read. Spills go under the fixture's own directory with a
+    /// tiny threshold, so ORDER BY and DISTINCT exercise their disk paths.
+    async fn run(&self, query: &str) -> (Vec<HashMap<String, Binding>>, u64) {
+        let (rows, stats) = self.run_with_stats(query).await;
+        (rows, stats.storage_rows_read())
+    }
+
+    async fn run_with_stats(
         &self,
         query: &str,
-        max_rows: usize,
-    ) -> Result<Vec<HashMap<String, Binding>>, SparqlError> {
+    ) -> (Vec<HashMap<String, Binding>>, Arc<ExecutionStats>) {
         let parsed = spargebra::SparqlParser::new()
             .parse_query(query)
             .expect("query must parse");
         // The scope carries the keyspace (which table) and the graph (which partition)
-        // separately. Passing one value for both was the bound-subject bug; these
-        // suites keep them equal because that is what their fixtures write.
+        // separately; these suites keep them equal because that is what their fixtures write.
         let scope = planner::TripleScope::new(KS, KS);
         let plan = planner::plan_query(&parsed, &scope).expect("query must plan");
-        Ok(
-            executor::execute(&plan, &self.write_path, &ExecutionLimits { max_rows })
-                .await?
-                .results
-                .bindings,
-        )
+        let cx =
+            ExecutionContext::new(self._dir.path().join("spill"), 64).with_dedup_resident_keys(2);
+        let rows = executor::execute(&plan, &self.write_path, &cx)
+            .await
+            .unwrap_or_else(|e| panic!("{query} must succeed with no row bound: {e}"))
+            .results
+            .bindings;
+        (rows, Arc::clone(cx.stats()))
     }
 }
 
 // =======================================================================
-// I6 — Complete result, or an error. Never a silent truncation.
+// I6 — Complete result, or an error. Never a silent truncation, never a cap.
 // =======================================================================
 
-/// I6: a scan that cannot finish within the row bound must ERROR. Returning the
-/// first `BOUND` rows and calling it the answer is indistinguishable from a
-/// correct short result, which is exactly the failure mode the old
-/// `SCAN_ROW_CAP` warning pretended to guard against while truncating nothing.
+/// I6: a scan past the former row bound returns the complete result. It used
+/// to be refused; now nothing caps it.
 #[tokio::test]
-async fn scan_exceeding_the_row_bound_errors_instead_of_truncating() {
+async fn scan_past_the_old_bound_returns_the_complete_result() {
     let f = fixture();
     f.seed().await;
 
-    let err = f
-        .run("SELECT ?s ?p ?o WHERE { ?s ?p ?o }", BOUND)
-        .await
-        .expect_err("a full scan of 20 rows under an 8-row bound must fail, not truncate");
+    let (rows, read) = f.run("SELECT ?s ?p ?o WHERE { ?s ?p ?o }").await;
+    assert_eq!(rows.len(), TABLE_ROWS, "every row, not a prefix");
+    assert!(read as usize > OLD_BOUND);
+}
 
-    let msg = err.to_string();
-    assert!(
-        msg.contains(&BOUND.to_string()),
-        "the error must name the bound that was crossed: {msg}"
+/// I6: ORDER BY must see every solution before emitting the first. Past the
+/// spill threshold it sorts on disk and still returns the global order.
+#[tokio::test]
+async fn order_by_past_the_old_bound_returns_the_global_order() {
+    let f = fixture();
+    f.seed().await;
+
+    let (rows, read) = f
+        .run("SELECT ?o WHERE { ?s <http://ex/p> ?o } ORDER BY DESC(?o) LIMIT 3")
+        .await;
+    let top: Vec<&str> = rows
+        .iter()
+        .map(|r| r["o"].scalar_value().unwrap())
+        .collect();
+    assert_eq!(top, vec!["object-019", "object-018", "object-017"]);
+    assert_eq!(read as usize, TABLE_ROWS, "ORDER BY reads everything, once");
+}
+
+/// ORDER BY and DISTINCT past the in-memory threshold go to disk — the spill
+/// path, not a resident buffer, produced the correct answers above.
+#[tokio::test]
+async fn order_by_and_distinct_spill_past_the_threshold_and_stay_correct() {
+    let f = fixture();
+    f.seed().await;
+
+    let (rows, stats) = f
+        .run_with_stats("SELECT ?o WHERE { ?s <http://ex/p> ?o } ORDER BY ?o")
+        .await;
+    let got: Vec<&str> = rows
+        .iter()
+        .map(|r| r["o"].scalar_value().unwrap())
+        .collect();
+    let want: Vec<String> = (0..TABLE_ROWS).map(|i| format!("object-{i:03}")).collect();
+    assert_eq!(got, want, "the merged runs must be in global order");
+    assert_eq!(
+        stats.sort_spills(),
+        1,
+        "a 64-byte threshold must spill the sort"
     );
-    assert!(
-        msg.to_lowercase().contains("truncat"),
-        "the error must say it is refusing to truncate, so an operator knows the \
-         result is missing rather than empty: {msg}"
+
+    let (rows, stats) = f
+        .run_with_stats("SELECT DISTINCT ?o WHERE { ?s ?p ?o }")
+        .await;
+    assert_eq!(rows.len(), TABLE_ROWS);
+    assert_eq!(
+        stats.dedup_spills(),
+        1,
+        "two resident keys must spill the set"
     );
 }
 
-/// I6: a scan that DOES fit within the bound returns the complete result and no
-/// error. The bound must not fire early — a guard that rejects valid queries is
-/// as wrong as one that truncates silently.
+/// I6: DISTINCT cannot know a solution is a duplicate without having seen the
+/// earlier one; its seen-set spills instead of capping.
 #[tokio::test]
-async fn scan_within_the_row_bound_returns_the_complete_result() {
+async fn distinct_past_the_old_bound_is_exact() {
     let f = fixture();
     f.seed().await;
 
-    let rows = f
-        .run("SELECT ?s ?p ?o WHERE { ?s ?p ?o }", TABLE_ROWS)
-        .await
-        .expect("a scan that fits inside the bound must succeed");
+    let (rows, _) = f.run("SELECT DISTINCT ?p WHERE { ?s ?p ?o }").await;
+    assert_eq!(rows.len(), 1);
+    let (rows, _) = f.run("SELECT DISTINCT ?o WHERE { ?s ?p ?o }").await;
+    assert_eq!(rows.len(), TABLE_ROWS);
+}
 
+/// I6: a FILTER drops solutions AFTER they are bound, so `LIMIT 1` above a
+/// filter must keep reading until a solution survives — here the last row.
+#[tokio::test]
+async fn filtered_limit_reads_until_a_solution_survives() {
+    let f = fixture();
+    f.seed().await;
+
+    let (rows, _) = f
+        .run("SELECT ?o WHERE { ?s ?p ?o . FILTER(?o = \"object-019\") } LIMIT 1")
+        .await;
     assert_eq!(
         rows.len(),
-        TABLE_ROWS,
-        "the result must be complete, not clipped at the bound"
+        1,
+        "the matching triple must be found, not cut off"
     );
-}
-
-/// I6: ORDER BY is a blocking operator — it must see every solution before it
-/// can emit the first. It may therefore buffer, but it must respect the bound
-/// and fail loud past it rather than sorting a clipped window and presenting it
-/// as the global order.
-#[tokio::test]
-async fn order_by_over_a_scan_exceeding_the_bound_errors() {
-    let f = fixture();
-    f.seed().await;
-
-    let err = f
-        .run(
-            "SELECT ?o WHERE { ?s <http://ex/p> ?o } ORDER BY ?o LIMIT 3",
-            BOUND,
-        )
-        .await
-        .expect_err(
-            "ORDER BY must see all 20 solutions to know the smallest 3; it may not \
-             sort the first 8 and call the answer global",
-        );
-
-    assert!(err.to_string().contains(&BOUND.to_string()));
-}
-
-/// I6: DISTINCT is likewise blocking — it cannot know a solution is a duplicate
-/// without having seen the earlier one.
-#[tokio::test]
-async fn distinct_over_a_scan_exceeding_the_bound_errors() {
-    let f = fixture();
-    f.seed().await;
-
-    let err = f
-        .run("SELECT DISTINCT ?p WHERE { ?s ?p ?o } LIMIT 1", BOUND)
-        .await
-        .expect_err("DISTINCT must not deduplicate a clipped window and report success");
-
-    assert!(err.to_string().contains(&BOUND.to_string()));
-}
-
-/// I6: a FILTER drops solutions AFTER they are bound, so a `LIMIT` above a
-/// filter cannot be pushed into the scan — stopping at `n` bound rows could
-/// return fewer than `n` results. The scan must therefore run to completion (and
-/// trip the bound) rather than quietly returning a short answer.
-#[tokio::test]
-async fn filtered_limit_does_not_push_down_and_stay_short() {
-    let f = fixture();
-    f.seed().await;
-
-    let err = f
-        .run(
-            "SELECT ?o WHERE { ?s ?p ?o . FILTER(?o = \"object-019\") } LIMIT 1",
-            BOUND,
-        )
-        .await
-        .expect_err(
-            "the matching triple is the last one written; a pushed-down LIMIT would \
-             stop after 1 bound row and return nothing, so LIMIT must not push \
-             through a FILTER",
-        );
-
-    assert!(err.to_string().contains(&BOUND.to_string()));
+    assert_eq!(rows[0]["o"].scalar_value(), Some("object-019"));
 }
 
 // =======================================================================
 // I7 — A bounded query does bounded work.
 // =======================================================================
 
-/// I7: `LIMIT n` must stop reading once it has `n` solutions.
-///
-/// The bound is 8 rows and the table is 20. A `LIMIT 3` full scan that reads
-/// only what it needs touches 3 rows and succeeds; one that materializes the
-/// table first reads 20 and trips the bound. The unbounded form of the same
-/// query is asserted to fail in the same test, which is what proves the success
-/// above comes from stopping early rather than from the bound being inert.
+/// I7: `LIMIT n` stops reading once it has `n` solutions: the response pulls,
+/// and nothing pulls past the n-th solution. The unlimited control reads the
+/// whole table, which is what proves the limited read stopped early.
 #[tokio::test]
 async fn limit_stops_the_scan_instead_of_reading_the_whole_table() {
     let f = fixture();
     f.seed().await;
 
-    let rows = f
-        .run("SELECT ?s WHERE { ?s ?p ?o } LIMIT 3", BOUND)
-        .await
-        .expect("LIMIT 3 must read ~3 rows, not all 20");
+    let (rows, read) = f.run("SELECT ?s WHERE { ?s ?p ?o } LIMIT 3").await;
     assert_eq!(rows.len(), 3);
+    assert_eq!(read, 3, "one row per partition: LIMIT 3 reads exactly 3");
 
-    f.run("SELECT ?s WHERE { ?s ?p ?o }", BOUND)
-        .await
-        .expect_err(
-            "control: the same scan without a LIMIT must trip the bound — otherwise \
-             the assertion above proves nothing about early termination",
-        );
+    let (rows, read) = f.run("SELECT ?s WHERE { ?s ?p ?o }").await;
+    assert_eq!(rows.len(), TABLE_ROWS);
+    assert_eq!(
+        read as usize, TABLE_ROWS,
+        "control: the unlimited scan reads all"
+    );
 }
 
-/// I7: OFFSET rows are read and discarded, so the scan must produce
-/// `offset + limit` solutions — no fewer (which would lose rows) and, within
-/// the bound, no more.
+/// I7: OFFSET rows are read and discarded, so the scan reads exactly
+/// `offset + limit` rows — no fewer (which would lose rows), no more.
 #[tokio::test]
 async fn limit_with_offset_reads_offset_plus_limit_rows() {
     let f = fixture();
     f.seed().await;
 
-    let rows = f
-        .run("SELECT ?s WHERE { ?s ?p ?o } LIMIT 2 OFFSET 4", BOUND)
-        .await
-        .expect("OFFSET 4 LIMIT 2 needs 6 rows, which fits inside the 8-row bound");
+    let (rows, read) = f.run("SELECT ?s WHERE { ?s ?p ?o } LIMIT 2 OFFSET 4").await;
     assert_eq!(
         rows.len(),
         2,
         "the window must still be exactly 2 rows wide"
     );
+    assert_eq!(read, 6);
 
-    f.run("SELECT ?s WHERE { ?s ?p ?o } LIMIT 2 OFFSET 12", BOUND)
-        .await
-        .expect_err(
-            "OFFSET 12 LIMIT 2 needs 14 rows, past the 8-row bound: it must fail \
-             loud rather than return a window built from the rows it managed to read",
-        );
+    let (rows, read) = f
+        .run("SELECT ?s WHERE { ?s ?p ?o } LIMIT 2 OFFSET 12")
+        .await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(read, 14);
 }
 
 /// I7: an ASK query is planned with `LIMIT 1`, so it must terminate after the
@@ -316,40 +298,20 @@ async fn ask_terminates_after_the_first_match() {
 
     let result = f.engine.execute("ASK { ?s ?p ?o }", KS).await;
 
-    match result.expect("ASK must not read the whole table") {
+    match result.expect("ASK must answer") {
         ferrosa_sparql::engine::SparqlResult::Ask(a) => assert!(a.boolean),
         other => panic!("expected an ASK result, got {other:?}"),
     }
 }
 
-/// A `LIMIT` larger than the table is not a pushdown opportunity, but it must
-/// still return everything rather than erroring — the bound is about work done,
-/// not about the number the user typed.
+/// A `LIMIT` larger than the table returns everything — LIMIT is an
+/// optimization, not a bound.
 #[tokio::test]
 async fn limit_larger_than_the_table_returns_everything() {
     let f = fixture();
     f.seed().await;
 
-    let rows = f
-        .run("SELECT ?s WHERE { ?s ?p ?o } LIMIT 1000", TABLE_ROWS)
-        .await
-        .expect("a LIMIT above the table size is satisfied by the whole table");
-
+    let (rows, read) = f.run("SELECT ?s WHERE { ?s ?p ?o } LIMIT 1000").await;
     assert_eq!(rows.len(), TABLE_ROWS);
-}
-
-/// The default bound is a real number the engine actually enforces, not a
-/// constant nothing reads. `SparqlConfig::default()` must carry it.
-#[tokio::test]
-async fn default_config_carries_the_enforced_row_bound() {
-    assert_eq!(
-        SparqlConfig::default().max_rows,
-        DEFAULT_MAX_ROWS,
-        "the shipped config must use the executor's documented default bound"
-    );
-    assert_eq!(
-        ExecutionLimits::default().max_rows,
-        DEFAULT_MAX_ROWS,
-        "ExecutionLimits::default must agree with the config default"
-    );
+    assert_eq!(read as usize, TABLE_ROWS);
 }

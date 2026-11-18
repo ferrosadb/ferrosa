@@ -70,7 +70,7 @@ use std::sync::Arc;
 use ferrosa_cluster::write_path::WritePath;
 use ferrosa_sparql::engine::{SparqlConfig, SparqlEngine};
 use ferrosa_sparql::error::SparqlError;
-use ferrosa_sparql::executor::{self, ExecutionLimits};
+use ferrosa_sparql::executor::{self, ExecutionContext};
 use ferrosa_sparql::planner::{self, QueryPlan};
 use ferrosa_sparql::results::Binding;
 use ferrosa_storage::{
@@ -155,7 +155,7 @@ impl Fixture {
     async fn try_execute(&self, query: &str) -> Result<Vec<HashMap<String, Binding>>, SparqlError> {
         let plan = plan(query);
         Ok(
-            executor::execute(&plan, &self.write_path, &ExecutionLimits::default())
+            executor::execute(&plan, &self.write_path, &ExecutionContext::default())
                 .await?
                 .results
                 .bindings,
@@ -384,9 +384,15 @@ mod baseline_bind {
     async fn raw_bindings_preserve_rdf_terms() {
         let f = fixture();
         let p = plan("SELECT ?copy WHERE { BIND(<http://ex/a> AS ?iri) BIND(\"hello\"@en AS ?text) BIND(?text AS ?copy) }");
-        let rows = executor::execute_bindings(&p, &f.write_path, &ExecutionLimits::default())
-            .await
-            .unwrap();
+        use futures::TryStreamExt;
+        let rows: Vec<_> = executor::where_solutions(
+            std::sync::Arc::new(p),
+            std::sync::Arc::clone(&f.write_path),
+            ExecutionContext::default(),
+        )
+        .try_collect()
+        .await
+        .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["iri"].kind(), "uri");
         assert_eq!(rows[0]["iri"].scalar_value().unwrap(), "http://ex/a");

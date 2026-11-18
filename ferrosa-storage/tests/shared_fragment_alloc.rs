@@ -21,6 +21,7 @@ fn source_partition(count: u32) -> Arc<Partition> {
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1_000_000),
             })
+            .map(Arc::new)
             .collect(),
     })
 }
@@ -96,7 +97,7 @@ fn shared_unsorted_rows_preserve_ordering_without_mutating_the_source() {
     .unwrap();
     let mut seen = Vec::new();
     while let Some(fragment) = merger.next_fragment(1).unwrap() {
-        seen.extend(fragment.rows.into_iter().map(|row| row.clustering));
+        seen.extend(fragment.rows.into_iter().map(|row| row.clustering.clone()));
     }
     assert_eq!(
         seen,

@@ -194,12 +194,12 @@ fn partition(token: i64, key: &[u8]) -> Partition {
         },
         deletion: DeletionTime::LIVE,
         static_row: None,
-        rows: vec![Row {
+        rows: vec![Arc::new(Row {
             clustering: vec![],
             cells: vec![(0, CellValue::live(b"v".to_vec(), 1))],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1),
-        }],
+        })],
     }
 }
 

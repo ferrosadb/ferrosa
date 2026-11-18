@@ -44,14 +44,14 @@ async fn finalize_compaction_offloads_blocking_steps_and_still_commits() {
     for i in 0..4 {
         let value = vec![b'a' + i as u8; 64];
         engine
-            .write(&tid, &make_key(&format!("k{i}")), make_row(&value, 1000 + i), 1000 + i)
+            .write(&tid, &make_key(&format!("k{i}")), Arc::new(make_row(&value, 1000 + i)), 1000 + i)
             .unwrap();
     }
     engine.flush(&tid).unwrap();
     for i in 0..4 {
         let value = vec![b'm' + i as u8; 64];
         engine
-            .write(&tid, &make_key(&format!("m{i}")), make_row(&value, 2000 + i), 2000 + i)
+            .write(&tid, &make_key(&format!("m{i}")), Arc::new(make_row(&value, 2000 + i)), 2000 + i)
             .unwrap();
     }
     engine.flush(&tid).unwrap();

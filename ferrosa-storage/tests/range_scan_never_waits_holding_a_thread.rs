@@ -18,6 +18,7 @@
 //! Its own binary: both counters are process-wide.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -89,7 +90,7 @@ fn seeded_engine(dir: &Path) -> (StorageEngine, TableId) {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };
-        engine.write(&table_id, &key, row, 1000).unwrap();
+        engine.write(&table_id, &key, Arc::new(row), 1000).unwrap();
     }
     (engine, table_id)
 }

@@ -52,7 +52,7 @@ impl RunReport {
 
         Self {
             run_id: run_id.to_string(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: ferrosa_common::temporal::now().to_rfc3339(),
             results,
             total,
             passed,

@@ -158,9 +158,9 @@ theorem ledgerTotal_is_the_registry_sum :
     build failure rather than a silently smaller total. Ninety-seven: the raft surface audit added
     three reds without adding an area, the startup and replay audit added three, partial application
     two, the grant projection one, `6c270518` closed one, the projection layer added seven, the
-    quarantine design added six, and the memory-discipline audit added an area of thirty-six items
-    with fourteen reds. -/
-theorem ledgerTotal_pinned : ledgerTotal = 108 := by decide
+    quarantine design added six, the memory-discipline audit added an area of thirty-six items
+    with fourteen reds, and removing the SSTable reader's vector-returning scan closed one. -/
+theorem ledgerTotal_pinned : ledgerTotal = 107 := by decide
 
 /-- Print every registered ledger, with the header its area module prints. -/
 def printAllLedgers : IO Unit := do

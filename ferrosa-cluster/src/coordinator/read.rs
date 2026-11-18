@@ -49,6 +49,7 @@ use ferrosa_storage::TableId;
 
 use ferrosa_storage::Mutation;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::consistency::ConsistencyLevel;
 use crate::error::ClusterError;
@@ -1178,7 +1179,7 @@ impl ClusterCoordinator {
         &self,
         table_id: &TableId,
         key: &DecoratedKey,
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         self.coordinate_read_with(table_id, key, self.default_cl, self.default_rf)
             .await
     }
@@ -1264,7 +1265,7 @@ impl ClusterCoordinator {
         key: &DecoratedKey,
         cl: ConsistencyLevel,
         rf: usize,
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         self.coordinate_read_with_limited_rows(table_id, key, cl, rf, 0)
             .await
     }
@@ -1283,7 +1284,7 @@ impl ClusterCoordinator {
         cl: ConsistencyLevel,
         rf: usize,
         row_limit: usize,
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         self.coordinate_read_with_filter(
             table_id,
             key,
@@ -1303,7 +1304,7 @@ impl ClusterCoordinator {
         rf: usize,
         row_limit: usize,
         start_clustering: &[u8],
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         self.coordinate_read_with_filter(
             table_id,
             key,
@@ -1321,7 +1322,7 @@ impl ClusterCoordinator {
         clustering: &[u8],
         cl: ConsistencyLevel,
         rf: usize,
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         self.coordinate_read_with_filter(
             table_id,
             key,
@@ -1339,7 +1340,7 @@ impl ClusterCoordinator {
         cl: ConsistencyLevel,
         rf: usize,
         slice: PartitionReadSlice,
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         let raw_replicas = {
             let ring = self.ring.load();
             ring.replicas(key.token.0, rf)
@@ -1369,7 +1370,7 @@ impl ClusterCoordinator {
         raw_replicas: Vec<u64>,
         requirement: ReadQuorumRequirement<'_>,
         slice: PartitionReadSlice,
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         let required = requirement.initial;
         let scope = requirement.scope.as_ref();
         let PartitionReadSlice {
@@ -1758,7 +1759,7 @@ impl ClusterCoordinator {
         ring: &crate::ring::TokenRing,
         cl: ConsistencyLevel,
         slice: PartitionReadSlice,
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         let row_limit = slice.row_limit;
         let clustering = slice.clustering.as_deref();
         let start_clustering = slice.start_clustering.as_deref();
@@ -1870,7 +1871,7 @@ impl ClusterCoordinator {
                 READ_PAGE_SIZE
             };
 
-            let mut all_rows: Vec<Row> = Vec::new();
+            let mut all_rows: Vec<Arc<Row>> = Vec::new();
             let mut page_state: Vec<u8> = vec![];
             let mut found_partition = false;
 
@@ -1963,7 +1964,7 @@ impl ClusterCoordinator {
         key: &DecoratedKey,
         replicas: &[u64],
         ring: &crate::ring::TokenRing,
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         self.read_one_replica_limited_rows(
             table_id,
             key,
@@ -1989,7 +1990,7 @@ impl ClusterCoordinator {
         key: &DecoratedKey,
         cl: ConsistencyLevel,
         strategy: &crate::ring::strategy::ReplicationStrategy,
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         self.coordinate_read_nts_limited_rows(table_id, key, cl, strategy, 0)
             .await
     }
@@ -2001,7 +2002,7 @@ impl ClusterCoordinator {
         cl: ConsistencyLevel,
         strategy: &crate::ring::strategy::ReplicationStrategy,
         row_limit: usize,
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         self.coordinate_read_nts_filtered(
             table_id,
             key,
@@ -2021,7 +2022,7 @@ impl ClusterCoordinator {
         strategy: &crate::ring::strategy::ReplicationStrategy,
         row_limit: usize,
         start_clustering: &[u8],
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         self.coordinate_read_nts_filtered(
             table_id,
             key,
@@ -2039,7 +2040,7 @@ impl ClusterCoordinator {
         clustering: &[u8],
         cl: ConsistencyLevel,
         strategy: &crate::ring::strategy::ReplicationStrategy,
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         self.coordinate_read_nts_filtered(
             table_id,
             key,
@@ -2057,7 +2058,7 @@ impl ClusterCoordinator {
         cl: ConsistencyLevel,
         strategy: &crate::ring::strategy::ReplicationStrategy,
         slice: PartitionReadSlice,
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         let PartitionReadSlice {
             row_limit,
             clustering,
@@ -2345,31 +2346,19 @@ impl ClusterCoordinator {
         Ok(deduped)
     }
 
-    /// KEYED secondary-index read (t_430c4188): consult the index for
-    /// `index_key` restricted to the partition `key`, contacting ONLY that
-    /// partition's replicas under `strategy` — never a global scatter-gather.
-    ///
-    /// Each replica consults partition-scoped postings and reads candidate rows.
-    /// Partition-key indexes intentionally name the partition; other postings
-    /// use exact row reads. A candidate's own configured positive certificate
-    /// permits merged-row reconciliation without another RPC. Ambiguous
-    /// positives require a canonical exact-row certificate because empty
-    /// posting replies carry no row version. Both paths re-evaluate the index
-    /// predicate; falling short in either phase returns a consistency error.
-    pub async fn coordinate_index_read_in_partition(
+    /// The replicas a keyed index read of `key` consults under `cl`, refused
+    /// as `Unavailable` when too few are known to satisfy it.
+    fn keyed_index_replicas(
         &self,
-        table_id: &TableId,
         key: &DecoratedKey,
-        index_name: &str,
-        index_key: &ferrosa_index::IndexKey,
         cl: ConsistencyLevel,
         strategy: &crate::ring::strategy::ReplicationStrategy,
-    ) -> crate::error::Result<Vec<ferrosa_sstable::types::Partition>> {
+    ) -> crate::error::Result<KeyedIndexReplicas> {
         let ring = self.ring.load();
         let mut eligible = ring.replicas_for_strategy(key.token.0, strategy);
         crate::coordinator::cl_routing::retain_eligible_replicas_for_cl(cl, &mut eligible, &ring);
         let local_dc = resolve_local_dc(&ring, self.local_node_id);
-        let replica_ids = match cl {
+        let replica_ids: Vec<u64> = match cl {
             // DC_QUORUM reads stay in the origin datacenter, so the keyed-index path filters to it
             // exactly as the local levels do.
             ConsistencyLevel::LocalQuorum
@@ -2397,18 +2386,20 @@ impl ClusterCoordinator {
             .iter()
             .filter_map(|&id| ring.get_node(id).map(|node| (id, node.data_center.clone())))
             .collect();
-        let nodes: Vec<(u64, Option<(uuid::Uuid, String)>)> = replica_ids
+        // The local replica first: it is served without a network hop.
+        let mut nodes: Vec<(u64, Option<(uuid::Uuid, String)>)> = replica_ids
             .iter()
             .map(|&id| (id, ring.get_node(id).map(|n| (n.host_id, n.addr.clone()))))
             .collect();
+        nodes.sort_by_key(|(id, _)| *id != self.local_node_id);
         drop(ring);
 
-        let available = read_quorum_progress(cl, strategy, &local_dc, nodes.len(), |dc| {
-            replica_dc_by_id
-                .values()
-                .filter(|actual| *actual == dc)
-                .count()
-        });
+        let replicas = KeyedIndexReplicas {
+            nodes,
+            replica_dc_by_id,
+            local_dc,
+        };
+        let available = replicas.progress(cl, strategy, replicas.nodes.iter().map(|(id, _)| id));
         if !available.satisfied() {
             return Err(ClusterError::Unavailable {
                 consistency: cl.to_string(),
@@ -2416,257 +2407,266 @@ impl ClusterCoordinator {
                 alive: available.received,
             });
         }
-        let req_payload = IndexReadInPartitionRequestPayload {
+        Ok(replicas)
+    }
+
+    /// KEYED secondary-index read (t_430c4188), streamed: the rows of the
+    /// partition `key` matching `index_key`, in clustering order, contacting
+    /// ONLY that partition's replicas under `strategy` — never a global
+    /// scatter-gather.
+    ///
+    /// Each replica streams its matches (the local one from the engine, a
+    /// remote one over `IndexReadInPartitionStreamRequest` windows with
+    /// ADR-020 back-pressure). Replicas are opened local-first until `cl` is
+    /// covered; a replica that cannot be opened is passed over, and one that
+    /// fails mid-stream fails the read loudly (its prefix is already out).
+    /// The coordinator merges the replica streams by clustering, holding one
+    /// row per replica:
+    /// - a row enough replicas returned as a match to certify `cl` on their
+    ///   own is merged across them and re-checked against the index;
+    /// - any other row (posting absence carries no row version) is read
+    ///   canonically at `cl` and re-checked.
+    ///
+    /// Memory is O(replicas) rows whatever the partition holds; a consumer
+    /// that stops reading stops every replica walk.
+    pub async fn coordinate_index_read_in_partition_stream(
+        self: &Arc<Self>,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        index_name: &str,
+        index_key: &ferrosa_index::IndexKey,
+        cl: ConsistencyLevel,
+        strategy: &crate::ring::strategy::ReplicationStrategy,
+    ) -> crate::error::Result<super::range_read_stream::ClusterPartitionStream> {
+        let replicas = self.keyed_index_replicas(key, cl, strategy)?;
+        let mut sources: Vec<KeyedIndexSource> = Vec::with_capacity(replicas.nodes.len());
+        let mut first_error: Option<ClusterError> = None;
+        for (node_id, remote) in &replicas.nodes {
+            let opened = replicas.progress(cl, strategy, sources.iter().map(|s| &s.node_id));
+            if opened.satisfied() {
+                break;
+            }
+            match self
+                .open_keyed_index_source(table_id, key, index_name, index_key, *node_id, remote)
+                .await
+            {
+                Ok(stream) => sources.push(KeyedIndexSource {
+                    node_id: *node_id,
+                    stream: Some(stream),
+                    head: None,
+                }),
+                Err(error) => {
+                    tracing::warn!(node_id, %error, "keyed index read: replica could not be opened");
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        let opened = replicas.progress(cl, strategy, sources.iter().map(|s| &s.node_id));
+        if !opened.satisfied() {
+            if let Some(error) = first_error {
+                tracing::warn!(%error, "keyed index read did not satisfy consistency");
+            }
+            return Err(ClusterError::ReadTimeout {
+                consistency: cl.to_string(),
+                received: opened.received,
+                required: opened.required,
+                data_present: false,
+            });
+        }
+        let merge = KeyedIndexMerge {
+            verifier: KeyedIndexVerifier {
+                coordinator: Arc::clone(self),
+                table_id: table_id.clone(),
+                key: key.clone(),
+                index_name: index_name.to_string(),
+                index_key: index_key.clone(),
+                cl,
+                strategy: strategy.clone(),
+                replicas,
+            },
+            sources,
+            failed: false,
+        };
+        Ok(Box::pin(futures::stream::unfold(
+            merge,
+            |mut merge| async move {
+                if merge.failed {
+                    return None;
+                }
+                match merge.next_verified().await {
+                    Ok(Some(partition)) => Some((Ok(partition), merge)),
+                    Ok(None) => None,
+                    Err(error) => {
+                        merge.failed = true;
+                        Some((Err(error), merge))
+                    }
+                }
+            },
+        )))
+    }
+
+    /// One replica's stream of the partition's index matches, one row per
+    /// item, in clustering order.
+    async fn open_keyed_index_source(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        index_name: &str,
+        index_key: &ferrosa_index::IndexKey,
+        node_id: u64,
+        remote: &Option<(uuid::Uuid, String)>,
+    ) -> crate::error::Result<super::range_read_stream::ClusterPartitionStream> {
+        let partition_key = key.key.as_bytes();
+        let is_local = node_id == self.local_node_id
+            || remote
+                .as_ref()
+                .is_some_and(|(host, _)| *host == self.peer_manager.local_host_id());
+        if is_local {
+            return Ok(super::range_read_stream::bounded_local_index_source(
+                Box::pin(
+                    self.storage
+                        .read_by_index_in_partition_stream_after(
+                            table_id,
+                            index_name,
+                            index_key,
+                            partition_key,
+                            None,
+                        )
+                        .map(|item| item.map_err(ClusterError::Storage)),
+                ),
+                super::range_read_stream::merge_source_fragment_timeout(),
+            ));
+        }
+        let (host_id, addr) = remote.as_ref().ok_or_else(|| {
+            ClusterError::Internal(format!("keyed index read: node {node_id} has no host_id"))
+        })?;
+        // Connect first, so the handshake's capabilities are known: a peer
+        // whose capabilities are unknown is served the legacy way.
+        self.peer_manager
+            .ensure_peer(*host_id, addr)
+            .await
+            .map_err(|e| {
+                ClusterError::Internal(format!(
+                    "keyed index read: cannot reach node {node_id} ({host_id}) via {addr}: {e}"
+                ))
+            })?;
+        let streams_keyed = self
+            .peer_manager
+            .peer_capabilities(*host_id)
+            .await
+            .is_some_and(|caps| caps & ferrosa_net::handshake::CAP_INDEX_PARTITION_STREAM != 0);
+        if streams_keyed {
+            return self
+                .spawn_replica_keyed_index_stream(
+                    table_id,
+                    *host_id,
+                    index_name,
+                    &index_key.0,
+                    partition_key,
+                )
+                .await;
+        }
+        self.open_legacy_keyed_index_source(table_id, key, index_name, index_key, *host_id, addr)
+            .await
+    }
+
+    /// A replica that did not advertise `CAP_INDEX_PARTITION_STREAM` (an
+    /// older build, or one not yet handshaken) must not be sent the new type
+    /// byte, which would drop its connection. It is served through requests
+    /// it already understands — a designed, logged fallback:
+    /// - a clustered table: the global index stream, resumed just after
+    ///   `(pk, [])`, so it starts at this partition, cut at the first row of
+    ///   another partition. The cut drops the stream, which cancels the
+    ///   producer; at most one window past the partition is read.
+    /// - a table without clustering columns: its partition holds one row,
+    ///   and the global resume would skip exactly that row (`[]` is the
+    ///   cursor), so the legacy keyed request answers — at most one row.
+    async fn open_legacy_keyed_index_source(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        index_name: &str,
+        index_key: &ferrosa_index::IndexKey,
+        host_id: uuid::Uuid,
+        addr: &str,
+    ) -> crate::error::Result<super::range_read_stream::ClusterPartitionStream> {
+        let schema = self.storage.table_schema(table_id).ok_or_else(|| {
+            ClusterError::Internal(format!(
+                "keyed index read: table {table_id} is not registered on this coordinator"
+            ))
+        })?;
+        tracing::warn!(
+            %host_id,
+            table = %table_id,
+            index = index_name,
+            "keyed index read: replica does not advertise CAP_INDEX_PARTITION_STREAM; \
+             serving it through the requests it understands"
+        );
+        if !schema.clustering_columns.is_empty() {
+            let resume = crate::write_path::ScanResume {
+                key: key.clone(),
+                clustering: Some(Vec::new()),
+            };
+            let stream = self
+                .spawn_replica_fragment_stream(
+                    table_id,
+                    host_id,
+                    None,
+                    Some((index_name, &index_key.0)),
+                    Some(&resume),
+                    super::range_read_stream::STREAM_WINDOW_CHUNKS,
+                )
+                .await?;
+            let wanted = key.key.clone();
+            return Ok(Box::pin(stream.take_while(move |item| {
+                std::future::ready(
+                    item.as_ref()
+                        .map_or(true, |partition| partition.key.key == wanted),
+                )
+            })));
+        }
+        let request = IndexReadInPartitionRequestPayload {
             keyspace: table_id.keyspace.clone(),
             table: table_id.table.clone(),
             index_name: index_name.to_string(),
             index_key: index_key.0.clone(),
             partition_key: key.key.as_bytes().to_vec(),
         };
-        let req_body = Bytes::from(bincode::serialize(&req_payload).unwrap_or_default());
-
-        let local_id = self.local_node_id;
-        let storage = self.storage.clone();
-        let table_id_clone = table_id.clone();
-        let index_name_owned = index_name.to_string();
-        let index_key_clone = index_key.clone();
-        let partition_key_bytes = key.key.as_bytes().to_vec();
-        let mut futs: FuturesUnordered<_> = nodes
-            .into_iter()
-            .map(|(node_id, remote)| {
-                let storage = storage.clone();
-                let table_id = table_id_clone.clone();
-                let index_name = index_name_owned.clone();
-                let index_key = index_key_clone.clone();
-                let partition_key = partition_key_bytes.clone();
-                let req_body = req_body.clone();
-                let coordinator = self;
-
-                async move {
-                    let result = async {
-                        if node_id == local_id
-                            || remote.as_ref().is_some_and(|(host, _)| {
-                                *host == coordinator.peer_manager.local_host_id()
-                            })
-                        {
-                            storage
-                                .read_by_index_in_partition(
-                                    &table_id,
-                                    &index_name,
-                                    &index_key,
-                                    &partition_key,
-                                )
-                                .map_err(ClusterError::Storage)
-                        } else {
-                            let (hid, addr) = remote.ok_or_else(|| {
-                                ClusterError::Internal(format!(
-                                    "keyed index read: node {node_id} has no host_id"
-                                ))
-                            })?;
-
-                            let resp = coordinator
-                                .send_remote_with_reconnect_timeout(
-                                    hid,
-                                    &addr,
-                                    Message::IndexReadInPartitionRequest(req_body),
-                                    Lane::Bulk,
-                                    Self::BULK_READ_TIMEOUT,
-                                )
-                                .await
-                                .map_err(|e| {
-                                    ClusterError::Internal(format!(
-                                        "keyed index read from node {node_id} ({hid}) via {addr}: {e}"
-                                    ))
-                                })?;
-
-                            match resp {
-                                Message::IndexReadInPartitionResponse(b) => {
-                                    let payload =
-                                        bincode::deserialize::<IndexReadResponsePayload>(&b)
-                                            .map_err(|e| {
-                                                ClusterError::Internal(format!(
-                                                    "keyed index read: failed to decode response \
-                                                     from node {node_id} ({hid}): {e}"
-                                                ))
-                                            })?;
-                                    Ok(payload
-                                        .partitions
-                                        .into_iter()
-                                        .map(partition_from_wire)
-                                        .collect())
-                                }
-                                other => Err(ClusterError::Internal(format!(
-                                    "keyed index read: unexpected response {:?} from node \
-                                     {node_id} ({hid})",
-                                    other.msg_type()
-                                ))),
-                            }
-                        }
-                    }
-                    .await;
-                    (node_id, result)
-                }
-            })
-            .collect();
-
-        let mut all_partitions: Vec<ferrosa_sstable::types::Partition> = Vec::new();
-        // Row identity -> distinct positive responders. Only clustering bytes
-        // and replica IDs are retained here; row payloads move into the merge.
-        let mut positives: std::collections::HashMap<Vec<u8>, std::collections::HashSet<u64>> =
-            std::collections::HashMap::new();
-
-        let mut first_error: Option<ClusterError> = None;
-        let mut received = 0usize;
-        let mut received_by_dc: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-
-        while let Some((node_id, result)) = futs.next().await {
-            match result {
-                Ok(batch) => {
-                    for partition in &batch {
-                        if partition.key.key != key.key {
-                            return Err(ClusterError::Internal(
-                                "keyed index replica returned a different partition".into(),
-                            ));
-                        }
-                        for row in &partition.rows {
-                            if !self
-                                .storage
-                                .index_row_matches(table_id, index_name, index_key, key, row)
-                                .map_err(ClusterError::Storage)?
-                            {
-                                continue;
-                            }
-                            if let Some(sources) = positives.get_mut(&row.clustering) {
-                                sources.insert(node_id);
-                            } else {
-                                positives.insert(
-                                    row.clustering.clone(),
-                                    std::collections::HashSet::from([node_id]),
-                                );
-                            }
-                        }
-                    }
-                    all_partitions.extend(batch);
-                    received += 1;
-                    if let Some(dc) = replica_dc_by_id.get(&node_id) {
-                        *received_by_dc.entry(dc.clone()).or_default() += 1;
-                    }
-                    let consistency_met =
-                        read_quorum_progress(cl, strategy, &local_dc, received, |dc| {
-                            received_by_dc.get(dc).copied().unwrap_or(0)
-                        })
-                        .satisfied();
-                    if consistency_met {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("coordinate_index_read_in_partition: {e}");
-                    if first_error.is_none() {
-                        first_error = Some(e);
-                    }
-                }
-            }
-        }
-
-        let certificate = read_quorum_progress(cl, strategy, &local_dc, received, |dc| {
-            received_by_dc.get(dc).copied().unwrap_or(0)
-        });
-        let consistency_met = certificate.satisfied();
-        if !consistency_met {
-            if let Some(err) = first_error {
-                tracing::warn!(%err, "keyed index read did not satisfy consistency");
-            }
-            return Err(ClusterError::ReadTimeout {
-                consistency: cl.to_string(),
-                received: certificate.received,
-                required: certificate.required,
-                data_present: !all_partitions.is_empty(),
-            });
-        }
-
-        // Merge per token (all results are the same partition; replicas may
-        // each return the same rows).
-        let mut by_token: BTreeMap<i64, Vec<ferrosa_sstable::types::Partition>> = BTreeMap::new();
-        for p in all_partitions {
-            by_token.entry(p.key.token.0).or_default().push(p);
-        }
-
-        let deduped: Vec<ferrosa_sstable::types::Partition> = by_token
-            .into_values()
-            .map(|group| {
-                if group.len() == 1 {
-                    group.into_iter().next().unwrap()
-                } else {
-                    ferrosa_storage::merge::merge_partitions(group)
-                }
-            })
-            .collect();
-
-        // A row's own positive responder certificate permits a healthy fast
-        // path. Posting absence carries no row/version: ambiguous candidates
-        // instead require canonical exact-row evidence at the requested CL.
-        // Re-evaluate merged values in both paths, including expiry/deletion.
-        let mut verified = Vec::with_capacity(deduped.len());
-        for mut partition in deduped {
-            let mut rows = Vec::with_capacity(partition.rows.len());
-            for candidate in partition.rows.drain(..) {
-                let positive_certificate =
-                    positives.get(&candidate.clustering).is_some_and(|sources| {
-                        read_quorum_progress(cl, strategy, &local_dc, sources.len(), |dc| {
-                            sources
-                                .iter()
-                                .filter(|&&id| {
-                                    replica_dc_by_id.get(&id).is_some_and(|actual| actual == dc)
-                                })
-                                .count()
-                        })
-                        .satisfied()
-                    });
-                if positive_certificate {
-                    // Matching full rows from this candidate's own configured
-                    // certificate already provide canonical reconciliation.
-                    if self
-                        .storage
-                        .index_row_matches(table_id, index_name, index_key, key, &candidate)
-                        .map_err(ClusterError::Storage)?
-                    {
-                        rows.push(candidate);
-                    }
-                    continue;
-                }
-                let canonical = self
-                    .coordinate_read_nts_clustering_row(
-                        table_id,
-                        key,
-                        &candidate.clustering,
-                        cl,
-                        strategy,
-                    )
-                    .await?
-                    .unwrap_or_default();
-                for row in canonical {
-                    if row.clustering != candidate.clustering {
-                        return Err(ClusterError::Internal(
-                            "keyed index verification returned a different clustering row".into(),
-                        ));
-                    }
-                    if self
-                        .storage
-                        .index_row_matches(table_id, index_name, index_key, key, &row)
-                        .map_err(ClusterError::Storage)?
-                    {
-                        rows.push(row);
-                    }
-                }
-            }
-            partition.rows = rows;
-            if !partition.rows.is_empty() {
-                verified.push(partition);
-            }
-        }
-        Ok(verified)
+        let body = bincode::serialize(&request).map_err(|e| {
+            ClusterError::Internal(format!("keyed index read: encode request: {e}"))
+        })?;
+        let response = self
+            .send_remote_with_reconnect_timeout(
+                host_id,
+                addr,
+                Message::IndexReadInPartitionRequest(Bytes::from(body)),
+                Lane::Bulk,
+                Self::BULK_READ_TIMEOUT,
+            )
+            .await
+            .map_err(|e| {
+                ClusterError::Internal(format!("keyed index read from {host_id} via {addr}: {e}"))
+            })?;
+        let Message::IndexReadInPartitionResponse(bytes) = response else {
+            return Err(ClusterError::Internal(format!(
+                "keyed index read: unexpected response {:?} from {host_id}",
+                response.msg_type()
+            )));
+        };
+        let payload = bincode::deserialize::<IndexReadResponsePayload>(&bytes).map_err(|e| {
+            ClusterError::Internal(format!(
+                "keyed index read: failed to decode response from {host_id}: {e}"
+            ))
+        })?;
+        // A table without clustering columns: at most one row comes back.
+        Ok(Box::pin(futures::stream::iter(
+            payload
+                .partitions
+                .into_iter()
+                .map(partition_from_wire)
+                .flat_map(split_into_single_row_partitions)
+                .map(Ok),
+        )))
     }
 
     /// Fan out a full-text (`fts_match`) lookup to every node and union the
@@ -2886,7 +2886,7 @@ pub(crate) fn read_repair_body(
     let rows: Vec<&ferrosa_sstable::types::Row> = deletion
         .iter()
         .chain(static_marker)
-        .chain(partition.rows.iter())
+        .chain(partition.rows.iter().map(|row| &**row))
         .collect();
     let newest = partition_write_timestamp(partition);
     let body = Mutation::serialize_borrowed_rows(
@@ -2925,7 +2925,7 @@ pub(crate) fn read_repair_body_for_target(
     let rows: Vec<&ferrosa_sstable::types::Row> = deletion
         .iter()
         .chain(static_marker)
-        .chain(partition.rows.iter())
+        .chain(partition.rows.iter().map(|row| &**row))
         .collect();
     let newest = partition_write_timestamp(partition);
     let body = Mutation::serialize_purged_rows(
@@ -3078,6 +3078,264 @@ async fn send_repair_writes(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Test support: a keyed index read collected into one partition per key, the
+/// shape callers assembled before the read streamed.
+#[cfg(test)]
+pub(crate) async fn collect_keyed_index_read(
+    coordinator: &Arc<ClusterCoordinator>,
+    table_id: &TableId,
+    key: &DecoratedKey,
+    index_name: &str,
+    index_key: &ferrosa_index::IndexKey,
+    cl: ConsistencyLevel,
+    strategy: &crate::ring::strategy::ReplicationStrategy,
+) -> crate::error::Result<Vec<Partition>> {
+    let mut stream = coordinator
+        .coordinate_index_read_in_partition_stream(
+            table_id, key, index_name, index_key, cl, strategy,
+        )
+        .await?;
+    let mut collected: Vec<Partition> = Vec::new();
+    while let Some(partition) = stream.next().await {
+        let partition = partition?;
+        match collected.last_mut() {
+            Some(last) if last.key == partition.key => last.rows.extend(partition.rows),
+            _ => collected.push(partition),
+        }
+    }
+    Ok(collected)
+}
+
+/// The replicas a keyed index read consults, local first, and the
+/// datacenters their answers count toward.
+struct KeyedIndexReplicas {
+    nodes: Vec<(u64, Option<(uuid::Uuid, String)>)>,
+    replica_dc_by_id: std::collections::HashMap<u64, String>,
+    local_dc: String,
+}
+
+impl KeyedIndexReplicas {
+    /// How far `responders` go toward `cl`.
+    fn progress<'a>(
+        &self,
+        cl: ConsistencyLevel,
+        strategy: &crate::ring::strategy::ReplicationStrategy,
+        responders: impl Iterator<Item = &'a u64> + Clone,
+    ) -> super::dc_quorum::Progress {
+        let count = responders.clone().count();
+        read_quorum_progress(cl, strategy, &self.local_dc, count, |dc| {
+            responders
+                .clone()
+                .filter(|id| {
+                    self.replica_dc_by_id
+                        .get(id)
+                        .is_some_and(|actual| actual == dc)
+                })
+                .count()
+        })
+    }
+}
+
+/// One replica's keyed index stream and the row it has shown the merge.
+struct KeyedIndexSource {
+    node_id: u64,
+    /// `None` once exhausted: dropping the stream releases (and, for a
+    /// remote, cancels) its producer at once.
+    stream: Option<super::range_read_stream::ClusterPartitionStream>,
+    head: Option<Partition>,
+}
+
+/// The coordinator-side merge of a keyed index read's replica streams.
+struct KeyedIndexMerge {
+    verifier: KeyedIndexVerifier,
+    sources: Vec<KeyedIndexSource>,
+    failed: bool,
+}
+
+/// What a keyed index merge checks each row against. Kept apart from the
+/// replica streams so a check can be awaited while they stay borrowed.
+struct KeyedIndexVerifier {
+    coordinator: Arc<ClusterCoordinator>,
+    table_id: TableId,
+    key: DecoratedKey,
+    index_name: String,
+    index_key: ferrosa_index::IndexKey,
+    cl: ConsistencyLevel,
+    strategy: crate::ring::strategy::ReplicationStrategy,
+    replicas: KeyedIndexReplicas,
+}
+
+impl KeyedIndexMerge {
+    /// Pull one row into every live source that has none showing. A replica
+    /// that answers for another partition, or with more than one row per
+    /// item, breaks the keyed read's contract and fails it.
+    async fn fill_heads(&mut self) -> crate::error::Result<()> {
+        for source in &mut self.sources {
+            if source.head.is_some() {
+                continue;
+            }
+            let Some(stream) = source.stream.as_mut() else {
+                continue;
+            };
+            match stream.next().await {
+                Some(Ok(partition)) => {
+                    if partition.key.key != self.verifier.key.key {
+                        return Err(ClusterError::Internal(
+                            "keyed index replica returned a different partition".into(),
+                        ));
+                    }
+                    if partition.rows.len() != 1 {
+                        return Err(ClusterError::Internal(format!(
+                            "keyed index replica {} returned {} rows in one item; \
+                             one row per item is the contract",
+                            source.node_id,
+                            partition.rows.len()
+                        )));
+                    }
+                    source.head = Some(partition);
+                }
+                Some(Err(error)) => return Err(error),
+                None => source.stream = None,
+            }
+        }
+        Ok(())
+    }
+
+    /// The next verified row, as a one-row partition; `None` once every
+    /// replica is exhausted. Each loop takes at least one head, so the walk
+    /// is bounded by the rows the replicas return.
+    async fn next_verified(&mut self) -> crate::error::Result<Option<Partition>> {
+        loop {
+            self.fill_heads().await?;
+            let Some(clustering) = self
+                .sources
+                .iter()
+                .filter_map(|source| source.head.as_ref())
+                .map(|partition| partition.rows[0].clustering.as_slice())
+                .min()
+                .map(<[u8]>::to_vec)
+            else {
+                return Ok(None);
+            };
+            let mut positives: Vec<u64> = Vec::with_capacity(self.sources.len());
+            let mut copies: Vec<(u64, Partition)> = Vec::with_capacity(self.sources.len());
+            for source in &mut self.sources {
+                let same = source
+                    .head
+                    .as_ref()
+                    .is_some_and(|partition| partition.rows[0].clustering == clustering);
+                let Some(partition) = source.head.take_if(|_| same) else {
+                    continue;
+                };
+                copies.push((source.node_id, partition));
+            }
+            for (node_id, partition) in &copies {
+                if self.verifier.row_matches(&partition.rows[0])? {
+                    positives.push(*node_id);
+                }
+            }
+            let copies: Vec<Partition> = copies.into_iter().map(|(_, p)| p).collect();
+            if let Some(verified) = self.verifier.verify(copies, &positives).await? {
+                return Ok(Some(verified));
+            }
+        }
+    }
+}
+
+impl KeyedIndexVerifier {
+    fn row_matches(&self, row: &Row) -> crate::error::Result<bool> {
+        self.coordinator
+            .storage
+            .index_row_matches(
+                &self.table_id,
+                &self.index_name,
+                &self.index_key,
+                &self.key,
+                row,
+            )
+            .map_err(ClusterError::Storage)
+    }
+
+    /// Reconcile one clustering's replica copies. A row whose own matching
+    /// responders certify `cl` is merged across the copies and re-checked;
+    /// any other is read canonically at `cl` and re-checked. `None` when the
+    /// row no longer matches.
+    async fn verify(
+        &self,
+        copies: Vec<Partition>,
+        positives: &[u64],
+    ) -> crate::error::Result<Option<Partition>> {
+        let mut merged = if copies.len() == 1 {
+            copies.into_iter().next().ok_or_else(|| {
+                ClusterError::Internal("keyed index merge lost its only copy".into())
+            })?
+        } else {
+            ferrosa_storage::merge::merge_partitions(copies)
+        };
+        let certified = self
+            .replicas
+            .progress(self.cl, &self.strategy, positives.iter())
+            .satisfied();
+        if certified {
+            let rows = std::mem::take(&mut merged.rows);
+            let mut kept = Vec::with_capacity(rows.len());
+            for row in rows {
+                if self.row_matches(&row)? {
+                    kept.push(row);
+                }
+            }
+            merged.rows = kept;
+        } else {
+            let Some(row) = merged.rows.first() else {
+                return Ok(None);
+            };
+            let clustering = row.clustering.clone();
+            let canonical = self
+                .coordinator
+                .coordinate_read_nts_clustering_row(
+                    &self.table_id,
+                    &self.key,
+                    &clustering,
+                    self.cl,
+                    &self.strategy,
+                )
+                .await?
+                .unwrap_or_default();
+            let mut rows = Vec::with_capacity(canonical.len());
+            for row in canonical {
+                if row.clustering != clustering {
+                    return Err(ClusterError::Internal(
+                        "keyed index verification returned a different clustering row".into(),
+                    ));
+                }
+                if self.row_matches(&row)? {
+                    rows.push(row);
+                }
+            }
+            merged.rows = rows;
+        }
+        Ok((!merged.rows.is_empty()).then_some(merged))
+    }
+}
+
+/// Split a partition into one partition per row, the shape every keyed
+/// index source yields. The key and partition header go with each row; the
+/// rows themselves move.
+fn split_into_single_row_partitions(partition: Partition) -> impl Iterator<Item = Partition> {
+    let Partition {
+        key,
+        deletion,
+        static_row,
+        rows,
+    } = partition;
+    rows.into_iter().map(move |row| Partition {
+        key: key.clone(),
+        deletion,
+        static_row: static_row.clone(),
+        rows: vec![row],
+    })
+}
 
 #[cfg(test)]
 mod tests {
@@ -3417,13 +3675,22 @@ mod tests {
         msg_type: MsgType,
         handler: Arc<dyn RpcHandler>,
     ) -> (Arc<RpcServer>, std::net::SocketAddr, uuid::Uuid) {
+        let legacy_keyed_index = msg_type == MsgType::IndexReadInPartitionRequest;
         let config = NetConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
+            // A stub that answers the legacy keyed index request stands in
+            // for a peer on a build without the streaming keyed read.
+            advertised_capabilities: if legacy_keyed_index {
+                ferrosa_net::handshake::LOCAL_CAPABILITIES
+                    & !ferrosa_net::handshake::CAP_INDEX_PARTITION_STREAM
+            } else {
+                ferrosa_net::handshake::LOCAL_CAPABILITIES
+            },
             ..NetConfig::default()
         };
         let server_id = Uuid::new_v4();
         let registry = Arc::new(HandlerRegistry::new());
-        if msg_type == MsgType::IndexReadInPartitionRequest {
+        if legacy_keyed_index {
             registry.register(MsgType::ReadRequest, handler.clone());
             registry.register(MsgType::RepairWrite, handler.clone());
         }
@@ -3467,7 +3734,7 @@ mod tests {
         // Local node: an FTI row whose text matches → local returns key [1,2,3].
         storage.add_fulltext_index(&table_id, "val_fti", 0).unwrap();
         storage
-            .write(&table_id, &test_key(), test_row(1000), 1000)
+            .write(&table_id, &test_key(), Arc::new(test_row(1000)), 1000)
             .unwrap();
 
         // The local FTI now returns a full ROW-GRANULAR doc key (partition +
@@ -3627,7 +3894,7 @@ mod tests {
         let table_id = TableId::new("test_ks", "test_tbl");
         let key = test_key();
         storage
-            .write(&table_id, &key, test_row(1000), 1000)
+            .write(&table_id, &key, Arc::new(test_row(1000)), 1000)
             .unwrap();
         storage.flush(&table_id).unwrap();
 
@@ -3749,7 +4016,9 @@ mod tests {
         let row = test_row(1000);
 
         // Write directly to storage.
-        storage.write(&table_id, &key, row.clone(), 1000).unwrap();
+        storage
+            .write(&table_id, &key, Arc::new(row.clone()), 1000)
+            .unwrap();
 
         // Read via coordinator.
         let result = coordinator.coordinate_read(&table_id, &key).await.unwrap();
@@ -3833,7 +4102,7 @@ mod tests {
         let table_id = TableId::new("test_ks", "test_tbl");
         let key = test_key();
         let row = test_row(1000);
-        storage.write(&table_id, &key, row, 1000).unwrap();
+        storage.write(&table_id, &key, Arc::new(row), 1000).unwrap();
 
         // With CL=ONE the coordinator must succeed using only the local replica.
         let result = coordinator.coordinate_read(&table_id, &key).await.unwrap();
@@ -3985,8 +4254,12 @@ mod tests {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(9000),
         };
-        storage.write(&table_id, &key, older_row, 100).unwrap();
-        storage.write(&table_id, &key, newer_row, 9000).unwrap();
+        storage
+            .write(&table_id, &key, Arc::new(older_row), 100)
+            .unwrap();
+        storage
+            .write(&table_id, &key, Arc::new(newer_row), 9000)
+            .unwrap();
 
         let result = coordinator.coordinate_read(&table_id, &key).await.unwrap();
         assert!(result.is_some(), "should return data");
@@ -4050,7 +4323,7 @@ mod tests {
 
         // Write data locally so the local read succeeds.
         storage
-            .write(&table_id, &key, test_row(1000), 1000)
+            .write(&table_id, &key, Arc::new(test_row(1000)), 1000)
             .unwrap();
 
         // Quorum requires 2 responses; only local (1) will succeed.
@@ -4076,7 +4349,7 @@ mod tests {
             key: key.clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![test_row(1000)],
+            rows: vec![Arc::new(test_row(1000))],
         };
         storage
             .write(&table_id, &key, partition.rows[0].clone(), 1000)
@@ -4153,7 +4426,7 @@ mod tests {
         row: Row,
         ts: i64,
     ) {
-        storage.write(table_id, key, row, ts).unwrap();
+        storage.write(table_id, key, Arc::new(row), ts).unwrap();
         storage.flush(table_id).unwrap();
         let sstable_dir = dir.join("sstables").join(table_id.to_string());
         let mut corrupted = 0usize;
@@ -4192,7 +4465,7 @@ mod tests {
             key: key.clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![test_row(1234)],
+            rows: vec![Arc::new(test_row(1234))],
         };
         let (server, addr, remote_host_id) = start_rpc_server(
             MsgType::ReadRequest,
@@ -4272,7 +4545,7 @@ mod tests {
             key: key.clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![test_row(1234)],
+            rows: vec![Arc::new(test_row(1234))],
         };
         let (server, addr, remote_host_id) = start_rpc_server(
             MsgType::ReadRequest,
@@ -4354,7 +4627,7 @@ mod tests {
             key: key.clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![test_row(777)],
+            rows: vec![Arc::new(test_row(777))],
         };
         let (server, addr, remote_host_id) = start_rpc_server(
             MsgType::ReadRequest,
@@ -4484,7 +4757,7 @@ mod tests {
             key: key.clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![test_row(888)],
+            rows: vec![Arc::new(test_row(888))],
         };
         let poison = Partition {
             key: DecoratedKey {
@@ -4493,7 +4766,7 @@ mod tests {
             },
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![test_row(777)],
+            rows: vec![Arc::new(test_row(777))],
         };
 
         let (replica_server, replica_addr, replica_host_id) = start_rpc_server(
@@ -4530,24 +4803,30 @@ mod tests {
         ring.assign_tokens(2u64, &[42]);
         ring.assign_tokens(3u64, &[1_000_000]);
 
-        let coordinator =
-            make_coordinator(ring, pm.clone(), 1u64, storage, 1, ConsistencyLevel::One);
+        let coordinator = Arc::new(make_coordinator(
+            ring,
+            pm.clone(),
+            1u64,
+            storage,
+            1,
+            ConsistencyLevel::One,
+        ));
 
         let table_id = TableId::new("test_ks", "test_tbl");
         let strategy = crate::ring::strategy::ReplicationStrategy::Simple {
             replication_factor: 1,
         };
-        let partitions = coordinator
-            .coordinate_index_read_in_partition(
-                &table_id,
-                &key,
-                "val_idx",
-                &ferrosa_index::IndexKey(b"hello".to_vec()),
-                ConsistencyLevel::One,
-                &strategy,
-            )
-            .await
-            .unwrap();
+        let partitions = collect_keyed_index_read(
+            &coordinator,
+            &table_id,
+            &key,
+            "val_idx",
+            &ferrosa_index::IndexKey(b"hello".to_vec()),
+            ConsistencyLevel::One,
+            &strategy,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             partitions.len(),
@@ -4601,13 +4880,15 @@ mod tests {
 
         let table_id = TableId::new("test_ks", "test_tbl");
         let key = test_key();
-        storage.write(&table_id, &key, test_row(10), 10).unwrap();
+        storage
+            .write(&table_id, &key, Arc::new(test_row(10)), 10)
+            .unwrap();
 
         let slow_partition = Partition {
             key: key.clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![test_row(9)],
+            rows: vec![Arc::new(test_row(9))],
         };
         let (slow_server, slow_addr, slow_host_id) = start_rpc_server(
             MsgType::IndexReadInPartitionRequest,
@@ -4637,14 +4918,22 @@ mod tests {
         ring.assign_tokens(2u64, &[500_000]);
         ring.assign_tokens(3u64, &[1_000_000]);
 
-        let coordinator = make_coordinator(ring, pm, 1u64, storage, 3, ConsistencyLevel::One);
+        let coordinator = Arc::new(make_coordinator(
+            ring,
+            pm,
+            1u64,
+            storage,
+            3,
+            ConsistencyLevel::One,
+        ));
         let strategy = crate::ring::strategy::ReplicationStrategy::Simple {
             replication_factor: 3,
         };
 
         let quorum = tokio::time::timeout(
             std::time::Duration::from_millis(100),
-            coordinator.coordinate_index_read_in_partition(
+            collect_keyed_index_read(
+                &coordinator,
                 &table_id,
                 &key,
                 "val_idx",
@@ -4661,7 +4950,8 @@ mod tests {
 
         tokio::time::timeout(
             std::time::Duration::from_millis(500),
-            coordinator.coordinate_index_read_in_partition(
+            collect_keyed_index_read(
+                &coordinator,
                 &table_id,
                 &key,
                 "val_idx",
@@ -4676,7 +4966,8 @@ mod tests {
 
         tokio::time::timeout(
             std::time::Duration::from_millis(100),
-            coordinator.coordinate_index_read_in_partition(
+            collect_keyed_index_read(
+                &coordinator,
                 &table_id,
                 &key,
                 "val_idx",
@@ -4689,16 +4980,16 @@ mod tests {
         .expect("CL ONE keyed index read waited for the slow replica")
         .unwrap();
 
-        let each_quorum = coordinator
-            .coordinate_index_read_in_partition(
-                &table_id,
-                &key,
-                "val_idx",
-                &ferrosa_index::IndexKey(b"hello".to_vec()),
-                ConsistencyLevel::EachQuorum,
-                &strategy,
-            )
-            .await;
+        let each_quorum = collect_keyed_index_read(
+            &coordinator,
+            &table_id,
+            &key,
+            "val_idx",
+            &ferrosa_index::IndexKey(b"hello".to_vec()),
+            ConsistencyLevel::EachQuorum,
+            &strategy,
+        )
+        .await;
         assert!(matches!(
             each_quorum,
             Err(ClusterError::NotImplemented { .. })
@@ -4734,7 +5025,9 @@ mod tests {
 
         let table_id = TableId::new("test_ks", "test_tbl");
         let key = test_key();
-        storage.write(&table_id, &key, test_row(10), 10).unwrap();
+        storage
+            .write(&table_id, &key, Arc::new(test_row(10)), 10)
+            .unwrap();
 
         let mut local = make_node("127.0.0.1:1");
         local.host_id = Uuid::new_v4();
@@ -4750,21 +5043,28 @@ mod tests {
         let strategy = crate::ring::strategy::ReplicationStrategy::Simple {
             replication_factor: 1,
         };
-        let coordinator = make_coordinator(ring, pm, 1u64, storage, 1, ConsistencyLevel::One);
-        let partitions = coordinator
-            .coordinate_index_read_in_partition(
-                &table_id,
-                &key,
-                "val_idx",
-                &ferrosa_index::IndexKey(b"hello".to_vec()),
-                ConsistencyLevel::DcQuorum,
-                &strategy,
-            )
-            .await
-            .expect(
-                "DC_QUORUM on a Simple strategy must count the live replica, \
+        let coordinator = Arc::new(make_coordinator(
+            ring,
+            pm,
+            1u64,
+            storage,
+            1,
+            ConsistencyLevel::One,
+        ));
+        let partitions = collect_keyed_index_read(
+            &coordinator,
+            &table_id,
+            &key,
+            "val_idx",
+            &ferrosa_index::IndexKey(b"hello".to_vec()),
+            ConsistencyLevel::DcQuorum,
+            &strategy,
+        )
+        .await
+        .expect(
+            "DC_QUORUM on a Simple strategy must count the live replica, \
                  not report alive: 0",
-            );
+        );
         // The defect this test exists for is the `Unavailable { required: 1, alive: 0 }` above; the
         // call returning `Ok` is the proof that a DC-scoped read counts a live replica instead of
         // refusing. Whether the one node's partition comes back is a property of this harness
@@ -4851,8 +5151,12 @@ mod tests {
         let table_id = TableId::new("test_ks", "test_tbl");
         let k1 = DecoratedKey::new(PartitionKey::new(b"pk1".to_vec()));
         let k2 = DecoratedKey::new(PartitionKey::new(b"pk2".to_vec()));
-        storage.write(&table_id, &k1, test_row(10), 10).unwrap();
-        storage.write(&table_id, &k2, test_row(11), 11).unwrap();
+        storage
+            .write(&table_id, &k1, Arc::new(test_row(10)), 10)
+            .unwrap();
+        storage
+            .write(&table_id, &k2, Arc::new(test_row(11)), 11)
+            .unwrap();
 
         let handler = IndexReadInPartitionHandler::new(storage);
         let req = IndexReadInPartitionRequestPayload {
@@ -4900,7 +5204,7 @@ mod tests {
             key: key.clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![test_row(999)],
+            rows: vec![Arc::new(test_row(999))],
         };
 
         let table_id = TableId::new("test_ks", "test_tbl");
@@ -4986,7 +5290,7 @@ mod tests {
         let table_id = TableId::new("test_ks", "test_tbl");
         let key = test_key();
         let row = test_row(1000);
-        storage.write(&table_id, &key, row, 1000).unwrap();
+        storage.write(&table_id, &key, Arc::new(row), 1000).unwrap();
 
         // Without override: QUORUM with 1 node in the ring should fail.
         let result = coordinator.coordinate_read(&table_id, &key).await;
@@ -5045,9 +5349,11 @@ mod tests {
         let key = test_key();
 
         // Write older then newer data to the same key.
-        storage.write(&table_id, &key, test_row(100), 100).unwrap();
         storage
-            .write(&table_id, &key, test_row(9000), 9000)
+            .write(&table_id, &key, Arc::new(test_row(100)), 100)
+            .unwrap();
+        storage
+            .write(&table_id, &key, Arc::new(test_row(9000)), 9000)
             .unwrap();
 
         // CL=ONE with 1 replica — fast path, no digest comparison.
@@ -5189,7 +5495,7 @@ mod tests {
             key: key.clone(),
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
             static_row: None,
-            rows: vec![test_row(1000)],
+            rows: vec![Arc::new(test_row(1000))],
         };
 
         // Attempt repair to unreachable replica.
@@ -5274,7 +5580,7 @@ mod tests {
             key: key.clone(),
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
             static_row: None,
-            rows: vec![test_row(1000)],
+            rows: vec![Arc::new(test_row(1000))],
         };
 
         coordinator
@@ -5381,7 +5687,7 @@ mod tests {
     /// inline repair wrote into the LOCAL replica's storage (remote repair writes
     /// go to a no-op peer manager).
     struct TwoReplicaRead {
-        rows: Vec<Row>,
+        rows: Vec<Arc<Row>>,
         coordinator: ClusterCoordinator,
         table_id: TableId,
         key: DecoratedKey,
@@ -5544,14 +5850,14 @@ mod tests {
         // bytes, so `test_key()`'s fixed token would make the remote miss.
         let key = DecoratedKey::new(PartitionKey::new(b"server-device".to_vec()));
         for row in local_rows {
-            local.write(&table_id, &key, row, 2_000).unwrap();
+            local.write(&table_id, &key, Arc::new(row), 2_000).unwrap();
         }
         for row in remote_rows {
-            remote.write(&table_id, &key, row, 2_000).unwrap();
+            remote.write(&table_id, &key, Arc::new(row), 2_000).unwrap();
         }
         if let Some(marker) = ferrosa_storage::partition_apply::deletion_marker(remote_deletion) {
             remote
-                .apply_partition_rows(&table_id, &key, vec![marker])
+                .apply_partition_rows(&table_id, &key, vec![Arc::new(marker)])
                 .unwrap();
         }
         let (server, addr, remote_host_id) = start_read_server(Arc::new(
@@ -5633,7 +5939,9 @@ mod tests {
         let table_id = register_ttl_table(&storage);
         let key = DecoratedKey::new(PartitionKey::new(b"server-device".to_vec()));
         for row in rows {
-            storage.write(&table_id, &key, row, 2_000).unwrap();
+            storage
+                .write(&table_id, &key, Arc::new(row), 2_000)
+                .unwrap();
         }
         let (server, addr, host_id) = start_read_server_advertising(
             Arc::new(crate::raft::handlers::ReadRequestHandler::new(storage)),
@@ -5978,7 +6286,7 @@ mod tests {
         let table_id = TableId::new("test_ks", "test_tbl");
         let key = test_key();
         storage
-            .write(&table_id, &key, test_row(1000), 1000)
+            .write(&table_id, &key, Arc::new(test_row(1000)), 1000)
             .unwrap();
 
         let result = coordinator.coordinate_read(&table_id, &key).await.unwrap();
@@ -6013,7 +6321,7 @@ mod tests {
             key: key.clone(),
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
             static_row: None,
-            rows: vec![test_row(1000)],
+            rows: vec![Arc::new(test_row(1000))],
         };
 
         coordinator
@@ -6069,7 +6377,7 @@ mod tests {
             key: key.clone(),
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
             static_row: None,
-            rows: vec![test_row(5000)],
+            rows: vec![Arc::new(test_row(5000))],
         };
 
         // Repair two stale replicas.
@@ -6137,7 +6445,7 @@ mod tests {
         let table_id = TableId::new("test_ks", "test_tbl");
         let key = test_key();
         let row = test_row(1000);
-        storage.write(&table_id, &key, row, 1000).unwrap();
+        storage.write(&table_id, &key, Arc::new(row), 1000).unwrap();
 
         let dc_rf = std::collections::HashMap::from([
             ("dc1".to_string(), 1usize),
@@ -6155,7 +6463,7 @@ mod tests {
         for clustering in [vec![1], vec![2], vec![3]] {
             let mut row = test_row(2000 + i64::from(clustering[0]));
             row.clustering = clustering;
-            storage.write(&table_id, &key, row, 2000).unwrap();
+            storage.write(&table_id, &key, Arc::new(row), 2000).unwrap();
         }
         let suffix = coordinator
             .coordinate_read_nts_limited_rows_from(
@@ -6460,7 +6768,7 @@ mod tests {
 
         // Now write data and verify it returns.
         storage
-            .write(&table_id, &key, test_row(1000), 1000)
+            .write(&table_id, &key, Arc::new(test_row(1000)), 1000)
             .unwrap();
         let result = coordinator
             .read_one_replica(&table_id, &key, &[local_node_id], &ring)
@@ -6499,7 +6807,7 @@ mod tests {
 
         // Write data to storage for this key.
         storage
-            .write(&table_id, &key, test_row(2000), 2000)
+            .write(&table_id, &key, Arc::new(test_row(2000)), 2000)
             .unwrap();
 
         // Pass replicas list where local is second — the function should
@@ -6569,7 +6877,7 @@ mod tests {
         let table_id = TableId::new("test_ks", "test_tbl");
         let key = test_key();
         storage
-            .write(&table_id, &key, test_row(1000), 1000)
+            .write(&table_id, &key, Arc::new(test_row(1000)), 1000)
             .unwrap();
 
         let result = coordinator.coordinate_range_read(&table_id).await;
@@ -6608,7 +6916,7 @@ mod tests {
         let table_id = TableId::new("test_ks", "test_tbl");
         let key = test_key();
         storage
-            .write(&table_id, &key, test_row(1000), 1000)
+            .write(&table_id, &key, Arc::new(test_row(1000)), 1000)
             .unwrap();
 
         let result = coordinator.coordinate_range_read(&table_id).await;
@@ -6694,7 +7002,7 @@ mod tests {
 
         let table_id = TableId::new("test_ks", "test_tbl");
         storage
-            .write(&table_id, &test_key(), test_row(1000), 1000)
+            .write(&table_id, &test_key(), Arc::new(test_row(1000)), 1000)
             .unwrap();
 
         // Baseline: at the node's own default (ONE) the local count is a
@@ -6768,7 +7076,7 @@ mod tests {
         // Write a partition locally. The OLD code would have happily returned
         // count=1 here — but that is only the LOCAL view; node2 may hold more.
         storage
-            .write(&table_id, &test_key(), test_row(1000), 1000)
+            .write(&table_id, &test_key(), Arc::new(test_row(1000)), 1000)
             .unwrap();
 
         let result = coordinator.coordinate_range_count(&table_id).await;
@@ -6809,7 +7117,7 @@ mod tests {
 
         let table_id = TableId::new("test_ks", "test_tbl");
         storage
-            .write(&table_id, &test_key(), test_row(1000), 1000)
+            .write(&table_id, &test_key(), Arc::new(test_row(1000)), 1000)
             .unwrap();
 
         let count = coordinator
@@ -6864,7 +7172,7 @@ mod tests {
         );
         let table_id = TableId::new("test_ks", "test_tbl");
         storage
-            .write(&table_id, &test_key(), test_row(1000), 1000)
+            .write(&table_id, &test_key(), Arc::new(test_row(1000)), 1000)
             .unwrap();
 
         let mut stream = coordinator
@@ -6911,6 +7219,7 @@ mod tests {
                         row.clustering = (i as u32).to_be_bytes().to_vec();
                         row
                     })
+                    .map(Arc::new)
                     .collect(),
             }])
         }
@@ -6955,7 +7264,9 @@ mod tests {
         for i in 0..2_000u32 {
             let mut row = test_row(i as i64);
             row.clustering = i.to_be_bytes().to_vec();
-            storage.write(&table_id, &key, row, i as i64).unwrap();
+            storage
+                .write(&table_id, &key, Arc::new(row), i as i64)
+                .unwrap();
         }
         storage.flush(&table_id).unwrap();
 
@@ -7009,12 +7320,13 @@ mod tests {
         for batch in 0..8u32 {
             for i in 0..4_000u32 {
                 let pk = (batch * 4_000 + i).to_be_bytes().to_vec();
-                let key = DecoratedKey {
-                    token: Token((batch * 4_000 + i) as i64),
-                    key: PartitionKey::new(pk),
-                };
+                // The real partitioner token: SSTables do not store tokens, so a
+                // forged one is recomputed on read and no longer matches the
+                // order the file was written in, which the bounded multi-pass
+                // merge (8 SSTables > the merge fan-in) then rejects.
+                let key = DecoratedKey::new(PartitionKey::new(pk));
                 storage
-                    .write(&table_id, &key, test_row(i as i64), i as i64)
+                    .write(&table_id, &key, Arc::new(test_row(i as i64)), i as i64)
                     .unwrap();
             }
             storage.flush(&table_id).unwrap();
@@ -7088,7 +7400,7 @@ mod tests {
             key,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![test_row(4321)],
+            rows: vec![Arc::new(test_row(4321))],
         };
         let (server, addr, remote_host_id) = start_rpc_server(
             MsgType::RangeReadRequest,
@@ -7141,7 +7453,7 @@ mod tests {
             key: key.clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![test_row(4321)],
+            rows: vec![Arc::new(test_row(4321))],
         };
         let (server, addr, remote_host_id) = start_rpc_server(
             MsgType::ReadRequest,
@@ -7240,7 +7552,7 @@ mod tests {
         let table_id = TableId::new("test_ks", "test_tbl");
         let key = test_key();
         storage
-            .write(&table_id, &key, test_row(1000), 1000)
+            .write(&table_id, &key, Arc::new(test_row(1000)), 1000)
             .unwrap();
 
         let result = coordinator.coordinate_read(&table_id, &key).await;
@@ -7278,7 +7590,7 @@ mod tests {
         let table_id = TableId::new("test_ks", "test_tbl");
         let key = test_key();
         storage
-            .write(&table_id, &key, test_row(1000), 1000)
+            .write(&table_id, &key, Arc::new(test_row(1000)), 1000)
             .unwrap();
 
         let dc_rf = std::collections::HashMap::from([("dc1".to_string(), 1usize)]);
@@ -7325,7 +7637,7 @@ mod tests {
         let table_id = TableId::new("test_ks", "test_tbl");
         let key = test_key();
         storage
-            .write(&table_id, &key, test_row(1000), 1000)
+            .write(&table_id, &key, Arc::new(test_row(1000)), 1000)
             .unwrap();
 
         // Use CL=ONE (non-LOCAL) with NTS strategy -- takes the regular path
@@ -7374,7 +7686,7 @@ mod tests {
         .await
         .expect("origin and remote-majority digests must launch together")
         .unwrap();
-        assert_eq!(rows, vec![test_row(1000)]);
+        assert_eq!(rows, vec![Arc::new(test_row(1000))]);
     }
 
     fn verification_nts_newest_row() -> Row {
@@ -7389,7 +7701,7 @@ mod tests {
         newest: Option<u64>,
         index: bool,
         rendezvous: Option<std::sync::Arc<tokio::sync::Barrier>>,
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         let dir = tempfile::tempdir().unwrap();
         let storage = test_storage(dir.path());
         if index {
@@ -7419,7 +7731,7 @@ mod tests {
             key: key.clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![test_row(1000)],
+            rows: vec![Arc::new(test_row(1000))],
         };
         storage
             .write(&table, &key, partition.rows[0].clone(), 1000)
@@ -7450,7 +7762,7 @@ mod tests {
                         Arc::new(StaticDigestReadHandler {
                             partition: if newest == Some(id) {
                                 Partition {
-                                    rows: vec![verification_nts_newest_row()],
+                                    rows: vec![Arc::new(verification_nts_newest_row())],
                                     ..partition.clone()
                                 }
                             } else {
@@ -7467,7 +7779,7 @@ mod tests {
             ring.add_node(id, node);
             ring.assign_tokens(id, &[id as i64 * 100]);
         }
-        let coordinator = make_coordinator(ring, peers, 1, storage, 9, cl);
+        let coordinator = Arc::new(make_coordinator(ring, peers, 1, storage, 9, cl));
         let strategy = crate::ring::strategy::ReplicationStrategy::NetworkTopology {
             dc_rf: std::collections::HashMap::from([
                 ("dc1".into(), 3),
@@ -7476,17 +7788,17 @@ mod tests {
             ]),
         };
         let result = if index {
-            coordinator
-                .coordinate_index_read_in_partition(
-                    &table,
-                    &key,
-                    "val_idx",
-                    &ferrosa_index::IndexKey(b"hello".to_vec()),
-                    cl,
-                    &strategy,
-                )
-                .await
-                .map(|partitions| Some(partitions.into_iter().flat_map(|p| p.rows).collect()))
+            collect_keyed_index_read(
+                &coordinator,
+                &table,
+                &key,
+                "val_idx",
+                &ferrosa_index::IndexKey(b"hello".to_vec()),
+                cl,
+                &strategy,
+            )
+            .await
+            .map(|partitions| Some(partitions.into_iter().flat_map(|p| p.rows).collect()))
         } else {
             if rendezvous.is_some() {
                 tokio::time::timeout(
@@ -7514,7 +7826,7 @@ mod tests {
     async fn verification_nts_read_case(
         live: &[u64],
         cl: ConsistencyLevel,
-    ) -> crate::error::Result<Option<Vec<Row>>> {
+    ) -> crate::error::Result<Option<Vec<Arc<Row>>>> {
         verification_nts_read_case_with_newest(live, cl, None, false, None).await
     }
 
@@ -7532,7 +7844,7 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(rows, vec![verification_nts_newest_row()]);
+        assert_eq!(rows, vec![Arc::new(verification_nts_newest_row())]);
     }
 
     #[tokio::test]
@@ -7547,7 +7859,7 @@ mod tests {
         .await
         .expect("nested keyed-index certificate")
         .unwrap();
-        assert_eq!(rows, vec![test_row(1000)]);
+        assert_eq!(rows, vec![Arc::new(test_row(1000))]);
     }
 
     #[tokio::test]
@@ -7582,7 +7894,7 @@ mod tests {
             .await
             .expect("origin + remote majorities must suffice while dc3 is absent")
             .unwrap();
-        assert_eq!(rows, vec![test_row(1000)]);
+        assert_eq!(rows, vec![Arc::new(test_row(1000))]);
     }
 
     #[tokio::test]
@@ -7621,7 +7933,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(rows, vec![test_row(1000)]);
+        assert_eq!(rows, vec![Arc::new(test_row(1000))]);
     }
 
     #[tokio::test]
@@ -7645,7 +7957,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap(),
-            vec![test_row(1000)]
+            vec![Arc::new(test_row(1000))]
         );
     }
 

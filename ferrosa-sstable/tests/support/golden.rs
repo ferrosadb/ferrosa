@@ -9,6 +9,7 @@
 //! this directory.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
 use ferrosa_sstable::compression::Compression;
@@ -124,12 +125,12 @@ pub fn build_case(spec: &CaseSpec) -> (SerializationHeader, Vec<Partition>) {
                 key: DecoratedKey::new(PartitionKey::new(b"large-row".to_vec())),
                 deletion: DeletionTime::LIVE,
                 static_row: None,
-                rows: vec![Row {
+                rows: vec![Arc::new(Row {
                     clustering: vec![],
                     cells: vec![(0, CellValue::live(value, 1))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1),
-                }],
+                })],
             };
             (schema.header(), vec![partition])
         }
@@ -151,6 +152,7 @@ pub fn build_case(spec: &CaseSpec) -> (SerializationHeader, Vec<Partition>) {
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp((i as i64) + 1),
                 })
+                .map(Arc::new)
                 .collect();
             let partition = Partition {
                 key: DecoratedKey::new(PartitionKey::new(b"straddle".to_vec())),

@@ -223,7 +223,7 @@ impl HistoryRecorder {
             self.pending.is_none(),
             "cannot invoke while another operation is pending"
         );
-        let now_us = chrono::Utc::now().timestamp_micros() as u64;
+        let now_us = ferrosa_common::temporal::now().timestamp_micros() as u64;
         self.pending = Some((now_us, op));
     }
 
@@ -238,7 +238,7 @@ impl HistoryRecorder {
             .pending
             .take()
             .expect("complete called with no pending operation");
-        let complete_us = chrono::Utc::now().timestamp_micros() as u64;
+        let complete_us = ferrosa_common::temporal::now().timestamp_micros() as u64;
         let operation = Operation {
             client_id: self.client_id.clone(),
             invoke_us,

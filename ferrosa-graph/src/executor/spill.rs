@@ -304,7 +304,7 @@ impl OrderKeys {
                 row.len()
             )));
         }
-        if let Some(next) = self.next_arrival.as_mut() {
+        if let Some(next) = &mut self.next_arrival {
             row.push(serde_json::Value::from(*next));
             *next += 1;
             return Ok(row);
@@ -336,6 +336,25 @@ impl OrderKeys {
         Ok(row)
     }
 
+    /// Append ORDER BY key values the caller already evaluated, one per term
+    /// in order. For a producer whose sort keys are not evaluated against a
+    /// projected row's bindings (the WITH pipeline orders STATES, keyed on
+    /// their projected bindings). Fails loud on a width mismatch.
+    fn attach_keys(&self, mut row: RowVals, keys: Vec<serde_json::Value>) -> Result<RowVals> {
+        let visible = self.visible();
+        if row.len() != visible || self.next_arrival.is_some() || keys.len() != self.order_by.len()
+        {
+            return Err(GraphError::Internal(format!(
+                "ORDER BY key attach: {} values and {} keys for {visible} columns and {} terms",
+                row.len(),
+                keys.len(),
+                self.order_by.len()
+            )));
+        }
+        row.extend(keys);
+        Ok(row)
+    }
+
     /// Strip the hidden keys, restoring exactly the projected row. Fails loud
     /// on a width mismatch: a row that is not `visible + keys` wide means the
     /// layout was violated, and truncating it anyway could hand a client a
@@ -363,7 +382,7 @@ impl OrderKeys {
 ///
 /// Fails loud on any spill/merge I/O error — a dropped run would silently lose
 /// rows, which is strictly worse than the old cap.
-pub(super) struct SpillSortSink {
+pub(crate) struct SpillSortSink {
     keys: OrderKeys,
     reservation: ferrosa_storage::TempSortTableReservation,
     sorter: ferrosa_storage::external_sort::ExternalSorter<GraphRow, GraphRowOrder>,
@@ -453,6 +472,16 @@ impl SpillSortSink {
             .map_err(|e| GraphError::Internal(format!("ORDER BY spill: {e}")))
     }
 
+    /// Accept one row with its already-evaluated ORDER BY keys.
+    fn push_keyed(&mut self, row: RowVals, keys: Vec<serde_json::Value>) -> Result<()> {
+        let keyed = self.keys.attach_keys(row, keys)?;
+        self.rows_pushed += 1;
+        match self.sorter.push(GraphRow(keyed)) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(GraphError::Internal(format!("ORDER BY spill: {e}"))),
+        }
+    }
+
     /// Finish the sort and stream the merged output WITHOUT re-materializing
     /// it: each pull reads the next row from the merge and strips its hidden
     /// keys. The temp-dir reservation is moved into the stream, so the spilled
@@ -502,7 +531,7 @@ pub fn in_memory_order_by_sorts() -> u64 {
 /// same comparator the spilling sorter uses. Unbounded by construction — which
 /// is why it is counted, warned about, and unreachable with a backend.
 #[derive(Debug)]
-pub(super) struct InMemorySortSink {
+pub(crate) struct InMemorySortSink {
     keys: OrderKeys,
     rows: Vec<RowVals>,
 }
@@ -529,6 +558,11 @@ impl InMemorySortSink {
         Ok(())
     }
 
+    fn push_keyed(&mut self, row: RowVals, keys: Vec<serde_json::Value>) -> Result<()> {
+        self.rows.push(self.keys.attach_keys(row, keys)?);
+        Ok(())
+    }
+
     fn finish_stream(mut self) -> RowStream<'static> {
         let order = self.keys.row_order();
         // Stable, like the in-memory sorts this replaces: ties keep
@@ -544,7 +578,7 @@ impl InMemorySortSink {
 /// An ORDER BY accumulator: spill-backed whenever a backend is configured,
 /// the observable in-memory fallback otherwise.
 #[derive(Debug)]
-pub(super) enum OrderBySink {
+pub(crate) enum OrderBySink {
     Spill(SpillSortSink),
     InMemory(InMemorySortSink),
 }
@@ -581,6 +615,15 @@ impl OrderBySink {
         match self {
             Self::Spill(sink) => sink.push(row, bindings),
             Self::InMemory(sink) => sink.push(row, bindings),
+        }
+    }
+
+    /// Accept one row whose ORDER BY keys the caller evaluated, one value per
+    /// term (see `OrderKeys::attach_keys`).
+    pub(super) fn push_keyed(&mut self, row: RowVals, keys: Vec<serde_json::Value>) -> Result<()> {
+        match self {
+            Self::Spill(sink) => sink.push_keyed(row, keys),
+            Self::InMemory(sink) => sink.push_keyed(row, keys),
         }
     }
 
@@ -633,7 +676,7 @@ pub fn in_memory_unordered_results() -> u64 {
 /// production order. Without a backend (unit tests, embedded use) the designed
 /// in-memory fallbacks apply, and each is counted and warned about once.
 #[derive(Debug)]
-pub(super) enum RowAcc {
+pub(crate) enum RowAcc {
     /// No ORDER BY and no spill backend: a counted in-memory buffer.
     InMemoryUnordered(Vec<RowVals>),
     /// Boxed: the sink carries the external sorter and its spill-pool charge,
@@ -644,7 +687,7 @@ pub(super) enum RowAcc {
 }
 
 impl RowAcc {
-    pub(super) fn new(
+    pub(crate) fn new(
         columns: &[String],
         return_clause: &ReturnClause,
         config: &super::expand::GraphEngineConfig,
@@ -669,7 +712,7 @@ impl RowAcc {
         Ok(Self::InMemoryUnordered(Vec::new()))
     }
 
-    pub(super) fn push(
+    pub(crate) fn push(
         &mut self,
         row: RowVals,
         bindings: &HashMap<String, serde_json::Value>,
@@ -686,13 +729,94 @@ impl RowAcc {
 
     /// The result tail as a stream: sorted (if ordered), then DISTINCT, then
     /// LIMIT.
-    pub(super) fn into_stream(self, return_clause: &ReturnClause) -> Result<RowStream<'static>> {
+    pub(crate) fn into_stream(self, return_clause: &ReturnClause) -> Result<RowStream<'static>> {
         let rows = match self {
             Self::InMemoryUnordered(rows) => super::stream::stream_from_rows(rows),
             Self::Ordered(sink) => sink.finish_stream()?,
             Self::ArrivalOrder(sink) => sink.finish_stream()?,
         };
         Ok(distinct_then_limit(rows, return_clause))
+    }
+}
+
+/// Drain `rows` to its end into a spill-backed run in ARRIVAL order, then hand
+/// back a stream that replays the run once.
+///
+/// This is the read-then-write barrier for write operators (SET, REMOVE,
+/// DELETE, CALL {} outer rows) and the buffer for orchestrators that must run
+/// every input before the first output is final. Writing while the matching
+/// scan is still being pulled would let a write change rows the same statement
+/// is still reading (the Halloween problem), so the producer is drained
+/// completely before this returns; memory is bounded by
+/// `spill_threshold_bytes`, not by the size of the run.
+///
+/// Without a spill backend (unit tests, embedded use) the run is the counted,
+/// warned-about in-memory fallback of [`RowAcc`].
+///
+/// Each row goes straight into the sink as it is pulled — a spill-bounded
+/// sink, not a growing `Vec` — and the first error stops the drain.
+pub(crate) async fn spill_run(
+    columns: &[String],
+    rows: RowStream<'_>,
+    config: &super::expand::GraphEngineConfig,
+    label: &str,
+) -> Result<RowStream<'static>> {
+    let mut run = RowRun::new(columns, config, label)?;
+    run.drain(rows).await?;
+    run.finish()
+}
+
+/// A spill-backed run of rows in arrival order that several producers append
+/// to in turn — e.g. one inner execution per UNWIND element or per CALL {}
+/// outer row — and that is replayed once, in the order it was written.
+///
+/// See [`spill_run`] for the single-producer form and the memory contract.
+pub(crate) struct RowRun {
+    acc: RowAcc,
+}
+
+impl RowRun {
+    fn arrival() -> ReturnClause {
+        ReturnClause {
+            distinct: false,
+            items: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+        }
+    }
+
+    pub(crate) fn new(
+        columns: &[String],
+        config: &super::expand::GraphEngineConfig,
+        label: &str,
+    ) -> Result<Self> {
+        let acc = RowAcc::new(
+            columns,
+            &Self::arrival(),
+            config,
+            label,
+            OrderSemantics::Arrival,
+        )?;
+        Ok(Self { acc })
+    }
+
+    /// Append one row.
+    pub(crate) fn append(&mut self, row: RowVals) -> Result<()> {
+        self.acc.push(row, &HashMap::new())
+    }
+
+    /// Append every row of `rows`, pulling it to its end. Each row goes
+    /// straight into the spill-bounded sink as it is pulled; the first error
+    /// stops the drain and is returned.
+    pub(crate) async fn drain(&mut self, rows: RowStream<'_>) -> Result<()> {
+        use futures::TryStreamExt as _;
+        rows.try_for_each(|row| futures::future::ready(self.append(row)))
+            .await
+    }
+
+    /// Replay the run once, in arrival order.
+    pub(crate) fn finish(self) -> Result<RowStream<'static>> {
+        self.acc.into_stream(&Self::arrival())
     }
 }
 

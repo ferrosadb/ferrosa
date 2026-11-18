@@ -1199,7 +1199,14 @@ impl<'a> Auditor<'a> {
 
         // Rule 8 (UFCS form): `Partition::clone(&p)` / `Clone::clone(&partition)`
         // — the explicit-path spelling of a row-data clone.
-        if last == Some("clone") {
+        // `Arc::clone(x)` / `Rc::clone(x)` only type-check when `x` already is
+        // the shared handle, so they bump a refcount and never copy row data.
+        let refcount_clone = segs
+            .len()
+            .checked_sub(2)
+            .and_then(|i| segs.get(i))
+            .is_some_and(|s| s == "Arc" || s == "Rc");
+        if last == Some("clone") && !refcount_clone {
             let type_seg_is_row = segs
                 .iter()
                 .any(|s| ROW_DATA_STRUCT_IDENTS.contains(&s.as_str()));
@@ -2357,6 +2364,13 @@ const MEMORY_SHAPE_EXEMPT: &[&str] = &[
     "BACKOFF",
     "INTERVAL",
     "ATTEMPT",
+    // a scan's resume count is a retry bound (compaction retired an input)
+    "RESUME",
+    // a compaction batch's input count: background work no query result
+    // passes through
+    "COMPACTION",
+    // a sampled seek summary's size: a sparser summary, never fewer results
+    "SUMMARY",
     // cache sizes are bounded-memory design, not result caps
     "CACHE",
     // *_LEN bounds the length of one value (bytes/chars), not a result count
@@ -3790,6 +3804,37 @@ mod tests {
         assert_eq!(count, 2, "UFCS clones of row data fire: {f:?}");
     }
 
+    /// `Arc::clone(&chunk)` / `Rc::clone(&rows)` bump a refcount: the call only
+    /// type-checks when the argument already is that shared handle, so it can
+    /// never copy the data behind it. A real UFCS row copy in the same fn must
+    /// still fire, or the exclusion would be a blind spot rather than a fix.
+    #[test]
+    fn rule_copies_row_data_arg_ignores_refcount_clones_but_not_row_clones() {
+        let src = r#"
+            fn a(chunk: Arc<Vec<u8>>, rows: Rc<Vec<R>>, partition: Arc<P>, p: &P) {
+                let h1 = Arc::clone(&chunk);
+                let h2 = Rc::clone(&rows);
+                let h3 = std::sync::Arc::clone(&partition);
+                let h4 = std::rc::Rc::clone(&rows);
+                let copy = Partition::clone(p);
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        let hits: Vec<_> = f
+            .iter()
+            .filter(|x| x.rule == rule::COPIES_ROW_DATA_ARG)
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "only the Partition::clone copies data: {hits:?}"
+        );
+        assert_eq!(
+            hits[0].line, 7,
+            "the surviving finding is the real copy: {hits:?}"
+        );
+    }
+
     #[test]
     fn rule_copies_row_data_arg_does_not_fire_on_byte_buffers() {
         let src = r#"
@@ -3842,6 +3887,39 @@ mod tests {
         assert!(
             !f.iter().any(|x| x.rule == rule::SERVER_SIDE_RESULT_CAP),
             "memory/shape/retry bounds must not fire: {f:?}"
+        );
+    }
+
+    /// A scan's resume count is a retry bound; a compaction batch's input count
+    /// is background work no query result passes through; a sampled seek
+    /// summary's size is a memory bound (a sparser summary, never fewer
+    /// results). None of them caps a result. The same result units in a real
+    /// result cap must still fire beside them.
+    #[test]
+    fn rule_result_cap_skips_resume_compaction_and_summary_bounds_only() {
+        let src = r#"
+            const RANGE_SCAN_MAX_RESUMES: u32 = 8;
+            const MAX_COMPACTION_CANDIDATES: usize = 64;
+            const PARTITION_TOKEN_SUMMARY_MAX_ENTRIES: usize = 65_536;
+            const MAX_SCAN_PARTITIONS: usize = 5000;
+            const MAX_ANN_CANDIDATES: usize = 512;
+            const MAX_INDEX_ROWS: usize = 10_000;
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        let mut fired: Vec<&str> = f
+            .iter()
+            .filter(|x| x.rule == rule::SERVER_SIDE_RESULT_CAP)
+            .map(|x| x.symbol.as_str())
+            .collect();
+        fired.sort_unstable();
+        assert_eq!(
+            fired,
+            [
+                "MAX_ANN_CANDIDATES",
+                "MAX_INDEX_ROWS",
+                "MAX_SCAN_PARTITIONS"
+            ],
+            "only the three result caps fire: {f:?}"
         );
     }
 

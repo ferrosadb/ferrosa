@@ -195,12 +195,12 @@ impl MaterializedRollup {
             keyspace: self.target.target_table.keyspace.clone(),
             table: self.target.target_table.table.clone(),
             key: DecoratedKey::new(PartitionKey::new(self.partition_key.clone())),
-            rows: vec![Row {
+            rows: vec![std::sync::Arc::new(Row {
                 clustering: window_start_raw.to_be_bytes().to_vec(),
                 cells,
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(write_timestamp),
-            }],
+            })],
             timestamp: write_timestamp,
         }
     }

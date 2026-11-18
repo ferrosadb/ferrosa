@@ -1795,7 +1795,7 @@ mod tests {
             primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
         };
         engine
-            .write(&table_id, &key, row, 1)
+            .write(&table_id, &key, Arc::new(row), 1)
             .expect("storage should accept write after table registered");
     }
 
@@ -2450,7 +2450,7 @@ mod tests {
                 ),
             };
             engine
-                .write(&tid, &key, row, 1000 + i64::from(value))
+                .write(&tid, &key, Arc::new(row), 1000 + i64::from(value))
                 .unwrap();
             engine.flush(&tid).unwrap();
         }
@@ -2562,7 +2562,7 @@ mod tests {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1_000),
         };
-        engine.write(&tid, &key1, row1, 1_000).unwrap();
+        engine.write(&tid, &key1, Arc::new(row1), 1_000).unwrap();
         engine.flush_all().unwrap();
 
         // ALTER TABLE ADD extra text column.
@@ -2599,7 +2599,7 @@ mod tests {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(2_000),
         };
-        engine.write(&tid, &key2, row2, 2_000).unwrap();
+        engine.write(&tid, &key2, Arc::new(row2), 2_000).unwrap();
         engine.flush_all().unwrap();
 
         // Both rows must be readable.

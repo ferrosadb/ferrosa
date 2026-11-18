@@ -80,7 +80,7 @@ async fn a_stalled_index_stream_consumer_does_not_block_ddl_or_reads() {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1),
         };
-        engine.write(&tid, &key, row, 1).unwrap();
+        engine.write(&tid, &key, Arc::new(row), 1).unwrap();
     }
 
     let mut stalled =

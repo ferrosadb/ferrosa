@@ -165,7 +165,7 @@ fn ledger_row() -> Row {
 /// SSTable (as the evicted generation did on node1).
 fn seed(storage: &StorageEngine) {
     storage
-        .write(&table_id(), &ledger_key(), ledger_row(), WRITE_TS)
+        .write(&table_id(), &ledger_key(), Arc::new(ledger_row()), WRITE_TS)
         .unwrap();
     storage.flush(&table_id()).unwrap();
 }
@@ -370,7 +370,10 @@ async fn kill(replica: &mut Replica) {
 
 async fn ledger_read(
     coordinator: &ClusterCoordinator,
-) -> (Result<Option<Vec<Row>>, ClusterError>, Duration) {
+) -> (
+    Result<Option<Vec<std::sync::Arc<Row>>>, ClusterError>,
+    Duration,
+) {
     let started = Instant::now();
     let result = tokio::time::timeout(
         READ_BOUND,
@@ -386,7 +389,7 @@ async fn ledger_read(
     (result, started.elapsed())
 }
 
-fn assert_is_ledger_row(rows: Option<Vec<Row>>, context: &str) {
+fn assert_is_ledger_row(rows: Option<Vec<std::sync::Arc<Row>>>, context: &str) {
     let rows = rows.unwrap_or_else(|| panic!("{context}: the ledger row is absent"));
     assert_eq!(rows.len(), 1, "{context}: expected exactly the ledger row");
     let (column, cell) = &rows[0].cells[0];

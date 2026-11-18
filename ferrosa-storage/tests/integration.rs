@@ -67,7 +67,7 @@ fn write_flush_read_round_trip() {
         store
             .write(
                 &key,
-                make_row(format!("value_{i}").as_bytes(), 1000 + i as i64),
+                Arc::new(make_row(format!("value_{i}").as_bytes(), 1000 + i as i64)),
             )
             .unwrap();
     }
@@ -92,25 +92,25 @@ fn multiple_flushes_merge() {
 
     // Write and flush with initial timestamps
     store
-        .write(&make_key("k1"), make_row(b"old_1", 1000))
+        .write(&make_key("k1"), Arc::new(make_row(b"old_1", 1000)))
         .unwrap();
     store
-        .write(&make_key("k2"), make_row(b"old_2", 1000))
+        .write(&make_key("k2"), Arc::new(make_row(b"old_2", 1000)))
         .unwrap();
     store.flush().unwrap();
 
     // Write same keys with newer timestamps and flush again
     store
-        .write(&make_key("k1"), make_row(b"new_1", 2000))
+        .write(&make_key("k1"), Arc::new(make_row(b"new_1", 2000)))
         .unwrap();
     store
-        .write(&make_key("k2"), make_row(b"new_2", 2000))
+        .write(&make_key("k2"), Arc::new(make_row(b"new_2", 2000)))
         .unwrap();
     store.flush().unwrap();
 
     // Write to memtable (not flushed)
     store
-        .write(&make_key("k1"), make_row(b"newest_1", 3000))
+        .write(&make_key("k1"), Arc::new(make_row(b"newest_1", 3000)))
         .unwrap();
 
     // Read should merge 2 SSTables + memtable
@@ -137,7 +137,7 @@ fn flush_does_not_block_reads() {
     // Pre-populate
     for i in 0..n {
         store
-            .write(&make_key(&format!("k{i}")), make_row(b"v", 1000))
+            .write(&make_key(&format!("k{i}")), Arc::new(make_row(b"v", 1000)))
             .unwrap();
     }
 
@@ -175,13 +175,13 @@ fn deletion_suppresses_across_sources() {
 
     // Write and flush data
     store
-        .write(&make_key("k1"), make_row(b"alive", 1000))
+        .write(&make_key("k1"), Arc::new(make_row(b"alive", 1000)))
         .unwrap();
     store.flush().unwrap();
 
     // Write newer data to memtable that overwrites flushed data.
     store
-        .write(&make_key("k1"), make_row(b"newer", 2000))
+        .write(&make_key("k1"), Arc::new(make_row(b"newer", 2000)))
         .unwrap();
 
     let result = store.read(&make_key("k1")).unwrap().unwrap();
@@ -201,8 +201,12 @@ fn snapshot_produces_token_order() {
 
     for i in 0..100 {
         let key = make_key(&format!("random_key_{i}"));
-        mem.put(&key, make_row(format!("v{i}").as_bytes(), 1000), &schema)
-            .unwrap();
+        mem.put(
+            &key,
+            Arc::new(make_row(format!("v{i}").as_bytes(), 1000)),
+            &schema,
+        )
+        .unwrap();
     }
 
     let snapshot = mem.snapshot();
@@ -226,10 +230,10 @@ fn file_flush_target_creates_readable_sstables() {
     );
 
     store
-        .write(&make_key("k1"), make_row(b"file_v1", 1000))
+        .write(&make_key("k1"), Arc::new(make_row(b"file_v1", 1000)))
         .unwrap();
     store
-        .write(&make_key("k2"), make_row(b"file_v2", 2000))
+        .write(&make_key("k2"), Arc::new(make_row(b"file_v2", 2000)))
         .unwrap();
     store.flush().unwrap();
 
@@ -258,7 +262,7 @@ fn concurrent_writes_no_data_loss() {
                     store
                         .write(
                             &key,
-                            make_row(format!("v{t}_{k}").as_bytes(), 1000 + t as i64),
+                            Arc::new(make_row(format!("v{t}_{k}").as_bytes(), 1000 + t as i64)),
                         )
                         .unwrap();
                 }
@@ -290,21 +294,21 @@ fn merge_is_commutative() {
 
     // Store1: write A then B
     store1
-        .write(&make_key("k1"), make_row(b"v_a", 1000))
+        .write(&make_key("k1"), Arc::new(make_row(b"v_a", 1000)))
         .unwrap();
     store1.flush().unwrap();
     store1
-        .write(&make_key("k1"), make_row(b"v_b", 2000))
+        .write(&make_key("k1"), Arc::new(make_row(b"v_b", 2000)))
         .unwrap();
     store1.flush().unwrap();
 
     // Store2: write B then A
     store2
-        .write(&make_key("k1"), make_row(b"v_b", 2000))
+        .write(&make_key("k1"), Arc::new(make_row(b"v_b", 2000)))
         .unwrap();
     store2.flush().unwrap();
     store2
-        .write(&make_key("k1"), make_row(b"v_a", 1000))
+        .write(&make_key("k1"), Arc::new(make_row(b"v_a", 1000)))
         .unwrap();
     store2.flush().unwrap();
 

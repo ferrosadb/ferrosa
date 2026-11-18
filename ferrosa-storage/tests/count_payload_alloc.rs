@@ -5,6 +5,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::sync::Arc;
 
 use ferrosa_common::cell::CellValue;
 use ferrosa_common::key::{DecoratedKey, PartitionKey};
@@ -79,7 +80,7 @@ fn sample(payload_bytes: usize, predicate: bool, columns: usize) -> usize {
             .write(
                 &table,
                 &key,
-                Row {
+                Arc::new(Row {
                     clustering: vec![],
                     cells: (0..columns)
                         .map(|i| {
@@ -91,7 +92,7 @@ fn sample(payload_bytes: usize, predicate: bool, columns: usize) -> usize {
                         .collect(),
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
-                },
+                }),
                 timestamp,
             )
             .unwrap();

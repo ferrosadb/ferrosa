@@ -127,7 +127,9 @@ pub fn seed_legacy(
         for (key, rows) in partitions {
             for row in rows {
                 let ts = row.primary_key_liveness.timestamp;
-                engine.write(&tid, &key, row, ts).expect("seed write");
+                engine
+                    .write(&tid, &key, Arc::new(row), ts)
+                    .expect("seed write");
             }
         }
     };
@@ -156,7 +158,7 @@ pub fn seed_legacy(
                     key,
                     deletion: DeletionTime::LIVE,
                     static_row: None,
-                    rows,
+                    rows: rows.into_iter().map(Arc::new).collect(),
                 })
                 .collect();
             parts.sort_by(|a, b| a.key.cmp(&b.key));

@@ -488,7 +488,7 @@ mod tests {
             keyspace: "test_ks".to_string(),
             table: "test_tbl".to_string(),
             key,
-            rows: vec![row],
+            rows: vec![Arc::new(row)],
             timestamp: 1000,
         }
     }
@@ -1405,7 +1405,7 @@ mod tests {
             primary_coordinator_with_archive_options(dir.path(), Some(store.clone()), true).await;
         let coordinator = Arc::new(coordinator.with_strict_quorum(true));
         let mut mutation = test_mutation();
-        mutation.rows[0].cells[0].1 = CellValue::live(vec![7; 1800], 1000);
+        Arc::make_mut(&mut mutation.rows[0]).cells[0].1 = CellValue::live(vec![7; 1800], 1000);
         for _ in 0..3 {
             coordinator.apply_locally(&mutation).unwrap();
         }

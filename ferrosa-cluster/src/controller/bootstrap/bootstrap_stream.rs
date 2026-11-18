@@ -299,7 +299,13 @@ mod tests {
                 primary_key_liveness: LivenessInfo::with_timestamp(1),
             };
             storage
-                .apply_partition_parts(&tid, &key, DeletionTime::LIVE, None, std::iter::once(row))
+                .apply_partition_parts(
+                    &tid,
+                    &key,
+                    DeletionTime::LIVE,
+                    None,
+                    std::iter::once(std::sync::Arc::new(row)),
+                )
                 .unwrap();
         }
 

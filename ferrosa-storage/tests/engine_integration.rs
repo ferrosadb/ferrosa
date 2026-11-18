@@ -4,6 +4,7 @@ use ferrosa_common::cell::CellValue;
 use ferrosa_common::key::{DecoratedKey, PartitionKey};
 use ferrosa_common::schema::{ColumnDefinition, TableSchema};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+use std::sync::Arc;
 
 use std::path::Path;
 use std::time::Duration;
@@ -90,7 +91,12 @@ fn write_read_round_trip() {
     for (i, key) in keys.iter().enumerate() {
         let ts = (i as i64 + 1) * 1000;
         engine
-            .write(&tid, key, make_row(format!("value_{i}").as_bytes(), ts), ts)
+            .write(
+                &tid,
+                key,
+                Arc::new(make_row(format!("value_{i}").as_bytes(), ts)),
+                ts,
+            )
             .unwrap();
     }
 
@@ -124,7 +130,12 @@ fn write_flush_read() {
     for i in 0..5 {
         let key = make_key(&format!("order_{i}"));
         engine
-            .write(&tid, &key, make_row(b"pending", 1000 + i), 1000 + i)
+            .write(
+                &tid,
+                &key,
+                Arc::new(make_row(b"pending", 1000 + i)),
+                1000 + i,
+            )
             .unwrap();
     }
 
@@ -158,13 +169,13 @@ fn write_flush_write_read_merges() {
 
     // Write old value and flush.
     engine
-        .write(&tid, &key, make_row(b"old_data", 1000), 1000)
+        .write(&tid, &key, Arc::new(make_row(b"old_data", 1000)), 1000)
         .unwrap();
     engine.flush(&tid).unwrap();
 
     // Write new value (stays in memtable).
     engine
-        .write(&tid, &key, make_row(b"new_data", 2000), 2000)
+        .write(&tid, &key, Arc::new(make_row(b"new_data", 2000)), 2000)
         .unwrap();
 
     // Read should merge and return the newer value.
@@ -195,7 +206,7 @@ fn multiple_flushes() {
             let key = make_key(&format!("batch{batch}_entry{i}"));
             let ts = (batch * 1000 + i) as i64;
             engine
-                .write(&tid, &key, make_row(b"log_data", ts), ts)
+                .write(&tid, &key, Arc::new(make_row(b"log_data", ts)), ts)
                 .unwrap();
         }
         engine.flush(&tid).unwrap();
@@ -229,10 +240,10 @@ fn multi_table_isolation() {
     let key = make_key("shared_key");
 
     engine
-        .write(&tid_a, &key, make_row(b"from_a", 1000), 1000)
+        .write(&tid_a, &key, Arc::new(make_row(b"from_a", 1000)), 1000)
         .unwrap();
     engine
-        .write(&tid_b, &key, make_row(b"from_b", 2000), 2000)
+        .write(&tid_b, &key, Arc::new(make_row(b"from_b", 2000)), 2000)
         .unwrap();
 
     // Each table sees its own data.
@@ -277,7 +288,9 @@ fn concurrent_writers() {
                 for i in 0..25 {
                     let key = make_key(&format!("t{t}_k{i}"));
                     let ts = (t * 1000 + i) as i64;
-                    engine.write(&tid, &key, make_row(b"val", ts), ts).unwrap();
+                    engine
+                        .write(&tid, &key, Arc::new(make_row(b"val", ts)), ts)
+                        .unwrap();
                 }
             })
         })
@@ -316,7 +329,12 @@ fn flush_2000_keys_all_readable() {
         let key = make_key(&format!("k{i:06}"));
         let ts = i as i64;
         engine
-            .write(&tid, &key, make_row(format!("v{i}").as_bytes(), ts), ts)
+            .write(
+                &tid,
+                &key,
+                Arc::new(make_row(format!("v{i}").as_bytes(), ts)),
+                ts,
+            )
             .unwrap();
     }
 
@@ -361,7 +379,7 @@ fn many_flushes_no_data_loss() {
                 .write(
                     &tid,
                     &key,
-                    make_row(format!("v{key_idx}").as_bytes(), ts),
+                    Arc::new(make_row(format!("v{key_idx}").as_bytes(), ts)),
                     ts,
                 )
                 .unwrap();
@@ -414,7 +432,12 @@ fn single_writer_concurrent_flush_no_data_loss() {
             let idx = counter_w.fetch_add(1, Ordering::SeqCst);
             let key = make_key(&format!("k{idx:08}"));
             ts += 1;
-            let _ = eng.write(&tid_w, &key, make_row(format!("v{idx}").as_bytes(), ts), ts);
+            let _ = eng.write(
+                &tid_w,
+                &key,
+                Arc::new(make_row(format!("v{idx}").as_bytes(), ts)),
+                ts,
+            );
         }
     });
 
@@ -482,7 +505,7 @@ fn concurrent_writes_with_flushes_no_data_loss() {
                 match eng.write(
                     &tid,
                     &key,
-                    make_row(format!("v{ts}").as_bytes(), ts as i64),
+                    Arc::new(make_row(format!("v{ts}").as_bytes(), ts as i64)),
                     ts as i64,
                 ) {
                     Ok(()) => {
@@ -551,7 +574,7 @@ fn a_partition_delete_survives_its_own_flush() {
     let key = make_key("k");
 
     engine
-        .write(&tid, &key, make_row(b"v", 1000), 1000)
+        .write(&tid, &key, Arc::new(make_row(b"v", 1000)), 1000)
         .unwrap();
     engine.flush(&tid).unwrap();
 
@@ -561,7 +584,7 @@ fn a_partition_delete_survives_its_own_flush() {
         deletion: DeletionTime::new(2000, 1_000_000_000),
         primary_key_liveness: LivenessInfo::NONE,
     };
-    engine.write(&tid, &key, delete, 2000).unwrap();
+    engine.write(&tid, &key, Arc::new(delete), 2000).unwrap();
     let live_rows = |engine: &StorageEngine| {
         engine
             .read(&tid, &key)
@@ -616,7 +639,7 @@ fn restart_does_not_reduce_durable_state_counts() {
                 .write(
                     &table_a,
                     key,
-                    make_row(b"a", 1000 + i as i64),
+                    Arc::new(make_row(b"a", 1000 + i as i64)),
                     1000 + i as i64,
                 )
                 .unwrap();
@@ -626,7 +649,7 @@ fn restart_does_not_reduce_durable_state_counts() {
                 .write(
                     &table_b,
                     key,
-                    make_row(b"b", 2000 + i as i64),
+                    Arc::new(make_row(b"b", 2000 + i as i64)),
                     2000 + i as i64,
                 )
                 .unwrap();
@@ -691,7 +714,7 @@ fn count_monotonicity_across_restart_cycles() {
                 let key = make_key(&format!("cycle_{cycle}_key_{i}"));
                 let ts = 1000 + (cycle * 10 + i) as i64;
                 engine
-                    .write(&table_id, &key, make_row(b"v", ts), ts)
+                    .write(&table_id, &key, Arc::new(make_row(b"v", ts)), ts)
                     .unwrap();
                 keys.push(key);
             }

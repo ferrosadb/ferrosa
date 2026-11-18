@@ -129,7 +129,7 @@ fn write_path(dir: &std::path::Path, remotes: usize) -> WritePath {
         primary_key_liveness: LivenessInfo::with_timestamp(1000),
     };
     storage
-        .write(&TableId::new(KS, TBL), &key(), row, 1000)
+        .write(&TableId::new(KS, TBL), &key(), Arc::new(row), 1000)
         .unwrap();
 
     let mut ring = TokenRing::new();

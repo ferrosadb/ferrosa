@@ -398,12 +398,12 @@ async fn scan_page_collector_does_not_drain_the_upstream_result() {
                 )),
                 deletion: ferrosa_sstable::types::DeletionTime::LIVE,
                 static_row: None,
-                rows: vec![ferrosa_sstable::types::Row {
+                rows: vec![Arc::new(ferrosa_sstable::types::Row {
                     clustering: Vec::new(),
                     cells: Vec::new(),
                     deletion: ferrosa_sstable::types::DeletionTime::LIVE,
                     primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
-                }],
+                })],
             })
         })));
     let names = vec!["id".to_string()];

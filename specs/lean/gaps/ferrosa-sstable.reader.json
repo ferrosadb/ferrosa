@@ -1,0 +1,58 @@
+{
+  "stage": "aeneas",
+  "llbc": "/tmp/oomcat/main-wt/ferrosa_sstable.llbc",
+  "lean": "/tmp/leangap-ferrosa-sstable-afew1rbd/FerrosaSstable.lean",
+  "translation_errors": 0,
+  "translation_unique_reported": null,
+  "translation_messages": [],
+  "aeneas_exit": 1,
+  "lean_errors": 7,
+  "errors": [
+    {
+      "location": "FerrosaSstable.lean:960:36",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaSstable.lean:2767:32",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaSstable.lean:2783:78",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaSstable.lean:2799:32",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaSstable.lean:2815:32",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaSstable.lean:2937:29",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaSstable.lean:2958:29",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    }
+  ],
+  "sorry_declarations": 137,
+  "compiled": false,
+  "crate": "ferrosa-sstable",
+  "prefix": "ferrosa_sstable::reader::*",
+  "generated_at": "2026-11-17T18:41:24+00:00",
+  "memory_max": "9600M",
+  "toolchain": {
+    "charon": "/tmp/oomcat/aeneas-arc/charon/bin/charon",
+    "aeneas": "/tmp/oomcat/aeneas-arc/src/_build/default/main.exe",
+    "lean_pkg": "/tmp/oomcat/aeneas-arc/backends/lean"
+  }
+}
