@@ -302,4 +302,111 @@ theorem framed_new_delivers_all (target : List α → Option Nat) :
       have := ih f (fun m' h => hok m' (by simp [h])) (by omega)
       simp [this]
 
+/-! ## Envelope compression: the flag is dead at v5
+
+Compression in v5 lives in the *segment* framing and is negotiated once for the
+connection (`native_protocol_v5.spec` §2.3.2). The envelope header keeps its
+`0x01` bit only for backward compatibility, and §2.4.1.2 says plainly that it is
+"deprecated and ignored".
+
+The shipped decoder decompressed the segment and then decompressed each
+envelope again whenever that bit was set. It is not a dead branch in practice:
+the DataStax Java driver (`FrameCodec.computeFlags`) still sets `0x01` on every
+envelope that is not STARTUP or OPTIONS, so its traffic always tripped it. The
+body was already plaintext, its first four bytes — for a QUERY, the query-string
+length — were read as an uncompressed-length prefix, and LZ4 failed on the
+resulting nonsense, closing the connection mid-setup (issue #664).
+
+The model below makes the argument without LZ4: a body that survives the
+identity function is one that was never compressed, and a decoder that applies
+`f` to it anyway returns something else. `envelope_old_corrupts_a_v5_body` is
+that, and `envelope_new_ignores_the_flag` is the fix.
+-/
+
+namespace Envelope
+
+/-- What an envelope's flags say. `compressed` is the deprecated `0x01` bit. -/
+structure Env (α : Type) where
+  body : List α
+  compressed : Bool
+  deriving Repr, DecidableEq
+
+/-- Decode a v5 envelope body. v5 framing has already decompressed the segment,
+so the envelope's flag carries no information and must be ignored. -/
+def decodeEnvelopeV5 (_decompress : List α → List α) (e : Env α) : List α :=
+  e.body
+
+/-- Decode a v5 envelope the way the shipped code did: decompress again whenever
+the deprecated flag is set. -/
+def decodeEnvelopeV5Old (decompress : List α → List α) (e : Env α) : List α :=
+  if e.compressed then decompress e.body else e.body
+
+/-- A body that is not compressed: decompressing it as though it were changes it.
+`decompress` here is any non-identity on this input, which is what LZ4 is on
+plaintext. -/
+def corruptingDecompress : List Nat → List Nat
+  | [] => []
+  | x :: _ => [x]
+
+/-- The driver's shape: flag set, body already plaintext. -/
+def driverEnvelope : Env Nat := ⟨[37, 83, 69, 76], true⟩
+
+/-- The shipped decoder corrupts a body the framing layer had already
+decompressed — the LZ4 decode error, and the closed connection, in miniature. -/
+theorem envelope_old_corrupts_a_v5_body :
+    decodeEnvelopeV5Old corruptingDecompress driverEnvelope ≠ driverEnvelope.body := by
+  decide
+
+/-- The fix returns the body the framing layer produced, whatever the flag says. -/
+theorem envelope_new_ignores_the_flag :
+    decodeEnvelopeV5 corruptingDecompress driverEnvelope = driverEnvelope.body := by
+  rfl
+
+/-- The fix holds for every body and every flag: it never consults the flag. -/
+theorem envelope_new_is_the_identity (_decompress : List α → List α) (e : Env α) :
+    decodeEnvelopeV5 _decompress e = e.body := rfl
+
+/-- And it agrees with the old decoder exactly where the bit is clear, so the
+change cannot have removed any behaviour v5 actually relied on. -/
+theorem envelope_new_agrees_when_unflagged (decompress : List α → List α) (e : Env α)
+    (h : e.compressed = false) :
+    decodeEnvelopeV5Old decompress e = decodeEnvelopeV5 decompress e := by
+  simp [decodeEnvelopeV5Old, decodeEnvelopeV5, h]
+
+/-! ### The flag cannot express the framing decision
+
+The two decoders must disagree on *something*, but the point is narrower and
+worth stating exactly: the framing layer has already decided whether the segment
+was compressed, and that decision is not recoverable from the envelope's flag.
+So the flag cannot be an input to the envelope decode at all.
+
+Two consequences below. `envelope_decode_ignores_the_flag` says the flag never
+changes the result — which is what makes it safe to ignore rather than merely
+convenient. `envelope_old_corrupts_whenever_flagged` says the old decoder's
+failure does not depend on which bytes arrived, only on the bit: any body that
+survives `decompress` unchanged would have hidden the bug, and LZ4 on plaintext
+is precisely a `decompress` that does not. -/
+
+/-- Whatever the flag reads, the v5 envelope decode returns the body the framing
+layer produced. This is the property the fix implements. -/
+theorem envelope_decode_ignores_the_flag (decompress : List α → List α) (e : Env α) :
+    decodeEnvelopeV5 decompress e = decodeEnvelopeV5 decompress ⟨e.body, !e.compressed⟩ := rfl
+
+/-- The old decoder corrupts every flagged body that `decompress` does not
+already fix. Since LZ4 over plaintext is exactly such a function, this is the
+issue's failure generalised off the particular query text. -/
+theorem envelope_old_corrupts_whenever_flagged (decompress : List α → List α)
+    (e : Env α) (hflag : e.compressed = true) (hmoves : decompress e.body ≠ e.body) :
+    decodeEnvelopeV5Old decompress e ≠ e.body := by
+  simp [decodeEnvelopeV5Old, hflag, hmoves]
+
+/-- And the old decoder is only harmless when the bit is clear, which is why the
+bug could not be seen with any of the fixtures the Python driver produced. -/
+theorem envelope_old_is_harmless_only_when_unflagged (decompress : List α → List α)
+    (e : Env α) (h : e.compressed = false) :
+    decodeEnvelopeV5Old decompress e = e.body := by
+  simp [decodeEnvelopeV5Old, h]
+
+end Envelope
+
 end Ferrosa.Cql.V5Framing
