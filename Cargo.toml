@@ -95,6 +95,12 @@ arrow-schema = { git = "https://github.com/ferrosadb/arrow-rs.git", rev = "6e38b
 arrow-select = { git = "https://github.com/ferrosadb/arrow-rs.git", rev = "6e38b194" }
 arrow-string = { git = "https://github.com/ferrosadb/arrow-rs.git", rev = "6e38b194" }
 
+# russh (ferrosa-jepsen) reaches chrono through russh-util, which uses it for
+# its wasm32 `Instant`. The ferrosadb/russh fork's `ferrosa/0.65.1-no-chrono`
+# branch reads `Date.now()` through js-sys instead; native builds use
+# std::time::Instant either way.
+russh-util = { git = "https://github.com/ferrosadb/russh.git", rev = "5281cc07" }
+
 # Keep line-table debug info in release builds so container crashes produce a readable backtrace
 # without bloating the binary to full DWARF. Required for gdb backtraces inside the runtime image.
 [profile.release]
