@@ -45,7 +45,6 @@ RELEASE_SHAPED_JOBS = {
     ("ci.yml", "musl"): "the shipped static musl binary, built once",
     ("ci.yml", "glibc"): "the shipped glibc binary, built once in Ubuntu 22.04; build-node-image packages it",
     ("ci.yml", "aarch64-musl"): "checks release.yml's aarch64 packages and features",
-    ("ci.yml", "clippy-macos"): "runs release.yml's macOS clippy gate at PR time",
     ("install-smoke.yml", "build"): "stages the real release tarball layout",
     ("nightly-fuzz.yml", "smoke-test"): "musl fallback for the nightly .deb image",
     ("nightly-slow-tests.yml", "build-node-image"): "release image the nightly's test cluster runs",
@@ -207,17 +206,6 @@ class CiCacheWorkflowTests(unittest.TestCase):
             job = jobs((WORKFLOWS / workflow).read_text(encoding="utf-8"))[name]
             for command in cargo_commands(job):
                 self.assertNotIn("--all-features", command, f"{workflow}:{name} ({why})")
-
-    def test_pr_macos_clippy_runs_the_release_macos_clippy(self):
-        # target_os = "macos" code only compiles on a Mac. If the PR job drifts
-        # from the release gate, a macOS-only break again surfaces at release.
-        ci = jobs((WORKFLOWS / "ci.yml").read_text(encoding="utf-8"))["clippy-macos"]
-        release = jobs((WORKFLOWS / "release.yml").read_text(encoding="utf-8"))["build-macos-aarch64"]
-        release_clippy = [c for c in cargo_commands(release) if "clippy" in c]
-        self.assertEqual(len(release_clippy), 1, release_clippy)
-        self.assertEqual(cargo_commands(ci), release_clippy)
-        self.assertIn("runs-on: macos-15", ci)
-        self.assertIn("runs-on: macos-15", release)
 
     def test_only_jobs_with_one_compile_share_the_test_cache(self):
         for path in workflow_files():

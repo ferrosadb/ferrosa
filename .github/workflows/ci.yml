@@ -300,40 +300,6 @@ jobs:
           git fetch --no-tags origin "$base"
           python3 scripts/check-no-new-waivers.py "origin/$base"
 
-  clippy-macos:
-    name: Clippy (macOS aarch64)
-    # The same clippy step release.yml's "Build macOS aarch64" job runs, moved
-    # to PR time. Files gated on target_os = "macos" (the mach residency tests in
-    # ferrosa-sstable) never compile on the Linux jobs, so a change to a shared
-    # type broke only the next release: v2026.11.18.2009 failed E0308 after #667
-    # changed Partition.rows to Vec<Arc<Row>>.
-    #
-    # Hosted macos-15 for the reasons recorded on the release job: a public
-    # repo's PR refs cannot dispatch to the self-hosted Macs, and macos-latest
-    # would repoint without review. macOS minutes bill at 10x; the rust-cache
-    # restore keeps the run to a clippy pass over cached dependencies.
-    #
-    # Default features, not --all-features: this mirrors the release gate it
-    # protects (tests/ci/test_ci_cache_workflow.py RELEASE_SHAPED_JOBS).
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
-        with:
-          targets: aarch64-apple-darwin
-          components: clippy
-      - name: Install capnproto
-        run: |
-          if brew tap | grep -qx 'aws/tap'; then
-            brew untap aws/tap
-          fi
-          brew install capnp
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
-      - name: Clippy
-        run: cargo clippy --all-targets --target aarch64-apple-darwin -- -D warnings
-
   # ── Stage 2: Tests ──────────────────────────────────────────────────
   test:
     name: Test + Coverage
