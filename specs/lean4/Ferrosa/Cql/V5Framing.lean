@@ -373,6 +373,40 @@ theorem envelope_new_agrees_when_unflagged (decompress : List α → List α) (e
     decodeEnvelopeV5Old decompress e = decodeEnvelopeV5 decompress e := by
   simp [decodeEnvelopeV5Old, decodeEnvelopeV5, h]
 
+/-! ### The flag cannot express the framing decision
+
+The two decoders must disagree on *something*, but the point is narrower and
+worth stating exactly: the framing layer has already decided whether the segment
+was compressed, and that decision is not recoverable from the envelope's flag.
+So the flag cannot be an input to the envelope decode at all.
+
+Two consequences below. `envelope_decode_ignores_the_flag` says the flag never
+changes the result — which is what makes it safe to ignore rather than merely
+convenient. `envelope_old_corrupts_whenever_flagged` says the old decoder's
+failure does not depend on which bytes arrived, only on the bit: any body that
+survives `decompress` unchanged would have hidden the bug, and LZ4 on plaintext
+is precisely a `decompress` that does not. -/
+
+/-- Whatever the flag reads, the v5 envelope decode returns the body the framing
+layer produced. This is the property the fix implements. -/
+theorem envelope_decode_ignores_the_flag (decompress : List α → List α) (e : Env α) :
+    decodeEnvelopeV5 decompress e = decodeEnvelopeV5 decompress ⟨e.body, !e.compressed⟩ := rfl
+
+/-- The old decoder corrupts every flagged body that `decompress` does not
+already fix. Since LZ4 over plaintext is exactly such a function, this is the
+issue's failure generalised off the particular query text. -/
+theorem envelope_old_corrupts_whenever_flagged (decompress : List α → List α)
+    (e : Env α) (hflag : e.compressed = true) (hmoves : decompress e.body ≠ e.body) :
+    decodeEnvelopeV5Old decompress e ≠ e.body := by
+  simp [decodeEnvelopeV5Old, hflag, hmoves]
+
+/-- And the old decoder is only harmless when the bit is clear, which is why the
+bug could not be seen with any of the fixtures the Python driver produced. -/
+theorem envelope_old_is_harmless_only_when_unflagged (decompress : List α → List α)
+    (e : Env α) (h : e.compressed = false) :
+    decodeEnvelopeV5Old decompress e = e.body := by
+  simp [decodeEnvelopeV5Old, h]
+
 end Envelope
 
 end Ferrosa.Cql.V5Framing
