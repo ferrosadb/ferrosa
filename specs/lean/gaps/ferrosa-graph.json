@@ -1,302 +1,267 @@
 {
   "stage": "aeneas",
-  "llbc": "/tmp/oomcat/main-wt/ferrosa_graph.llbc",
-  "lean": "/tmp/leangap-ferrosa-graph-10pbmu4d/FerrosaGraph.lean",
+  "llbc": "/home/bkearns/src/ferrosa-suite/ferrosa-wt-oom-burndown/ferrosa_graph.llbc",
+  "lean": "/tmp/leangap-ferrosa-graph-c957r0x8/FerrosaGraph.lean",
   "translation_errors": 0,
   "translation_unique_reported": null,
   "translation_messages": [],
   "aeneas_exit": 1,
-  "lean_errors": 78,
+  "lean_errors": 79,
   "errors": [
     {
-      "location": "FerrosaGraph.lean:1480:4",
+      "location": "FerrosaGraph.lean:1522:4",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown constant `Aeneas.Std.core.iter.adapters.map.Map.Insts.CoreIterTraitsIteratorIterator`"
     },
     {
-      "location": "FerrosaGraph.lean:2469:18",
+      "location": "FerrosaGraph.lean:2478:18",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown constant `ferrosa_graph.core.option.IntoIter.Insts.CoreIterTraitsIteratorIterator`"
     },
     {
-      "location": "FerrosaGraph.lean:5177:14",
+      "location": "FerrosaGraph.lean:5174:14",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaGraph.lean:7085:20",
+      "location": "FerrosaGraph.lean:7122:20",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaGraph.lean:7479:45",
+      "location": "FerrosaGraph.lean:7516:45",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaGraph.lean:7489:40",
+      "location": "FerrosaGraph.lean:7526:40",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaGraph.lean:9767:31",
+      "location": "FerrosaGraph.lean:9804:31",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaGraph.lean:9768:32",
+      "location": "FerrosaGraph.lean:9805:32",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaGraph.lean:9797:31",
+      "location": "FerrosaGraph.lean:9834:31",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaGraph.lean:9798:32",
+      "location": "FerrosaGraph.lean:9835:32",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaGraph.lean:9833:31",
+      "location": "FerrosaGraph.lean:9870:31",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaGraph.lean:9834:32",
+      "location": "FerrosaGraph.lean:9871:32",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaGraph.lean:9936:19",
+      "location": "FerrosaGraph.lean:9973:19",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `openraft.node.NodeId`"
     },
     {
-      "location": "FerrosaGraph.lean:9949:19",
+      "location": "FerrosaGraph.lean:9986:19",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `openraft.node.NodeId`"
     },
     {
-      "location": "FerrosaGraph.lean:9966:19",
+      "location": "FerrosaGraph.lean:10003:19",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `openraft.node.NodeId`"
     },
     {
-      "location": "FerrosaGraph.lean:10049:2",
+      "location": "FerrosaGraph.lean:10086:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `openraft.type_config.RaftTypeConfig`"
     },
     {
-      "location": "FerrosaGraph.lean:10111:39",
+      "location": "FerrosaGraph.lean:10148:39",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaGraph.lean:10128:35",
+      "location": "FerrosaGraph.lean:10165:35",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `openraft.type_config.RaftTypeConfig`"
     },
     {
-      "location": "FerrosaGraph.lean:10145:35",
+      "location": "FerrosaGraph.lean:10182:35",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `openraft.type_config.RaftTypeConfig`"
     },
     {
-      "location": "FerrosaGraph.lean:10161:2",
+      "location": "FerrosaGraph.lean:10198:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `openraft.type_config.RaftTypeConfig`"
     },
     {
-      "location": "FerrosaGraph.lean:10163:12",
+      "location": "FerrosaGraph.lean:10200:12",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `openraft.entry.payload.EntryPayload`"
     },
     {
-      "location": "FerrosaGraph.lean:10600:40",
+      "location": "FerrosaGraph.lean:10638:40",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaGraph.lean:10637:71",
+      "location": "FerrosaGraph.lean:10675:71",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaGraph.lean:10688:41",
+      "location": "FerrosaGraph.lean:10726:41",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaGraph.lean:10698:75",
+      "location": "FerrosaGraph.lean:10736:75",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaGraph.lean:10709:5",
+      "location": "FerrosaGraph.lean:10747:5",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaGraph.lean:10746:32",
+      "location": "FerrosaGraph.lean:10784:32",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaGraph.lean:10756:32",
+      "location": "FerrosaGraph.lean:10794:32",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaGraph.lean:10766:52",
+      "location": "FerrosaGraph.lean:10804:52",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaGraph.lean:10799:37",
+      "location": "FerrosaGraph.lean:10837:37",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaGraph.lean:10890:32",
+      "location": "FerrosaGraph.lean:10928:32",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaGraph.lean:10907:64",
+      "location": "FerrosaGraph.lean:10945:64",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaGraph.lean:11014:38",
+      "location": "FerrosaGraph.lean:11052:38",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaGraph.lean:11024:38",
+      "location": "FerrosaGraph.lean:11062:38",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaGraph.lean:11034:66",
+      "location": "FerrosaGraph.lean:11072:66",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaGraph.lean:11060:4",
+      "location": "FerrosaGraph.lean:11098:4",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown constant `ferrosa_graph.ferrosa_schema.metadata.table.TableFlag.Insts.CoreCmpPartialEqTableFlag`"
     },
     {
-      "location": "FerrosaGraph.lean:11071:45",
+      "location": "FerrosaGraph.lean:11109:45",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaGraph.lean:11229:66",
+      "location": "FerrosaGraph.lean:11267:66",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaGraph.lean:11275:31",
+      "location": "FerrosaGraph.lean:11313:31",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaGraph.lean:11363:64",
+      "location": "FerrosaGraph.lean:11415:64",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaGraph.lean:11410:5",
+      "location": "FerrosaGraph.lean:11462:5",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaGraph.lean:11427:69",
+      "location": "FerrosaGraph.lean:11479:69",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaGraph.lean:11444:72",
+      "location": "FerrosaGraph.lean:11496:72",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaGraph.lean:11472:5",
+      "location": "FerrosaGraph.lean:11524:5",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaGraph.lean:11494:18",
+      "location": "FerrosaGraph.lean:11546:18",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaGraph.lean:11517:34",
+      "location": "FerrosaGraph.lean:11569:34",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaGraph.lean:11572:60",
+      "location": "FerrosaGraph.lean:11628:60",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaGraph.lean:11594:54",
+      "location": "FerrosaGraph.lean:11650:54",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaGraph.lean:11795:78",
+      "location": "FerrosaGraph.lean:11851:78",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaGraph.lean:11803:60",
+      "location": "FerrosaGraph.lean:11859:60",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaGraph.lean:11813:44",
+      "location": "FerrosaGraph.lean:11869:44",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
-    },
-    {
-      "location": "FerrosaGraph.lean:11830:2",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserialize`"
-    },
-    {
-      "location": "FerrosaGraph.lean:11838:40",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserialize`"
-    },
-    {
-      "location": "FerrosaGraph.lean:11846:40",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserialize`"
-    },
-    {
-      "location": "FerrosaGraph.lean:11854:42",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserialize`"
-    },
-    {
-      "location": "FerrosaGraph.lean:11865:2",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserialize`"
-    },
-    {
-      "location": "FerrosaGraph.lean:11875:21",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserialize`"
-    },
-    {
-      "location": "FerrosaGraph.lean:11875:52",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
       "location": "FerrosaGraph.lean:11886:2",
@@ -304,97 +269,137 @@
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaGraph.lean:11886:33",
+      "location": "FerrosaGraph.lean:11894:39",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaGraph.lean:11897:47",
+      "location": "FerrosaGraph.lean:11902:40",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaGraph.lean:11899:2",
+      "location": "FerrosaGraph.lean:11910:40",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaGraph.lean:11899:33",
+      "location": "FerrosaGraph.lean:11918:42",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaGraph.lean:11911:21",
+      "location": "FerrosaGraph.lean:11929:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaGraph.lean:11913:2",
+      "location": "FerrosaGraph.lean:11939:21",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaGraph.lean:11915:2",
+      "location": "FerrosaGraph.lean:11939:52",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaGraph.lean:11924:74",
+      "location": "FerrosaGraph.lean:11950:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaGraph.lean:11950:33",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaGraph.lean:11961:47",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaGraph.lean:11963:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaGraph.lean:11963:33",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaGraph.lean:11975:21",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaGraph.lean:11977:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaGraph.lean:11979:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaGraph.lean:11988:74",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaGraph.lean:11933:2",
+      "location": "FerrosaGraph.lean:11997:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaGraph.lean:11941:40",
+      "location": "FerrosaGraph.lean:12005:40",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaGraph.lean:11949:39",
+      "location": "FerrosaGraph.lean:12013:39",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaGraph.lean:11957:39",
+      "location": "FerrosaGraph.lean:12021:39",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaGraph.lean:11965:41",
+      "location": "FerrosaGraph.lean:12029:41",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaGraph.lean:11974:39",
+      "location": "FerrosaGraph.lean:12038:38",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaGraph.lean:11982:39",
+      "location": "FerrosaGraph.lean:12046:39",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaGraph.lean:11990:39",
+      "location": "FerrosaGraph.lean:12054:39",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaGraph.lean:11999:55",
+      "location": "FerrosaGraph.lean:12062:39",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaGraph.lean:12010:4",
+      "location": "FerrosaGraph.lean:12071:55",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaGraph.lean:12010:34",
+      "location": "FerrosaGraph.lean:12082:4",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     }
@@ -403,7 +408,7 @@
   "compiled": false,
   "crate": "ferrosa-graph",
   "prefix": "ferrosa_graph::*",
-  "generated_at": "2026-11-18T06:54:34+00:00",
+  "generated_at": "2026-11-18T07:08:00+00:00",
   "memory_max": "9600M",
   "toolchain": {
     "charon": "/tmp/oomcat/aeneas-arc/charon/bin/charon",

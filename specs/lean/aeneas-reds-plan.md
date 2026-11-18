@@ -56,6 +56,11 @@ Re-measured under `0d04b2ae`:
   elaborates (Step 3), so one synth failure became two unknown identifiers. The class grew
   because more of the code elaborates; it is not new code.
 
+PR #667 (the OOM burndown) records one more accepted growth on this pin: `ferrosa-graph`
+`lean.unknownIdentifier` 48 -> 49. DETACH DELETE now spills its entry records to disk, and their
+`Vec<u8>` fields need serde's `u8` instances, which name `Serialize`/`Deserialize` (Step 3 again).
+The same PR closes 427 reds, sparql alone 422.
+
 Step 3's opaque cut was implemented and measured before this pin (aeneas branch
 `feat/trait-group-cut`, `b8e5e200`, not pinned). Cutting the format-side serde traits and
 emitting the rest in dependency order removes the unknown identifiers, but costs a hole per cut

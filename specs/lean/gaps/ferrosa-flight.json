@@ -1,164 +1,159 @@
 {
   "stage": "aeneas",
-  "llbc": "/tmp/oomcat/main-wt/ferrosa_flight.llbc",
-  "lean": "/tmp/leangap-ferrosa-flight-1ck9a5mh/FerrosaFlight.lean",
+  "llbc": "/home/bkearns/src/ferrosa-suite/ferrosa-wt-oom-burndown/ferrosa_flight.llbc",
+  "lean": "/tmp/leangap-ferrosa-flight-1vtrhdyf/FerrosaFlight.lean",
   "translation_errors": 0,
   "translation_unique_reported": null,
   "translation_messages": [],
   "aeneas_exit": 1,
-  "lean_errors": 29,
+  "lean_errors": 28,
   "errors": [
     {
-      "location": "FerrosaFlight.lean:11364:31",
+      "location": "FerrosaFlight.lean:11356:31",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaFlight.lean:11394:31",
+      "location": "FerrosaFlight.lean:11386:31",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaFlight.lean:11430:31",
+      "location": "FerrosaFlight.lean:11422:31",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaFlight.lean:11442:22",
+      "location": "FerrosaFlight.lean:11434:22",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `openraft.OptionalSerde`"
     },
     {
-      "location": "FerrosaFlight.lean:11453:22",
+      "location": "FerrosaFlight.lean:11445:22",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `openraft.OptionalSerde`"
     },
     {
-      "location": "FerrosaFlight.lean:11533:19",
+      "location": "FerrosaFlight.lean:11525:19",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `openraft.node.NodeId`"
     },
     {
-      "location": "FerrosaFlight.lean:11545:17",
+      "location": "FerrosaFlight.lean:11537:17",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `openraft.node.Node`"
     },
     {
-      "location": "FerrosaFlight.lean:11546:19",
+      "location": "FerrosaFlight.lean:11538:19",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `openraft.node.NodeId`"
     },
     {
-      "location": "FerrosaFlight.lean:11562:17",
+      "location": "FerrosaFlight.lean:11554:17",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `openraft.node.Node`"
     },
     {
-      "location": "FerrosaFlight.lean:11563:19",
+      "location": "FerrosaFlight.lean:11555:19",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `openraft.node.NodeId`"
     },
     {
-      "location": "FerrosaFlight.lean:11564:22",
+      "location": "FerrosaFlight.lean:11556:22",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `openraft.OptionalSerde`"
     },
     {
-      "location": "FerrosaFlight.lean:11646:2",
+      "location": "FerrosaFlight.lean:11638:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `openraft.type_config.RaftTypeConfig`"
     },
     {
-      "location": "FerrosaFlight.lean:11717:35",
+      "location": "FerrosaFlight.lean:11709:35",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `openraft.type_config.RaftTypeConfig`"
     },
     {
-      "location": "FerrosaFlight.lean:11734:35",
+      "location": "FerrosaFlight.lean:11726:35",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `openraft.type_config.RaftTypeConfig`"
     },
     {
-      "location": "FerrosaFlight.lean:11750:2",
+      "location": "FerrosaFlight.lean:11742:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `openraft.type_config.RaftTypeConfig`"
     },
     {
-      "location": "FerrosaFlight.lean:11752:12",
+      "location": "FerrosaFlight.lean:11744:12",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `openraft.entry.payload.EntryPayload`"
     },
     {
-      "location": "FerrosaFlight.lean:12027:75",
+      "location": "FerrosaFlight.lean:12019:75",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaFlight.lean:12038:5",
+      "location": "FerrosaFlight.lean:12030:5",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaFlight.lean:12048:37",
+      "location": "FerrosaFlight.lean:12040:37",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaFlight.lean:12058:38",
+      "location": "FerrosaFlight.lean:12050:68",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaFlight.lean:12068:68",
+      "location": "FerrosaFlight.lean:12930:32",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaFlight.lean:12948:32",
+      "location": "FerrosaFlight.lean:13348:32",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaFlight.lean:13365:32",
+      "location": "FerrosaFlight.lean:13412:64",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaFlight.lean:13429:64",
+      "location": "FerrosaFlight.lean:13432:66",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaFlight.lean:13449:66",
+      "location": "FerrosaFlight.lean:13441:24",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaFlight.lean:13458:24",
+      "location": "FerrosaFlight.lean:13450:24",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaFlight.lean:13467:24",
+      "location": "FerrosaFlight.lean:13536:76",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaFlight.lean:13553:76",
-      "kind": "lean.synthInstanceFailed",
-      "message": "failed to synthesize instance of type class"
-    },
-    {
-      "location": "FerrosaFlight.lean:13563:68",
+      "location": "FerrosaFlight.lean:13546:68",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     }
   ],
-  "sorry_declarations": 618,
+  "sorry_declarations": 617,
   "compiled": false,
   "crate": "ferrosa-flight",
   "prefix": "ferrosa_flight::*",
-  "generated_at": "2026-11-18T06:53:58+00:00",
+  "generated_at": "2026-11-18T07:07:25+00:00",
   "memory_max": "9600M",
   "toolchain": {
     "charon": "/tmp/oomcat/aeneas-arc/charon/bin/charon",
