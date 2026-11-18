@@ -92,6 +92,10 @@ import Ferrosa.Storage.SyncHealth
 #check Ferrosa.Cql.V5Framing.decode_new_progress
 #check Ferrosa.Cql.V5Framing.decode_new_reassembles
 #check Ferrosa.Cql.V5Framing.framed_new_delivers_all
+#check Ferrosa.Cql.V5Framing.Envelope.envelope_old_corrupts_a_v5_body
+#check Ferrosa.Cql.V5Framing.Envelope.envelope_new_ignores_the_flag
+#check Ferrosa.Cql.V5Framing.Envelope.envelope_new_is_the_identity
+#check Ferrosa.Cql.V5Framing.Envelope.envelope_new_agrees_when_unflagged
 #check Ferrosa.Storage.SyncHealth.force_old_keeps_refusing
 #check Ferrosa.Storage.SyncHealth.force_new_is_a_sync
 #check Ferrosa.Storage.SyncHealth.completed_sync_clears_the_clock
