@@ -63,6 +63,15 @@ openraft = { git = "https://github.com/ferrosadb/openraft.git", rev = "098874df"
 # the original crates in its tests.
 object_store = { git = "https://github.com/ferrosadb/arrow-rs.git", rev = "8d32810b" }
 
+# The scylla driver (ferrosa-jepsen) and scylla-cql (ferrosa-cql tests) require
+# chrono in every release. The ferrosadb/scylla-rust-driver fork's
+# `ferrosa/1.6.0-no-chrono` branch is 1.6.0 with chrono removed: CqlValue's
+# date/timestamp Display is computed in-crate (golden-tested against chrono's
+# output), request history uses jiff, and the `chrono-04` feature, which ferrosa
+# never enabled, is dropped.
+scylla = { git = "https://github.com/ferrosadb/scylla-rust-driver.git", rev = "05460867" }
+scylla-cql = { git = "https://github.com/ferrosadb/scylla-rust-driver.git", rev = "05460867" }
+
 # Keep line-table debug info in release builds so container crashes produce a readable backtrace
 # without bloating the binary to full DWARF. Required for gdb backtraces inside the runtime image.
 [profile.release]
