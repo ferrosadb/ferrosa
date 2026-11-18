@@ -1600,6 +1600,34 @@ impl CommitLog {
         self.active.load().with_flush_held_for_test(hold);
     }
 
+    /// How far the active segment must be durable to cover every entry
+    /// appended before this call.
+    pub fn sync_target(&self) -> SyncTarget {
+        let segment = self.active.load_full();
+        let offset = segment.current_position();
+        SyncTarget { segment, offset }
+    }
+
+    /// Make `target` durable: return at once if a flush already covered it,
+    /// otherwise flush (sharing the flush with every caller queued with it).
+    ///
+    /// An already-durable target returns before the sync health is touched,
+    /// so a caller that needed no I/O can never clear the stall clock while
+    /// the sync machinery is stuck on later entries.
+    pub fn force_sync_through(&self, target: SyncTarget) -> ferrosa_common::Result<()> {
+        let SyncTarget { segment, offset } = target;
+        if segment.is_durable_through(offset) {
+            return Ok(());
+        }
+        // A forced sync is accounted like the thread's own fsync: a completed
+        // one clears the stall clock and a failed one leaves it running. The
+        // flush can still find the target durable once it holds the lock, but
+        // only because a flush that started after this call succeeded.
+        sync::forced_sync(self.sync_strategy.sync_health(), || {
+            segment.flush_through(offset)
+        })
+    }
+
     /// Force-syncs the active segment to disk.
     ///
     /// Waits for all in-flight writers to complete, then flushes the
@@ -1608,11 +1636,10 @@ impl CommitLog {
     pub fn force_sync(&self) -> ferrosa_common::Result<()> {
         // Every flush closes its section (reserve-ahead; see the segment
         // module docs), so a forced sync is an ordinary flush. No marker that
-        // is already on disk is ever rewritten. It is accounted in the sync
-        // health like the thread's own fsync, so a completed one clears the
-        // stall clock and a failed one leaves it running.
-        let active = self.active.load();
-        sync::forced_sync(self.sync_strategy.sync_health(), || active.flush_to_disk())
+        // is already on disk is ever rewritten. Its target is everything
+        // appended before this call, so a caller another flush already covered
+        // returns without I/O (group commit; see `force_sync_through`).
+        self.force_sync_through(self.sync_target())
     }
 
     /// Health of the sync machinery, for the node supervisor and metrics.
@@ -1675,6 +1702,13 @@ impl CommitLog {
             }
         }
     }
+}
+
+/// A point in one segment that a caller needs durable: everything allocated
+/// below `offset` when [`CommitLog::sync_target`] was taken.
+pub struct SyncTarget {
+    segment: Arc<Segment>,
+    offset: u64,
 }
 
 /// Parses a segment ID from a filename like `commitlog-42.log`.
@@ -3210,6 +3244,45 @@ mod tests {
             markers, 1,
             "{CALLERS} callers queued behind one flush wrote {markers} sections, one fsync \
              each; a single flush must make the whole queue durable"
+        );
+        cl.shutdown().unwrap();
+    }
+
+    /// A caller whose entries an earlier flush already made durable returns
+    /// without writing, even when another writer has appended since.
+    ///
+    /// Without this a queued caller that wins the flush lock fsyncs whatever
+    /// arrived after its own entry, so every waiter in a convoy pays a device
+    /// flush: 128 concurrent pair writers did 0.41 fsyncs per apply and waited
+    /// up to 581 ms on the flush lock for 9.6 ms fsyncs.
+    #[test]
+    fn force_sync_through_an_already_durable_target_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig {
+            segment_size: 64 * 1024,
+            ..CommitLogConfig::test_config(dir.path())
+        };
+        let cl = CommitLog::new(config).unwrap();
+        let path = cl.active.load().path().to_path_buf();
+
+        cl.append_for_explicit_sync(&simple_mutation()).unwrap();
+        let mine = cl.sync_target();
+        cl.force_sync().unwrap(); // someone else's flush covers my entry
+        let durable = std::fs::metadata(&path).unwrap().len();
+
+        cl.append_for_explicit_sync(&simple_mutation()).unwrap(); // a later writer
+        cl.force_sync_through(mine).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            durable,
+            "a caller whose entry was already durable flushed a later writer's entry"
+        );
+
+        let later = cl.sync_target();
+        cl.force_sync_through(later).unwrap();
+        assert!(
+            std::fs::metadata(&path).unwrap().len() > durable,
+            "a target that was not yet durable must still be flushed"
         );
         cl.shutdown().unwrap();
     }

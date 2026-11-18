@@ -967,6 +967,36 @@ impl Segment {
     /// Closing before the lock gave every queued caller its own section and
     /// its own serial fsync.
     pub fn flush_to_disk(&self) -> ferrosa_common::Result<()> {
+        self.flush_through(self.position.load(Ordering::Acquire))
+    }
+
+    /// Whether every byte allocated below `target` is already on disk.
+    ///
+    /// After a flush that ran to its section's end, `last_flushed` is the
+    /// offset of the reserved head slot of the next section, and the target
+    /// taken right after that flush ends just past the slot:
+    /// `[last_flushed, last_flushed + SYNC_MARKER_SIZE)` holds no entry, so
+    /// such a target is covered. The allowance applies only while that slot
+    /// is still the current head; a flush cut short at an unpublished entry
+    /// leaves the watermark at an entry boundary, and then only `target <=
+    /// last_flushed` counts. Anything else is answered "not durable", which
+    /// costs at most a flush, never an early acknowledgement.
+    pub(crate) fn is_durable_through(&self, target: u64) -> bool {
+        let flushed = self.last_flushed.load(Ordering::Acquire);
+        if target <= flushed {
+            return true;
+        }
+        !self.chain_closed.load(Ordering::Acquire)
+            && flushed > 0
+            && flushed == self.head_marker_offset.load(Ordering::Acquire)
+            && target <= flushed + SYNC_MARKER_SIZE as u64
+    }
+
+    /// [`flush_to_disk`](Self::flush_to_disk) for a caller that needs only
+    /// the bytes below `target`: once it holds the flush lock it returns
+    /// without I/O if the flush it queued behind already covered `target`,
+    /// instead of fsyncing entries other writers appended after it.
+    pub(crate) fn flush_through(&self, target: u64) -> ferrosa_common::Result<()> {
         // File I/O happens under the file_handle mutex so concurrent flushers
         // never write the same range twice. `release_buffer()` also takes
         // this lock, so once we hold it the buffer's (ptr, len, cap) is
@@ -977,6 +1007,9 @@ impl Segment {
         let mut handle = self.file_handle.lock();
         self.flush_waiters.fetch_sub(1, Ordering::AcqRel);
         let file_lock_wait = lock_start.elapsed();
+        if self.is_durable_through(target) {
+            return Ok(());
+        }
         let end = self.close_section()?;
         self.write_through(&mut handle, end as usize, file_lock_wait)
     }
