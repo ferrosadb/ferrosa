@@ -277,8 +277,7 @@ leaf status would have duplicated machinery `ferrosa-cql` and `ferrosa-graph`
 already share, and duplicated its failure handling with it.
 
 External crates: `ordered-float` (total-order `f64` for join/group keys),
-`num-bigint` (arbitrary-precision `Numeric`), `uuid`, `chrono` (std-only, typed
-temporal literal parsing), `serde` + `serde_json` (spilled runs are
+`num-bigint` (arbitrary-precision `Numeric`), `uuid`, `serde` + `serde_json` (spilled runs are
 length-prefixed JSON records), `tracing`. Dev-only: `tempfile` and `libc` —
 `libc` because `tests/spill_operators.rs` raises the process soft
 `RLIMIT_NOFILE` to its hard limit (see the Tests section).

@@ -207,7 +207,8 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   therefore compose safely with whole-map inserts and later key removals.
   **Timestamp bounds validation (Bug C, t_a0f922a3)**: `validate_timestamp_ms`
   rejects any `timestamp` cell outside `[TIMESTAMP_MIN_MS, TIMESTAMP_MAX_MS]`
-  (chrono `MIN_UTC`/`MAX_UTC` millis) at the **write** boundary — integer-literal,
+  (the `ferrosa_common::temporal` calendar range, years -262143..=262142, which
+  is chrono's `MIN_UTC`/`MAX_UTC` that client drivers decode) at the **write** boundary — integer-literal,
   string, and bound 8-byte-blob paths alike — so an out-of-range value can never
   be persisted into a cell whose date the driver would fail to decode. On the
   **read** side `cell_to_cql_value` fails loud (`ServerError` naming the offending

@@ -2407,7 +2407,6 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "bytes",
- "chrono",
  "criterion",
  "dashmap",
  "ferrosa-cdc",
@@ -2529,7 +2528,6 @@ dependencies = [
  "bincode",
  "blake3",
  "bytes",
- "chrono",
  "ferrosa-alloc-count",
  "ferrosa-cluster",
  "ferrosa-common",
@@ -2601,9 +2599,9 @@ version = "0.36.3"
 dependencies = [
  "anyhow",
  "async-trait",
- "chrono",
  "clap",
  "dirs-next",
+ "ferrosa-common",
  "ferrosa-sim",
  "rand 0.10.1",
  "reqwest 0.12.28",
@@ -2704,7 +2702,6 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "capnp",
- "chrono",
  "ferrosa-cluster",
  "ferrosa-common",
  "ferrosa-jsonb",
@@ -2850,7 +2847,6 @@ dependencies = [
 name = "ferrosa-sql"
 version = "0.36.3"
 dependencies = [
- "chrono",
  "ferrosa-common",
  "ferrosa-jsonb",
  "ferrosa-storage",

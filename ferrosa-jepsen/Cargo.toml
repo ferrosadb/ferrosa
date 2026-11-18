@@ -28,6 +28,8 @@ path = "src/main.rs"
 anyhow = "1"
 # W8.9 — sim-equivalent endurance path (ADR-016).
 ferrosa-sim = { path = "../ferrosa-sim" }
+# Wall-clock timestamps for histories, run ids and reports (`temporal::now`).
+ferrosa-common = { path = "../ferrosa-common" }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -35,7 +37,6 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 russh = "0.65"

@@ -527,7 +527,7 @@ label, is what would attribute it.
   `WriteObserver` / `ObserverMode` (the observer hook).
 
 External: `axum`/`axum-server` (`tls-rustls-no-provider`), `rustls`, `tokio-rustls`, `tokio`, `serde`/`serde_json`, `arc-swap`,
-`parking_lot`, `indexmap`, `phf`, `blake3`, `uuid`, `base64`, `hex`, `chrono`.
+`parking_lot`, `indexmap`, `phf`, `blake3`, `uuid`, `base64`, `hex`. Timestamp text uses `ferrosa_common::temporal` (no date library).
 
 **Called by** (crates that depend on this):
 

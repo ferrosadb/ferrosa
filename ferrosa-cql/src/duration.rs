@@ -11,7 +11,7 @@
 //! Arithmetic adds months calendar-aware (clamping to month end), days as
 //! calendar days, and nanoseconds as a fixed offset.
 
-use chrono::{DateTime, Days, Months, NaiveDate, TimeZone, Utc};
+use ferrosa_common::temporal::{Date, DateTime};
 
 const NANOS_PER_MICRO: i64 = 1_000;
 const NANOS_PER_MILLI: i64 = 1_000_000;
@@ -179,72 +179,51 @@ pub fn parse_iso_duration(input: &str) -> Result<DurationComponents, String> {
     })
 }
 
-/// Apply a signed number of months to a UTC datetime, clamping the day to the
-/// target month's length (chrono's `Months` already does this).
-fn shift_months_dt(dt: DateTime<Utc>, months: i32) -> Option<DateTime<Utc>> {
-    if months >= 0 {
-        dt.checked_add_months(Months::new(months as u32))
-    } else {
-        dt.checked_sub_months(Months::new(months.unsigned_abs()))
-    }
-}
-
-fn shift_days_dt(dt: DateTime<Utc>, days: i32) -> Option<DateTime<Utc>> {
-    if days >= 0 {
-        dt.checked_add_days(Days::new(days as u64))
-    } else {
-        dt.checked_sub_days(Days::new(days.unsigned_abs() as u64))
-    }
-}
-
 /// Apply a duration to a timestamp (milliseconds since the Unix epoch),
-/// `subtract`ing it if requested. Months and days are calendar-aware.
+/// `subtract`ing it if requested. Months are calendar-aware (the day clamps
+/// to the target month's length), days are calendar days, and nanoseconds a
+/// fixed offset; `None` when any step leaves the representable range.
 pub fn apply_to_timestamp_millis(
     millis: i64,
     dur: DurationComponents,
     subtract: bool,
 ) -> Option<i64> {
     let s: i64 = if subtract { -1 } else { 1 };
-    let dt = Utc.timestamp_millis_opt(millis).single()?;
-    let dt = shift_months_dt(dt, (s as i32).checked_mul(dur.months)?)?;
-    let dt = shift_days_dt(dt, (s as i32).checked_mul(dur.days)?)?;
-    let dt = dt.checked_add_signed(chrono::Duration::nanoseconds(s * dur.nanos))?;
+    let dt = DateTime::from_timestamp_millis(millis)?;
+    let dt = dt.checked_add_months(i64::from((s as i32).checked_mul(dur.months)?))?;
+    let dt = dt.checked_add_days(i64::from((s as i32).checked_mul(dur.days)?))?;
+    let dt = dt.checked_add_nanos(s * dur.nanos)?;
     Some(dt.timestamp_millis())
 }
 
 /// Apply a duration to a `date` (Cassandra `u32`, days from epoch offset by
 /// `2^31`). Sub-day nanosecond components are folded into whole days.
 pub fn apply_to_date_days(date: u32, dur: DurationComponents, subtract: bool) -> Option<u32> {
-    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)?;
-    let day_index = i64::from(date) - DATE_EPOCH_OFFSET;
-    let base = if day_index >= 0 {
-        epoch.checked_add_days(Days::new(day_index as u64))?
-    } else {
-        epoch.checked_sub_days(Days::new(day_index.unsigned_abs()))?
-    };
+    let base = Date::from_days_since_epoch(i64::from(date) - DATE_EPOCH_OFFSET)?;
     let s: i64 = if subtract { -1 } else { 1 };
 
     let months = (s as i32).checked_mul(dur.months)?;
-    let shifted = if months >= 0 {
-        base.checked_add_months(Months::new(months as u32))?
-    } else {
-        base.checked_sub_months(Months::new(months.unsigned_abs()))?
-    };
+    let shifted = base.checked_add_months(i64::from(months))?;
     let extra_days = s.checked_mul(i64::from(dur.days))? + s * (dur.nanos / NANOS_PER_DAY);
-    let result = if extra_days >= 0 {
-        shifted.checked_add_days(Days::new(extra_days as u64))?
-    } else {
-        shifted.checked_sub_days(Days::new(extra_days.unsigned_abs()))?
-    };
+    let result = shifted.checked_add_days(extra_days)?;
 
-    let delta = result.signed_duration_since(epoch).num_days();
-    u32::try_from(delta + DATE_EPOCH_OFFSET).ok()
+    u32::try_from(result.days_since_epoch() + DATE_EPOCH_OFFSET).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Datelike;
+
+    /// Milliseconds since the epoch of midnight UTC on `y-m-d`.
+    fn midnight_millis(y: i64, m: u32, d: u32) -> i64 {
+        Date::from_ymd(y, m, d).unwrap().days_since_epoch() * 86_400_000
+    }
+
+    /// The UTC calendar date of a millisecond timestamp.
+    fn ymd(millis: i64) -> (i32, u32, u32) {
+        let date = DateTime::from_timestamp_millis(millis).unwrap().date();
+        (date.year(), date.month(), date.day())
+    }
 
     #[test]
     fn compact_durations() {
@@ -345,10 +324,7 @@ mod tests {
     #[test]
     fn timestamp_arithmetic_calendar_months() {
         // 2024-01-31 + 1 month clamps to 2024-02-29 (leap year).
-        let jan31 = Utc
-            .with_ymd_and_hms(2024, 1, 31, 0, 0, 0)
-            .unwrap()
-            .timestamp_millis();
+        let jan31 = midnight_millis(2024, 1, 31);
         let plus_month = apply_to_timestamp_millis(
             jan31,
             DurationComponents {
@@ -359,16 +335,12 @@ mod tests {
             false,
         )
         .unwrap();
-        let dt = Utc.timestamp_millis_opt(plus_month).single().unwrap();
-        assert_eq!((dt.year(), dt.month(), dt.day()), (2024, 2, 29));
+        assert_eq!(ymd(plus_month), (2024, 2, 29));
     }
 
     #[test]
     fn timestamp_subtract_days() {
-        let base = Utc
-            .with_ymd_and_hms(2017, 1, 3, 0, 0, 0)
-            .unwrap()
-            .timestamp_millis();
+        let base = midnight_millis(2017, 1, 3);
         let minus = apply_to_timestamp_millis(
             base,
             DurationComponents {
@@ -379,8 +351,7 @@ mod tests {
             true,
         )
         .unwrap();
-        let dt = Utc.timestamp_millis_opt(minus).single().unwrap();
-        assert_eq!((dt.year(), dt.month(), dt.day()), (2017, 1, 1));
+        assert_eq!(ymd(minus), (2017, 1, 1));
     }
 
     #[test]

@@ -4700,9 +4700,9 @@ async fn route_select(
                         ProjOp::FromRow(i) => row[*i].clone(),
                         ProjOp::ConstFn(fn_name) => match *fn_name {
                             "now" => Some(bridge::eval_now()),
-                            "currenttimestamp" => {
-                                Some(CqlValue::Timestamp(chrono::Utc::now().timestamp_millis()))
-                            }
+                            "currenttimestamp" => Some(CqlValue::Timestamp(
+                                ferrosa_common::temporal::now().timestamp_millis(),
+                            )),
                             "uuid" => Some(CqlValue::Uuid(uuid::Uuid::new_v4())),
                             _ => None,
                         },
@@ -9044,7 +9044,7 @@ fn cell_to_cql_value(
             let arr: [u8; 8] = bytes.as_slice().try_into().unwrap_or([0; 8]);
             let ms = i64::from_be_bytes(arr);
             // Read robustness (Bug C): an already-corrupt on-disk timestamp
-            // (millis outside chrono's representable range) must fail loud
+            // (millis outside the representable calendar range) must fail loud
             // rather than be emitted to a client that will crash decoding it.
             crate::bridge::validate_timestamp_ms(ms).map_err(|_| {
                 CqlError::ServerError(format!(

@@ -39,6 +39,7 @@
 
 #![cfg(feature = "live-infra-tests")]
 
+use ferrosa_common::temporal::{self, parse::formats};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
@@ -1033,10 +1034,10 @@ fn cql_bytes(v: &ferrosa_common::CqlValue) -> Vec<u8> {
 /// timestamp column never needs sub-ms precision (the sub-ms cases live only in
 /// the `at_time` column, which is microsecond-resolution `time`).
 fn cql_timestamp(s: &str) -> ferrosa_common::CqlValue {
-    let naive = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
-        .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
+    let naive = temporal::parse::naive_datetime(s, formats::YMD_HMS_FRAC)
+        .or_else(|_| temporal::parse::naive_datetime(s, formats::YMD_HMS))
         .unwrap_or_else(|e| panic!("bad timestamp literal {s:?}: {e}"));
-    let micros = naive.and_utc().timestamp_micros();
+    let micros = naive.timestamp_micros();
     assert_eq!(
         micros % 1000,
         0,
@@ -1048,23 +1049,19 @@ fn cql_timestamp(s: &str) -> ferrosa_common::CqlValue {
 
 /// `YYYY-MM-DD` → `CqlValue::Date(days + 2^31)` (CQL epoch-centered encoding).
 fn cql_date(s: &str) -> ferrosa_common::CqlValue {
-    let date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-        .unwrap_or_else(|e| panic!("bad date literal {s:?}: {e}"));
-    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-    let days = (date - epoch).num_days();
+    let days = temporal::parse::date(s, formats::YMD)
+        .unwrap_or_else(|e| panic!("bad date literal {s:?}: {e}"))
+        .days_since_epoch();
     let encoded = (days + 2_147_483_648) as u32;
     ferrosa_common::CqlValue::Date(encoded)
 }
 
 /// `HH:MM:SS[.ffffff]` → `CqlValue::Time(nanos since midnight)`.
 fn cql_time(s: &str) -> ferrosa_common::CqlValue {
-    let t = chrono::NaiveTime::parse_from_str(s, "%H:%M:%S%.f")
-        .or_else(|_| chrono::NaiveTime::parse_from_str(s, "%H:%M:%S"))
-        .unwrap_or_else(|e| panic!("bad time literal {s:?}: {e}"));
-    let midnight = chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap();
-    let nanos = (t - midnight)
-        .num_nanoseconds()
-        .expect("time within a day fits in i64 nanos");
+    let nanos = temporal::parse::time(s, formats::HMS_FRAC)
+        .or_else(|_| temporal::parse::time(s, formats::HMS))
+        .unwrap_or_else(|e| panic!("bad time literal {s:?}: {e}"))
+        .nanos_since_midnight();
     ferrosa_common::CqlValue::Time(nanos)
 }
 
