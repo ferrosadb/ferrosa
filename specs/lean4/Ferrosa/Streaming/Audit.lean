@@ -85,6 +85,63 @@ def sites : List Site := [
   ⟨"system tables", "the system-table walk visits one partition at a time", .streaming,
    "ferrosa-cluster/src/system_table_loader.rs:78",
    "`walk_all_partitions` delegates to `walk_token_range`, which streams the merged memtable and SSTable view."⟩,
+  ⟨"repair", "the apply path moves each chunk of partitions to its replica without copying it", .streaming,
+   "ferrosa-cluster/src/repair/rpc.rs:443",
+   "The executor hands its apply queue over with `mem::take` once it reaches `REPAIR_APPLY_CHUNK_PARTITIONS` (64); `apply_wire_chunks` moves each partition into its wire form, and the per-leaf diff borrows the partitions it compares instead of cloning them."⟩,
+  ⟨"cql", "a local LWT evaluates its IF clause on the row in place", .streaming,
+   "ferrosa-cql/src/router.rs:10150",
+   "`eval_local_condition` reads the one row it locked and passes `if_conditions_hold` a lookup over the positional cells (`columns.get_index_of`), so no name-keyed copy of the row is built; the owned `eval_if_conditions` wraps the same evaluator."⟩,
+  ⟨"sstable", "the decoded-chunk cache shares a chunk by refcount and evicts to a byte budget", .boundedByConfig "FERROSA_SSTABLE_CHUNK_CACHE_BYTES",
+   "ferrosa-sstable/src/reader.rs:148",
+   "`ChunkCache::insert` stores `Arc::clone(&chunk)` (a refcount bump, never a copy of the bytes) and pops LRU entries until the resident charge fits `max_bytes` (default 128 x 64 KiB, capped at 1 GiB)."⟩,
+  ⟨"graph", "a graph write derives its adjacency entries from the row it moves into the write", .streaming,
+   "ferrosa-graph/src/executor/expand.rs:4230",
+   "CREATE (4230), MERGE (4549) and DELETE call `explicit_adjacency_for` on the borrowed row, then move the row into `write`; neither the call site nor the helper copies it. Residual: `adjacency_write_with_retry` still clones the small derived adjacency row once per attempt."⟩,
+  ⟨"graph", "an aggregate group keeps its first row without copying it", .boundedByConfig "GraphEngineConfig::max_groups",
+   "ferrosa-graph/src/executor/expand.rs:7040",
+   "A new group starts with an empty `first_row`; the accumulators read the row, then it is moved in. Groups (one first row each) are capped by `max_groups`, which fails loud with ResourceLimit."⟩,
+  ⟨"flight", "Arrow conversion reads CQL values in place and DoPut yields one row at a time", .streaming,
+   "ferrosa-flight/src/convert.rs:192",
+   "Every Arrow builder takes `&[Option<&CqlValue>]` (text and blobs borrowed into the array, no per-cell clone); `record_batch_rows` returns `BatchRows`, which moves each row out of the decoded columns instead of building a row matrix."⟩,
+  ⟨"system tables", "the storage schema loaders walk system_schema one keyspace at a time", .streaming,
+   "ferrosa-storage/src/engine.rs:6311",
+   "`decode_system_schema_rows` drives `walk_token_range` over the table and decodes each partition's rows as it arrives; the capped `read_range(.., 10_000)` it replaces dropped every keyspace past the cap."⟩,
+  ⟨"storage", "a keyed index read streams the partition's matches in row order", .streaming,
+   "ferrosa-storage/src/store/index_read.rs:408",
+   "`read_by_index_in_partition_each_after` seeks every posting source to `(pk, after)`, merges them in row order through `OrderedPostings`, point-reads each row as it is reached and stops at the first posting of another partition; `INDEX_RESULT_CAP` is gone."⟩,
+  ⟨"storage", "a geo index read streams its candidates without a seen-set", .streaming,
+   "ferrosa-storage/src/store/index_read.rs:538",
+   "`read_by_index_cell_ranges_each` merges the memtable and sidecar range iterators lazily in (key, row) order, takes a duplicated posting once, and drops a moved point's stale posting by re-checking its encoded cell: no HashSet of positions."⟩,
+  ⟨"cluster", "a keyed index read merges replica streams one row at a time", .streaming,
+   "ferrosa-cluster/src/coordinator/read.rs:2432",
+   "`coordinate_index_read_in_partition_stream` opens replicas local-first until CL is covered and merges one row per replica by clustering; remote replicas answer `IndexReadInPartitionStreamRequest` (0x6A) with ADR-020 stream frames."⟩,
+  ⟨"cluster", "the write path exposes the keyed index read as a stream", .streaming,
+   "ferrosa-cluster/src/write_path/index_read.rs:58",
+   "`index_read_in_partition_stream` returns a stream for Direct, Pair and Cluster; the Vec-returning `index_read_in_partition` was deleted."⟩,
+  ⟨"sparql", "SPARQL solutions stream to the response", .streaming,
+   "ferrosa-sparql/src/response.rs:166",
+   "Solutions are a lazy stream written into a chunked HTTP body about 64 KiB at a time; there is no row bound (`DEFAULT_MAX_ROWS` was deleted)."⟩,
+  ⟨"sparql", "SPARQL ORDER BY, DISTINCT and grouped COUNT spill", .spilling true,
+   "ferrosa-sparql/src/executor.rs:102",
+   "`select_stream` pulls solutions lazily; ORDER BY uses `ExternalSorter`, DISTINCT `SpillingDedup`, and grouped COUNT flushes partial groups into an external sort past `spill_threshold_bytes`."⟩,
+  ⟨"sparql", "property-path closure expands by lookup and spills its frontier", .spilling true,
+   "ferrosa-sparql/src/property_path.rs:279",
+   "`bfs` expands each node with a point lookup of its partition; the visited set and each frontier level spill to disk, so no predicate adjacency is held."⟩,
+  ⟨"graph", "the MATCH anchor frontier spills instead of being collected", .spilling true,
+   "ferrosa-graph/src/executor/expand.rs:1664",
+   "`expand_to_states` writes anchor states to a spill-backed `StateRun` in scan order; hops, OPTIONAL MATCH, WITH and the projection pull them one at a time."⟩,
+  ⟨"graph", "a write's match set spills before the first write", .spilling true,
+   "ferrosa-graph/src/executor/spill.rs:757",
+   "SET / REMOVE / DELETE read the whole match set into `spill_run` (the ORDER BY `ExternalSorter` in arrival order) before writing, then replay it: Halloween-safe and memory-bounded."⟩,
+  ⟨"graph", "DETACH DELETE stages its batch and spills instead of collecting it", .spilling true,
+   "ferrosa-graph/src/executor/expand/detach_delete.rs:239",
+   "`stage_incident_edges` writes tombstones into a spilling `WriteSetStage`; `record_protectors` is a sort-merge through `ExternalSorter` with O(1) state per adjacency entry; the batch commits atomically through `write_staged_batch`."⟩,
+  ⟨"graph", "a retried adjacency write shares one row", .streaming,
+   "ferrosa-graph/src/executor/expand/adjacency_write.rs:158",
+   "`adjacency_write_with_retry` holds one `Arc<Row>` and passes `Arc::clone` per attempt all the way into the memtable: no copy per attempt."⟩,
+  ⟨"storage", "an observer-derived mutation is applied without copying its rows", .streaming,
+   "ferrosa-storage/src/engine/write.rs:16",
+   "`apply_derived_mutation` hands each derived `Arc<Row>` to the store; with `Partition.rows` / `Mutation.rows` as `Vec<Arc<Row>>`, the memtable and the async observers share the same rows."⟩,
   ⟨"cql", "a result cursor holds a node-wide permit or is refused", .serialized,
    "ferrosa-cql/src/result_cursor.rs:513",
    "`admit` CAS-increments the open count under `max_open` (default 256), sweeps expired cursors first, and returns Overloaded rather than queueing."⟩,
@@ -165,8 +222,8 @@ def sites : List Site := [
    "No rewrap operator exists in the tree: the only PITR path is `run_pitr_replay_e2e`, a replay test, so there is no transform to inspect."⟩
 ]
 
-/-- Thirty-two sites were read. -/
-theorem site_count : sites.length = 32 := by decide
+/-- Fifty-one sites were read. -/
+theorem site_count : sites.length = 51 := by decide
 
 /-- **Every site names a file and line.**  A row without a location is a mood, not an audit finding, so
     each `site` field has to contain a `file.rs:line`. -/
@@ -180,20 +237,20 @@ theorem every_config_bound_names_its_knob :
       | .boundedByConfig knob => !knob.isEmpty
       | _ => true) = true := by native_decide
 
-/-- Six sites are bounded by construction. -/
-theorem streaming_sites : (sites.filter fun s => s.klass == .streaming).length = 6 := by decide
+/-- Eighteen sites are bounded by construction. -/
+theorem streaming_sites : (sites.filter fun s => s.klass == .streaming).length = 18 := by decide
 
 /-- Three are bounded by a permit. -/
 theorem serialized_sites : (sites.filter fun s => match s.klass with
     | .serialized => true | _ => false).length = 3 := by decide
 
-/-- Three are bounded because they spill. -/
+/-- Eight are bounded because they spill. -/
 theorem spilling_sites : (sites.filter fun s => match s.klass with
-    | .spilling _ => true | _ => false).length = 3 := by decide
+    | .spilling _ => true | _ => false).length = 8 := by decide
 
-/-- Seven are bounded only by a setting. -/
+/-- Nine are bounded only by a setting. -/
 theorem config_bounded_sites : (sites.filter fun s => match s.klass with
-    | .boundedByConfig _ => true | _ => false).length = 7 := by decide
+    | .boundedByConfig _ => true | _ => false).length = 9 := by decide
 
 /-- Eight are bounded by nothing in the dataset size. -/
 theorem unbounded_sites : (sites.filter fun s => match s.klass with
@@ -217,7 +274,7 @@ theorem classes_partition_the_sites :
       + (sites.filter fun s => match s.klass with | .spilling _ => true | _ => false).length
       + (sites.filter fun s => match s.klass with | .boundedByConfig _ => true | _ => false).length
       + (sites.filter fun s => match s.klass with | .unbounded _ => true | _ => false).length
-      + (sites.filter fun s => s.klass == .unresolved).length = 32 := by decide
+      + (sites.filter fun s => s.klass == .unresolved).length = 51 := by decide
 
 /-- The layers the audit covers, so the table can be printed by layer. -/
 def layers : List String := ["cql", "commit log", "compaction", "flush", "graph", "permits",

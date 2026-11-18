@@ -948,12 +948,12 @@ async fn hints_for_a_live_replica_are_delivered_without_a_recovery_event() {
         keyspace: "hint_ks".to_string(),
         table: "hint_tbl".to_string(),
         key: key.clone(),
-        rows: vec![Row {
+        rows: vec![Arc::new(Row {
             clustering: vec![],
             cells: vec![(0, CellValue::live(b"hinted".to_vec(), 1000))],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
-        }],
+        })],
         timestamp: 1000,
     };
     let hints = node1.controller.hint_store();

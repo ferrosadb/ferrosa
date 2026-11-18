@@ -66,12 +66,11 @@ mod timestamp_regression {
             .into_iter()
             .filter_map(|message| match message {
                 SimpleQueryMessage::Row(row) => Some(
-                    chrono::NaiveDateTime::parse_from_str(
+                    ferrosa_common::temporal::parse::naive_datetime(
                         row.get(0).expect("timestamp must not be NULL"),
-                        "%Y-%m-%d %H:%M:%S%.f",
+                        ferrosa_common::temporal::parse::formats::YMD_HMS_FRAC,
                     )
                     .expect("valid PostgreSQL timestamp text")
-                    .and_utc()
                     .timestamp_micros(),
                 ),
                 _ => None,

@@ -3064,12 +3064,12 @@ mod tests {
             key: make_key(key),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![0x00, 0x00, 0x00, 0x01], // Int32Type = 4 bytes
                 cells: vec![(0, CellValue::live(value.to_vec(), ts))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(ts),
-            }],
+            })],
         }
     }
 
@@ -3099,7 +3099,7 @@ mod tests {
                     key: make_key(&i.to_string()),
                     deletion,
                     static_row: None,
-                    rows,
+                    rows: rows.into_iter().map(Arc::new).collect(),
                 }
             })
             .collect();
@@ -3328,12 +3328,12 @@ mod tests {
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::NONE,
             }),
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![],
                 cells: vec![(0, CellValue::live(b"regular_val".to_vec(), 4000))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(4000),
-            }],
+            })],
         };
 
         let header = build_serialization_header(&schema, &[partition]);

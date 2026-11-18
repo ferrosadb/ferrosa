@@ -494,7 +494,14 @@ async fn verification_membership_sequential_three_four_five_preserves_rf5_canary
         .controller
         .write_path
         .load_full()
-        .write(&table, &key, row.clone(), 1000, CL::Quorum, &strategy)
+        .write(
+            &table,
+            &key,
+            Arc::new(row.clone()),
+            1000,
+            CL::Quorum,
+            &strategy,
+        )
         .await
         .unwrap();
     let mut failure = None;
@@ -526,7 +533,7 @@ async fn verification_membership_sequential_three_four_five_preserves_rf5_canary
             if new_state == Some(NodeState::Normal)
                 && new_data
                     .as_ref()
-                    .is_none_or(|p| p.rows != vec![row.clone()])
+                    .is_none_or(|p| p.rows != vec![Arc::new(row.clone())])
             {
                 failure = Some(format!(
                     "node{id} marked Normal before verified canary copy"
@@ -571,7 +578,7 @@ async fn verification_membership_sequential_three_four_five_preserves_rf5_canary
                 .unwrap();
             assert_eq!(
                 value.rows,
-                vec![row.clone()],
+                vec![Arc::new(row.clone())],
                 "RF5 QUORUM canary survives admission on{}",
                 n.id
             );

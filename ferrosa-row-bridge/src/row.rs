@@ -6,6 +6,7 @@
 //! FMEA risk for the SQL front-end — so it lives here once.
 
 use std::ops::ControlFlow;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ferrosa_common::{CellValue, CqlType, CqlValue, DecoratedKey, PartitionKey};
@@ -213,7 +214,10 @@ where
                 continue;
             }
 
-            let (clustering, output_row) = decode_output_row_owned(row, &decode_context)?;
+            let (clustering, output_row) = match Arc::try_unwrap(row) {
+                Ok(row) => decode_output_row_owned(row, &decode_context)?,
+                Err(shared) => decode_output_row_borrowed(&shared, &decode_context)?,
+            };
             if let ControlFlow::Break(()) = visit(pk_bytes, clustering, output_row) {
                 break;
             }
@@ -293,7 +297,7 @@ fn decode_key_component(
 /// Source rows and static cells stay owned until consumed or dropped; decoded
 /// rows are never accumulated in a second partition-sized buffer.
 pub struct OwnedPartitionRows<'a> {
-    rows: std::vec::IntoIter<Row>,
+    rows: std::vec::IntoIter<Arc<Row>>,
     partition_key: Vec<u8>,
     pk_values: Vec<Vec<u8>>,
     static_row: Option<Row>,
@@ -353,7 +357,10 @@ impl Iterator for OwnedPartitionRows<'_> {
                 partition_key: &self.partition_key,
                 static_row: self.static_row.as_ref(),
             };
-            let decoded = decode_output_row_owned(row, &context);
+            let decoded = match Arc::try_unwrap(row) {
+                Ok(row) => decode_output_row_owned(row, &context),
+                Err(shared) => decode_output_row_borrowed(&shared, &context),
+            };
             self.failed = decoded.is_err();
             return Some(decoded);
         }
@@ -384,6 +391,18 @@ fn decode_output_keys(
 }
 
 /// Consume simple rows without grouping scalar cells or copying unique payloads.
+/// Decode a stored row still shared with the memtable or another reader by
+/// reference: it is never copied into an owned `Row` first. A row this decoder
+/// holds alone goes through [`decode_output_row_owned`] instead and gives up
+/// its cells and clustering by move.
+fn decode_output_row_borrowed(
+    shared: &Row,
+    context: &RowDecodeContext<'_>,
+) -> Result<(Vec<u8>, Vec<Option<CqlValue>>), RowDecodeError> {
+    let output = decode_output_row(shared, context)?;
+    Ok((shared.clustering.as_slice().to_vec(), output))
+}
+
 fn decode_output_row_owned(
     row: Row,
     context: &RowDecodeContext<'_>,
@@ -918,7 +937,7 @@ mod tests {
             key: dk,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row],
+            rows: vec![Arc::new(row)],
         }
     }
 
@@ -1117,14 +1136,14 @@ mod tests {
     fn owned_row_iterator_emits_prefix_then_contextual_error_and_fuses() {
         let mut partition =
             single_row_partition(vec![(0, CellValue::live(b"valid".to_vec(), 1000))]);
-        partition.rows[0].clustering = 1i32.to_be_bytes().to_vec();
+        Arc::make_mut(&mut partition.rows[0]).clustering = 1i32.to_be_bytes().to_vec();
         let clustering_ptr = partition.rows[0].clustering.as_ptr();
-        partition.rows.push(Row {
+        partition.rows.push(Arc::new(Row {
             clustering: 2i32.to_be_bytes().to_vec(),
             cells: vec![(0, CellValue::live(vec![0xff], 1000))],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
-        });
+        }));
         let names = vec!["pk".into(), "ck".into(), "value".into()];
         let types = vec![CqlType::Int, CqlType::Int, CqlType::Varchar];
         let mut rows =
@@ -1155,14 +1174,14 @@ mod tests {
     #[test]
     fn static_row_cells_are_overlaid_on_every_row() {
         let mut partition = single_row_partition(vec![(1, CellValue::live(b"a1".to_vec(), 10))]);
-        let mut second = partition.rows[0].clone();
+        let mut second = Row::clone(&partition.rows[0]);
         second.clustering = vec![1];
         second.cells = vec![
             (0, CellValue::live(b"row-old".to_vec(), 5)),
             (1, CellValue::live(b"a2".to_vec(), 10)),
         ];
-        partition.rows[0].clustering = vec![0];
-        partition.rows.push(second);
+        Arc::make_mut(&mut partition.rows[0]).clustering = vec![0];
+        partition.rows.push(Arc::new(second));
         partition.static_row = Some(Row {
             clustering: vec![],
             cells: vec![(0, CellValue::live(b"static".to_vec(), 20))],

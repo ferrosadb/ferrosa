@@ -56,6 +56,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use ferrosa_common::cell::CellValue;
 use ferrosa_common::key::{DecoratedKey, PartitionKey};
@@ -144,16 +145,21 @@ fn row(ck: i32, value: &[u8], ts: i64) -> Row {
 
 /// Build one row per clustering key. Rows are built here, OUTSIDE any measured
 /// window, so the counts below reflect `put` only.
-fn rows(cks: impl IntoIterator<Item = i32>) -> Vec<Row> {
+fn rows(cks: impl IntoIterator<Item = i32>) -> Vec<Arc<Row>> {
     cks.into_iter()
-        .map(|ck| row(ck, b"payload", i64::from(ck)))
+        .map(|ck| Arc::new(row(ck, b"payload", i64::from(ck))))
         .collect()
 }
 
 /// Measure the allocations `put` makes while inserting `rs` (already built)
 /// into `key`. `rs` is moved in, so the only allocations in the window are the
 /// memtable's.
-fn measure(mem: &dyn Memtable, key: &DecoratedKey, rs: Vec<Row>, schema: &TableSchema) -> usize {
+fn measure(
+    mem: &dyn Memtable,
+    key: &DecoratedKey,
+    rs: Vec<Arc<Row>>,
+    schema: &TableSchema,
+) -> usize {
     let (_unit, allocs) = count_allocs(|| {
         for r in rs {
             mem.put(key, r, schema).expect("put must succeed");
@@ -198,7 +204,7 @@ fn memtable_writes_do_not_allocate_per_write() {
     let fresh = SkipListMemtable::new();
     let (_u, ctrl) = count_allocs(|| {
         fresh
-            .put(&key("fresh"), row(0, b"seed", 0), &schema)
+            .put(&key("fresh"), Arc::new(row(0, b"seed", 0)), &schema)
             .expect("put must succeed");
     });
     assert!(
@@ -210,7 +216,7 @@ fn memtable_writes_do_not_allocate_per_write() {
     // --- the rule: no per-write allocation into an existing partition ---
     let mem = SkipListMemtable::new();
     let pk = key("pk");
-    mem.put(&pk, row(0, b"seed", 0), &schema).unwrap();
+    mem.put(&pk, Arc::new(row(0, b"seed", 0)), &schema).unwrap();
 
     const BATCH: i32 = 64;
     let first = measure(&mem, &pk, rows(1..=BATCH), &schema);
@@ -249,12 +255,16 @@ fn memtable_writes_do_not_allocate_per_write() {
     // amortized `Vec` growth the insert path legitimately pays.
     let sup_mem = SkipListMemtable::new();
     let sup = key("supersede");
-    sup_mem.put(&sup, row(0, b"seed", 0), &schema).unwrap();
+    sup_mem
+        .put(&sup, Arc::new(row(0, b"seed", 0)), &schema)
+        .unwrap();
     let appended = measure(&sup_mem, &sup, rows(1..=BATCH), &schema);
 
     // Same clustering keys 1..=BATCH, newer timestamp (1000 > every seed ts,
     // which is `ck`), different payload, so 1000 wins LWW for every row.
-    let superseding: Vec<Row> = (1..=BATCH).map(|ck| row(ck, b"payload2", 1000)).collect();
+    let superseding: Vec<Arc<Row>> = (1..=BATCH)
+        .map(|ck| Arc::new(row(ck, b"payload2", 1000)))
+        .collect();
     let supersede = measure(&sup_mem, &sup, superseding, &schema);
 
     // Anti-vacuity: if the merge failed to find the existing rows it would
@@ -285,7 +295,8 @@ fn memtable_writes_do_not_allocate_per_write() {
     // --- headline scale: filling one partition stays linear ---
     let big = SkipListMemtable::new();
     let bkey = key("bigpk");
-    big.put(&bkey, row(i32::MIN, b"seed", 0), &schema).unwrap();
+    big.put(&bkey, Arc::new(row(i32::MIN, b"seed", 0)), &schema)
+        .unwrap();
     let n = 4000;
     let total = measure(&big, &bkey, rows(i32::MIN + 1..i32::MIN + 1 + n), &schema);
     assert!(

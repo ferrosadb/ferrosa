@@ -108,7 +108,7 @@ impl Fixture {
         .await
     }
 
-    fn raw_rows(&self, graph: &str) -> Vec<Row> {
+    fn raw_rows(&self, graph: &str) -> Vec<std::sync::Arc<Row>> {
         self.storage
             .read(&triples_table_id(KS), &partition_key(graph, S))
             .expect("read real stored partition")
@@ -366,7 +366,7 @@ async fn legacy_dataset_refuses_reads_and_writes_before_v2_registration() {
         .write(
             &table,
             &partition_key(G, S),
-            Row {
+            Arc::new(Row {
                 clustering,
                 cells: vec![
                     (0, CellValue::live(b"literal".to_vec(), 1)),
@@ -374,7 +374,7 @@ async fn legacy_dataset_refuses_reads_and_writes_before_v2_registration() {
                 ],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1),
-            },
+            }),
             1,
         )
         .unwrap();
@@ -424,7 +424,7 @@ async fn malformed_identity_or_key_cell_mismatch_is_a_query_error() {
     for corruption in ["version", "cell", "partition"] {
         let f = Fixture::new();
         f.insert(G, "1").await;
-        let mut row = f.raw_rows(G).pop().unwrap();
+        let mut row = std::sync::Arc::unwrap_or_clone(f.raw_rows(G).pop().unwrap());
         let mut key = partition_key(G, S);
         match corruption {
             "version" => {
@@ -445,10 +445,12 @@ async fn malformed_identity_or_key_cell_mismatch_is_a_query_error() {
         }
         row.primary_key_liveness = LivenessInfo::with_timestamp(i64::MAX - 1);
         // Shape validation may reject a corrupted key before it reaches reads.
-        match f
-            .storage
-            .write(&triples_table_id(KS), &key, row, i64::MAX - 1)
-        {
+        match f.storage.write(
+            &triples_table_id(KS),
+            &key,
+            std::sync::Arc::new(row),
+            i64::MAX - 1,
+        ) {
             Err(_) if corruption == "version" => (),
             r => {
                 r.unwrap();
@@ -696,29 +698,13 @@ async fn ask_and_construct_use_full_term_matching() {
 }
 
 #[tokio::test]
-async fn clear_wide_graph_preflights_limits_then_deletes_every_fragment() {
+async fn clear_wide_graph_deletes_every_fragment_with_no_row_bound() {
     let f = Fixture::new();
     for i in 0..600 {
         f.insert(G, &format!("\"term-{i}\"")).await;
     }
     f.storage.flush(&triples_table_id(KS)).unwrap();
-    let bounded = SparqlEngine::new(
-        f.storage.clone(),
-        Arc::new(WritePath::direct(f.storage.clone())),
-        SparqlConfig {
-            max_rows: 599,
-            ..Default::default()
-        },
-    );
-    assert!(bounded
-        .execute_update(&format!("CLEAR GRAPH <{G}>"), KS)
-        .await
-        .is_err());
-    assert_eq!(
-        f.objects(G).await.len(),
-        600,
-        "failed preflight must not delete a prefix"
-    );
+    assert_eq!(f.objects(G).await.len(), 600);
     f.engine
         .execute_update(&format!("CLEAR GRAPH <{G}>"), KS)
         .await

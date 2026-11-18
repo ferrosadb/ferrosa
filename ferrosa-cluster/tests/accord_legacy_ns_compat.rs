@@ -74,7 +74,7 @@ fn mutation_bytes(pk: &str, value: i32, cell_ts: i64) -> Vec<u8> {
         KS.to_string(),
         TABLE.to_string(),
         key(pk),
-        vec![v_row(value, cell_ts)],
+        vec![Arc::new(v_row(value, cell_ts))],
         cell_ts,
     );
     let mut buf = vec![0u8; m.serialized_size()];
@@ -405,7 +405,7 @@ async fn a_row_lwt_written_in_microseconds_by_532_still_cas() {
     let seed = |dir: &std::path::Path| {
         let engine = open_engine(dir, &schema());
         engine
-            .write(&tid(), &key("head"), v_row(50, stamp), stamp)
+            .write(&tid(), &key("head"), Arc::new(v_row(50, stamp)), stamp)
             .unwrap();
         engine.flush(&tid()).unwrap();
         engine
@@ -442,12 +442,17 @@ fn a_mixed_version_pair_converges_after_repair() {
         ],
     );
     let b = open_engine(db.path(), &schema());
-    b.write(&tid(), &key("lwt-later"), v_row(2, t0 + 1_000), t0 + 1_000)
-        .unwrap();
+    b.write(
+        &tid(),
+        &key("lwt-later"),
+        Arc::new(v_row(2, t0 + 1_000)),
+        t0 + 1_000,
+    )
+    .unwrap();
     b.write(
         &tid(),
         &key("plain-later"),
-        v_row(2, t0 + 1_000),
+        Arc::new(v_row(2, t0 + 1_000)),
         t0 + 1_000,
     )
     .unwrap();

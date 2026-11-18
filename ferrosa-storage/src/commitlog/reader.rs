@@ -416,6 +416,7 @@ mod tests {
     use super::*;
     use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+    use std::sync::Arc;
 
     /// Helper to create a simple mutation for testing.
     fn simple_mutation() -> Mutation {
@@ -424,12 +425,12 @@ mod tests {
             keyspace: "test_ks".to_string(),
             table: "test_table".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"pk1".to_vec())),
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![1, 2, 3],
                 cells: vec![(0, CellValue::live(b"hello".to_vec(), 1000))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1000),
-            }],
+            })],
             timestamp: 42_000,
         }
     }
@@ -441,12 +442,12 @@ mod tests {
             keyspace: "test_ks".to_string(),
             table: "test_table".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"pk2".to_vec())),
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![4, 5, 6],
                 cells: vec![(1, CellValue::live(b"world".to_vec(), 2000))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(2000),
-            }],
+            })],
             timestamp: 99_000,
         }
     }
@@ -535,9 +536,10 @@ mod tests {
         let segment = Segment::new(7, 512 * 1024, dir.path());
 
         let mut first = simple_mutation();
-        first.rows[0].cells[0].1 = CellValue::live(vec![0x41; 64 * 1024], 1000);
+        Arc::make_mut(&mut first.rows[0]).cells[0].1 = CellValue::live(vec![0x41; 64 * 1024], 1000);
         let mut second = another_mutation();
-        second.rows[0].cells[0].1 = CellValue::live(vec![0x42; 64 * 1024], 2000);
+        Arc::make_mut(&mut second.rows[0]).cells[0].1 =
+            CellValue::live(vec![0x42; 64 * 1024], 2000);
 
         let first_offset = segment.allocate(Segment::entry_total_size(&first)).unwrap();
         segment.write_entry(first_offset, &first);

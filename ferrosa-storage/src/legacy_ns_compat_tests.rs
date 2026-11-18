@@ -183,7 +183,12 @@ fn a_plain_update_beats_a_legacy_row() {
         );
         // A plain CQL UPDATE one millisecond later, stamped in micros.
         engine
-            .write(&tid(), &key("k"), row(b"plain", t0 + 1_000), t0 + 1_000)
+            .write(
+                &tid(),
+                &key("k"),
+                Arc::new(row(b"plain", t0 + 1_000)),
+                t0 + 1_000,
+            )
             .unwrap();
         assert_eq!(
             read_v(&engine, "k").as_deref(),
@@ -219,7 +224,7 @@ fn a_row_delete_removes_a_legacy_row() {
             .write(
                 &tid(),
                 &key("k"),
-                row_delete(t0 + 1_000, now_secs()),
+                Arc::new(row_delete(t0 + 1_000, now_secs())),
                 t0 + 1_000,
             )
             .unwrap();
@@ -243,7 +248,7 @@ fn a_partition_delete_removes_a_legacy_row() {
             .write(
                 &tid(),
                 &key("k"),
-                partition_delete(t0 + 1_000, now_secs()),
+                Arc::new(partition_delete(t0 + 1_000, now_secs())),
                 t0 + 1_000,
             )
             .unwrap();
@@ -265,7 +270,12 @@ fn a_later_write_beats_a_legacy_tombstone() {
             vec![row_delete(legacy_ns(t0), now_secs())],
         );
         engine
-            .write(&tid(), &key("k"), row(b"after", t0 + 1_000), t0 + 1_000)
+            .write(
+                &tid(),
+                &key("k"),
+                Arc::new(row(b"after", t0 + 1_000)),
+                t0 + 1_000,
+            )
             .unwrap();
         assert_eq!(
             read_v(&engine, "k").as_deref(),
@@ -345,7 +355,7 @@ async fn compacting_mixed_and_legacy_sstables_succeeds_and_writes_micros() {
         key: key(pk),
         deletion: DeletionTime::LIVE,
         static_row: None,
-        rows,
+        rows: rows.into_iter().map(Arc::new).collect(),
     };
     let mut mixed = vec![
         part("a", vec![row(b"a-lwt", legacy_ns(t0))]),
@@ -375,7 +385,7 @@ async fn compacting_mixed_and_legacy_sstables_succeeds_and_writes_micros() {
     assert_eq!(engine.sstable_count(&tid()), 2);
     for (pk, v) in [("a", b"a-plain"), ("c", b"c-plain")] {
         engine
-            .write(&tid(), &key(pk), row(v, t0 + 2_000), t0 + 2_000)
+            .write(&tid(), &key(pk), Arc::new(row(v, t0 + 2_000)), t0 + 2_000)
             .unwrap();
     }
     engine.flush(&tid()).unwrap();
@@ -415,7 +425,7 @@ async fn a_compacted_legacy_row_reads_the_same_after_restart() {
             vec![row(b"lwt", legacy_ns(t0))],
         );
         engine
-            .write(&tid(), &key("other"), row(b"x", t0 + 5), t0 + 5)
+            .write(&tid(), &key("other"), Arc::new(row(b"x", t0 + 5)), t0 + 5)
             .unwrap();
         engine.flush(&tid()).unwrap();
         compact_to_one(&engine).await;
@@ -447,7 +457,7 @@ async fn purge_scenario(tombstone_ldt: u32) -> u64 {
             .write(
                 &tid(),
                 &key("dead"),
-                row(b"v", t0 - 3_600_000_000),
+                Arc::new(row(b"v", t0 - 3_600_000_000)),
                 t0 - 3_600_000_000,
             )
             .unwrap();
@@ -455,7 +465,7 @@ async fn purge_scenario(tombstone_ldt: u32) -> u64 {
             .write(
                 &tid(),
                 &key("live"),
-                row(b"v", t0 - 3_600_000_000),
+                Arc::new(row(b"v", t0 - 3_600_000_000)),
                 t0 - 3_600_000_000,
             )
             .unwrap();
@@ -479,7 +489,7 @@ async fn purge_scenario(tombstone_ldt: u32) -> u64 {
         .write(
             &tid(),
             &key("late"),
-            row(b"v", t0 + 1_000_000),
+            Arc::new(row(b"v", t0 + 1_000_000)),
             t0 + 1_000_000,
         )
         .unwrap();
@@ -525,7 +535,7 @@ fn rows_stamped_in_microseconds_by_532_are_unchanged() {
             key: key("k"),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row(b"micros", t0)],
+            rows: vec![Arc::new(row(b"micros", t0))],
         }],
     )
     .unwrap();
@@ -534,7 +544,7 @@ fn rows_stamped_in_microseconds_by_532_are_unchanged() {
     assert_eq!(read_v_ts(&engine, "k"), Some(t0));
     // A plain write one microsecond EARLIER must still lose to it.
     engine
-        .write(&tid(), &key("k"), row(b"older", t0 - 1), t0 - 1)
+        .write(&tid(), &key("k"), Arc::new(row(b"older", t0 - 1)), t0 - 1)
         .unwrap();
     assert_eq!(read_v(&engine, "k").as_deref(), Some(b"micros".as_slice()));
 }
@@ -551,7 +561,7 @@ fn pitr_includes_a_legacy_mutation_written_before_the_target() {
         keyspace: KS.to_string(),
         table: TABLE.to_string(),
         key: key("k"),
-        rows: vec![row(b"lwt", legacy_ns(t0))],
+        rows: vec![Arc::new(row(b"lwt", legacy_ns(t0)))],
         timestamp: legacy_ns(t0),
     };
     let mut bytes = vec![0u8; legacy.serialized_size()];

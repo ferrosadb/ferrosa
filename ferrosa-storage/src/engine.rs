@@ -63,6 +63,8 @@ use crate::timeseries::{
 };
 use crate::upload::{ObjectStoreConfig, UploadManager};
 use crate::write_set_stage::WriteSetSource;
+mod index_read;
+mod write;
 
 // T-023 crash injection belongs to the poll future that explicitly opts in.
 // Task-local scope follows Tokio task migration and resets on unwind/drop;
@@ -229,8 +231,8 @@ pub enum BatchOp {
         table: String,
         /// Partition key.
         key: DecoratedKey,
-        /// Row to upsert.
-        row: Row,
+        /// Row to upsert, shared with whoever built it (never copied).
+        row: Arc<Row>,
         /// Mutation timestamp (microseconds since epoch).
         timestamp: i64,
     },
@@ -280,7 +282,7 @@ impl BatchOp {
                     deletion,
                     primary_key_liveness: ferrosa_sstable::types::LivenessInfo::NONE,
                 };
-                Mutation::new(keyspace, table, key, vec![row], timestamp)
+                Mutation::new(keyspace, table, key, vec![Arc::new(row)], timestamp)
             }
         }
     }
@@ -5208,7 +5210,7 @@ impl StorageEngine {
             // Old segments may hold whole-value collection cells; expand them
             // so the flush writer's mixed-cell assertion cannot fire later.
             let normalized = {
-                let mut normalized = row.clone();
+                let mut normalized = Arc::clone(row);
                 crate::memtable::expand_legacy_collection_blobs(
                     &mut normalized,
                     &state.store.schema(),
@@ -6245,20 +6247,14 @@ impl StorageEngine {
             return Ok(IndexReloadOutcome::default());
         }
 
-        // Full scan of system_schema.indexes. This table holds one row per
-        // index cluster-wide; it is tiny. Bound the scan at the engine's
-        // range-read materialization cap and warn loudly if we hit it, so a
-        // truncated reload is visible rather than silently dropping indexes.
-        const MAX_INDEXES_TO_RELOAD: usize = 10_000;
-        let partitions = self.read_range(&indexes_tid, None, None, MAX_INDEXES_TO_RELOAD)?;
-
+        // Walk every row of system_schema.indexes, one keyspace at a time. The
+        // capped `read_range(.., 10_000)` this replaces read only the first
+        // 10_000 keyspaces and warned, so later registrations never came back.
         let mut restored = 0usize;
         let mut skipped = 0usize;
-        let mut rows_seen = 0usize;
-        for partition in &partitions {
-            let keyspace = String::from_utf8_lossy(partition.key.key.as_bytes()).to_string();
+        self.walk_token_range(&indexes_tid, i64::MIN, i64::MAX, |partition| {
+            let keyspace = String::from_utf8_lossy(partition.key.key.as_bytes());
             for row in &partition.rows {
-                rows_seen += 1;
                 // A row fully shadowed by a DROP INDEX / DROP TABLE tombstone
                 // surfaces from the merge with its cells suppressed and the
                 // row-level deletion set. That is a *normal* deleted
@@ -6274,14 +6270,8 @@ impl StorageEngine {
                     skipped += 1;
                 }
             }
-        }
-        if rows_seen >= MAX_INDEXES_TO_RELOAD {
-            tracing::warn!(
-                rows_seen,
-                cap = MAX_INDEXES_TO_RELOAD,
-                "system_schema.indexes reload hit the read cap — some indexes may not have been restored"
-            );
-        }
+            Ok(())
+        })?;
         if skipped > 0 {
             // One summary warn instead of a warn per orphan — dangling
             // registrations (DROP TABLE debris predating the tombstone
@@ -6302,6 +6292,30 @@ impl StorageEngine {
         Ok(IndexReloadOutcome { restored, skipped })
     }
 
+    /// Decode every live row of a `system_schema` table, walking it one
+    /// partition (keyspace) at a time. The capped `read_range(.., 10_000)` this
+    /// replaces silently dropped every keyspace past the cap on boot.
+    ///
+    /// The walk is `[i64::MIN, i64::MAX)`, the same span the cluster's
+    /// system-table loader walks.
+    fn decode_system_schema_rows<T>(
+        &self,
+        table_id: &TableId,
+        decode: fn(&str, &Row) -> Option<T>,
+    ) -> ferrosa_common::Result<Vec<T>> {
+        let mut out = Vec::new();
+        self.walk_token_range(table_id, i64::MIN, i64::MAX, |partition| {
+            let keyspace = String::from_utf8_lossy(partition.key.key.as_bytes());
+            for row in &partition.rows {
+                if let Some(decoded) = decode(&keyspace, row) {
+                    out.push(decoded);
+                }
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
     /// Reads every live row of the persisted `system_schema.indexes` table and
     /// decodes it into [`PersistedIndexRow`]s.
     ///
@@ -6316,19 +6330,7 @@ impl StorageEngine {
             return Ok(Vec::new());
         }
 
-        const MAX_INDEXES_TO_READ: usize = 10_000;
-        let partitions = self.read_range(&indexes_tid, None, None, MAX_INDEXES_TO_READ)?;
-
-        let mut out = Vec::new();
-        for partition in &partitions {
-            let keyspace = String::from_utf8_lossy(partition.key.key.as_bytes()).to_string();
-            for row in &partition.rows {
-                if let Some(decoded) = decode_persisted_index_row(&keyspace, row) {
-                    out.push(decoded);
-                }
-            }
-        }
-        Ok(out)
+        self.decode_system_schema_rows(&indexes_tid, decode_persisted_index_row)
     }
 
     /// Reads every live row of the persisted `system_schema.types` table and
@@ -6344,19 +6346,7 @@ impl StorageEngine {
             return Ok(Vec::new());
         }
 
-        const MAX_TYPES_TO_READ: usize = 10_000;
-        let partitions = self.read_range(&types_tid, None, None, MAX_TYPES_TO_READ)?;
-
-        let mut out = Vec::new();
-        for partition in &partitions {
-            let keyspace = String::from_utf8_lossy(partition.key.key.as_bytes()).to_string();
-            for row in &partition.rows {
-                if let Some(decoded) = decode_persisted_type_row(&keyspace, row) {
-                    out.push(decoded);
-                }
-            }
-        }
-        Ok(out)
+        self.decode_system_schema_rows(&types_tid, decode_persisted_type_row)
     }
 
     /// Reads every live row of the persisted `system_schema.functions` table and
@@ -6372,19 +6362,7 @@ impl StorageEngine {
             return Ok(Vec::new());
         }
 
-        const MAX_FUNCTIONS_TO_READ: usize = 10_000;
-        let partitions = self.read_range(&functions_tid, None, None, MAX_FUNCTIONS_TO_READ)?;
-
-        let mut out = Vec::new();
-        for partition in &partitions {
-            let keyspace = String::from_utf8_lossy(partition.key.key.as_bytes()).to_string();
-            for row in &partition.rows {
-                if let Some(decoded) = decode_persisted_function_row(&keyspace, row) {
-                    out.push(decoded);
-                }
-            }
-        }
-        Ok(out)
+        self.decode_system_schema_rows(&functions_tid, decode_persisted_function_row)
     }
 
     /// Tombstones a `system_schema.indexes` row (DROP INDEX) using the same
@@ -6420,7 +6398,7 @@ impl StorageEngine {
             primary_key_liveness: ferrosa_sstable::types::LivenessInfo::NONE,
         };
         let tid = TableId::new("system_schema", "indexes");
-        self.write(&tid, &key, row, ts)
+        self.write(&tid, &key, Arc::new(row), ts)
     }
 
     /// Tombstones every live `system_schema.indexes` row registered on
@@ -9700,54 +9678,6 @@ impl StorageEngine {
         });
     }
 
-    /// Writes a derived mutation (produced by an observer) to the commit log
-    /// and the target table's memtable.
-    ///
-    /// Mirrors the pattern in `dispatch_sync_observers`. Errors are logged at
-    /// ERROR level and the write is skipped; derived mutation failures must
-    /// not crash the engine.
-    fn apply_derived_mutation(&self, dm: &Mutation) {
-        if let Err(e) = self.check_write_admission() {
-            tracing::error!(
-                %e,
-                keyspace = %dm.keyspace,
-                table = %dm.table,
-                "observer drain: local disk reserve exhausted; derived mutation dropped"
-            );
-            return;
-        }
-        if let Err(e) = self.commit_log.append(dm) {
-            tracing::error!(
-                %e,
-                keyspace = %dm.keyspace,
-                table = %dm.table,
-                "observer drain: commit log append failed for derived mutation"
-            );
-            return;
-        }
-        let dtid = TableId::new(&dm.keyspace, &dm.table);
-        let tables = self.tables.load();
-        if let Some(state) = tables.get(&dtid) {
-            for row in &dm.rows {
-                if let Err(e) = state.store.write(&dm.key, row.clone()) {
-                    tracing::error!(
-                        %e,
-                        keyspace = %dm.keyspace,
-                        table = %dm.table,
-                        "observer drain: memtable write failed for derived mutation"
-                    );
-                }
-            }
-        } else {
-            tracing::error!(
-                keyspace = %dm.keyspace,
-                table = %dm.table,
-                "observer drain: target table not registered — derived mutation dropped; \
-                 register the adjacency table with StorageEngine before registering the observer"
-            );
-        }
-    }
-
     /// Dispatches a mutation to all sync observers watching the given table.
     ///
     /// Derived mutations produced by observers go through the commit log for
@@ -10190,204 +10120,7 @@ impl StorageEngine {
         let state = tables.get(table_id).ok_or_else(|| {
             ferrosa_common::Error::InvalidData(format!("observability table not found: {table_id}"))
         })?;
-        state.store.write(key, row)?;
-        Ok(())
-    }
-
-    pub fn write(
-        &self,
-        table_id: &TableId,
-        key: &DecoratedKey,
-        row: Row,
-        timestamp: i64,
-    ) -> ferrosa_common::Result<()> {
-        let total_start = Instant::now();
-        // Per-write span emitted at DEBUG level so it is free at the
-        // default INFO subscriber filter — every span allocation was
-        // measurable on a 50k ops/s workload.
-        let _span = tracing::debug_span!(
-            "storage.write",
-            table = %table_id,
-        )
-        .entered();
-        let phase_start = Instant::now();
-        if let Err(e) = self.check_write_admission() {
-            crate::metrics::observe_write_phase(
-                crate::metrics::WritePhase::AdmissionDisk,
-                phase_start.elapsed(),
-            );
-            crate::metrics::observe_write_phase(
-                crate::metrics::WritePhase::Total,
-                total_start.elapsed(),
-            );
-            crate::metrics::inc_write_failure_reason(
-                crate::metrics::WriteFailureReason::DiskReserve,
-            );
-            return Err(e);
-        }
-        crate::metrics::observe_write_phase(
-            crate::metrics::WritePhase::AdmissionDisk,
-            phase_start.elapsed(),
-        );
-
-        let phase_start = Instant::now();
-        {
-            let tables = self.tables.load();
-            let state = match tables.get(table_id) {
-                Some(state) => state,
-                None => {
-                    crate::metrics::observe_write_phase(
-                        crate::metrics::WritePhase::AdmissionMemtable,
-                        phase_start.elapsed(),
-                    );
-                    crate::metrics::observe_write_phase(
-                        crate::metrics::WritePhase::Total,
-                        total_start.elapsed(),
-                    );
-                    crate::metrics::inc_write_failure_reason(
-                        crate::metrics::WriteFailureReason::TableMissing,
-                    );
-                    return Err(ferrosa_common::Error::InvalidFormat(format!(
-                        "table not registered: {table_id}"
-                    )));
-                }
-            };
-            if let Err(e) = self.check_memtable_write_admission(table_id, state) {
-                crate::metrics::observe_write_phase(
-                    crate::metrics::WritePhase::AdmissionMemtable,
-                    phase_start.elapsed(),
-                );
-                crate::metrics::observe_write_phase(
-                    crate::metrics::WritePhase::Total,
-                    total_start.elapsed(),
-                );
-                crate::metrics::inc_write_failure_reason(
-                    crate::metrics::WriteFailureReason::MemtableBackpressure,
-                );
-                return Err(e);
-            }
-        }
-        crate::metrics::observe_write_phase(
-            crate::metrics::WritePhase::AdmissionMemtable,
-            phase_start.elapsed(),
-        );
-
-        // 1. Append to commit log for durability.
-        let phase_start = Instant::now();
-        let cl_pos = match self
-            .commit_log
-            .append_single_row(table_id, key, &row, timestamp)
-        {
-            Ok(pos) => pos,
-            Err(e) => {
-                crate::metrics::observe_write_phase(
-                    crate::metrics::WritePhase::CommitLogAppend,
-                    phase_start.elapsed(),
-                );
-                crate::metrics::observe_write_phase(
-                    crate::metrics::WritePhase::Total,
-                    total_start.elapsed(),
-                );
-                crate::metrics::inc_write_failure_reason(
-                    crate::metrics::WriteFailureReason::CommitLogAppend,
-                );
-                return Err(e);
-            }
-        };
-        crate::metrics::observe_write_phase(
-            crate::metrics::WritePhase::CommitLogAppend,
-            phase_start.elapsed(),
-        );
-        let observer_mutation = if self.has_observers_for_table(table_id) {
-            // Clone row metadata for the observer lifetime. CellBytes shares
-            // immutable payloads with the row moved into the memtable.
-            Some(Mutation::new(
-                table_id.keyspace.clone(),
-                table_id.table.clone(),
-                key.clone(),
-                vec![row.clone()],
-                timestamp,
-            ))
-        } else {
-            None
-        };
-
-        // 2. Write to the table's memtable and track commit log position.
-        let phase_start = Instant::now();
-        {
-            let tables = self.tables.load();
-            let state = match tables.get(table_id) {
-                Some(state) => state,
-                None => {
-                    crate::metrics::observe_write_phase(
-                        crate::metrics::WritePhase::MemtableWrite,
-                        phase_start.elapsed(),
-                    );
-                    crate::metrics::observe_write_phase(
-                        crate::metrics::WritePhase::Total,
-                        total_start.elapsed(),
-                    );
-                    crate::metrics::inc_write_failure_reason(
-                        crate::metrics::WriteFailureReason::TableMissing,
-                    );
-                    return Err(ferrosa_common::Error::InvalidFormat(format!(
-                        "table not registered: {table_id}"
-                    )));
-                }
-            };
-            if let Err(e) = state.store.write(key, row) {
-                crate::metrics::observe_write_phase(
-                    crate::metrics::WritePhase::MemtableWrite,
-                    phase_start.elapsed(),
-                );
-                crate::metrics::observe_write_phase(
-                    crate::metrics::WritePhase::Total,
-                    total_start.elapsed(),
-                );
-                crate::metrics::inc_write_failure_reason(
-                    crate::metrics::WriteFailureReason::MemtableWrite,
-                );
-                return Err(e);
-            }
-            state.last_commit_log_position.store(Arc::new(Some(cl_pos)));
-            // Set the first-unflushed timestamp via CAS — succeeds at most once
-            // per memtable epoch, no contention after the first write.
-            if state
-                .first_unflushed_write_at_nanos
-                .load(std::sync::atomic::Ordering::Relaxed)
-                == 0
-            {
-                let now = now_nanos_since_reference();
-                let _ = state.first_unflushed_write_at_nanos.compare_exchange(
-                    0,
-                    now,
-                    std::sync::atomic::Ordering::Relaxed,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-            }
-            self.request_flush_if_needed(state);
-        }
-        crate::metrics::observe_write_phase(
-            crate::metrics::WritePhase::MemtableWrite,
-            phase_start.elapsed(),
-        );
-
-        // 3. Notify observers after successful commit log + memtable write.
-        let phase_start = Instant::now();
-        if let Some(mutation) = observer_mutation {
-            self.dispatch_sync_observers(table_id, &mutation);
-            self.dispatch_async_observers(table_id, || mutation);
-        }
-        crate::metrics::observe_write_phase(
-            crate::metrics::WritePhase::Observers,
-            phase_start.elapsed(),
-        );
-        crate::metrics::observe_write_phase(
-            crate::metrics::WritePhase::Total,
-            total_start.elapsed(),
-        );
-        crate::metrics::inc_write_total();
-
+        state.store.write(key, Arc::new(row))?;
         Ok(())
     }
 
@@ -10419,15 +10152,14 @@ impl StorageEngine {
             }
 
             // The key is moved in: the memtable write below borrows `mutation.key`,
-            // so nothing needs the local `key` afterwards. The row cannot be moved
-            // the same way — the memtable takes ownership of it below and the
-            // observers still need it after that, so the two owners are concurrent.
-            // CellBytes shares the immutable bytes across these row metadata copies.
+            // so nothing needs the local `key` afterwards. The row is shared: the
+            // memtable stores it and the observers read the same allocation.
+            let row = Arc::new(row);
             let mutation = Mutation::new(
                 table_id.keyspace.clone(),
                 table_id.table.clone(),
                 key,
-                vec![row.clone()],
+                vec![Arc::clone(&row)],
                 timestamp,
             );
 
@@ -10642,28 +10374,6 @@ impl StorageEngine {
         })?;
 
         Ok(())
-    }
-
-    /// Apply a batch of mixed ops atomically and durably (single fsync group).
-    ///
-    /// All-or-nothing: every op lowers to a [`Mutation`] and the whole set is
-    /// applied through [`Self::write_atomic_batch`], which preflights every
-    /// target table **before** appending any commit-log record. On any
-    /// preflight / append failure **none** of the ops are applied and an `Err`
-    /// is returned (spec URS-QEC-X02, fail-loud per X01). Ops touching the same
-    /// `(keyspace, table, key)` are applied in `ops` order.
-    ///
-    /// An empty batch is `Ok(())`.
-    pub fn apply_batch(&self, ops: Vec<BatchOp>) -> ferrosa_common::Result<()> {
-        if ops.is_empty() {
-            return Ok(());
-        }
-        let mutations: Vec<Mutation> = ops.into_iter().map(BatchOp::into_mutation).collect();
-        let record = crate::commitlog::transaction_record::encode(
-            &mutations,
-            self.commit_log.max_entry_size(),
-        )?;
-        self.write_atomic_batch_inner(mutations, Some(record))
     }
 
     /// Open a staging handle for a Bolt explicit transaction (B02).
@@ -11155,62 +10865,6 @@ impl StorageEngine {
         }
     }
 
-    /// Visit a secondary-index result one partition at a time, in row order.
-    /// The callback may stop the scan, allowing paging and cancellation to
-    /// reach the index reader without first building a `Vec` of all postings
-    /// or partitions. See [`Self::read_by_index_each_after`].
-    pub fn read_by_index_each(
-        &self,
-        table_id: &TableId,
-        index_name: &str,
-        key: &ferrosa_index::IndexKey,
-        visitor: &mut dyn FnMut(Partition) -> std::ops::ControlFlow<()>,
-    ) -> ferrosa_common::Result<()> {
-        self.read_by_index_each_after(table_id, index_name, key, None, visitor)
-    }
-
-    /// Whether ANY row of `table_id` carries an `index_name` posting for `key_bytes`.
-    ///
-    /// A thin, `ferrosa-index`-free convenience over [`Self::read_by_index_each`] for a
-    /// caller that holds only the encoded key bytes (the Postgres front end's foreign-key
-    /// probe does). It stops at the first match, so the cost is one index point lookup,
-    /// never O(result) or a scan. Errors propagate from `read_by_index_each`, which refuses
-    /// loudly when the index is undeclared or not current — a probe never reports "no such
-    /// parent" for an index it could not actually consult.
-    pub fn read_by_index_exists(
-        &self,
-        table_id: &TableId,
-        index_name: &str,
-        key_bytes: &[u8],
-    ) -> ferrosa_common::Result<bool> {
-        let key = ferrosa_index::IndexKey(key_bytes.to_vec());
-        let mut found = false;
-        self.read_by_index_each(table_id, index_name, &key, &mut |_| {
-            found = true;
-            std::ops::ControlFlow::Break(())
-        })?;
-        Ok(found)
-    }
-
-    /// Visit every partition a secondary-index result names, by RAW encoded key bytes.
-    ///
-    /// The multi-partition sibling of [`Self::read_by_index_exists`]: the same
-    /// `ferrosa-index`-free convenience for a caller that holds only the encoded value
-    /// bytes (a front end that must enumerate the rows an indexed value reaches, not
-    /// merely test for one). The visitor runs in row order and may stop early. A missing
-    /// or stale index is refused loudly by [`Self::read_by_index_each_after`] — it never
-    /// answers "no rows" for an index it could not consult.
-    pub fn read_by_index_each_bytes(
-        &self,
-        table_id: &TableId,
-        index_name: &str,
-        key_bytes: &[u8],
-        visitor: &mut dyn FnMut(Partition) -> std::ops::ControlFlow<()>,
-    ) -> ferrosa_common::Result<()> {
-        let key = ferrosa_index::IndexKey(key_bytes.to_vec());
-        self.read_by_index_each(table_id, index_name, &key, visitor)
-    }
-
     /// Declare an ordered (BTree) secondary index over the column at `column_position`.
     ///
     /// The declaration half of the pair whose read half is [`Self::read_by_index_exists`]: a
@@ -11229,149 +10883,6 @@ impl StorageEngine {
             column_position,
             ferrosa_index::IndexType::BTree,
         )
-    }
-
-    /// Visit a secondary-index result in row order — `(partition key,
-    /// clustering)` — strictly after `after` when given, so a page can resume
-    /// where the previous one stopped. O(posting sources) memory; see
-    /// `TableStore::read_by_index_each_after`.
-    pub fn read_by_index_each_after(
-        &self,
-        table_id: &TableId,
-        index_name: &str,
-        key: &ferrosa_index::IndexKey,
-        after: Option<&ferrosa_index::RowPosition>,
-        visitor: &mut dyn FnMut(Partition) -> std::ops::ControlFlow<()>,
-    ) -> ferrosa_common::Result<()> {
-        if !self.index_is_current(table_id, index_name) {
-            return Err(ferrosa_common::Error::InvalidData(format!(
-                "secondary index '{index_name}' on {table_id} is not current; refusing to return \
-                 incomplete results while index backfill is pending or failed"
-            )));
-        }
-        let state = self.require_table(table_id)?;
-        state.note_foreground_read();
-        state
-            .store
-            .read_by_index_each_after(index_name, key, after, visitor)
-    }
-
-    /// Open a bounded asynchronous stream over a secondary-index result.
-    /// The index walk runs on a blocking worker and hands partitions through
-    /// a bounded channel; the full global result is never materialized.
-    pub fn read_by_index_stream(
-        self: &Arc<Self>,
-        table_id: &TableId,
-        index_name: &str,
-        key: &ferrosa_index::IndexKey,
-    ) -> std::pin::Pin<
-        Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Partition>> + Send>,
-    > {
-        self.read_by_index_stream_after(table_id, index_name, key, None)
-    }
-
-    /// [`Self::read_by_index_stream`] resumed strictly after `after`: the
-    /// stream yields rows in row order, so the next page of an index read is
-    /// the stream opened after the last row the previous page delivered.
-    pub fn read_by_index_stream_after(
-        self: &Arc<Self>,
-        table_id: &TableId,
-        index_name: &str,
-        key: &ferrosa_index::IndexKey,
-        after: Option<ferrosa_index::RowPosition>,
-    ) -> std::pin::Pin<
-        Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Partition>> + Send>,
-    > {
-        let table_id = table_id.clone();
-        let index_name = index_name.to_string();
-        let key = key.clone();
-        let engine = Arc::clone(self);
-        let label = format!("{table_id} index {index_name}");
-        spawn_index_stream(label, move |visit| {
-            engine.read_by_index_each_after(&table_id, &index_name, &key, after.as_ref(), visit)
-        })
-    }
-
-    /// Whether `key` names so large a share of `table_id` that a scan is
-    /// cheaper than serving it through `index_name`. See
-    /// [`TableStore::index_key_is_unselective`]. An unregistered table is
-    /// `false`: the index path that follows reports it loudly.
-    pub fn index_key_is_unselective(
-        &self,
-        table_id: &TableId,
-        index_name: &str,
-        key: &ferrosa_index::IndexKey,
-    ) -> ferrosa_common::Result<bool> {
-        match self.table_state(table_id) {
-            Some(state) => state.store.index_key_is_unselective(index_name, key),
-            None => Ok(false),
-        }
-    }
-
-    /// Evaluate a canonical row against the named local index declaration,
-    /// using the same catalog, key encoding and predicate rules as postings.
-    pub fn index_row_matches(
-        &self,
-        table_id: &TableId,
-        index_name: &str,
-        query: &ferrosa_index::IndexKey,
-        key: &DecoratedKey,
-        row: &Row,
-    ) -> ferrosa_common::Result<bool> {
-        self.require_table(table_id)?
-            .store
-            .index_row_matches(index_name, query, key, row)
-    }
-
-    /// Query by secondary index restricted to ONE partition (t_430c4188).
-    ///
-    /// Delegates to [`TableStore::read_by_index_in_partition`], which keeps
-    /// only the postings for `partition_key` and point-reads exactly those
-    /// rows — O(matching rows in the partition), never O(partition rows).
-    ///
-    /// This fails loud on an unregistered table: the keyed CQL path only
-    /// reaches here after schema validation, so a missing table is an internal
-    /// inconsistency, not an empty result.
-    pub fn read_by_index_in_partition(
-        &self,
-        table_id: &TableId,
-        index_name: &str,
-        key: &ferrosa_index::IndexKey,
-        partition_key: &[u8],
-    ) -> ferrosa_common::Result<Vec<Partition>> {
-        match self.table_state(table_id) {
-            Some(state) => {
-                state.note_foreground_read();
-                state
-                    .store
-                    .read_by_index_in_partition(index_name, key, partition_key)
-            }
-            None => Err(ferrosa_common::Error::InvalidData(format!(
-                "read_by_index_in_partition: table {table_id:?} not registered"
-            ))),
-        }
-    }
-
-    /// Query a geo (cell-id) secondary index by inclusive `[start, end]` cell-id
-    /// ranges across the memtable index and SSTable sidecars.
-    ///
-    /// Delegates to [`TableStore::read_by_index_cell_ranges`]. Returns an empty
-    /// vec if the table is not registered. The fail-loud `INDEX_RESULT_CAP`
-    /// bound applies — an unbounded candidate set returns an error rather than
-    /// silently truncating.
-    pub fn read_by_index_cell_ranges(
-        &self,
-        table_id: &TableId,
-        index_name: &str,
-        ranges: &[(u64, u64)],
-    ) -> ferrosa_common::Result<Vec<Partition>> {
-        match self.table_state(table_id) {
-            Some(state) => {
-                state.note_foreground_read();
-                state.store.read_by_index_cell_ranges(index_name, ranges)
-            }
-            None => Ok(vec![]),
-        }
     }
 
     /// Truncates a table: clears the memtable and drops all SSTable references.
@@ -14920,23 +14431,30 @@ impl StorageEngine {
         // Swallowing this error is what let 36,572 of them accumulate unnoticed.
         if component_dir != table_dir {
             if let Err(e) = std::fs::remove_dir(&component_dir) {
-                let leftovers: Vec<String> = std::fs::read_dir(&component_dir)
-                    .map(|entries| {
-                        entries
-                            .flatten()
-                            .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
-                            .take(8)
-                            .collect()
-                    })
-                    .unwrap_or_default();
                 tracing::error!(
                     dir = %component_dir.display(),
                     error = %e,
-                    ?leftovers,
                     "delete_sstable_files: SSTable component directory survived deletion — \
                      it will be re-examined by compaction planning on every cycle and can \
                      never be compacted. This is an SSTable husk leak."
                 );
+                // Name every leftover, one line each, rather than collecting a sample.
+                match std::fs::read_dir(&component_dir) {
+                    Ok(entries) => {
+                        for entry in entries.flatten() {
+                            tracing::error!(
+                                dir = %component_dir.display(),
+                                leftover = %entry.file_name().to_string_lossy(),
+                                "delete_sstable_files: file left in the SSTable husk"
+                            );
+                        }
+                    }
+                    Err(e) => tracing::error!(
+                        dir = %component_dir.display(),
+                        error = %e,
+                        "delete_sstable_files: could not list the SSTable husk"
+                    ),
+                }
             }
         }
 
@@ -16113,7 +15631,6 @@ impl StorageEngine {
         // Shared with `ObjectStoreConfig::build_object_store`, which warns
         // when the in-flight limit is below it.
         const FETCH_CONCURRENCY: usize = crate::upload::config::STARTUP_FETCH_CONCURRENCY;
-        const LISTED_FAILURES: usize = 10;
 
         let evicted = Self::evicted_generations(&data_dir.join("sstables"));
         if evicted.is_empty() {
@@ -16139,22 +15656,10 @@ impl StorageEngine {
             "storage-engine: registering evicted SSTables as remote-backed (index components only, no Data.db download)"
         );
         let started = Instant::now();
-        // Only LISTED_FAILURES messages are ever shown, so retain exactly that
-        // many: a max-heap capped at LISTED_FAILURES yields the same lowest-N
-        // sorted sample the old `sort().take(N)` produced, in O(N) memory rather
-        // than one string per failed generation (352-373 per node on 2026-09-29).
-        // `failure_count` carries the true total into the error message.
-        let mut failures: std::collections::BinaryHeap<String> =
-            std::collections::BinaryHeap::new();
-        let mut failure_count = 0usize;
-        let note_failure =
-            |heap: &mut std::collections::BinaryHeap<String>, count: &mut usize, msg: String| {
-                *count += 1;
-                heap.push(msg);
-                if heap.len() > LISTED_FAILURES {
-                    heap.pop();
-                }
-            };
+        // Every failure is logged as it happens (352-373 per node on
+        // 2026-09-29); the tally keeps only the count and the lowest message
+        // for the refusal, so nothing here grows with the number of failures.
+        let mut failures = FailureTally::default();
         let mut jobs = Vec::new();
         for (dir_name, gens) in &evicted {
             let table_dir = data_dir.join("sstables").join(dir_name);
@@ -16173,11 +15678,7 @@ impl StorageEngine {
                 } else if listed {
                     jobs.push((dir_name.clone(), gen.clone(), table_dir.clone()));
                 } else {
-                    note_failure(
-                        &mut failures,
-                        &mut failure_count,
-                        format!("{dir_name} generation {gen}: not in the manifest"),
-                    );
+                    failures.note(format!("{dir_name} generation {gen}: not in the manifest"));
                 }
             }
         }
@@ -16207,7 +15708,7 @@ impl StorageEngine {
                     let now = Instant::now();
                     let bytes = reads.index_bytes_fetched();
                     if progress.report_due(now, watch.progress_every) {
-                        progress.log(now, bytes, failure_count);
+                        progress.log(now, bytes, failures.count());
                     }
                     if let Some(stall) = progress.stalled(now, watch.stall_after) {
                         tracing::error!("storage-engine: {stall}");
@@ -16224,37 +15725,25 @@ impl StorageEngine {
             // Also report here: the fetches write and fsync components on
             // this thread, which can hold the ticker off for seconds.
             if progress.report_due(now, watch.progress_every) {
-                progress.log(now, reads.index_bytes_fetched(), failure_count);
+                progress.log(now, reads.index_bytes_fetched(), failures.count());
             }
             match outcome {
                 Ok(crate::evicted_read::QueryFetch::Ready) => registered += 1,
-                Ok(crate::evicted_read::QueryFetch::IndexArtifactsLost(message)) => note_failure(
-                    &mut failures,
-                    &mut failure_count,
-                    format!("{dir_name} generation {gen}: {message}"),
-                ),
-                Ok(other) => note_failure(
-                    &mut failures,
-                    &mut failure_count,
-                    format!(
-                        "{dir_name} generation {gen}: objects unavailable in the store ({other:?})"
-                    ),
-                ),
-                Err(e) => note_failure(
-                    &mut failures,
-                    &mut failure_count,
-                    format!("{dir_name} generation {gen}: {e}"),
-                ),
+                Ok(crate::evicted_read::QueryFetch::IndexArtifactsLost(message)) => {
+                    failures.note(format!("{dir_name} generation {gen}: {message}"))
+                }
+                Ok(other) => failures.note(format!(
+                    "{dir_name} generation {gen}: objects unavailable in the store ({other:?})"
+                )),
+                Err(e) => failures.note(format!("{dir_name} generation {gen}: {e}")),
             }
         }
-        if failure_count > 0 {
-            let mut shown = failures.into_sorted_vec();
-            shown.truncate(LISTED_FAILURES);
+        if let Some(first) = failures.first() {
             return Err(ferrosa_common::Error::InvalidFormat(format!(
                 "{} evicted SSTable generation(s) are neither local nor resolvable from the \
-                 object store; refusing to start and serve their tables without them: {}",
-                failure_count,
-                shown.join("; ")
+                 object store; refusing to start and serve their tables without them. \
+                 First: {first}. Every one is logged above.",
+                failures.count(),
             )));
         }
         tracing::info!(
@@ -17878,7 +17367,7 @@ mod tests {
                 .write(
                     &table_id,
                     &make_key(key),
-                    make_row(value, timestamp),
+                    Arc::new(make_row(value, timestamp)),
                     timestamp,
                 )
                 .unwrap();
@@ -19786,7 +19275,12 @@ mod tests {
 
         let key = make_key("pk1");
         engine
-            .write(&table_id(), &key, make_row(b"schema-backed", 1000), 1000)
+            .write(
+                &table_id(),
+                &key,
+                Arc::new(make_row(b"schema-backed", 1000)),
+                1000,
+            )
             .expect("table from current SchemaSnapshot JSON should be registered before replay");
     }
 
@@ -19800,7 +19294,7 @@ mod tests {
 
         let key = make_key("pk1");
         engine
-            .write(&table_id(), &key, make_row(b"hello", 1000), 1000)
+            .write(&table_id(), &key, Arc::new(make_row(b"hello", 1000)), 1000)
             .unwrap();
 
         let result = engine.read(&table_id(), &key).unwrap();
@@ -19824,7 +19318,7 @@ mod tests {
         let key = make_key("pk1");
         let before = engine.commit_log_position();
         let err = engine
-            .write(&table_id(), &key, make_row(b"hello", 1000), 1000)
+            .write(&table_id(), &key, Arc::new(make_row(b"hello", 1000)), 1000)
             .expect_err("write must fail before commitlog append when disk reserve is exhausted");
         assert!(
             err.to_string()
@@ -19853,7 +19347,7 @@ mod tests {
         let key = make_key("pk1");
 
         let err = engine
-            .write(&table_id(), &key, make_row(b"hello", 1000), 1000)
+            .write(&table_id(), &key, Arc::new(make_row(b"hello", 1000)), 1000)
             .expect_err("write must fail under impossible reserve");
         assert!(err.is_backpressure(), "unexpected error: {err}");
         assert!(
@@ -19884,7 +19378,12 @@ mod tests {
         let engine = StorageEngine::new(config, None).unwrap();
 
         let key = make_key("k");
-        let result = engine.write(&TableId::new("no", "such"), &key, make_row(b"v", 1), 1);
+        let result = engine.write(
+            &TableId::new("no", "such"),
+            &key,
+            Arc::new(make_row(b"v", 1)),
+            1,
+        );
         assert!(result.is_err());
     }
 
@@ -19899,13 +19398,15 @@ mod tests {
 
         // Write should succeed while registered.
         let key = make_key("before");
-        engine.write(&tid, &key, make_row(b"val", 1), 1).unwrap();
+        engine
+            .write(&tid, &key, Arc::new(make_row(b"val", 1)), 1)
+            .unwrap();
 
         // Unregister the table.
         engine.unregister_table(&tid).unwrap();
 
         // Write should now fail — table is no longer registered.
-        let result = engine.write(&tid, &make_key("after"), make_row(b"v", 2), 2);
+        let result = engine.write(&tid, &make_key("after"), Arc::new(make_row(b"v", 2)), 2);
         assert!(result.is_err(), "write to unregistered table should fail");
     }
 
@@ -19920,7 +19421,9 @@ mod tests {
 
         // Write and flush so data is in SSTables on disk.
         let key = make_key("old_data");
-        engine.write(&tid, &key, make_row(b"stale", 1), 1).unwrap();
+        engine
+            .write(&tid, &key, Arc::new(make_row(b"stale", 1)), 1)
+            .unwrap();
         engine.flush(&tid).unwrap();
 
         // Verify data exists.
@@ -19971,7 +19474,9 @@ mod tests {
         // The bulk load: rows flushed to real SSTables on disk.
         for i in 0..5 {
             let key = make_key(&format!("old{i}"));
-            engine.write(&tid, &key, make_row(b"stale", 1), 1).unwrap();
+            engine
+                .write(&tid, &key, Arc::new(make_row(b"stale", 1)), 1)
+                .unwrap();
         }
         engine.flush(&tid).unwrap();
         assert_eq!(
@@ -20004,7 +19509,7 @@ mod tests {
         for i in 0..3 {
             let key = make_key(&format!("new{i}"));
             engine
-                .write(&tid, &key, make_row(b"fresh", 100), 100)
+                .write(&tid, &key, Arc::new(make_row(b"fresh", 100)), 100)
                 .unwrap();
         }
 
@@ -20100,7 +19605,9 @@ mod tests {
             engine.register_table(test_schema()).unwrap();
             for i in 0..7 {
                 let key = make_key(&format!("old{i}"));
-                engine.write(&tid, &key, make_row(b"stale", 1), 1).unwrap();
+                engine
+                    .write(&tid, &key, Arc::new(make_row(b"stale", 1)), 1)
+                    .unwrap();
             }
             engine.flush(&tid).unwrap();
             assert_eq!(engine.count_range(&tid, None, None).unwrap(), 7);
@@ -20119,7 +19626,7 @@ mod tests {
             for i in 0..4 {
                 let key = make_key(&format!("new{i}"));
                 engine
-                    .write(&tid, &key, make_row(b"fresh", 100), 100)
+                    .write(&tid, &key, Arc::new(make_row(b"fresh", 100)), 100)
                     .unwrap();
             }
             assert_eq!(
@@ -20167,7 +19674,9 @@ mod tests {
         engine.register_table(test_schema()).unwrap();
         for i in 0..5 {
             let key = make_key(&format!("old{i}"));
-            engine.write(&tid, &key, make_row(b"stale", 1), 1).unwrap();
+            engine
+                .write(&tid, &key, Arc::new(make_row(b"stale", 1)), 1)
+                .unwrap();
         }
         engine.flush(&tid).unwrap();
         let table_dir = dir.path().join("sstables").join(tid.to_string());
@@ -20202,7 +19711,9 @@ mod tests {
             engine.register_table(test_schema()).unwrap();
             for i in 0..5 {
                 let key = make_key(&format!("old{i}"));
-                engine.write(&tid, &key, make_row(b"stale", 1), 1).unwrap();
+                engine
+                    .write(&tid, &key, Arc::new(make_row(b"stale", 1)), 1)
+                    .unwrap();
             }
             engine.flush(&tid).unwrap();
             assert_eq!(engine.count_range(&tid, None, None).unwrap(), 5);
@@ -20273,13 +19784,13 @@ mod tests {
         // Write data to BOTH tables and flush to SSTable files on disk.
         let key_a = make_key("entity_1");
         engine
-            .write(&tid_a, &key_a, make_row(b"important_data", 1), 1)
+            .write(&tid_a, &key_a, Arc::new(make_row(b"important_data", 1)), 1)
             .unwrap();
         engine.flush(&tid_a).unwrap();
 
         let key_b = make_key("edge_1");
         engine
-            .write(&tid_b, &key_b, make_row(b"will_be_dropped", 2), 2)
+            .write(&tid_b, &key_b, Arc::new(make_row(b"will_be_dropped", 2)), 2)
             .unwrap();
         engine.flush(&tid_b).unwrap();
 
@@ -20334,7 +19845,7 @@ mod tests {
 
         let key = make_key("trunc_data");
         engine
-            .write(&tid, &key, make_row(b"will_be_gone", 1), 1)
+            .write(&tid, &key, Arc::new(make_row(b"will_be_gone", 1)), 1)
             .unwrap();
         engine.flush(&tid).unwrap();
 
@@ -20370,7 +19881,7 @@ mod tests {
             .write(
                 &tid,
                 &key,
-                make_row(b"NEWER_VALUE", 7_000_000_000),
+                Arc::new(make_row(b"NEWER_VALUE", 7_000_000_000)),
                 7_000_000_000,
             )
             .unwrap();
@@ -20381,7 +19892,7 @@ mod tests {
             .write(
                 &tid,
                 &key,
-                make_row(b"OLDER_VALUE", 3_000_000_000),
+                Arc::new(make_row(b"OLDER_VALUE", 3_000_000_000)),
                 3_000_000_000,
             )
             .unwrap();
@@ -20411,25 +19922,45 @@ mod tests {
 
         // Flush 1: write at ts=5e9
         engine
-            .write(&tid, &key, make_row(b"V5", 5_000_000_000), 5_000_000_000)
+            .write(
+                &tid,
+                &key,
+                Arc::new(make_row(b"V5", 5_000_000_000)),
+                5_000_000_000,
+            )
             .unwrap();
         engine.flush(&tid).unwrap();
 
         // Flush 2: write at ts=7e9 (HIGHEST — should win)
         engine
-            .write(&tid, &key, make_row(b"V7", 7_000_000_000), 7_000_000_000)
+            .write(
+                &tid,
+                &key,
+                Arc::new(make_row(b"V7", 7_000_000_000)),
+                7_000_000_000,
+            )
             .unwrap();
         engine.flush(&tid).unwrap();
 
         // Flush 3: write at ts=3e9
         engine
-            .write(&tid, &key, make_row(b"V3", 3_000_000_000), 3_000_000_000)
+            .write(
+                &tid,
+                &key,
+                Arc::new(make_row(b"V3", 3_000_000_000)),
+                3_000_000_000,
+            )
             .unwrap();
         engine.flush(&tid).unwrap();
 
         // Memtable: write at ts=1e9
         engine
-            .write(&tid, &key, make_row(b"V1", 1_000_000_000), 1_000_000_000)
+            .write(
+                &tid,
+                &key,
+                Arc::new(make_row(b"V1", 1_000_000_000)),
+                1_000_000_000,
+            )
             .unwrap();
 
         // Read should return V7 (highest timestamp across all sources).
@@ -20494,7 +20025,7 @@ mod tests {
 
                     let key = make_key(&key_str);
                     let row = make_row(&value, ts);
-                    engine.write(&tid, &key, row, ts).unwrap();
+                    engine.write(&tid, &key, Arc::new(row), ts).unwrap();
 
                     // Track in expected map (LWW by timestamp).
                     let mut map = expected.lock().unwrap();
@@ -20616,7 +20147,9 @@ mod tests {
         for i in 0..50 {
             let key = make_key("pk1"); // same partition key for all
             let row = make_row_ck(i, format!("batch1_{i}").as_bytes(), (i + 1) as i64);
-            engine.write(&tid, &key, row, (i + 1) as i64).unwrap();
+            engine
+                .write(&tid, &key, Arc::new(row), (i + 1) as i64)
+                .unwrap();
         }
         engine.flush(&tid).unwrap();
 
@@ -20633,7 +20166,9 @@ mod tests {
         for i in 50..150 {
             let key = make_key("pk1");
             let row = make_row_ck(i, format!("batch2_{i}").as_bytes(), (i + 1) as i64);
-            engine.write(&tid, &key, row, (i + 1) as i64).unwrap();
+            engine
+                .write(&tid, &key, Arc::new(row), (i + 1) as i64)
+                .unwrap();
         }
         engine.flush(&tid).unwrap();
 
@@ -20675,7 +20210,9 @@ mod tests {
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp((i + 1) as i64),
             };
-            engine.write(&tid, &key, row, (i + 1) as i64).unwrap();
+            engine
+                .write(&tid, &key, Arc::new(row), (i + 1) as i64)
+                .unwrap();
 
             // Manually flush every 50 rows to simulate auto-flush behavior
             if (i + 1) % 50 == 0 {
@@ -20707,7 +20244,9 @@ mod tests {
         engine.register_table(test_schema()).unwrap();
 
         let key = make_key("delete_test");
-        engine.write(&tid, &key, make_row(b"val", 1), 1).unwrap();
+        engine
+            .write(&tid, &key, Arc::new(make_row(b"val", 1)), 1)
+            .unwrap();
         engine.flush(&tid).unwrap();
 
         // Verify data exists
@@ -20778,7 +20317,9 @@ mod tests {
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(i as i64 + 1),
             };
-            engine.write(&tid, &pk, row, i as i64 + 1).unwrap();
+            engine
+                .write(&tid, &pk, Arc::new(row), i as i64 + 1)
+                .unwrap();
         }
         engine.flush(&tid).unwrap();
 
@@ -20790,7 +20331,9 @@ mod tests {
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(i as i64 + 1),
             };
-            engine.write(&tid, &pk, row, i as i64 + 1).unwrap();
+            engine
+                .write(&tid, &pk, Arc::new(row), i as i64 + 1)
+                .unwrap();
         }
         engine.flush(&tid).unwrap();
 
@@ -20823,7 +20366,9 @@ mod tests {
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(i as i64 + 1),
             };
-            engine.write(&tid, &pk, row, i as i64 + 1).unwrap();
+            engine
+                .write(&tid, &pk, Arc::new(row), i as i64 + 1)
+                .unwrap();
         }
         engine.flush(&tid).unwrap();
 
@@ -20835,7 +20380,9 @@ mod tests {
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(i as i64 + 1),
             };
-            engine.write(&tid, &pk, row, i as i64 + 1).unwrap();
+            engine
+                .write(&tid, &pk, Arc::new(row), i as i64 + 1)
+                .unwrap();
         }
         engine.flush(&tid).unwrap();
 
@@ -20877,7 +20424,9 @@ mod tests {
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(ck as i64 + 1),
                 };
-                engine.write(&tid, &pk, row, ck as i64 + 1).unwrap();
+                engine
+                    .write(&tid, &pk, Arc::new(row), ck as i64 + 1)
+                    .unwrap();
             }
             engine.flush(&tid).unwrap();
         }
@@ -20920,7 +20469,9 @@ mod tests {
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp((i + 1) as i64),
             };
-            engine.write(&tid, &pk, row, (i + 1) as i64).unwrap();
+            engine
+                .write(&tid, &pk, Arc::new(row), (i + 1) as i64)
+                .unwrap();
         }
         engine.flush(&tid).unwrap();
 
@@ -21020,7 +20571,9 @@ mod tests {
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp((i + 1) as i64),
                 };
-                engine.write(&tid, &pk, row, (i + 1) as i64).unwrap();
+                engine
+                    .write(&tid, &pk, Arc::new(row), (i + 1) as i64)
+                    .unwrap();
             }
             engine.flush(&tid).unwrap();
 
@@ -21105,7 +20658,7 @@ mod tests {
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1000),
             };
-            engine.write(&tid, &pk, row, 1000).unwrap();
+            engine.write(&tid, &pk, Arc::new(row), 1000).unwrap();
             engine.flush(&tid).unwrap();
         }
 
@@ -21247,7 +20800,7 @@ mod tests {
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1000),
             };
-            engine.write(&tid, &pk, row, 1000).unwrap();
+            engine.write(&tid, &pk, Arc::new(row), 1000).unwrap();
             engine.flush(&tid).unwrap();
         }
 
@@ -21336,7 +20889,7 @@ mod tests {
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1000),
             };
-            engine.write(&tid, &pk, row, 1000).unwrap();
+            engine.write(&tid, &pk, Arc::new(row), 1000).unwrap();
             engine.flush(&tid).unwrap();
         }
 
@@ -21442,7 +20995,7 @@ mod tests {
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
                 };
-                engine.write(&tid, &pk, row, 1000).unwrap();
+                engine.write(&tid, &pk, Arc::new(row), 1000).unwrap();
             }
             engine.flush(&tid).unwrap();
         }
@@ -21532,12 +21085,22 @@ mod tests {
             engine.register_table(schema.clone()).unwrap();
 
             engine
-                .write(&tid, &healthy_key, make_row(b"healthy", 1000), 1000)
+                .write(
+                    &tid,
+                    &healthy_key,
+                    Arc::new(make_row(b"healthy", 1000)),
+                    1000,
+                )
                 .unwrap();
             engine.flush(&tid).unwrap();
 
             engine
-                .write(&tid, &corrupt_key, make_row(b"corrupt", 2000), 2000)
+                .write(
+                    &tid,
+                    &corrupt_key,
+                    Arc::new(make_row(b"corrupt", 2000)),
+                    2000,
+                )
                 .unwrap();
             engine.flush(&tid).unwrap();
         }
@@ -21629,7 +21192,10 @@ mod tests {
             for i in 0..n {
                 let key = make_key(&format!("pk-{i}"));
                 store
-                    .write(&key, make_row(format!("v{i}").as_bytes(), 1000 + i as i64))
+                    .write(
+                        &key,
+                        Arc::new(make_row(format!("v{i}").as_bytes(), 1000 + i as i64)),
+                    )
                     .unwrap();
                 store.flush().unwrap();
             }
@@ -21728,7 +21294,9 @@ mod tests {
                         deletion: DeletionTime::LIVE,
                         primary_key_liveness: LivenessInfo::with_timestamp((idx + 1) as i64),
                     };
-                    engine.write(&tid, &pk, row, (idx + 1) as i64).unwrap();
+                    engine
+                        .write(&tid, &pk, Arc::new(row), (idx + 1) as i64)
+                        .unwrap();
                 }
                 engine.flush(&tid).unwrap();
             }
@@ -21786,7 +21354,12 @@ mod tests {
             for i in 0..n {
                 let pk = make_key(&format!("restart-{i:05}"));
                 engine
-                    .write(&tid, &pk, make_row(format!("v{i}").as_bytes(), 1), 1)
+                    .write(
+                        &tid,
+                        &pk,
+                        Arc::new(make_row(format!("v{i}").as_bytes(), 1)),
+                        1,
+                    )
                     .unwrap();
             }
             engine.flush(&tid).unwrap();
@@ -21923,7 +21496,7 @@ mod tests {
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
                 };
-                engine.write(&tid, &pk, row, 1000).unwrap();
+                engine.write(&tid, &pk, Arc::new(row), 1000).unwrap();
             }
             engine.flush(&tid).unwrap();
         }
@@ -22048,7 +21621,9 @@ mod tests {
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(ck as i64 + 1),
                 };
-                engine.write(&tid, &pk, row, ck as i64 + 1).unwrap();
+                engine
+                    .write(&tid, &pk, Arc::new(row), ck as i64 + 1)
+                    .unwrap();
                 total += 1;
             }
             engine.flush(&tid).unwrap();
@@ -22082,7 +21657,7 @@ mod tests {
         let tid = table_id();
         let key = make_key("flushed_key");
         engine
-            .write(&tid, &key, make_row(b"before_flush", 1000), 1000)
+            .write(&tid, &key, Arc::new(make_row(b"before_flush", 1000)), 1000)
             .unwrap();
 
         engine.flush(&tid).unwrap();
@@ -22131,7 +21706,7 @@ mod tests {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };
-        engine.write(&tid, &key, row, 1000).unwrap();
+        engine.write(&tid, &key, Arc::new(row), 1000).unwrap();
 
         engine.flush(&tid).unwrap();
         assert_eq!(engine.sstable_count(&tid), 1);
@@ -22167,13 +21742,13 @@ mod tests {
 
         // Write old value and flush to SSTable.
         engine
-            .write(&tid, &key, make_row(b"old", 1000), 1000)
+            .write(&tid, &key, Arc::new(make_row(b"old", 1000)), 1000)
             .unwrap();
         engine.flush(&tid).unwrap();
 
         // Write newer value — stays in memtable.
         engine
-            .write(&tid, &key, make_row(b"new", 2000), 2000)
+            .write(&tid, &key, Arc::new(make_row(b"new", 2000)), 2000)
             .unwrap();
 
         // Should merge: timestamp 2000 wins.
@@ -22210,10 +21785,10 @@ mod tests {
         let key = make_key("shared_key");
 
         engine
-            .write(&tid1, &key, make_row(b"val1", 1000), 1000)
+            .write(&tid1, &key, Arc::new(make_row(b"val1", 1000)), 1000)
             .unwrap();
         engine
-            .write(&tid2, &key, make_row(b"val2", 2000), 2000)
+            .write(&tid2, &key, Arc::new(make_row(b"val2", 2000)), 2000)
             .unwrap();
 
         let r1 = engine.read(&tid1, &key).unwrap().unwrap();
@@ -22239,10 +21814,10 @@ mod tests {
 
         let tid = table_id();
         engine
-            .write(&tid, &make_key("k1"), make_row(b"v1", 1000), 1000)
+            .write(&tid, &make_key("k1"), Arc::new(make_row(b"v1", 1000)), 1000)
             .unwrap();
         engine
-            .write(&tid, &make_key("k2"), make_row(b"v2", 2000), 2000)
+            .write(&tid, &make_key("k2"), Arc::new(make_row(b"v2", 2000)), 2000)
             .unwrap();
 
         engine.shutdown().unwrap();
@@ -22428,7 +22003,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key(&format!("k{i}")),
-                    make_row(b"v", 1000),
+                    Arc::new(make_row(b"v", 1000)),
                     1000,
                 )
                 .unwrap();
@@ -22455,7 +22030,9 @@ mod tests {
         engine.register_table(test_schema()).unwrap();
         let tid = table_id();
         let dk = make_key("k1");
-        engine.write(&tid, &dk, make_row(b"v", 1000), 1000).unwrap();
+        engine
+            .write(&tid, &dk, Arc::new(make_row(b"v", 1000)), 1000)
+            .unwrap();
         assert_eq!(
             engine.table_last_foreground_read(&tid),
             None,
@@ -22513,7 +22090,9 @@ mod tests {
             let k = format!("k{i:03}");
             let dk = make_key(&k);
             let tok = dk.token.0;
-            engine.write(&tid, &dk, make_row(b"v", 1000), 1000).unwrap();
+            engine
+                .write(&tid, &dk, Arc::new(make_row(b"v", 1000)), 1000)
+                .unwrap();
             keys_with_tokens.push((k, tok));
         }
 
@@ -22552,7 +22131,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key(&format!("k{i}")),
-                    make_row(b"v", 1000),
+                    Arc::new(make_row(b"v", 1000)),
                     1000,
                 )
                 .unwrap();
@@ -22575,7 +22154,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key(&format!("k{i}")),
-                    make_row(b"v", 1000),
+                    Arc::new(make_row(b"v", 1000)),
                     1000,
                 )
                 .unwrap();
@@ -22608,7 +22187,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key(&format!("k{i:04}")),
-                    make_row(&big, 1000),
+                    Arc::new(make_row(&big, 1000)),
                     1000,
                 )
                 .unwrap();
@@ -22663,7 +22242,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key(&format!("k{i:04}")),
-                    make_row(b"v", 1000),
+                    Arc::new(make_row(b"v", 1000)),
                     1000,
                 )
                 .unwrap();
@@ -22703,7 +22282,12 @@ mod tests {
         let tid = table_id();
         let big = vec![b'y'; 1024];
         engine
-            .write(&tid, &make_key("only"), make_row(&big, 1000), 1000)
+            .write(
+                &tid,
+                &make_key("only"),
+                Arc::new(make_row(&big, 1000)),
+                1000,
+            )
             .unwrap();
 
         // Byte budget far below the single partition's size.
@@ -22733,7 +22317,9 @@ mod tests {
             let k = format!("k{i:06}");
             let dk = make_key(&k);
             tokens.push(dk.token.0);
-            engine.write(&tid, &dk, make_row(b"v", 1000), 1000).unwrap();
+            engine
+                .write(&tid, &dk, Arc::new(make_row(b"v", 1000)), 1000)
+                .unwrap();
         }
         tokens.sort_unstable();
 
@@ -22767,7 +22353,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key(&format!("k{i}")),
-                    make_row(b"v", 1000),
+                    Arc::new(make_row(b"v", 1000)),
                     1000,
                 )
                 .unwrap();
@@ -22822,7 +22408,12 @@ mod tests {
         let mut refused = None;
         for seq in 0..4096u32 {
             let key = format!("k{seq}");
-            match engine.write(&tid, &make_key(&key), make_row(b"data", 1000), 1000) {
+            match engine.write(
+                &tid,
+                &make_key(&key),
+                Arc::new(make_row(b"data", 1000)),
+                1000,
+            ) {
                 Ok(()) => accepted.push(key),
                 Err(error) => {
                     refused = Some(error);
@@ -22862,7 +22453,7 @@ mod tests {
             .write(
                 &tid,
                 &make_key("after-drain"),
-                make_row(b"data", 1000),
+                Arc::new(make_row(b"data", 1000)),
                 1000,
             )
             .expect("once the buffer has drained the engine must admit writes again");
@@ -22885,7 +22476,12 @@ mod tests {
         engine.register_table(test_schema()).unwrap();
         let tid = table_id();
         engine
-            .write(&tid, &make_key("k"), make_row(b"data", 1000), 1000)
+            .write(
+                &tid,
+                &make_key("k"),
+                Arc::new(make_row(b"data", 1000)),
+                1000,
+            )
             .unwrap();
         assert!(
             engine.take_flush_request(),
@@ -22893,7 +22489,12 @@ mod tests {
         );
 
         let err = engine
-            .write(&tid, &make_key("k2"), make_row(b"data", 1000), 1000)
+            .write(
+                &tid,
+                &make_key("k2"),
+                Arc::new(make_row(b"data", 1000)),
+                1000,
+            )
             .unwrap_err();
         assert!(
             err.to_string().contains("memtable backpressure"),
@@ -22926,7 +22527,12 @@ mod tests {
         engine.register_table(test_schema()).unwrap();
         let tid = table_id();
         engine
-            .write(&tid, &make_key("soft"), make_row(b"data", 1000), 1000)
+            .write(
+                &tid,
+                &make_key("soft"),
+                Arc::new(make_row(b"data", 1000)),
+                1000,
+            )
             .unwrap();
         let current_size = engine.tables.load()[&tid].store.memtable_size() as u64;
         engine.config.memtable_backpressure_bytes = current_size.saturating_mul(2).max(2);
@@ -22958,7 +22564,12 @@ mod tests {
         engine.register_table(test_schema()).unwrap();
         let tid = table_id();
         engine
-            .write(&tid, &make_key("soft"), make_row(b"data", 1000), 1000)
+            .write(
+                &tid,
+                &make_key("soft"),
+                Arc::new(make_row(b"data", 1000)),
+                1000,
+            )
             .unwrap();
         let current_size = engine.tables.load()[&tid].store.memtable_size() as u64;
         engine.config.memtable_backpressure_bytes = current_size.saturating_mul(2).max(2);
@@ -22983,7 +22594,12 @@ mod tests {
 
         let tid = table_id();
         engine
-            .write(&tid, &make_key("k"), make_row(b"data", 1000), 1000)
+            .write(
+                &tid,
+                &make_key("k"),
+                Arc::new(make_row(b"data", 1000)),
+                1000,
+            )
             .unwrap();
 
         engine.flush_if_needed().unwrap();
@@ -23002,7 +22618,12 @@ mod tests {
 
         let tid = table_id();
         engine
-            .write(&tid, &make_key("k1"), make_row(b"tiny", 1000), 1000)
+            .write(
+                &tid,
+                &make_key("k1"),
+                Arc::new(make_row(b"tiny", 1000)),
+                1000,
+            )
             .unwrap();
 
         // Memtable should have data.
@@ -23066,7 +22687,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key(&format!("tiny-{batch:04}")),
-                    make_row(b"x", batch as i64 + 1),
+                    Arc::new(make_row(b"x", batch as i64 + 1)),
                     batch as i64 + 1,
                 )
                 .unwrap();
@@ -23116,7 +22737,7 @@ mod tests {
                 .write(
                     &table_id,
                     &make_key("pk"),
-                    make_row(b"x", index as i64 + 1),
+                    Arc::new(make_row(b"x", index as i64 + 1)),
                     index as i64 + 1,
                 )
                 .unwrap();
@@ -23167,7 +22788,7 @@ mod tests {
                 .write(
                     &oldest_owner,
                     &make_key(&format!("oldest-{i}")),
-                    make_row(&payload, 1000 + i),
+                    Arc::new(make_row(&payload, 1000 + i)),
                     1000 + i,
                 )
                 .unwrap();
@@ -23179,7 +22800,7 @@ mod tests {
             .write(
                 &unrelated,
                 &make_key("unrelated"),
-                make_row(b"tiny", 5000),
+                Arc::new(make_row(b"tiny", 5000)),
                 5000,
             )
             .unwrap();
@@ -23234,7 +22855,7 @@ mod tests {
                     .write(
                         &tid,
                         &make_key(&format!("replay-{i:04}")),
-                        make_row(b"durable-in-wal", i + 1),
+                        Arc::new(make_row(b"durable-in-wal", i + 1)),
                         i + 1,
                     )
                     .unwrap();
@@ -23284,7 +22905,7 @@ mod tests {
                     .write(
                         &tid,
                         &make_key(&format!("backlog-{i:04}")),
-                        make_row(b"x", i as i64 + 1),
+                        Arc::new(make_row(b"x", i as i64 + 1)),
                         i as i64 + 1,
                     )
                     .unwrap();
@@ -23371,7 +22992,7 @@ mod tests {
                     1000 + i,
                 ),
             };
-            engine.write(&tid, &key, row, 1000 + i).unwrap();
+            engine.write(&tid, &key, Arc::new(row), 1000 + i).unwrap();
         }
 
         // Force flush to SSTable
@@ -23443,7 +23064,7 @@ mod tests {
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
             primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1000),
         };
-        engine.write(&tid, &key1, row1, 1000).unwrap();
+        engine.write(&tid, &key1, Arc::new(row1), 1000).unwrap();
 
         // Row 2: long hash + short model version + 1-byte result (SURVIVES in prod)
         let hash2 = "4bbe47ee6bb1d0ecaa4d47fce3d99e2044cdfdbfac4dde0c0c083f97e4fad000"; // pragma: allowlist secret
@@ -23464,7 +23085,7 @@ mod tests {
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
             primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(2000),
         };
-        engine.write(&tid, &key2, row2, 2000).unwrap();
+        engine.write(&tid, &key2, Arc::new(row2), 2000).unwrap();
 
         // Verify memtable reads work
         assert!(
@@ -23552,7 +23173,7 @@ mod tests {
 
         let key = make_key("k1");
         engine
-            .write(&tid, &key, make_row(b"val", 1000), 1000)
+            .write(&tid, &key, Arc::new(make_row(b"val", 1000)), 1000)
             .unwrap();
 
         assert_eq!(observer.count(), 1);
@@ -23573,7 +23194,7 @@ mod tests {
         let tid = table_id();
         let key = make_key("k1");
         engine
-            .write(&tid, &key, make_row(b"val", 1000), 1000)
+            .write(&tid, &key, Arc::new(make_row(b"val", 1000)), 1000)
             .unwrap();
 
         assert_eq!(observer.count(), 0);
@@ -23623,7 +23244,7 @@ mod tests {
 
         let key = make_key("k1");
         engine
-            .write(&tid, &key, make_row(b"val", 1000), 1000)
+            .write(&tid, &key, Arc::new(make_row(b"val", 1000)), 1000)
             .unwrap();
 
         // Write should succeed (async observer does not block).
@@ -23732,7 +23353,9 @@ mod tests {
         for i in 0..BURST {
             let key = make_key(&format!("k{i}"));
             let ts = 1000 + i as i64;
-            engine.write(&tid, &key, make_row(b"val", ts), ts).unwrap();
+            engine
+                .write(&tid, &key, Arc::new(make_row(b"val", ts)), ts)
+                .unwrap();
         }
 
         // Nothing drained the queue: k0 is still in it, and that is the only
@@ -23782,7 +23405,9 @@ mod tests {
         for i in 0..3 {
             let key = make_key(&format!("k{i}"));
             let ts = 1000 + i as i64;
-            engine.write(&tid, &key, make_row(b"val", ts), ts).unwrap();
+            engine
+                .write(&tid, &key, Arc::new(make_row(b"val", ts)), ts)
+                .unwrap();
         }
         let elapsed = started.elapsed();
 
@@ -23842,7 +23467,9 @@ mod tests {
         for i in 0..3 {
             let key = make_key(&format!("k{i}"));
             let ts = 1000 + i as i64;
-            engine.write(&tid, &key, make_row(b"val", ts), ts).unwrap();
+            engine
+                .write(&tid, &key, Arc::new(make_row(b"val", ts)), ts)
+                .unwrap();
         }
         let events = engine.observer_backpressure_count() - before;
 
@@ -23921,7 +23548,7 @@ mod tests {
                         .write(
                             &tid,
                             &make_key(&key_name),
-                            make_row(key_name.as_bytes(), ts),
+                            Arc::new(make_row(key_name.as_bytes(), ts)),
                             ts,
                         )
                         .unwrap();
@@ -23936,7 +23563,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key("unflushed"),
-                    make_row(b"survive", 9999),
+                    Arc::new(make_row(b"survive", 9999)),
                     9999,
                 )
                 .unwrap();
@@ -23980,7 +23607,12 @@ mod tests {
 
             let tid = table_id();
             engine
-                .write(&tid, &make_key("good"), make_row(b"val", 1000), 1000)
+                .write(
+                    &tid,
+                    &make_key("good"),
+                    Arc::new(make_row(b"val", 1000)),
+                    1000,
+                )
                 .unwrap();
             engine.commit_log.shutdown().unwrap();
         }
@@ -24020,7 +23652,7 @@ mod tests {
             tid.keyspace.clone(),
             tid.table.clone(),
             key.clone(),
-            vec![make_row(b"late-schema", 1000)],
+            vec![Arc::new(make_row(b"late-schema", 1000))],
             1000,
         );
 
@@ -24053,7 +23685,7 @@ mod tests {
             let engine = StorageEngine::new(config, None).unwrap();
             engine.register_table(test_schema()).unwrap();
             engine
-                .write(&tid, &key, make_row(b"pending", 2000), 2000)
+                .write(&tid, &key, Arc::new(make_row(b"pending", 2000)), 2000)
                 .unwrap();
             engine.commit_log.shutdown().unwrap();
         }
@@ -24101,7 +23733,12 @@ mod tests {
             engine.register_table(test_schema_2()).unwrap();
 
             engine
-                .write(&table_a, &survivor_key, make_row(b"survive", 1000), 1000)
+                .write(
+                    &table_a,
+                    &survivor_key,
+                    Arc::new(make_row(b"survive", 1000)),
+                    1000,
+                )
                 .unwrap();
 
             for i in 0..16 {
@@ -24110,7 +23747,7 @@ mod tests {
                     .write(
                         &table_b,
                         &key,
-                        make_row(format!("v{i}").as_bytes(), 2000 + i),
+                        Arc::new(make_row(format!("v{i}").as_bytes(), 2000 + i)),
                         2000 + i,
                     )
                     .unwrap();
@@ -24155,7 +23792,12 @@ mod tests {
             engine.register_table(test_schema_2()).unwrap();
 
             engine
-                .write(&table_a, &survivor_key, make_row(b"survive", 3000), 3000)
+                .write(
+                    &table_a,
+                    &survivor_key,
+                    Arc::new(make_row(b"survive", 3000)),
+                    3000,
+                )
                 .unwrap();
 
             for i in 0..16 {
@@ -24164,7 +23806,7 @@ mod tests {
                     .write(
                         &table_b,
                         &key,
-                        make_row(format!("v{i}").as_bytes(), 4000 + i),
+                        Arc::new(make_row(format!("v{i}").as_bytes(), 4000 + i)),
                         4000 + i,
                     )
                     .unwrap();
@@ -24204,7 +23846,7 @@ mod tests {
             engine.register_table(test_schema()).unwrap();
             engine.register_table(test_schema_2()).unwrap();
             engine
-                .write(&table_a, &key, make_row(b"replayed", 3000), 3000)
+                .write(&table_a, &key, Arc::new(make_row(b"replayed", 3000)), 3000)
                 .unwrap();
             // Persist the local schema so the restart replays into table_a.
             engine.flush(&table_id_2()).unwrap();
@@ -24248,7 +23890,7 @@ mod tests {
                     .write(
                         &table_a,
                         &make_key(&format!("replayed-{i}")),
-                        make_row(b"v", 3000),
+                        Arc::new(make_row(b"v", 3000)),
                         3000,
                     )
                     .unwrap();
@@ -24348,7 +23990,7 @@ mod tests {
     fn recovery_reader_admission_requires_rejection_hook() {
         let dir = tempfile::tempdir().unwrap();
         let (schema, tid, mut mutation, survivor) = recovery_admission_fixture();
-        mutation.rows = vec![survivor.clone()];
+        mutation.rows = vec![Arc::new(survivor.clone())];
         let config = StorageEngineConfig::test_config(dir.path());
         let position = {
             let engine =
@@ -24388,7 +24030,7 @@ mod tests {
                 assert!(pending.is_empty());
                 assert_eq!(
                     engine.read(&tid, &mutation.key).unwrap().unwrap().rows,
-                    vec![survivor]
+                    vec![Arc::new(survivor)]
                 );
                 assert!(engine.assert_table_recovery_complete(&tid).is_err(),
                     "reader skipped a CRC-valid undecodable frame, but engine admission falsely reports complete");
@@ -24404,7 +24046,7 @@ mod tests {
     ) -> (std::path::PathBuf, Vec<u8>, Mutation, Mutation) {
         use crate::commitlog::{segment::Segment, transaction_record};
         let (schema, tid, mut first, survivor) = recovery_admission_fixture();
-        first.rows = vec![survivor];
+        first.rows = vec![Arc::new(survivor)];
         {
             let engine = StorageEngine::new(StorageEngineConfig::test_config(dir), None).unwrap();
             engine.register_table(schema).unwrap();
@@ -24427,7 +24069,7 @@ mod tests {
             // A valid first member followed by a malformed second member.
             let mut payload = bad.rows[0].cells[0].1.value.as_deref().unwrap().to_vec();
             payload.extend_from_slice(&[0, 0, 0, 8, 0xff]);
-            bad.rows[0].cells[0].1 = CellValue::live(payload, 0);
+            Arc::make_mut(&mut bad.rows[0]).cells[0].1 = CellValue::live(payload, 0);
         }
         let offset = put(&bad);
         // Close the section so `last` sits behind its own sync marker.
@@ -24565,7 +24207,7 @@ mod tests {
         use crate::commitlog::segment::Segment;
         let dir = tempfile::tempdir().unwrap();
         let (schema, tid, mut mutation, survivor) = recovery_admission_fixture();
-        mutation.rows = vec![survivor];
+        mutation.rows = vec![Arc::new(survivor)];
         recovery_admission_seed(dir.path(), &schema, &mutation);
         let config = StorageEngineConfig::test_config(dir.path());
         let segment = Segment::new(50, 65536, &config.commit_log.log_dir);
@@ -24627,7 +24269,12 @@ mod tests {
         retained_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         // This write puts a flush position AFTER the retained but unhandled frame.
         engine
-            .write(&tid, &make_key("after-inflight-replay"), survivor, 2000)
+            .write(
+                &tid,
+                &make_key("after-inflight-replay"),
+                Arc::new(survivor),
+                2000,
+            )
             .unwrap();
         let (flush_started_tx, flush_started_rx) = mpsc::channel();
         let (flush_done_tx, flush_done_rx) = mpsc::channel();
@@ -24714,7 +24361,7 @@ mod tests {
         use crate::commitlog::{descriptor::HEADER_SIZE, segment::Segment};
         let dir = tempfile::tempdir().unwrap();
         let (schema, tid, mut mutation, survivor) = recovery_admission_fixture();
-        mutation.rows = vec![survivor];
+        mutation.rows = vec![Arc::new(survivor)];
         recovery_admission_seed(dir.path(), &schema, &mutation);
         let config = StorageEngineConfig::test_config(dir.path());
         for extra in 0..8 {
@@ -24750,7 +24397,7 @@ mod tests {
             schema.keyspace.clone(),
             schema.table.clone(),
             make_key("recovery-admission"),
-            vec![survivor.clone(), malformed],
+            vec![Arc::new(survivor.clone()), Arc::new(malformed)],
             1000,
         );
         (schema, table_id(), mutation, survivor)
@@ -24782,7 +24429,7 @@ mod tests {
     fn recovery_admission_clean_recovery_and_pending_handoff() {
         let dir = tempfile::tempdir().unwrap();
         let (schema, tid, mut mutation, survivor) = recovery_admission_fixture();
-        mutation.rows = vec![survivor.clone()];
+        mutation.rows = vec![Arc::new(survivor.clone())];
         // No schema: open returns a caller-owned pending vector.
         let log = CommitLog::new(StorageEngineConfig::test_config(dir.path()).commit_log).unwrap();
         log.append(&mutation).unwrap();
@@ -24800,7 +24447,7 @@ mod tests {
         engine.assert_table_recovery_complete(&tid).unwrap();
         assert_eq!(
             engine.read(&tid, &mutation.key).unwrap().unwrap().rows,
-            vec![survivor]
+            vec![Arc::new(survivor)]
         );
         engine.flush(&tid).unwrap();
         engine.commit_log.shutdown().unwrap();
@@ -24822,7 +24469,7 @@ mod tests {
             assert!(pending.is_empty());
             assert_eq!(
                 engine.read(&tid, &mutation.key).unwrap().unwrap().rows,
-                vec![survivor.clone()]
+                vec![Arc::new(survivor.clone())]
             );
             assert!(engine.assert_table_recovery_complete(&tid).is_err());
             engine.replay_mutations(vec![mutation.clone()]).unwrap();
@@ -24880,7 +24527,7 @@ mod tests {
         assert!(engine.assert_table_recovery_complete(&tid).is_err());
         assert_eq!(
             engine.read(&tid, &mutation.key).unwrap().unwrap().rows,
-            vec![survivor]
+            vec![Arc::new(survivor)]
         );
     }
 
@@ -24937,7 +24584,12 @@ mod tests {
         assert!(!recovery_status::incomplete(dir.path(), &tid).unwrap());
         assert!(engine.assert_table_recovery_complete(&tid).is_err());
         engine
-            .write(&tid, &make_key("new-after-status-failure"), survivor, 2000)
+            .write(
+                &tid,
+                &make_key("new-after-status-failure"),
+                Arc::new(survivor),
+                2000,
+            )
             .unwrap();
         engine.flush(&tid).unwrap();
         let cp = crate::commitlog::checkpoint::CommitLogCheckpoint::load(
@@ -24965,7 +24617,7 @@ mod tests {
         let mut later = mutation.clone();
         later.mutation_id = [42; 16];
         later.key = make_key("later");
-        later.rows = vec![survivor.clone()];
+        later.rows = vec![Arc::new(survivor.clone())];
         assert!(engine
             .replay_mutations(vec![mutation.clone(), later.clone()])
             .is_err());
@@ -24973,7 +24625,7 @@ mod tests {
         assert!(engine.assert_table_recovery_complete(&tid).is_err());
         // A later valid write/flush must not checkpoint past the failed frame.
         engine
-            .write(&tid, &make_key("new"), survivor, 2000)
+            .write(&tid, &make_key("new"), Arc::new(survivor), 2000)
             .unwrap();
         engine.flush(&tid).unwrap();
         let cp = crate::commitlog::checkpoint::CommitLogCheckpoint::load(
@@ -25039,7 +24691,7 @@ mod tests {
         assert!(!report.path.exists());
         assert_eq!(
             engine.read(&tid, &mutation.key).unwrap().unwrap().rows,
-            vec![survivor]
+            vec![Arc::new(survivor)]
         );
         assert!(engine.assert_table_recovery_complete(&tid).is_err());
     }
@@ -25120,7 +24772,9 @@ mod tests {
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1000),
             };
-            engine.write(&tid, &good_key, good_row, 1000).unwrap();
+            engine
+                .write(&tid, &good_key, Arc::new(good_row), 1000)
+                .unwrap();
 
             // Now build a malformed mutation: 8-byte cell where the
             // schema declares UTF8 (variable, fine), but clustering is
@@ -25159,7 +24813,7 @@ mod tests {
                 bad_table_schema.keyspace.clone(),
                 bad_table_schema.table.clone(),
                 bad_key.clone(),
-                vec![bad_row],
+                vec![Arc::new(bad_row)],
                 2000,
             );
             // Bypass Layer 1: append directly to the commit log without
@@ -25248,11 +24902,11 @@ mod tests {
 
         // Create 2 SSTables.
         engine
-            .write(&tid, &make_key("k1"), make_row(b"v1", 1000), 1000)
+            .write(&tid, &make_key("k1"), Arc::new(make_row(b"v1", 1000)), 1000)
             .unwrap();
         engine.flush(&tid).unwrap();
         engine
-            .write(&tid, &make_key("k2"), make_row(b"v2", 2000), 2000)
+            .write(&tid, &make_key("k2"), Arc::new(make_row(b"v2", 2000)), 2000)
             .unwrap();
         engine.flush(&tid).unwrap();
 
@@ -25299,11 +24953,11 @@ mod tests {
 
         // t1 -> gen1, t2 -> gen2. t2 lives ONLY in gen2 (no survivor SSTable).
         engine
-            .write(&tid, &make_key("t1"), make_row(b"v1", 1000), 1000)
+            .write(&tid, &make_key("t1"), Arc::new(make_row(b"v1", 1000)), 1000)
             .unwrap();
         engine.flush(&tid).unwrap();
         engine
-            .write(&tid, &make_key("t2"), make_row(b"v2", 2000), 2000)
+            .write(&tid, &make_key("t2"), Arc::new(make_row(b"v2", 2000)), 2000)
             .unwrap();
         engine.flush(&tid).unwrap();
         assert_eq!(engine.sstable_count(&tid), 2);
@@ -25409,11 +25063,11 @@ mod tests {
         // Each flush SEEDS the gen's reader into the pool, so a later read of t2
         // is a cache hit that consults gen2's in-memory bloom.
         engine
-            .write(&tid, &make_key("t1"), make_row(b"v1", 1000), 1000)
+            .write(&tid, &make_key("t1"), Arc::new(make_row(b"v1", 1000)), 1000)
             .unwrap();
         engine.flush(&tid).unwrap();
         engine
-            .write(&tid, &make_key("t2"), make_row(b"v2", 2000), 2000)
+            .write(&tid, &make_key("t2"), Arc::new(make_row(b"v2", 2000)), 2000)
             .unwrap();
         engine.flush(&tid).unwrap();
         assert_eq!(engine.sstable_count(&tid), 2);
@@ -25529,7 +25183,12 @@ mod tests {
             for i in 0..2_000 {
                 let key = format!("k{batch}-{i:05}");
                 engine
-                    .write(&tid, &make_key(&key), make_row(&value, 1_000), 1_000)
+                    .write(
+                        &tid,
+                        &make_key(&key),
+                        Arc::new(make_row(&value, 1_000)),
+                        1_000,
+                    )
                     .unwrap();
                 expected.insert(make_key(&key));
             }
@@ -25614,11 +25273,11 @@ mod tests {
         // t1 -> gen1, t2 -> gen2. t2 lives ONLY in gen2 (no survivor SSTable).
         // Both use clustering [0,0,0,1] (see make_row).
         engine
-            .write(&tid, &make_key("t1"), make_row(b"v1", 1000), 1000)
+            .write(&tid, &make_key("t1"), Arc::new(make_row(b"v1", 1000)), 1000)
             .unwrap();
         engine.flush(&tid).unwrap();
         engine
-            .write(&tid, &make_key("t2"), make_row(b"v2", 2000), 2000)
+            .write(&tid, &make_key("t2"), Arc::new(make_row(b"v2", 2000)), 2000)
             .unwrap();
         engine.flush(&tid).unwrap();
         assert_eq!(engine.sstable_count(&tid), 2);
@@ -25737,7 +25396,12 @@ mod tests {
             let mut ts = 1i64;
             for (i, k) in keys.iter().enumerate() {
                 engine
-                    .write(&tid, k, make_row(format!("v{i}").as_bytes(), ts), ts)
+                    .write(
+                        &tid,
+                        k,
+                        Arc::new(make_row(format!("v{i}").as_bytes(), ts)),
+                        ts,
+                    )
                     .unwrap();
                 ts += 1;
                 if (i + 1) % flush_every == 0 {
@@ -25784,7 +25448,7 @@ mod tests {
                         .write(
                             &tid,
                             &make_key(&format!("junk{j:010}")),
-                            make_row(b"j", ts),
+                            Arc::new(make_row(b"j", ts)),
                             ts,
                         )
                         .unwrap();
@@ -25964,11 +25628,11 @@ mod tests {
         let tid = table_id();
 
         engine
-            .write(&tid, &make_key("t1"), make_row(b"v1", 1000), 1000)
+            .write(&tid, &make_key("t1"), Arc::new(make_row(b"v1", 1000)), 1000)
             .unwrap();
         engine.flush(&tid).unwrap();
         engine
-            .write(&tid, &make_key("t2"), make_row(b"v2", 2000), 2000)
+            .write(&tid, &make_key("t2"), Arc::new(make_row(b"v2", 2000)), 2000)
             .unwrap();
         engine.flush(&tid).unwrap();
         assert_eq!(engine.sstable_count(&tid), 2);
@@ -26009,7 +25673,7 @@ mod tests {
         let before = engine.commit_log_position();
         let tid = table_id();
         engine
-            .write(&tid, &make_key("k1"), make_row(b"v1", 1000), 1000)
+            .write(&tid, &make_key("k1"), Arc::new(make_row(b"v1", 1000)), 1000)
             .unwrap();
         let after = engine.commit_log_position();
 
@@ -26049,7 +25713,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key(&format!("k{i}")),
-                    make_row(b"value", 1000 + i),
+                    Arc::new(make_row(b"value", 1000 + i)),
                     1000 + i,
                 )
                 .unwrap();
@@ -26116,7 +25780,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key(&format!("k{i}")),
-                    make_row(b"value", 1000 + i),
+                    Arc::new(make_row(b"value", 1000 + i)),
                     1000 + i,
                 )
                 .unwrap();
@@ -26194,7 +25858,7 @@ mod tests {
 
             // Write enough to trigger rotation.
             for i in 0..20 {
-                let _ = engine.write(&tid, &key, row.clone(), i);
+                let _ = engine.write(&tid, &key, Arc::new(row.clone()), i);
             }
 
             // Give the archiver time to process.
@@ -26475,7 +26139,7 @@ mod tests {
             let tid = table_id();
             let key = make_key("k1");
             engine
-                .write(&tid, &key, make_row(b"value", 1000), 1000)
+                .write(&tid, &key, Arc::new(make_row(b"value", 1000)), 1000)
                 .unwrap();
 
             // Create snapshot via injected store.
@@ -26591,18 +26255,23 @@ mod tests {
                 .write(
                     &tid,
                     &make_key("alice"),
-                    make_row(b"before-snap", 1000),
+                    Arc::new(make_row(b"before-snap", 1000)),
                     1000,
                 )
                 .unwrap();
             engine
-                .write(&tid, &make_key("bob"), make_row(b"before-snap", 1001), 1001)
+                .write(
+                    &tid,
+                    &make_key("bob"),
+                    Arc::new(make_row(b"before-snap", 1001)),
+                    1001,
+                )
                 .unwrap();
             engine
                 .write(
                     &tid,
                     &make_key("carol"),
-                    make_row(b"before-snap", 1002),
+                    Arc::new(make_row(b"before-snap", 1002)),
                     1002,
                 )
                 .unwrap();
@@ -26631,10 +26300,20 @@ mod tests {
 
             // ── Phase 2: Write MORE data after snapshot ──────────────
             engine
-                .write(&tid, &make_key("dave"), make_row(b"after-snap", 2000), 2000)
+                .write(
+                    &tid,
+                    &make_key("dave"),
+                    Arc::new(make_row(b"after-snap", 2000)),
+                    2000,
+                )
                 .unwrap();
             engine
-                .write(&tid, &make_key("eve"), make_row(b"after-snap", 2001), 2001)
+                .write(
+                    &tid,
+                    &make_key("eve"),
+                    Arc::new(make_row(b"after-snap", 2001)),
+                    2001,
+                )
                 .unwrap();
 
             // Verify all 5 rows exist in the live engine.
@@ -26728,10 +26407,20 @@ mod tests {
 
             // Write to both tables.
             engine
-                .write(&t1, &make_key("t1-key"), make_row(b"table-one", 100), 100)
+                .write(
+                    &t1,
+                    &make_key("t1-key"),
+                    Arc::new(make_row(b"table-one", 100)),
+                    100,
+                )
                 .unwrap();
             engine
-                .write(&t2, &make_key("t2-key"), make_row(b"table-two", 101), 101)
+                .write(
+                    &t2,
+                    &make_key("t2-key"),
+                    Arc::new(make_row(b"table-two", 101)),
+                    101,
+                )
                 .unwrap();
 
             // Flush both tables.
@@ -26826,7 +26515,7 @@ mod tests {
 
             // Write + flush → SSTable gen 1.
             engine
-                .write(&tid, &make_key("k1"), make_row(b"gen1", 100), 100)
+                .write(&tid, &make_key("k1"), Arc::new(make_row(b"gen1", 100)), 100)
                 .unwrap();
             engine.flush(&tid).unwrap();
 
@@ -26858,7 +26547,7 @@ mod tests {
 
             // Write more data + flush → SSTable gen 2 (new data, same table).
             engine
-                .write(&tid, &make_key("k2"), make_row(b"gen2", 200), 200)
+                .write(&tid, &make_key("k2"), Arc::new(make_row(b"gen2", 200)), 200)
                 .unwrap();
             engine.flush(&tid).unwrap();
 
@@ -26967,7 +26656,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key(&key_str),
-                    make_row(b"batch1", (1_000 + i as i64) * 1_000),
+                    Arc::new(make_row(b"batch1", (1_000 + i as i64) * 1_000)),
                     (1_000 + i as i64) * 1_000,
                 )
                 .unwrap();
@@ -27008,7 +26697,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key(&key_str),
-                    make_row(b"batch2", 2_000_000_000 + i as i64),
+                    Arc::new(make_row(b"batch2", 2_000_000_000 + i as i64)),
                     2_000_000_000 + i as i64,
                 )
                 .unwrap();
@@ -27156,7 +26845,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key(&format!("keep-{i}")),
-                    make_row(b"keep", (1_000 + i as i64) * 1_000),
+                    Arc::new(make_row(b"keep", (1_000 + i as i64) * 1_000)),
                     (1_000 + i as i64) * 1_000,
                 )
                 .unwrap();
@@ -27184,7 +26873,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key(&format!("drop-{i}")),
-                    make_row(b"drop", 2_000_000_000 + i as i64),
+                    Arc::new(make_row(b"drop", 2_000_000_000 + i as i64)),
                     2_000_000_000 + i as i64,
                 )
                 .unwrap();
@@ -27340,7 +27029,7 @@ mod tests {
                     .write(
                         &tid,
                         &make_key(&key_str),
-                        make_row(val_str.as_bytes(), i),
+                        Arc::new(make_row(val_str.as_bytes(), i)),
                         i,
                     )
                     .unwrap();
@@ -27411,7 +27100,7 @@ mod tests {
 
             // Write data so the manifest is non-empty.
             engine
-                .write(&tid, &make_key("k"), make_row(b"v", 1), 1)
+                .write(&tid, &make_key("k"), Arc::new(make_row(b"v", 1)), 1)
                 .unwrap();
             engine.flush(&tid).unwrap();
             engine
@@ -27467,7 +27156,7 @@ mod tests {
             engine.register_table(test_schema()).unwrap();
             let tid = table_id();
             engine
-                .write(&tid, &make_key("k"), make_row(b"v", 1), 1)
+                .write(&tid, &make_key("k"), Arc::new(make_row(b"v", 1)), 1)
                 .unwrap();
             engine.flush(&tid).unwrap();
             engine
@@ -27593,7 +27282,12 @@ mod tests {
             .unwrap();
         let tid = table_id();
         engine
-            .write(&tid, &make_key("user1"), make_row(b"alice", 1000), 1000)
+            .write(
+                &tid,
+                &make_key("user1"),
+                Arc::new(make_row(b"alice", 1000)),
+                1000,
+            )
             .unwrap();
 
         engine.flush(&tid).unwrap();
@@ -27641,7 +27335,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key(&format!("user{i}")),
-                    make_row(b"alice", 1000),
+                    Arc::new(make_row(b"alice", 1000)),
                     1000,
                 )
                 .unwrap();
@@ -27702,7 +27396,7 @@ mod tests {
             .write(
                 &tid,
                 &make_key("doc0"),
-                make_row(b"ferrosarotationprobe one", 1000),
+                Arc::new(make_row(b"ferrosarotationprobe one", 1000)),
                 1000,
             )
             .unwrap();
@@ -27734,10 +27428,20 @@ mod tests {
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };
         engine
-            .write(&tid, &make_key("k0"), vector_row(&[1.0, 0.0, 0.0]), 1000)
+            .write(
+                &tid,
+                &make_key("k0"),
+                Arc::new(vector_row(&[1.0, 0.0, 0.0])),
+                1000,
+            )
             .unwrap();
         engine
-            .write(&tid, &make_key("k1"), vector_row(&[0.0, 1.0, 0.0]), 1000)
+            .write(
+                &tid,
+                &make_key("k1"),
+                Arc::new(vector_row(&[0.0, 1.0, 0.0])),
+                1000,
+            )
             .unwrap();
         engine.add_vector_index(&tid, "vec_idx", 0, 3).unwrap();
 
@@ -27791,7 +27495,7 @@ mod tests {
             .write(
                 &TableId::new("system_schema", "indexes"),
                 &row.key,
-                row.row,
+                Arc::new(row.row),
                 now_micros_for_test(),
             )
             .unwrap();
@@ -27807,7 +27511,12 @@ mod tests {
         persist_vector_index_row(&engine, "vec_idx");
         for (key, vector) in rows {
             engine
-                .write(&tid, &make_key(key), vector_test_row(vector), 1000)
+                .write(
+                    &tid,
+                    &make_key(key),
+                    Arc::new(vector_test_row(vector)),
+                    1000,
+                )
                 .unwrap();
         }
         engine.flush(&tid).unwrap();
@@ -27922,7 +27631,12 @@ mod tests {
         for batch in batches {
             for (key, vector) in *batch {
                 engine
-                    .write(&tid, &make_key(key), vector_test_row(vector), 1000)
+                    .write(
+                        &tid,
+                        &make_key(key),
+                        Arc::new(vector_test_row(vector)),
+                        1000,
+                    )
                     .unwrap();
             }
             engine.flush(&tid).unwrap();
@@ -28032,7 +27746,12 @@ mod tests {
         );
         for (key, vector) in [("k6", [0.5, 0.5, 0.0]), ("k7", [0.0, 0.5, 0.5])] {
             engine
-                .write(&table_id(), &make_key(key), vector_test_row(&vector), 1000)
+                .write(
+                    &table_id(),
+                    &make_key(key),
+                    Arc::new(vector_test_row(&vector)),
+                    1000,
+                )
                 .unwrap();
         }
         engine.flush(&table_id()).unwrap();
@@ -28094,7 +27813,7 @@ mod tests {
                 .write(
                     &table_id(),
                     &make_key("k0"),
-                    vector_test_row(&[1.0, 0.0, 0.0]),
+                    Arc::new(vector_test_row(&[1.0, 0.0, 0.0])),
                     1000,
                 )
                 .unwrap();
@@ -28399,7 +28118,7 @@ mod tests {
                     key: make_key(&format!("before-panic-{i}")),
                     deletion: DeletionTime::LIVE,
                     static_row: None,
-                    rows: vec![make_row(b"v", 1)],
+                    rows: vec![Arc::new(make_row(b"v", 1))],
                 };
                 assert!(visit(partition).is_continue());
             });
@@ -28453,7 +28172,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key(&format!("user{i}")),
-                    make_row(b"alice", 1000),
+                    Arc::new(make_row(b"alice", 1000)),
                     1000,
                 )
                 .unwrap();
@@ -28541,7 +28260,12 @@ mod tests {
                 .unwrap();
 
             engine
-                .write(&tid, &make_key("user1"), make_row(b"alice", 1000), 1000)
+                .write(
+                    &tid,
+                    &make_key("user1"),
+                    Arc::new(make_row(b"alice", 1000)),
+                    1000,
+                )
                 .unwrap();
             engine.flush(&tid).unwrap();
 
@@ -28577,6 +28301,29 @@ mod tests {
     }
 
     // ── read_by_index_in_partition (t_430c4188) ──────────────────────────────
+
+    /// A keyed index read's partitions, collected — test-only.
+    fn keyed_hits(
+        engine: &StorageEngine,
+        table_id: &TableId,
+        index_name: &str,
+        key: &ferrosa_index::IndexKey,
+        partition_key: &[u8],
+    ) -> ferrosa_common::Result<Vec<Partition>> {
+        let mut hits = Vec::new();
+        engine.read_by_index_in_partition_each_after(
+            table_id,
+            index_name,
+            key,
+            partition_key,
+            None,
+            &mut |partition| {
+                hits.push(partition);
+                std::ops::ControlFlow::Continue(())
+            },
+        )?;
+        Ok(hits)
+    }
     //
     // Keyed secondary-index consult: postings for the indexed value are
     // restricted to ONE specified partition, so a full-partition-key +
@@ -28609,22 +28356,47 @@ mod tests {
         // index layers. p1 also holds non-matching rows, and p2 holds a
         // matching row that must NOT leak into the p1 result.
         engine
-            .write(&tid, &make_key("p1"), row_ck(1, b"alice", 1000), 1000)
+            .write(
+                &tid,
+                &make_key("p1"),
+                Arc::new(row_ck(1, b"alice", 1000)),
+                1000,
+            )
             .unwrap();
         engine
-            .write(&tid, &make_key("p2"), row_ck(1, b"alice", 1001), 1001)
+            .write(
+                &tid,
+                &make_key("p2"),
+                Arc::new(row_ck(1, b"alice", 1001)),
+                1001,
+            )
             .unwrap();
         engine.flush(&tid).unwrap();
         engine
-            .write(&tid, &make_key("p1"), row_ck(2, b"bob", 1002), 1002)
+            .write(
+                &tid,
+                &make_key("p1"),
+                Arc::new(row_ck(2, b"bob", 1002)),
+                1002,
+            )
             .unwrap();
         engine
-            .write(&tid, &make_key("p1"), row_ck(3, b"alice", 1003), 1003)
+            .write(
+                &tid,
+                &make_key("p1"),
+                Arc::new(row_ck(3, b"alice", 1003)),
+                1003,
+            )
             .unwrap();
 
-        let hits = engine
-            .read_by_index_in_partition(&tid, "val_idx", &IndexKey(b"alice".to_vec()), b"p1")
-            .unwrap();
+        let hits = keyed_hits(
+            &engine,
+            &tid,
+            "val_idx",
+            &IndexKey(b"alice".to_vec()),
+            b"p1",
+        )
+        .unwrap();
 
         assert!(
             hits.iter().all(|p| p.key.key.as_bytes() == b"p1"),
@@ -28663,19 +28435,34 @@ mod tests {
             .register_table_with_indexes(test_schema(), vec![("val_idx".to_string(), 0_usize)])
             .unwrap();
         engine
-            .write(&tid, &make_key("p1"), row_ck(1, b"alice", 1000), 1000)
+            .write(
+                &tid,
+                &make_key("p1"),
+                Arc::new(row_ck(1, b"alice", 1000)),
+                1000,
+            )
             .unwrap();
 
         // Value exists but not in the requested partition.
-        let hits = engine
-            .read_by_index_in_partition(&tid, "val_idx", &IndexKey(b"alice".to_vec()), b"p9")
-            .unwrap();
+        let hits = keyed_hits(
+            &engine,
+            &tid,
+            "val_idx",
+            &IndexKey(b"alice".to_vec()),
+            b"p9",
+        )
+        .unwrap();
         assert!(hits.is_empty(), "no matches in partition → empty result");
 
         // Value absent everywhere.
-        let hits = engine
-            .read_by_index_in_partition(&tid, "val_idx", &IndexKey(b"nobody".to_vec()), b"p1")
-            .unwrap();
+        let hits = keyed_hits(
+            &engine,
+            &tid,
+            "val_idx",
+            &IndexKey(b"nobody".to_vec()),
+            b"p1",
+        )
+        .unwrap();
         assert!(hits.is_empty(), "absent value → empty result");
 
         let mut visitor = |_partition| std::ops::ControlFlow::Continue(());
@@ -28691,7 +28478,8 @@ mod tests {
         );
 
         // Unknown table fails loud (mirrors read_by_index).
-        let err = engine.read_by_index_in_partition(
+        let err = keyed_hits(
+            &engine,
             &TableId::new("nope", "nope"),
             "val_idx",
             &IndexKey(b"alice".to_vec()),
@@ -28720,14 +28508,14 @@ mod tests {
         // test_schema has ONE clustering column (ck: int, big-endian bytes).
         // Two rows with ck=7 in different partitions + one non-matching row.
         engine
-            .write(&tid, &make_key("p1"), row_ck(7, b"a", 1000), 1000)
+            .write(&tid, &make_key("p1"), Arc::new(row_ck(7, b"a", 1000)), 1000)
             .unwrap();
         engine
-            .write(&tid, &make_key("p2"), row_ck(7, b"b", 1001), 1001)
+            .write(&tid, &make_key("p2"), Arc::new(row_ck(7, b"b", 1001)), 1001)
             .unwrap();
         engine.flush(&tid).unwrap(); // ck=7 entries now live in the SIDECAR
         engine
-            .write(&tid, &make_key("p1"), row_ck(9, b"c", 1002), 1002)
+            .write(&tid, &make_key("p1"), Arc::new(row_ck(9, b"c", 1002)), 1002)
             .unwrap(); // ck=9 stays in the MEMTABLE index
 
         let key7 = IndexKey(7_i32.to_be_bytes().to_vec());
@@ -28746,18 +28534,14 @@ mod tests {
         );
 
         // Keyed consult restricted to p1 returns only p1's ck=7 row.
-        let keyed = engine
-            .read_by_index_in_partition(&tid, "ck_idx", &key7, b"p1")
-            .unwrap();
+        let keyed = keyed_hits(&engine, &tid, "ck_idx", &key7, b"p1").unwrap();
         assert_eq!(keyed.len(), 1, "one matching row in p1");
         assert_eq!(keyed[0].key.key.as_bytes(), b"p1");
         assert_eq!(keyed[0].rows[0].clustering, 7_i32.to_be_bytes().to_vec());
 
         // Memtable layer: the post-flush ck=9 write is indexed too.
         let key9 = IndexKey(9_i32.to_be_bytes().to_vec());
-        let keyed9 = engine
-            .read_by_index_in_partition(&tid, "ck_idx", &key9, b"p1")
-            .unwrap();
+        let keyed9 = keyed_hits(&engine, &tid, "ck_idx", &key9, b"p1").unwrap();
         assert_eq!(keyed9.len(), 1, "memtable-resident clustering entry found");
         assert_eq!(keyed9[0].rows[0].clustering, 9_i32.to_be_bytes().to_vec());
     }
@@ -28817,7 +28601,12 @@ mod tests {
                 primary_key_liveness: LivenessInfo::with_timestamp(1000),
             };
             engine
-                .write(&tid, &make_entity_store_pk(tenant, session), row, 1000)
+                .write(
+                    &tid,
+                    &make_entity_store_pk(tenant, session),
+                    Arc::new(row),
+                    1000,
+                )
                 .unwrap();
         }
         engine.flush(&tid).unwrap();
@@ -28913,7 +28702,12 @@ mod tests {
                 primary_key_liveness: LivenessInfo::with_timestamp(1000),
             };
             engine
-                .write(&tid, &make_entity_store_pk(tenant, session), row, 1000)
+                .write(
+                    &tid,
+                    &make_entity_store_pk(tenant, session),
+                    Arc::new(row),
+                    1000,
+                )
                 .unwrap();
         }
         engine.flush(&tid).unwrap();
@@ -29036,7 +28830,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key(&format!("k{i}")),
-                    make_row(b"v", 1000),
+                    Arc::new(make_row(b"v", 1000)),
                     1000,
                 )
                 .unwrap();
@@ -29117,7 +28911,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key(&format!("k{i}")),
-                    make_row(b"v", 1000),
+                    Arc::new(make_row(b"v", 1000)),
                     1000,
                 )
                 .unwrap();
@@ -29152,7 +28946,7 @@ mod tests {
         engine.register_table(test_schema()).unwrap();
         let tid = table_id();
         engine
-            .write(&tid, &make_key("k0"), make_row(b"v", 1000), 1000)
+            .write(&tid, &make_key("k0"), Arc::new(make_row(b"v", 1000)), 1000)
             .unwrap();
         engine.flush(&tid).unwrap();
 
@@ -29201,7 +28995,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key(&format!("k{i}")),
-                    make_row(b"v", 1000),
+                    Arc::new(make_row(b"v", 1000)),
                     1000,
                 )
                 .unwrap();
@@ -29268,7 +29062,7 @@ mod tests {
         let tid = table_id();
         let flush_key = |name: &str| {
             engine
-                .write(&tid, &make_key(name), make_row(b"v", 1000), 1000)
+                .write(&tid, &make_key(name), Arc::new(make_row(b"v", 1000)), 1000)
                 .unwrap();
             engine.flush(&tid).unwrap();
         };
@@ -29404,7 +29198,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key(&format!("k{i}")),
-                    make_row(b"shared", 1000),
+                    Arc::new(make_row(b"shared", 1000)),
                     1000,
                 )
                 .unwrap();
@@ -29458,7 +29252,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key(&format!("k{i}")),
-                    make_row(b"shared", 1000),
+                    Arc::new(make_row(b"shared", 1000)),
                     1000,
                 )
                 .unwrap();
@@ -29507,7 +29301,12 @@ mod tests {
             .add_index(&tid, "val_idx", 0, ferrosa_index::IndexType::BTree)
             .unwrap();
         engine
-            .write(&tid, &make_key("present"), make_row(b"shared", 1000), 1000)
+            .write(
+                &tid,
+                &make_key("present"),
+                Arc::new(make_row(b"shared", 1000)),
+                1000,
+            )
             .unwrap();
         engine.index_tracker.mark_pending(
             tid.keyspace(),
@@ -29572,7 +29371,12 @@ mod tests {
             for batch in [["k0", "k1"], ["k2", "k3"], ["k4", "k5"]] {
                 for key in batch {
                     engine
-                        .write(&tid, &make_key(key), make_row(b"shared", 1000), 1000)
+                        .write(
+                            &tid,
+                            &make_key(key),
+                            Arc::new(make_row(b"shared", 1000)),
+                            1000,
+                        )
                         .unwrap();
                 }
                 if batch[0] != "k4" {
@@ -29643,7 +29447,12 @@ mod tests {
         let tid = table_id();
         for key in ["k0", "k1", "k2"] {
             engine
-                .write(&tid, &make_key(key), make_row(b"shared", 1000), 1000)
+                .write(
+                    &tid,
+                    &make_key(key),
+                    Arc::new(make_row(b"shared", 1000)),
+                    1000,
+                )
                 .unwrap();
         }
         engine.flush(&tid).unwrap();
@@ -29752,7 +29561,7 @@ mod tests {
             .write(
                 &tid,
                 &make_key("g1|s1"),
-                graph_triple_row("p", "shared"),
+                Arc::new(graph_triple_row("p", "shared")),
                 1000,
             )
             .unwrap();
@@ -29760,7 +29569,7 @@ mod tests {
             .write(
                 &tid,
                 &make_key("g1|s1"),
-                graph_triple_row("q", "shared"),
+                Arc::new(graph_triple_row("q", "shared")),
                 1001,
             )
             .unwrap();
@@ -29768,7 +29577,7 @@ mod tests {
             .write(
                 &tid,
                 &make_key("g1|s2"),
-                graph_triple_row("p", "shared"),
+                Arc::new(graph_triple_row("p", "shared")),
                 1002,
             )
             .unwrap();
@@ -29942,7 +29751,12 @@ mod tests {
             )
             .unwrap();
         engine
-            .write(&tid, &make_key("k0"), make_row(b"active", 1000), 1000)
+            .write(
+                &tid,
+                &make_key("k0"),
+                Arc::new(make_row(b"active", 1000)),
+                1000,
+            )
             .unwrap();
         engine.flush(&tid).unwrap();
         let state = engine.table_state(&tid).unwrap();
@@ -30012,7 +29826,7 @@ mod tests {
         let tid = table_id();
         for name in ["live0", "live1", "live2", "dead"] {
             engine
-                .write(&tid, &make_key(name), make_row(b"v", 1000), 1000)
+                .write(&tid, &make_key(name), Arc::new(make_row(b"v", 1000)), 1000)
                 .unwrap();
         }
         engine.flush(&tid).unwrap();
@@ -30020,7 +29834,7 @@ mod tests {
             .write(
                 &tid,
                 &make_key("dead"),
-                partition_delete_row(2000, tombstone_ldt),
+                Arc::new(partition_delete_row(2000, tombstone_ldt)),
                 2000,
             )
             .unwrap();
@@ -30029,7 +29843,7 @@ mod tests {
         if let Some(ts) = unflushed_older_write_ts {
             // Sits in the memtable, unflushed, older than the tombstone.
             engine
-                .write(&tid, &make_key("late"), make_row(b"v", ts), ts)
+                .write(&tid, &make_key("late"), Arc::new(make_row(b"v", ts)), ts)
                 .unwrap();
         }
 
@@ -30074,7 +29888,7 @@ mod tests {
                 primary_key_liveness: LivenessInfo::with_timestamp(1_000 + i),
             };
             engine
-                .write(&tid, &make_key(&i.to_string()), row, 1_000 + i)
+                .write(&tid, &make_key(&i.to_string()), Arc::new(row), 1_000 + i)
                 .unwrap();
             if i % 1_000 == 999 {
                 engine.flush(&tid).unwrap();
@@ -30090,7 +29904,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key(&i.to_string()),
-                    partition_delete_row(ts, now),
+                    Arc::new(partition_delete_row(ts, now)),
                     ts,
                 )
                 .unwrap();
@@ -30191,7 +30005,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key(&format!("a{i}")),
-                    make_row(b"shared", 1000),
+                    Arc::new(make_row(b"shared", 1000)),
                     1000,
                 )
                 .unwrap();
@@ -30202,7 +30016,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key(&format!("b{i}")),
-                    make_row(b"shared", 2000),
+                    Arc::new(make_row(b"shared", 2000)),
                     2000,
                 )
                 .unwrap();
@@ -30283,7 +30097,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key(&format!("k{i}")),
-                    make_row(b"shared", 1000),
+                    Arc::new(make_row(b"shared", 1000)),
                     1000,
                 )
                 .unwrap();
@@ -30351,7 +30165,12 @@ mod tests {
                 .unwrap();
             let row = persistence::index_to_rows(&idx_meta);
             engine
-                .write(&indexes_tid, &row.key, row.row, now_micros_for_test())
+                .write(
+                    &indexes_tid,
+                    &row.key,
+                    Arc::new(row.row),
+                    now_micros_for_test(),
+                )
                 .unwrap();
 
             for i in 0..8u8 {
@@ -30369,7 +30188,12 @@ mod tests {
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
                 };
                 engine
-                    .write(&tid, &make_entity_store_pk(tenant, session), row, 1000)
+                    .write(
+                        &tid,
+                        &make_entity_store_pk(tenant, session),
+                        Arc::new(row),
+                        1000,
+                    )
                     .unwrap();
             }
             engine.flush(&tid).unwrap();
@@ -30460,15 +30284,21 @@ mod tests {
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1000),
             };
-            engine.write(&tid, &make_key(pk), row, 1000).unwrap();
+            engine
+                .write(&tid, &make_key(pk), Arc::new(row), 1000)
+                .unwrap();
         }
 
         let ranges: Vec<(u64, u64)> = cover_radius(37.7955, -122.3937, 3000.0, DEFAULT_COVER_LEVEL)
             .iter()
             .map(|r| (r.start, r.end))
             .collect();
-        let partitions = engine
-            .read_by_index_cell_ranges(&tid, "loc_geo", &ranges)
+        let mut partitions = Vec::new();
+        engine
+            .read_by_index_cell_ranges_each(&tid, "loc_geo", &ranges, &mut |partition| {
+                partitions.push(partition);
+                std::ops::ControlFlow::Continue(())
+            })
             .unwrap();
         // The two SF points are inside the 3km cover; NYC is far away.
         assert!(
@@ -30487,14 +30317,25 @@ mod tests {
     }
 
     #[test]
-    fn engine_read_by_index_cell_ranges_unknown_table_is_empty() {
+    fn engine_read_by_index_cell_ranges_unknown_table_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let config = StorageEngineConfig::test_config(dir.path());
         let engine = StorageEngine::new(config, None).unwrap();
-        let result = engine
-            .read_by_index_cell_ranges(&TableId::new("nope", "nope"), "idx", &[(0, u64::MAX)])
-            .unwrap();
-        assert!(result.is_empty());
+        let mut visited = 0;
+        let result = engine.read_by_index_cell_ranges_each(
+            &TableId::new("nope", "nope"),
+            "idx",
+            &[(0, u64::MAX)],
+            &mut |_| {
+                visited += 1;
+                std::ops::ControlFlow::Continue(())
+            },
+        );
+        assert!(
+            result.is_err(),
+            "an unregistered table must be refused, not answered with no points"
+        );
+        assert_eq!(visited, 0);
         engine.shutdown().unwrap();
     }
 
@@ -30541,12 +30382,12 @@ mod tests {
                     token: Token(1),
                     key: PartitionKey::new(b"pk1".to_vec()),
                 },
-                rows: vec![Row {
+                rows: vec![Arc::new(Row {
                     clustering: vec![],
                     cells: vec![(0, CellValue::live(b"val_a".to_vec(), 100))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(100),
-                }],
+                })],
                 timestamp: 100,
             },
             Mutation {
@@ -30557,12 +30398,12 @@ mod tests {
                     token: Token(2),
                     key: PartitionKey::new(b"pk2".to_vec()),
                 },
-                rows: vec![Row {
+                rows: vec![Arc::new(Row {
                     clustering: vec![],
                     cells: vec![(0, CellValue::live(b"val_b".to_vec(), 100))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(100),
-                }],
+                })],
                 timestamp: 100,
             },
         ];
@@ -30622,12 +30463,12 @@ mod tests {
                 token: Token(ts),
                 key: PartitionKey::new(pk.to_vec()),
             },
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![],
                 cells: vec![(0, CellValue::live(value.to_vec(), ts))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(ts),
-            }],
+            })],
             timestamp: ts,
         }
     }
@@ -30966,7 +30807,7 @@ mod tests {
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
             primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1000),
         };
-        engine.write(&tid, &key, row, 1000).unwrap();
+        engine.write(&tid, &key, Arc::new(row), 1000).unwrap();
 
         // Read from memtable — should work
         let memtable_result = engine.read(&tid, &key);
@@ -31039,7 +30880,7 @@ mod tests {
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
             primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1000),
         };
-        engine.write(&tid, &key, row, 1000).unwrap();
+        engine.write(&tid, &key, Arc::new(row), 1000).unwrap();
         engine.flush_all().unwrap();
 
         // Corrupt: truncate the Data.db file to 1 byte
@@ -31104,7 +30945,7 @@ mod tests {
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
             primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1000),
         };
-        engine.write(&tid, &key, row, 1000).unwrap();
+        engine.write(&tid, &key, Arc::new(row), 1000).unwrap();
         engine.flush_all().unwrap();
 
         // Corrupt: zero out the Data.db file
@@ -31167,7 +31008,7 @@ mod tests {
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
             primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1000),
         };
-        engine.write(&tid, &key1, row1, 1000).unwrap();
+        engine.write(&tid, &key1, Arc::new(row1), 1000).unwrap();
         engine.flush_all().unwrap();
 
         // "ALTER TABLE ADD" — propagate the post-ALTER schema to the storage
@@ -31195,7 +31036,7 @@ mod tests {
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
             primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(2000),
         };
-        engine.write(&tid, &key2, row2, 2000).unwrap();
+        engine.write(&tid, &key2, Arc::new(row2), 2000).unwrap();
         engine.flush_all().unwrap();
 
         // Read both rows — old SSTable should not crash
@@ -31248,7 +31089,7 @@ mod tests {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };
-        engine.write(&tid, &key, row, 1000).unwrap();
+        engine.write(&tid, &key, Arc::new(row), 1000).unwrap();
 
         let post_alter = ferrosa_common::TableSchema {
             keyspace: "test_ks".into(),
@@ -31356,7 +31197,7 @@ mod tests {
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
             primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1000),
         };
-        engine.write(&tid, &key_old, row, 1000).unwrap();
+        engine.write(&tid, &key_old, Arc::new(row), 1000).unwrap();
         engine.flush_all().unwrap();
 
         // Corrupt the SSTable
@@ -31378,7 +31219,7 @@ mod tests {
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
             primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(2000),
         };
-        engine.write(&tid, &key_new, row, 2000).unwrap();
+        engine.write(&tid, &key_new, Arc::new(row), 2000).unwrap();
 
         // Read new data from memtable — must still work despite the corrupt
         // SSTable (the key is resolvable from a healthy source).
@@ -31448,13 +31289,13 @@ mod tests {
 
         // Flush 1: write k1 → SSTable #1.
         engine
-            .write(&tid, &make_key("k1"), make_row(b"v1", 1000), 1000)
+            .write(&tid, &make_key("k1"), Arc::new(make_row(b"v1", 1000)), 1000)
             .unwrap();
         engine.flush(&tid).unwrap();
 
         // Flush 2: write k2 → SSTable #2.
         engine
-            .write(&tid, &make_key("k2"), make_row(b"v2", 2000), 2000)
+            .write(&tid, &make_key("k2"), Arc::new(make_row(b"v2", 2000)), 2000)
             .unwrap();
         engine.flush(&tid).unwrap();
 
@@ -31893,11 +31734,11 @@ mod tests {
 
         // Flush 2 SSTables.
         engine
-            .write(&tid, &make_key("k1"), make_row(b"v1", 1000), 1000)
+            .write(&tid, &make_key("k1"), Arc::new(make_row(b"v1", 1000)), 1000)
             .unwrap();
         engine.flush(&tid).unwrap();
         engine
-            .write(&tid, &make_key("k2"), make_row(b"v2", 2000), 2000)
+            .write(&tid, &make_key("k2"), Arc::new(make_row(b"v2", 2000)), 2000)
             .unwrap();
         engine.flush(&tid).unwrap();
 
@@ -31920,7 +31761,7 @@ mod tests {
 
         // Write a third row for the concurrent flush.
         engine
-            .write(&tid, &make_key("k3"), make_row(b"v3", 3000), 3000)
+            .write(&tid, &make_key("k3"), Arc::new(make_row(b"v3", 3000)), 3000)
             .unwrap();
 
         // Wait for compaction to finish, on the deterministic completion
@@ -33145,10 +32986,20 @@ mod tests {
         // (which would make the executor keep one unpurged partition instead
         // -- `compaction_purge_held_back_total`).
         engine
-            .write(&tid, &make_key("live"), make_row(b"v", 1000), 1000)
+            .write(
+                &tid,
+                &make_key("live"),
+                Arc::new(make_row(b"v", 1000)),
+                1000,
+            )
             .unwrap();
         engine
-            .write(&tid, &make_key("dead"), make_row(b"v", 1000), 1000)
+            .write(
+                &tid,
+                &make_key("dead"),
+                Arc::new(make_row(b"v", 1000)),
+                1000,
+            )
             .unwrap();
         engine.flush(&tid).unwrap();
 
@@ -33159,7 +33010,7 @@ mod tests {
             .write(
                 &tid,
                 &make_key("dead"),
-                partition_delete_row(2000, LONG_AGO_LDT),
+                Arc::new(partition_delete_row(2000, LONG_AGO_LDT)),
                 2000,
             )
             .unwrap();
@@ -33653,7 +33504,7 @@ mod tests {
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
             primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1000),
         };
-        engine.write(&tid, &k1, row1, 1000).unwrap();
+        engine.write(&tid, &k1, Arc::new(row1), 1000).unwrap();
         engine.flush(&tid).unwrap();
 
         // Flush 2: row with int cell.
@@ -33665,7 +33516,7 @@ mod tests {
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
             primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(2000),
         };
-        engine.write(&tid, &k2, row2, 2000).unwrap();
+        engine.write(&tid, &k2, Arc::new(row2), 2000).unwrap();
         engine.flush(&tid).unwrap();
 
         // ── Step 2: compact and upload to MinIO ──
@@ -33999,7 +33850,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key(key_suffix),
-                    make_row(value.as_bytes(), ts),
+                    Arc::new(make_row(value.as_bytes(), ts)),
                     ts,
                 )
                 .unwrap();
@@ -34323,7 +34174,7 @@ mod tests {
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
             primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1000),
         };
-        engine.write(&tid, &key, row, 1000).unwrap();
+        engine.write(&tid, &key, Arc::new(row), 1000).unwrap();
 
         engine.flush(&tid).unwrap();
         assert_eq!(
@@ -34371,7 +34222,7 @@ mod tests {
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
             primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(2000),
         };
-        engine.write(&tid, &key, row, 2000).unwrap();
+        engine.write(&tid, &key, Arc::new(row), 2000).unwrap();
 
         engine.flush(&tid).unwrap();
         assert_eq!(
@@ -34419,7 +34270,7 @@ mod tests {
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
             primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(3000),
         };
-        engine.write(&tid, &key, row, 3000).unwrap();
+        engine.write(&tid, &key, Arc::new(row), 3000).unwrap();
 
         engine.flush(&tid).unwrap();
         assert_eq!(
@@ -34464,14 +34315,14 @@ mod tests {
             .write(
                 &tid,
                 &key,
-                Row {
+                Arc::new(Row {
                     clustering: vec![],
                     cells: vec![(0, CellValue::live(baseline, 1_000))],
                     deletion: ferrosa_sstable::types::DeletionTime::LIVE,
                     primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
                         1_000,
                     ),
-                },
+                }),
                 1_000,
             )
             .unwrap();
@@ -34480,7 +34331,7 @@ mod tests {
             .write(
                 &tid,
                 &key,
-                Row {
+                Arc::new(Row {
                     clustering: vec![],
                     cells: vec![(
                         0,
@@ -34491,7 +34342,7 @@ mod tests {
                     primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
                         2_000,
                     ),
-                },
+                }),
                 2_000,
             )
             .unwrap();
@@ -34538,14 +34389,14 @@ mod tests {
             .write(
                 &set_tid,
                 &set_key,
-                Row {
+                Arc::new(Row {
                     clustering: vec![],
                     cells: vec![(0, CellValue::live(encode_cql_sequence(&[b"alpha"]), 1_000))],
                     deletion: ferrosa_sstable::types::DeletionTime::LIVE,
                     primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
                         1_000,
                     ),
-                },
+                }),
                 1_000,
             )
             .unwrap();
@@ -34553,7 +34404,7 @@ mod tests {
             .write(
                 &set_tid,
                 &set_key,
-                Row {
+                Arc::new(Row {
                     clustering: vec![],
                     cells: vec![(
                         0,
@@ -34563,7 +34414,7 @@ mod tests {
                     primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
                         2_000,
                     ),
-                },
+                }),
                 2_000,
             )
             .unwrap();
@@ -34601,7 +34452,7 @@ mod tests {
             .write(
                 &map_tid,
                 &map_key,
-                Row {
+                Arc::new(Row {
                     clustering: vec![],
                     cells: vec![(
                         0,
@@ -34611,7 +34462,7 @@ mod tests {
                     primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
                         1_000,
                     ),
-                },
+                }),
                 1_000,
             )
             .unwrap();
@@ -34619,7 +34470,7 @@ mod tests {
             .write(
                 &map_tid,
                 &map_key,
-                Row {
+                Arc::new(Row {
                     clustering: vec![],
                     cells: vec![(
                         0,
@@ -34630,7 +34481,7 @@ mod tests {
                     primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
                         2_000,
                     ),
-                },
+                }),
                 2_000,
             )
             .unwrap();
@@ -34774,7 +34625,12 @@ mod tests {
             // Persist the index row exactly as the DDL write path does.
             let row = persistence::index_to_rows(&idx_meta);
             engine
-                .write(&indexes_tid, &row.key, row.row, now_micros_for_test())
+                .write(
+                    &indexes_tid,
+                    &row.key,
+                    Arc::new(row.row),
+                    now_micros_for_test(),
+                )
                 .unwrap();
 
             engine.flush(&user_tid).unwrap();
@@ -34832,7 +34688,7 @@ mod tests {
             .write(
                 &TableId::new("system_schema", "indexes"),
                 &row.key,
-                row.row,
+                Arc::new(row.row),
                 now_micros_for_test(),
             )
             .unwrap();
@@ -34853,7 +34709,7 @@ mod tests {
 
         let key = make_key("pk");
         engine
-            .write(&table_id, &key, make_row(b"indexed", 1000), 1000)
+            .write(&table_id, &key, Arc::new(make_row(b"indexed", 1000)), 1000)
             .unwrap();
         assert_eq!(
             collect_index_results(
@@ -34913,7 +34769,12 @@ mod tests {
             .add_index(&table_id, "val_idx", 0, IndexType::BTree)
             .unwrap();
         engine
-            .write(&table_id, &make_key("pk"), make_row(b"indexed", 1000), 1000)
+            .write(
+                &table_id,
+                &make_key("pk"),
+                Arc::new(make_row(b"indexed", 1000)),
+                1000,
+            )
             .unwrap();
         assert_eq!(
             collect_index_results(
@@ -34961,7 +34822,7 @@ mod tests {
 
         let key = make_key("pk");
         engine
-            .write(&table_id, &key, make_row(b"John", 1000), 1000)
+            .write(&table_id, &key, Arc::new(make_row(b"John", 1000)), 1000)
             .unwrap();
         engine
             .add_index(&table_id, "name_idx", 0, IndexType::Phonetic)
@@ -35003,7 +34864,12 @@ mod tests {
             .add_index(&table_id, "name_idx", 0, IndexType::Phonetic)
             .unwrap();
         engine
-            .write(&table_id, &make_key("pk"), make_row(b"John", 1000), 1000)
+            .write(
+                &table_id,
+                &make_key("pk"),
+                Arc::new(make_row(b"John", 1000)),
+                1000,
+            )
             .unwrap();
 
         // Model the state a concurrent registration built after its initial
@@ -35322,7 +35188,12 @@ mod tests {
             .add_index(&table_id, "val_idx", 0, IndexType::BTree)
             .unwrap();
         engine
-            .write(&table_id, &make_key("pk"), make_row(b"indexed", 1000), 1000)
+            .write(
+                &table_id,
+                &make_key("pk"),
+                Arc::new(make_row(b"indexed", 1000)),
+                1000,
+            )
             .unwrap();
         engine.flush(&table_id).unwrap();
         engine
@@ -35398,7 +35269,12 @@ mod tests {
             .add_index(&table_id, "val_idx", 0, IndexType::BTree)
             .unwrap();
         engine
-            .write(&table_id, &make_key("pk"), make_row(b"indexed", 1000), 1000)
+            .write(
+                &table_id,
+                &make_key("pk"),
+                Arc::new(make_row(b"indexed", 1000)),
+                1000,
+            )
             .unwrap();
         engine.flush(&table_id).unwrap();
 
@@ -35459,7 +35335,12 @@ mod tests {
                 .add_index(&table_id, "val_idx", 0, IndexType::BTree)
                 .unwrap();
             engine
-                .write(&table_id, &make_key("pk"), make_row(b"indexed", 1000), 1000)
+                .write(
+                    &table_id,
+                    &make_key("pk"),
+                    Arc::new(make_row(b"indexed", 1000)),
+                    1000,
+                )
                 .unwrap();
             engine.flush(&table_id).unwrap();
             engine
@@ -35647,7 +35528,7 @@ mod tests {
         // compaction swap has installed the output in the view. Flush one row
         // to create it.
         store
-            .write(&make_key("eager-type-pk"), make_row(b"v", 1000))
+            .write(&make_key("eager-type-pk"), Arc::new(make_row(b"v", 1000)))
             .unwrap();
         store.flush().unwrap();
         let sstable_id = store
@@ -35784,7 +35665,12 @@ mod tests {
             .add_index(&table_id, "idx_mentioned_in_by_tenant", 2, IndexType::BTree)
             .unwrap();
         engine
-            .write(&table_id, &make_key("pk"), make_row(b"v", 1000), 1000)
+            .write(
+                &table_id,
+                &make_key("pk"),
+                Arc::new(make_row(b"v", 1000)),
+                1000,
+            )
             .unwrap();
 
         engine.flush(&table_id).unwrap();
@@ -35878,7 +35764,12 @@ mod tests {
 
             let row = persistence::index_to_rows(&idx_meta);
             engine
-                .write(&indexes_tid, &row.key, row.row, now_micros_for_test())
+                .write(
+                    &indexes_tid,
+                    &row.key,
+                    Arc::new(row.row),
+                    now_micros_for_test(),
+                )
                 .unwrap();
 
             engine.flush(&user_tid).unwrap();
@@ -35920,7 +35811,7 @@ mod tests {
             .write(
                 &user_tid,
                 &make_key("pk-active"),
-                storage_to_cell("alice", "active", 1000),
+                Arc::new(storage_to_cell("alice", "active", 1000)),
                 1000,
             )
             .unwrap();
@@ -35928,7 +35819,7 @@ mod tests {
             .write(
                 &user_tid,
                 &make_key("pk-inactive"),
-                storage_to_cell("alice", "inactive", 1001),
+                Arc::new(storage_to_cell("alice", "inactive", 1001)),
                 1001,
             )
             .unwrap();
@@ -35987,7 +35878,12 @@ mod tests {
             // Persist the type row exactly as the DDL write path does.
             let row = persistence::type_to_row(&udt);
             engine
-                .write(&types_tid, &row.key, row.row, now_micros_for_test())
+                .write(
+                    &types_tid,
+                    &row.key,
+                    Arc::new(row.row),
+                    now_micros_for_test(),
+                )
                 .unwrap();
             engine.flush(&types_tid).unwrap();
         }
@@ -36016,6 +35912,82 @@ mod tests {
         );
     }
 
+    /// The boot-time index reload reads every `system_schema.indexes` row. It
+    /// used to read at most 10_000 keyspaces and only warn, so registrations
+    /// past the cap were never restored. Every row here is unresolvable (its
+    /// table is not registered), so each one must be counted as skipped.
+    #[test]
+    fn index_reload_visits_more_keyspaces_than_the_old_cap() {
+        use ferrosa_schema::metadata::index::IndexMetadata;
+        use ferrosa_schema::system::persistence;
+
+        const KEYSPACES: usize = 10_001;
+        let dir = tempfile::tempdir().unwrap();
+        let indexes_tid = TableId::new("system_schema", "indexes");
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_system_tables().unwrap();
+        let ts = now_micros_for_test();
+        for i in 0..KEYSPACES {
+            let index = IndexMetadata {
+                keyspace: format!("ks{i:05}"),
+                table: "unregistered".to_string(),
+                name: "idx".to_string(),
+                index_type: ferrosa_index::IndexType::BTree,
+                target_columns: vec!["v".to_string()],
+                filter_predicate: None,
+                options: Default::default(),
+            };
+            let row = persistence::index_to_rows(&index);
+            engine
+                .write(&indexes_tid, &row.key, Arc::new(row.row), ts)
+                .unwrap();
+        }
+
+        let outcome = engine
+            .reload_indexes_from_system_schema(&PartitionKeyColumns::new())
+            .unwrap();
+
+        assert_eq!(outcome.restored, 0);
+        assert_eq!(outcome.skipped, KEYSPACES, "every registration is visited");
+    }
+
+    /// The schema loaders read the whole system table. They used to ask for at
+    /// most 10_000 partitions (one per keyspace), so the 10_001st keyspace's
+    /// UDTs, indexes and functions silently vanished on boot.
+    #[test]
+    fn read_persisted_types_reads_more_keyspaces_than_the_old_cap() {
+        use ferrosa_common::CqlType;
+        use ferrosa_schema::metadata::user_type::UserTypeMetadata;
+        use ferrosa_schema::system::persistence;
+
+        const KEYSPACES: usize = 10_001;
+        let dir = tempfile::tempdir().unwrap();
+        let types_tid = TableId::new("system_schema", "types");
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_system_tables().unwrap();
+        let ts = now_micros_for_test();
+        for i in 0..KEYSPACES {
+            let udt = UserTypeMetadata {
+                keyspace: format!("ks{i:05}"),
+                name: "t".to_string(),
+                fields: vec![("f".to_string(), CqlType::Int)],
+            };
+            let row = persistence::type_to_row(&udt);
+            engine
+                .write(&types_tid, &row.key, Arc::new(row.row), ts)
+                .unwrap();
+        }
+
+        let stored = engine.read_persisted_types().unwrap();
+        assert_eq!(stored.len(), KEYSPACES, "every keyspace's UDT must load");
+        let mut names: Vec<&str> = stored.iter().map(|r| r.keyspace_name.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), KEYSPACES, "each keyspace exactly once");
+    }
+
     /// A tombstoned `system_schema.types` row (DROP TYPE) masks the live row:
     /// `read_persisted_types` returns nothing after the tombstone is written.
     #[test]
@@ -36037,7 +36009,12 @@ mod tests {
         };
         let row = persistence::type_to_row(&udt);
         engine
-            .write(&types_tid, &row.key, row.row, now_micros_for_test())
+            .write(
+                &types_tid,
+                &row.key,
+                Arc::new(row.row),
+                now_micros_for_test(),
+            )
             .unwrap();
         assert_eq!(engine.read_persisted_types().unwrap().len(), 1);
 
@@ -36050,7 +36027,9 @@ mod tests {
             deletion: DeletionTime::new(ts, (ts / 1_000_000) as u32),
             primary_key_liveness: LivenessInfo::NONE,
         };
-        engine.write(&types_tid, &key, tombstone, ts).unwrap();
+        engine
+            .write(&types_tid, &key, Arc::new(tombstone), ts)
+            .unwrap();
 
         assert!(
             engine.read_persisted_types().unwrap().is_empty(),
@@ -36087,7 +36066,12 @@ mod tests {
 
             let row = persistence::function_to_row(&func);
             engine
-                .write(&functions_tid, &row.key, row.row, now_micros_for_test())
+                .write(
+                    &functions_tid,
+                    &row.key,
+                    Arc::new(row.row),
+                    now_micros_for_test(),
+                )
                 .unwrap();
             engine.flush(&functions_tid).unwrap();
         }
@@ -36137,7 +36121,12 @@ mod tests {
         for func in [make(CqlType::Int), make(CqlType::Varchar)] {
             let row = persistence::function_to_row(&func);
             engine
-                .write(&functions_tid, &row.key, row.row, now_micros_for_test())
+                .write(
+                    &functions_tid,
+                    &row.key,
+                    Arc::new(row.row),
+                    now_micros_for_test(),
+                )
                 .unwrap();
         }
         assert_eq!(
@@ -36155,7 +36144,9 @@ mod tests {
             deletion: DeletionTime::new(ts, (ts / 1_000_000) as u32),
             primary_key_liveness: LivenessInfo::NONE,
         };
-        engine.write(&functions_tid, &key, tombstone, ts).unwrap();
+        engine
+            .write(&functions_tid, &key, Arc::new(tombstone), ts)
+            .unwrap();
 
         let remaining = engine.read_persisted_functions().unwrap();
         assert_eq!(remaining.len(), 1, "only the text overload should remain");
@@ -36174,7 +36165,7 @@ mod tests {
             engine.register_table(test_schema()).unwrap();
             engine.flush(&tid).unwrap();
             engine
-                .write(&tid, &key, make_row(b"streamed", 42), 42)
+                .write(&tid, &key, Arc::new(make_row(b"streamed", 42)), 42)
                 .unwrap();
             engine.commit_log.shutdown().unwrap();
         }
@@ -36208,7 +36199,7 @@ mod tests {
                     .write(
                         &tid,
                         &make_key(&format!("no-schema-{i}")),
-                        make_row(b"pending", i),
+                        Arc::new(make_row(b"pending", i)),
                         i,
                     )
                     .unwrap();
@@ -36262,12 +36253,17 @@ mod tests {
             // A flush persists storage-schema.json (register_table alone does
             // not), which is the durable schema source replay binds to.
             engine
-                .write(&tid, &make_key("anchor"), make_row(b"v", 9), 9)
+                .write(&tid, &make_key("anchor"), Arc::new(make_row(b"v", 9)), 9)
                 .unwrap();
             engine.flush(&tid).unwrap();
             for i in 0..3 {
                 engine
-                    .write(&tid, &make_key(&format!("k{i}")), make_row(b"v", i), i)
+                    .write(
+                        &tid,
+                        &make_key(&format!("k{i}")),
+                        Arc::new(make_row(b"v", i)),
+                        i,
+                    )
                     .unwrap();
             }
             engine.commit_log.shutdown().unwrap();
@@ -36302,7 +36298,7 @@ mod tests {
                     "test_ks".into(),
                     "test_table".into(),
                     make_key(key),
-                    vec![make_row(b"aside", ts)],
+                    vec![Arc::new(make_row(b"aside", ts))],
                     ts,
                 ))
                 .unwrap();
@@ -36350,7 +36346,12 @@ mod tests {
             engine.register_table(test_schema()).unwrap();
             // A flush persists storage-schema.json, the schema `open` binds to.
             engine
-                .write(&table_id(), &make_key("anchor"), make_row(b"v", 9), 9)
+                .write(
+                    &table_id(),
+                    &make_key("anchor"),
+                    Arc::new(make_row(b"v", 9)),
+                    9,
+                )
                 .unwrap();
             engine.flush(&table_id()).unwrap();
             engine.commit_log.shutdown().unwrap();
@@ -36571,7 +36572,12 @@ mod tests {
                 StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
             engine.register_table(test_schema()).unwrap();
             engine
-                .write(&table_id(), &make_key("anchor"), make_row(b"v", 9), 9)
+                .write(
+                    &table_id(),
+                    &make_key("anchor"),
+                    Arc::new(make_row(b"v", 9)),
+                    9,
+                )
                 .unwrap();
             engine.flush(&table_id()).unwrap();
             engine.commit_log.shutdown().unwrap();
@@ -36587,7 +36593,7 @@ mod tests {
                 "test_ks".into(),
                 "ghost_table".into(),
                 make_key("g0"),
-                vec![make_row(b"aside", 200)],
+                vec![Arc::new(make_row(b"aside", 200))],
                 200,
             ))
             .unwrap();
@@ -36771,7 +36777,7 @@ mod tests {
                 .write(
                     &dropped_id,
                     &make_key(&format!("d{i}")),
-                    make_row(b"v", i as i64),
+                    Arc::new(make_row(b"v", i as i64)),
                     i as i64,
                 )
                 .unwrap();
@@ -36779,7 +36785,7 @@ mod tests {
         engine.unregister_table(&dropped_id).unwrap();
         // A flush persists storage-schema.json, now without the dropped table.
         engine
-            .write(&tid, &make_key("anchor"), make_row(b"v", 9), 9)
+            .write(&tid, &make_key("anchor"), Arc::new(make_row(b"v", 9)), 9)
             .unwrap();
         engine.flush(&tid).unwrap();
         engine.commit_log.shutdown().unwrap();
@@ -36883,7 +36889,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key("blob"),
-                    live_row(CellValue::live(blob, 1_000), 1_000),
+                    Arc::new(live_row(CellValue::live(blob, 1_000), 1_000)),
                     1_000,
                 )
                 .unwrap();
@@ -36891,7 +36897,12 @@ mod tests {
             let element = CellValue::live(b"c".to_vec(), 2_000)
                 .with_path(ferrosa_row_bridge::collection::list_cell_path(2_000, 0));
             engine
-                .write(&tid, &make_key("elem"), live_row(element, 2_000), 2_000)
+                .write(
+                    &tid,
+                    &make_key("elem"),
+                    Arc::new(live_row(element, 2_000)),
+                    2_000,
+                )
                 .unwrap();
             engine.commit_log.shutdown().unwrap();
         }
@@ -36952,14 +36963,19 @@ mod tests {
             .write(
                 &tid,
                 &make_key("blob"),
-                live_row(CellValue::live(blob, 1_000), 1_000),
+                Arc::new(live_row(CellValue::live(blob, 1_000), 1_000)),
                 1_000,
             )
             .unwrap();
         let element = CellValue::live(b"c".to_vec(), 2_000)
             .with_path(ferrosa_row_bridge::collection::list_cell_path(2_000, 0));
         engine
-            .write(&tid, &make_key("elem"), live_row(element, 2_000), 2_000)
+            .write(
+                &tid,
+                &make_key("elem"),
+                Arc::new(live_row(element, 2_000)),
+                2_000,
+            )
             .unwrap();
 
         engine
@@ -37035,13 +37051,13 @@ mod tests {
             .write(
                 &tid,
                 &make_key("blob"),
-                row(
+                Arc::new(row(
                     vec![
                         (0, CellValue::live(blob, 1_000)),
                         (1, CellValue::live(b"alice".to_vec(), 1_000)),
                     ],
                     1_000,
-                ),
+                )),
                 1_000,
             )
             .unwrap();
@@ -37052,10 +37068,10 @@ mod tests {
             .write(
                 &tid,
                 &make_key("elem"),
-                row(
+                Arc::new(row(
                     vec![(0, element), (1, CellValue::live(b"bob".to_vec(), 2_000))],
                     2_000,
-                ),
+                )),
                 2_000,
             )
             .unwrap();
@@ -37120,7 +37136,7 @@ mod tests {
             primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1_000),
         };
         let err = engine
-            .write(&tid, &make_key("k"), row, 1_000)
+            .write(&tid, &make_key("k"), Arc::new(row), 1_000)
             .expect_err("a malformed collection value must be refused");
         assert!(err.to_string().contains("collection"), "got: {err}");
         assert!(engine.read(&tid, &make_key("k")).unwrap().is_none());
@@ -37156,7 +37172,7 @@ mod tests {
             .write(
                 &tid,
                 &make_key("blob"),
-                live_row(CellValue::live(blob, 1_000), 1_000),
+                Arc::new(live_row(CellValue::live(blob, 1_000), 1_000)),
                 1_000,
             )
             .unwrap();
@@ -37165,7 +37181,12 @@ mod tests {
         let element = CellValue::live(b"c".to_vec(), 2_000)
             .with_path(ferrosa_row_bridge::collection::list_cell_path(2_000, 0));
         engine
-            .write(&tid, &make_key("elem"), live_row(element, 2_000), 2_000)
+            .write(
+                &tid,
+                &make_key("elem"),
+                Arc::new(live_row(element, 2_000)),
+                2_000,
+            )
             .unwrap();
         engine.flush(&tid).unwrap();
         assert_eq!(engine.sstable_count(&tid), 2);
@@ -37242,7 +37263,7 @@ mod tests {
                 primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1_000),
             };
             let err = engine
-                .write(&tid, &make_key("k"), row, 1_000)
+                .write(&tid, &make_key("k"), Arc::new(row), 1_000)
                 .expect_err("an implausible element must be refused");
             assert!(
                 err.to_string().contains("element") || err.to_string().contains("value"),
@@ -37311,7 +37332,7 @@ mod tests {
                 StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
             engine.register_table(schema()).unwrap();
             let write = |key: &str, r: Row, ts: i64| {
-                engine.write(&tid, &make_key(key), r, ts).unwrap();
+                engine.write(&tid, &make_key(key), Arc::new(r), ts).unwrap();
             };
             // Whole value only (pre-e513bc60 UPDATE).
             write(
@@ -37423,7 +37444,7 @@ mod tests {
             engine.register_table(test_schema()).unwrap();
             let key = make_key("restart_key");
             engine
-                .write(&tid, &key, make_row(b"restart_val", 1000), 1000)
+                .write(&tid, &key, Arc::new(make_row(b"restart_val", 1000)), 1000)
                 .unwrap();
             engine.flush(&tid).unwrap();
             // engine drops here — storage-schema.json is now on disk
@@ -37435,7 +37456,12 @@ mod tests {
 
         // Write succeeds only if the table was re-registered from local schema metadata.
         let key2 = make_key("restart_key2");
-        let write_result = engine2.write(&tid, &key2, make_row(b"after_restart", 2000), 2000);
+        let write_result = engine2.write(
+            &tid,
+            &key2,
+            Arc::new(make_row(b"after_restart", 2000)),
+            2000,
+        );
         assert!(
             write_result.is_ok(),
             "write after restart must succeed — schema must have been loaded \
@@ -37472,7 +37498,7 @@ mod tests {
             engine.register_table(test_schema()).unwrap();
             let key = make_key("upgrade_key");
             engine
-                .write(&tid, &key, make_row(b"upgrade_val", 5000), 5000)
+                .write(&tid, &key, Arc::new(make_row(b"upgrade_val", 5000)), 5000)
                 .unwrap();
             engine.flush(&tid).unwrap();
         }
@@ -37543,7 +37569,7 @@ mod tests {
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
             primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(7000),
         };
-        engine.write(&tid, &key, row, 7000).unwrap();
+        engine.write(&tid, &key, Arc::new(row), 7000).unwrap();
 
         engine.flush(&tid).unwrap();
         assert_eq!(
@@ -37722,7 +37748,7 @@ mod tests {
                 primary_key_liveness: LivenessInfo::with_timestamp(1_000 + i),
             };
             engine
-                .write(&tid, &make_key(&i.to_string()), row, 1_000 + i)
+                .write(&tid, &make_key(&i.to_string()), Arc::new(row), 1_000 + i)
                 .unwrap();
         }
         engine.flush(&tid).unwrap();
@@ -37814,7 +37840,7 @@ mod tests {
         engine.register_table(test_schema_2()).unwrap();
         for tid in [table_id(), table_id_2()] {
             engine
-                .write(&tid, &make_key("k"), make_row(b"v", 1000), 1000)
+                .write(&tid, &make_key("k"), Arc::new(make_row(b"v", 1000)), 1000)
                 .unwrap();
             engine.flush(&tid).unwrap();
         }
@@ -37947,7 +37973,7 @@ mod tests {
             engine.register_table(test_schema()).unwrap();
             for key in &keys {
                 engine
-                    .write(&tid, &make_key(key), make_row(b"v", 1000), 1000)
+                    .write(&tid, &make_key(key), Arc::new(make_row(b"v", 1000)), 1000)
                     .unwrap();
             }
             engine.flush(&tid).unwrap();
@@ -37994,7 +38020,12 @@ mod tests {
             engine.add_vector_index(&tid, "vec_idx", 0, 3).unwrap();
             for (key, vector) in &SIX_VECTORS {
                 engine
-                    .write(&tid, &make_key(key), vector_test_row(vector), 1000)
+                    .write(
+                        &tid,
+                        &make_key(key),
+                        Arc::new(vector_test_row(vector)),
+                        1000,
+                    )
                     .unwrap();
             }
             engine.flush(&tid).unwrap();
@@ -38084,7 +38115,7 @@ mod tests {
         let keys: Vec<String> = (0..5).map(|i| format!("k{i}")).collect();
         for key in &keys {
             engine
-                .write(&tid, &make_key(key), make_row(b"v", 1000), 1000)
+                .write(&tid, &make_key(key), Arc::new(make_row(b"v", 1000)), 1000)
                 .unwrap();
         }
         engine.flush(&tid).unwrap();
@@ -38167,7 +38198,12 @@ mod tests {
         // A live memtable row, so a partial result would be non-empty and
         // look like a complete answer.
         engine
-            .write(&tid, &make_key("live"), make_row(b"v", 2000), 2000)
+            .write(
+                &tid,
+                &make_key("live"),
+                Arc::new(make_row(b"v", 2000)),
+                2000,
+            )
             .unwrap();
         delete_all_objects(&store).await;
 
@@ -38723,7 +38759,7 @@ mod tests {
             engine.register_table(test_schema()).unwrap();
             for key in &keys {
                 engine
-                    .write(&tid, &make_key(key), make_row(b"v", 1000), 1000)
+                    .write(&tid, &make_key(key), Arc::new(make_row(b"v", 1000)), 1000)
                     .unwrap();
             }
             engine.flush(&tid).unwrap();
@@ -39025,7 +39061,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key(&format!("k{i}")),
-                    make_row(b"shared", 1000),
+                    Arc::new(make_row(b"shared", 1000)),
                     1000,
                 )
                 .unwrap();
@@ -39362,7 +39398,12 @@ mod tests {
         for (i, key_suffix) in ["a", "b", "c", "d"].iter().enumerate() {
             let ts = (i as i64 + 1) * 1000;
             engine
-                .write(&tid, &make_key(key_suffix), make_row(b"v", ts), ts)
+                .write(
+                    &tid,
+                    &make_key(key_suffix),
+                    Arc::new(make_row(b"v", ts)),
+                    ts,
+                )
                 .unwrap();
             engine.flush(&tid).unwrap();
         }
@@ -39439,7 +39480,7 @@ mod tests {
         for (i, key) in ["p1", "p2", "p3"].iter().enumerate() {
             let ts = (i as i64 + 1) * 1000;
             engine
-                .write(&tid, &make_key(key), make_row(b"value", ts), ts)
+                .write(&tid, &make_key(key), Arc::new(make_row(b"value", ts)), ts)
                 .unwrap();
             engine.flush(&tid).unwrap();
         }
@@ -39495,7 +39536,12 @@ mod tests {
 
         // Write + flush so a real SSTable file exists.
         engine
-            .write(&tid, &make_key("k1"), make_row(b"hello", 1000), 1000)
+            .write(
+                &tid,
+                &make_key("k1"),
+                Arc::new(make_row(b"hello", 1000)),
+                1000,
+            )
             .unwrap();
         engine.flush(&tid).unwrap();
 
@@ -39539,7 +39585,7 @@ mod tests {
 
         // Write + flush: S3 upload must be skipped while pinned.
         engine
-            .write(&tid, &make_key("k1"), make_row(b"v1", 1000), 1000)
+            .write(&tid, &make_key("k1"), Arc::new(make_row(b"v1", 1000)), 1000)
             .unwrap();
         engine.flush(&tid).unwrap();
 
@@ -39607,7 +39653,12 @@ mod tests {
         // Register normally (no pin) and flush once — should upload to S3.
         engine.register_table(test_schema()).unwrap();
         engine
-            .write(&tid, &make_key("before"), make_row(b"v1", 1000), 1000)
+            .write(
+                &tid,
+                &make_key("before"),
+                Arc::new(make_row(b"v1", 1000)),
+                1000,
+            )
             .unwrap();
         engine.flush(&tid).unwrap();
 
@@ -39628,7 +39679,12 @@ mod tests {
 
         // Flush again while pinned — this SSTable must NOT be enqueued for S3.
         engine
-            .write(&tid, &make_key("after"), make_row(b"v2", 2000), 2000)
+            .write(
+                &tid,
+                &make_key("after"),
+                Arc::new(make_row(b"v2", 2000)),
+                2000,
+            )
             .unwrap();
         engine.flush(&tid).unwrap();
 
@@ -39665,7 +39721,7 @@ mod tests {
             .write(
                 &tid,
                 &make_key("r1"),
-                make_row(b"memory snippet content", 1000),
+                Arc::new(make_row(b"memory snippet content", 1000)),
                 1000,
             )
             .unwrap();
@@ -39698,7 +39754,12 @@ mod tests {
         let indexes_tid = TableId::new("system_schema", "indexes");
         let row = persistence::index_to_rows(&dangling);
         engine
-            .write(&indexes_tid, &row.key, row.row, now_micros_for_test())
+            .write(
+                &indexes_tid,
+                &row.key,
+                Arc::new(row.row),
+                now_micros_for_test(),
+            )
             .unwrap();
         let outcome = engine
             .reload_indexes_from_system_schema(&PartitionKeyColumns::new())
@@ -39756,7 +39817,12 @@ mod tests {
             ("r3", "hello world"),
         ] {
             engine
-                .write(&tid, &make_key(key), make_row(text.as_bytes(), 1000), 1000)
+                .write(
+                    &tid,
+                    &make_key(key),
+                    Arc::new(make_row(text.as_bytes(), 1000)),
+                    1000,
+                )
                 .unwrap();
         }
         engine.flush(&tid).unwrap();
@@ -39805,7 +39871,12 @@ mod tests {
             ("r3", "rust hello world"),
         ] {
             engine
-                .write(&tid, &make_key(key), make_row(text.as_bytes(), 1000), 1000)
+                .write(
+                    &tid,
+                    &make_key(key),
+                    Arc::new(make_row(text.as_bytes(), 1000)),
+                    1000,
+                )
                 .unwrap();
         }
         engine.flush(&tid).unwrap();
@@ -39880,7 +39951,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key("r1"),
-                    make_row(b"rust distributed database", 1000),
+                    Arc::new(make_row(b"rust distributed database", 1000)),
                     1000,
                 )
                 .unwrap();
@@ -39888,7 +39959,12 @@ mod tests {
 
             let row = persistence::index_to_rows(&idx_meta);
             engine
-                .write(&indexes_tid, &row.key, row.row, now_micros_for_test())
+                .write(
+                    &indexes_tid,
+                    &row.key,
+                    Arc::new(row.row),
+                    now_micros_for_test(),
+                )
                 .unwrap();
             engine.flush(&indexes_tid).unwrap();
 
@@ -39940,7 +40016,12 @@ mod tests {
         ];
         for (key, text) in &docs {
             engine
-                .write(&tid, &make_key(key), make_row(text.as_bytes(), 1000), 1000)
+                .write(
+                    &tid,
+                    &make_key(key),
+                    Arc::new(make_row(text.as_bytes(), 1000)),
+                    1000,
+                )
                 .unwrap();
         }
         engine.flush(&tid).unwrap();
@@ -39985,10 +40066,10 @@ mod tests {
             .write(
                 &tid,
                 &make_key("r1"),
-                make_row(
+                Arc::new(make_row(
                     b"quarterly latency reports emitted by the ingest pipeline",
                     1000,
-                ),
+                )),
                 1000,
             )
             .unwrap();
@@ -39996,7 +40077,7 @@ mod tests {
             .write(
                 &tid,
                 &make_key("r2"),
-                make_row(b"python scripting only", 1000),
+                Arc::new(make_row(b"python scripting only", 1000)),
                 1000,
             )
             .unwrap();
@@ -40038,7 +40119,7 @@ mod tests {
             .write(
                 &tid,
                 &make_key("fresh"),
-                make_row(b"ferrosaftsfresh native fts probe body", 1000),
+                Arc::new(make_row(b"ferrosaftsfresh native fts probe body", 1000)),
                 1000,
             )
             .unwrap();
@@ -40091,7 +40172,7 @@ mod tests {
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(i as i64),
             };
-            engine.write(&tid, &key, row, i as i64).unwrap();
+            engine.write(&tid, &key, Arc::new(row), i as i64).unwrap();
 
             if (i + 1) % 25 == 0 {
                 engine.flush(&tid).unwrap();
@@ -40153,7 +40234,7 @@ mod tests {
                 };
                 let ts = (n as i64) + 1;
                 engine
-                    .write(&tid, &key, make_row(text.as_bytes(), ts), ts)
+                    .write(&tid, &key, Arc::new(make_row(text.as_bytes(), ts)), ts)
                     .unwrap();
             }
             engine.flush(&tid).unwrap();
@@ -40218,7 +40299,10 @@ mod tests {
             .write(
                 &tid,
                 &key,
-                make_row(format!("{PROBE} distributed database").as_bytes(), 1),
+                Arc::new(make_row(
+                    format!("{PROBE} distributed database").as_bytes(),
+                    1,
+                )),
                 1,
             )
             .unwrap();
@@ -40340,7 +40424,7 @@ mod tests {
             .write(
                 &tid,
                 &make_key("live_doc"),
-                make_row(format!("{PROBE} live row").as_bytes(), 1),
+                Arc::new(make_row(format!("{PROBE} live row").as_bytes(), 1)),
                 1,
             )
             .unwrap();
@@ -40398,11 +40482,21 @@ mod tests {
         const OLD: &str = "ferrosaftssupersededtext";
         const NEW: &str = "ferrosaftscurrenttext";
         engine
-            .write(&tid, &make_key("doc"), make_row(OLD.as_bytes(), 1), 1)
+            .write(
+                &tid,
+                &make_key("doc"),
+                Arc::new(make_row(OLD.as_bytes(), 1)),
+                1,
+            )
             .unwrap();
         engine.flush(&tid).unwrap();
         engine
-            .write(&tid, &make_key("doc"), make_row(NEW.as_bytes(), 2), 2)
+            .write(
+                &tid,
+                &make_key("doc"),
+                Arc::new(make_row(NEW.as_bytes(), 2)),
+                2,
+            )
             .unwrap();
         engine.flush(&tid).unwrap();
         for batch in 0..3i64 {
@@ -40411,7 +40505,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key(&format!("filler_{batch}")),
-                    make_row(b"filler row text", ts),
+                    Arc::new(make_row(b"filler row text", ts)),
                     ts,
                 )
                 .unwrap();
@@ -40469,7 +40563,7 @@ mod tests {
                 .write(
                     &tid,
                     &make_key(&format!("doc_{gen:02}")),
-                    make_row(b"ferrosaftsalpha ferrosaftsbeta", ts),
+                    Arc::new(make_row(b"ferrosaftsalpha ferrosaftsbeta", ts)),
                     ts,
                 )
                 .unwrap();
@@ -40578,7 +40672,12 @@ mod tests {
             ("doc_beta", "ferrosaftsbeta only"),
         ] {
             engine
-                .write(&tid, &make_key(name), make_row(text.as_bytes(), 1), 1)
+                .write(
+                    &tid,
+                    &make_key(name),
+                    Arc::new(make_row(text.as_bytes(), 1)),
+                    1,
+                )
                 .unwrap();
             engine.flush(&tid).unwrap();
         }
@@ -40620,7 +40719,7 @@ mod tests {
             .write(
                 &tid,
                 &make_key("doc_0000"),
-                make_row(format!("{PROBE} row").as_bytes(), 1),
+                Arc::new(make_row(format!("{PROBE} row").as_bytes(), 1)),
                 1,
             )
             .unwrap();
@@ -40687,7 +40786,7 @@ mod tests {
                     .write(
                         &tid,
                         &make_key(&format!("doc{s}-{r:04}")),
-                        make_row(body.as_bytes(), 1),
+                        Arc::new(make_row(body.as_bytes(), 1)),
                         1,
                     )
                     .unwrap();
@@ -40769,7 +40868,7 @@ mod tests {
                         deletion: DeletionTime::LIVE,
                         primary_key_liveness: LivenessInfo::with_timestamp(ts as i64),
                     };
-                    let _ = eng.write(&tid, &key, row, ts as i64);
+                    let _ = eng.write(&tid, &key, Arc::new(row), ts as i64);
                 }
             }));
         }
@@ -40837,7 +40936,7 @@ mod tests {
             primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
         };
 
-        engine.write(&table_id, &key, row, 1).unwrap();
+        engine.write(&table_id, &key, Arc::new(row), 1).unwrap();
         let _ = engine.read(&table_id, &key);
 
         let recorded = crate::test_span_collector::drain_names();
@@ -41150,7 +41249,7 @@ mod tests {
             ];
             for (k, v) in &rows_to_write {
                 engine
-                    .write(&tid, &make_key(k), make_row(v, 1000), 1000)
+                    .write(&tid, &make_key(k), Arc::new(make_row(v, 1000)), 1000)
                     .unwrap();
             }
 
@@ -41323,11 +41422,11 @@ mod tests {
 
         let tid = table_id();
         engine
-            .write(&tid, &make_key("k1"), make_row(b"v1", 1000), 1000)
+            .write(&tid, &make_key("k1"), Arc::new(make_row(b"v1", 1000)), 1000)
             .unwrap();
         engine.flush(&tid).unwrap();
         engine
-            .write(&tid, &make_key("k2"), make_row(b"v2", 2000), 2000)
+            .write(&tid, &make_key("k2"), Arc::new(make_row(b"v2", 2000)), 2000)
             .unwrap();
         engine.flush(&tid).unwrap();
 
@@ -41387,11 +41486,11 @@ mod tests {
 
         let tid = table_id();
         engine
-            .write(&tid, &make_key("k1"), make_row(b"v1", 1000), 1000)
+            .write(&tid, &make_key("k1"), Arc::new(make_row(b"v1", 1000)), 1000)
             .unwrap();
         engine.flush(&tid).unwrap();
         engine
-            .write(&tid, &make_key("k2"), make_row(b"v2", 2000), 2000)
+            .write(&tid, &make_key("k2"), Arc::new(make_row(b"v2", 2000)), 2000)
             .unwrap();
         engine.flush(&tid).unwrap();
 
@@ -41507,7 +41606,7 @@ mod tests {
                         primary_key_liveness: LivenessInfo::with_timestamp(1000),
                     };
                     engine
-                        .write(&tid, &make_key(&partition), row, 1000)
+                        .write(&tid, &make_key(&partition), Arc::new(row), 1000)
                         .unwrap();
                     if (i + 1) % 10_000 == 0 {
                         engine.flush(&tid).unwrap();
@@ -41574,7 +41673,9 @@ mod tests {
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp((i + 1) as i64),
                 };
-                engine.write(&tid, &pk, row, (i + 1) as i64).unwrap();
+                engine
+                    .write(&tid, &pk, Arc::new(row), (i + 1) as i64)
+                    .unwrap();
 
                 // Simulate the background flush loop calling flush_if_needed
                 // every 100 writes (production runs on a timer)
@@ -41642,7 +41743,9 @@ mod tests {
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp((i + 1) as i64),
                 };
-                engine.write(&tid, &pk, row, (i + 1) as i64).unwrap();
+                engine
+                    .write(&tid, &pk, Arc::new(row), (i + 1) as i64)
+                    .unwrap();
             }
 
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -41684,4 +41787,58 @@ mod tests {
         }
     }
     include!("engine_backpressure_tests.rs");
+}
+
+/// Count of failures plus the lowest message, for a refusal that has already
+/// logged each failure. Constant size whatever the failure count.
+#[derive(Default)]
+struct FailureTally {
+    count: usize,
+    first: Option<String>,
+}
+
+impl FailureTally {
+    /// Log `msg` and fold it into the tally.
+    fn note(&mut self, msg: String) {
+        tracing::error!(failure = %msg, "storage-engine: evicted SSTable generation unresolvable");
+        self.count += 1;
+        if self.first.as_ref().is_none_or(|first| msg < *first) {
+            self.first = Some(msg);
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.count
+    }
+
+    fn first(&self) -> Option<&str> {
+        self.first.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod failure_tally_tests {
+    use super::FailureTally;
+
+    /// Startup registration used to keep the first ten failure messages in a
+    /// capped heap for its error text. Every failure is now logged as it
+    /// happens, and the tally keeps only the count and the lowest message (so
+    /// the error text is deterministic): nothing grows with the failure count.
+    #[test]
+    fn a_failure_tally_keeps_the_count_and_the_lowest_message_only() {
+        let mut tally = FailureTally::default();
+        assert_eq!(tally.count(), 0);
+        assert_eq!(tally.first(), None);
+
+        for msg in [
+            "t2 generation 9: gone",
+            "t1 generation 3: gone",
+            "t3 generation 1: gone",
+        ] {
+            tally.note(msg.to_string());
+        }
+
+        assert_eq!(tally.count(), 3);
+        assert_eq!(tally.first(), Some("t1 generation 3: gone"));
+    }
 }

@@ -12,10 +12,10 @@
 //! 1. registration DECLARES the index, and the object-bound query returns
 //!    exactly the triples it stored — the VALUES, not a count;
 //! 2. the query stops reading once the index has answered. The instrument is
-//!    the executor's own row counter: `Scan::feed` counts every storage row at
-//!    the source and errors past `ExecutionLimits::max_rows`, so a table of 20
-//!    rows under an 8-row bound is answerable ONLY by an index read. No timing
-//!    and no new counter is involved;
+//!    the executor's own row counter: every scan counts each storage row it
+//!    decodes in `ExecutionStats::storage_rows_read`, and `run_bounded` fails
+//!    when a query read more than its bound, so a table of 20 rows under an
+//!    8-row bound is answerable ONLY by an index read. No timing is involved;
 //! 3. MIRROR CONTROL — a table with NO declared index must still stream the
 //!    full scan, still answer with the right values, and still say so. Without
 //!    it this defect could be "fixed" by deleting the fallback (an undeclared
@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 
 use ferrosa_cluster::write_path::WritePath;
 use ferrosa_sparql::engine::{SparqlConfig, SparqlEngine, SparqlResult};
-use ferrosa_sparql::executor::{self, ExecutionLimits};
+use ferrosa_sparql::executor::{self, ExecutionContext};
 use ferrosa_sparql::planner;
 use ferrosa_sparql::results::Binding;
 use ferrosa_sparql::triple_store::triples_table_id;
@@ -142,9 +142,10 @@ impl Fixture {
             .expect("INSERT DATA must succeed");
     }
 
-    /// Run `query` through the executor under an explicit row bound — the same
-    /// public entry point `SparqlEngine::execute` drives, with the bound under
-    /// test instead of the default one.
+    /// Run `query` through the executor and fail if it read more than
+    /// `max_rows` storage rows. The executor itself has no row bound; this is
+    /// the test's measurement of how much a query read, taken from the
+    /// query's own counter.
     ///
     /// Returns `(subject, predicate)` of every solution: the object is the
     /// pattern's own constant, so the pair IS the row's identity and content.
@@ -158,7 +159,14 @@ impl Fixture {
             .expect("query must parse");
         let scope = planner::TripleScope::new(KS, KS);
         let plan = planner::plan_query(&parsed, &scope).expect("query must plan");
-        let out = executor::execute(&plan, &self.write_path, &ExecutionLimits { max_rows }).await?;
+        let cx = ExecutionContext::new(self._dir.path().join("spill"), 1 << 20);
+        let out = executor::execute(&plan, &self.write_path, &cx).await?;
+        let read = cx.stats().storage_rows_read();
+        if read > max_rows as u64 {
+            return Err(ferrosa_sparql::error::SparqlError::Execution(format!(
+                "query read more than {max_rows} storage rows ({read})"
+            )));
+        }
         Ok(rows_of(&out.results.bindings))
     }
 

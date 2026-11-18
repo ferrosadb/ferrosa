@@ -123,7 +123,7 @@ async fn main() -> Result<()> {
         } => {
             let run_id = format!(
                 "{}-{}",
-                chrono::Utc::now().format("%Y%m%d-%H%M%S"),
+                ferrosa_common::temporal::now().format_compact(),
                 &uuid::Uuid::new_v4().to_string()[..8],
             );
 

@@ -430,7 +430,7 @@ impl RepairStore for RemoteRepairStore {
     async fn apply_partitions(
         &self,
         table: &TableId,
-        partitions: &[Partition],
+        partitions: Vec<Partition>,
     ) -> Result<(), String> {
         // Chunk the apply payload so the wire body, the peer's
         // bincode-deserialise buffer, and the peer's in-flight
@@ -440,11 +440,11 @@ impl RepairStore for RemoteRepairStore {
         // the peer materialises that whole payload in memory
         // (decoded `PartitionWire` → `Partition`) and the cgroup
         // OOMs.
-        for chunk in partitions.chunks(super::executor::REPAIR_APPLY_CHUNK_PARTITIONS) {
+        for chunk in apply_wire_chunks(partitions) {
             let req = RepairApplyRequestPayload {
                 keyspace: table.keyspace.clone(),
                 table: table.table.clone(),
-                partitions: chunk.iter().cloned().map(partition_to_wire).collect(),
+                partitions: chunk,
             };
             let body = bincode::serialize(&req).map_err(|e| format!("serialize: {e}"))?;
             let resp = self
@@ -516,9 +516,54 @@ impl RepairStore for RemoteRepairStore {
     }
 }
 
+/// Split an apply queue into wire chunks of at most
+/// [`REPAIR_APPLY_CHUNK_PARTITIONS`](super::executor::REPAIR_APPLY_CHUNK_PARTITIONS),
+/// moving each partition into its wire form. The caller gives up the queue,
+/// so no partition is copied to build the request.
+fn apply_wire_chunks(partitions: Vec<Partition>) -> impl Iterator<Item = Vec<PartitionWire>> {
+    let size = super::executor::REPAIR_APPLY_CHUNK_PARTITIONS;
+    debug_assert!(size > 0, "a zero chunk size would never advance");
+    let mut rest = partitions.into_iter().peekable();
+    std::iter::from_fn(move || {
+        rest.peek()?;
+        Some(rest.by_ref().take(size).map(partition_to_wire).collect())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The apply RPC must move each partition into its wire chunk, not clone
+    /// it: the executor hands over the queue and never reads it again. Chunks
+    /// stay at most REPAIR_APPLY_CHUNK_PARTITIONS long and keep queue order.
+    #[test]
+    fn apply_chunks_take_ownership_and_keep_order_and_size() {
+        use super::super::executor::REPAIR_APPLY_CHUNK_PARTITIONS as N;
+        let total = 2 * N + 5;
+        let partitions: Vec<Partition> = (0..total)
+            .map(|i| {
+                let mut p = repair_fetch_fixture();
+                p.key = ferrosa_common::key::DecoratedKey::new(
+                    ferrosa_common::key::PartitionKey::new(format!("pk-{i:04}").into_bytes()),
+                );
+                p
+            })
+            .collect();
+        let expected: Vec<Vec<u8>> = partitions
+            .iter()
+            .map(|p| p.key.key.as_bytes().to_vec())
+            .collect();
+
+        let chunks: Vec<Vec<PartitionWire>> = apply_wire_chunks(partitions).collect();
+
+        assert_eq!(
+            chunks.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![N, N, 5]
+        );
+        let got: Vec<Vec<u8>> = chunks.into_iter().flatten().map(|w| w.key_bytes).collect();
+        assert_eq!(got, expected, "wire order must be queue order");
+    }
 
     /// A multi-row, multi-cell partition: exercises every layer of the wire
     /// encoding so a byte-equivalence assertion below is not trivially true.
@@ -552,6 +597,7 @@ mod tests {
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(12_345 + i as i64),
                 })
+                .map(Arc::new)
                 .collect(),
         }
     }

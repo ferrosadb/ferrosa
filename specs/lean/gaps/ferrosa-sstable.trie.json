@@ -1,0 +1,63 @@
+{
+  "stage": "aeneas",
+  "llbc": "/tmp/oomcat/main-wt/ferrosa_sstable.llbc",
+  "lean": "/tmp/leangap-ferrosa-sstable-x4eavx3a/FerrosaSstable.lean",
+  "translation_errors": 0,
+  "translation_unique_reported": null,
+  "translation_messages": [],
+  "aeneas_exit": 1,
+  "lean_errors": 8,
+  "errors": [
+    {
+      "location": "FerrosaSstable.lean:499:36",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    },
+    {
+      "location": "FerrosaSstable.lean:1312:7",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_sstable.core.iter.adapters.copied.Copied.Insts.CoreIterTraitsIteratorIterator`"
+    },
+    {
+      "location": "FerrosaSstable.lean:1389:7",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `Aeneas.Std.core.iter.adapters.map.Map.Insts.CoreIterTraitsIteratorIterator`"
+    },
+    {
+      "location": "FerrosaSstable.lean:1400:7",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `Aeneas.Std.core.iter.adapters.map.Map.Insts.CoreIterTraitsIteratorIterator`"
+    },
+    {
+      "location": "FerrosaSstable.lean:1438:11",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_sstable.core.iter.adapters.copied.Copied.Insts.CoreIterTraitsIteratorIterator`"
+    },
+    {
+      "location": "FerrosaSstable.lean:1453:11",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_sstable.core.iter.adapters.copied.Copied.Insts.CoreIterTraitsIteratorIterator`"
+    },
+    {
+      "location": "FerrosaSstable.lean:2402:7",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `Aeneas.Std.core.iter.adapters.zip.Zip.Insts.CoreIterTraitsIteratorIteratorPair`"
+    },
+    {
+      "location": "FerrosaSstable.lean:2408:5",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown constant `ferrosa_sstable.core.iter.adapters.take_while.TakeWhile.Insts.CoreIterTraitsIteratorIterator`"
+    }
+  ],
+  "sorry_declarations": 49,
+  "compiled": false,
+  "crate": "ferrosa-sstable",
+  "prefix": "ferrosa_sstable::trie::*",
+  "generated_at": "2026-11-17T18:41:51+00:00",
+  "memory_max": "9600M",
+  "toolchain": {
+    "charon": "/tmp/oomcat/aeneas-arc/charon/bin/charon",
+    "aeneas": "/tmp/oomcat/aeneas-arc/src/_build/default/main.exe",
+    "lean_pkg": "/tmp/oomcat/aeneas-arc/backends/lean"
+  }
+}

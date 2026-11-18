@@ -661,13 +661,21 @@ impl EngineStorageReader {
         // `accord_cell_timestamp`): compared raw, the nanosecond `t.time` sat
         // ~1000x above every cell and bounded nothing (t_277e2bf9).
         let cell_ts_bound = accord_cell_timestamp(t);
-        let rows: Vec<ferrosa_sstable::types::Row> = partition
+        let rows: Vec<Arc<ferrosa_sstable::types::Row>> = partition
             .rows
             .into_iter()
             .filter(|row| clustering.is_none_or(|ck| row.clustering == ck))
             .filter_map(|mut row| {
-                row.cells
-                    .retain(|(_, cell)| cell.timestamp <= cell_ts_bound);
+                // Copy on write only a shared row that actually loses a cell.
+                if row
+                    .cells
+                    .iter()
+                    .any(|(_, cell)| cell.timestamp > cell_ts_bound)
+                {
+                    Arc::make_mut(&mut row)
+                        .cells
+                        .retain(|(_, cell)| cell.timestamp <= cell_ts_bound);
+                }
                 // Drop a row that has no surviving live cell AND no live PK
                 // liveness (it did not exist at `t`).
                 let has_live_cell = row.cells.iter().any(|(_, c)| c.value.is_some());
@@ -1161,7 +1169,8 @@ impl ferrosa_storage::write_set_stage::WriteSetSource for AccordWriteSet<'_, '_>
             // commit-log framing (one entry per row) stays byte-identical to the
             // path this replaces.
             for mut row in std::mem::take(&mut decoded.rows) {
-                restamp_row(&mut row, cell_ts);
+                // Freshly decoded, so this is the only handle: no copy.
+                restamp_row(Arc::make_mut(&mut row), cell_ts);
                 let op = Mutation::new(
                     keyspace.clone(),
                     table.clone(),
@@ -3062,7 +3071,7 @@ mod engine_applier_tests {
             KS.to_string(),
             TABLE.to_string(),
             key,
-            vec![make_row(value, cell_ts)],
+            vec![Arc::new(make_row(value, cell_ts))],
             cell_ts,
         );
         let mut buf = vec![0u8; m.serialized_size()];
@@ -3141,7 +3150,7 @@ mod engine_applier_tests {
             KS.to_string(),
             TABLE.to_string(),
             key.clone(),
-            vec![row],
+            vec![Arc::new(row)],
             9_999_999,
         );
         let mut buf = vec![0u8; m.serialized_size()];
@@ -3241,7 +3250,7 @@ mod engine_applier_tests {
             KS.to_string(),
             "no_such_table".to_string(),
             make_key("pk1"),
-            vec![make_row(b"x", 1000)],
+            vec![Arc::new(make_row(b"x", 1000))],
             1000,
         );
         let mut buf = vec![0u8; m.serialized_size()];
@@ -3446,9 +3455,9 @@ mod engine_applier_tests {
             TABLE.to_string(),
             key.clone(),
             vec![
-                clustered_row(1, b"a", 1000),
-                clustered_row(2, b"b", 1000),
-                clustered_row(3, b"c", 1000),
+                Arc::new(clustered_row(1, b"a", 1000)),
+                Arc::new(clustered_row(2, b"b", 1000)),
+                Arc::new(clustered_row(3, b"c", 1000)),
             ],
             1000,
         );
@@ -3506,7 +3515,7 @@ mod engine_applier_tests {
             KS.to_string(),
             "no_such_table".to_string(),
             make_key("pk2"),
-            vec![make_row(b"b", 1000)],
+            vec![Arc::new(make_row(b"b", 1000))],
             1000,
         );
         let mut buf = vec![0u8; bad_m.serialized_size()];
@@ -3577,7 +3586,7 @@ mod engine_applier_tests {
             KS.to_string(),
             table.to_string(),
             key,
-            vec![make_row(value, 1000)],
+            vec![Arc::new(make_row(value, 1000))],
             1000,
         );
         let mut buf = vec![0u8; m.serialized_size()];
@@ -4031,7 +4040,7 @@ mod engine_applier_tests {
             .write(
                 &TableId::new(KS, TABLE),
                 &key,
-                make_row(b"plain", now_us + 1_000),
+                Arc::new(make_row(b"plain", now_us + 1_000)),
                 now_us + 1_000,
             )
             .unwrap();
@@ -4067,7 +4076,7 @@ mod engine_applier_tests {
             .write(
                 &TableId::new(KS, TABLE),
                 &key,
-                make_row(b"later", now_us + 60_000_000),
+                Arc::new(make_row(b"later", now_us + 60_000_000)),
                 now_us + 60_000_000,
             )
             .unwrap();
@@ -4090,7 +4099,7 @@ mod engine_applier_tests {
             .write(
                 &TableId::new(KS, TABLE),
                 &key,
-                make_row(b"v", now_us - 1),
+                Arc::new(make_row(b"v", now_us - 1)),
                 now_us - 1,
             )
             .unwrap();
@@ -4119,7 +4128,7 @@ mod engine_applier_tests {
                 KS.to_string(),
                 TABLE.to_string(),
                 make_key("pk1"),
-                vec![row],
+                vec![Arc::new(row)],
                 1000,
             );
             let mut buf = vec![0u8; m.serialized_size()];
@@ -4204,10 +4213,10 @@ mod engine_applier_tests {
             KS.to_string(),
             TABLE.to_string(),
             key.clone(),
-            vec![make_row(b"first", 1_000)],
+            vec![Arc::new(make_row(b"first", 1_000))],
             1_000,
         );
-        m.rows.push(make_row(b"second", 2_000));
+        m.rows.push(Arc::new(make_row(b"second", 2_000)));
         let mut buf = vec![0u8; m.serialized_size()];
         m.serialize_into(&mut buf);
         let am = ApplyMutation {
@@ -4287,7 +4296,10 @@ mod engine_applier_tests {
                 KS.to_string(),
                 TABLE.to_string(),
                 key,
-                vec![make_row(format!("v{i}").as_bytes(), 1_000 + i as i64)],
+                vec![Arc::new(make_row(
+                    format!("v{i}").as_bytes(),
+                    1_000 + i as i64,
+                ))],
                 1_000 + i as i64,
             );
             let t0 = std::time::Instant::now();
@@ -4383,7 +4395,10 @@ mod engine_applier_tests {
                 KS.to_string(),
                 TABLE.to_string(),
                 make_key(&format!("a{i}")),
-                vec![make_row(format!("v{i}").as_bytes(), 1_000 + i as i64)],
+                vec![Arc::new(make_row(
+                    format!("v{i}").as_bytes(),
+                    1_000 + i as i64,
+                ))],
                 1_000 + i as i64,
             );
             let t0 = std::time::Instant::now();

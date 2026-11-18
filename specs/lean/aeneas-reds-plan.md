@@ -23,13 +23,51 @@ Shrinking always passes and is recorded with `lean_gap_ratchet.py update`, which
 to raise a count. `.github/workflows/lean-gap-ratchet.yml` rebuilds the pinned toolchain,
 re-measures the gated crates and runs that check weekly.
 
-The pin is a commit on `ferrosadb/aeneas` main -- **aeneas `80b690a9`**, charon
+The pin is a commit on `ferrosadb/aeneas` -- **aeneas `0d04b2ae`**, charon
 `7b462d9` (from that checkout's `charon-pin`), Lean 4.35.0 from the Aeneas backend's
 `lean-toolchain`. It has to be a fetchable commit: the identity recorded before this was
 `d8480a0e`, which is on no remote ref (it was replaced by the merged noncomputable-section
 change), so a CI job pinning it could never reproduce the numbers it was comparing. The
 records were re-measured under `80b690a9`; no Lean error class moved, and the only count
 that changed was `red-ledger`'s sorry holes (0 -> 3).
+
+`0d04b2ae` is `80b690a9` plus three commits (ferrosadb/aeneas#6):
+
+- a model of `Arc<T>` as `T`, the way `Box<T>` is modelled, with `try_unwrap` taking an opaque
+  uniqueness choice;
+- a fix to the check on a builtin's trait-clause filter, which the `Arc` model's `clone` needed;
+- a model of the futures slice a lazy stream goes through: `Poll`, a value-free `Context`,
+  `futures_core::stream::Stream`, `FnOnce1`/`FnMut1`, and `StreamExt::map`'s `Map` with a real
+  `Stream` impl. `Pin<P>` becomes `P`.
+
+Storage partitions hold `Vec<Arc<Row>>` so rows are shared, not copied, and the graph executor
+streams through `StreamExt::map`. Without these models every crate naming `Arc` gained an opaque
+`sorry` per type and per method, and the lazy `map` cost graph an opaque `Map` and a `{ sorry }`
+impl.
+
+Re-measured under `0d04b2ae`:
+
+- 9 reds closed: the opaque `Context` in eight crates, and graph's `Map` impl.
+- `ferrosa-graph`, `ferrosa-sql` and `ferrosa-sstable` now conclude instead of crashing (also
+  true on the old pin), so their rows are real ceilings.
+- **One accepted growth** (`update --accept-growth`): `ferrosa-graph` `lean.unknownIdentifier`
+  46 -> 48. With `Context` and `Pin` modelled, axum's `Json` `IntoResponse` impl no longer fails
+  as a `{ sorry }` instance. It now extracts far enough to name serde's `Serialize`, which never
+  elaborates (Step 3), so one synth failure became two unknown identifiers. The class grew
+  because more of the code elaborates; it is not new code.
+
+PR #667 (the OOM burndown) records one more accepted growth on this pin: `ferrosa-graph`
+`lean.unknownIdentifier` 48 -> 49. DETACH DELETE now spills its entry records to disk, and their
+`Vec<u8>` fields need serde's `u8` instances, which name `Serialize`/`Deserialize` (Step 3 again).
+The same PR closes 427 reds, sparql alone 422.
+
+Step 3's opaque cut was implemented and measured before this pin (aeneas branch
+`feat/trait-group-cut`, `b8e5e200`, not pinned). Cutting the format-side serde traits and
+emitting the rest in dependency order removes the unknown identifiers, but costs a hole per cut
+trait and per impl. Opaque impls also hit the `{ sorry }` printer bug (t_0f78d03f) and become
+synth failures. Net, over the gated crates: sql +88, sparql +82, sim +35, graph +25,
+postgres +7, jsonb +2, session -11. The cut does not pay for serde's consumers. Revisit it
+only after the printer prints opaque impls as `:= sorry`.
 
 The ceiling covers 451 of the 763 reds, over 19 crates. Five crates are measured but not
 gated, because one measurement of them does not fit a hosted runner;

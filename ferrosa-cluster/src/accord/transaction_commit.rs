@@ -1084,7 +1084,7 @@ mod tests {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1),
         };
-        let m = Mutation::new("ks".into(), "t".into(), key.clone(), vec![row], 1);
+        let m = Mutation::new("ks".into(), "t".into(), key.clone(), vec![Arc::new(row)], 1);
         let mut buf = vec![0u8; m.serialized_size()];
         m.serialize_into(&mut buf);
 

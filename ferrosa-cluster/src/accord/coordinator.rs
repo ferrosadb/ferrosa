@@ -3852,12 +3852,12 @@ mod tests {
                 keyspace: "ks".to_string(),
                 table: "t".to_string(),
                 key: DecoratedKey::new(PartitionKey::new(b"k".to_vec())),
-                rows: vec![Row {
+                rows: vec![Arc::new(Row {
                     clustering: vec![],
                     cells: vec![(0, CellValue::live(b"v".to_vec(), cell_ts))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(cell_ts),
-                }],
+                })],
                 timestamp: mutation_ts,
             };
             let mut buf = vec![0u8; m.serialized_size()];

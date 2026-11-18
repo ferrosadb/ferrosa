@@ -8,6 +8,7 @@ use ferrosa_cluster::{
 };
 use ferrosa_common::DecoratedKey;
 use ferrosa_sstable::types::{Partition, Row};
+use ferrosa_storage::write_set_stage::StagedWriteSet;
 use ferrosa_storage::{Mutation, TableId};
 use std::sync::Arc;
 
@@ -50,7 +51,7 @@ pub trait GraphWrite: Send + Sync {
         &self,
         table_id: &TableId,
         key: &DecoratedKey,
-        row: Row,
+        row: Arc<Row>,
         timestamp: i64,
         cl: ConsistencyLevel,
         strategy: &ReplicationStrategy,
@@ -58,6 +59,14 @@ pub trait GraphWrite: Send + Sync {
     async fn write_batch(
         &self,
         mutations: Vec<Mutation>,
+        cl: ConsistencyLevel,
+        rf: usize,
+    ) -> ferrosa_common::Result<()>;
+    /// Commit a staged write-set as one atomic batch without holding it as a
+    /// `Vec<Mutation>` (see [`WritePath::write_staged_batch`]).
+    async fn write_staged_batch(
+        &self,
+        batch: StagedWriteSet,
         cl: ConsistencyLevel,
         rf: usize,
     ) -> ferrosa_common::Result<()>;
@@ -115,7 +124,7 @@ impl GraphWrite for WritePath {
         &self,
         table_id: &TableId,
         key: &DecoratedKey,
-        row: Row,
+        row: Arc<Row>,
         timestamp: i64,
         cl: ConsistencyLevel,
         strategy: &ReplicationStrategy,
@@ -129,6 +138,14 @@ impl GraphWrite for WritePath {
         rf: usize,
     ) -> ferrosa_common::Result<()> {
         WritePath::write_batch(self, mutations, cl, rf).await
+    }
+    async fn write_staged_batch(
+        &self,
+        batch: StagedWriteSet,
+        cl: ConsistencyLevel,
+        rf: usize,
+    ) -> ferrosa_common::Result<()> {
+        WritePath::write_staged_batch(self, batch, cl, rf).await
     }
 }
 
@@ -184,7 +201,7 @@ impl<T: GraphWrite + ?Sized> GraphWrite for Arc<T> {
         &self,
         table_id: &TableId,
         key: &DecoratedKey,
-        row: Row,
+        row: Arc<Row>,
         timestamp: i64,
         cl: ConsistencyLevel,
         strategy: &ReplicationStrategy,
@@ -198,5 +215,13 @@ impl<T: GraphWrite + ?Sized> GraphWrite for Arc<T> {
         rf: usize,
     ) -> ferrosa_common::Result<()> {
         T::write_batch(self.as_ref(), mutations, cl, rf).await
+    }
+    async fn write_staged_batch(
+        &self,
+        batch: StagedWriteSet,
+        cl: ConsistencyLevel,
+        rf: usize,
+    ) -> ferrosa_common::Result<()> {
+        T::write_staged_batch(self.as_ref(), batch, cl, rf).await
     }
 }

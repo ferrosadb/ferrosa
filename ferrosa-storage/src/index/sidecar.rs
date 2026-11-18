@@ -685,6 +685,23 @@ impl SidecarReader {
         Ok(())
     }
 
+    /// The entries whose key lies in `[start, end]` (inclusive), in
+    /// `(key, row)` order, borrowed from the mapping: a binary search to the
+    /// first key at or after `start`, then a walk that decodes one entry at a
+    /// time and ends at the first key past `end`. Nothing is collected, so a
+    /// consumer that stops early pays only for what it read.
+    pub fn entries_in_range<'a>(
+        &'a self,
+        start: &[u8],
+        end: &'a [u8],
+    ) -> impl Iterator<Item = (&'a [u8], RowPositionRef<'a>)> + 'a {
+        let first = self.partition_point(|entry| entry.key < start);
+        (first..self.entry_count)
+            .map(move |index| self.entry(index))
+            .take_while(move |entry| entry.key <= end)
+            .map(|entry| (entry.key, entry.position))
+    }
+
     /// Range query: returns all `RowPosition`s for keys in `[start, end]`
     /// inclusive.
     pub fn range(&self, start: &IndexKey, end: &IndexKey) -> IndexResult<Vec<RowPosition>> {
@@ -959,6 +976,32 @@ mod tests {
             })
             .unwrap();
         visited
+    }
+
+    /// The lazy range walk yields exactly what `range` collects, with each
+    /// entry's key, and stops at the first key past `end`.
+    #[test]
+    fn entries_in_range_matches_range_lazily() {
+        let mut entries = Vec::new();
+        for key in 0u8..32 {
+            for pk in 0u8..2 {
+                entries.push((IndexKey(vec![key]), row(&[pk], b"")));
+            }
+        }
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("range.sidecar");
+        SidecarWriter::write(&path, &entries).unwrap();
+        let reader = SidecarReader::open(&path).unwrap();
+        for (start, end) in [(0u8, 31u8), (4, 9), (9, 9), (31, 31), (20, 3)] {
+            let (start, end) = (IndexKey(vec![start]), IndexKey(vec![end]));
+            let lazy: Vec<(Vec<u8>, RowPosition)> = reader
+                .entries_in_range(&start.0, &end.0)
+                .map(|(key, position)| (key.to_vec(), position.to_owned_position()))
+                .collect();
+            assert!(lazy.iter().all(|(key, _)| *key >= start.0 && *key <= end.0));
+            let positions: Vec<RowPosition> = lazy.into_iter().map(|(_, p)| p).collect();
+            assert_eq!(positions, reader.range(&start, &end).unwrap());
+        }
     }
 
     /// A key's postings are visited in row order — (partition key,

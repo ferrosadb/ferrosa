@@ -1574,14 +1574,14 @@ mod tests {
                 )),
                 deletion: ferrosa_sstable::types::DeletionTime::LIVE,
                 static_row: None,
-                rows: vec![ferrosa_sstable::types::Row {
+                rows: vec![Arc::new(ferrosa_sstable::types::Row {
                     clustering: vec![],
                     cells: vec![(0, cell)],
                     deletion: ferrosa_sstable::types::DeletionTime::LIVE,
                     primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
                         1000,
                     ),
-                }],
+                })],
             };
             let mut values = None;
             ferrosa_row_bridge::consume_partition_rows_with_clustering(
@@ -2012,11 +2012,16 @@ mod tests {
         let table = TableId::new("ks", "t");
         let key = DecoratedKey::new(PartitionKey::new(b"alpha".to_vec()));
         engine
-            .write(&table, &key, storage_row(1, "valid", 10, 1000), 1000)
+            .write(
+                &table,
+                &key,
+                Arc::new(storage_row(1, "valid", 10, 1000)),
+                1000,
+            )
             .unwrap();
         let mut corrupt = storage_row(2, "bad", 20, 1001);
         corrupt.cells[0].1 = CellValue::live(vec![0xff], 1001);
-        engine.write(&table, &key, corrupt, 1001).unwrap();
+        engine.write(&table, &key, Arc::new(corrupt), 1001).unwrap();
         for flushed in [false, true] {
             if flushed {
                 engine.flush_all().unwrap();
@@ -2057,13 +2062,28 @@ mod tests {
         let key_a = DecoratedKey::new(PartitionKey::new(b"alpha".to_vec()));
         let key_b = DecoratedKey::new(PartitionKey::new(b"beta".to_vec()));
         engine
-            .write(&tid, &key_a, storage_row(1, "ann", 10, 1000), 1000)
+            .write(
+                &tid,
+                &key_a,
+                Arc::new(storage_row(1, "ann", 10, 1000)),
+                1000,
+            )
             .unwrap();
         engine
-            .write(&tid, &key_a, storage_row(2, "amy", 20, 1001), 1001)
+            .write(
+                &tid,
+                &key_a,
+                Arc::new(storage_row(2, "amy", 20, 1001)),
+                1001,
+            )
             .unwrap();
         engine
-            .write(&tid, &key_b, storage_row(1, "bob", 30, 1002), 1002)
+            .write(
+                &tid,
+                &key_b,
+                Arc::new(storage_row(1, "bob", 30, 1002)),
+                1002,
+            )
             .unwrap();
 
         let table = Arc::new(
@@ -2127,7 +2147,7 @@ mod tests {
         let tid = TableId::new("ks", "t");
         let key = DecoratedKey::new(PartitionKey::new(b"alpha".to_vec()));
         engine
-            .write(&tid, &key, storage_row(1, "ann", 10, 1000), 1000)
+            .write(&tid, &key, Arc::new(storage_row(1, "ann", 10, 1000)), 1000)
             .unwrap();
         let manager = Arc::new(crate::mvcc::MvccManager::default());
         let snapshot = manager.snapshot();
@@ -2172,7 +2192,7 @@ mod tests {
                     before: Some(before.clone()),
                     after: Some(after),
                 }],
-                || engine.write(&tid, &key, storage_row(1, "amy", 20, 2000), 2000),
+                || engine.write(&tid, &key, Arc::new(storage_row(1, "amy", 20, 2000)), 2000),
             )
             .unwrap();
         let table = catalog.resolve("ks", "t").unwrap();
@@ -2203,7 +2223,7 @@ mod tests {
                     ])),
                     after: None,
                 }],
-                || engine.write(&tid, &key, tombstone, 3000),
+                || engine.write(&tid, &key, Arc::new(tombstone), 3000),
             )
             .unwrap();
         for _ in 0..2 {
@@ -2218,7 +2238,7 @@ mod tests {
                 "ks".into(),
                 "t".into(),
                 key.clone(),
-                vec![storage_row(1, "own", 40, 4000)],
+                vec![Arc::new(storage_row(1, "own", 40, 4000))],
                 4000,
             ),
             schema.snapshot().tables[&("ks".into(), "t".into())].id,
@@ -2311,7 +2331,10 @@ mod tests {
                     "ks".into(),
                     "t".into(),
                     key,
-                    (0..size).map(|i| storage_row(i, "row", i, 1000)).collect(),
+                    (0..size)
+                        .map(|i| storage_row(i, "row", i, 1000))
+                        .map(Arc::new)
+                        .collect(),
                     1000,
                 )])
                 .unwrap();
@@ -2432,7 +2455,7 @@ mod tests {
                     "ks".into(),
                     "t".into(),
                     DecoratedKey::new(PartitionKey::new(b"alpha".to_vec())),
-                    vec![storage_row(1, "own", 40, 4000)],
+                    vec![Arc::new(storage_row(1, "own", 40, 4000))],
                     4000,
                 ),
                 schema.snapshot().tables[&("ks".into(), "t".into())].id,
@@ -2491,10 +2514,20 @@ mod tests {
         let key_a = DecoratedKey::new(PartitionKey::new(b"alpha".to_vec()));
         let key_b = DecoratedKey::new(PartitionKey::new(b"beta".to_vec()));
         engine
-            .write(&tid, &key_a, storage_row(1, "ann", 10, 1000), 1000)
+            .write(
+                &tid,
+                &key_a,
+                Arc::new(storage_row(1, "ann", 10, 1000)),
+                1000,
+            )
             .unwrap();
         engine
-            .write(&tid, &key_b, storage_row(1, "bob", 30, 1002), 1002)
+            .write(
+                &tid,
+                &key_b,
+                Arc::new(storage_row(1, "bob", 30, 1002)),
+                1002,
+            )
             .unwrap();
 
         let table = Arc::new(
@@ -2562,7 +2595,7 @@ mod tests {
         let mut corrupt = storage_row(1, "bad", 0, 1000);
         corrupt.cells[0] = (0, CellValue::live(vec![0xff, 0xfe], 1000));
         let key = DecoratedKey::new(PartitionKey::new(b"corrupt".to_vec()));
-        engine.write(&tid, &key, corrupt, 1000).unwrap();
+        engine.write(&tid, &key, Arc::new(corrupt), 1000).unwrap();
 
         let failure = ScanFailure::default();
         let table = Arc::new(
@@ -2689,7 +2722,7 @@ mod tests {
                 .write(
                     &tid,
                     &key,
-                    storage_row(1, "old", 100 + i as i32, 1_000),
+                    Arc::new(storage_row(1, "old", 100 + i as i32, 1_000)),
                     1_000,
                 )
                 .unwrap();
@@ -2703,7 +2736,7 @@ mod tests {
                 keyspace: "ks".to_string(),
                 table: "t".to_string(),
                 key: DecoratedKey::new(PartitionKey::new(format!("k{i}").into_bytes())),
-                rows: vec![storage_row(1, "new", i as i32, TS)],
+                rows: vec![Arc::new(storage_row(1, "new", i as i32, TS))],
                 timestamp: TS,
             })
             .collect();
@@ -2811,7 +2844,12 @@ mod tests {
                 keyspace: "ks".to_string(),
                 table: "t".to_string(),
                 key: DecoratedKey::new(PartitionKey::new(format!("k{i}").into_bytes())),
-                rows: vec![storage_row(1, &"n".repeat(*width), 100 + i as i32, TS)],
+                rows: vec![Arc::new(storage_row(
+                    1,
+                    &"n".repeat(*width),
+                    100 + i as i32,
+                    TS,
+                ))],
                 timestamp: TS,
             })
             .collect();
@@ -2902,7 +2940,12 @@ mod tests {
                 keyspace: "ks".to_string(),
                 table: "t".to_string(),
                 key: DecoratedKey::new(PartitionKey::new(format!("k{i:08}").into_bytes())),
-                rows: vec![storage_row(1, &"v".repeat(1 + i % 64), i as i32, TS)],
+                rows: vec![Arc::new(storage_row(
+                    1,
+                    &"v".repeat(1 + i % 64),
+                    i as i32,
+                    TS,
+                ))],
                 timestamp: TS,
             })
             .collect();

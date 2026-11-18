@@ -137,18 +137,13 @@ uses — decode each row, filter it, and bind it immediately. No intermediate
 rather than the table. `SELECT * WHERE { ?s ?p ?o }` no longer materializes the
 whole triple store.
 
-`SparqlConfig::max_rows` (default `100_000`) is the engine's single row bound.
-It is enforced in two places, both real:
-
-- **at the source** — storage rows read by a scan, counted as they arrive;
-- **at each operator** — solutions buffered by a pattern, counted as appended.
-
-Crossing either returns `SparqlError::Execution`. **Nothing is silently
-truncated**: a clipped result reported as complete is indistinguishable from a
-correct short one, which is worse than a failure. This replaces the former
-`SCAN_ROW_CAP` constant, which only logged "scan results truncated at row cap"
-*after* the whole table had already been materialized and truncated nothing, and
-the former `SparqlConfig::max_results` field, which nothing read.
+There is no row bound. Solutions are a lazy stream that the HTTP layer writes into a
+chunked response body as they arrive (`response.rs`). `ORDER BY`, `DISTINCT`, grouped
+`COUNT` and property-path closure spill to `<data_dir>/tmp_sparql_spill` once they pass
+`SparqlConfig::spill_threshold_bytes` (default: the process spill threshold), so memory
+is bounded by the threshold rather than the result. An error after the response head
+aborts the body and is logged. Nothing is silently truncated. This replaces the former
+`max_rows` bound (`DEFAULT_MAX_ROWS`, 100 000), which failed any query past it.
 
 `LIMIT` is pushed **into** the scan — the scan stops after `offset + limit`
 solutions — whenever that is provably safe: exactly one triple pattern, and no

@@ -10,6 +10,10 @@ use crate::ast::{
 };
 use crate::exec::{AggFunc, CmpOp, SortDir};
 use crate::types::Value;
+use ferrosa_common::temporal::{
+    self,
+    parse::{formats, SQL_TIMESTAMP},
+};
 
 #[path = "parser_ddl.rs"]
 mod ddl;
@@ -1854,27 +1858,18 @@ fn parse_typed_literal(kind: TypedLiteral, body: &str) -> Result<Value, ParseErr
     match kind {
         TypedLiteral::Timestamp => {
             let s = body.trim();
-            let naive = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
-                .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f"))
-                .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
-                .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"))
-                .map_err(|_| bad())?;
-            Ok(Value::Timestamp(naive.and_utc().timestamp_micros()))
+            let naive = temporal::parse::first_naive_datetime(s, SQL_TIMESTAMP).ok_or_else(bad)?;
+            Ok(Value::Timestamp(naive.timestamp_micros()))
         }
         TypedLiteral::Date => {
-            let date =
-                chrono::NaiveDate::parse_from_str(body.trim(), "%Y-%m-%d").map_err(|_| bad())?;
-            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch valid");
-            let days = (date - epoch).num_days();
+            let date = temporal::parse::date(body.trim(), formats::YMD).map_err(|_| bad())?;
+            let days = date.days_since_epoch();
             Ok(Value::Date(i32::try_from(days).map_err(|_| bad())?))
         }
         TypedLiteral::Time => {
             let s = body.trim();
-            let t = chrono::NaiveTime::parse_from_str(s, "%H:%M:%S%.f")
-                .or_else(|_| chrono::NaiveTime::parse_from_str(s, "%H:%M:%S"))
-                .map_err(|_| bad())?;
-            let midnight = chrono::NaiveTime::from_hms_opt(0, 0, 0).expect("midnight valid");
-            let micros = (t - midnight).num_microseconds().ok_or_else(bad)?;
+            let t = temporal::parse::time(s, formats::HMS_FRAC).map_err(|_| bad())?;
+            let micros = t.nanos_since_midnight() / 1000;
             Ok(Value::Time(micros))
         }
         TypedLiteral::Inet => body

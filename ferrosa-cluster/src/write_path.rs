@@ -23,6 +23,8 @@ use crate::error::ClusterError;
 use crate::pair::coordinator::PairCoordinator;
 use crate::ring::strategy::ReplicationStrategy;
 use ferrosa_net::task_pool::TaskPool;
+mod index_read;
+mod write;
 
 /// Per-replica scan window for the LEGACY single-shot range RPC.
 ///
@@ -352,6 +354,30 @@ fn cluster_error_to_common(err: ClusterError) -> ferrosa_common::Error {
     }
 }
 
+/// Staged write-sets decoded into the resident cluster batchlog (see
+/// [`WritePath::write_staged_batch`]).
+static STAGED_BATCHES_DECODED_FOR_BATCHLOG: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many staged write-sets the cluster write path had to decode into its
+/// resident logged-batch protocol (observability for the one resident step).
+pub fn staged_batches_decoded_for_batchlog() -> u64 {
+    STAGED_BATCHES_DECODED_FOR_BATCHLOG.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Decode entry `index` of a staged write-set; a frame that does not decode
+/// is an error, never an empty mutation.
+fn decode_staged(
+    batch: &ferrosa_storage::write_set_stage::StagedWriteSet,
+    index: usize,
+) -> ferrosa_common::Result<Mutation> {
+    Mutation::deserialize_from(batch.entry(index)?).map_err(|e| {
+        ferrosa_common::Error::InvalidData(format!(
+            "staged write-set entry {index} is not a decodable mutation frame: {e}"
+        ))
+    })
+}
+
 /// Build a `CommittedToCluster` CDC event for a regular-CL write, if the
 /// engine's shared CDC bus has a committed-stream subscriber.
 ///
@@ -365,7 +391,7 @@ fn committed_cdc_event(
     storage: &StorageEngine,
     table_id: &TableId,
     key: &DecoratedKey,
-    rows: &[Row],
+    rows: &[Arc<Row>],
     timestamp: i64,
 ) -> Option<(Arc<ferrosa_cdc::CdcBus>, ferrosa_cdc::CdcEvent)> {
     let bus = storage.cdc_bus()?;
@@ -587,6 +613,92 @@ impl WritePath {
                     }
                 }
                 res
+            }
+        }
+    }
+
+    /// Commit a STAGED write-set (see
+    /// [`ferrosa_storage::write_set_stage::WriteSetStage`]) as one logged batch,
+    /// decoding one mutation at a time out of the stage instead of holding the
+    /// batch as a `Vec<Mutation>`.
+    ///
+    /// - `Direct`: [`StorageEngine::write_atomic_batch`] over the staged set:
+    ///   all-or-nothing, and the set is never resident.
+    /// - `Pair`: each mutation is forwarded in turn, exactly as
+    ///   [`Self::write_batch`] does (atomicity comes from the batchlog).
+    /// - `Cluster`: the batchlog protocol (`coordinate_logged_batch`) holds
+    ///   its entry resident by design (an in-memory batchlog map plus one
+    ///   serialized entry per replica), so the staged set is decoded into it.
+    ///   This is the one resident step left; it is logged at WARN once and
+    ///   counted by [`staged_batches_decoded_for_batchlog`], never silent.
+    pub async fn write_staged_batch(
+        &self,
+        batch: ferrosa_storage::write_set_stage::StagedWriteSet,
+        cl: ConsistencyLevel,
+        rf: usize,
+    ) -> ferrosa_common::Result<()> {
+        use ferrosa_storage::write_set_stage::WriteSetSource as _;
+        if let Some(storage) = self.admission_storage() {
+            // One admission wait per target table; a batch names few tables.
+            let mut tables: Vec<(String, String)> = Vec::new();
+            batch.for_each_mutation(&mut |m| {
+                if !tables
+                    .iter()
+                    .any(|(keyspace, table)| *keyspace == m.keyspace && *table == m.table)
+                {
+                    tables.push((m.keyspace.clone(), m.table.clone()));
+                }
+                Ok(())
+            })?;
+            for (keyspace, table) in &tables {
+                storage
+                    .await_write_admission(&TableId::new(keyspace, table))
+                    .await?;
+            }
+        }
+        match self {
+            Self::Direct(engine) => engine.write_atomic_batch(batch),
+            Self::Unavailable | Self::DegradedPair(_) => Err(ferrosa_common::Error::InvalidData(
+                "pair mode: primary unavailable, writes rejected until operator promotes".into(),
+            )),
+            Self::Pair(coordinator) => {
+                for index in 0..batch.len() {
+                    let mutation = decode_staged(&batch, index)?;
+                    coordinator
+                        .coordinate_write_with(&mutation, cl, rf)
+                        .await
+                        .map_err(|e| ferrosa_common::Error::InvalidData(format!("pair: {e}")))?;
+                    if let Some((bus, event)) = committed_cdc_event(
+                        coordinator.local_storage(),
+                        &TableId::new(&mutation.keyspace, &mutation.table),
+                        &mutation.key,
+                        &mutation.rows,
+                        mutation.timestamp,
+                    ) {
+                        bus.publish(event);
+                    }
+                }
+                Ok(())
+            }
+            Self::Cluster(_) => {
+                let prior = STAGED_BATCHES_DECODED_FOR_BATCHLOG
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if prior == 0 {
+                    tracing::warn!(
+                        entries = batch.len(),
+                        "a staged write-set is being decoded into the resident cluster \
+                         batchlog: the logged-batch protocol holds its entry in memory. \
+                         Further occurrences are counted by \
+                         staged_batches_decoded_for_batchlog()"
+                    );
+                }
+                let mut mutations = Vec::with_capacity(batch.len());
+                batch.for_each_owned_mutation(&mut |m| {
+                    mutations.push(m);
+                    Ok(())
+                })?;
+                drop(batch);
+                self.write_batch(mutations, cl, rf).await
             }
         }
     }
@@ -1321,84 +1433,6 @@ impl WritePath {
         }
     }
 
-    /// Stream a global secondary-index lookup in row order — `(partition
-    /// key, clustering)` — strictly after `after` when given, without
-    /// materializing the matching partitions. Every layer holds O(sources):
-    /// each node merges its posting sources in row order, and the cluster path
-    /// merges the nodes in row order, dropping replica copies by adjacency.
-    /// A page resumes by passing the last row it delivered as `after`.
-    pub async fn index_read_stream(
-        &self,
-        table_id: &TableId,
-        index_name: &str,
-        index_key: &ferrosa_index::IndexKey,
-        after: Option<&ferrosa_index::RowPosition>,
-    ) -> crate::error::Result<PartitionResultStream> {
-        match self {
-            Self::Direct(engine) => Ok(Box::pin(
-                engine
-                    .read_by_index_stream_after(table_id, index_name, index_key, after.cloned())
-                    .map(|item| item.map_err(ClusterError::Storage)),
-            )),
-            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => Ok(Box::pin(
-                coordinator
-                    .local_storage()
-                    .read_by_index_stream_after(table_id, index_name, index_key, after.cloned())
-                    .map(|item| item.map_err(ClusterError::Storage)),
-            )),
-            Self::Cluster(coordinator) => {
-                coordinator
-                    .coordinate_index_read_stream(table_id, index_name, index_key, after)
-                    .await
-            }
-            Self::Unavailable => Err(ClusterError::Internal(
-                "index read stream unavailable: write path is in degraded mode".into(),
-            )),
-        }
-    }
-
-    /// KEYED secondary-index read (t_430c4188): consult the index for
-    /// `index_key` restricted to the partition `key`.
-    ///
-    /// - `Direct` / `Pair`: local `read_by_index_in_partition`.
-    /// - `Cluster`: routes to the PARTITION'S replicas under `strategy` (normal
-    ///   keyed routing) — never the global scatter-gather of
-    ///   [`index_read_stream`](Self::index_read_stream).
-    /// - `Unavailable`: returns error.
-    ///
-    /// Per-node work is O(rows matching the indexed value), never O(partition
-    /// rows) — this is what serves `WHERE <full partition key> AND
-    /// <indexed_col> = ?` without a full-partition filtering scan.
-    pub async fn index_read_in_partition(
-        &self,
-        table_id: &TableId,
-        key: &DecoratedKey,
-        index_name: &str,
-        index_key: &ferrosa_index::IndexKey,
-        cl: ConsistencyLevel,
-        strategy: &ReplicationStrategy,
-    ) -> crate::error::Result<Vec<ferrosa_sstable::types::Partition>> {
-        match self {
-            Self::Direct(engine) => engine
-                .read_by_index_in_partition(table_id, index_name, index_key, key.key.as_bytes())
-                .map_err(crate::error::ClusterError::Storage),
-            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => coordinator
-                .local_storage()
-                .read_by_index_in_partition(table_id, index_name, index_key, key.key.as_bytes())
-                .map_err(crate::error::ClusterError::Storage),
-            Self::Cluster(coordinator) => {
-                coordinator
-                    .coordinate_index_read_in_partition(
-                        table_id, key, index_name, index_key, cl, strategy,
-                    )
-                    .await
-            }
-            Self::Unavailable => Err(crate::error::ClusterError::Internal(
-                "keyed index read unavailable: write path is in degraded mode".into(),
-            )),
-        }
-    }
-
     /// Full-text (`fts_match`) index lookup, returning matching partition keys.
     ///
     /// In standalone/pair mode this hits local storage. In cluster mode the
@@ -1585,7 +1619,7 @@ impl WritePath {
         &self,
         table_id: &TableId,
         key: &DecoratedKey,
-        rows: Vec<Row>,
+        rows: Vec<Arc<Row>>,
         timestamp: i64,
     ) -> ferrosa_common::Result<()> {
         match self {
@@ -1644,91 +1678,6 @@ impl WritePath {
             Self::Unavailable => Err(ferrosa_common::Error::InvalidData(
                 "pair mode: primary unavailable, truncate rejected until operator promotes".into(),
             )),
-        }
-    }
-
-    /// Write a row. In standalone mode this goes directly to storage.
-    /// In pair mode this goes through the PairCoordinator which handles
-    /// replication (primary) or forwarding (secondary).
-    /// In cluster mode the replication strategy determines whether to use
-    /// SimpleStrategy or NetworkTopologyStrategy DC-aware coordination.
-    pub async fn write(
-        &self,
-        table_id: &TableId,
-        key: &DecoratedKey,
-        row: Row,
-        timestamp: i64,
-        cl: ConsistencyLevel,
-        strategy: &ReplicationStrategy,
-    ) -> ferrosa_common::Result<()> {
-        self.await_write_admission(table_id).await?;
-        match self {
-            Self::Direct(engine) => engine.write(table_id, key, row, timestamp),
-            Self::Unavailable => Err(ferrosa_common::Error::InvalidData(
-                "pair mode: primary unavailable, writes rejected until operator promotes".into(),
-            )),
-            Self::DegradedPair(_) => Err(ferrosa_common::Error::InvalidData(
-                "pair mode: primary unavailable, writes rejected until operator promotes".into(),
-            )),
-            Self::Pair(coordinator) => {
-                let mutation = Mutation::new(
-                    table_id.keyspace.clone(),
-                    table_id.table.clone(),
-                    key.clone(),
-                    vec![row],
-                    timestamp,
-                );
-                let res = coordinator
-                    .coordinate_write_with(&mutation, cl, strategy.replication_factor())
-                    .await
-                    .map_err(cluster_error_to_common);
-                if res.is_ok() {
-                    if let Some((bus, ev)) = committed_cdc_event(
-                        coordinator.local_storage(),
-                        table_id,
-                        &mutation.key,
-                        &mutation.rows,
-                        mutation.timestamp,
-                    ) {
-                        bus.publish(ev);
-                    }
-                }
-                res
-            }
-            Self::Cluster(coordinator) => {
-                // Capture the committed-CDC payload before `row` is moved into
-                // the coordinate call; clones only if a subscriber is listening.
-                let pending = committed_cdc_event(
-                    &coordinator.storage,
-                    table_id,
-                    key,
-                    std::slice::from_ref(&row),
-                    timestamp,
-                );
-                let res = match strategy {
-                    ReplicationStrategy::Simple { replication_factor } => coordinator
-                        .coordinate_write_with(
-                            table_id,
-                            key,
-                            row,
-                            timestamp,
-                            cl,
-                            *replication_factor,
-                        )
-                        .await
-                        .map_err(cluster_error_to_common),
-                    ReplicationStrategy::NetworkTopology { .. } => coordinator
-                        .coordinate_write_nts(table_id, key, row, timestamp, cl, strategy)
-                        .await
-                        .map_err(cluster_error_to_common),
-                };
-                if res.is_ok() {
-                    if let Some((bus, ev)) = pending {
-                        bus.publish(ev);
-                    }
-                }
-                res
-            }
         }
     }
 }
@@ -1854,7 +1803,7 @@ mod tests {
             &wp,
             &table_id,
             &key,
-            row,
+            Arc::new(row),
             1000,
             ConsistencyLevel::One,
             &strategy,
@@ -1902,19 +1851,19 @@ mod tests {
 
         // No committed-stream subscriber → no event built (no allocation).
         assert!(
-            committed_cdc_event(&storage, &table_id, &key, std::slice::from_ref(&row), 1000)
+            committed_cdc_event(&storage, &table_id, &key, &[Arc::new(row.clone())], 1000)
                 .is_none()
         );
 
         // With a subscriber → event built with the right fields, accord_ts None.
         let _sub = bus.subscribe(ferrosa_cdc::CdcStream::CommittedToCluster);
         let (_bus, ev) =
-            committed_cdc_event(&storage, &table_id, &key, std::slice::from_ref(&row), 1000)
+            committed_cdc_event(&storage, &table_id, &key, &[Arc::new(row.clone())], 1000)
                 .expect("committed CDC event built when subscribed");
         assert_eq!(ev.stream, ferrosa_cdc::CdcStream::CommittedToCluster);
         assert_eq!(ev.keyspace, "ks");
         assert_eq!(ev.table, "t");
-        assert_eq!(ev.rows, vec![row]);
+        assert_eq!(ev.rows, vec![Arc::new(row)]);
         assert!(ev.accord_ts.is_none());
     }
 
@@ -1952,7 +1901,7 @@ mod tests {
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1000),
             };
-            storage.write(&table_id, &key, row, 1000).unwrap();
+            storage.write(&table_id, &key, Arc::new(row), 1000).unwrap();
         }
 
         // Verify base data is readable.
@@ -2062,10 +2011,14 @@ mod tests {
             !range_read_body.contains("coordinate_range_read_stream_all(table_id, 0)"),
             "cluster range_read must not call the Vec-returning unbounded streaming coordinator"
         );
+        let stream_all_with_body = source
+            .split("pub async fn range_read_stream_all_with(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    pub ").next())
+            .expect("range_read_stream_all_with body must be present");
         assert!(
-            source.contains("pub async fn range_read_stream_all_with")
-                && source.contains("strategy.replication_factor()")
-                && source.contains("coordinate_range_read_stream_all_with"),
+            stream_all_with_body
+                .contains("coordinate_range_read_stream_all_with(table_id, row_limit, cl, strategy)"),
             "cluster streaming full scans must carry caller consistency and keyspace replication into the coordinator"
         );
         assert!(
@@ -2292,7 +2245,11 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(key.to_vec())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: clusterings.iter().map(|c| resume_row(c)).collect(),
+            rows: clusterings
+                .iter()
+                .map(|c| resume_row(c))
+                .map(Arc::new)
+                .collect(),
         }
     }
 
@@ -2385,7 +2342,7 @@ mod tests {
             key,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows,
+            rows: rows.into_iter().map(Arc::new).collect(),
         }
     }
 

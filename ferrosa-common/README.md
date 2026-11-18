@@ -114,6 +114,16 @@ here — it lives in `ferrosa-cql` / `ferrosa-row-bridge`.
   `PRIMARY KEY`, where a time-ordered globally-unique row key is required. The
   layout is bytes-only and takes no clock of its own, so callers own uniqueness.
   See [Reserved `_sys_` columns](#reserved-_sys_-columns).
+- **Calendar arithmetic and date/time text** — `temporal` replaces the
+  `chrono` crate (unmaintained, RUSTSEC-2026-0543) for the engine's needs:
+  proleptic-Gregorian `Date`/`Time`/`DateTime` over chrono's range
+  (years -262143..=262142), `temporal::parse` reproducing chrono 0.4.39's
+  `parse_from_str`/`parse_from_rfc3339` for the formats the CQL, SQL, Postgres
+  and graph front ends accept (same leniency, same error kinds and messages),
+  RFC 3339 / `%Y-%m-%d %H:%M:%S` rendering, and calendar-aware month/day
+  arithmetic. Its equivalence to chrono was checked by a differential harness
+  outside the workspace (two million fuzzed inputs, zero mismatches); the
+  golden vectors live in `temporal/tests.rs`.
 - **Test generators** — behind the `test-generators` feature: proptest
   strategies (`arb_cell_value`, `arb_cell`, `arb_partition_key`,
   `arb_decorated_key`) shared across crates, plus shrink-friendly generated
@@ -142,6 +152,8 @@ HLC reading the system clock:
   qualified or not).
 - **`geometry`** — WKB marshal/parse for the supported geometry subset.
 - **`task_pool`** — runtime-aware spawn helper.
+- **`temporal`** — dates, times and timestamps without a date library;
+  `temporal::now()` is the only clock read.
 - **`timeuuid`** — v1 TimeUUID byte layout plus the `_sys_` reserved-name rule.
   Shares `UUID_EPOCH_OFFSET` with `complex_cell`'s Accord list-path mint so the
   two encodings cannot drift apart.
@@ -181,6 +193,7 @@ back:
 | Schema | `TableSchema`, `ColumnDefinition`, `PinConfig`, `fixed_width_for_marshal_type`, `validate_cell_bytes`, `validate_clustering_shape` |
 | Geometry | `Geometry`, `marshal_wkb`, `parse_wkb` |
 | TimeUUID keys | `timeuuid::v1_timeuuid`, `timeuuid::SYNTHETIC_KEY_COLUMN`, `timeuuid::is_reserved_column_name`, `timeuuid::UUID_EPOCH_OFFSET` |
+| Dates and times | `temporal::{Date, Time, DateTime, now, MIN_YEAR, MAX_YEAR}`, `temporal::parse::{date, time, naive_datetime, datetime_with_offset, rfc3339, first_naive_datetime, formats, SQL_TIMESTAMP}` |
 | Spawning | `TaskPool` |
 | Cancellation | `CancelToken`, `CancelReason`, `Cancelled` |
 

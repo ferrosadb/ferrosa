@@ -54,8 +54,8 @@ pub struct CdcEvent {
     pub table: String,
     /// Decorated partition key.
     pub key: DecoratedKey,
-    /// Mutated rows (reused verbatim from the commit-log mutation).
-    pub rows: Vec<Row>,
+    /// Mutated rows, shared with the commit-log mutation (never copied).
+    pub rows: Vec<Arc<Row>>,
     /// Mutation/write timestamp in microseconds. Ordering key for
     /// `WrittenOnNode` and for regular-CL `CommittedToCluster` events.
     pub timestamp: i64,
@@ -191,12 +191,12 @@ mod tests {
             keyspace: "ks".to_string(),
             table: "t".to_string(),
             key: DecoratedKey::new(PartitionKey::from(b"pk".as_slice())),
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![],
                 cells: vec![],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::default(),
-            }],
+            })],
             timestamp: id as i64,
             accord_ts: None,
             mutation_id: [id; 16],

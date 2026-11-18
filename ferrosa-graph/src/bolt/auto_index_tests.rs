@@ -1,8 +1,12 @@
 //! Exercise the real Bolt RUN/PULL dispatch against storage, without network races.
+#[path = "anchor_spill_tests.rs"]
+mod anchor_spill_tests;
 #[path = "order_by_spill_tests.rs"]
 mod order_by_spill_tests;
 #[path = "transaction_auto_schema_tests.rs"]
 mod transaction_auto_schema_tests;
+#[path = "write_spill_tests.rs"]
+mod write_spill_tests;
 use super::*;
 use crate::engine::{GraphSchemaCoordinator, LocalGraphSchemaCoordinator};
 use ferrosa_cluster::write_path::WritePath;
@@ -225,12 +229,12 @@ impl Fixture {
             .write(
                 &TableId::new("bolt_auto", "scalar_v"),
                 &key,
-                Row {
+                Arc::new(Row {
                     clustering: vec![],
                     cells,
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
-                },
+                }),
                 timestamp,
             )
             .unwrap();

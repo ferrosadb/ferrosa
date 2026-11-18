@@ -82,7 +82,7 @@ mod tests {
                 let k = format!("p{input}-{p}");
                 let value = format!("v-{k}").into_bytes();
                 engine
-                    .write(tid, &key(&k), row(&value, ts), ts)
+                    .write(tid, &key(&k), Arc::new(row(&value, ts)), ts)
                     .expect("write");
                 oracle.record_write(&key(&k), &1i32.to_be_bytes(), &value, ts);
                 ts += 1;

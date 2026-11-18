@@ -23,6 +23,7 @@
 //! [`crate::flush::FileFlushTarget`] when a property needs the reopen/pool path.
 
 use proptest::prelude::*;
+use std::sync::Arc;
 
 use ferrosa_common::cell::CellValue;
 use ferrosa_common::key::{DecoratedKey, PartitionKey};
@@ -132,7 +133,7 @@ pub fn arb_partition_for_key(
                 key: key.clone(),
                 deletion,
                 static_row,
-                rows,
+                rows: rows.into_iter().map(Arc::new).collect(),
             }
         },
     )
@@ -236,7 +237,7 @@ fn bump_partition_ts(p: &mut Partition, delta: i64) {
         bump_row(sr);
     }
     for r in &mut p.rows {
-        bump_row(r);
+        bump_row(Arc::make_mut(r));
     }
     if p.deletion.marked_for_delete_at != i64::MIN {
         bump(&mut p.deletion.marked_for_delete_at);

@@ -433,6 +433,7 @@ mod tests {
         WriteOptions,
     };
     use sha2::{Digest, Sha256};
+    use std::sync::Arc;
 
     fn schema() -> TableSchema {
         TableSchema {
@@ -453,12 +454,12 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(b"k".to_vec())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![],
                 cells: vec![(0, CellValue::live(value.to_vec(), timestamp))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
-            }],
+            })],
         };
         let header = build_serialization_header(&schema(), std::slice::from_ref(&partition));
         let mut writer = SSTableWriter::new(
