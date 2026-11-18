@@ -1,12 +1,12 @@
 {
   "stage": "aeneas",
   "llbc": "/home/bkearns/src/ferrosa-suite/ferrosa-wt-oom-burndown/ferrosa_sql.llbc",
-  "lean": "/tmp/leangap-ferrosa-sql-e43iqpa4/FerrosaSql.lean",
+  "lean": "/tmp/leangap-ferrosa-sql-wig35udw/FerrosaSql.lean",
   "translation_errors": 0,
   "translation_unique_reported": null,
   "translation_messages": [],
   "aeneas_exit": 1,
-  "lean_errors": 89,
+  "lean_errors": 86,
   "errors": [
     {
       "location": "FerrosaSql.lean:2792:18",
@@ -14,124 +14,244 @@
       "message": "Unknown constant `ferrosa_sql.core.option.Iter.Insts.CoreIterTraitsIteratorIteratorSharedAA`"
     },
     {
-      "location": "FerrosaSql.lean:6828:2",
+      "location": "FerrosaSql.lean:6454:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serializer`"
     },
     {
-      "location": "FerrosaSql.lean:6842:2",
+      "location": "FerrosaSql.lean:6468:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaSql.lean:7130:2",
+      "location": "FerrosaSql.lean:6756:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserializer`"
     },
     {
-      "location": "FerrosaSql.lean:7141:2",
+      "location": "FerrosaSql.lean:6767:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaSql.lean:7377:2",
+      "location": "FerrosaSql.lean:7003:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serializer`"
     },
     {
-      "location": "FerrosaSql.lean:7391:2",
+      "location": "FerrosaSql.lean:7017:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaSql.lean:7414:2",
+      "location": "FerrosaSql.lean:7040:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserializer`"
     },
     {
-      "location": "FerrosaSql.lean:7425:2",
+      "location": "FerrosaSql.lean:7051:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaSql.lean:7819:2",
+      "location": "FerrosaSql.lean:7583:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serializer`"
     },
     {
-      "location": "FerrosaSql.lean:7833:2",
+      "location": "FerrosaSql.lean:7597:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaSql.lean:7855:2",
+      "location": "FerrosaSql.lean:7619:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserializer`"
     },
     {
-      "location": "FerrosaSql.lean:7866:2",
+      "location": "FerrosaSql.lean:7630:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaSql.lean:7952:20",
+      "location": "FerrosaSql.lean:7716:20",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaSql.lean:7961:31",
+      "location": "FerrosaSql.lean:7725:31",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaSql.lean:8451:2",
+      "location": "FerrosaSql.lean:8215:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serializer`"
     },
     {
-      "location": "FerrosaSql.lean:8465:2",
+      "location": "FerrosaSql.lean:8229:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaSql.lean:8487:2",
+      "location": "FerrosaSql.lean:8251:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserializer`"
     },
     {
-      "location": "FerrosaSql.lean:8497:2",
+      "location": "FerrosaSql.lean:8261:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaSql.lean:9295:2",
+      "location": "FerrosaSql.lean:9059:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaSql.lean:9296:2",
+      "location": "FerrosaSql.lean:9060:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serializer`"
     },
     {
-      "location": "FerrosaSql.lean:9312:32",
+      "location": "FerrosaSql.lean:9076:32",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaSql.lean:9313:2",
+      "location": "FerrosaSql.lean:9077:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaSql.lean:9338:33",
+      "location": "FerrosaSql.lean:9102:33",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaSql.lean:9339:34",
+      "location": "FerrosaSql.lean:9103:34",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserializer`"
+    },
+    {
+      "location": "FerrosaSql.lean:9116:33",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaSql.lean:9117:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaSql.lean:9132:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaSql.lean:9153:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserializer`"
+    },
+    {
+      "location": "FerrosaSql.lean:9164:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaSql.lean:9179:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserializer`"
+    },
+    {
+      "location": "FerrosaSql.lean:9187:41",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaSql.lean:9201:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserializer`"
+    },
+    {
+      "location": "FerrosaSql.lean:9209:40",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaSql.lean:9223:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserializer`"
+    },
+    {
+      "location": "FerrosaSql.lean:9231:40",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaSql.lean:9245:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserializer`"
+    },
+    {
+      "location": "FerrosaSql.lean:9253:40",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaSql.lean:9267:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserializer`"
+    },
+    {
+      "location": "FerrosaSql.lean:9275:40",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaSql.lean:9289:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserializer`"
+    },
+    {
+      "location": "FerrosaSql.lean:9299:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaSql.lean:9314:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaSql.lean:9314:51",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserializer`"
+    },
+    {
+      "location": "FerrosaSql.lean:9325:21",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaSql.lean:9325:52",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaSql.lean:9341:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaSql.lean:9341:51",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserializer`"
+    },
+    {
+      "location": "FerrosaSql.lean:9352:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
       "location": "FerrosaSql.lean:9352:33",
@@ -139,326 +259,191 @@
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaSql.lean:9353:2",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserialize`"
-    },
-    {
       "location": "FerrosaSql.lean:9368:2",
       "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserializer`"
+    },
+    {
+      "location": "FerrosaSql.lean:9378:2",
+      "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaSql.lean:9389:2",
+      "location": "FerrosaSql.lean:9393:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaSql.lean:9393:51",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserializer`"
     },
     {
-      "location": "FerrosaSql.lean:9400:2",
+      "location": "FerrosaSql.lean:9403:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaSql.lean:9415:2",
+      "location": "FerrosaSql.lean:9403:33",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaSql.lean:9418:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `serde_core.de.Deserialize`"
+    },
+    {
+      "location": "FerrosaSql.lean:9418:51",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserializer`"
     },
     {
-      "location": "FerrosaSql.lean:9423:41",
+      "location": "FerrosaSql.lean:9429:26",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaSql.lean:9437:2",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserializer`"
-    },
-    {
-      "location": "FerrosaSql.lean:9445:40",
+      "location": "FerrosaSql.lean:9430:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaSql.lean:9459:2",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserializer`"
-    },
-    {
-      "location": "FerrosaSql.lean:9467:40",
+      "location": "FerrosaSql.lean:9502:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaSql.lean:9481:2",
+      "location": "FerrosaSql.lean:9513:2",
       "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserializer`"
-    },
-    {
-      "location": "FerrosaSql.lean:9489:40",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserialize`"
-    },
-    {
-      "location": "FerrosaSql.lean:9503:2",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserializer`"
-    },
-    {
-      "location": "FerrosaSql.lean:9511:40",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserialize`"
+      "message": "Unknown identifier `serde_core.de.Visitor`"
     },
     {
       "location": "FerrosaSql.lean:9525:2",
       "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserializer`"
+      "message": "Unknown identifier `serde_core.de.Visitor`"
     },
     {
-      "location": "FerrosaSql.lean:9535:2",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserialize`"
-    },
-    {
-      "location": "FerrosaSql.lean:9550:2",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserialize`"
-    },
-    {
-      "location": "FerrosaSql.lean:9550:51",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserializer`"
-    },
-    {
-      "location": "FerrosaSql.lean:9561:21",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserialize`"
-    },
-    {
-      "location": "FerrosaSql.lean:9561:52",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserialize`"
-    },
-    {
-      "location": "FerrosaSql.lean:9577:2",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserialize`"
-    },
-    {
-      "location": "FerrosaSql.lean:9577:51",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserializer`"
-    },
-    {
-      "location": "FerrosaSql.lean:9588:2",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserialize`"
-    },
-    {
-      "location": "FerrosaSql.lean:9588:33",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserialize`"
-    },
-    {
-      "location": "FerrosaSql.lean:9604:2",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserializer`"
-    },
-    {
-      "location": "FerrosaSql.lean:9614:2",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserialize`"
-    },
-    {
-      "location": "FerrosaSql.lean:9629:2",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserialize`"
-    },
-    {
-      "location": "FerrosaSql.lean:9629:51",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserializer`"
-    },
-    {
-      "location": "FerrosaSql.lean:9639:2",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserialize`"
-    },
-    {
-      "location": "FerrosaSql.lean:9639:33",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserialize`"
-    },
-    {
-      "location": "FerrosaSql.lean:9654:2",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserialize`"
-    },
-    {
-      "location": "FerrosaSql.lean:9654:51",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserializer`"
-    },
-    {
-      "location": "FerrosaSql.lean:9665:26",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserialize`"
-    },
-    {
-      "location": "FerrosaSql.lean:9666:2",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserialize`"
-    },
-    {
-      "location": "FerrosaSql.lean:9738:2",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Deserialize`"
-    },
-    {
-      "location": "FerrosaSql.lean:9749:2",
+      "location": "FerrosaSql.lean:9537:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Visitor`"
     },
     {
-      "location": "FerrosaSql.lean:9761:2",
+      "location": "FerrosaSql.lean:9549:25",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Visitor`"
     },
     {
-      "location": "FerrosaSql.lean:9773:2",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Visitor`"
-    },
-    {
-      "location": "FerrosaSql.lean:9785:25",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.de.Visitor`"
-    },
-    {
-      "location": "FerrosaSql.lean:9786:22",
+      "location": "FerrosaSql.lean:9550:22",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserializer`"
     },
     {
-      "location": "FerrosaSql.lean:9797:25",
+      "location": "FerrosaSql.lean:9561:25",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Visitor`"
     },
     {
-      "location": "FerrosaSql.lean:9798:19",
+      "location": "FerrosaSql.lean:9562:19",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.SeqAccess`"
     },
     {
-      "location": "FerrosaSql.lean:9809:25",
+      "location": "FerrosaSql.lean:9573:25",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Visitor`"
     },
     {
-      "location": "FerrosaSql.lean:9810:19",
+      "location": "FerrosaSql.lean:9574:19",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.MapAccess`"
     },
     {
-      "location": "FerrosaSql.lean:9821:52",
+      "location": "FerrosaSql.lean:9585:52",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Visitor`"
     },
     {
-      "location": "FerrosaSql.lean:9822:35",
+      "location": "FerrosaSql.lean:9586:35",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.EnumAccess`"
     },
     {
-      "location": "FerrosaSql.lean:9834:2",
+      "location": "FerrosaSql.lean:9598:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.SeqAccess`"
     },
     {
-      "location": "FerrosaSql.lean:9835:2",
+      "location": "FerrosaSql.lean:9599:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaSql.lean:9846:2",
+      "location": "FerrosaSql.lean:9610:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.MapAccess`"
     },
     {
-      "location": "FerrosaSql.lean:9847:2",
+      "location": "FerrosaSql.lean:9611:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaSql.lean:9858:2",
+      "location": "FerrosaSql.lean:9622:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.MapAccess`"
     },
     {
-      "location": "FerrosaSql.lean:9859:2",
+      "location": "FerrosaSql.lean:9623:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaSql.lean:9870:28",
+      "location": "FerrosaSql.lean:9634:28",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.EnumAccess`"
     },
     {
-      "location": "FerrosaSql.lean:9871:38",
+      "location": "FerrosaSql.lean:9635:38",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaSql.lean:9882:2",
+      "location": "FerrosaSql.lean:9646:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.VariantAccess`"
     },
     {
-      "location": "FerrosaSql.lean:9883:2",
+      "location": "FerrosaSql.lean:9647:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaSql.lean:9907:2",
+      "location": "FerrosaSql.lean:9671:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serializer`"
     },
     {
-      "location": "FerrosaSql.lean:9918:40",
+      "location": "FerrosaSql.lean:9682:40",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaSql.lean:9943:2",
+      "location": "FerrosaSql.lean:9707:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serializer`"
     },
     {
-      "location": "FerrosaSql.lean:9954:39",
+      "location": "FerrosaSql.lean:9718:39",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
-    },
-    {
-      "location": "FerrosaSql.lean:9979:2",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.ser.Serializer`"
-    },
-    {
-      "location": "FerrosaSql.lean:9990:39",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.ser.Serialize`"
-    },
-    {
-      "location": "FerrosaSql.lean:10015:2",
-      "kind": "lean.unknownIdentifier",
-      "message": "Unknown identifier `serde_core.ser.Serializer`"
     }
   ],
-  "sorry_declarations": 626,
+  "sorry_declarations": 608,
   "compiled": false,
   "crate": "ferrosa-sql",
   "prefix": "ferrosa_sql::*",
-  "generated_at": "2026-11-18T07:15:44+00:00",
+  "generated_at": "2026-11-18T16:01:18+00:00",
   "memory_max": "9600M",
   "toolchain": {
     "charon": "/tmp/oomcat/aeneas-arc/charon/bin/charon",

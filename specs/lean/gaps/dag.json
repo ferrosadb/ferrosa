@@ -144,6 +144,7 @@
       "ferrosa-common"
     ],
     "ferrosa-jepsen": [
+      "ferrosa-common",
       "ferrosa-sim"
     ],
     "ferrosa-loadgen": [

@@ -1,7 +1,7 @@
 {
   "stage": "aeneas",
   "llbc": "/home/bkearns/src/ferrosa-suite/ferrosa-wt-oom-burndown/ferrosa_flight.llbc",
-  "lean": "/tmp/leangap-ferrosa-flight-1vtrhdyf/FerrosaFlight.lean",
+  "lean": "/tmp/leangap-ferrosa-flight-ucq001qg/FerrosaFlight.lean",
   "translation_errors": 0,
   "translation_unique_reported": null,
   "translation_messages": [],
@@ -153,7 +153,7 @@
   "compiled": false,
   "crate": "ferrosa-flight",
   "prefix": "ferrosa_flight::*",
-  "generated_at": "2026-11-18T07:07:25+00:00",
+  "generated_at": "2026-11-18T15:49:46+00:00",
   "memory_max": "9600M",
   "toolchain": {
     "charon": "/tmp/oomcat/aeneas-arc/charon/bin/charon",

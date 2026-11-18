@@ -1,7 +1,7 @@
 {
   "stage": "aeneas",
   "llbc": "/home/bkearns/src/ferrosa-suite/ferrosa-wt-oom-burndown/ferrosa_postgres.llbc",
-  "lean": "/tmp/leangap-ferrosa-postgres-hsrittaa/FerrosaPostgres.lean",
+  "lean": "/tmp/leangap-ferrosa-postgres-5b8c7q48/FerrosaPostgres.lean",
   "translation_errors": 0,
   "translation_unique_reported": null,
   "translation_messages": [],
@@ -26,359 +26,359 @@
     {
       "location": "FerrosaPostgres.lean:10778:26",
       "kind": "lean.invalidField",
-      "message": "Invalid field `sorry /- ERROR: unknown identifier\": trait_type_id: trait_decl: capnp::traits::OwnedStruct (id: 86), type name: Reader-/)`: The environment does not contain `sorryAx.\u00absorry /- ERROR: unknown identifier\": trait_type_id: trait_decl: capnp::traits::OwnedStruct (id: 86), type name: Reader"
+      "message": "Invalid field `sorry /- ERROR: unknown identifier\": trait_type_id: trait_decl: capnp::traits::OwnedStruct (id: 85), type name: Reader-/)`: The environment does not contain `sorryAx.\u00absorry /- ERROR: unknown identifier\": trait_type_id: trait_decl: capnp::traits::OwnedStruct (id: 85), type name: Reader"
     },
     {
       "location": "FerrosaPostgres.lean:10813:27",
       "kind": "lean.invalidField",
-      "message": "Invalid field `sorry /- ERROR: unknown identifier\": trait_type_id: trait_decl: capnp::traits::OwnedStruct (id: 86), type name: Builder-/)`: The environment does not contain `sorryAx.\u00absorry /- ERROR: unknown identifier\": trait_type_id: trait_decl: capnp::traits::OwnedStruct (id: 86), type name: Build"
+      "message": "Invalid field `sorry /- ERROR: unknown identifier\": trait_type_id: trait_decl: capnp::traits::OwnedStruct (id: 85), type name: Builder-/)`: The environment does not contain `sorryAx.\u00absorry /- ERROR: unknown identifier\": trait_type_id: trait_decl: capnp::traits::OwnedStruct (id: 85), type name: Build"
     },
     {
-      "location": "FerrosaPostgres.lean:14463:31",
+      "location": "FerrosaPostgres.lean:13680:31",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaPostgres.lean:14464:32",
+      "location": "FerrosaPostgres.lean:13681:32",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaPostgres.lean:14493:31",
+      "location": "FerrosaPostgres.lean:13710:31",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaPostgres.lean:14494:32",
+      "location": "FerrosaPostgres.lean:13711:32",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaPostgres.lean:14529:31",
+      "location": "FerrosaPostgres.lean:13746:31",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     },
     {
-      "location": "FerrosaPostgres.lean:14530:32",
+      "location": "FerrosaPostgres.lean:13747:32",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.de.Deserialize`"
     },
     {
-      "location": "FerrosaPostgres.lean:14632:19",
+      "location": "FerrosaPostgres.lean:13849:19",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `openraft.node.NodeId`"
     },
     {
-      "location": "FerrosaPostgres.lean:14645:19",
+      "location": "FerrosaPostgres.lean:13862:19",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `openraft.node.NodeId`"
     },
     {
-      "location": "FerrosaPostgres.lean:14662:19",
+      "location": "FerrosaPostgres.lean:13879:19",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `openraft.node.NodeId`"
     },
     {
-      "location": "FerrosaPostgres.lean:14745:2",
+      "location": "FerrosaPostgres.lean:13962:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `openraft.type_config.RaftTypeConfig`"
     },
     {
-      "location": "FerrosaPostgres.lean:14816:35",
+      "location": "FerrosaPostgres.lean:14033:35",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `openraft.type_config.RaftTypeConfig`"
     },
     {
-      "location": "FerrosaPostgres.lean:14833:35",
+      "location": "FerrosaPostgres.lean:14050:35",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `openraft.type_config.RaftTypeConfig`"
     },
     {
-      "location": "FerrosaPostgres.lean:14849:2",
+      "location": "FerrosaPostgres.lean:14066:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `openraft.type_config.RaftTypeConfig`"
     },
     {
-      "location": "FerrosaPostgres.lean:14851:12",
+      "location": "FerrosaPostgres.lean:14068:12",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `openraft.entry.payload.EntryPayload`"
     },
     {
-      "location": "FerrosaPostgres.lean:14880:40",
+      "location": "FerrosaPostgres.lean:14097:40",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:15122:37",
+      "location": "FerrosaPostgres.lean:14339:37",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:15193:37",
+      "location": "FerrosaPostgres.lean:14410:37",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:15225:33",
+      "location": "FerrosaPostgres.lean:14442:33",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:15248:5",
+      "location": "FerrosaPostgres.lean:14465:5",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:15258:37",
+      "location": "FerrosaPostgres.lean:14475:37",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:15268:37",
+      "location": "FerrosaPostgres.lean:14485:37",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:15303:37",
+      "location": "FerrosaPostgres.lean:14520:37",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:15313:38",
+      "location": "FerrosaPostgres.lean:14530:38",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:15323:38",
+      "location": "FerrosaPostgres.lean:14540:38",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:15392:32",
+      "location": "FerrosaPostgres.lean:14609:32",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:15402:32",
+      "location": "FerrosaPostgres.lean:14619:32",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:15435:66",
+      "location": "FerrosaPostgres.lean:14652:66",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:15445:68",
+      "location": "FerrosaPostgres.lean:14662:68",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:15455:60",
+      "location": "FerrosaPostgres.lean:14672:60",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:15529:36",
+      "location": "FerrosaPostgres.lean:14689:34",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:15558:37",
+      "location": "FerrosaPostgres.lean:14808:36",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:15669:68",
+      "location": "FerrosaPostgres.lean:14837:37",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:15737:61",
+      "location": "FerrosaPostgres.lean:14948:68",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:15892:66",
+      "location": "FerrosaPostgres.lean:15016:61",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:15932:68",
+      "location": "FerrosaPostgres.lean:15171:66",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:16102:32",
+      "location": "FerrosaPostgres.lean:15211:68",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:16244:32",
+      "location": "FerrosaPostgres.lean:15381:32",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:16399:37",
+      "location": "FerrosaPostgres.lean:15523:32",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:16409:37",
+      "location": "FerrosaPostgres.lean:15678:37",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:16426:39",
+      "location": "FerrosaPostgres.lean:15688:37",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:16443:39",
+      "location": "FerrosaPostgres.lean:15705:39",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:16494:64",
+      "location": "FerrosaPostgres.lean:15722:39",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:16504:62",
+      "location": "FerrosaPostgres.lean:15773:64",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:16577:38",
+      "location": "FerrosaPostgres.lean:15783:62",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:16594:68",
+      "location": "FerrosaPostgres.lean:15856:38",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:16604:74",
+      "location": "FerrosaPostgres.lean:15873:68",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:16614:78",
+      "location": "FerrosaPostgres.lean:15883:74",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:16624:64",
+      "location": "FerrosaPostgres.lean:15893:78",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:16634:66",
+      "location": "FerrosaPostgres.lean:15903:64",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:16644:63",
+      "location": "FerrosaPostgres.lean:15913:66",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:16654:65",
+      "location": "FerrosaPostgres.lean:15923:63",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:16698:44",
+      "location": "FerrosaPostgres.lean:15933:65",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:16708:61",
+      "location": "FerrosaPostgres.lean:15977:44",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:18111:31",
+      "location": "FerrosaPostgres.lean:15987:61",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:18120:31",
+      "location": "FerrosaPostgres.lean:17390:31",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:18129:31",
+      "location": "FerrosaPostgres.lean:17399:31",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:18150:32",
+      "location": "FerrosaPostgres.lean:17408:31",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:18160:32",
+      "location": "FerrosaPostgres.lean:17429:32",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:18169:32",
+      "location": "FerrosaPostgres.lean:17439:32",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:18179:32",
+      "location": "FerrosaPostgres.lean:17448:32",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:18188:32",
+      "location": "FerrosaPostgres.lean:17458:32",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:18198:32",
+      "location": "FerrosaPostgres.lean:17467:32",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:18207:29",
+      "location": "FerrosaPostgres.lean:17477:32",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:18216:29",
+      "location": "FerrosaPostgres.lean:17486:29",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:18225:32",
+      "location": "FerrosaPostgres.lean:17495:29",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:18235:32",
+      "location": "FerrosaPostgres.lean:17504:32",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:18244:32",
+      "location": "FerrosaPostgres.lean:17514:32",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaPostgres.lean:18254:32",
+      "location": "FerrosaPostgres.lean:17523:32",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     }
   ],
-  "sorry_declarations": 889,
+  "sorry_declarations": 842,
   "compiled": false,
   "crate": "ferrosa-postgres",
   "prefix": "ferrosa_postgres::*",
-  "generated_at": "2026-11-18T07:17:52+00:00",
+  "generated_at": "2026-11-18T16:03:46+00:00",
   "memory_max": "9600M",
   "toolchain": {
     "charon": "/tmp/oomcat/aeneas-arc/charon/bin/charon",
