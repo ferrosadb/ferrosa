@@ -6,7 +6,7 @@ pub mod node;
 pub mod switchover;
 
 pub use coordinator::PairCoordinator;
-pub use handler::PairWriteForwardHandler;
+pub use handler::{PairBatchForwardHandler, PairWriteForwardHandler};
 pub use node::PairNode;
 
 use std::net::SocketAddr;
