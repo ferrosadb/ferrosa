@@ -1,6 +1,7 @@
-//! Last revised: 2026-10-23
-//! Last changed: Decode compressed chunks into bounded reusable storage.
-//! Correctness: Cursor parity, corruption and ordinal-remap tests.
+//! Last revised: 2026-11-15
+//! Last changed: decompress enforces the caller's output bound via decompress_into.
+//! Correctness: Cursor parity, corruption, ordinal-remap and bounded-decode tests.
+
 //!
 //! Compression and CompressionInfo for SSTable data chunks.
 //!
@@ -268,13 +269,11 @@ impl Compression {
     }
 
     /// Decompress a block of data.
-    pub fn decompress(&self, data: &[u8], _uncompressed_len: usize) -> Result<Vec<u8>> {
-        match self {
-            Compression::None => Ok(data.to_vec()),
-            Compression::Lz4 => lz4_flex::decompress_size_prepended(data)
-                .map_err(|e| Error::InvalidData(format!("LZ4 decompression failed: {e}"))),
-            Compression::Zstd { .. } => zstd::decode_all(data).map_err(Error::Io),
-        }
+    pub fn decompress(&self, data: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
+        let mut out = vec![0u8; uncompressed_len];
+        let written = self.decompress_into(data, &mut out)?;
+        out.truncate(written);
+        Ok(out)
     }
 
     /// Decode into bounded caller-owned storage. Malformed or oversized frames
@@ -579,6 +578,92 @@ mod tests {
         let compressed = compression.compress(data).unwrap();
         let decompressed = compression.decompress(&compressed, data.len()).unwrap();
         assert_eq!(decompressed, data);
+    }
+
+    // --- Bounded decompression: enforce caller-provided output limits ---
+
+    /// decompress takes uncompressed_len and must treat it as a limit, not a hint:
+    /// the same rule decompress_into documents ("Malformed or oversized frames fail
+    /// instead of expanding a buffer from a wire-declared size") and the same check
+    /// reader.rs performs by hand on the LZ4 prefix before it calls decompress_into.
+    ///
+    /// Mismatch is deliberately small (11 vs 4) so the failure cannot be an OOM: even a
+    /// buggy decoder allocates 11 bytes here.
+    #[test]
+    fn decompress_refuses_a_payload_that_declares_more_than_the_caller_allowed() {
+        let compression = Compression::Lz4;
+        let data = b"hello world";
+        let compressed = compression.compress(data).unwrap();
+
+        // Prove the fixture is well formed: LZ4 prepends a little-endian u32 size, and it
+        // really does declare 11. Without this a corrupt frame could look like a bound failure.
+        assert_eq!(
+            u32::from_le_bytes([compressed[0], compressed[1], compressed[2], compressed[3]]),
+            11,
+            "the LZ4 prefix must declare the 11-byte payload"
+        );
+
+        // Positive control: a truthful limit still decodes, so a pass below cannot be the
+        // decoder being broken in general.
+        let decoded = compression.decompress(&compressed, data.len()).unwrap();
+        assert_eq!(
+            decoded, data,
+            "a limit equal to the real length must decode"
+        );
+
+        // The contract: 4 bytes of room may not yield 11 bytes of output — neither as a
+        // successful over-long result nor as a silent truncation.
+        match compression.decompress(&compressed, 4) {
+            Ok(decoded) => panic!(
+                "a payload declaring 11 bytes satisfied a 4-byte limit: returned {} byte(s): {:?}",
+                decoded.len(),
+                String::from_utf8_lossy(&decoded)
+            ),
+            Err(Error::InvalidData(_)) => {} // the behaviour the fix must produce
+            Err(other) => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decompress_none_refuses_more_than_the_caller_allowed() {
+        let compression = Compression::None;
+        let data = b"hello world";
+        let compressed = compression.compress(data).unwrap();
+
+        // A valid output limit succeeds.
+        let decoded = compression.decompress(&compressed, data.len()).unwrap();
+        assert_eq!(decoded, data);
+
+        // Eleven bytes must not fit into a four-byte limit.
+        match compression.decompress(&compressed, 4) {
+            Ok(decoded) => panic!(
+                "uncompressed payload exceeded limit: returned {} bytes",
+                decoded.len()
+            ),
+            Err(Error::InvalidData(_)) => {}
+            Err(other) => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decompress_zstd_refuses_more_than_the_caller_allowed() {
+        let compression = Compression::Zstd { level: 3 };
+        let data = b"hello world";
+        let compressed = compression.compress(data).unwrap();
+
+        // A valid output limit succeeds.
+        let decoded = compression.decompress(&compressed, data.len()).unwrap();
+        assert_eq!(decoded, data);
+
+        // An oversized result must be rejected.
+        match compression.decompress(&compressed, 4) {
+            Ok(decoded) => panic!(
+                "zstd payload exceeded limit: returned {} bytes",
+                decoded.len()
+            ),
+            Err(Error::InvalidData(_)) | Err(Error::Io(_)) => {}
+            Err(other) => panic!("expected bounded-decode error, got {other:?}"),
+        }
     }
 
     #[test]

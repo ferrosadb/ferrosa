@@ -102,6 +102,23 @@ resolution beyond the serialization header, or cluster routing.
   fresh 32 KiB `Vec` per call with no way to reuse it. `compress_into`'s
   output is proven byte-identical to `compress`'s for every codec
   (`compress_into_matches_compress_*`, `ferrosa-sstable/src/compression.rs`).
+
+  `decompress(data, uncompressed_len)` is the allocating counterpart of
+  `decompress_into` and enforces the caller-provided output bound.
+  If a compressed payload requires more output space than the caller allows,
+  decompression returns an error rather than an oversized buffer.
+  Regression tests cover None, Lz4, and Zstd:
+  `decompress_none_refuses_more_than_the_caller_allowed`,
+  `decompress_refuses_a_payload_that_declares_more_than_the_caller_allowed`,
+  and `decompress_zstd_refuses_more_than_the_caller_allowed`.
+
+  This is a per-call output bound, not a process-wide memory budget.
+  The caller still determines the initial allocation size, and
+  `chunk_length` loaded from `CompressionInfo.db` remains a separate
+  potential source of large allocations.
+
+
+
   **`Lz4` is not fully allocation-free**: `lz4_flex` 0.11's public block API
   always allocates a fresh match-finding hash table per call (no reusable
   state is exposed); `tests/compress_into_alloc.rs` measures and documents
