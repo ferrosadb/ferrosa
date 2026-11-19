@@ -278,6 +278,12 @@ impl ModeController {
         ));
         self.registry
             .register(MsgType::PairWriteForward, write_fwd_handler);
+        let batch_fwd_handler = Arc::new(crate::pair::handler::PairBatchForwardHandler::new(
+            role_arc.clone(),
+            coordinator.clone(),
+        ));
+        self.registry
+            .register(MsgType::PairBatchForward, batch_fwd_handler);
 
         let role_swap_handler = Arc::new(crate::pair::switchover::RoleSwapHandler::durable(
             self.local_host_id,

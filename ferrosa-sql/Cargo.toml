@@ -16,9 +16,6 @@ uuid = { version = "1", features = ["serde", "v4"] }
 num-bigint = { version = "0.4", features = ["serde"] }
 num-traits = "0.2"
 stacker = "0.1"
-# Calendar math to parse typed temporal literals (`TIMESTAMP '...'`, `DATE '...'`,
-# `TIME '...'`) into the engine's epoch-based integer reprs. `std` only.
-chrono = { version = "0.4", default-features = false, features = ["std"] }
 # Spill-to-disk for the blocking operators (sort / hash aggregate / join build /
 # DISTINCT dedup) reuses the storage engine's bounded external merge sort and its
 # cancellable temp-table reservation, exactly as ferrosa-graph and ferrosa-cql do

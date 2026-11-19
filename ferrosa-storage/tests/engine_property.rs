@@ -1,6 +1,7 @@
 //! Property tests for StorageEngine invariants.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use proptest::prelude::*;
@@ -95,7 +96,7 @@ proptest! {
             let key = make_key(key_str);
             let ts = i as i64 + 1;
             engine
-                .write(&tid, &key, make_row(key_str.as_bytes(), ts), ts)
+                .write(&tid, &key, Arc::new(make_row(key_str.as_bytes(), ts)), ts)
                 .unwrap();
         }
 
@@ -130,7 +131,7 @@ proptest! {
             let key = make_key(key_str);
             let ts = i as i64 + 1;
             engine
-                .write(&tid, &key, make_row(key_str.as_bytes(), ts), ts)
+                .write(&tid, &key, Arc::new(make_row(key_str.as_bytes(), ts)), ts)
                 .unwrap();
         }
 
@@ -169,7 +170,7 @@ proptest! {
             let val = format!("value_{i}");
             let ts = (i as i64 + 1) * 1000;
             engine
-                .write(&tid, &key, make_row(val.as_bytes(), ts), ts)
+                .write(&tid, &key, Arc::new(make_row(val.as_bytes(), ts)), ts)
                 .unwrap();
             last_value = val.into_bytes();
 

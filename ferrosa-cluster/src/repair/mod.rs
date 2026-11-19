@@ -41,6 +41,8 @@ pub use scheduler::{
 };
 pub use trigger::{ClusterRepairTrigger, ExecutorProvider};
 
+use std::sync::Arc;
+
 use ferrosa_sstable::types::Partition;
 use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::TableId;
@@ -338,9 +340,9 @@ fn reconcile_row(a: &ferrosa_sstable::types::Row, b: &ferrosa_sstable::types::Ro
 #[derive(Default)]
 struct PartitionMerge {
     /// Rows to stream A→B.
-    to_b: Vec<ferrosa_sstable::types::Row>,
+    to_b: Vec<Arc<ferrosa_sstable::types::Row>>,
     /// Rows to stream B→A.
-    to_a: Vec<ferrosa_sstable::types::Row>,
+    to_a: Vec<Arc<ferrosa_sstable::types::Row>>,
     /// At least one row was settled by comparing values at an equal timestamp
     /// rather than by timestamp alone, or partition-level state diverged.
     /// Reported as `timestamp_ties` for observability — the replicas still
@@ -380,12 +382,12 @@ fn merge_partition_rows(a: &Partition, b: &Partition) -> PartitionMerge {
         merge.partition_state_diverged = true;
     }
 
-    let rows_b: std::collections::BTreeMap<&[u8], &ferrosa_sstable::types::Row> = b
+    let rows_b: std::collections::BTreeMap<&[u8], &Arc<ferrosa_sstable::types::Row>> = b
         .rows
         .iter()
         .map(|r| (r.clustering.as_slice(), r))
         .collect();
-    let rows_a: std::collections::BTreeMap<&[u8], &ferrosa_sstable::types::Row> = a
+    let rows_a: std::collections::BTreeMap<&[u8], &Arc<ferrosa_sstable::types::Row>> = a
         .rows
         .iter()
         .map(|r| (r.clustering.as_slice(), r))
@@ -394,7 +396,7 @@ fn merge_partition_rows(a: &Partition, b: &Partition) -> PartitionMerge {
     for (clustering, row_a) in &rows_a {
         match rows_b.get(clustering) {
             // Present only on A — no ambiguity, B needs it.
-            None => merge.to_b.push((*row_a).clone()),
+            None => merge.to_b.push(Arc::clone(row_a)),
             Some(row_b) => match reconcile_row(row_a, row_b) {
                 RowVerdict::Agree => {}
                 RowVerdict::Stream {
@@ -403,10 +405,10 @@ fn merge_partition_rows(a: &Partition, b: &Partition) -> PartitionMerge {
                     tiebreak,
                 } => {
                     if to_a {
-                        merge.to_a.push((*row_b).clone());
+                        merge.to_a.push(Arc::clone(row_b));
                     }
                     if to_b {
-                        merge.to_b.push((*row_a).clone());
+                        merge.to_b.push(Arc::clone(row_a));
                     }
                     // The rows differ, yet neither carries anything that would
                     // change the other: row-level state diverged in a way
@@ -421,14 +423,14 @@ fn merge_partition_rows(a: &Partition, b: &Partition) -> PartitionMerge {
     }
     for (clustering, row_b) in &rows_b {
         if !rows_a.contains_key(clustering) {
-            merge.to_a.push((*row_b).clone());
+            merge.to_a.push(Arc::clone(row_b));
         }
     }
     merge
 }
 
 /// A copy of `src` carrying only `rows` — the trimmed partition to stream.
-fn partition_with_rows(src: &Partition, rows: Vec<ferrosa_sstable::types::Row>) -> Partition {
+fn partition_with_rows(src: &Partition, rows: Vec<Arc<ferrosa_sstable::types::Row>>) -> Partition {
     Partition {
         key: src.key.clone(),
         deletion: src.deletion,
@@ -498,12 +500,22 @@ fn row_content_hash(row: &ferrosa_sstable::types::Row) -> u64 {
 /// observability, not a blocker: repair converges those rows too, because
 /// leaving them alone left replicas divergent forever while reporting success.
 pub fn diff_partition_sets(a: &[Partition], b: &[Partition]) -> RepairPlan {
+    diff_partition_refs(a, b)
+}
+
+/// [`diff_partition_sets`] over borrowed partitions, so a caller that filters
+/// a larger slice (one Merkle leaf of it) does not have to copy the matches
+/// into a new Vec first. Only partitions the plan streams are cloned.
+pub fn diff_partition_refs<'p>(
+    a: impl IntoIterator<Item = &'p Partition>,
+    b: impl IntoIterator<Item = &'p Partition>,
+) -> RepairPlan {
     use std::collections::HashMap;
     // Key the lookups by raw partition-key bytes — DecoratedKey isn't Hash.
     let a_by_key: HashMap<&[u8], &Partition> =
-        a.iter().map(|p| (p.key.key.as_bytes(), p)).collect();
+        a.into_iter().map(|p| (p.key.key.as_bytes(), p)).collect();
     let b_by_key: HashMap<&[u8], &Partition> =
-        b.iter().map(|p| (p.key.key.as_bytes(), p)).collect();
+        b.into_iter().map(|p| (p.key.key.as_bytes(), p)).collect();
     let mut plan = RepairPlan::default();
 
     for (key, p_a) in &a_by_key {
@@ -645,7 +657,7 @@ where
 /// 1. Build a Merkle tree on each side.
 /// 2. Find the leaves where the trees diverge.
 /// 3. For each divergent leaf, filter partitions to that sub-range and
-///    diff with [`diff_partition_sets`].
+///    diff the borrowed matches with [`diff_partition_refs`].
 /// 4. Union the per-leaf diffs.
 ///
 /// Pure function — does no I/O. Storage-side callers should first
@@ -676,17 +688,11 @@ pub fn compute_repair_plan(
 
     let mut plan = RepairPlan::default();
     for (sub_start, sub_end) in divergent {
-        let a_in_leaf: Vec<Partition> = parts_a
-            .iter()
-            .filter(|p| p.key.token.0 >= sub_start && p.key.token.0 < sub_end)
-            .cloned()
-            .collect();
-        let b_in_leaf: Vec<Partition> = parts_b
-            .iter()
-            .filter(|p| p.key.token.0 >= sub_start && p.key.token.0 < sub_end)
-            .cloned()
-            .collect();
-        let sub_plan = diff_partition_sets(&a_in_leaf, &b_in_leaf);
+        let in_leaf = |p: &&Partition| p.key.token.0 >= sub_start && p.key.token.0 < sub_end;
+        let sub_plan = diff_partition_refs(
+            parts_a.iter().filter(in_leaf),
+            parts_b.iter().filter(in_leaf),
+        );
         plan.a_to_b.extend(sub_plan.a_to_b);
         plan.b_to_a.extend(sub_plan.b_to_a);
         plan.timestamp_ties.extend(sub_plan.timestamp_ties);
@@ -824,7 +830,7 @@ mod tests {
             key: dk,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row],
+            rows: vec![Arc::new(row)],
         }
     }
 
@@ -849,7 +855,7 @@ mod tests {
             key: dk,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row],
+            rows: vec![Arc::new(row)],
         }
     }
 
@@ -936,7 +942,7 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(key.to_vec())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows,
+            rows: rows.into_iter().map(Arc::new).collect(),
         }
     }
 
@@ -995,6 +1001,49 @@ mod tests {
             plan.timestamp_ties.len(),
             1,
             "the genuine conflict must still be surfaced"
+        );
+    }
+
+    /// The per-leaf diff in `compute_repair_plan` must work on borrowed
+    /// partitions. It used to `.cloned()` every partition in every divergent
+    /// leaf into a fresh Vec only to hand out a slice, so a dense leaf held two
+    /// copies of its data. The borrowed diff must decide exactly what the
+    /// slice-based one decides.
+    #[test]
+    fn the_borrowed_diff_decides_exactly_what_the_slice_diff_decides() {
+        let a = vec![
+            multi_row_partition(
+                b"k1",
+                vec![
+                    row_at(b"agreed", b"same", 900),
+                    row_at(b"tied", b"a-version", 500),
+                ],
+            ),
+            multi_row_partition(b"only-a", vec![row_at(b"x", b"a", 10)]),
+        ];
+        let b = vec![
+            multi_row_partition(
+                b"k1",
+                vec![
+                    row_at(b"agreed", b"same", 900),
+                    row_at(b"tied", b"b-version", 500),
+                    row_at(b"only-b", b"new-row", 400),
+                ],
+            ),
+            multi_row_partition(b"only-b", vec![row_at(b"y", b"b", 20)]),
+        ];
+
+        let owned = diff_partition_sets(&a, &b);
+        let borrowed = diff_partition_refs(a.iter(), b.iter());
+
+        assert_eq!(streamed(&borrowed.a_to_b), streamed(&owned.a_to_b));
+        assert_eq!(streamed(&borrowed.b_to_a), streamed(&owned.b_to_a));
+        assert_eq!(borrowed.a_to_b.len(), owned.a_to_b.len());
+        assert_eq!(borrowed.b_to_a.len(), owned.b_to_a.len());
+        assert_eq!(borrowed.timestamp_ties.len(), owned.timestamp_ties.len());
+        assert!(
+            !owned.a_to_b.is_empty() && !owned.b_to_a.is_empty(),
+            "fixture must exercise both directions, or the comparison is vacuous"
         );
     }
 
@@ -1301,7 +1350,7 @@ mod tests {
                 key: DecoratedKey::new(PartitionKey::new(b"k1".to_vec())),
                 deletion: DeletionTime::LIVE,
                 static_row: None,
-                rows,
+                rows: rows.into_iter().map(Arc::new).collect(),
             }
         }
 
@@ -1356,7 +1405,7 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(b"k1".to_vec())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows,
+            rows: rows.into_iter().map(Arc::new).collect(),
         };
         let a = vec![part(vec![
             row(b"shared", b"same", 500),
@@ -1393,7 +1442,7 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(b"k1".to_vec())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows,
+            rows: rows.into_iter().map(Arc::new).collect(),
         };
         // Same clustering, same timestamp, different value: the timestamp alone
         // does not pick a winner.
@@ -1433,7 +1482,7 @@ mod tests {
             key: key.clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row(500)],
+            rows: vec![Arc::new(row(500))],
         }];
         let b = vec![Partition {
             key,
@@ -1442,7 +1491,7 @@ mod tests {
                 local_deletion_time: 1,
             },
             static_row: None,
-            rows: vec![row(500)],
+            rows: vec![Arc::new(row(500))],
         }];
 
         let plan = diff_partition_sets(&a, &b);

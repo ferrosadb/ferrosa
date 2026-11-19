@@ -1,208 +1,298 @@
-//! Bounded COUNT accumulators over a stream of solution mappings.
+//! COUNT accumulators over a stream of solution mappings, with spilled state.
+//!
+//! COUNT never retains its input solutions. What it does retain is spilled:
+//!
+//! - `COUNT(DISTINCT …)` admits each (group, aggregate, value) key once through
+//!   a spilling de-duplication set;
+//! - grouped counts pre-aggregate in a hash map until it reaches the spill
+//!   threshold, then flush partial groups into ferrosa-storage's external
+//!   sorter keyed by the group's canonical bytes; the final merge sums the
+//!   partials of each group as it streams out.
+//!
 //! Correctness: preserve RDF term identity, unbound values and empty-input groups.
-//! Last revised: 2026-10-27
-//! Last changed: Add scalar/grouped COUNT without retaining input solutions.
+//! Last revised: 2026-11-16
+//! Last changed: Spill DISTINCT keys and grouped partials instead of capping them.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::future::ready;
 use std::sync::Arc;
 
+use ferrosa_storage::engine::TempSortTableReservation;
+use ferrosa_storage::external_sort::{ExternalSorter, SortedRows, SpillOrder, SpillRow};
+use futures::stream;
+use futures::{StreamExt, TryStreamExt};
+use serde::{Deserialize, Serialize};
+
 use crate::error::SparqlError;
-use crate::executor::{check_solution_bound, ExecutionLimits};
+use crate::executor::SolutionStream;
 use crate::planner::CountAggregate;
 use crate::results::Binding;
+use crate::spill::{
+    decode_solution_key, solution_key, spill_error, term_key, ExecutionContext, Solution,
+    SpillDedup, TermRef,
+};
 
-type Solution = HashMap<String, Binding>;
-type GroupKey = Vec<Option<Binding>>;
+const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
 
-enum Seen {
-    Terms(HashSet<Binding>),
-    Solutions(HashSet<Arc<Vec<(String, Binding)>>>),
+/// Fold `rows` into COUNT results: one row for a global count, one row per
+/// group otherwise.
+pub(crate) fn count_stream(
+    rows: SolutionStream,
+    variables: Arc<[String]>,
+    specs: Arc<[(String, CountAggregate)]>,
+    cx: ExecutionContext,
+) -> SolutionStream {
+    stream::once(async move {
+        let mut counts = Counts::new(variables, specs, cx);
+        rows.try_for_each(|row| ready(counts.feed(row))).await?;
+        counts.finish()
+    })
+    .try_flatten()
+    .boxed()
 }
 
-struct Counter {
-    value: u64,
-    seen: Option<Seen>,
+/// One group's partial counts, as an external-sort row.
+#[derive(Serialize, Deserialize)]
+struct Partial {
+    key: Vec<u8>,
+    counts: Vec<u64>,
 }
 
-/// Retain only group keys, counters and explicitly requested DISTINCT state.
-pub(crate) struct Counts<'a> {
-    variables: &'a [String],
-    specs: &'a [(String, CountAggregate)],
-    limits: &'a ExecutionLimits,
-    single: Option<Vec<Counter>>,
-    groups: HashMap<GroupKey, Vec<Counter>>,
-    distinct_values: usize,
+impl SpillRow for Partial {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.key.capacity()
+            + self.counts.capacity() * std::mem::size_of::<u64>()
+    }
 }
 
-impl<'a> Counts<'a> {
-    pub(crate) fn new(
-        variables: &'a [String],
-        specs: &'a [(String, CountAggregate)],
-        limits: &'a ExecutionLimits,
+#[derive(Clone, Copy)]
+struct ByKey;
+
+impl SpillOrder<Partial> for ByKey {
+    fn compare(&self, a: &Partial, b: &Partial) -> std::cmp::Ordering {
+        a.key.cmp(&b.key)
+    }
+}
+
+struct Counts {
+    variables: Arc<[String]>,
+    specs: Arc<[(String, CountAggregate)]>,
+    cx: ExecutionContext,
+    /// The global counters (no GROUP BY variables).
+    single: Option<Vec<u64>>,
+    /// Resident partial groups, keyed by canonical group bytes.
+    groups: HashMap<Vec<u8>, Vec<u64>>,
+    group_bytes: usize,
+    spilled: Option<(ExternalSorter<Partial, ByKey>, TempSortTableReservation)>,
+    /// Admitted DISTINCT keys, shared by every DISTINCT aggregate and group.
+    distinct: Option<SpillDedup>,
+}
+
+impl Counts {
+    fn new(
+        variables: Arc<[String]>,
+        specs: Arc<[(String, CountAggregate)]>,
+        cx: ExecutionContext,
     ) -> Self {
+        let distinct = specs
+            .iter()
+            .any(|(_, spec)| spec.distinct)
+            .then(|| cx.dedup("sparql-count-distinct"));
         Self {
+            single: variables.is_empty().then(|| vec![0; specs.len()]),
             variables,
             specs,
-            limits,
-            single: variables.is_empty().then(|| counters(specs)),
+            cx,
             groups: HashMap::new(),
-            distinct_values: 0,
+            group_bytes: 0,
+            spilled: None,
+            distinct,
         }
     }
 
-    pub(crate) fn feed(&mut self, row: Solution) -> Result<(), SparqlError> {
-        let states = if let Some(single) = &mut self.single {
-            single
+    fn feed(&mut self, row: Solution) -> Result<(), SparqlError> {
+        let key = if self.single.is_some() {
+            Vec::new()
         } else {
-            let key: GroupKey = self
-                .variables
-                .iter()
-                .map(|name| row.get(name).cloned())
-                .collect();
-            if !self.groups.contains_key(&key) {
-                check_solution_bound(self.groups.len().saturating_add(1), self.limits)?;
-            }
-            self.groups
-                .entry(key)
-                .or_insert_with(|| counters(self.specs))
+            solution_key(&row, &self.variables)?
         };
-        for ((_, spec), state) in self.specs.iter().zip(states.iter_mut()) {
-            self.distinct_values +=
-                usize::from(state.feed(spec, &row, self.distinct_values, self.limits)?);
+        let increments = self.increments(&key, &row)?;
+        if let Some(single) = self.single.as_mut() {
+            return add(single, &increments);
         }
-        if states
-            .iter()
-            .any(|state| matches!(state.seen, Some(Seen::Solutions(_))))
-        {
-            // COUNT(DISTINCT *) owns exactly the retained solution key. Move its
-            // terms once, then share it across any repeated DISTINCT * aggregates.
-            let mut key: Vec<_> = row.into_iter().collect();
-            key.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-            let key = Arc::new(key);
-            for state in states {
-                self.distinct_values +=
-                    usize::from(state.feed_solution(&key, self.distinct_values, self.limits)?);
-            }
+        if let Some(counts) = self.groups.get_mut(&key) {
+            return add(counts, &increments);
         }
-
+        self.group_bytes += key.capacity() + increments.capacity() * 8 + 64;
+        self.groups.insert(key, increments);
+        if self.group_bytes as u64 >= self.cx.spill_threshold_bytes() {
+            self.flush_groups()?;
+        }
         Ok(())
     }
 
-    pub(crate) fn finish(self) -> Vec<Solution> {
-        if let Some(single) = self.single {
-            vec![finish_group(self.variables, self.specs, vec![], single)]
-        } else {
-            self.groups
-                .into_iter()
-                .map(|(key, states)| finish_group(self.variables, self.specs, key, states))
-                .collect()
+    /// What `row` adds to each aggregate of its group.
+    fn increments(&mut self, group: &[u8], row: &Solution) -> Result<Vec<u64>, SparqlError> {
+        let specs = Arc::clone(&self.specs);
+        let mut increments = Vec::with_capacity(specs.len());
+        for (index, (_, spec)) in specs.iter().enumerate() {
+            let counted = match &spec.expression {
+                Some(expression) => match count_expression(expression, row)? {
+                    None => false,
+                    Some(_) if !spec.distinct => true,
+                    Some(value) => self.admit(group, index, &term_key(&value)?)?,
+                },
+                None if !spec.distinct => true,
+                None => self.admit(group, index, &whole_solution_key(row)?)?,
+            };
+            increments.push(u64::from(counted));
         }
+        Ok(increments)
+    }
+
+    /// Admit a DISTINCT value of aggregate `index` in `group` once.
+    fn admit(&mut self, group: &[u8], index: usize, value: &[u8]) -> Result<bool, SparqlError> {
+        let set = self
+            .distinct
+            .as_mut()
+            .expect("a DISTINCT aggregate always has a set");
+        let mut key = Vec::with_capacity(16 + group.len() + value.len());
+        key.extend_from_slice(&(group.len() as u64).to_le_bytes());
+        key.extend_from_slice(group);
+        key.extend_from_slice(&(index as u64).to_le_bytes());
+        key.extend_from_slice(value);
+        set.insert(&key)
+    }
+
+    /// Move the resident partial groups into the spilling sorter.
+    fn flush_groups(&mut self) -> Result<(), SparqlError> {
+        if self.spilled.is_none() {
+            let dir = self.cx.reserve_dir("sparql-group-by")?;
+            let sorter = ExternalSorter::new(dir.path(), ByKey, self.cx.spill_threshold_bytes());
+            self.spilled = Some((sorter, dir));
+        }
+        let (sorter, _) = self.spilled.as_mut().expect("sorter was just created");
+        for (key, counts) in self.groups.drain() {
+            sorter
+                .push(Partial { key, counts })
+                .map_err(|e| spill_error("GROUP BY", e))?;
+        }
+        self.group_bytes = 0;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<SolutionStream, SparqlError> {
+        let variables = Arc::clone(&self.variables);
+        let specs = Arc::clone(&self.specs);
+        if let Some(single) = self.single.take() {
+            let row = finish_group(&variables, &specs, Vec::new(), single);
+            return Ok(stream::iter([Ok(row)]).boxed());
+        }
+        if self.spilled.is_none() {
+            let rows: Vec<_> = self
+                .groups
+                .drain()
+                .map(|(key, counts)| {
+                    let terms = decode_solution_key(&key)?;
+                    Ok(finish_group(&variables, &specs, terms, counts))
+                })
+                .collect();
+            return Ok(stream::iter(rows).boxed());
+        }
+        self.flush_groups()?;
+        let (sorter, dir) = self.spilled.take().expect("spilled state checked above");
+        self.cx.stats().note_sort_spill();
+        let sorted = sorter.finish().map_err(|e| spill_error("GROUP BY", e))?;
+        Ok(stream::iter(MergedGroups {
+            sorted: sorted.peekable(),
+            variables,
+            specs,
+            _dir: dir,
+        })
+        .boxed())
     }
 }
 
-fn counters(specs: &[(String, CountAggregate)]) -> Vec<Counter> {
-    specs
-        .iter()
-        .map(|(_, spec)| Counter {
-            value: 0,
-            seen: if !spec.distinct {
-                None
-            } else if spec.expression.is_some() {
-                Some(Seen::Terms(HashSet::new()))
-            } else {
-                Some(Seen::Solutions(HashSet::new()))
-            },
-        })
-        .collect()
+/// Sums the sorted partials of each group as they stream out.
+struct MergedGroups {
+    sorted: std::iter::Peekable<SortedRows<Partial, ByKey>>,
+    variables: Arc<[String]>,
+    specs: Arc<[(String, CountAggregate)]>,
+    _dir: TempSortTableReservation,
 }
 
-fn admit_distinct(retained: usize, limits: &ExecutionLimits) -> Result<(), SparqlError> {
-    check_solution_bound(retained.saturating_add(1), limits)
+impl MergedGroups {
+    fn next_group(&mut self) -> Result<Option<Solution>, SparqlError> {
+        let Some(first) = self.sorted.next() else {
+            return Ok(None);
+        };
+        let Partial { key, mut counts } = first.map_err(|e| spill_error("GROUP BY", e))?;
+        while let Some(Ok(next)) = self.sorted.peek() {
+            if next.key != key {
+                break;
+            }
+            let Some(Ok(next)) = self.sorted.next() else {
+                unreachable!("peeked an Ok partial");
+            };
+            add(&mut counts, &next.counts)?;
+        }
+        let terms = decode_solution_key(&key)?;
+        Ok(Some(finish_group(
+            &self.variables,
+            &self.specs,
+            terms,
+            counts,
+        )))
+    }
+}
+
+impl Iterator for MergedGroups {
+    type Item = Result<Solution, SparqlError>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_group().transpose()
+    }
+}
+
+fn add(counts: &mut [u64], increments: &[u64]) -> Result<(), SparqlError> {
+    for (count, inc) in counts.iter_mut().zip(increments) {
+        *count = count
+            .checked_add(*inc)
+            .ok_or_else(|| SparqlError::Execution("COUNT overflow".into()))?;
+    }
+    Ok(())
+}
+
+/// Canonical bytes of a whole solution, for COUNT(DISTINCT *).
+fn whole_solution_key(row: &Solution) -> Result<Vec<u8>, SparqlError> {
+    let mut entries: Vec<(&str, TermRef<'_>)> = row
+        .iter()
+        .map(|(name, value)| (name.as_str(), TermRef::from(value)))
+        .collect();
+    entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    serde_json::to_vec(&entries)
+        .map_err(|e| SparqlError::Execution(format!("COUNT(DISTINCT *) key: {e}")))
 }
 
 fn finish_group(
     variables: &[String],
     specs: &[(String, CountAggregate)],
-    key: GroupKey,
-    states: Vec<Counter>,
+    key: Vec<Option<Binding>>,
+    counts: Vec<u64>,
 ) -> Solution {
     let mut row: Solution = variables
         .iter()
         .zip(key)
         .filter_map(|(name, value)| value.map(|v| (name.clone(), v)))
         .collect();
-    for ((name, _), counter) in specs.iter().zip(states) {
+    for ((name, _), count) in specs.iter().zip(counts) {
         row.insert(
             name.clone(),
-            Binding::literal(
-                counter.value.to_string(),
-                Some("http://www.w3.org/2001/XMLSchema#integer".into()),
-                None,
-            ),
+            Binding::literal(count.to_string(), Some(XSD_INTEGER.into()), None),
         );
     }
     row
-}
-
-impl Counter {
-    /// Count one bound expression/solution, retaining only explicit DISTINCT keys.
-    /// The parent supplies one shared retention budget across groups/aggregates.
-    fn feed(
-        &mut self,
-        spec: &CountAggregate,
-        row: &Solution,
-        retained: usize,
-        limits: &ExecutionLimits,
-    ) -> Result<bool, SparqlError> {
-        let value = spec
-            .expression
-            .as_ref()
-            .map(|expression| count_expression(expression, row))
-            .transpose()?
-            .flatten();
-        if spec.expression.is_some() && value.is_none() {
-            return Ok(false);
-        }
-        let inserted = match &mut self.seen {
-            None => false,
-            Some(Seen::Terms(terms)) => {
-                let value = value.as_ref().expect("COUNT expression has a bound term");
-                if terms.contains(value.as_ref()) {
-                    return Ok(false);
-                }
-                admit_distinct(retained, limits)?;
-                terms.insert(value.as_ref().clone())
-            }
-            Some(Seen::Solutions(_)) => return Ok(false),
-        };
-
-        self.value = self
-            .value
-            .checked_add(1)
-            .ok_or_else(|| SparqlError::Execution("COUNT overflow".into()))?;
-        Ok(inserted)
-    }
-    fn feed_solution(
-        &mut self,
-        key: &Arc<Vec<(String, Binding)>>,
-        retained: usize,
-        limits: &ExecutionLimits,
-    ) -> Result<bool, SparqlError> {
-        let Some(Seen::Solutions(solutions)) = &mut self.seen else {
-            return Ok(false);
-        };
-        if solutions.contains(key) {
-            return Ok(false);
-        }
-        admit_distinct(retained, limits)?;
-        solutions.insert(Arc::clone(key));
-        self.value = self
-            .value
-            .checked_add(1)
-            .ok_or_else(|| SparqlError::Execution("COUNT overflow".into()))?;
-        Ok(true)
-    }
 }
 
 /// Borrow a variable term; only computed expressions need an owned binding.

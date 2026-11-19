@@ -39,7 +39,7 @@ fn evicted_generations_fixture(
     let tid = table_id();
     for i in 0..generations {
         engine
-            .write(&tid, &make_key(&format!("k{i:04}")), make_row(b"shared", 1000), 1000)
+            .write(&tid, &make_key(&format!("k{i:04}")), Arc::new(make_row(b"shared", 1000)), 1000)
             .unwrap();
         engine.flush(&tid).unwrap();
     }
@@ -306,7 +306,7 @@ fn evicted_generation_with_commit_log(
     let tid = table_id();
     for i in 0..5 {
         engine
-            .write(&tid, &make_key(&format!("k{i}")), make_row(b"shared", 1000), 1000)
+            .write(&tid, &make_key(&format!("k{i}")), Arc::new(make_row(b"shared", 1000)), 1000)
             .unwrap();
     }
     engine.flush(&tid).unwrap();
@@ -317,7 +317,7 @@ fn evicted_generation_with_commit_log(
     );
     for key in ["k5", "k6"] {
         engine
-            .write(&tid, &make_key(key), make_row(b"shared", 1000), 1000)
+            .write(&tid, &make_key(key), Arc::new(make_row(b"shared", 1000)), 1000)
             .unwrap();
     }
     drop(engine);
@@ -515,7 +515,7 @@ fn open_engine_reads_and_backfills_a_generation_evicted_at_runtime() {
             .write(
                 &tid,
                 &make_key(&format!("k{i}")),
-                make_row(format!("v{i}").as_bytes(), 1000),
+                Arc::new(make_row(format!("v{i}").as_bytes(), 1000)),
                 1000,
             )
             .unwrap();

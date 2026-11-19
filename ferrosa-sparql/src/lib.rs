@@ -20,9 +20,12 @@ pub mod planner;
 pub mod property_path;
 pub mod rdf_star;
 pub mod results;
+mod spill;
 pub mod triple_store;
 pub mod update;
 
 mod negotiation;
 
 mod protocol;
+
+mod response;

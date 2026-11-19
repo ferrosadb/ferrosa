@@ -158,16 +158,20 @@ pub async fn start_bolt_server(
                 let cfg = config.clone();
                 let tls_acceptor = tls_acceptor.clone();
 
+                // The connection future is boxed: one allocation per connection.
+                // It nests the whole streaming executor, and inline, its layout
+                // exceeds rustc's query depth limit under `--all-features`.
                 tokio::spawn(async move {
                     tracing::debug!(%peer_addr, "Bolt connection accepted");
                     let result = match tls_acceptor {
-                        None => handle_connection(stream, engine, schema, cfg).await,
+                        None => Box::pin(handle_connection(stream, engine, schema, cfg)).await,
                         Some(acceptor) => {
                             match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream))
                                 .await
                             {
                                 Ok(Ok(tls_stream)) => {
-                                    handle_connection(tls_stream, engine, schema, cfg).await
+                                    Box::pin(handle_connection(tls_stream, engine, schema, cfg))
+                                        .await
                                 }
                                 Ok(Err(e)) => {
                                     tracing::warn!(%peer_addr, %e, "Bolt TLS handshake failed");

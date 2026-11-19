@@ -1,0 +1,28 @@
+{
+  "stage": "aeneas",
+  "llbc": "/tmp/oomcat/main-wt/ferrosa_sstable.llbc",
+  "lean": "/tmp/leangap-ferrosa-sstable-bgjhu_bz/FerrosaSstable.lean",
+  "translation_errors": 0,
+  "translation_unique_reported": null,
+  "translation_messages": [],
+  "aeneas_exit": 1,
+  "lean_errors": 1,
+  "errors": [
+    {
+      "location": "FerrosaSstable.lean:161:33",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    }
+  ],
+  "sorry_declarations": 39,
+  "compiled": false,
+  "crate": "ferrosa-sstable",
+  "prefix": "ferrosa_sstable::compression::*",
+  "generated_at": "2026-11-17T18:40:54+00:00",
+  "memory_max": "9600M",
+  "toolchain": {
+    "charon": "/tmp/oomcat/aeneas-arc/charon/bin/charon",
+    "aeneas": "/tmp/oomcat/aeneas-arc/src/_build/default/main.exe",
+    "lean_pkg": "/tmp/oomcat/aeneas-arc/backends/lean"
+  }
+}

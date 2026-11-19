@@ -34,13 +34,14 @@ use crate::adjacency::reconcile::{
 };
 use crate::adjacency::{adjacency_keyspace_name, adjacency_table_metadata};
 use crate::error::{GraphError, Result};
-use crate::executor::aggregate::{create_accumulator, is_aggregate_function};
+use crate::executor::aggregate::{create_accumulator, is_aggregate_function, Accumulator};
 use crate::executor::eval::eval_expr;
 use crate::executor::expand::{
-    build_columns, execute, execute_streaming_owned, sort_rows, GraphEngineConfig, OwnedExecCtx,
+    build_columns, execute_streaming, execute_streaming_owned, GraphEngineConfig, OwnedExecCtx,
 };
 use crate::executor::result::{GraphResult, QueryStats};
-use crate::executor::stream::{collect_to_graph_result, stream_from_rows, RowStream};
+use crate::executor::spill::{OrderSemantics, RowAcc, RowRun};
+use crate::executor::stream::{stream_from_rows, RowStream};
 use crate::executor::subscribe::SubscriptionRegistry;
 use crate::parser::{
     parse, Assignment, Expr, Literal, Pattern, ReturnClause, ReturnItem, Statement, WithPipeline,
@@ -74,12 +75,9 @@ fn adjacency_keyspace_metadata(
     }
 }
 
-/// Present an already-materialized [`GraphResult`] in the streaming shape.
-///
-/// Every use marks a path that genuinely buffers — FOREACH and `CALL {}` (both
-/// orchestrate many sub-executions), and the missing-label short circuit. Naming
-/// it keeps those honest instead of hiding them behind an inline
-/// `stream_from_rows`.
+/// Present an already-complete, fixed-size [`GraphResult`] in the streaming
+/// shape: FOREACH's single status row and the missing-label empty result.
+/// Neither scales with stored data.
 fn buffered_as_stream(result: GraphResult) -> (Vec<String>, RowStream<'static>, QueryStats) {
     (result.columns, stream_from_rows(result.rows), result.stats)
 }
@@ -1392,7 +1390,10 @@ impl GraphEngine {
         });
     }
 
-    /// Execute a Cypher query: parse -> validate -> plan -> execute.
+    /// Execute a Cypher query: parse -> validate -> plan -> execute, and drain
+    /// the result. Test-only: production callers consume
+    /// [`GraphEngine::execute_stream_with_params`] and never hold a result.
+    #[cfg(test)]
     pub async fn execute(
         &self,
         query: &str,
@@ -1403,9 +1404,11 @@ impl GraphEngine {
             .await
     }
 
-    /// Buffered façade over [`GraphEngine::execute_stream_with_params`]: drains
-    /// the row stream into a `GraphResult`. There is one query pipeline, not
-    /// two — this entry point adds only the materialization.
+    /// Test-only buffered façade over
+    /// [`GraphEngine::execute_stream_with_params`]: drains the row stream into
+    /// a `GraphResult`. There is one query pipeline, not two — this entry point
+    /// adds only the materialization, and no production path calls it.
+    #[cfg(test)]
     pub async fn execute_with_params(
         &self,
         query: &str,
@@ -1418,7 +1421,7 @@ impl GraphEngine {
             .await?;
         // `usize::MAX`, deliberately NOT `config.max_result_rows` — matching
         // `executor::expand::execute`, which has never applied a global cap.
-        collect_to_graph_result(columns, rows, stats, usize::MAX).await
+        crate::executor::stream::collect_to_graph_result(columns, rows, stats, usize::MAX).await
     }
 
     /// Execute a query and return its columns, a `'static` row stream, and the
@@ -1773,10 +1776,9 @@ impl GraphEngine {
             return_clause,
         } = statement
         {
-            let result = self
+            return self
                 .execute_call_subquery(*outer, &imports, *inner, return_clause, request)
-                .await?;
-            return Ok(buffered_as_stream(result));
+                .await;
         }
         if let Statement::Unwind {
             expr,
@@ -1785,24 +1787,9 @@ impl GraphEngine {
             ..
         } = &statement
         {
-            let result = self.execute_unwind_write(expr, var, inner, request).await?;
-            return Ok(buffered_as_stream(result));
+            return self.execute_unwind_write(expr, var, inner, request).await;
         }
         self.execute_statement_streaming(statement, request).await
-    }
-
-    /// Validate, plan, and execute a single non-orchestrated statement (i.e. not
-    /// FOREACH / CALL {}, which the engine expands first). Shared by the top-level
-    /// query path and the CALL {} subquery orchestrator.
-    ///
-    /// Buffered façade over [`GraphEngine::execute_statement_streaming`].
-    async fn execute_statement(
-        &self,
-        statement: Statement,
-        request: QueryRequest<'_>,
-    ) -> Result<GraphResult> {
-        let (columns, rows, stats) = self.execute_statement_streaming(statement, request).await?;
-        collect_to_graph_result(columns, rows, stats, usize::MAX).await
     }
 
     /// Create the backing tables a write statement implies.
@@ -1979,7 +1966,9 @@ impl GraphEngine {
             "first-write scalar columns for keyspace '{keyspace}' are not ready after {:?}; retry",self.config.query_timeout)))?
     }
 
-    /// The streaming half of [`GraphEngine::execute_statement`].
+    /// Validate, plan, and execute a single non-orchestrated statement (i.e.
+    /// not FOREACH / CALL {}, which the engine expands first), as a stream.
+    /// Shared by the top-level query path and the orchestrators.
     async fn execute_statement_streaming(
         &self,
         statement: Statement,
@@ -2058,7 +2047,7 @@ impl GraphEngine {
         var: &str,
         inner: &Statement,
         request: QueryRequest<'_>,
-    ) -> Result<GraphResult> {
+    ) -> Result<(Vec<String>, RowStream<'static>, QueryStats)> {
         let list_value = eval_expr(expr, &HashMap::new())
             .map_err(|e| GraphError::Validation(format!("UNWIND list expression: {e}")))?;
         let elements = match list_value {
@@ -2071,27 +2060,38 @@ impl GraphEngine {
             }
         };
 
+        // Every element runs (and writes) before the first row is returned, in
+        // list order; their rows go to one spill-backed run, not a `Vec`.
         let mut columns: Option<Vec<String>> = None;
-        let mut rows: Vec<Vec<Value>> = Vec::new();
+        let mut run: Option<RowRun> = None;
         let mut stats = QueryStats::default();
         for element in &elements {
             let replacement = value_to_expr(element)?;
             let bound = subst_var_statement(inner.clone(), var, &replacement);
-            let result = self.execute_statement(bound, request).await?;
-            stats.vertices_written += result.stats.vertices_written;
-            stats.vertices_read += result.stats.vertices_read;
-            stats.edges_read += result.stats.edges_read;
-            stats.vertices_deleted += result.stats.vertices_deleted;
-            stats.edges_deleted += result.stats.edges_deleted;
-            set_or_check_columns(&mut columns, &result.columns)?;
-            rows.extend(result.rows);
+            let (element_columns, rows, element_stats) =
+                self.execute_statement_streaming(bound, request).await?;
+            stats.vertices_written += element_stats.vertices_written;
+            stats.vertices_read += element_stats.vertices_read;
+            stats.edges_read += element_stats.edges_read;
+            stats.vertices_deleted += element_stats.vertices_deleted;
+            stats.edges_deleted += element_stats.edges_deleted;
+            set_or_check_columns(&mut columns, &element_columns)?;
+            let run = match run.as_mut() {
+                Some(run) => run,
+                None => run.insert(RowRun::new(
+                    &element_columns,
+                    &self.config,
+                    "graph_unwind_write",
+                )?),
+            };
+            run.drain(rows).await?;
         }
 
-        Ok(GraphResult {
-            columns: columns.unwrap_or_default(),
-            rows,
-            stats,
-        })
+        let rows = match run {
+            Some(run) => run.finish()?,
+            None => stream_from_rows(Vec::new()),
+        };
+        Ok((columns.unwrap_or_default(), rows, stats))
     }
 
     /// Execute `FOREACH (var IN list | body...)`: run each body update clause
@@ -2128,7 +2128,7 @@ impl GraphEngine {
         let mut stats = QueryStats::default();
         for physical in planned.plans {
             let wp = self.owned_exec_ctx(keyspace).write_path;
-            let result = execute(
+            let (_columns, rows, clause_stats) = execute_streaming(
                 physical,
                 &wp,
                 keyspace,
@@ -2137,8 +2137,11 @@ impl GraphEngine {
                 Some(&self.schema),
             )
             .await?;
-            stats.vertices_written += result.stats.vertices_written;
-            stats.vertices_deleted += result.stats.vertices_deleted;
+            // A FOREACH body returns nothing: pull each clause to its end so
+            // it is complete before the next one runs, and drop its rows.
+            drain_discarding(rows).await?;
+            stats.vertices_written += clause_stats.vertices_written;
+            stats.vertices_deleted += clause_stats.vertices_deleted;
         }
 
         Ok(GraphResult {
@@ -2253,30 +2256,43 @@ impl GraphEngine {
         inner: Statement,
         return_clause: Option<ReturnClause>,
         request: QueryRequest<'_>,
-    ) -> Result<GraphResult> {
+    ) -> Result<(Vec<String>, RowStream<'static>, QueryStats)> {
+        use futures::StreamExt as _;
+
         // 1. Run the outer query, projecting each imported variable as a column so
         //    we can bind it per row. The outer is the MATCH built by the parser with
         //    an empty RETURN; we replace it with `RETURN <imports...>`.
+        //
+        //    The outer match set is read COMPLETELY, into a spill-backed run,
+        //    before the first inner execution: an inner write must not change
+        //    the rows the outer MATCH is still producing (Halloween).
         let outer = project_imports(outer, imports)?;
-        let outer_result = self.execute_statement(outer, request).await?;
-        let import_cols = outer_result.columns.clone();
+        let (import_cols, outer_rows, _outer_stats) =
+            self.execute_statement_streaming(outer, request).await?;
+        let mut outer_rows = crate::executor::spill::spill_run(
+            &import_cols,
+            outer_rows,
+            &self.config,
+            "graph_call_outer",
+        )
+        .await?;
 
         let inner_returns = statement_is_returning(&inner);
         let mut out_columns: Option<Vec<String>> = None;
-        let mut out_rows: Vec<Vec<Value>> = Vec::new();
-        // Combined `outer ∪ inner` binding maps for the trailing RETURN, accumulated
-        // across ALL outer rows. The trailing clause is a single projection over the
-        // whole united stream, so DISTINCT / ORDER BY / LIMIT / aggregation must be
-        // applied once at the end — never per outer row.
-        let mut trailing_bindings: Vec<HashMap<String, Value>> = Vec::new();
+        let mut out_run: Option<RowRun> = None;
+        // The trailing RETURN is a single projection over the whole united
+        // stream, so DISTINCT / ORDER BY / LIMIT / aggregation apply once at
+        // the end — never per outer row.
+        let mut trailing = return_clause
+            .as_ref()
+            .map(|rc| TrailingReturn::new(rc, &self.config))
+            .transpose()?;
         let mut stats = QueryStats::default();
 
         // 2. For each outer row, materialize imports into the inner subquery and run.
-        for outer_row in &outer_result.rows {
-            let mut import_bindings: HashMap<String, Value> = HashMap::new();
-            for (col, value) in import_cols.iter().zip(outer_row.iter()) {
-                import_bindings.insert(col.clone(), value.clone());
-            }
+        while let Some(outer_row) = outer_rows.next().await {
+            let import_bindings: HashMap<String, Value> =
+                import_cols.iter().cloned().zip(outer_row?).collect();
 
             // Substitute every imported variable into the inner statement, then
             // constant-fold the now-closed expressions (e.g. `p.age + 1000` becomes
@@ -2291,55 +2307,64 @@ impl GraphEngine {
             }
             let bound_inner = fold_constants_statement(bound_inner)?;
 
-            let inner_result = self.execute_statement(bound_inner, request).await?;
-            stats.vertices_written += inner_result.stats.vertices_written;
-            stats.vertices_deleted += inner_result.stats.vertices_deleted;
-            stats.vertices_read += inner_result.stats.vertices_read;
-            stats.edges_read += inner_result.stats.edges_read;
-            stats.edges_deleted += inner_result.stats.edges_deleted;
+            let (inner_columns, inner_rows, inner_stats) = self
+                .execute_statement_streaming(bound_inner, request)
+                .await?;
+            stats.vertices_written += inner_stats.vertices_written;
+            stats.vertices_deleted += inner_stats.vertices_deleted;
+            stats.vertices_read += inner_stats.vertices_read;
+            stats.edges_read += inner_stats.edges_read;
+            stats.edges_deleted += inner_stats.edges_deleted;
 
             // 3. Combine per the subquery shape.
-            if return_clause.is_some() {
-                // Trailing RETURN: accumulate the combined `outer ∪ inner` bindings.
-                // A unit inner contributes no inner columns, so the trailing RETURN
-                // sees only the outer (import) bindings and yields one binding per
-                // outer row. A returning inner yields one combined binding per inner
-                // row. Projection is deferred to the finalizer.
-                let inner_rows = if inner_returns {
-                    rows_as_bindings(inner_result)
-                } else {
-                    vec![HashMap::new()]
-                };
-                for inner_binding in inner_rows {
-                    let mut combined = import_bindings.clone();
-                    combined.extend(inner_binding);
-                    trailing_bindings.push(combined);
+            match (trailing.as_mut(), inner_returns) {
+                // Trailing RETURN over a returning inner: one combined
+                // `outer ∪ inner` binding per inner row.
+                (Some(trailing), true) => {
+                    trailing
+                        .feed_rows(&import_bindings, &inner_columns, inner_rows)
+                        .await?;
                 }
-            } else if inner_returns {
+                // Trailing RETURN over a unit inner: the inner contributes no
+                // columns, so the RETURN sees one binding per outer row.
+                (Some(trailing), false) => {
+                    drain_discarding(inner_rows).await?;
+                    trailing.feed(&import_bindings)?;
+                }
                 // No trailing RETURN: unite the inner rows directly.
-                set_or_check_columns(&mut out_columns, &inner_result.columns)?;
-                out_rows.extend(inner_result.rows);
+                (None, true) => {
+                    set_or_check_columns(&mut out_columns, &inner_columns)?;
+                    let run = match out_run.as_mut() {
+                        Some(run) => run,
+                        None => out_run.insert(RowRun::new(
+                            &inner_columns,
+                            &self.config,
+                            "graph_call_rows",
+                        )?),
+                    };
+                    run.drain(inner_rows).await?;
+                }
+                // Unit subquery with no trailing RETURN: nothing to project; the
+                // writes already happened. (Outer cardinality is preserved but
+                // yields no columns, matching a write-only statement's empty
+                // result shape.)
+                (None, false) => drain_discarding(inner_rows).await?,
             }
-            // Unit subquery with no trailing RETURN: nothing to project; the writes
-            // already happened. (Outer cardinality is preserved but yields no
-            // columns, matching a write-only statement's empty result shape.)
         }
 
-        // 4. If there is a trailing RETURN, run the full projection pipeline over the
-        //    united bindings: grouped aggregation (if any aggregate item), then
-        //    DISTINCT, ORDER BY, and LIMIT — matching openCypher RETURN semantics so
-        //    these operators are never silently dropped (URS-QEC-X01).
-        if let Some(rc) = &return_clause {
-            let (cols, rows) = project_trailing_return(rc, &trailing_bindings, &self.config)?;
-            out_columns = Some(cols);
-            out_rows = rows;
+        // 4. A trailing RETURN finishes its pipeline: grouped aggregation (if any
+        //    aggregate item), then DISTINCT, ORDER BY, and LIMIT — matching
+        //    openCypher RETURN semantics so these operators are never silently
+        //    dropped (URS-QEC-X01).
+        if let Some(trailing) = trailing {
+            let (columns, rows) = trailing.finish(&self.config)?;
+            return Ok((columns, rows, stats));
         }
-
-        Ok(GraphResult {
-            columns: out_columns.unwrap_or_default(),
-            rows: out_rows,
-            stats,
-        })
+        let rows = match out_run {
+            Some(run) => run.finish()?,
+            None => stream_from_rows(Vec::new()),
+        };
+        Ok((out_columns.unwrap_or_default(), rows, stats))
     }
 
     /// Explain a query: parse -> validate -> plan (return plan description).
@@ -2358,7 +2383,11 @@ impl GraphEngine {
         query: &str,
         keyspace: &str,
         auth: &AuthContext,
-    ) -> Result<(GraphResult, Duration, bool)> {
+    ) -> Result<(
+        (Vec<String>, RowStream<'static>, QueryStats),
+        Duration,
+        bool,
+    )> {
         let statement = parse(query)?;
 
         // Verify this is actually a SUBSCRIBE statement.
@@ -2388,19 +2417,10 @@ impl GraphEngine {
             _ => unreachable!("SUBSCRIBE statement must produce Subscribe plan"),
         };
 
-        // Execute the initial snapshot.
-        let wp = self.owned_exec_ctx(keyspace).write_path;
-        let result = execute(
-            physical,
-            &wp,
-            keyspace,
-            &self.config,
-            Some(self.schema.virtual_tables()),
-            Some(&self.schema),
-        )
-        .await?;
+        // Start the initial snapshot; the caller pulls its rows.
+        let snapshot = execute_streaming_owned(physical, self.owned_exec_ctx(keyspace)).await?;
 
-        Ok((result, interval, delta))
+        Ok((snapshot, interval, delta))
     }
 
     /// Get a reference to the subscription registry.
@@ -2981,203 +3001,317 @@ fn expr_contains_aggregate(expr: &Expr) -> bool {
     }
 }
 
-/// Project a trailing CALL {} RETURN clause over the fully-united `outer ∪ inner`
-/// bindings, applying the complete openCypher RETURN pipeline:
+/// The trailing `RETURN` of a CALL {} subquery, accumulated incrementally over
+/// the united `outer ∪ inner` bindings, applying the complete openCypher RETURN
+/// pipeline:
 ///
 /// 1. If any RETURN item contains an aggregate (`count`/`sum`/`avg`/`min`/`max`/
-///    `collect`), group by the *non-aggregate* items and aggregate per group.
-///    Otherwise project one row per binding.
-/// 2. DISTINCT (dedup whole rows).
-/// 3. ORDER BY (via the shared `sort_rows`).
-/// 4. LIMIT (truncate).
+///    `collect`), group by the *non-aggregate* items and aggregate per group,
+///    one accumulator per (group, aggregate item). Otherwise project one row per
+///    binding as it arrives.
+/// 2. DISTINCT (dedup whole rows), ORDER BY (`sort_rows` semantics) and LIMIT,
+///    on the spill-backed result stream.
 ///
 /// None of these are silently dropped — a trailing DISTINCT/ORDER BY/LIMIT/aggregate
 /// is honored or fails loud, satisfying URS-QEC-X01.
+///
+/// # Memory
+///
+/// No binding is retained. A row-per-binding RETURN projects each binding as it
+/// is fed and hands the row to a spill-backed [`RowAcc`]; an aggregating RETURN
+/// keeps one accumulator per group (bounded by `max_groups`, and `collect()` by
+/// `max_collect_size`, exactly as before).
+enum TrailingReturn<'r> {
+    Rows {
+        rc: &'r ReturnClause,
+        acc: RowAcc,
+    },
+    Aggregate {
+        rc: &'r ReturnClause,
+        groups: TrailingGroups,
+    },
+}
+
+/// Per-group aggregation state for an aggregating trailing RETURN.
+struct TrailingGroups {
+    item_is_aggregate: Vec<bool>,
+    has_group_keys: bool,
+    /// Serialized grouping key -> index into `groups` (first-seen order).
+    index: HashMap<String, usize>,
+    groups: Vec<TrailingGroup>,
+    max_groups: usize,
+    max_collect_size: usize,
+}
+
+struct TrailingGroup {
+    key_vals: Vec<Value>,
+    /// One slot per RETURN item; `None` for a grouping-key item.
+    slots: Vec<Option<AggregateSlot>>,
+}
+
+/// One aggregate item's running state within one group.
+struct AggregateSlot {
+    arg: Option<Expr>,
+    count_star: bool,
+    /// `Some` for a `DISTINCT` argument: the argument values already counted.
+    seen: Option<HashSet<String>>,
+    acc: Box<dyn Accumulator>,
+}
+
+impl AggregateSlot {
+    /// Validate a RETURN aggregate expression and start its accumulator.
+    ///
+    /// Supports a bare aggregate call (`count(*)`, `sum(x)`, `collect(x)`),
+    /// including a `DISTINCT` argument (`count(DISTINCT n.age)`). A
+    /// non-aggregate expression nested around an aggregate (e.g. `count(*) + 1`)
+    /// is rejected fail-loud rather than silently mis-evaluated.
+    fn new(expr: &Expr, max_collect_size: usize) -> Result<Self> {
+        let unsupported = || {
+            GraphError::Validation(format!(
+                "unsupported aggregate expression in CALL {{}} trailing RETURN: {expr:?} \
+                 (only a bare aggregate call such as count(*) is supported)"
+            ))
+        };
+        let Expr::Function { name, args } = expr else {
+            return Err(unsupported());
+        };
+        if !is_aggregate_function(name) {
+            return Err(unsupported());
+        }
+        let (arg, distinct): (Option<&Expr>, bool) = match args.as_slice() {
+            [] => (None, false),
+            [Expr::Distinct(inner)] => (Some(inner.as_ref()), true),
+            [single] => (Some(single), false),
+            _ => {
+                return Err(GraphError::Validation(format!(
+                    "aggregate {name}() in CALL {{}} trailing RETURN takes a single argument"
+                )))
+            }
+        };
+        let count_star =
+            name.eq_ignore_ascii_case("count") && matches!(arg, Some(Expr::Var(v)) if v == "*");
+        Ok(Self {
+            arg: arg.cloned(),
+            count_star,
+            seen: if distinct { Some(HashSet::new()) } else { None },
+            acc: create_accumulator(name, count_star, max_collect_size)?,
+        })
+    }
+
+    fn accumulate(&mut self, binding: &HashMap<String, Value>) -> Result<()> {
+        let value = match &self.arg {
+            // count(*) counts every row regardless of the argument value.
+            _ if self.count_star => Value::from(1),
+            Some(e) => eval_expr(e, binding)?,
+            None => Value::Null,
+        };
+        if let Some(seen) = &mut self.seen {
+            if !seen.insert(serde_json::to_string(&value).unwrap_or_default()) {
+                return Ok(());
+            }
+        }
+        self.acc.accumulate(&value);
+        Ok(())
+    }
+}
+
+impl TrailingGroups {
+    fn new(rc: &ReturnClause, config: &GraphEngineConfig) -> Self {
+        let mut item_is_aggregate = Vec::with_capacity(rc.items.len());
+        let mut has_group_keys = false;
+        for item in &rc.items {
+            let is_aggregate = expr_contains_aggregate(&item.expr);
+            has_group_keys |= !is_aggregate;
+            item_is_aggregate.push(is_aggregate);
+        }
+        Self {
+            has_group_keys,
+            item_is_aggregate,
+            index: HashMap::new(),
+            groups: Vec::new(),
+            max_groups: config.max_groups,
+            max_collect_size: config.max_collect_size,
+        }
+    }
+
+    fn new_group(&self, rc: &ReturnClause, key_vals: Vec<Value>) -> Result<TrailingGroup> {
+        let mut slots = Vec::with_capacity(rc.items.len());
+        for (item, is_agg) in rc.items.iter().zip(&self.item_is_aggregate) {
+            let slot = if *is_agg {
+                Some(AggregateSlot::new(&item.expr, self.max_collect_size)?)
+            } else {
+                None
+            };
+            slots.push(slot);
+        }
+        Ok(TrailingGroup { key_vals, slots })
+    }
+
+    fn feed(&mut self, rc: &ReturnClause, binding: &HashMap<String, Value>) -> Result<()> {
+        // The grouping key is the tuple of evaluated non-aggregate items.
+        let mut key_vals = Vec::new();
+        for (item, is_agg) in rc.items.iter().zip(&self.item_is_aggregate) {
+            if !*is_agg {
+                key_vals.push(eval_expr(&item.expr, binding)?);
+            }
+        }
+        let key_str = serde_json::to_string(&key_vals).unwrap_or_default();
+        let at = match self.index.get(&key_str) {
+            Some(at) => *at,
+            None => {
+                if self.groups.len() >= self.max_groups {
+                    return Err(GraphError::ResourceLimit(format!(
+                        "CALL {{}} trailing aggregation group count limit exceeded: {} (limit: {})",
+                        self.groups.len() + 1,
+                        self.max_groups
+                    )));
+                }
+                let group = self.new_group(rc, key_vals)?;
+                self.groups.push(group);
+                self.index.insert(key_str, self.groups.len() - 1);
+                self.groups.len() - 1
+            }
+        };
+        for slot in self.groups[at].slots.iter_mut() {
+            let Some(slot) = slot else { continue };
+            slot.accumulate(binding)?;
+        }
+        Ok(())
+    }
+
+    /// One row per group, in first-seen key order.
+    fn finish(mut self, rc: &ReturnClause) -> Result<Vec<Vec<Value>>> {
+        // No rows and no grouping keys: still emit a single implicit group so
+        // bare aggregates (e.g. count(*)) return their zero value rather than
+        // no rows.
+        if self.groups.is_empty() && !self.has_group_keys {
+            let implicit = self.new_group(rc, Vec::new())?;
+            self.groups = vec![implicit];
+        }
+        let mut rows = Vec::with_capacity(self.groups.len());
+        for group in self.groups {
+            let mut keys = group.key_vals.into_iter();
+            let mut row = Vec::with_capacity(group.slots.len());
+            for slot in group.slots {
+                row.push(match slot {
+                    Some(slot) => slot.acc.finish(),
+                    None => keys.next().unwrap_or(Value::Null),
+                });
+            }
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+}
+
+impl<'r> TrailingReturn<'r> {
+    fn new(rc: &'r ReturnClause, config: &GraphEngineConfig) -> Result<Self> {
+        if return_has_aggregate(rc) {
+            return Ok(Self::Aggregate {
+                rc,
+                groups: TrailingGroups::new(rc, config),
+            });
+        }
+        Ok(Self::Rows {
+            rc,
+            acc: trailing_acc(rc, config)?,
+        })
+    }
+
+    /// Fold one combined `outer ∪ inner` binding into the RETURN.
+    fn feed(&mut self, binding: &HashMap<String, Value>) -> Result<()> {
+        match self {
+            Self::Rows { rc, acc } => {
+                let mut row = Vec::with_capacity(rc.items.len());
+                for item in &rc.items {
+                    row.push(eval_expr(&item.expr, binding)?);
+                }
+                acc.push(row, binding)
+            }
+            Self::Aggregate { rc, groups } => groups.feed(rc, binding),
+        }
+    }
+
+    /// Feed one combined binding per inner row: the outer row's imports
+    /// overlaid with the inner row's columns.
+    async fn feed_rows(
+        &mut self,
+        imports: &HashMap<String, Value>,
+        inner_columns: &[String],
+        inner_rows: RowStream<'_>,
+    ) -> Result<()> {
+        use futures::TryStreamExt as _;
+        inner_rows
+            .try_for_each(|row| {
+                let mut combined = imports.clone();
+                combined.extend(inner_columns.iter().cloned().zip(row));
+                futures::future::ready(self.feed(&combined))
+            })
+            .await
+    }
+
+    /// The RETURN's columns and its rows, after DISTINCT, ORDER BY and LIMIT.
+    fn finish(self, config: &GraphEngineConfig) -> Result<(Vec<String>, RowStream<'static>)> {
+        let (rc, acc) = match self {
+            Self::Rows { rc, acc } => (rc, acc),
+            Self::Aggregate { rc, groups } => {
+                let mut acc = trailing_acc(rc, config)?;
+                let no_bindings = HashMap::new();
+                for row in groups.finish(rc)? {
+                    acc.push(row, &no_bindings)?;
+                }
+                (rc, acc)
+            }
+        };
+        Ok((build_columns(rc), acc.into_stream(rc)?))
+    }
+}
+
+/// Whether any RETURN item contains an aggregate: such a RETURN groups and
+/// aggregates instead of projecting one row per binding.
+fn return_has_aggregate(rc: &ReturnClause) -> bool {
+    for item in &rc.items {
+        if expr_contains_aggregate(&item.expr) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The spill-backed accumulator a trailing RETURN's rows go into, with the
+/// `sort_rows` (projected-column) ORDER BY semantics the in-memory tail used.
+fn trailing_acc(rc: &ReturnClause, config: &GraphEngineConfig) -> Result<RowAcc> {
+    RowAcc::new(
+        &build_columns(rc),
+        rc,
+        config,
+        "graph_call_return",
+        OrderSemantics::ProjectedColumns,
+    )
+}
+
+/// Test bridge: run a trailing RETURN over an in-memory list of bindings.
+#[cfg(test)]
 fn project_trailing_return(
     rc: &ReturnClause,
     bindings: &[HashMap<String, Value>],
     config: &GraphEngineConfig,
 ) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
-    let columns = build_columns(rc);
-    let has_aggregate = rc
-        .items
-        .iter()
-        .any(|item| expr_contains_aggregate(&item.expr));
-
-    let mut rows = if has_aggregate {
-        project_trailing_aggregate(rc, bindings, config)?
-    } else {
-        let mut out = Vec::with_capacity(bindings.len());
-        for binding in bindings {
-            let mut row = Vec::with_capacity(rc.items.len());
-            for item in &rc.items {
-                row.push(eval_expr(&item.expr, binding)?);
-            }
-            out.push(row);
-        }
-        out
-    };
-
-    // DISTINCT: dedup whole projected rows, preserving first-seen order.
-    if rc.distinct {
-        let mut seen: HashSet<String> = HashSet::new();
-        rows.retain(|row| seen.insert(serde_json::to_string(row).unwrap_or_default()));
+    let mut trailing = TrailingReturn::new(rc, config)?;
+    for binding in bindings {
+        trailing.feed(binding)?;
     }
-
-    // ORDER BY then LIMIT, reusing the executor's shared sort.
-    sort_rows(&mut rows, &columns, &rc.order_by);
-    if let Some(limit) = rc.limit {
-        rows.truncate(limit.max(0) as usize);
-    }
-
+    let (columns, rows) = trailing.finish(config)?;
+    let rows = futures::executor::block_on(crate::executor::stream::collect_rows(rows))?;
     Ok((columns, rows))
 }
 
-/// Grouped aggregation for a trailing CALL {} RETURN containing aggregate items.
-///
-/// openCypher grouping: the non-aggregate RETURN items form the grouping key; the
-/// aggregate items accumulate per group. With no non-aggregate items there is a
-/// single (implicit) group, so `count(*)` over an empty stream still yields one row
-/// with `0`. Each group emits one row in first-seen key order.
-fn project_trailing_aggregate(
-    rc: &ReturnClause,
-    bindings: &[HashMap<String, Value>],
-    config: &GraphEngineConfig,
-) -> Result<Vec<Vec<Value>>> {
-    // Classify each RETURN item as a grouping key or an aggregate.
-    let item_is_aggregate: Vec<bool> = rc
-        .items
-        .iter()
-        .map(|item| expr_contains_aggregate(&item.expr))
-        .collect();
-    let has_group_keys = item_is_aggregate.iter().any(|agg| !agg);
-
-    // Ordered group keys (serialized key -> insertion index) + per-group binding lists.
-    let mut group_order: Vec<String> = Vec::new();
-    let mut group_rows: HashMap<String, Vec<&HashMap<String, Value>>> = HashMap::new();
-    let mut group_key_values: HashMap<String, Vec<Value>> = HashMap::new();
-
-    for binding in bindings {
-        // The grouping key is the tuple of evaluated non-aggregate items.
-        let mut key_vals: Vec<Value> = Vec::new();
-        for (item, is_agg) in rc.items.iter().zip(&item_is_aggregate) {
-            if !is_agg {
-                key_vals.push(eval_expr(&item.expr, binding)?);
-            }
-        }
-        let key_str = serde_json::to_string(&key_vals).unwrap_or_default();
-        if !group_rows.contains_key(&key_str) {
-            if group_order.len() >= config.max_groups {
-                return Err(GraphError::ResourceLimit(format!(
-                    "CALL {{}} trailing aggregation group count limit exceeded: {} (limit: {})",
-                    group_order.len() + 1,
-                    config.max_groups
-                )));
-            }
-            group_order.push(key_str.clone());
-            group_key_values.insert(key_str.clone(), key_vals);
-        }
-        group_rows.entry(key_str).or_default().push(binding);
-    }
-
-    // No rows and no grouping keys: still emit a single implicit group so bare
-    // aggregates (e.g. count(*)) return their zero value rather than no rows.
-    if group_order.is_empty() && !has_group_keys {
-        group_order.push(String::new());
-        group_key_values.insert(String::new(), Vec::new());
-        group_rows.insert(String::new(), Vec::new());
-    }
-
-    let mut out_rows = Vec::with_capacity(group_order.len());
-    for key_str in &group_order {
-        let rows_in_group = group_rows.get(key_str).cloned().unwrap_or_default();
-        let key_vals = group_key_values.get(key_str).cloned().unwrap_or_default();
-        let mut key_iter = key_vals.into_iter();
-
-        let mut out_row = Vec::with_capacity(rc.items.len());
-        for (item, is_agg) in rc.items.iter().zip(&item_is_aggregate) {
-            if *is_agg {
-                out_row.push(eval_trailing_aggregate(&item.expr, &rows_in_group, config)?);
-            } else {
-                out_row.push(key_iter.next().unwrap_or(Value::Null));
-            }
-        }
-        out_rows.push(out_row);
-    }
-    Ok(out_rows)
-}
-
-/// Evaluate a single aggregate RETURN expression over one group's bindings.
-///
-/// Supports a bare aggregate call (`count(*)`, `sum(x)`, `collect(x)`), including a
-/// `DISTINCT` argument (`count(DISTINCT n.age)`). A non-aggregate expression nested
-/// around an aggregate (e.g. `count(*) + 1`) is rejected fail-loud rather than
-/// silently mis-evaluated.
-fn eval_trailing_aggregate(
-    expr: &Expr,
-    rows: &[&HashMap<String, Value>],
-    config: &GraphEngineConfig,
-) -> Result<Value> {
-    let Expr::Function { name, args } = expr else {
-        return Err(GraphError::Validation(format!(
-            "unsupported aggregate expression in CALL {{}} trailing RETURN: {expr:?} \
-             (only a bare aggregate call such as count(*) is supported)"
-        )));
-    };
-    if !is_aggregate_function(name) {
-        return Err(GraphError::Validation(format!(
-            "unsupported aggregate expression in CALL {{}} trailing RETURN: {expr:?} \
-             (only a bare aggregate call such as count(*) is supported)"
-        )));
-    }
-
-    // Unwrap a single DISTINCT argument; track it so duplicate arg values are
-    // accumulated once.
-    let (arg, distinct): (Option<&Expr>, bool) = match args.as_slice() {
-        [] => (None, false),
-        [Expr::Distinct(inner)] => (Some(inner.as_ref()), true),
-        [single] => (Some(single), false),
-        _ => {
-            return Err(GraphError::Validation(format!(
-                "aggregate {name}() in CALL {{}} trailing RETURN takes a single argument"
-            )))
-        }
-    };
-    let count_star =
-        name.eq_ignore_ascii_case("count") && matches!(arg, Some(Expr::Var(v)) if v == "*");
-
-    let mut acc = create_accumulator(name, count_star, config.max_collect_size)?;
-    let mut seen: HashSet<String> = HashSet::new();
-    for binding in rows {
-        let value = match arg {
-            // count(*) counts every row regardless of the argument value.
-            _ if count_star => Value::from(1),
-            Some(e) => eval_expr(e, binding)?,
-            None => Value::Null,
-        };
-        if distinct {
-            let key = serde_json::to_string(&value).unwrap_or_default();
-            if !seen.insert(key) {
-                continue;
-            }
-        }
-        acc.accumulate(&value);
-    }
-    Ok(acc.finish())
-}
-
-/// Turn a `GraphResult`'s rows into per-row binding maps keyed by column name, so
-/// trailing-RETURN expressions can read inner-subquery outputs by name.
-///
-/// Consumes the result: each inner row is MOVED into its binding map rather than
-/// `row.iter().cloned()` cloning every cell value (the old form copied each cell
-/// of every inner row). Column names are still cloned (a handful of `String`s,
-/// schema arity — not result-sized). The produced maps are identical.
-fn rows_as_bindings(result: GraphResult) -> Vec<HashMap<String, Value>> {
-    let GraphResult { columns, rows, .. } = result;
-    rows.into_iter()
-        .map(|row| columns.iter().cloned().zip(row).collect())
-        .collect()
+/// Pull a stream to its end, discarding its rows (a unit statement's status
+/// row, or an orchestrated write whose rows the caller does not return). The
+/// first error is returned.
+async fn drain_discarding(rows: RowStream<'_>) -> Result<()> {
+    use futures::TryStreamExt as _;
+    rows.try_for_each(|_| futures::future::ready(Ok(()))).await
 }
 
 /// Set the output columns on first use, or verify subsequent unions agree. Mirrors

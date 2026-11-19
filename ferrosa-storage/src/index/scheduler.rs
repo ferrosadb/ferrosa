@@ -1357,23 +1357,23 @@ mod tests {
                 key: DecoratedKey::new(PartitionKey::new(b"pk1".to_vec())),
                 deletion: DeletionTime::LIVE,
                 static_row: None,
-                rows: vec![Row {
+                rows: vec![Arc::new(Row {
                     clustering: vec![0x00, 0x00, 0x00, 0x01],
                     cells: vec![(0, CellValue::live(b"alice".to_vec(), 1000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                }],
+                })],
             },
             Partition {
                 key: DecoratedKey::new(PartitionKey::new(b"pk2".to_vec())),
                 deletion: DeletionTime::LIVE,
                 static_row: None,
-                rows: vec![Row {
+                rows: vec![Arc::new(Row {
                     clustering: vec![0x00, 0x00, 0x00, 0x02],
                     cells: vec![(0, CellValue::live(b"bob".to_vec(), 2000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(2000),
-                }],
+                })],
             },
         ];
         partitions.sort_by(|a, b| a.key.cmp(&b.key));
@@ -1469,7 +1469,7 @@ mod tests {
                 key: DecoratedKey::new(PartitionKey::new(b"pk1".to_vec())),
                 deletion: DeletionTime::LIVE,
                 static_row: None,
-                rows: vec![Row {
+                rows: vec![Arc::new(Row {
                     clustering: vec![],
                     cells: vec![
                         (0, CellValue::live(b"alice".to_vec(), 1000)),
@@ -1477,13 +1477,13 @@ mod tests {
                     ],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                }],
+                })],
             },
             Partition {
                 key: DecoratedKey::new(PartitionKey::new(b"pk2".to_vec())),
                 deletion: DeletionTime::LIVE,
                 static_row: None,
-                rows: vec![Row {
+                rows: vec![Arc::new(Row {
                     clustering: vec![],
                     cells: vec![
                         (0, CellValue::live(b"bob".to_vec(), 2000)),
@@ -1491,13 +1491,13 @@ mod tests {
                     ],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(2000),
-                }],
+                })],
             },
             Partition {
                 key: DecoratedKey::new(PartitionKey::new(b"pk3".to_vec())),
                 deletion: DeletionTime::LIVE,
                 static_row: None,
-                rows: vec![Row {
+                rows: vec![Arc::new(Row {
                     clustering: vec![],
                     cells: vec![
                         (0, CellValue::live(b"carol".to_vec(), 3000)),
@@ -1505,7 +1505,7 @@ mod tests {
                     ],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(3000),
-                }],
+                })],
             },
         ];
         partitions.sort_by(|a, b| a.key.cmp(&b.key));
@@ -1977,12 +1977,12 @@ mod tests {
                 key: DecoratedKey::new(PartitionKey::new(pk.to_vec())),
                 deletion: DeletionTime::LIVE,
                 static_row: None,
-                rows: vec![Row {
+                rows: vec![Arc::new(Row {
                     clustering: (i as u32 + 1).to_be_bytes().to_vec(),
                     cells: vec![(0, CellValue::live(val.to_vec(), 1000 + i as i64))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000 + i as i64),
-                }],
+                })],
             })
             .collect();
         partitions.sort_by(|a, b| a.key.cmp(&b.key));

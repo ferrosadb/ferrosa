@@ -22,3 +22,11 @@ publish = false
 ferrosa-jsonb = { path = "../ferrosa-jsonb" }
 parquet-variant = "=60.0.0"
 proptest = "1"
+
+# chrono is unmaintained (RUSTSEC-2026-0543) and parquet-variant 60.0.0 needs it
+# for its temporal variants. The ferrosadb/arrow-rs fork's
+# `ferrosa/parquet-variant-60.0.0-jiff` branch replaces it with jiff, keeping the
+# binary encoding byte-identical (upstream's interop data passes). These tests
+# use no temporal variant.
+[patch.crates-io]
+parquet-variant = { git = "https://github.com/ferrosadb/arrow-rs.git", rev = "20e606ee" }

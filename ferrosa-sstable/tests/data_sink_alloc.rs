@@ -20,6 +20,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
@@ -84,12 +85,12 @@ fn one_value_partition(key: &[u8], value: Vec<u8>) -> Partition {
         key: DecoratedKey::new(PartitionKey::new(key.to_vec())),
         deletion: DeletionTime::LIVE,
         static_row: None,
-        rows: vec![Row {
+        rows: vec![Arc::new(Row {
             clustering: vec![],
             cells: vec![(0, CellValue::live(value, 1))],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1),
-        }],
+        })],
     }
 }
 

@@ -135,7 +135,7 @@ fn backpressure_codec_and_data_sink_are_independent_bounded_stages() {
     };
     let mut partition = make_wide_partition(b"codec-gate", 1);
     let mut seed = 1234567u32;
-    partition.rows[0].cells[0].1.value = Some(
+    Arc::make_mut(&mut partition.rows[0]).cells[0].1.value = Some(
         (0..1024 * 1024)
             .map(|_| {
                 seed ^= seed << 13;

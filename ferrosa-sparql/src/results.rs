@@ -3,14 +3,16 @@
 //! Converts internal binding sets to SPARQL JSON Results format
 //! (`application/sparql-results+json`) per the W3C spec.
 //! Correctness: legacy RDF identity tests and COUNT/JSON/protocol regressions.
-//! Last revised: 2026-10-27
-//! Last changed: Add recursive RDF 1.2 JSON terms without changing scalar storage identity.
+//! Last revised: 2026-11-16
+//! Last changed: Factor per-row XML/N-Triples writers for streamed responses.
 
 use serde::Serialize;
 use std::collections::HashMap;
 
 /// Initial text direction for an RDF 1.2 language-tagged literal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum TextDirection {
     Ltr,
@@ -313,35 +315,11 @@ impl SparqlJsonResults {
     /// `<results>` with `<result>` / `<binding>` / `<uri>` / `<literal>` /
     /// `<bnode>` leaves.
     pub fn to_xml(&self) -> Result<Vec<u8>, String> {
-        let mut buf = String::new();
-        buf.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-        buf.push_str("<sparql xmlns=\"http://www.w3.org/2005/sparql-results#\">\n");
-
-        // <head>
-        buf.push_str("  <head>\n");
-        for var in &self.head.vars {
-            buf.push_str(&format!("    <variable name=\"{}\"/>\n", xml_escape(var)));
-        }
-        buf.push_str("  </head>\n");
-
-        // <results>
-        buf.push_str("  <results>\n");
+        let mut buf = xml_head(&self.head.vars);
         for row in &self.results.bindings {
-            buf.push_str("    <result>\n");
-            for var in &self.head.vars {
-                if let Some(binding) = row.get(var) {
-                    buf.push_str(&format!(
-                        "      <binding name=\"{}\">{}</binding>\n",
-                        xml_escape(var),
-                        format_xml_binding(binding)?
-                    ));
-                }
-            }
-            buf.push_str("    </result>\n");
+            buf.push_str(&xml_result(&self.head.vars, row)?);
         }
-        buf.push_str("  </results>\n");
-        buf.push_str("</sparql>\n");
-
+        buf.push_str(XML_TAIL);
         Ok(buf.into_bytes())
     }
 
@@ -352,16 +330,7 @@ impl SparqlJsonResults {
     pub fn to_ntriples(&self) -> Result<Vec<u8>, String> {
         let mut buf = String::new();
         for row in &self.results.bindings {
-            let parts: Vec<String> = self
-                .head
-                .vars
-                .iter()
-                .filter_map(|var| row.get(var).map(format_ntriples_term))
-                .collect::<Result<_, _>>()?;
-            if !parts.is_empty() {
-                buf.push_str(&parts.join(" "));
-                buf.push_str(" .\n");
-            }
+            buf.push_str(&ntriples_row(&self.head.vars, row)?);
         }
         Ok(buf.into_bytes())
     }
@@ -373,6 +342,57 @@ impl SparqlJsonResults {
     pub fn to_turtle(&self) -> Result<Vec<u8>, String> {
         self.to_ntriples()
     }
+}
+
+/// The SPARQL Results XML document up to and including `<results>`.
+pub(crate) fn xml_head(vars: &[String]) -> String {
+    let mut buf = String::new();
+    buf.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    buf.push_str("<sparql xmlns=\"http://www.w3.org/2005/sparql-results#\">\n");
+    buf.push_str("  <head>\n");
+    for var in vars {
+        buf.push_str(&format!("    <variable name=\"{}\"/>\n", xml_escape(var)));
+    }
+    buf.push_str("  </head>\n");
+    buf.push_str("  <results>\n");
+    buf
+}
+
+/// The SPARQL Results XML document after the last `<result>`.
+pub(crate) const XML_TAIL: &str = "  </results>\n</sparql>\n";
+
+/// One `<result>` element.
+pub(crate) fn xml_result(
+    vars: &[String],
+    row: &HashMap<String, Binding>,
+) -> Result<String, String> {
+    let mut buf = String::from("    <result>\n");
+    for var in vars {
+        if let Some(binding) = row.get(var) {
+            buf.push_str(&format!(
+                "      <binding name=\"{}\">{}</binding>\n",
+                xml_escape(var),
+                format_xml_binding(binding)?
+            ));
+        }
+    }
+    buf.push_str("    </result>\n");
+    Ok(buf)
+}
+
+/// One solution as an N-Triples-style line (empty when nothing is bound).
+pub(crate) fn ntriples_row(
+    vars: &[String],
+    row: &HashMap<String, Binding>,
+) -> Result<String, String> {
+    let parts: Vec<String> = vars
+        .iter()
+        .filter_map(|var| row.get(var).map(format_ntriples_term))
+        .collect::<Result<_, _>>()?;
+    if parts.is_empty() {
+        return Ok(String::new());
+    }
+    Ok(format!("{} .\n", parts.join(" ")))
 }
 
 /// Escape a string for inclusion in XML text content or attribute values.

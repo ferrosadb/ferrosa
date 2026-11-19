@@ -158,7 +158,7 @@ async fn big_evicted_sstable(dir: &std::path::Path, prefix: &str, compression: &
             .write(
                 &tid,
                 &make_key(&format!("k{i:04}")),
-                make_row(&incompressible_value(i as u64), 1000),
+                Arc::new(make_row(&incompressible_value(i as u64), 1000)),
                 1000,
             )
             .unwrap();
@@ -424,7 +424,7 @@ async fn compaction_over_a_ranged_input_rehydrates_it_and_keeps_every_row() {
     assert!(!big.local_data_db().exists());
     let tid = table_id();
     big.engine
-        .write(&tid, &make_key("zz-late"), make_row(b"late", 2000), 2000)
+        .write(&tid, &make_key("zz-late"), Arc::new(make_row(b"late", 2000)), 2000)
         .unwrap();
     big.engine.flush(&tid).unwrap();
 
@@ -592,7 +592,7 @@ async fn restart_with_two_evicted_tables(
         engine.register_table(test_schema_2()).unwrap();
         for tid in [table_id(), table_id_2()] {
             engine
-                .write(&tid, &make_key("k"), make_row(b"v", 1000), 1000)
+                .write(&tid, &make_key("k"), Arc::new(make_row(b"v", 1000)), 1000)
                 .unwrap();
             engine.flush(&tid).unwrap();
         }

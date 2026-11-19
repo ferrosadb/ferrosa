@@ -152,7 +152,7 @@ pub struct PartitionFragment {
     pub key: DecoratedKey,
     pub deletion: ferrosa_sstable::types::DeletionTime,
     pub static_row: Option<Row>,
-    pub rows: Vec<Row>,
+    pub rows: Vec<Arc<Row>>,
     pub first: bool,
     pub last: bool,
 }
@@ -273,7 +273,8 @@ impl ColumnOrdinalMapping {
             self.remap_static_row(static_row);
         }
         for row in &mut partition.rows {
-            self.remap_regular_row(row);
+            // SSTable rows are decoded fresh, so this is the only `Arc`.
+            self.remap_regular_row(Arc::make_mut(row));
         }
     }
 
@@ -374,7 +375,7 @@ struct PoppedHeader {
 /// Move uniquely owned rows; otherwise retain the immutable source and copy
 /// only each requested row's metadata. Cell payload backing remains shared.
 enum MemPartitionRows {
-    Owned(std::vec::IntoIter<Row>),
+    Owned(std::vec::IntoIter<Arc<Row>>),
     Shared {
         partition: Arc<Partition>,
         position: usize,
@@ -385,7 +386,7 @@ enum MemPartitionRows {
 }
 
 impl Iterator for MemPartitionRows {
-    type Item = Row;
+    type Item = Arc<Row>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
@@ -399,7 +400,8 @@ impl Iterator for MemPartitionRows {
                     Some(order) => *order.get(*position)?,
                     None => *position,
                 };
-                let row = partition.rows.get(index)?.clone();
+                // Share the memtable's row: one refcount, never a deep copy.
+                let row = Arc::clone(partition.rows.get(index)?);
                 *position += 1;
                 Some(row)
             }
@@ -1550,7 +1552,7 @@ struct ActivePartition {
     /// `heads[i]` is the next unconsumed row from `cursors[i]`, or
     /// `None` if that cursor is exhausted. Peak resident rows for the
     /// merge proper is `cursors.len()` (one head each).
-    heads: Vec<Option<Row>>,
+    heads: Vec<Option<Arc<Row>>>,
     /// Source indices to refill back onto the heap once this partition
     /// is fully drained.
     refill_srcs: Vec<usize>,
@@ -1923,7 +1925,7 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
     }
 
     /// Pull one row from cursor `i` of the active partition.
-    fn next_cursor_row(&mut self, i: usize) -> Result<Option<Row>> {
+    fn next_cursor_row(&mut self, i: usize) -> Result<Option<Arc<Row>>> {
         // Determine the cursor kind without holding an active borrow over
         // the source fetch.
         enum Kind {
@@ -1941,7 +1943,7 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
                 RowCursor::Mem(it) => it.next(),
                 RowCursor::Sst { .. } => None,
             })),
-            Kind::Sst(src) => self.sources[src].next_fragment_row(),
+            Kind::Sst(src) => Ok(self.sources[src].next_fragment_row()?.map(Arc::new)),
             Kind::Done => Ok(None),
         }
     }
@@ -1955,7 +1957,7 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
         // `k` bounds emitted rows, not the initial allocation. Most partitions
         // are much narrower; reserving the full cap here allocates hundreds of
         // KiB even for a single row. Grow only when a surviving row is emitted.
-        let mut out: Vec<Row> = Vec::new();
+        let mut out: Vec<Arc<Row>> = Vec::new();
         let partition_delete_at = self
             .active
             .as_ref()
@@ -1985,7 +1987,7 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
 
             // Fold every head at that clustering key (cell-level LWW),
             // advancing each consumed cursor by one row.
-            let mut merged_row: Option<Row> = None;
+            let mut merged_row: Option<Arc<Row>> = None;
             let n = self.active.as_ref().expect("active set").cursors.len();
             for i in 0..n {
                 let matches = self
@@ -2003,7 +2005,7 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
                     .and_then(|a| a.heads[i].take())
                     .expect("matched head present");
                 merged_row = Some(match merged_row.take() {
-                    Some(prev) => merge::merge_rows(prev, row),
+                    Some(prev) => merge::merge_shared_rows(prev, row),
                     None => row,
                 });
                 // Advance this cursor's head.
@@ -2048,9 +2050,13 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
             if partition_deleted && row.primary_key_liveness.timestamp < partition_delete_at {
                 continue;
             }
-            if !row.deletion.is_live() {
-                let cut = row.deletion.marked_for_delete_at;
-                row.cells.retain(|(_col, cell)| cell.timestamp >= cut);
+            let cut = row.deletion.marked_for_delete_at;
+            // Copy on write only a shared row that actually loses a cell.
+            if !row.deletion.is_live() && row.cells.iter().any(|(_col, cell)| cell.timestamp < cut)
+            {
+                Arc::make_mut(&mut row)
+                    .cells
+                    .retain(|(_col, cell)| cell.timestamp >= cut);
             }
             out.push(row);
         }
@@ -2161,12 +2167,12 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::from(key)),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: clustering.to_be_bytes().to_vec(),
                 cells: vec![(0, CellValue::live(value.to_vec(), 1_000_042))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1_000_042),
-            }],
+            })],
         }
     }
 
@@ -2244,7 +2250,7 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::from(key)),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows,
+            rows: rows.into_iter().map(Arc::new).collect(),
         }
     }
 
@@ -2347,6 +2353,7 @@ mod tests {
             rows: clusterings
                 .iter()
                 .map(|&c| row(c, 0, b"v", c as i64))
+                .map(Arc::new)
                 .collect(),
         };
         // sstable A holds even clusterings, B holds odd — both for the SAME key.
@@ -2411,6 +2418,7 @@ mod tests {
             rows: [5, 0, 1, 2, 3, 4]
                 .iter()
                 .map(|&c| row(c, 0, b"v", c as i64))
+                .map(Arc::new)
                 .collect(),
         };
         let a = std::sync::Arc::new(reader_from_partitions(&[p]));

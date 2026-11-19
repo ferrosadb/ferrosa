@@ -263,9 +263,10 @@ independently testable.
    no regressions. Remove the legacy
    `RangeReadRequest`/`RangeReadResponse` path and
    `BULK_READ_TIMEOUT` constant in the release after that.
-6. **Remove `RANGE_READ_MATERIALIZATION_CAP`** when the legacy path
-   is gone — the cap is only there because the legacy path
-   materializes.
+6. **Remove `RANGE_READ_MATERIALIZATION_CAP`** — done 2026-11-16: the
+   limited read now walks the merged sources and stops at the caller's
+   limit, so the cap had nothing left to guard (it also returned the wrong
+   keys under a limit; see storage FMEA ST-109).
 
 The same shape generalizes to `IndexReadRequest` (also currently a
 single-response RPC) and `RangeWriteRequest` (the inverse direction

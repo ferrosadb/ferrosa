@@ -86,7 +86,7 @@ fn arb_mutation() -> impl Strategy<Value = Mutation> {
                 keyspace,
                 table,
                 key,
-                rows,
+                rows: rows.into_iter().map(Arc::new).collect(),
                 timestamp,
             }
         })
@@ -211,12 +211,12 @@ fn cas_allocation_non_overlapping() {
                         key: ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
                             format!("t{t}_k{i}").into_bytes(),
                         )),
-                        rows: vec![Row {
+                        rows: vec![Arc::new(Row {
                             clustering: vec![t as u8, i as u8],
                             cells: vec![(0, CellValue::live(vec![0u8; 16], 1000))],
                             deletion: DeletionTime::LIVE,
                             primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                        }],
+                        })],
                         timestamp: (t * 1000 + i) as i64,
                     };
                     let pos = cl.append(&m).unwrap();
@@ -376,12 +376,12 @@ proptest! {
                 key: ferrosa_common::DecoratedKey::new(
                     ferrosa_common::PartitionKey::new(b"pk".to_vec()),
                 ),
-                rows: vec![Row {
+                rows: vec![Arc::new(Row {
                     clustering: vec![i as u8],
                     cells: vec![(0, CellValue::live(vec![0u8; 8], 1000 + i))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000 + i),
-                }],
+                })],
                 timestamp: 1000 + i,
             };
             match cl.append(&ma) {
@@ -396,12 +396,12 @@ proptest! {
                 key: ferrosa_common::DecoratedKey::new(
                     ferrosa_common::PartitionKey::new(b"pk".to_vec()),
                 ),
-                rows: vec![Row {
+                rows: vec![Arc::new(Row {
                     clustering: vec![i as u8],
                     cells: vec![(0, CellValue::live(vec![0u8; 8], 2000 + i))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(2000 + i),
-                }],
+                })],
                 timestamp: 2000 + i,
             };
             match cl.append(&mb) {
@@ -493,12 +493,12 @@ proptest! {
                 key: ferrosa_common::DecoratedKey::new(
                     ferrosa_common::PartitionKey::new(format!("pk_{i}").into_bytes()),
                 ),
-                rows: vec![Row {
+                rows: vec![Arc::new(Row {
                     clustering: vec![i as u8],
                     cells: vec![(0, CellValue::live(format!("val_{i}").into_bytes(), 1000 + i as i64))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000 + i as i64),
-                }],
+                })],
                 timestamp: 1000 + i as i64,
             };
             let pos = cl.append(&m).unwrap();
@@ -627,12 +627,12 @@ proptest! {
                     key: ferrosa_common::DecoratedKey::new(
                         ferrosa_common::PartitionKey::new(b"pk".to_vec()),
                     ),
-                    rows: vec![Row {
+                    rows: vec![Arc::new(Row {
                         clustering: vec![i as u8],
                         cells: vec![(0, CellValue::live(vec![0u8; 8], 1000 + i))],
                         deletion: DeletionTime::LIVE,
                         primary_key_liveness: LivenessInfo::with_timestamp(1000 + i),
-                    }],
+                    })],
                     timestamp: 1000 + i,
                 };
                 match cl.append(&ma) {
@@ -647,12 +647,12 @@ proptest! {
                     key: ferrosa_common::DecoratedKey::new(
                         ferrosa_common::PartitionKey::new(b"pk".to_vec()),
                     ),
-                    rows: vec![Row {
+                    rows: vec![Arc::new(Row {
                         clustering: vec![i as u8],
                         cells: vec![(0, CellValue::live(vec![0u8; 8], 2000 + i))],
                         deletion: DeletionTime::LIVE,
                         primary_key_liveness: LivenessInfo::with_timestamp(2000 + i),
-                    }],
+                    })],
                     timestamp: 2000 + i,
                 };
                 match cl.append(&mb) {
@@ -770,12 +770,12 @@ proptest! {
                 key: ferrosa_common::DecoratedKey::new(
                     ferrosa_common::PartitionKey::new(format!("pk_{i}").into_bytes()),
                 ),
-                rows: vec![Row {
+                rows: vec![Arc::new(Row {
                     clustering: vec![i as u8],
                     cells: vec![(0, CellValue::live(format!("v{i}").into_bytes(), 1000 + i as i64))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000 + i as i64),
-                }],
+                })],
                 timestamp: 1000 + i as i64,
             };
             let pos = cl.append(&m).unwrap();

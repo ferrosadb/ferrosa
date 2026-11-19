@@ -529,7 +529,12 @@ mod tests {
         for (i, value) in values.iter().enumerate() {
             let ts = 1_000 + i as i64;
             engine
-                .write(&tid, &key(&format!("pk{i}")), row(value.as_bytes(), ts), ts)
+                .write(
+                    &tid,
+                    &key(&format!("pk{i}")),
+                    Arc::new(row(value.as_bytes(), ts)),
+                    ts,
+                )
                 .unwrap();
             engine.flush(&tid).unwrap();
         }

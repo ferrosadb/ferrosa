@@ -1,0 +1,22 @@
+{
+  "stage": "aeneas",
+  "llbc": "/tmp/oomcat/main-wt/ferrosa_sstable.llbc",
+  "lean": "/tmp/leangap-ferrosa-sstable-t8yyc47z/FerrosaSstable.lean",
+  "translation_errors": 0,
+  "translation_unique_reported": null,
+  "translation_messages": [],
+  "aeneas_exit": 0,
+  "lean_errors": 0,
+  "errors": [],
+  "sorry_declarations": 2,
+  "compiled": true,
+  "crate": "ferrosa-sstable",
+  "prefix": "ferrosa_sstable::types::*",
+  "generated_at": "2026-11-17T18:42:02+00:00",
+  "memory_max": "9600M",
+  "toolchain": {
+    "charon": "/tmp/oomcat/aeneas-arc/charon/bin/charon",
+    "aeneas": "/tmp/oomcat/aeneas-arc/src/_build/default/main.exe",
+    "lean_pkg": "/tmp/oomcat/aeneas-arc/backends/lean"
+  }
+}

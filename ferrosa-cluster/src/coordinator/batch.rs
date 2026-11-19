@@ -82,7 +82,7 @@ impl ClusterCoordinator {
                     crate::error::ClusterError::Internal("batch semaphore closed".to_string())
                 })?;
                 let key = m.key.clone();
-                let row = row.clone();
+                let row = Arc::clone(row);
                 let ts = m.timestamp;
                 let tid = table_id.clone();
                 futs.push(async move {
@@ -553,7 +553,7 @@ mod tests {
             keyspace: "test_ks".to_string(),
             table: "test_tbl".to_string(),
             key: test_key(),
-            rows: vec![test_row()],
+            rows: vec![Arc::new(test_row())],
             timestamp: 1000,
         }];
 
@@ -642,7 +642,7 @@ mod tests {
                 keyspace: "test_ks".to_string(),
                 table: "test_tbl".to_string(),
                 key: test_key(),
-                rows: vec![test_row()],
+                rows: vec![Arc::new(test_row())],
                 timestamp: 1000,
             }],
         };
@@ -678,7 +678,7 @@ mod tests {
                     keyspace: "test_ks".to_string(),
                     table: "test_tbl".to_string(),
                     key: test_key(),
-                    rows: vec![test_row()],
+                    rows: vec![Arc::new(test_row())],
                     timestamp: 1000,
                 }],
             })

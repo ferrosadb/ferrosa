@@ -20,6 +20,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::sync::Arc;
 
 use ferrosa_common::key::{DecoratedKey, PartitionKey};
 use ferrosa_common::schema::{ColumnDefinition, TableSchema};
@@ -172,7 +173,9 @@ fn write_rows(engine: &StorageEngine) {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };
-        engine.write(&table_id(), &key, row, 1000).unwrap();
+        engine
+            .write(&table_id(), &key, Arc::new(row), 1000)
+            .unwrap();
     }
 }
 

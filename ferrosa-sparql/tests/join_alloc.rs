@@ -54,7 +54,7 @@ async fn sample(n: usize) -> usize {
         Arc::new(WritePath::direct(storage)),
         SparqlConfig {
             default_graph: "default".into(),
-            max_rows: 10000,
+            ..Default::default()
         },
     );
     let mut update = String::from("INSERT DATA {");
@@ -110,7 +110,7 @@ async fn borrowed_subject_join_preserves_bags_and_repeated_variables() {
         Arc::new(WritePath::direct(storage)),
         SparqlConfig {
             default_graph: "default".into(),
-            max_rows: 100,
+            ..Default::default()
         },
     );
     engine.execute_update("INSERT DATA { <urn:a> <urn:p> 1, 2; <urn:q> 3, 4; <urn:self> <urn:a> . <urn:b> <urn:self> <urn:c> . }", "default").await.unwrap();

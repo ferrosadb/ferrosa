@@ -12,6 +12,7 @@
 //! implementation written against the spec rather than copied from the code.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use ferrosa_common::key::DecoratedKey;
 use ferrosa_common::CellValue;
@@ -29,7 +30,7 @@ pub fn oracle_merge(sources: &[Partition]) -> Partition {
 
     let mut deletion = sources[0].deletion;
     let mut static_row: Option<Row> = None;
-    let mut rows: BTreeMap<Vec<u8>, Row> = BTreeMap::new();
+    let mut rows: BTreeMap<Vec<u8>, Arc<Row>> = BTreeMap::new();
 
     for source in sources {
         if source.deletion.marked_for_delete_at > deletion.marked_for_delete_at {
@@ -43,8 +44,8 @@ pub fn oracle_merge(sources: &[Partition]) -> Partition {
         }
         for row in &source.rows {
             let merged = match rows.remove(&row.clustering) {
-                None => row.clone(),
-                Some(acc) => oracle_merge_row(&acc, row),
+                None => Arc::clone(row),
+                Some(acc) => Arc::new(oracle_merge_row(&acc, row)),
             };
             rows.insert(row.clustering.clone(), merged);
         }
@@ -168,7 +169,8 @@ fn suppress_deleted(partition: &mut Partition) {
     for row in &mut partition.rows {
         if !row.deletion.is_live() {
             let row_delete_at = row.deletion.marked_for_delete_at;
-            row.cells
+            Arc::make_mut(row)
+                .cells
                 .retain(|(_col, cell)| cell.timestamp >= row_delete_at);
         }
     }
@@ -198,7 +200,7 @@ mod tests {
             key: key(k),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows,
+            rows: rows.into_iter().map(Arc::new).collect(),
         }
     }
 

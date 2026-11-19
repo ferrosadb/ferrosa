@@ -18,6 +18,7 @@
 //! on the real engine. The applied node's table directory is made unremovable
 //! with the same order-independent POSIX mode-000 seam the storage tests use.
 
+use std::sync::Arc;
 mod common;
 
 use std::collections::HashMap;
@@ -172,7 +173,7 @@ async fn a_refused_drop_on_the_applying_node_surfaces_and_never_resurrects() {
                 .write(
                     &tid,
                     &DecoratedKey::new(PartitionKey::new(pk.into_bytes())),
-                    row(b"stale", 1),
+                    Arc::new(row(b"stale", 1)),
                     1,
                 )
                 .unwrap_or_else(|e| panic!("seed row on node {}: {e}", node.node_id));
@@ -324,7 +325,7 @@ async fn a_refused_drop_on_the_applying_node_surfaces_and_never_resurrects() {
                 .write(
                     &tid,
                     &DecoratedKey::new(PartitionKey::new(pk.into_bytes())),
-                    row(b"fresh", 100),
+                    Arc::new(row(b"fresh", 100)),
                     100,
                 )
                 .expect("write new row");

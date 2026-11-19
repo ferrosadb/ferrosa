@@ -85,10 +85,6 @@ def broken : List Item := [
    "A scan gathers a whole page of rows in memory before it encodes any of them, so its peak memory is a full page rather than one row.",
    "encode_rows_with_writer visits one row at a time, but all_rows accumulates a whole page before it is called",
    "Ferrosa.Storage.Streaming", "the row buffer is never built as Vec<Vec<Option<CqlValue>>> on the scan path"⟩,
-  ⟨"Streaming", "the reader streams partitions to the caller",
-   "The partition reader hands back a finished list, so a whole page is held in memory before the caller sees its first partition.",
-   "read_partitions_limited returns Vec<Partition>, so the page is already materialised when the caller sees it",
-   "Ferrosa.Storage.Streaming", "the reader hands partitions to the caller instead of a vector of them"⟩,
   ⟨"Streaming", "a decoded chunk is written into a caller-supplied buffer",
    "Every compressed chunk is decompressed into a newly allocated buffer, so each byte read costs an extra allocation and an extra copy.",
    "compression.rs decompress ignores its uncompressed-length argument and returns a fresh Vec per chunk: one allocation and one copy for every byte read",
@@ -278,14 +274,15 @@ def broken : List Item := [
    "Ferrosa.Ownership.Obligations", "an observer drain moves rows out of the mutation it owns"⟩
 ]
 
-/-- Fifty-seven built-and-wrong items, pinned so a defect cannot be dropped from the list without the
-corpus classification breaking. The sysfail row left for `Unimplemented.discharged` when `6c270518`
+/-- Fifty-six built-and-wrong items, pinned so a defect cannot be dropped from the list without the
+corpus classification breaking. The streaming-reader row left when the SSTable reader lost its
+vector-returning scan; the sysfail row left for `Unimplemented.discharged` when `6c270518`
 closed it; six rows joined when startup, replay and the grant projection were audited, seven when
 the system-table projection layer was modelled, nine when the memory-discipline machine was audited
 against the read and transform paths, five when the canonical-form and codec-seam audit found that
 the pipeline's value type and the file layout both live in four crates it should not, and six when
 the ownership machine was audited against the peer send, snapshot and observer paths. -/
-theorem broken_has_fifty_seven_items : broken.length = 57 := by native_decide
+theorem broken_has_fifty_six_items : broken.length = 56 := by native_decide
 
 /-- The surfaces are where the damage concentrates: five of the thirty-one are SQL or SPARQL, which
     are the two places where a client is most likely to be told something confidently wrong. -/
@@ -301,8 +298,8 @@ theorem five_rows_have_no_verified_site :
 
 /-- The remainder - the rows that name a real location — are what the list's opening claim is about:
     code that was read, not inferred. -/
-theorem fifty_two_rows_name_a_site :
-    (broken.filter fun i => !i.site.startsWith "unverified:").length = 52 := by native_decide
+theorem fifty_one_rows_name_a_site :
+    (broken.filter fun i => !i.site.startsWith "unverified:").length = 51 := by native_decide
 
 /-- What a reader of the specification is shown for a row: the sentence that says what is wrong. -/
 def readerText (i : Item) : String := i.plain

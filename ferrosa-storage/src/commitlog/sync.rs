@@ -1567,12 +1567,12 @@ mod tests {
             keyspace: "test_ks".to_string(),
             table: "test_table".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"pk1".to_vec())),
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![1, 2, 3],
                 cells: vec![(0, CellValue::live(b"hello".to_vec(), 1000))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1000),
-            }],
+            })],
             timestamp: 42_000,
         }
     }

@@ -1,6 +1,10 @@
 //! Real-storage contracts for graph secondary-index selection and count pushdown.
 //! Result equality alone cannot distinguish a keyed read from a table scan;
 //! vertices_read additionally pins how many partitions the graph executor opens.
+mod support;
+#[allow(unused_imports)] // a test binary may only use the streaming API
+use support::ExecuteCollect as _;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -174,12 +178,12 @@ impl Fixture {
             .write(
                 &TableId::new("bench", "benchrow"),
                 &key,
-                Row {
+                Arc::new(Row {
                     clustering: vec![],
                     cells,
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
-                },
+                }),
                 timestamp,
             )
             .unwrap();

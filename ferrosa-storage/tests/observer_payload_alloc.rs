@@ -150,7 +150,8 @@ fn measure_observer_write_allocations() {
             let mut samples = Vec::with_capacity(8);
             for iteration in 0..12 {
                 let timestamp = 1_800_000_000_000_000 + iteration;
-                let (input, input_calls, input_bytes) = measured(|| row(cells, timestamp));
+                let (input, input_calls, input_bytes) =
+                    measured(|| Arc::new(row(cells, timestamp)));
                 // Build the oracle independently: cloning input here could
                 // promote shared backing before the write's measured window.
                 let expected = row(cells, timestamp);
@@ -161,11 +162,11 @@ fn measure_observer_write_allocations() {
                     let (received_table, mutation) = receiver.try_recv().unwrap();
                     assert_eq!(received_table, table);
                     assert_eq!(mutation.key, key);
-                    assert_eq!(mutation.rows.as_slice(), std::slice::from_ref(&expected));
+                    assert_eq!(mutation.rows, [Arc::new(expected.clone())]);
                     assert!(receiver.try_recv().is_err());
                 }
                 let stored = engine.read(&table, &key).unwrap().unwrap();
-                assert_eq!(stored.rows, [expected]);
+                assert_eq!(stored.rows, [Arc::new(expected)]);
                 if iteration >= 4 {
                     samples.push((calls, bytes, input_calls, input_bytes));
                 }
@@ -195,14 +196,19 @@ fn observers_share_the_same_immutable_payload() {
     let key = DecoratedKey::new(PartitionKey::new(b"key".to_vec()));
     let expected = row(4, 1_800_000_000_000_000);
     engine
-        .write(&table, &key, expected.clone(), 1_800_000_000_000_000)
+        .write(
+            &table,
+            &key,
+            Arc::new(expected.clone()),
+            1_800_000_000_000_000,
+        )
         .unwrap();
     // Keep both payloads alive throughout the identity comparison. Equal
     // addresses cannot then be allocator reuse after dropping the first value.
     let (_, a) = left.try_recv().unwrap();
     let (_, b) = right.try_recv().unwrap();
-    assert_eq!(a.rows.as_slice(), std::slice::from_ref(&expected));
-    assert_eq!(b.rows, [expected]);
+    assert_eq!(a.rows, [Arc::new(expected.clone())]);
+    assert_eq!(b.rows, [Arc::new(expected)]);
     assert!(
         std::ptr::eq(a.rows.as_ptr(), b.rows.as_ptr()),
         "fan-out deep-copied rows"
@@ -231,7 +237,7 @@ fn owned_and_borrowed_batches_share_observer_payloads() {
                     table.keyspace.clone(),
                     table.table.clone(),
                     key.clone(),
-                    vec![expected.clone()],
+                    vec![Arc::new(expected.clone())],
                     timestamp,
                 )])
                 .unwrap();
@@ -242,13 +248,16 @@ fn owned_and_borrowed_batches_share_observer_payloads() {
         }
         let (_, a) = left.try_recv().unwrap();
         let (_, b) = right.try_recv().unwrap();
-        assert_eq!(a.rows.as_slice(), std::slice::from_ref(&expected));
-        assert_eq!(b.rows.as_slice(), std::slice::from_ref(&expected));
+        assert_eq!(a.rows, [Arc::new(expected.clone())]);
+        assert_eq!(b.rows, [Arc::new(expected.clone())]);
         assert_eq!(a.key, key);
         assert_eq!(a.mutation_id, b.mutation_id);
         assert!(std::ptr::eq(a.rows.as_ptr(), b.rows.as_ptr()));
         assert!(std::ptr::eq(a.keyspace.as_ptr(), b.keyspace.as_ptr()));
-        assert_eq!(engine.read(&table, &key).unwrap().unwrap().rows, [expected]);
+        assert_eq!(
+            engine.read(&table, &key).unwrap().unwrap().rows,
+            [Arc::new(expected)]
+        );
     }
 }
 
@@ -264,9 +273,9 @@ fn input_memtable_and_observers_share_bytes_and_keep_old_versions() {
     let timestamp = 1_800_000_000_000_000;
     // Hold the original input AND all consumers alive. A deep copy cannot pass
     // by freeing the original allocation and accidentally reusing its address.
-    let input = row(4, timestamp);
+    let input = Arc::new(row(4, timestamp));
     engine
-        .write(&table, &key, input.clone(), timestamp)
+        .write(&table, &key, Arc::clone(&input), timestamp)
         .unwrap();
     let (_, a) = left.try_recv().unwrap();
     let (_, b) = right.try_recv().unwrap();
@@ -288,10 +297,10 @@ fn input_memtable_and_observers_share_bytes_and_keep_old_versions() {
         *cell = CellValue::live(vec![b'y'; 64], timestamp + 1);
     }
     engine
-        .write(&table, &key, newer.clone(), timestamp + 1)
+        .write(&table, &key, Arc::new(newer.clone()), timestamp + 1)
         .unwrap();
     let latest = engine.read(&table, &key).unwrap().unwrap();
-    assert_eq!(latest.rows.as_slice(), std::slice::from_ref(&newer));
+    assert_eq!(latest.rows, [Arc::new(newer.clone())]);
     for old in [&a.rows[0], &b.rows[0], &old_read.rows[0]] {
         assert_eq!(old, &input, "a later merge mutated an earlier view");
     }

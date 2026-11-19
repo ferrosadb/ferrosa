@@ -3,7 +3,7 @@
 # (T-025: ci_serde_json_feature_guard, ci_arrow_free_guard). Each case builds a
 # throwaway one-crate workspace and runs the real guard against real `cargo tree`,
 # so a guard that silently reads nothing fails here. Needs the crates in the local
-# cargo registry (offline); CI has them after any prior build.
+# cargo registry and git checkouts (offline); CI has them after `cargo fetch`.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SJ="$ROOT/scripts/ci/guard-serde-json-features.sh"
@@ -46,7 +46,15 @@ expect "arrow guard: no args is a usage error" 2 bash "$AF"
 expect "arrow guard: unknown crate is an input error" 2 bash "$AF" nonexistent
 expect "arrow guard: arrow-free crate passes" 0 bash "$AF" victim
 rm -rf "$D"
-D=$(ws 'arrow-array = "=53.4.1"'); MP="$D/Cargo.toml"
+# The workspace takes arrow from the chrono-free fork ([patch.crates-io] in the
+# root manifest), so that git checkout, not a registry copy, is what an offline
+# runner holds. Seed the same source the workspace pins.
+ARROW_SEED=$(grep -E '^arrow-array = \{ git = ' "$ROOT/Cargo.toml")
+if [ -z "$ARROW_SEED" ]; then
+  echo "FAIL arrow guard seed: no arrow-array [patch] entry in $ROOT/Cargo.toml"
+  exit 1
+fi
+D=$(ws "$ARROW_SEED"); MP="$D/Cargo.toml"
 expect "arrow guard: seeded arrow-array is refused" 1 bash "$AF" victim
 rm -rf "$D"
 exit $fail

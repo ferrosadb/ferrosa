@@ -987,7 +987,7 @@ impl Workload for LwtWithTimestamp {
         while start.elapsed() < duration {
             let expected = counter;
             let new_val = counter + 1;
-            let ts = chrono::Utc::now().timestamp_micros();
+            let ts = ferrosa_common::temporal::now().timestamp_micros();
 
             recorder.invoke(Op::UpdateIf {
                 table: "jepsen.lwt13".into(),

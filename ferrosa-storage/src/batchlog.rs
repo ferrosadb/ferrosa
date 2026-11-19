@@ -189,6 +189,7 @@ impl BatchlogManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn batchlog_entry_creation() {
@@ -227,12 +228,12 @@ mod tests {
             keyspace: "ks1".to_string(),
             table: "tbl1".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"pk1".to_vec())),
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![],
                 cells: vec![(0, CellValue::live(b"hello".to_vec(), 1000))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1000),
-            }],
+            })],
             timestamp: 1000,
         };
         let m2 = Mutation {
@@ -240,12 +241,12 @@ mod tests {
             keyspace: "ks1".to_string(),
             table: "tbl2".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"pk2".to_vec())),
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![1, 2],
                 cells: vec![(0, CellValue::live(b"world".to_vec(), 2000))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(2000),
-            }],
+            })],
             timestamp: 2000,
         };
 

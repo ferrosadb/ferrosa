@@ -10,6 +10,7 @@ use ferrosa_common::key::{DecoratedKey, PartitionKey};
 use ferrosa_common::schema::{ColumnDefinition, TableSchema};
 use ferrosa_common::CellValue;
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
+use std::sync::Arc;
 
 const REGULAR_COLUMNS: u16 = 4;
 const KEYS: u64 = 6;
@@ -127,7 +128,7 @@ pub fn generate(seed: u64) -> Corpus {
                 key: DecoratedKey::new(PartitionKey::new(format!("k{k:02}").into_bytes())),
                 deletion: DeletionTime::LIVE,
                 static_row: None,
-                rows,
+                rows: rows.into_iter().map(Arc::new).collect(),
             });
         }
         partitions.sort_by(|a, b| a.key.cmp(&b.key));

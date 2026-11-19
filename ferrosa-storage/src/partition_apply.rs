@@ -20,6 +20,8 @@
 //! Because these are ordinary rows they travel through the commit log and
 //! through the existing `Mutation` wire format unchanged.
 
+use std::sync::Arc;
+
 use ferrosa_common::{DecoratedKey, Error, Result};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
 
@@ -45,6 +47,7 @@ pub fn partition_write_timestamp(partition: &Partition) -> i64 {
     partition
         .rows
         .iter()
+        .map(|row| &**row)
         .chain(partition.static_row.as_ref())
         .map(row_write_timestamp)
         .chain([partition.deletion.marked_for_delete_at])
@@ -100,16 +103,19 @@ pub fn partition_state_rows(
     key: &DecoratedKey,
     deletion: DeletionTime,
     static_row: Option<Row>,
-) -> Result<impl Iterator<Item = Row>> {
+) -> Result<impl Iterator<Item = Arc<Row>>> {
     let keep_static = static_row_marker(key, static_row.as_ref())?.is_some();
     let static_marker = static_row.filter(|_| keep_static);
-    Ok(deletion_marker(deletion).into_iter().chain(static_marker))
+    Ok(deletion_marker(deletion)
+        .into_iter()
+        .chain(static_marker)
+        .map(Arc::new))
 }
 
 /// Every piece of `partition`'s state as rows, in apply order: partition
 /// deletion, static row, clustered rows. Consumes the partition; nothing is
 /// copied.
-pub fn into_partition_rows(partition: Partition) -> Result<impl Iterator<Item = Row>> {
+pub fn into_partition_rows(partition: Partition) -> Result<impl Iterator<Item = Arc<Row>>> {
     let Partition {
         key,
         deletion,
@@ -146,7 +152,7 @@ impl StorageEngine {
         key: &DecoratedKey,
         deletion: DeletionTime,
         static_row: Option<Row>,
-        rows: impl IntoIterator<Item = Row>,
+        rows: impl IntoIterator<Item = Arc<Row>>,
     ) -> Result<usize> {
         if static_row.is_some() {
             let schema = self
@@ -174,7 +180,7 @@ impl StorageEngine {
         &self,
         table_id: &TableId,
         key: &DecoratedKey,
-        rows: impl IntoIterator<Item = Row>,
+        rows: impl IntoIterator<Item = Arc<Row>>,
     ) -> Result<usize> {
         let mut written = 0usize;
         for row in rows {
@@ -205,14 +211,14 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(b"k".to_vec())),
             deletion,
             static_row,
-            rows: vec![cell_row(vec![0, 0, 0, 1], 1, 30)],
+            rows: vec![Arc::new(cell_row(vec![0, 0, 0, 1], 1, 30))],
         }
     }
 
     #[test]
     fn rows_carry_deletion_then_static_then_clustered() {
         let p = partition(DeletionTime::new(10, 99), Some(cell_row(Vec::new(), 0, 20)));
-        let rows: Vec<Row> = into_partition_rows(p.clone()).unwrap().collect();
+        let rows: Vec<Arc<Row>> = into_partition_rows(p.clone()).unwrap().collect();
         assert_eq!(rows.len(), 3);
         assert!(rows[0].clustering.is_empty() && rows[0].cells.is_empty());
         assert_eq!(rows[0].deletion, DeletionTime::new(10, 99));

@@ -2828,6 +2828,7 @@ fn message_family_for_kind(kind: u16) -> MessageFamily {
             | MsgType::SstableStreamChunk
             | MsgType::SstableStreamEnd
             | MsgType::RangeReadStreamRequest
+            | MsgType::IndexReadInPartitionStreamRequest
             | MsgType::RangeReadStreamChunk
             | MsgType::RangeReadStreamHeartbeat
             | MsgType::RangeReadStreamDone

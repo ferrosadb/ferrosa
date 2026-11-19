@@ -92,7 +92,10 @@ controls already passed before the fix (`tests/count_payload_alloc.rs`).
   rewritten and a reader tailing the open segment never sees a marker change.
   A full or sealed segment closes its final head with `next = 0`. Segments
   from older binaries (which patched the previous marker in place) still
-  replay unchanged. Three sync strategies
+  replay unchanged. Forced syncs group-commit: a `force_sync` closes its
+  section only once it holds the flush lock, so one fsync covers every caller
+  queued behind it, and a caller whose entries an earlier flush already made
+  durable returns without I/O (FMEA ST-113). Three sync strategies
   (`Batch`, `Periodic`, `Group`); **default is `Periodic`** → a bounded
   durability window (see FMEA). Open-time replay re-logs every mutation it
   keeps only in memory into the new log generation (`ReplayRelog`) and fsyncs
@@ -1590,9 +1593,6 @@ so they are deferred rather than removed unsafely. They are tracked here and in
 
 | Bound | Where | Exceeding it | Needed replacement |
 |---|---|---|---|
-| `RANGE_READ_MATERIALIZATION_CAP` (10000) | `store.rs` | a range read is REFUSED | re-point the materializing path at the existing streaming twin `range_iter` |
-| `INDEX_RESULT_CAP` (10000) | `store.rs` | an index query is REFUSED | stream / spill index postings instead of materializing them |
-| `MAX_INDEXES_TO_RELOAD` / `_READ`, `MAX_TYPES_TO_READ`, `MAX_FUNCTIONS_TO_READ` (10000) | `engine.rs` | `system_schema` rows are silently skipped | the paginated `system_schema` scan (roadmap t_1ec2e3fc) |
 | `DEFAULT_MAX_BYTES` | `schema_snapshot.rs` | a schema-snapshot persist/load is REFUSED | externalize the bound and stream the registry document |
 | `MAX_RECORD_BYTES` | `eviction_audit.rs` | one audit record is REFUSED (that pass is lost) | drop the per-record cap; the ring already bounds the total |
 | RRD ring memory budget | `timeseries/aggregator.rs` | a rollup ring is SKIPPED when the budget is exhausted | spill rollups to disk instead of skipping the ring |

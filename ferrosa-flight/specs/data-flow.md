@@ -79,7 +79,7 @@ since it is indistinguishable from the non-clustered case.
 ```mermaid
 flowchart LR
     A["inbound FlightData stream"] --> B["FlightRecordBatchStream<br/>-> RecordBatch"]
-    B --> C["convert::record_batch_to_rows<br/>(scalar Arrow types; fail-loud on rest)"]
+    B --> C["convert::record_batch_rows<br/>(rows one at a time; scalar Arrow types; fail-loud on rest)"]
     C --> D["per row: build_insert<br/>INSERT INTO ks.t (...) VALUES (...)"]
     D --> E{"column representable?<br/>(cql_literal)"}
     E -- "NULL cell" --> F["cell skipped (absent by design)"]

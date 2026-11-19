@@ -23,6 +23,10 @@
 //! coordinator captures the engine's DDL calls; if the engine bypasses it
 //! (the pre-fix behaviour), the recording is empty and the test fails.
 
+mod support;
+#[allow(unused_imports)] // a test binary may only use the streaming API
+use support::ExecuteCollect as _;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

@@ -1,5 +1,5 @@
 //! SPARQL COUNT semantics over the real typed RDF store.
-//! Correctness: global/grouped counts, empty input, term identity and scan bounds.
+//! Correctness: global/grouped counts, empty input, term identity, spilled groups.
 //! Last revised: 2026-10-27
 //! Last changed: Pin the live COUNT rejection before adding aggregation.
 
@@ -11,7 +11,11 @@ use ferrosa_storage::{StorageEngine, StorageEngineConfig};
 
 const KS: &str = "default";
 
-fn fixture(max_rows: usize) -> (SparqlEngine, tempfile::TempDir) {
+/// Every fixture spills grouped partials and sort runs almost immediately, so
+/// the counts below are produced by the spilled merge path, not a hash map.
+const TINY_SPILL_THRESHOLD_BYTES: u64 = 64;
+
+fn fixture() -> (SparqlEngine, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let mut config = StorageEngineConfig::test_config(dir.path());
     config.commit_log.segment_size = 1024 * 1024;
@@ -23,7 +27,7 @@ fn fixture(max_rows: usize) -> (SparqlEngine, tempfile::TempDir) {
             path,
             SparqlConfig {
                 default_graph: KS.into(),
-                max_rows,
+                spill_threshold_bytes: TINY_SPILL_THRESHOLD_BYTES,
             },
         ),
         dir,
@@ -56,7 +60,7 @@ async fn count(engine: &SparqlEngine, query: &str) -> u64 {
 
 #[tokio::test]
 async fn count_star_and_bound_variable_preserve_bag_multiplicity() {
-    let (engine, _dir) = fixture(64);
+    let (engine, _dir) = fixture();
     seed(&engine).await;
     for aggregate in ["*", "?o"] {
         let query = format!("SELECT (COUNT({aggregate}) AS ?c) WHERE {{ ?s <urn:p> ?o }}");
@@ -74,7 +78,7 @@ async fn count_star_and_bound_variable_preserve_bag_multiplicity() {
 
 #[tokio::test]
 async fn global_count_of_empty_input_is_one_zero_row() {
-    let (engine, _dir) = fixture(64);
+    let (engine, _dir) = fixture();
     assert_eq!(
         count(&engine, "SELECT (COUNT(*) AS ?c) WHERE { ?s <urn:p> ?o }").await,
         0
@@ -83,7 +87,7 @@ async fn global_count_of_empty_input_is_one_zero_row() {
 
 #[tokio::test]
 async fn distinct_count_preserves_rdf_term_identity() {
-    let (engine, _dir) = fixture(64);
+    let (engine, _dir) = fixture();
     engine
         .execute_update(
             "INSERT DATA { <urn:a> <urn:p> \"1\"^^<http://www.w3.org/2001/XMLSchema#integer> . \
@@ -105,7 +109,7 @@ async fn distinct_count_preserves_rdf_term_identity() {
 
 #[tokio::test]
 async fn grouped_count_emits_one_row_per_group() {
-    let (engine, _dir) = fixture(64);
+    let (engine, _dir) = fixture();
     seed(&engine).await;
     let SparqlResult::Select(result) = engine
         .execute(
@@ -133,7 +137,7 @@ async fn grouped_count_emits_one_row_per_group() {
 
 #[tokio::test]
 async fn count_named_graph_does_not_mix_default_graph_rows() {
-    let (engine, _dir) = fixture(64);
+    let (engine, _dir) = fixture();
     seed(&engine).await;
     engine
         .execute_update("INSERT DATA { GRAPH <urn:g> { <urn:n> <urn:p> 9 } }", KS)
@@ -154,8 +158,8 @@ async fn count_named_graph_does_not_mix_default_graph_rows() {
 }
 
 #[tokio::test]
-async fn limit_applies_after_count_and_scan_limits_remain_loud() {
-    let (engine, _dir) = fixture(64);
+async fn limit_applies_after_count_and_no_row_bound_refuses_it() {
+    let (engine, _dir) = fixture();
     seed(&engine).await;
     assert_eq!(
         count(
@@ -165,18 +169,17 @@ async fn limit_applies_after_count_and_scan_limits_remain_loud() {
         .await,
         3
     );
-    let (bounded, _bounded_dir) = fixture(2);
-    seed(&bounded).await;
-    let error = bounded
-        .execute("SELECT (COUNT(*) AS ?c) WHERE { ?s <urn:p> ?o }", KS)
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("bound"), "{error}");
+    // The executor used to refuse a COUNT whose input crossed `max_rows` (2
+    // here). There is no row bound now: the count is complete.
+    assert_eq!(
+        count(&engine, "SELECT (COUNT(*) AS ?c) WHERE { ?s <urn:p> ?o }").await,
+        3
+    );
 }
 
 #[tokio::test]
 async fn count_preserves_join_and_filter_multiplicity() {
-    let (engine, _dir) = fixture(64);
+    let (engine, _dir) = fixture();
     seed(&engine).await;
     assert_eq!(
         count(
@@ -197,7 +200,7 @@ async fn count_preserves_join_and_filter_multiplicity() {
 }
 #[tokio::test]
 async fn count_fails_loud_on_unimplemented_input_algebra() {
-    let (engine, _dir) = fixture(64);
+    let (engine, _dir) = fixture();
     seed(&engine).await;
     for query in [
         "SELECT (COUNT(*) AS ?c) WHERE { { ?s <urn:p> ?o } UNION { ?s <urn:p> ?o } }",
@@ -213,7 +216,7 @@ async fn count_fails_loud_on_unimplemented_input_algebra() {
 
 #[tokio::test]
 async fn streamed_count_obeys_bind_filter_and_constant_constraints() {
-    let (engine, _dir) = fixture(64);
+    let (engine, _dir) = fixture();
     seed(&engine).await;
     engine
         .execute_update("INSERT DATA { <urn:a> <urn:q> 2 }", KS)

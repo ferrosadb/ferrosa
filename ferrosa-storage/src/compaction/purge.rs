@@ -14,6 +14,8 @@
 //! Last changed: New module — compaction kept every partition/row/cell tombstone
 //!   forever because `gc_grace_seconds` was stored in the schema but never read.
 
+use std::sync::Arc;
+
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
 
 use super::metadata::SSTableMetadata;
@@ -152,6 +154,10 @@ pub fn purge_partition(partition: &mut Partition, policy: &PurgePolicy) -> Purge
     }
     let rows_before = partition.rows.len();
     partition.rows.retain_mut(|row| {
+        // Compaction rows come straight off an SSTable decode, so this `Arc`
+        // is the only one and `make_mut` mutates in place; a row still shared
+        // with a reader is copied on write rather than changed under it.
+        let row = Arc::make_mut(row);
         let changed = purge_row(row, policy, &mut stats);
         !(changed && row_is_vacant(row))
     });
@@ -309,7 +315,7 @@ pub fn has_purgeable_marker(partition: &Partition, policy: &PurgePolicy) -> bool
     };
     policy.purgeable_deletion(&partition.deletion)
         || partition.static_row.as_ref().is_some_and(row_has_marker)
-        || partition.rows.iter().any(row_has_marker)
+        || partition.rows.iter().any(|row| row_has_marker(row))
 }
 
 /// The policy for viewing an already-merged read result at horizon `gc_before`:
@@ -348,7 +354,11 @@ pub fn repair_guard(partition: &Partition, gc_before: i64) -> i64 {
     if !partition.deletion.is_live() && !open.purgeable_deletion(&partition.deletion) {
         hold(partition.deletion.marked_for_delete_at);
     }
-    for row in partition.static_row.iter().chain(partition.rows.iter()) {
+    for row in partition
+        .static_row
+        .iter()
+        .chain(partition.rows.iter().map(|row| &**row))
+    {
         if !row.deletion.is_live() && !open.purgeable_deletion(&row.deletion) {
             hold(row.deletion.marked_for_delete_at);
         }
@@ -481,7 +491,7 @@ mod tests {
             key: key(),
             deletion,
             static_row: None,
-            rows,
+            rows: rows.into_iter().map(Arc::new).collect(),
         }
     }
 
@@ -656,7 +666,7 @@ mod tests {
         let stats = purge_partition(&mut p, &policy(1_000));
         assert_eq!(
             p.rows,
-            vec![fresh],
+            vec![Arc::new(fresh)],
             "only the row still inside grace remains"
         );
         assert_eq!(stats.rows_removed, 1);
@@ -733,6 +743,7 @@ mod tests {
             .map(|r| PurgedRow::new(r, policy))
             .filter(|v| !v.removes_row())
             .map(|v| owned(&v))
+            .map(Arc::new)
             .collect();
         Partition {
             key: p.key.clone(),
@@ -818,7 +829,7 @@ mod tests {
         let kept = row(b"b", vec![(0, CellValue::live(b"v".to_vec(), 900))], 900);
         let p = partition(DeletionTime::LIVE, vec![expired, kept.clone()]);
         let viewed = rebuilt_from_views(&p, &read_view_policy(GC_BEFORE));
-        assert_eq!(viewed.rows, vec![kept]);
+        assert_eq!(viewed.rows, vec![Arc::new(kept)]);
     }
 
     #[test]

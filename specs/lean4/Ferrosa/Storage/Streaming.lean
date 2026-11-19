@@ -177,6 +177,33 @@ theorem a_vector_returning_reader_keeps_every_row_alive (materialised : Nat)
   unfold liveRows
   omega
 
+/-- The two shapes a partition reader's scan can take. `SSTableReader` now has only the first:
+    `partitions_iter` / `next_partition` hand out one partition per call, and the vector-returning
+    `read_partitions_limited` and `read_partitions_limited_rows` were removed (the store's range read
+    walks the merged sources and stops at the caller's limit). -/
+inductive ReaderShape where
+  | iterating
+  | vectorReturning
+  deriving DecidableEq, Repr
+
+/-- Partitions the reader keeps alive while a caller reads `n` of them. -/
+def readerResident : ReaderShape → Nat → Nat
+  | .iterating, _ => 1
+  | .vectorReturning, n => n
+
+/-- The reader's only scan shape. -/
+def sstableReaderShape : ReaderShape := .iterating
+
+/-- **The SSTable reader hands partitions to the caller one at a time.**  Whatever the caller reads,
+    the reader keeps one partition alive, and for any read of two or more partitions that is strictly
+    less than a vector-returning reader would hold. -/
+theorem the_sstable_reader_hands_out_one_partition_at_a_time (n : Nat) :
+    readerResident sstableReaderShape n = 1 ∧
+      (2 ≤ n → readerResident sstableReaderShape n < readerResident .vectorReturning n) := by
+  refine ⟨rfl, fun h => ?_⟩
+  simp only [sstableReaderShape, readerResident]
+  omega
+
 /-- Bytes copied when a decoder returns a fresh buffer for each chunk. -/
 def bytesCopiedPerChunk (chunks chunkSize : Nat) : Nat := chunks * chunkSize
 
@@ -430,9 +457,7 @@ def ledger : List SpecItem := [
      "it is a bound in rows: DEFAULT_SCAN_PAGE_SIZE is 5000, which is 5 MB of narrow rows and 5 GB of 1 MiB rows on the same coordinator"
      "Streaming.a_row_count_page_bound_is_not_a_memory_bound"⟩,
   ⟨"the reader hands partitions to the caller instead of a vector of them",
-   .failing
-     "read_partitions_limited returns Vec<Partition>, so the reader has already materialised the page by the time the caller sees it"
-     "Streaming.a_vector_returning_reader_keeps_every_row_alive"⟩,
+   .met "Streaming.the_sstable_reader_hands_out_one_partition_at_a_time"⟩,
   ⟨"a decoded chunk is written into a caller-supplied buffer rather than returned as a new Vec",
    .failing
      "compression.rs decompress takes the uncompressed length and ignores it, returning a fresh Vec per chunk: one allocation and one copy for every byte read"
@@ -477,9 +502,9 @@ def ledger : List SpecItem := [
      "Streaming.materialising_grows_with_the_input"⟩
 ]
 
-/-- The area records twenty-three obligations of which seven are unmet, and both numbers are pinned
+/-- The area records twenty-three obligations of which six are unmet, and both numbers are pinned
     here: adding a claim, or closing one, forces the ledger to be updated in the same change. -/
-theorem streaming_has_twenty_three_items_and_seven_red : ledger.length = 23 ∧ redCount ledger = 7 := by
+theorem streaming_has_twenty_three_items_and_six_red : ledger.length = 23 ∧ redCount ledger = 6 := by
   decide
 
 def main : IO Unit :=

@@ -6,6 +6,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ferrosa_common::schema::{ColumnDefinition, TableSchema};
@@ -154,6 +155,7 @@ fn inputs(
                     static_row: None,
                     rows: (0..rows)
                         .map(|i| row(s, i, bytes, complex, s + 1 == fanin))
+                        .map(Arc::new)
                         .collect(),
                 })
                 .collect();
@@ -213,7 +215,7 @@ fn validate(
                 expected.cells.remove(1);
             }
             assert!(
-                actual == &expected,
+                **actual == expected,
                 "wrong merged value at row {i}: actual_cells={}, expected_cells={} (payload diagnostics omitted)",
                 actual.cells.len(),
                 expected.cells.len()

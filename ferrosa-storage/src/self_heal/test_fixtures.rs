@@ -61,7 +61,12 @@ pub fn table_dir_with_n_generations(n: u64) -> (Arc<StorageEngine>, TempDir, Pat
         let key = DecoratedKey::new(PartitionKey::new(format!("pk{i}").into_bytes()));
         let ts = 1000 + i as i64;
         engine
-            .write(&tid, &key, make_row(format!("v{i}").as_bytes(), ts), ts)
+            .write(
+                &tid,
+                &key,
+                Arc::new(make_row(format!("v{i}").as_bytes(), ts)),
+                ts,
+            )
             .unwrap();
         engine.flush(&tid).unwrap();
     }

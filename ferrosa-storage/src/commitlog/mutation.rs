@@ -54,6 +54,7 @@ use ferrosa_common::{
     accord_list_cell_path, list_path_element_seq, CellValue, DecoratedKey, PartitionKey, Token,
 };
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// A mutation: one or more row writes targeting a single table.
@@ -87,8 +88,11 @@ pub struct Mutation {
     pub table: String,
     /// Partition key (with cached token).
     pub key: DecoratedKey,
-    /// Rows to write.
-    pub rows: Vec<Row>,
+    /// Rows to write, shared rather than copied: the same `Arc<Row>` moves
+    /// from the writer into the memtable, and a mutation fanned out to several
+    /// consumers (memtable, async observers, replicas) shares one allocation.
+    /// Encoders serialize from `&Row`; decoders build a fresh `Arc`.
+    pub rows: Vec<Arc<Row>>,
     /// Mutation timestamp (microseconds since epoch).
     pub timestamp: i64,
 }
@@ -104,7 +108,7 @@ impl Mutation {
         keyspace: String,
         table: String,
         key: DecoratedKey,
-        rows: Vec<Row>,
+        rows: Vec<Arc<Row>>,
         timestamp: i64,
     ) -> Self {
         Self {
@@ -738,7 +742,7 @@ impl Mutation {
 
         let mut rows = Vec::with_capacity(row_count);
         for _ in 0..row_count {
-            rows.push(Self::deserialize_row(&mut r, rebind_t, legacy)?);
+            rows.push(Arc::new(Self::deserialize_row(&mut r, rebind_t, legacy)?));
         }
 
         Ok(Mutation {
@@ -902,7 +906,7 @@ mod tests {
             keyspace: "ks".to_string(),
             table: "t".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"k".to_vec())),
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![0, 0, 0, 1],
                 cells: vec![
                     (0, CellValue::live(b"v".to_vec(), ns)),
@@ -910,7 +914,7 @@ mod tests {
                 ],
                 deletion: DeletionTime::new(ns - 5_000, 1_700_000_000),
                 primary_key_liveness: LivenessInfo::with_timestamp(ns),
-            }],
+            })],
             timestamp: ns,
         };
         let mut buf = vec![0u8; m.serialized_size()];
@@ -972,12 +976,12 @@ mod tests {
             keyspace: "ks".to_string(),
             table: "t".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"k".to_vec())),
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![],
                 cells: vec![(0, CellValue::live(b"v".to_vec(), 1_791_437_153_001_234))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::NONE,
-            }],
+            })],
             timestamp: 1_791_437_153_001_234,
         };
         let mut buf = vec![0u8; m.serialized_size()];
@@ -996,12 +1000,12 @@ mod tests {
             keyspace: "test_ks".to_string(),
             table: "test_table".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"pk1".to_vec())),
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![1, 2, 3],
                 cells: vec![(0, CellValue::live(b"hello".to_vec(), 1000))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1000),
-            }],
+            })],
             timestamp: 42_000,
         }
     }
@@ -1027,7 +1031,7 @@ mod tests {
     #[test]
     fn borrowed_rows_serialize_like_an_owned_mutation() {
         let m = simple_mutation();
-        let refs: Vec<&Row> = m.rows.iter().collect();
+        let refs: Vec<&Row> = m.rows.iter().map(|r| &**r).collect();
         let borrowed = Mutation::serialize_borrowed_rows(
             m.mutation_id,
             &m.keyspace,
@@ -1050,8 +1054,8 @@ mod tests {
         }
     }
 
-    fn serialize_purged(m: &Mutation, rows: &[Row], guard: i64) -> Vec<u8> {
-        let refs: Vec<&Row> = rows.iter().collect();
+    fn serialize_purged(m: &Mutation, rows: &[Arc<Row>], guard: i64) -> Vec<u8> {
+        let refs: Vec<&Row> = rows.iter().map(|r| &**r).collect();
         Mutation::serialize_purged_rows(
             m.mutation_id,
             &m.keyspace,
@@ -1068,7 +1072,7 @@ mod tests {
     #[test]
     fn purged_rows_with_nothing_purgeable_serialize_like_borrowed_rows() {
         let m = simple_mutation();
-        let refs: Vec<&Row> = m.rows.iter().collect();
+        let refs: Vec<&Row> = m.rows.iter().map(|r| &**r).collect();
         let borrowed = Mutation::serialize_borrowed_rows(
             m.mutation_id,
             &m.keyspace,
@@ -1137,7 +1141,12 @@ mod tests {
             },
             primary_key_liveness: LivenessInfo::NONE,
         };
-        let rows = vec![deletion_marker, expired, guarded.clone(), mixed.clone()];
+        let rows = vec![
+            Arc::new(deletion_marker),
+            Arc::new(expired),
+            Arc::new(guarded.clone()),
+            Arc::new(mixed.clone()),
+        ];
 
         let mut purged_mixed = mixed;
         purged_mixed.cells.truncate(1);
@@ -1163,7 +1172,7 @@ mod tests {
     #[test]
     fn borrowed_rows_beyond_the_u16_count_are_refused() {
         let m = simple_mutation();
-        let row = &m.rows[0];
+        let row: &Row = &m.rows[0];
         let refs: Vec<&Row> = std::iter::repeat_n(row, usize::from(u16::MAX) + 1).collect();
         let err = Mutation::serialize_borrowed_rows(
             m.mutation_id,
@@ -1194,12 +1203,12 @@ mod tests {
             keyspace: "ks".to_string(),
             table: "tbl".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"pk".to_vec())),
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![10],
                 cells: vec![(0, CellValue::tombstone(5000, 1_700_000_000))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(5000),
-            }],
+            })],
             timestamp: 5000,
         };
 
@@ -1221,7 +1230,7 @@ mod tests {
             keyspace: "ks".to_string(),
             table: "tbl".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"pk".to_vec())),
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![],
                 cells: vec![(
                     3,
@@ -1229,7 +1238,7 @@ mod tests {
                 )],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(2000),
-            }],
+            })],
             timestamp: 2000,
         };
 
@@ -1272,7 +1281,7 @@ mod tests {
             table: "tbl".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"multi".to_vec())),
             rows: vec![
-                Row {
+                Arc::new(Row {
                     clustering: vec![0, 0, 1],
                     cells: vec![
                         (0, CellValue::live(b"a".to_vec(), 100)),
@@ -1280,19 +1289,19 @@ mod tests {
                     ],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(100),
-                },
-                Row {
+                }),
+                Arc::new(Row {
                     clustering: vec![0, 0, 2],
                     cells: vec![(0, CellValue::tombstone(200, 1_700_000_000))],
                     deletion: DeletionTime::new(200, 1_700_000_000),
                     primary_key_liveness: LivenessInfo::with_timestamp(200),
-                },
-                Row {
+                }),
+                Arc::new(Row {
                     clustering: vec![0, 0, 3],
                     cells: vec![],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::NONE,
-                },
+                }),
             ],
             timestamp: 200,
         };
@@ -1343,7 +1352,7 @@ mod tests {
     #[test]
     fn complex_cell_path_round_trips() {
         let mut m = simple_mutation();
-        m.rows[0].cells = vec![
+        Arc::make_mut(&mut m.rows[0]).cells = vec![
             (
                 3,
                 CellValue::live(b"elem".to_vec(), 1000).with_path(b"timeuuid-path".to_vec()),
@@ -1414,12 +1423,12 @@ mod tests {
             keyspace: "ks".into(),
             table: "t".into(),
             key: DecoratedKey::new(PartitionKey::new(b"pk".to_vec())),
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![],
                 cells,
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1000),
-            }],
+            })],
             timestamp: 1000,
         };
         let mut buf = vec![0u8; m.serialized_size()];
@@ -1574,7 +1583,7 @@ mod tests {
             table: "wire_format".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"pk-golden".to_vec())),
             rows: vec![
-                Row {
+                Arc::new(Row {
                     clustering: vec![0, 0, 0, 1],
                     cells: vec![
                         (0, CellValue::live(b"hello, wire".to_vec(), GOLDEN_TS)),
@@ -1583,8 +1592,8 @@ mod tests {
                     ],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(GOLDEN_TS),
-                },
-                Row {
+                }),
+                Arc::new(Row {
                     clustering: vec![],
                     cells: vec![
                         (0, CellValue::live(b"second row".to_vec(), GOLDEN_TS - 1)),
@@ -1600,7 +1609,7 @@ mod tests {
                     ],
                     deletion: DeletionTime::new(GOLDEN_TS - 500, 1_700_000_001),
                     primary_key_liveness: LivenessInfo::with_timestamp(GOLDEN_TS - 1),
-                },
+                }),
             ],
             timestamp: GOLDEN_TS,
         }
@@ -1762,7 +1771,7 @@ mod prop_tests {
                     keyspace,
                     table,
                     key,
-                    rows,
+                    rows: rows.into_iter().map(Arc::new).collect(),
                     timestamp,
                 }
             })
@@ -1827,7 +1836,7 @@ mod prop_tests {
                     keyspace,
                     table,
                     key,
-                    rows,
+                    rows: rows.into_iter().map(Arc::new).collect(),
                     timestamp,
                 }
             })
