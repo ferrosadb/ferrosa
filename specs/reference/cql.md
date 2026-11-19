@@ -608,21 +608,37 @@ UNSUBSCRIBE [<stream_id>]
 
 ### Frame Compression
 
-Compression is negotiated during the STARTUP/OPTIONS handshake:
+The flag's meaning depends on the protocol version, and confusing the two is a
+connection-closing bug rather than a degraded one.
+
+**Protocol v4 and below.** Compression is per-envelope and the `0x01` flag is the
+only signal:
 
 1. Client sends OPTIONS; server responds with SUPPORTED listing `lz4` and `snappy`
 1. Client sends STARTUP with `COMPRESSION` key set to chosen algorithm
 1. Server validates the algorithm and sends READY
-1. All subsequent frames (both directions) may have `COMPRESSION` flag set
+1. Every later envelope that is compressed carries `COMPRESSION` set
 1. STARTUP and READY frames themselves are never compressed
+
+**Protocol v5.** Compression moves into the segment framing and is negotiated for
+the lifetime of the connection (`native_protocol_v5.spec` §2.3.2). Each segment
+carries its own uncompressed length in the segment header, and an uncompressed
+length of 0 means that segment's payload was not worth compressing. The envelope
+`0x01` flag is **deprecated and ignored** (§2.4.1.2).
 
 Implementation in `CqlCodec`:
 
 - `Compression` enum: `Lz4` and `Snappy` variants with `protocol_name()`/`from_protocol_name()`
 - `set_compression()` enables compression after handshake completes
-- Encoder compresses body and sets flag only when compression reduces size
-- Decoder checks flag and decompresses; rejects compressed frames if no compression negotiated
-- LZ4 uses CQL v5 wire format: 4-byte big-endian uncompressed length prefix + lz4 block
+- v5: `decode_v5_frame` decompresses **per segment**; `emit_envelopes`
+  deliberately does **not** re-check the envelope flag, because the segment has
+  already been decompressed and the driver still sets the deprecated bit. Doing
+  both decompresses plaintext twice (issue #664: the first four bytes of a QUERY
+  body were read as an LZ4 length prefix, and the decode failed with "the offset
+  to copy is not contained in the decompressed buffer")
+- v4: `decode_v4_envelope` honours the flag, and rejects a compressed envelope
+  when no compression was negotiated
+- LZ4 body framing (v4 only): 4-byte big-endian uncompressed length prefix + lz4 block
 - Snappy uses raw Snappy encoding via `snap` crate
 
 The stream ID in the frame header identifies the subscription. Multiple subscriptions can be active concurrently on the same connection using different stream IDs.

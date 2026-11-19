@@ -454,6 +454,21 @@ impl CqlCodec {
     /// The v5 spec allows pipelining multiple envelopes in a single
     /// self-contained frame. The DataStax Java driver does this (e.g. sending
     /// SELECT system.local and SELECT system.peers_v2 together).
+    ///
+    /// Compression is NOT applied here. In v5 it lives in the segment framing
+    /// and is negotiated for the lifetime of the connection
+    /// (native_protocol_v5.spec §2.3.2); the envelope's `COMPRESSION_FLAG` bit
+    /// is "deprecated and ignored" (§2.4.1.2). `decode_v5_frame` has already
+    /// decompressed the segment before we are called, so the bodies here are
+    /// plaintext however the envelope's flag reads.
+    ///
+    /// Honouring that flag would decompress plaintext a second time. It is not
+    /// a theoretical branch: the DataStax Java driver still sets 0x01 on every
+    /// non-STARTUP/OPTIONS envelope at v5, so its requests always take it — the
+    /// first four bytes of a QUERY body (its query-string length) were read as
+    /// an uncompressed-length prefix and LZ4 failed with "the offset to copy is
+    /// not contained in the decompressed buffer", closing the connection
+    /// mid-setup (issue #664).
     fn emit_envelopes(
         &mut self,
         envelope_data: Bytes,
@@ -471,21 +486,6 @@ impl CqlCodec {
                 )));
             }
             let body = envelope_data.slice(offset + HEADER_SIZE..body_end);
-
-            // Decompress if needed.
-            let body = if header.flags & COMPRESSION_FLAG != 0 {
-                match self.compression {
-                    Some(Compression::Lz4) => Bytes::from(decompress_lz4(&body)?),
-                    Some(Compression::Snappy) => Bytes::from(decompress_snappy(&body)?),
-                    None => {
-                        return Err(CqlError::Protocol(
-                            "received compressed frame but no compression negotiated".into(),
-                        ));
-                    }
-                }
-            } else {
-                body
-            };
 
             frames.push(CqlFrame { header, body });
             offset = body_end;
@@ -2059,6 +2059,96 @@ mod tests {
         assert!(
             result.is_err(),
             "should reject compressed frame without negotiation"
+        );
+    }
+
+    /// The DataStax Java driver (4.x) on protocol v5 sends every request as a
+    /// segment-compressed frame whose inner envelope ALSO carries the
+    /// `COMPRESSION_FLAG` bit.
+    ///
+    /// That bit is deprecated and ignored in v5 — the spec says compression is
+    /// "set for the lifetime of a connection and applies to all messages"
+    /// (native_protocol_v5.spec §2.4.1.2) — but the driver's
+    /// `FrameCodec.computeFlags` still sets it for anything that is not STARTUP
+    /// or OPTIONS. Reading it a second time inside `emit_envelopes` therefore
+    /// ran LZ4 over an already-decompressed body: the first four bytes of a
+    /// QUERY body are the query-string length, which was taken as an
+    /// uncompressed-length prefix, and `lz4_flex` reported
+    /// "the offset to copy is not contained in the decompressed buffer" before
+    /// closing the connection (issue #664).
+    #[test]
+    fn a_v5_envelope_carrying_the_deprecated_compression_flag_is_not_decompressed_again() {
+        // A real v5 QUERY body: long-string query text, consistency, flags.
+        let query = b"SELECT cluster_name FROM system.local";
+        let mut body = Vec::new();
+        body.extend_from_slice(&(query.len() as u32).to_be_bytes());
+        body.extend_from_slice(query);
+        body.extend_from_slice(&[0x00, 0x01]); // consistency LOCAL_ONE
+        body.push(0x00); // query flags: none
+
+        // What the driver puts on the wire: compressed per segment, envelope
+        // flag 0x01 left set.
+        let header = FrameHeader {
+            version: 0x05,
+            flags: COMPRESSION_FLAG,
+            stream_id: 42,
+            opcode: Opcode::Query,
+            length: body.len() as u32,
+        };
+        let mut buf = BytesMut::new();
+        encode_v5_message_compressed(&header, &body, Some(Compression::Lz4), &mut buf);
+
+        let mut decoder = CqlCodec::new(DEFAULT_MAX_FRAME_SIZE);
+        decoder.set_compression(Compression::Lz4);
+        decoder.enable_v5_framing();
+
+        let frame = decoder
+            .decode(&mut buf)
+            .expect("v5 envelope carrying the deprecated 0x01 flag must decode, not re-decompress");
+        let frame = frame.expect("the whole message is buffered");
+        assert_eq!(
+            &frame.body[..],
+            &body[..],
+            "the body must be the plaintext the driver encoded, not a failed LZ4 decode of it"
+        );
+
+        // The query text survives intact, which is what `SELECT cluster_name
+        // FROM system.local` returns a row for.
+        let mut cursor = frame.body.as_ref();
+        assert_eq!(cursor.get_u32() as usize, query.len());
+        assert_eq!(&cursor[..query.len()], &query[..]);
+    }
+
+    /// The converse, so the fix cannot be "ignore the flag everywhere": v4 has
+    /// no framing layer, so there the per-envelope flag is the ONLY compression
+    /// signal and must still be honoured.
+    #[test]
+    fn a_v4_envelope_still_honours_the_compression_flag() {
+        let body = b"v4 envelope body that compresses to nothing much at all";
+        let compressed = compress_lz4(body);
+
+        let header = FrameHeader {
+            version: 0x04,
+            flags: COMPRESSION_FLAG,
+            stream_id: 3,
+            opcode: Opcode::Query,
+            length: compressed.len() as u32,
+        };
+        let mut buf = BytesMut::new();
+        header.encode(&mut buf);
+        buf.put_slice(&compressed);
+
+        let mut decoder = CqlCodec::new(DEFAULT_MAX_FRAME_SIZE);
+        decoder.set_compression(Compression::Lz4);
+
+        let frame = decoder
+            .decode(&mut buf)
+            .unwrap()
+            .expect("complete v4 frame");
+        assert_eq!(
+            &frame.body[..],
+            &body[..],
+            "v4 must still decompress when the envelope flag is set"
         );
     }
 
