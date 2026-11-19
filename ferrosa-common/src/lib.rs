@@ -36,6 +36,7 @@ pub mod mem_probe;
 pub mod murmur3;
 pub mod schema;
 pub mod task_pool;
+pub mod temporal;
 pub mod timeuuid;
 pub mod token;
 

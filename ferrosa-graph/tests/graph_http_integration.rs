@@ -7,6 +7,10 @@
 //! Last revised: 2026-11-03
 //! Last changed: Cover legacy cascade row keys and temporal vertex endpoint identities.
 
+mod support;
+#[allow(unused_imports)] // a test binary may only use the streaming API
+use support::ExecuteCollect as _;
+
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -704,12 +708,12 @@ async fn cluster_anchor_full_primary_key_match_reads_remote_vertex_without_range
         )),
         deletion: DeletionTime::LIVE,
         static_row: None,
-        rows: vec![Row {
+        rows: vec![Arc::new(Row {
             clustering: vec![],
             cells: vec![(1, ferrosa_common::CellValue::live(b"Alice".to_vec(), 1000))],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
-        }],
+        })],
     };
 
     let (server, addr, remote_host_id) =
@@ -4385,7 +4389,12 @@ fn seed_agent_memory_entity(
         primary_key_liveness: LivenessInfo::with_timestamp(1),
     };
     storage
-        .write(&TableId::new("agent_memory", "entity_store"), &key, row, 1)
+        .write(
+            &TableId::new("agent_memory", "entity_store"),
+            &key,
+            Arc::new(row),
+            1,
+        )
         .unwrap();
 }
 
@@ -6091,12 +6100,12 @@ async fn inline_merge_reuses_legacy_destination_storage_identity() {
         .write(
             &TableId::new("social", "person_v"),
             &legacy_key,
-            Row {
+            Arc::new(Row {
                 clustering: vec![],
                 cells: vec![(1, CellValue::live(b"LegacyDst".to_vec(), 1))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1),
-            },
+            }),
             1,
         )
         .expect("seed the existing legacy vertex");
@@ -7276,14 +7285,21 @@ mod bolt_rmw_regressions {
     async fn bolt_rmw_gate_expired_stream_releases_before_error_is_dropped() {
         use futures::StreamExt;
         tokio::time::timeout(HANG_GUARD, async {
-            let fixture = Fixture::with_query_timeout(std::time::Duration::from_millis(100)).await;
+            // The fixture's normal 30 s timeout applies to every query here.
+            // FIRST's deadline is expired on tokio's clock, not by racing a
+            // real-time budget: with a 100 ms fixture timeout SECOND had to fit
+            // its own real write (a commit-log fsync) into 100 ms too, and one
+            // slow device flush on CI failed it (run 44390667223).
+            let fixture = Fixture::start().await;
             let (_, mut rows, _) = fixture
                 .engine
                 .execute_stream_with_params(FIRST, "neo4j", &superuser_auth(), &HashMap::new())
                 .await
                 .unwrap();
             // Deadline expiry is the behavior under test, not an overlap guess.
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            tokio::time::pause();
+            tokio::time::advance(std::time::Duration::from_secs(31)).await;
+            tokio::time::resume();
             assert!(
                 matches!(
                     rows.next().await,

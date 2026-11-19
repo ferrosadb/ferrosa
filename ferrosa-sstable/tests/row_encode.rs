@@ -8,6 +8,7 @@
 //! `tests/row_encode_alloc.rs`, which needs its own `#[global_allocator]`
 //! and so cannot share a test binary with anything else.
 
+use std::sync::Arc;
 mod support;
 
 use proptest::prelude::*;
@@ -70,12 +71,12 @@ fn write_single_row(cells: Vec<(u16, CellValue)>) -> Vec<u8> {
         key: DecoratedKey::new(PartitionKey::from(b"k".as_slice())),
         deletion: DeletionTime::LIVE,
         static_row: None,
-        rows: vec![Row {
+        rows: vec![Arc::new(Row {
             clustering: 0i32.to_be_bytes().to_vec(),
             cells,
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
-        }],
+        })],
     };
     writer.add_partition(&partition).expect("add_partition");
     writer.finish().expect("finish").data

@@ -503,13 +503,6 @@ pub const REDS: &[Red] = &[
         witness: "Streaming.the_pool_is_never_overcommitted",
     },
     Red {
-        name: "storage_streaming__the_reader_hands_partitions_to_the_caller_instead_of_a_vector_of_them",
-        module: "Ferrosa.Storage.Streaming",
-        claim: "the reader hands partitions to the caller instead of a vector of them",
-        why: "read_partitions_limited returns Vec<Partition>, so the reader has already materialised the page by the time the caller sees it",
-        witness: "Streaming.a_vector_returning_reader_keeps_every_row_alive",
-    },
-    Red {
         name: "storage_streaming__the_row_buffer_is_never_built_as_vec_vec_option_cqlvalue_on_the_scan_path",
         module: "Ferrosa.Storage.Streaming",
         claim: "the row buffer is never built as Vec<Vec<Option<CqlValue>>> on the scan path",

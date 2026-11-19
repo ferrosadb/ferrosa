@@ -47,12 +47,12 @@ fn make_mutation(ks: &str, table: &str, key: &[u8], value: &[u8], ts: i64) -> Mu
         keyspace: ks.to_string(),
         table: table.to_string(),
         key: DecoratedKey::new(PartitionKey::new(key.to_vec())),
-        rows: vec![Row {
+        rows: vec![Arc::new(Row {
             clustering: vec![0x00, 0x00, 0x00, 0x01],
             cells: vec![(0, CellValue::live(value.to_vec(), ts))],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(ts),
-        }],
+        })],
         timestamp: ts,
     }
 }

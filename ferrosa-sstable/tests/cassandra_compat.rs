@@ -11,6 +11,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ferrosa_common::{DecoratedKey, PartitionKey};
 use ferrosa_sstable::reader::{SSTableComponents, SSTableReader};
@@ -226,31 +227,31 @@ fn ferrosa_write_read_roundtrip_all_cell_types() {
             key: DecoratedKey::new(PartitionKey::from(b"normal".as_slice())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![0, 0, 0, 1], // ck = 1
                 cells: vec![(0, CellValue::live(b"hello".to_vec(), timestamp))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
-            }],
+            })],
         },
         // 2. Tombstone cell
         Partition {
             key: DecoratedKey::new(PartitionKey::from(b"tombstone".as_slice())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![0, 0, 0, 2],
                 cells: vec![(0, CellValue::tombstone(timestamp, 1_700_000))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
-            }],
+            })],
         },
         // 3. Expiring cell (USING TTL 3600)
         Partition {
             key: DecoratedKey::new(PartitionKey::from(b"ttl_cell".as_slice())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![0, 0, 0, 3],
                 cells: vec![(
                     0,
@@ -258,7 +259,7 @@ fn ferrosa_write_read_roundtrip_all_cell_types() {
                 )],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
-            }],
+            })],
         },
     ];
 
@@ -540,12 +541,12 @@ fn ferrosa_roundtrips_nonfrozen_list_complex_column() {
         key: DecoratedKey::new(PartitionKey::from(b"pk".as_slice())),
         deletion: DeletionTime::LIVE,
         static_row: None,
-        rows: vec![Row {
+        rows: vec![Arc::new(Row {
             clustering: vec![],
             cells: vec![(0, cell_a), (0, cell_b)],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(ts),
-        }],
+        })],
     };
 
     let mut writer = SSTableWriter::new(options, header.clone());
@@ -610,12 +611,12 @@ fn ferrosa_roundtrips_complex_column_deletion() {
         key: DecoratedKey::new(PartitionKey::from(b"pk".as_slice())),
         deletion: DeletionTime::LIVE,
         static_row: None,
-        rows: vec![Row {
+        rows: vec![Arc::new(Row {
             clustering: vec![],
             cells: vec![(0, deletion), (0, elem)],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(500),
-        }],
+        })],
     };
 
     let mut writer = SSTableWriter::new(options, header.clone());
@@ -691,12 +692,12 @@ fn ferrosa_roundtrips_nonfrozen_set_map_and_tombstone() {
         key: DecoratedKey::new(PartitionKey::from(b"pk".as_slice())),
         deletion: DeletionTime::LIVE,
         static_row: None,
-        rows: vec![Row {
+        rows: vec![Arc::new(Row {
             clustering: vec![],
             cells: vec![(0, set_a), (0, set_b), (1, map_k)],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(ts),
-        }],
+        })],
     };
 
     let mut writer = SSTableWriter::new(options, header.clone());
@@ -788,12 +789,12 @@ fn ferrosa_projected_read_over_complex_column() {
         key: DecoratedKey::new(PartitionKey::from(b"pk".as_slice())),
         deletion: DeletionTime::LIVE,
         static_row: None,
-        rows: vec![Row {
+        rows: vec![Arc::new(Row {
             clustering: vec![],
             cells: vec![(0, list_elem), (1, scalar)],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(ts),
-        }],
+        })],
     };
 
     let mut writer = SSTableWriter::new(options, header.clone());
@@ -947,7 +948,7 @@ fn sstable_compat_simple_types() {
         )),
         deletion: DeletionTime::LIVE,
         static_row: None,
-        rows: vec![Row {
+        rows: vec![Arc::new(Row {
             clustering: vec![],
             cells: vec![
                 (0, CellValue::live(b"hello".to_vec(), ts)),
@@ -965,7 +966,7 @@ fn sstable_compat_simple_types() {
             ],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(ts),
-        }],
+        })],
     };
 
     let mut writer = SSTableWriter::new(options, header.clone());

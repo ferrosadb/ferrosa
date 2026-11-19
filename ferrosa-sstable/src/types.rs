@@ -12,6 +12,8 @@
 //! - [`Row`] — a deserialized row from an SSTable
 //! - [`Partition`] — a deserialized partition from an SSTable
 
+use std::sync::Arc;
+
 use ferrosa_common::{CellValue, DecoratedKey};
 
 /// Partition-level or row-level deletion marker.
@@ -179,7 +181,14 @@ pub struct Partition {
     /// Static row (columns shared across all clustered rows).
     pub static_row: Option<Row>,
     /// Clustered rows in clustering order.
-    pub rows: Vec<Row>,
+    ///
+    /// Rows are immutable once built, so they are shared, never copied: a
+    /// reader that clones a partition (a memtable snapshot, a range-merge
+    /// source) bumps one refcount per row instead of deep-copying cells, and a
+    /// writer moves its `Arc` straight into the memtable. A merge that must
+    /// change a row still shared elsewhere copies it on write with
+    /// [`Arc::make_mut`].
+    pub rows: Vec<Arc<Row>>,
 }
 
 #[cfg(test)]
@@ -246,12 +255,12 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::from(b"test".as_slice())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![1],
                 cells: vec![(0, CellValue::live(b"v".to_vec(), 1000))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1000),
-            }],
+            })],
         };
         assert!(partition.deletion.is_live());
         assert!(partition.static_row.is_none());

@@ -628,7 +628,12 @@ impl Harness {
                 self.ts += 1;
                 let tid = self.models[i].tid.clone();
                 self.engine()
-                    .write(&tid, &make_key(&pk), make_row(ck, &val, self.ts), self.ts)
+                    .write(
+                        &tid,
+                        &make_key(&pk),
+                        Arc::new(make_row(ck, &val, self.ts)),
+                        self.ts,
+                    )
                     .unwrap();
                 self.models[i].rows.insert((pk, ck), val);
             }

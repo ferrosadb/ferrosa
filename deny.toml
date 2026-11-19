@@ -84,7 +84,7 @@ exceptions = [
 private = { ignore = true }
 
 [sources]
-# Crates may come only from the public registry, plus the one git fork the
+# Crates may come only from the public registry, plus the git forks the
 # workspace patches in by explicit commit. An unexpected git or alternate
 # registry source is how a dependency gets swapped for something else.
 unknown-registry = "deny"
@@ -94,4 +94,13 @@ allow-git = [
     # [patch.crates-io] openraft, pinned by rev in Cargo.toml (ADR-012:
     # PreVote, CheckQuorum, leadership transfer on top of upstream 0.9.24).
     "https://github.com/ferrosadb/openraft.git",
+    # [patch.crates-io] chrono-free forks (RUSTSEC-2026-0543 / -0542 mark
+    # chrono and humantime unmaintained, and every upstream release of these
+    # crates requires them), each pinned by rev in Cargo.toml and in
+    # ferrosa-jsonb-conformance/Cargo.toml: arrow 53.4.1, object_store 0.11.2
+    # and parquet-variant 60.0.0 (arrow-rs), scylla/scylla-cql 1.6.0, and
+    # russh-util 0.52.0.
+    "https://github.com/ferrosadb/arrow-rs.git",
+    "https://github.com/ferrosadb/scylla-rust-driver.git",
+    "https://github.com/ferrosadb/russh.git",
 ]

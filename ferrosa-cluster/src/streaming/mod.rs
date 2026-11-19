@@ -94,7 +94,7 @@ fn envelope_prefix() -> Vec<u8> {
 /// vector one at a time as they are pulled (never collected a second time).
 pub type StreamedRows = std::iter::Map<
     std::vec::IntoIter<crate::raft::handlers::RowWire>,
-    fn(crate::raft::handlers::RowWire) -> ferrosa_sstable::types::Row,
+    fn(crate::raft::handlers::RowWire) -> std::sync::Arc<ferrosa_sstable::types::Row>,
 >;
 
 /// The state of one streamed partition, decoded from either payload format.
@@ -105,8 +105,8 @@ pub struct StreamedPartition {
 }
 
 fn streamed_rows(rows: Vec<crate::raft::handlers::RowWire>) -> StreamedRows {
-    let convert: fn(crate::raft::handlers::RowWire) -> ferrosa_sstable::types::Row =
-        ferrosa_sstable::types::Row::from;
+    let convert: fn(crate::raft::handlers::RowWire) -> std::sync::Arc<ferrosa_sstable::types::Row> =
+        std::sync::Arc::from;
     rows.into_iter().map(convert)
 }
 
@@ -121,7 +121,11 @@ pub fn encode_partition_envelope(
     partition: &ferrosa_sstable::types::Partition,
 ) -> Result<Vec<u8>, bincode::Error> {
     use crate::raft::handlers::RowWire;
-    let rows: Vec<RowWire> = partition.rows.iter().cloned().map(RowWire::from).collect();
+    let rows: Vec<RowWire> = partition
+        .rows
+        .iter()
+        .map(|row| RowWire::from(&**row))
+        .collect();
     if partition.static_row.is_none() && partition.deletion.is_live() {
         return bincode::serialize(&rows);
     }
@@ -386,6 +390,7 @@ pub(crate) fn compute_checksum(mutations: &[StreamedMutation]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn make_mutation(
         keyspace: &str,
@@ -447,12 +452,12 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(b"k".to_vec())),
             deletion,
             static_row,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![0, 0, 0, 1],
                 cells: vec![(1, CellValue::live(b"v".to_vec(), 700))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(700),
-            }],
+            })],
         }
     }
     use ferrosa_sstable::types::Partition;

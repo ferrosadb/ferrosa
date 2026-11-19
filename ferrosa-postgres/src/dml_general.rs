@@ -29,6 +29,7 @@
 //! Last revised: 2026-11-08
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use ferrosa_common::{CqlType, CqlValue};
 use ferrosa_schema::{ColumnKind, SchemaSnapshot, TableMetadata};
@@ -484,7 +485,7 @@ impl Writer<'_> {
             self.target.ks.clone(),
             self.target.table.clone(),
             key,
-            vec![row],
+            vec![Arc::new(row)],
             timestamp,
         ))
     }

@@ -824,12 +824,12 @@ mod tests {
             keyspace: "ks".to_string(),
             table: "sensor".to_string(),
             key: DecoratedKey::new(PartitionKey::new(partition_key.as_bytes().to_vec())),
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: ts.to_be_bytes().to_vec(),
                 cells: vec![(0, CellValue::live(val.to_be_bytes().to_vec(), ts))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(ts),
-            }],
+            })],
             timestamp: ts,
         }
     }
@@ -904,12 +904,12 @@ mod tests {
             keyspace: "ks".to_string(),
             table: "sensor_1s".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"sensor-1".to_vec())),
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: 5_000_000_i64.to_be_bytes().to_vec(),
                 cells: vec![(0, CellValue::live(value_bytes, 5_000_000))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(5_000_000),
-            }],
+            })],
             timestamp: 5_000_000,
         };
 
@@ -948,12 +948,12 @@ mod tests {
             keyspace: "ks".to_string(),
             table: "sensor_1s".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"s1".to_vec())),
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: ts.to_be_bytes().to_vec(),
                 cells: vec![(0, CellValue::live(val.to_be_bytes().to_vec(), ts))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(ts),
-            }],
+            })],
             timestamp: ts,
         };
 
@@ -1406,12 +1406,12 @@ mod tests {
             keyspace: "ks".to_string(),
             table: "sensor".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"s1".to_vec())),
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: ts.to_be_bytes().to_vec(),
                 cells: vec![(0, CellValue::live(val.to_be_bytes().to_vec(), ts))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(ts),
-            }],
+            })],
             timestamp: ts,
         };
 
@@ -1461,12 +1461,12 @@ mod tests {
             keyspace: "ks".to_string(),
             table: "sensor_1s".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"s1".to_vec())),
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: ts.to_be_bytes().to_vec(),
                 cells: vec![(0, CellValue::live(val.to_be_bytes().to_vec(), ts))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(ts),
-            }],
+            })],
             timestamp: ts,
         };
 
@@ -1508,12 +1508,12 @@ mod tests {
             keyspace: "ks".to_string(),
             table: "sensor_1s".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"s1".to_vec())),
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: ts.to_be_bytes().to_vec(),
                 cells: vec![(0, CellValue::live(val.to_be_bytes().to_vec(), ts))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(ts),
-            }],
+            })],
             timestamp: ts,
         };
 
@@ -1656,12 +1656,12 @@ mod tests {
             keyspace: "ks".to_string(),
             table: "sensor".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"pk1".to_vec())),
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: 1_000_000_i64.to_be_bytes().to_vec(),
                 cells: vec![(0, CellValue::live(bad_bytes, 1_000_000))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1_000_000),
-            }],
+            })],
             timestamp: 1_000_000,
         };
 
@@ -1711,12 +1711,12 @@ mod tests {
             keyspace: "ks".to_string(),
             table: "sensor".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"pk1".to_vec())),
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: 1_000_000_i64.to_be_bytes().to_vec(),
                 cells: vec![(0, CellValue::live(float_bytes, 1_000_000))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1_000_000),
-            }],
+            })],
             timestamp: 1_000_000,
         };
 

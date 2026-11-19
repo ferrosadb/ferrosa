@@ -175,6 +175,7 @@ mod tests {
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
     use ferrosa_storage::replay_set_aside::ReplaySetAside;
     use ferrosa_storage::{Mutation, StorageEngineConfig, TableId};
+    use std::sync::Arc;
 
     fn schema() -> TableSchema {
         TableSchema {
@@ -213,7 +214,7 @@ mod tests {
                     "ctl_ks".into(),
                     table.into(),
                     key(k),
-                    vec![row(ts)],
+                    vec![Arc::new(row(ts))],
                     ts,
                 ))
                 .unwrap();
@@ -230,7 +231,12 @@ mod tests {
             StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
         engine.register_table(schema()).unwrap();
         engine
-            .write(&TableId::new("ctl_ks", "ctl_t"), &key("anchor"), row(1), 1)
+            .write(
+                &TableId::new("ctl_ks", "ctl_t"),
+                &key("anchor"),
+                Arc::new(row(1)),
+                1,
+            )
             .unwrap();
         engine.flush(&TableId::new("ctl_ks", "ctl_t")).unwrap();
         engine.shutdown().unwrap();

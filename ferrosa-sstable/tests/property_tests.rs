@@ -109,6 +109,7 @@ mod cell_roundtrip {
     use ferrosa_sstable::types::*;
     use ferrosa_sstable::writer::{SSTableWriter, WriteOptions};
     use proptest::prelude::*;
+    use std::sync::Arc;
 
     fn make_header(min_ts: i64, min_ldt: i32, min_ttl: i32) -> SerializationHeader {
         SerializationHeader {
@@ -165,12 +166,12 @@ mod cell_roundtrip {
                 key: DecoratedKey::new(PartitionKey::from(b"k".as_slice())),
                 deletion: DeletionTime::LIVE,
                 static_row: None,
-                rows: vec![Row {
+                rows: vec![Arc::new(Row {
                     clustering: vec![],
                     cells: vec![(0, CellValue::live(value.clone(), ts))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(ts),
-                }],
+                })],
             };
 
             let mut writer = SSTableWriter::new(write_options(), header.clone());
@@ -195,12 +196,12 @@ mod cell_roundtrip {
                 key: DecoratedKey::new(PartitionKey::from(b"k".as_slice())),
                 deletion: DeletionTime::LIVE,
                 static_row: None,
-                rows: vec![Row {
+                rows: vec![Arc::new(Row {
                     clustering: vec![],
                     cells: vec![(0, CellValue::tombstone(ts, ldt))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(ts),
-                }],
+                })],
             };
 
             let mut writer = SSTableWriter::new(write_options(), header.clone());
@@ -230,12 +231,12 @@ mod cell_roundtrip {
                 key: DecoratedKey::new(PartitionKey::from(b"k".as_slice())),
                 deletion: DeletionTime::LIVE,
                 static_row: None,
-                rows: vec![Row {
+                rows: vec![Arc::new(Row {
                     clustering: vec![],
                     cells: vec![(0, CellValue::expiring(value.clone(), ts, ttl, ldt))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(ts),
-                }],
+                })],
             };
 
             let mut writer = SSTableWriter::new(write_options(), header.clone());
@@ -274,24 +275,24 @@ mod cell_roundtrip {
                 deletion: DeletionTime::LIVE,
                 static_row: None,
                 rows: vec![
-                    Row {
+                    Arc::new(Row {
                         clustering: 1i32.to_be_bytes().to_vec(),
                         cells: vec![(0, CellValue::live(live_val.clone(), ts))],
                         deletion: DeletionTime::LIVE,
                         primary_key_liveness: LivenessInfo::with_timestamp(ts),
-                    },
-                    Row {
+                    }),
+                    Arc::new(Row {
                         clustering: 2i32.to_be_bytes().to_vec(),
                         cells: vec![(0, CellValue::tombstone(ts + 1, ldt))],
                         deletion: DeletionTime::LIVE,
                         primary_key_liveness: LivenessInfo::with_timestamp(ts + 1),
-                    },
-                    Row {
+                    }),
+                    Arc::new(Row {
                         clustering: 3i32.to_be_bytes().to_vec(),
                         cells: vec![(0, CellValue::expiring(ttl_val.clone(), ts + 2, ttl, ldt))],
                         deletion: DeletionTime::LIVE,
                         primary_key_liveness: LivenessInfo::with_timestamp(ts + 2),
-                    },
+                    }),
                 ],
             };
 
@@ -337,6 +338,7 @@ mod reader_fuzz {
     use ferrosa_sstable::data::DataReader;
     use ferrosa_sstable::statistics::SerializationHeader;
     use proptest::prelude::*;
+    use std::sync::Arc;
 
     fn default_header() -> SerializationHeader {
         SerializationHeader {
@@ -446,12 +448,12 @@ mod reader_fuzz {
                 key: DecoratedKey::new(PartitionKey::from(b"k".as_slice())),
                 deletion: DeletionTime::LIVE,
                 static_row: None,
-                rows: vec![Row {
+                rows: vec![Arc::new(Row {
                     clustering: vec![],
                     cells: vec![(0, CellValue::live(value, ts))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(ts),
-                }],
+                })],
             };
 
             let mut writer = SSTableWriter::new(options, header.clone());
@@ -508,12 +510,12 @@ mod reader_fuzz {
                 key: DecoratedKey::new(PartitionKey::from(b"k".as_slice())),
                 deletion: DeletionTime::LIVE,
                 static_row: None,
-                rows: vec![Row {
+                rows: vec![Arc::new(Row {
                     clustering: vec![],
                     cells: vec![(0, CellValue::expiring(value, ts, ttl, ldt))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(ts),
-                }],
+                })],
             };
 
             let mut writer = SSTableWriter::new(options, header.clone());

@@ -96,10 +96,32 @@ async fn request(
     tcp.take(1024 * 1024).read_to_end(&mut bytes).await.unwrap();
     let text = String::from_utf8(bytes).unwrap();
     let (head, body) = text.split_once("\r\n\r\n").unwrap();
+    let headers = head.to_ascii_lowercase();
+    // Streamed results arrive with chunked transfer coding; a real HTTP/1.1
+    // client de-chunks, and so does this one.
+    let body = if headers.contains("transfer-encoding: chunked") {
+        dechunk(body)
+    } else {
+        body.to_owned()
+    };
     Reply {
         status: head.split_whitespace().nth(1).unwrap().parse().unwrap(),
-        headers: head.to_ascii_lowercase(),
-        body: body.to_owned(),
+        headers,
+        body,
+    }
+}
+/// Decode an HTTP/1.1 chunked body; panics on a malformed or unterminated one
+/// (an aborted stream has no terminating zero-size chunk).
+fn dechunk(mut rest: &str) -> String {
+    let mut out = String::new();
+    loop {
+        let (size, after) = rest.split_once("\r\n").expect("chunk size line");
+        let size = usize::from_str_radix(size.trim(), 16).expect("hex chunk size");
+        if size == 0 {
+            return out;
+        }
+        out.push_str(&after[..size]);
+        rest = &after[size + 2..];
     }
 }
 const JSON: &str = "application/sparql-results+json";
@@ -353,4 +375,49 @@ async fn media_types_and_wildcard_types_are_case_insensitive() {
         serde_json::from_str::<serde_json::Value>(&r.body).unwrap()["boolean"],
         true
     );
+}
+
+#[tokio::test]
+async fn select_results_stream_into_a_chunked_body_and_stay_complete() {
+    let s = server().await;
+    let n = 3_000;
+    let mut data = String::from("INSERT DATA {");
+    for i in 0..n {
+        data.push_str(&format!(" <urn:s{i}> <urn:p> \"value-{i:05}\" ."));
+    }
+    data.push('}');
+    let r = request(
+        &s,
+        "POST",
+        "/sparql/update",
+        "application/sparql-update",
+        JSON,
+        &data,
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }";
+    type Count = Box<dyn Fn(&str) -> usize>;
+    let json: Count = Box::new(|body: &str| {
+        let data: serde_json::Value = serde_json::from_str(body).unwrap();
+        data["results"]["bindings"].as_array().unwrap().len()
+    });
+    let xml: Count = Box::new(|body: &str| {
+        assert!(
+            body.trim_end().ends_with("</sparql>"),
+            "XML tail must be written"
+        );
+        body.matches("<result>").count()
+    });
+    for (accept, rows) in [(JSON, json), ("application/sparql-results+xml", xml)] {
+        let r = request(&s, "POST", "/sparql", QUERY, accept, q).await;
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(
+            r.headers.contains("transfer-encoding: chunked"),
+            "a streamed result has no precomputed length: {}",
+            r.headers
+        );
+        assert!(!r.headers.contains("content-length"), "{}", r.headers);
+        assert_eq!(rows(&r.body), n, "every row must reach the client");
+    }
 }

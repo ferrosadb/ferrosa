@@ -175,6 +175,7 @@ impl IntegrityVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     use std::time::Duration;
 
@@ -247,7 +248,7 @@ mod tests {
             let ts = (i + 1) as i64;
             let dk = make_key(&key_str);
             engine
-                .write(&table_id, &dk, make_row(&value, ts), ts)
+                .write(&table_id, &dk, Arc::new(make_row(&value, ts)), ts)
                 .unwrap();
             gt.record_write(&key_str, &value, ts);
         }
@@ -273,7 +274,7 @@ mod tests {
             let ts = (i + 1) as i64;
             let dk = make_key(&key_str);
             engine
-                .write(&table_id, &dk, make_row(&value, ts), ts)
+                .write(&table_id, &dk, Arc::new(make_row(&value, ts)), ts)
                 .unwrap();
             gt.record_write(&key_str, &value, ts);
         }
@@ -303,14 +304,14 @@ mod tests {
         // Write one key with matching data.
         let dk = make_key("match_key");
         engine
-            .write(&table_id, &dk, make_row(b"correct", 1), 1)
+            .write(&table_id, &dk, Arc::new(make_row(b"correct", 1)), 1)
             .unwrap();
         gt.record_write("match_key", b"correct", 1);
 
         // Write another key with different values in engine vs ground truth.
         let dk2 = make_key("mismatch_key");
         engine
-            .write(&table_id, &dk2, make_row(b"engine_value", 2), 2)
+            .write(&table_id, &dk2, Arc::new(make_row(b"engine_value", 2)), 2)
             .unwrap();
         gt.record_write("mismatch_key", b"ground_truth_value", 2);
 
@@ -338,7 +339,7 @@ mod tests {
         // Also write a live key to verify mixed results.
         let dk = make_key("live_key");
         engine
-            .write(&table_id, &dk, make_row(b"alive", 3), 3)
+            .write(&table_id, &dk, Arc::new(make_row(b"alive", 3)), 3)
             .unwrap();
         gt.record_write("live_key", b"alive", 3);
 
@@ -361,7 +362,7 @@ mod tests {
             let ts = (i + 1) as i64;
             let dk = make_key(&key_str);
             engine
-                .write(&table_id, &dk, make_row(&value, ts), ts)
+                .write(&table_id, &dk, Arc::new(make_row(&value, ts)), ts)
                 .unwrap();
             gt.record_write(&key_str, &value, ts);
         }

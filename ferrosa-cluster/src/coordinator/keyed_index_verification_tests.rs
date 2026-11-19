@@ -19,6 +19,10 @@ use ferrosa_storage::{StorageEngine, StorageEngineConfig, SyncStrategyConfig, Ta
 use uuid::Uuid;
 
 use crate::consistency::ConsistencyLevel;
+use crate::coordinator::stream_frame_router::StreamFrameRouter;
+use crate::coordinator::stream_request_handler::{
+    PeerManagerSinkFactory, RangeReadStreamRequestHandler, StreamRangeReader,
+};
 use crate::coordinator::{ClusterCoordinator, MutationForwardHandler};
 use crate::raft::handlers::{IndexReadInPartitionHandler, ReadRequestHandler, ReadRequestPayload};
 use crate::raft::{NodeInfo, NodeState};
@@ -61,6 +65,102 @@ fn row_for(clustering: &[u8], value: &[u8], timestamp: i64) -> Row {
         deletion: DeletionTime::LIVE,
         primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
     }
+}
+
+/// A keyed index read's local partitions, collected — test-only.
+fn local_keyed(
+    storage: &StorageEngine,
+    table_id: &TableId,
+    index_name: &str,
+    index_key: &IndexKey,
+    partition_key: &[u8],
+) -> ferrosa_common::Result<Vec<ferrosa_sstable::types::Partition>> {
+    let mut found = Vec::new();
+    storage.read_by_index_in_partition_each_after(
+        table_id,
+        index_name,
+        index_key,
+        partition_key,
+        None,
+        &mut |partition| {
+            found.push(partition);
+            std::ops::ControlFlow::Continue(())
+        },
+    )?;
+    Ok(found)
+}
+
+/// Serve streaming keyed index reads from `reader` on `registry`. Returns the
+/// replica's back channel, which fires the response frames to the
+/// coordinator once [`route_streams`] connects it.
+fn serve_keyed_streams<R: StreamRangeReader + 'static>(
+    registry: &HandlerRegistry,
+    host: Uuid,
+    reader: Arc<R>,
+) -> Arc<PeerManager> {
+    let back = Arc::new(PeerManager::new(
+        Arc::new(NetConfig::default()),
+        host,
+        Arc::new(NoopListener),
+    ));
+    let handler = Arc::new(RangeReadStreamRequestHandler::new(
+        reader,
+        Arc::new(PeerManagerSinkFactory::new(back.clone())),
+        4,
+    ));
+    registry.register(MsgType::IndexReadInPartitionStreamRequest, handler.clone());
+    registry.register(MsgType::RangeReadStreamCancel, handler);
+    back
+}
+
+/// Route stream response frames from `backs` into `coordinator`'s stream
+/// router, as a node's inbound server does.
+async fn route_streams(
+    coordinator: &Arc<ClusterCoordinator>,
+    backs: &[Arc<PeerManager>],
+) -> Arc<RpcServer> {
+    let frames = Arc::new(StreamFrameRouter::new(coordinator.stream_router()));
+    let registry = Arc::new(HandlerRegistry::new());
+    for kind in [
+        MsgType::RangeReadStreamChunk,
+        MsgType::RangeReadStreamHeartbeat,
+        MsgType::RangeReadStreamDone,
+    ] {
+        registry.register(kind, frames.clone());
+    }
+    let host = coordinator.peer_manager.local_host_id();
+    let server = Arc::new(RpcServer::new(
+        NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        },
+        host,
+        registry,
+    ));
+    let addr = server.start_and_get_addr().await.unwrap();
+    for back in backs {
+        back.ensure_peer(host, &addr.to_string()).await.unwrap();
+    }
+    server
+}
+
+/// A keyed index read through `coordinator`, collected.
+async fn keyed_read(
+    coordinator: &Arc<ClusterCoordinator>,
+    value: &[u8],
+    cl: ConsistencyLevel,
+    replication_factor: usize,
+) -> crate::error::Result<Vec<ferrosa_sstable::types::Partition>> {
+    crate::coordinator::read::collect_keyed_index_read(
+        coordinator,
+        &table(),
+        &key(),
+        "value_idx",
+        &IndexKey(value.to_vec()),
+        cl,
+        &ReplicationStrategy::Simple { replication_factor },
+    )
+    .await
 }
 
 struct IndexedReplica {
@@ -112,7 +212,7 @@ struct History {
     engines: Vec<Arc<StorageEngine>>,
     servers: Vec<Arc<RpcServer>>,
     writer: ClusterCoordinator,
-    reader: ClusterCoordinator,
+    reader: Arc<ClusterCoordinator>,
     whole_partition_reads: Arc<AtomicUsize>,
     row_reads: Arc<AtomicUsize>,
     clustering: Vec<u8>,
@@ -130,6 +230,7 @@ impl History {
         let dir = tempfile::tempdir().unwrap();
         let mut engines = Vec::new();
         let mut servers = Vec::new();
+        let mut backs = Vec::new();
         let mut ring = TokenRing::new();
         let whole_partition_reads = Arc::new(AtomicUsize::new(0));
         let row_reads = Arc::new(AtomicUsize::new(0));
@@ -161,7 +262,12 @@ impl History {
             // The next client Y write reaches a different durable quorum.
             if id == 3 {
                 storage
-                    .write(&table(), &key(), row_for(clustering, b"X", 10), 10)
+                    .write(
+                        &table(),
+                        &key(),
+                        Arc::new(row_for(clustering, b"X", 10)),
+                        10,
+                    )
                     .unwrap();
             }
             let handler = Arc::new(IndexedReplica {
@@ -180,6 +286,11 @@ impl History {
                 registry.register(kind, handler.clone());
             }
             let host = Uuid::new_v4();
+            backs.push(serve_keyed_streams(
+                &registry,
+                host,
+                Arc::new(storage.clone()),
+            ));
             let server = Arc::new(RpcServer::new(
                 NetConfig {
                     bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -213,14 +324,15 @@ impl History {
             3,
             ConsistencyLevel::Quorum,
         );
-        let reader = ClusterCoordinator::new(
+        let reader = Arc::new(ClusterCoordinator::new(
             ring,
             peers(),
             3,
             engines[2].clone(),
             3,
             ConsistencyLevel::Quorum,
-        );
+        ));
+        servers.push(route_streams(&reader, &backs).await);
         Self {
             _dir: dir,
             engines,
@@ -239,7 +351,7 @@ impl History {
             .coordinate_write_with(
                 &table(),
                 &key(),
-                row_for(&self.clustering, b"Y", 20),
+                Arc::new(row_for(&self.clustering, b"Y", 20)),
                 20,
                 ConsistencyLevel::Quorum,
                 3,
@@ -256,27 +368,8 @@ impl History {
         // Real fresh indexes carry Y and answer X with negative evidence.
         // Stale node3 keeps X; no predicate-ignoring response fixture is used.
         for fresh in &self.engines[..2] {
-            assert!(fresh
-                .read_by_index_in_partition(
-                    &table(),
-                    "value_idx",
-                    &IndexKey(b"X".to_vec()),
-                    key().key.as_bytes()
-                )
-                .unwrap()
-                .is_empty());
-            assert!(!fresh
-                .read_by_index_in_partition(
-                    &table(),
-                    "value_idx",
-                    &IndexKey(b"Y".to_vec()),
-                    key().key.as_bytes()
-                )
-                .unwrap()
-                .is_empty());
-        }
-        assert!(!self.engines[2]
-            .read_by_index_in_partition(
+            assert!(local_keyed(
+                fresh,
                 &table(),
                 "value_idx",
                 &IndexKey(b"X".to_vec()),
@@ -284,6 +377,25 @@ impl History {
             )
             .unwrap()
             .is_empty());
+            assert!(!local_keyed(
+                fresh,
+                &table(),
+                "value_idx",
+                &IndexKey(b"Y".to_vec()),
+                key().key.as_bytes()
+            )
+            .unwrap()
+            .is_empty());
+        }
+        assert!(!local_keyed(
+            &self.engines[2],
+            &table(),
+            "value_idx",
+            &IndexKey(b"X".to_vec()),
+            key().key.as_bytes()
+        )
+        .unwrap()
+        .is_empty());
     }
 
     async fn close(self) {
@@ -437,20 +549,9 @@ async fn keyed_index_healthy_positive_quorum_needs_no_extra_row_rpcs() {
     // Complete the third replica's ordinary catch-up so this is the healthy
     // query case, while the write history above still has a real quorum ACK.
     history.engines[2]
-        .write(&table(), &key(), row(b"Y", 20), 20)
+        .write(&table(), &key(), Arc::new(row(b"Y", 20)), 20)
         .unwrap();
-    let current = history
-        .reader
-        .coordinate_index_read_in_partition(
-            &table(),
-            &key(),
-            "value_idx",
-            &IndexKey(b"Y".to_vec()),
-            ConsistencyLevel::Quorum,
-            &ReplicationStrategy::Simple {
-                replication_factor: 3,
-            },
-        )
+    let current = keyed_read(&history.reader, &b"Y"[..], ConsistencyLevel::Quorum, 3)
         .await
         .unwrap();
     assert_eq!(current.len(), 1);
@@ -468,44 +569,60 @@ async fn keyed_index_healthy_positive_quorum_needs_no_extra_row_rpcs() {
 
 #[tokio::test]
 async fn keyed_index_empty_clustered_remote_candidate_refuses_before_row_rpc() {
-    struct UnsupportedCandidate {
+    /// A replica whose keyed index stream names a row with empty clustering
+    /// in a clustered table — unsupported, remote data.
+    struct UnsupportedCandidate;
+    impl StreamRangeReader for UnsupportedCandidate {
+        fn range_iter<'a>(
+            &'a self,
+            _: &TableId,
+            _: Option<&'a [u16]>,
+            _: Option<&'a DecoratedKey>,
+        ) -> ferrosa_common::Result<crate::coordinator::stream_request_handler::PartitionStream<'a>>
+        {
+            Err(ferrosa_common::Error::InvalidData(
+                "not a range source".into(),
+            ))
+        }
+        fn index_partition_iter<'a>(
+            &'a self,
+            _: &TableId,
+            _: &str,
+            _: &[u8],
+            _: &[u8],
+            _: Option<&[u8]>,
+        ) -> ferrosa_common::Result<crate::coordinator::stream_request_handler::PartitionStream<'a>>
+        {
+            let partition = ferrosa_sstable::types::Partition {
+                key: key(),
+                deletion: DeletionTime::LIVE,
+                static_row: None,
+                rows: vec![Arc::new(row_for(&[], b"X", 10))],
+            };
+            Ok(Box::pin(futures::stream::iter([Ok(partition)])))
+        }
+    }
+    struct CountReads {
         reads: Arc<AtomicUsize>,
     }
     #[async_trait::async_trait]
-    impl RpcHandler for UnsupportedCandidate {
-        async fn handle(&self, _: PeerId, message: Message) -> Option<Message> {
-            match message {
-                Message::IndexReadInPartitionRequest(_) => {
-                    let partition = ferrosa_sstable::types::Partition {
-                        key: key(),
-                        deletion: DeletionTime::LIVE,
-                        static_row: None,
-                        rows: vec![row_for(&[], b"X", 10)],
-                    };
-                    let payload = crate::raft::handlers::IndexReadResponsePayload {
-                        partitions: vec![crate::raft::handlers::partition_to_wire(partition)],
-                    };
-                    Some(Message::IndexReadInPartitionResponse(Bytes::from(
-                        bincode::serialize(&payload).unwrap(),
-                    )))
-                }
-                Message::ReadRequest(_) => {
-                    self.reads.fetch_add(1, Ordering::SeqCst);
-                    None
-                }
-                _ => None,
-            }
+    impl RpcHandler for CountReads {
+        async fn handle(&self, _: PeerId, _: Message) -> Option<Message> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            None
         }
     }
     let history = History::new().await;
     let reads = Arc::new(AtomicUsize::new(0));
-    let handler = Arc::new(UnsupportedCandidate {
-        reads: reads.clone(),
-    });
     let registry = Arc::new(HandlerRegistry::new());
-    registry.register(MsgType::IndexReadInPartitionRequest, handler.clone());
-    registry.register(MsgType::ReadRequest, handler);
+    registry.register(
+        MsgType::ReadRequest,
+        Arc::new(CountReads {
+            reads: reads.clone(),
+        }),
+    );
     let host = Uuid::new_v4();
+    let back = serve_keyed_streams(&registry, host, Arc::new(UnsupportedCandidate));
     let server = Arc::new(RpcServer::new(
         NetConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -528,32 +645,23 @@ async fn keyed_index_empty_clustered_remote_candidate_refuses_before_row_rpc() {
         },
     );
     ring.assign_tokens(1, &[key().token.0]);
-    let reader = ClusterCoordinator::new(
+    let reader = Arc::new(ClusterCoordinator::new(
         Arc::new(ArcSwap::from_pointee(ring)),
         peers(),
         99,
         history.engines[2].clone(),
         1,
         ConsistencyLevel::One,
-    );
-    let result = reader
-        .coordinate_index_read_in_partition(
-            &table(),
-            &key(),
-            "value_idx",
-            &IndexKey(b"X".to_vec()),
-            ConsistencyLevel::One,
-            &ReplicationStrategy::Simple {
-                replication_factor: 1,
-            },
-        )
-        .await;
+    ));
+    let frames = route_streams(&reader, &[back]).await;
+    let result = keyed_read(&reader, b"X", ConsistencyLevel::One, 1).await;
     assert!(result.is_err(), "unsupported remote data must fail closed");
     assert_eq!(
         reads.load(Ordering::SeqCst),
         0,
         "never reinterpret an empty clustered candidate as an unbounded row read"
     );
+    frames.shutdown(Duration::from_millis(50)).await;
     server.shutdown(Duration::from_millis(50)).await;
     history.close().await;
 }
@@ -588,7 +696,7 @@ async fn keyed_index_empty_clustered_values_remain_explicitly_unsupported() {
     let unsupported = row_for(&[], b"X", 10);
     assert!(
         storage
-            .write(&table(), &key(), unsupported.clone(), 10)
+            .write(&table(), &key(), Arc::new(unsupported.clone()), 10)
             .is_err(),
         "the existing writer contract does not accept empty clustered values"
     );
@@ -619,17 +727,19 @@ async fn keyed_index_geo_verification_uses_the_backend_cell_key_encoding() {
     };
     let point = encode_point(1.0, 1.0);
     let current = row(&point, 20);
-    storage.write(&geo, &key(), current.clone(), 20).unwrap();
+    storage
+        .write(&geo, &key(), Arc::new(current.clone()), 20)
+        .unwrap();
     assert_eq!(
-        storage
-            .read_by_index_in_partition(
-                &geo,
-                "location",
-                &IndexKey(point.clone()),
-                key().key.as_bytes()
-            )
-            .unwrap()
-            .len(),
+        local_keyed(
+            storage,
+            &geo,
+            "location",
+            &IndexKey(point.clone()),
+            key().key.as_bytes()
+        )
+        .unwrap()
+        .len(),
         1
     );
     assert!(storage
@@ -653,39 +763,45 @@ async fn keyed_index_local_postings_do_not_resurrect_tombstones_or_expired_cells
     let storage = &history.engines[2];
     let mut deleted = row(b"X", 20);
     deleted.cells[0].1 = CellValue::tombstone(20, 1);
-    storage.write(&table(), &key(), deleted, 20).unwrap();
-    assert!(storage
-        .read_by_index_in_partition(
-            &table(),
-            "value_idx",
-            &IndexKey(b"X".to_vec()),
-            key().key.as_bytes()
-        )
-        .unwrap()
-        .is_empty());
+    storage
+        .write(&table(), &key(), Arc::new(deleted), 20)
+        .unwrap();
+    assert!(local_keyed(
+        storage,
+        &table(),
+        "value_idx",
+        &IndexKey(b"X".to_vec()),
+        key().key.as_bytes()
+    )
+    .unwrap()
+    .is_empty());
     let mut expired = row(b"X", 30);
     expired.cells[0].1 = CellValue::expiring(b"X".to_vec(), 30, 1, 1);
-    storage.write(&table(), &key(), expired, 30).unwrap();
-    assert!(storage
-        .read_by_index_in_partition(
+    storage
+        .write(&table(), &key(), Arc::new(expired), 30)
+        .unwrap();
+    assert!(local_keyed(
+        storage,
+        &table(),
+        "value_idx",
+        &IndexKey(b"X".to_vec()),
+        key().key.as_bytes()
+    )
+    .unwrap()
+    .is_empty());
+    storage
+        .write(&table(), &key(), Arc::new(row(b"X", 40)), 40)
+        .unwrap();
+    assert_eq!(
+        local_keyed(
+            storage,
             &table(),
             "value_idx",
             &IndexKey(b"X".to_vec()),
             key().key.as_bytes()
         )
         .unwrap()
-        .is_empty());
-    storage.write(&table(), &key(), row(b"X", 40), 40).unwrap();
-    assert_eq!(
-        storage
-            .read_by_index_in_partition(
-                &table(),
-                "value_idx",
-                &IndexKey(b"X".to_vec()),
-                key().key.as_bytes()
-            )
-            .unwrap()
-            .len(),
+        .len(),
         1
     );
     history.close().await;
@@ -695,28 +811,28 @@ async fn keyed_index_local_postings_do_not_resurrect_tombstones_or_expired_cells
 async fn keyed_index_local_value_change_filters_stale_insert_only_postings() {
     let history = History::new().await;
     history.engines[2]
-        .write(&table(), &key(), row(b"Y", 20), 20)
+        .write(&table(), &key(), Arc::new(row(b"Y", 20)), 20)
         .unwrap();
-    let old = history.engines[2]
-        .read_by_index_in_partition(
-            &table(),
-            "value_idx",
-            &IndexKey(b"X".to_vec()),
-            key().key.as_bytes(),
-        )
-        .unwrap();
+    let old = local_keyed(
+        &history.engines[2],
+        &table(),
+        "value_idx",
+        &IndexKey(b"X".to_vec()),
+        key().key.as_bytes(),
+    )
+    .unwrap();
     assert!(
         old.is_empty(),
         "a stale X posting must not return the canonical Y row: {old:?}"
     );
-    let current = history.engines[2]
-        .read_by_index_in_partition(
-            &table(),
-            "value_idx",
-            &IndexKey(b"Y".to_vec()),
-            key().key.as_bytes(),
-        )
-        .unwrap();
+    let current = local_keyed(
+        &history.engines[2],
+        &table(),
+        "value_idx",
+        &IndexKey(b"Y".to_vec()),
+        key().key.as_bytes(),
+    )
+    .unwrap();
     assert_eq!(current.len(), 1);
     history.close().await;
 }
@@ -725,18 +841,7 @@ async fn keyed_index_local_value_change_filters_stale_insert_only_postings() {
 async fn keyed_index_acknowledged_value_change_cannot_leave_a_stale_positive() {
     let history = History::new().await;
     history.replace_value_at_quorum().await;
-    let result = history
-        .reader
-        .coordinate_index_read_in_partition(
-            &table(),
-            &key(),
-            "value_idx",
-            &IndexKey(b"X".to_vec()),
-            ConsistencyLevel::Quorum,
-            &ReplicationStrategy::Simple {
-                replication_factor: 3,
-            },
-        )
+    let result = keyed_read(&history.reader, &b"X"[..], ConsistencyLevel::Quorum, 3)
         .await
         .expect("configured quorum answers the keyed predicate");
     assert!(
@@ -748,18 +853,7 @@ async fn keyed_index_acknowledged_value_change_cannot_leave_a_stale_positive() {
         canonical_reads > 0,
         "an ambiguous stale positive must obtain canonical row evidence"
     );
-    let current = history
-        .reader
-        .coordinate_index_read_in_partition(
-            &table(),
-            &key(),
-            "value_idx",
-            &IndexKey(b"Y".to_vec()),
-            ConsistencyLevel::Quorum,
-            &ReplicationStrategy::Simple {
-                replication_factor: 3,
-            },
-        )
+    let current = keyed_read(&history.reader, &b"Y"[..], ConsistencyLevel::Quorum, 3)
         .await
         .unwrap();
     assert_eq!(

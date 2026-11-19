@@ -25,7 +25,9 @@ use crate::executor::eval;
 use crate::executor::expand::{
     build_columns, check_timeout, extract_neighbor_id, GraphEngineConfig,
 };
-use crate::executor::result::{GraphResult, QueryStats};
+#[cfg(test)]
+use crate::executor::result::GraphResult;
+use crate::executor::result::QueryStats;
 use crate::executor::spill::{OrderSemantics, RowAcc};
 use crate::parser::ReturnClause;
 use crate::planner::physical::WcoJoinPlan;
@@ -167,6 +169,7 @@ fn next_common_value(iterators: &mut [AdjacencyIterator]) -> Option<Vec<u8>> {
 ///    d. Check that the closing edge `(c)->(a)` is satisfied.
 /// 3. Collect matched bindings and project via return clause.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub async fn execute_wco_join(
     write_path: &dyn GraphWrite,
     keyspace: &str,
@@ -561,6 +564,7 @@ async fn project_bindings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     /// Helper to build a clustering key for adjacency entries.
     #[allow(dead_code)]
@@ -651,7 +655,7 @@ mod tests {
             &self,
             table_id: &TableId,
             key: &DecoratedKey,
-            row: ferrosa_sstable::types::Row,
+            row: std::sync::Arc<ferrosa_sstable::types::Row>,
             timestamp: i64,
             cl: ferrosa_cluster::consistency::ConsistencyLevel,
             strategy: &ferrosa_cluster::ring::strategy::ReplicationStrategy,
@@ -665,6 +669,14 @@ mod tests {
             rf: usize,
         ) -> ferrosa_common::Result<()> {
             GraphWrite::write_batch(&self.inner, mutations, cl, rf).await
+        }
+        async fn write_staged_batch(
+            &self,
+            batch: ferrosa_storage::write_set_stage::StagedWriteSet,
+            cl: ferrosa_cluster::consistency::ConsistencyLevel,
+            rf: usize,
+        ) -> ferrosa_common::Result<()> {
+            GraphWrite::write_staged_batch(&self.inner, batch, cl, rf).await
         }
     }
 
@@ -696,12 +708,12 @@ mod tests {
             .write(
                 &TableId::new("test_ks", "person_v"),
                 &DecoratedKey::new(PartitionKey::new(b"A".to_vec())),
-                Row {
+                Arc::new(Row {
                     clustering: vec![],
                     cells: vec![],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1),
-                },
+                }),
                 1,
             )
             .unwrap();

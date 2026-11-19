@@ -13,6 +13,7 @@
 //! Last changed: Preserve scoped logical/physical identity in traversal, DELETE and DETACH.
 
 use crate::executor::io::GraphWrite;
+use std::sync::Arc;
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -35,14 +36,20 @@ use crate::error::{GraphError, Result};
 use crate::executor::aggregate::{create_accumulator, Accumulator};
 use crate::executor::eval;
 use crate::executor::result::{GraphResult, QueryStats};
-use crate::executor::stream::{
-    chain_streams, collect_to_graph_result, dedup_stream, stream_from_rows, RowStream,
-};
+use crate::executor::stream::{chain_streams, dedup_stream, stream_from_rows, RowStream};
 use crate::parser::{
     CompareOp, Direction, Expr, Literal, PatternComprehensionHop, RemoveItem, ReturnClause,
     ReturnItem, SortDir, WithPipeline,
 };
 use crate::planner::physical::{AggregateProjection, Anchor, CreateOp, Hop, MergeOp, PhysicalPlan};
+mod adjacency_write;
+pub mod detach_delete;
+#[cfg(test)]
+use adjacency_write::is_transient_replica_lag;
+use adjacency_write::{
+    explicit_adjacency_for, restore_entries_shared_with_live_edges,
+    write_explicit_adjacency_entries,
+};
 
 /// Maximum neighbor hydrations in flight at once within a single hop
 /// (t_4ce82a3e). Bounds the concurrent storage reads a high-degree hub can
@@ -154,9 +161,10 @@ type StreamingPlanResult<'a> = Result<(Vec<String>, RowStream<'a>, QueryStats)>;
 /// map cell indices to property names (e.g., `name`, `age`) so that Cypher
 /// property lookups like `a.name` resolve correctly.
 ///
-/// This is the buffered façade over [`execute_streaming`]: it drains the row
-/// stream through [`collect_to_graph_result`]. There is one executor, not two —
-/// this entry point adds only the materialization.
+/// Test-only buffered façade over [`execute_streaming`]: it drains the row
+/// stream into a `GraphResult` so tests can compare whole results. No
+/// production path collects a result; every caller consumes the stream.
+#[cfg(test)]
 pub async fn execute(
     plan: PhysicalPlan,
     write_path: &dyn GraphWrite,
@@ -173,48 +181,42 @@ pub async fn execute(
     // arms may legitimately return more than `max_result_rows` rows today.
     // Capping here would silently truncate results that currently come back in
     // full — a behavior change, and a silent one.
-    collect_to_graph_result(columns, rows_stream, stats, usize::MAX).await
+    crate::executor::stream::collect_to_graph_result(columns, rows_stream, stats, usize::MAX).await
 }
 
 /// Streaming entry point: the projected column names, a pull-based row stream,
 /// and the query's [`QueryStats`].
 ///
-/// Additive scaffold (increment 2 of the streaming executor, t_4ce82a3e). Only
-/// the provably-safe plan variants stream; everything else computes today's
-/// buffered [`GraphResult`] and hands it back through [`stream_from_rows`].
-/// Behavior is identical for every query either way — [`execute`] is this
-/// function plus a `collect`.
+/// This is the ONLY executor entry point production code uses; there is no
+/// buffered `GraphResult` path (the `execute` façade is test-only).
 ///
-/// # What actually streams
+/// # What streams
 ///
-/// - [`PhysicalPlan::Subscribe`] — pure passthrough to the inner plan, so it
-///   streams exactly as well as whatever it wraps.
-/// - [`PhysicalPlan::Union`] with `all: true` — concatenation, via
-///   [`chain_streams`]. A later arm is never polled until the earlier arms are
-///   drained. The arms themselves are
-///   still *executed* eagerly, because `stats` is returned up front and a
-///   UNION's stats are the sum over its arms — so the end-to-end laziness is
-///   real only when the arms are themselves converted variants.
-/// - [`PhysicalPlan::ReturnOnly`] — at most one row, produced on pull, so
-///   `LIMIT 0` never evaluates the projection.
+/// - `Subscribe` — passthrough to the inner plan.
+/// - `Union` — concatenation via [`chain_streams`]; without `ALL`, a
+///   first-seen [`dedup_stream`] on pull. A later arm is never polled until the
+///   earlier arms are drained (its setup still runs eagerly, for the stats).
+/// - `ReturnOnly`, `Unwind` without ORDER BY — produced on pull.
+/// - `Expand` — the anchor scan's states go to a spill-backed run and are
+///   pulled back one at a time by the hops and the projection; an ORDER BY
+///   spills and streams its merge.
+/// - `WcoJoin`, `ExpandVarLength` — their accumulators spill and the merge is
+///   consumed on pull.
 ///
-/// # What deliberately does not
+/// # What completes at setup
 ///
-/// Everything else, including `UNION` *without* `ALL` (its `HashSet` dedup
-/// spans the whole concatenation), `DeleteNodes` (it walks the matched rows
-/// twice — validate every vertex, then tombstone — and streaming it would
-/// partially delete) and `Aggregate`.
-///
-/// `WcoJoin` and `ExpandVarLength` moved into the streaming set: their ORDER BY
-/// accumulators spill while rows are produced, and the merge is consumed only
-/// as a stream (`OrderBySink::finish_stream`) — there is no `finish_rows` that
-/// could pull it back into memory.
+/// Writes (`CreateNodes`, `MergeUpsert`, `SetProperties`, `RemoveProperties`,
+/// `DeleteNodes`) and `Aggregate` finish their work before returning — a write
+/// must never be half-applied by a consumer that stops pulling. SET / REMOVE /
+/// DELETE read their whole match set into a spill-backed run BEFORE the first
+/// write (no Halloween re-match), and SET's RETURN rows stream back from a
+/// spill-backed accumulator.
 ///
 /// # Stats
 ///
-/// `QueryStats` is returned alongside the stream rather than after it, so it is
-/// computed exactly where the buffered path computes it today. That is why a
-/// fallback variant is fully executed before this function returns.
+/// `QueryStats` is returned alongside the stream rather than after it, so every
+/// operator finishes the work its stats count (scans, hops, writes) before
+/// this function returns; only projection and spill replay happen on pull.
 pub async fn execute_streaming<'a>(
     plan: PhysicalPlan,
     write_path: &'a dyn GraphWrite,
@@ -406,7 +408,7 @@ fn execute_streaming_inner<'a>(
                 )
                 .await
             }
-            PhysicalPlan::Union { arms, all: true } => {
+            PhysicalPlan::Union { arms, all } => {
                 let mut columns: Option<Vec<String>> = None;
                 let mut stats = QueryStats::default();
                 let mut arm_streams: Vec<RowStream<'a>> = Vec::with_capacity(arms.len());
@@ -440,11 +442,11 @@ fn execute_streaming_inner<'a>(
                     arm_streams.push(arm_stream);
                 }
                 stats.execution_ms = start.elapsed().as_millis() as u64;
-                Ok((
-                    columns.unwrap_or_default(),
-                    chain_streams(arm_streams),
-                    stats,
-                ))
+                let rows = chain_streams(arm_streams);
+                // `UNION` without ALL: first-seen dedup on pull, the same
+                // order the drained `retain` produced.
+                let rows = if all { rows } else { dedup_stream(rows) };
+                Ok((columns.unwrap_or_default(), rows, stats))
             }
             PhysicalPlan::ReturnOnly { return_clause } => {
                 Ok(return_only_stream(return_clause, start))
@@ -525,50 +527,127 @@ fn execute_streaming_inner<'a>(
                 .await
             }
 
-            // --- everything else: today's buffered result, wrapped -----------
-            other => {
-                let result = execute_buffered(
-                    other,
+            // --- write and blocking operators: complete at setup -------------
+            //
+            // These finish their work before returning (a write must not be
+            // half-applied by a consumer that stops pulling), so their result
+            // is handed back as an already-produced stream.
+            PhysicalPlan::Unwind {
+                expr,
+                var,
+                with_pipeline,
+                return_clause,
+            } => execute_unwind(&expr, &var, with_pipeline.as_ref(), return_clause, start),
+            PhysicalPlan::CreateNodes {
+                creates,
+                return_clause,
+            } => Ok(produced(
+                execute_create(
                     write_path,
+                    &creates,
+                    return_clause.as_ref(),
+                    config,
+                    start,
+                    schema,
+                )
+                .await?,
+            )),
+            PhysicalPlan::SetProperties {
+                expand,
+                assignments,
+                variable_tables,
+                return_clause,
+            } => {
+                execute_set(
+                    write_path,
+                    *expand,
                     keyspace,
+                    &assignments,
+                    &variable_tables,
+                    return_clause.as_ref(),
                     config,
                     virtual_tables,
-                    schema,
                     start,
+                    schema,
                 )
-                .await?;
-                Ok((result.columns, stream_from_rows(result.rows), result.stats))
+                .await
             }
+            PhysicalPlan::RemoveProperties {
+                expand,
+                items,
+                variable_tables,
+            } => Ok(produced(
+                execute_remove(
+                    write_path,
+                    *expand,
+                    keyspace,
+                    &items,
+                    &variable_tables,
+                    config,
+                    virtual_tables,
+                    start,
+                    schema,
+                )
+                .await?,
+            )),
+            PhysicalPlan::DeleteNodes {
+                expand,
+                variables,
+                detach,
+                variable_tables,
+            } => Ok(produced(
+                execute_delete(
+                    write_path,
+                    *expand,
+                    keyspace,
+                    &variables,
+                    detach,
+                    config,
+                    virtual_tables,
+                    start,
+                    schema,
+                    &variable_tables,
+                )
+                .await?,
+            )),
+            PhysicalPlan::Aggregate {
+                inner,
+                group_keys,
+                projections,
+                return_clause,
+            } => Ok(produced(
+                execute_aggregate(
+                    write_path,
+                    keyspace,
+                    *inner,
+                    &group_keys,
+                    &projections,
+                    &return_clause,
+                    config,
+                    start,
+                    virtual_tables,
+                    schema,
+                )
+                .await?,
+            )),
+            PhysicalPlan::MergeUpsert {
+                merges,
+                set_clause,
+                return_clause,
+            } => Ok(produced(
+                execute_merge(
+                    write_path,
+                    &merges,
+                    &set_clause,
+                    return_clause.as_ref(),
+                    config,
+                    start,
+                    schema,
+                )
+                .await?,
+            )),
         }
     })
-}
-
-/// Remove duplicate rows, keeping the first occurrence and the existing order.
-///
-/// The previous form sorted by debug representation and then `dedup()`ed:
-///
-/// (`text`, not `ignore`: the Cluster CI job runs `cargo test -- --ignored`,
-/// which forces ```ignore doctests to compile — and this snippet is an
-/// illustration of deleted code, not something that can compile.)
-///
-/// ```text
-/// rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
-/// rows.dedup();
-/// ```
-///
-/// `Vec::dedup` only removes *consecutive* duplicates, so the sort was there to
-/// make duplicates adjacent — but it ran **after** the ORDER BY sort and
-/// therefore destroyed it. `RETURN DISTINCT x ORDER BY x DESC` came back in
-/// debug-string ascending order, with no indication the requested order had
-/// been discarded.
-///
-/// Deduplicating on a hash of the row keeps every duplicate out without
-/// touching the order, so ORDER BY survives. First-seen order also matches what
-/// the streaming paths already do (`dedup_stream`, t_4ce82a3e), so the two
-/// forms of DISTINCT now agree instead of differing by which path a query took.
-pub(super) fn dedup_preserving_order(rows: &mut Vec<super::stream::RowVals>) {
-    let mut seen = std::collections::HashSet::new();
-    rows.retain(|row| seen.insert(serde_json::to_string(row).unwrap_or_default()));
 }
 
 /// `RETURN <exprs>` with no MATCH: at most one row, built on pull.
@@ -603,252 +682,10 @@ fn return_only_stream<'a>(
     (columns, Box::pin(row.take(limit)), stats)
 }
 
-/// The materializing executor: every plan variant that has not been converted
-/// to streaming, unchanged.
-///
-/// `start` is threaded in from [`execute_streaming_inner`] so `execution_ms`
-/// still measures from the same instant the buffered `execute` used to.
-async fn execute_buffered<'a>(
-    plan: PhysicalPlan,
-    write_path: &'a dyn GraphWrite,
-    keyspace: &'a str,
-    config: &'a GraphEngineConfig,
-    virtual_tables: Option<&'a VirtualTableRegistry>,
-    schema: Option<&'a Schema>,
-    start: Instant,
-) -> Result<GraphResult> {
-    match plan {
-        PhysicalPlan::Union { arms, all } => {
-            // Concatenation is the streaming half; `all: false` adds a HashSet
-            // dedup over the WHOLE concatenation, which has to see every row
-            // before any row is final. Route the concatenation through the
-            // streaming UNION ALL so there is one implementation of it, then
-            // materialize and dedup.
-            let (columns, rows_stream, mut stats) = execute_streaming(
-                PhysicalPlan::Union { arms, all: true },
-                write_path,
-                keyspace,
-                config,
-                virtual_tables,
-                schema,
-            )
-            .await?;
-            let mut rows = crate::executor::stream::collect_rows(rows_stream).await?;
-            if !all {
-                let mut seen = std::collections::HashSet::new();
-                rows.retain(|row| seen.insert(serde_json::to_string(row).unwrap_or_default()));
-            }
-            stats.execution_ms = start.elapsed().as_millis() as u64;
-            Ok(GraphResult {
-                columns,
-                rows,
-                stats,
-            })
-        }
-        // Converted variants: `execute_streaming` intercepts these before it
-        // ever delegates here. Present so this function stays total over
-        // `PhysicalPlan`, and routed through the same code so there is no
-        // second implementation to drift.
-        PhysicalPlan::ReturnOnly { return_clause } => {
-            let (columns, rows_stream, stats) = return_only_stream(return_clause, start);
-            collect_to_graph_result(columns, rows_stream, stats, usize::MAX).await
-        }
-        PhysicalPlan::Subscribe { inner, .. } => {
-            Box::pin(execute(
-                *inner,
-                write_path,
-                keyspace,
-                config,
-                virtual_tables,
-                schema,
-            ))
-            .await
-        }
-        PhysicalPlan::Unwind {
-            expr,
-            var,
-            with_pipeline,
-            return_clause,
-        } => execute_unwind(&expr, &var, with_pipeline.as_ref(), &return_clause, start).await,
-        PhysicalPlan::Expand {
-            anchor,
-            hops,
-            optional_hops,
-            post_filters,
-            with_pipeline,
-            return_clause,
-        } => {
-            execute_expand(
-                ExpandPlan {
-                    anchor: &anchor,
-                    hops: &hops,
-                    optional_hops: &optional_hops,
-                    post_filters: &post_filters,
-                    with_pipeline: with_pipeline.as_ref(),
-                    return_clause: &return_clause,
-                },
-                ExpandCtx {
-                    write_path,
-                    keyspace,
-                    config,
-                    virtual_tables,
-                    schema,
-                    start,
-                },
-            )
-            .await
-        }
-        PhysicalPlan::CreateNodes {
-            creates,
-            return_clause,
-        } => {
-            execute_create(
-                write_path,
-                &creates,
-                return_clause.as_ref(),
-                config,
-                start,
-                schema,
-            )
-            .await
-        }
-        PhysicalPlan::SetProperties {
-            expand,
-            assignments,
-            variable_tables,
-            return_clause,
-        } => {
-            execute_set(
-                write_path,
-                *expand,
-                keyspace,
-                &assignments,
-                &variable_tables,
-                return_clause.as_ref(),
-                config,
-                virtual_tables,
-                start,
-                schema,
-            )
-            .await
-        }
-        PhysicalPlan::RemoveProperties {
-            expand,
-            items,
-            variable_tables,
-        } => {
-            execute_remove(
-                write_path,
-                *expand,
-                keyspace,
-                &items,
-                &variable_tables,
-                config,
-                virtual_tables,
-                start,
-                schema,
-            )
-            .await
-        }
-        PhysicalPlan::DeleteNodes {
-            expand,
-            variables,
-            detach,
-            variable_tables,
-        } => {
-            // NOT streamable: this consumes the matched rows TWICE — validate
-            // across every matched vertex first, then tombstone. A single-pass
-            // stream would delete a prefix and then fail validation, i.e.
-            // partial deletion.
-            execute_delete(
-                write_path,
-                *expand,
-                keyspace,
-                &variables,
-                detach,
-                config,
-                virtual_tables,
-                start,
-                schema,
-                &variable_tables,
-            )
-            .await
-        }
-        PhysicalPlan::Aggregate {
-            inner,
-            group_keys,
-            projections,
-            return_clause,
-        } => {
-            execute_aggregate(
-                write_path,
-                keyspace,
-                *inner,
-                &group_keys,
-                &projections,
-                &return_clause,
-                config,
-                start,
-                virtual_tables,
-                schema,
-            )
-            .await
-        }
-        PhysicalPlan::ExpandVarLength {
-            anchor,
-            hop,
-            min_hops,
-            max_hops,
-            return_clause,
-        } => {
-            super::varpath::execute_var_length(
-                write_path,
-                keyspace,
-                &anchor,
-                &hop,
-                min_hops,
-                max_hops,
-                &return_clause,
-                config,
-                start,
-                virtual_tables,
-                schema,
-            )
-            .await
-        }
-        PhysicalPlan::WcoJoin {
-            plan,
-            return_clause,
-        } => {
-            super::leapfrog::execute_wco_join(
-                write_path,
-                keyspace,
-                &plan,
-                &return_clause,
-                config,
-                start,
-                virtual_tables,
-                schema,
-            )
-            .await
-        }
-        PhysicalPlan::MergeUpsert {
-            merges,
-            set_clause,
-            return_clause,
-        } => {
-            execute_merge(
-                write_path,
-                &merges,
-                &set_clause,
-                return_clause.as_ref(),
-                config,
-                start,
-                schema,
-            )
-            .await
-        }
-    }
+/// Present an operator result that is already complete (a write, or a
+/// blocking operator that finished at setup) in the streaming shape.
+fn produced<'a>(result: GraphResult) -> (Vec<String>, RowStream<'a>, QueryStats) {
+    (result.columns, stream_from_rows(result.rows), result.stats)
 }
 
 fn graph_filter_passes<'a>(
@@ -1386,13 +1223,15 @@ async fn resolve_target_node_json(
     Ok(matched.map(|m| m.json))
 }
 
-async fn execute_unwind(
+fn execute_unwind(
     expr: &Expr,
     var: &str,
     with_pipeline: Option<&WithPipeline>,
-    return_clause: &ReturnClause,
+    return_clause: ReturnClause,
     start: Instant,
-) -> Result<GraphResult> {
+) -> StreamingPlanResult<'static> {
+    use futures::StreamExt as _;
+
     let value = eval::eval_expr(expr, &HashMap::new())?;
     let values = match value {
         serde_json::Value::Array(values) => values,
@@ -1403,59 +1242,50 @@ async fn execute_unwind(
             )))
         }
     };
-    let mut states = Vec::new();
+    // The list is a literal of the query itself, so these states are bounded
+    // by the request, not by stored data.
+    let mut states: Vec<ExpandState> = Vec::with_capacity(values.len());
     for value in values {
-        let mut bindings = HashMap::new();
-        bindings.insert(var.to_string(), value);
         states.push(ExpandState {
             current_key: DecoratedKey::new(PartitionKey::new(Vec::new())),
-            bindings,
+            bindings: HashMap::from([(var.to_string(), value)]),
         });
     }
     if let Some(with_pipeline) = with_pipeline {
         states = apply_with_pipeline(states, with_pipeline)?;
     }
 
-    let columns = build_columns(return_clause);
-
-    // ORDER BY must see every row before any row is final, so it stays a
-    // pipeline-breaker over the (bounded) UNWIND list. Without it, projection
-    // and LIMIT stream: rows are produced lazily and `take(limit)` stops pulling
-    // — no full projection followed by a truncate (t_4ce82a3e increment 2).
-    let rows = if return_clause.order_by.is_empty() {
-        use futures::StreamExt as _;
-        let limit = return_clause
-            .limit
-            .map(|l| l.max(0) as usize)
-            .unwrap_or(usize::MAX);
-        let projected = futures::stream::iter(states.iter())
-            .map(|state| eval_return_items(&return_clause.items, &state.bindings));
-        let stream: crate::executor::stream::RowStream<'_> = Box::pin(projected.take(limit));
-        crate::executor::stream::collect_rows(stream).await?
-    } else {
-        let mut rows = Vec::with_capacity(states.len());
-        for state in &states {
-            rows.push(eval_return_items(&return_clause.items, &state.bindings)?);
-        }
-        sort_projected_rows_by_bindings(&mut rows, &states, return_clause)?;
-        if let Some(limit) = return_clause.limit {
-            rows.truncate(limit.max(0) as usize);
-        }
-        rows
+    let columns = build_columns(&return_clause);
+    let stats = QueryStats {
+        execution_ms: start.elapsed().as_millis() as u64,
+        ..QueryStats::default()
     };
 
-    Ok(GraphResult {
-        columns,
-        rows,
-        stats: QueryStats {
-            vertices_read: 0,
-            edges_read: 0,
-            vertices_written: 0,
-            vertices_deleted: 0,
-            edges_deleted: 0,
-            execution_ms: start.elapsed().as_millis() as u64,
-        },
-    })
+    // ORDER BY must see every row before any row is final, so it stays a
+    // pipeline-breaker over the (query-bounded) UNWIND list. Without it,
+    // projection and LIMIT stream: rows are produced on pull and `take(limit)`
+    // stops pulling.
+    if return_clause.order_by.is_empty() {
+        let limit = match return_clause.limit {
+            Some(l) => l.max(0) as usize,
+            None => usize::MAX,
+        };
+        let rows: RowStream<'static> = Box::pin(
+            futures::stream::iter(states)
+                .map(move |state| eval_return_items(&return_clause.items, &state.bindings))
+                .take(limit),
+        );
+        return Ok((columns, rows, stats));
+    }
+    let mut rows = Vec::with_capacity(states.len());
+    for state in &states {
+        rows.push(eval_return_items(&return_clause.items, &state.bindings)?);
+    }
+    sort_projected_rows_by_bindings(&mut rows, &states, &return_clause)?;
+    if let Some(limit) = return_clause.limit {
+        rows.truncate(limit.max(0) as usize);
+    }
+    Ok((columns, stream_from_rows(rows), stats))
 }
 
 /// The borrowed pieces of a `PhysicalPlan::Expand`.
@@ -1489,17 +1319,238 @@ enum ExpandStates {
     Virtual(GraphResult),
     /// The surviving states after hops, post-filters, OPTIONAL MATCH and the
     /// WITH pipeline, plus the stats accumulated getting there.
-    Materialized(Vec<ExpandState>, QueryStats),
+    Materialized(Frontier, QueryStats),
 }
 
-/// Execute a `PhysicalPlan::Expand` and buffer the whole result.
-async fn execute_expand(plan: ExpandPlan<'_>, ctx: ExpandCtx<'_>) -> Result<GraphResult> {
-    match expand_to_states(plan, ctx).await? {
-        ExpandStates::Virtual(result) => Ok(result),
-        ExpandStates::Materialized(states, stats) => {
-            finish_expand_buffered(states, stats, plan, ctx).await
+/// A lazily pulled sequence of expand states.
+type StateStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<ExpandState>> + Send>>;
+
+/// The current set of expand states.
+///
+/// `Spilled` is the anchor scan's output (and anything derived from it
+/// without a hop): a spill-backed run, replayed once, in scan order. It is
+/// never resident as a whole. `Resident` is a hop frontier, which
+/// `max_fan_out_per_hop` already bounds, or the edge-anchored initial states.
+enum Frontier {
+    Resident(Vec<ExpandState>),
+    Spilled(StateStream),
+}
+
+impl Frontier {
+    /// Pull the states one at a time, in order.
+    fn into_stream(self) -> StateStream {
+        match self {
+            Self::Resident(states) => Box::pin(futures::stream::iter(states.into_iter().map(Ok))),
+            Self::Spilled(states) => states,
         }
     }
+}
+
+/// Tests hand a plain list of states where a frontier is expected; production
+/// code builds `Frontier::Resident` or `Frontier::Spilled` itself.
+#[cfg(test)]
+impl From<Vec<ExpandState>> for Frontier {
+    fn from(states: Vec<ExpandState>) -> Self {
+        Self::Resident(states)
+    }
+}
+
+/// The spill layout of one expand state: its partition key (hex) and its
+/// bindings (a JSON object). Bindings are MOVED into the row, never cloned.
+fn state_run_columns() -> [String; 2] {
+    ["__state_key".to_string(), "__state_bindings".to_string()]
+}
+
+fn encode_state(state: ExpandState) -> crate::executor::stream::RowVals {
+    let key = serde_json::Value::String(hex::encode(state.current_key.key.as_bytes()));
+    // Each binding moves into the spilled object; nothing is copied.
+    let mut bindings = serde_json::Map::new();
+    for (name, value) in state.bindings {
+        bindings.insert(name, value);
+    }
+    vec![key, serde_json::Value::Object(bindings)]
+}
+
+/// Rebuild a state from its spilled row. The key is re-decorated with the
+/// engine's partitioner (Murmur3), which is how it was decorated on read.
+/// Move a spilled bindings object back into a binding map.
+fn bindings_from_object(
+    object: serde_json::Map<String, serde_json::Value>,
+) -> HashMap<String, serde_json::Value> {
+    let mut bindings = HashMap::new();
+    for (name, value) in object {
+        bindings.insert(name, value);
+    }
+    bindings
+}
+
+/// [`decode_state`] over a spilled run's item, passing a read error through.
+fn decode_state_row(row: Result<crate::executor::stream::RowVals>) -> Result<ExpandState> {
+    match row {
+        Ok(row) => decode_state(row),
+        Err(e) => Err(e),
+    }
+}
+
+fn decode_state(row: crate::executor::stream::RowVals) -> Result<ExpandState> {
+    let mut values = row.into_iter();
+    let (Some(serde_json::Value::String(key_hex)), Some(serde_json::Value::Object(bindings)), None) =
+        (values.next(), values.next(), values.next())
+    else {
+        return Err(GraphError::Internal(
+            "spilled expand state is not [key, bindings]".to_string(),
+        ));
+    };
+    let key = match hex::decode(&key_hex) {
+        Ok(key) => key,
+        Err(e) => {
+            return Err(GraphError::Internal(format!(
+                "spilled expand state key: {}",
+                hex_error_text(&e)
+            )))
+        }
+    };
+    Ok(ExpandState {
+        current_key: DecoratedKey::new(PartitionKey::new(key)),
+        bindings: bindings_from_object(bindings),
+    })
+}
+
+/// A spill-backed run of expand states in arrival order (see
+/// [`crate::executor::spill::RowRun`]).
+struct StateRun(crate::executor::spill::RowRun);
+
+impl StateRun {
+    fn new(config: &GraphEngineConfig, label: &str) -> Result<Self> {
+        crate::executor::spill::RowRun::new(&state_run_columns(), config, label).map(Self)
+    }
+
+    fn append(&mut self, state: ExpandState) -> Result<()> {
+        self.0.append(encode_state(state))
+    }
+
+    fn finish(self) -> Result<StateStream> {
+        use futures::StreamExt as _;
+        let rows = self.0.finish()?;
+        Ok(Box::pin(rows.map(decode_state_row)))
+    }
+}
+
+/// Whether `state` passes every predicate in `filters`.
+async fn state_passes_filters(
+    filters: &[Expr],
+    ctx: ExpandCtx<'_>,
+    anchor_var: &str,
+    state: &ExpandState,
+) -> Result<bool> {
+    for filter in filters {
+        if !graph_filter_passes(
+            filter,
+            ctx.write_path,
+            ctx.keyspace,
+            ctx.schema,
+            &state.bindings,
+            anchor_var,
+            &state.current_key,
+        )
+        .await?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// A canonical text key for a binding map: entries in key order, so two maps
+/// with the same contents always produce the same key. (A `HashMap`'s own
+/// iteration order differs between instances.)
+fn canonical_bindings_key(bindings: &HashMap<String, serde_json::Value>) -> String {
+    let ordered: std::collections::BTreeMap<&String, &serde_json::Value> =
+        bindings.iter().collect();
+    serde_json::to_string(&ordered).unwrap_or_default()
+}
+
+/// Project one state through a WITH clause: the WITH items become the new
+/// bindings, and the WITH ... WHERE decides whether it survives.
+fn with_project_state(
+    with_pipeline: &crate::parser::WithPipeline,
+    state: ExpandState,
+) -> Result<Option<ExpandState>> {
+    let mut bindings = HashMap::new();
+    for item in &with_pipeline.clause.items {
+        let value = eval::eval_expr(&item.expr, &state.bindings)?;
+        let name = match &item.alias {
+            Some(alias) => alias.clone(),
+            None => expr_to_column_name(&item.expr),
+        };
+        bindings.insert(name, value);
+    }
+    if let Some(where_clause) = &with_pipeline.where_clause {
+        if !eval::filter_passes(where_clause, &bindings)? {
+            return Ok(None);
+        }
+    }
+    Ok(Some(ExpandState {
+        current_key: state.current_key,
+        bindings,
+    }))
+}
+
+/// The WITH pipeline over a spilled frontier: projection, WHERE and DISTINCT
+/// on pull; ORDER BY through a spill-backed sort keyed exactly as
+/// [`apply_with_pipeline`] keys it (each term evaluated against the projected
+/// bindings, compared with `pipeline_value_cmp`); LIMIT as `take`.
+///
+/// DISTINCT keeps one key per distinct projected binding, as `dedup_stream`
+/// does for rows.
+async fn with_pipeline_stream(
+    states: StateStream,
+    with_pipeline: &crate::parser::WithPipeline,
+    config: &GraphEngineConfig,
+) -> Result<StateStream> {
+    use futures::{StreamExt as _, TryStreamExt as _};
+
+    let projection = with_pipeline.clone();
+    let mut states: StateStream = Box::pin(states.try_filter_map(move |state| {
+        futures::future::ready(with_project_state(&projection, state))
+    }));
+    if with_pipeline.clause.distinct {
+        let mut seen = HashSet::new();
+        states = Box::pin(states.try_filter(move |state| {
+            futures::future::ready(seen.insert(canonical_bindings_key(&state.bindings)))
+        }));
+    }
+    let clause = &with_pipeline.clause;
+    if !clause.order_by.is_empty() {
+        let Some(mut sink) = crate::executor::spill::OrderBySink::new(
+            &state_run_columns(),
+            clause,
+            config,
+            "graph_with_order_by",
+            crate::executor::spill::OrderSemantics::Bindings,
+        )?
+        else {
+            return Err(GraphError::Internal(
+                "WITH ORDER BY reached without an ORDER BY".to_string(),
+            ));
+        };
+        states
+            .try_for_each(|state| {
+                let keyed = clause
+                    .order_by
+                    .iter()
+                    .map(|order| eval::eval_expr(&order.expr, &state.bindings))
+                    .collect::<Result<Vec<_>>>()
+                    .and_then(|keys| sink.push_keyed(encode_state(state), keys));
+                futures::future::ready(keyed)
+            })
+            .await?;
+        states = Box::pin(sink.finish_stream()?.map(decode_state_row));
+    }
+    if let Some(limit) = clause.limit {
+        states = Box::pin(states.take(limit.max(0) as usize));
+    }
+    Ok(states)
 }
 
 /// Owned pieces of a `PhysicalPlan::Expand`, for the streaming entry point.
@@ -1518,16 +1569,16 @@ struct ExpandParts {
 
 /// Execute a `PhysicalPlan::Expand`, streaming the projection when it is safe.
 ///
-/// Phase A (which states survive) is shared verbatim with the buffered path and
-/// stops early for eligible bounded anchor scans; the hop loop still
-/// materializes the frontier, and the
-/// sequential-vs-concurrent hop split is untouched. What streams is phase B:
-/// one `project_state` per pull, so a `LIMIT k` projects k states instead of
-/// projecting everything and truncating.
+/// Phase A (which states survive) stops early for eligible bounded anchor
+/// scans; the anchor states go to a spill-backed run, which the hops pull one
+/// state at a time (each hop frontier stays `max_fan_out_per_hop`-bounded).
+/// Phase B projects one state per pull, so a `LIMIT k` projects k states.
 ///
-/// Falls back to [`finish_expand_buffered`] when the query has an `ORDER BY`
-/// (it must see every row before the first is final), and to
-/// `execute_virtual_anchor`'s buffered result for a virtual-table anchor.
+/// An `ORDER BY` projects every state into the spilling [`OrderBySink`] and
+/// streams the merge; a virtual-table anchor returns
+/// `execute_virtual_anchor`'s result as produced.
+///
+/// [`OrderBySink`]: crate::executor::spill::OrderBySink
 ///
 /// `DISTINCT` composes as [`dedup_stream`] on top of the projection — see that
 /// function for the deliberate first-seen-vs-sorted order change.
@@ -1584,7 +1635,7 @@ async fn execute_expand_streaming<'a>(
             schema: ctx.schema,
         };
         let sorted = order_states_stream(
-            &states,
+            states,
             &proj,
             ctx.config,
             ctx.start,
@@ -1702,11 +1753,17 @@ async fn expand_to_states(plan: ExpandPlan<'_>, ctx: ExpandCtx<'_>) -> Result<Ex
         None
     };
     if anchor_cap == Some(0) {
-        return Ok(ExpandStates::Materialized(Vec::new(), stats));
+        return Ok(ExpandStates::Materialized(
+            Frontier::Resident(Vec::new()),
+            stats,
+        ));
     }
 
-    let (mut current_states, traversal_hops): (Vec<ExpandState>, &[Hop]) = if let Some(states) =
-        try_edge_anchored_initial_states(
+    // `post_filters_pending`: WHERE predicates over hop-bound variables still
+    // to apply. With no traversal hops the anchor states ARE the matched
+    // pattern, so the scan applies them before a state enters the run.
+    let (mut current_states, traversal_hops, post_filters_pending): (Frontier, &[Hop], bool) =
+        if let Some(states) = try_edge_anchored_initial_states(
             write_path,
             anchor,
             hops,
@@ -1716,53 +1773,104 @@ async fn expand_to_states(plan: ExpandPlan<'_>, ctx: ExpandCtx<'_>) -> Result<Ex
             &mut stats,
         )
         .await?
-    {
-        check_timeout(start, config.query_timeout)?;
-        (states, &hops[1..])
-    } else {
-        let anchor_meta = table_metadata_for(schema, &anchor.table.keyspace, &anchor.table.table);
-        let mut anchor_partitions =
-            stream_anchor_partitions(write_path, anchor, anchor_meta.as_ref(), schema).await?;
-        check_timeout(start, config.query_timeout)?;
-
-        // Resolve column names from schema for property mapping.
-        let anchor_col_names =
-            column_names_for_table(schema, &anchor.table.keyspace, &anchor.table.table);
-
-        // Apply WHERE filters to anchor partitions using the expression evaluator.
-        // Skip partitions that are fully tombstoned (no live cells in any row
-        // and no live static row) — these represent deleted vertices whose
-        // tombstones have not yet been purged by compaction.
-        //
-        // The scan is PULLED one partition at a time (t_bc5f0e6f): a partition
-        // that fails the anchor predicates is dropped before the next is read,
-        // so an anchor whose filters select a handful of vertices costs a
-        // handful of states no matter how large the table is. `check_timeout`
-        // per partition keeps the WORK bounded — deliberately a work bound, not
-        // a result bound: only an eligible explicit query LIMIT stops `states`.
-        let anchor_var = anchor.var.as_deref().unwrap_or("_anon");
-        let mut states: Vec<ExpandState> = Vec::new();
-        'anchor_scan: while let Some(partition) = anchor_partitions.next().await {
-            let partition = &partition?;
-            stats.vertices_read += 1;
+        {
             check_timeout(start, config.query_timeout)?;
-            if is_partition_dead(partition) {
-                continue;
-            }
+            (Frontier::Resident(states), &hops[1..], true)
+        } else {
+            let anchor_meta =
+                table_metadata_for(schema, &anchor.table.keyspace, &anchor.table.table);
+            let mut anchor_partitions =
+                stream_anchor_partitions(write_path, anchor, anchor_meta.as_ref(), schema).await?;
+            check_timeout(start, config.query_timeout)?;
 
-            if let Some(meta) = anchor_meta.as_ref() {
-                for row in &partition.rows {
-                    if crate::adjacency::schema::row_is_deleted(row) {
-                        continue;
-                    }
-                    let row_json = row_to_json(meta, partition, row);
-                    if !prop_map_passes(anchor_var, &anchor.props, &row_json)? {
-                        continue;
-                    }
+            // Resolve column names from schema for property mapping.
+            let anchor_col_names =
+                column_names_for_table(schema, &anchor.table.keyspace, &anchor.table.table);
 
+            // Apply WHERE filters to anchor partitions using the expression evaluator.
+            // Skip partitions that are fully tombstoned (no live cells in any row
+            // and no live static row) — these represent deleted vertices whose
+            // tombstones have not yet been purged by compaction.
+            //
+            // The scan is PULLED one partition at a time (t_bc5f0e6f): a partition
+            // that fails the anchor predicates is dropped before the next is read,
+            // so an anchor whose filters select a handful of vertices costs a
+            // handful of states no matter how large the table is. `check_timeout`
+            // per partition keeps the WORK bounded — deliberately a work bound, not
+            // a result bound: only an eligible explicit query LIMIT stops `states`.
+            //
+            // The surviving states go to a spill-backed run in scan order, not a
+            // `Vec`: an anchor that selects most of a large table spills past
+            // `spill_threshold_bytes`, and the hops / projection pull the run back
+            // one state at a time. The scan still completes here, before any
+            // downstream work, so `stats` is final and a write operator above
+            // this Expand never interleaves with it.
+            let anchor_var = anchor.var.as_deref().unwrap_or("_anon");
+            let filter_in_scan = hops.is_empty();
+            let post_filter_var = anchor.var.as_deref().unwrap_or("");
+            let mut run = StateRun::new(config, "graph_anchor_states")?;
+            let mut kept = 0usize;
+            'anchor_scan: while let Some(partition) = anchor_partitions.next().await {
+                let partition = &partition?;
+                stats.vertices_read += 1;
+                check_timeout(start, config.query_timeout)?;
+                if is_partition_dead(partition) {
+                    continue;
+                }
+
+                if let Some(meta) = anchor_meta.as_ref() {
+                    for row in &partition.rows {
+                        if crate::adjacency::schema::row_is_deleted(row) {
+                            continue;
+                        }
+                        let row_json = row_to_json(meta, partition, row);
+                        if !prop_map_passes(anchor_var, &anchor.props, &row_json)? {
+                            continue;
+                        }
+
+                        let mut bindings = HashMap::new();
+                        bindings.insert(anchor_var.to_string(), row_json);
+                        let current_key =
+                            graph_vertex_lookup_key(meta, partition, row, &anchor.props)?;
+
+                        let mut passes = true;
+                        for filter in &anchor.filters {
+                            if !graph_filter_passes(
+                                filter,
+                                write_path,
+                                keyspace,
+                                schema,
+                                &bindings,
+                                anchor_var,
+                                &current_key,
+                            )
+                            .await?
+                            {
+                                passes = false;
+                                break;
+                            }
+                        }
+                        let state = ExpandState {
+                            current_key,
+                            bindings,
+                        };
+                        if passes
+                            && (!filter_in_scan
+                                || state_passes_filters(post_filters, ctx, post_filter_var, &state)
+                                    .await?)
+                        {
+                            run.append(state)?;
+                            kept += 1;
+                            if anchor_cap.is_some_and(|cap| kept >= cap) {
+                                break 'anchor_scan;
+                            }
+                        }
+                    }
+                } else {
+                    let hex_id = hex::encode(partition.key.key.as_bytes());
+                    let row_json = eval::partition_to_json(partition, &hex_id, &anchor_col_names);
                     let mut bindings = HashMap::new();
                     bindings.insert(anchor_var.to_string(), row_json);
-                    let current_key = graph_vertex_lookup_key(meta, partition, row, &anchor.props)?;
 
                     let mut passes = true;
                     for filter in &anchor.filters {
@@ -1773,7 +1881,7 @@ async fn expand_to_states(plan: ExpandPlan<'_>, ctx: ExpandCtx<'_>) -> Result<Ex
                             schema,
                             &bindings,
                             anchor_var,
-                            &current_key,
+                            &partition.key,
                         )
                         .await?
                         {
@@ -1781,52 +1889,25 @@ async fn expand_to_states(plan: ExpandPlan<'_>, ctx: ExpandCtx<'_>) -> Result<Ex
                             break;
                         }
                     }
-                    if passes {
-                        states.push(ExpandState {
-                            current_key,
-                            bindings,
-                        });
-                        if anchor_cap.is_some_and(|cap| states.len() >= cap) {
+                    let state = ExpandState {
+                        current_key: partition.key.clone(),
+                        bindings,
+                    };
+                    if passes
+                        && (!filter_in_scan
+                            || state_passes_filters(post_filters, ctx, post_filter_var, &state)
+                                .await?)
+                    {
+                        run.append(state)?;
+                        kept += 1;
+                        if anchor_cap.is_some_and(|cap| kept >= cap) {
                             break 'anchor_scan;
                         }
                     }
                 }
-            } else {
-                let hex_id = hex::encode(partition.key.key.as_bytes());
-                let row_json = eval::partition_to_json(partition, &hex_id, &anchor_col_names);
-                let mut bindings = HashMap::new();
-                bindings.insert(anchor_var.to_string(), row_json);
-
-                let mut passes = true;
-                for filter in &anchor.filters {
-                    if !graph_filter_passes(
-                        filter,
-                        write_path,
-                        keyspace,
-                        schema,
-                        &bindings,
-                        anchor_var,
-                        &partition.key,
-                    )
-                    .await?
-                    {
-                        passes = false;
-                        break;
-                    }
-                }
-                if passes {
-                    states.push(ExpandState {
-                        current_key: partition.key.clone(),
-                        bindings,
-                    });
-                    if anchor_cap.is_some_and(|cap| states.len() >= cap) {
-                        break 'anchor_scan;
-                    }
-                }
             }
-        }
-        (states, hops)
-    };
+            (Frontier::Spilled(run.finish()?), hops, !filter_in_scan)
+        };
 
     // Step 2: For each hop, traverse adjacency index.
     let adj_ks = adjacency_keyspace_name(keyspace);
@@ -1861,156 +1942,55 @@ async fn expand_to_states(plan: ExpandPlan<'_>, ctx: ExpandCtx<'_>) -> Result<Ex
         let cap_this_hop = pushdown_cap;
 
         let mut next_states = Vec::new();
-        'states: for state in &current_states {
-            let vertex_key = &state.current_key;
-            // Read adjacency entries for this vertex.
-            let adj_partition = write_path.read(&adj_table_id, vertex_key).await?;
-            if let Some(partition) = adj_partition {
-                stats.edges_read += partition.rows.len();
-
-                // If this hop has property filters and an edge table, read
-                // the edge partition once so we can check edge properties.
-                let edge_meta = hop
-                    .edge_table
-                    .as_ref()
-                    .and_then(|et| table_metadata_for(schema, &et.keyspace, &et.table));
-                let vertex_meta = hop
-                    .vertex_table
-                    .as_ref()
-                    .and_then(|vt| table_metadata_for(schema, &vt.keyspace, &vt.table));
-
-                let mut pairs_iter = partition.rows.iter().filter_map(|row| {
-                    traversable_neighbor_id(
-                        row,
-                        hop.edge_label.as_deref(),
-                        expected_adjacency_direction(hop.direction),
-                    )
-                    .map(|nid| (row, nid))
-                });
-
-                // Hydrate this vertex's neighbors with BOUNDED CONCURRENCY
-                // (t_4ce82a3e increment 3).
-                //
-                // Every input to `hydrate_hop_neighbor` is shared/immutable, so
-                // neighbors of one vertex hydrate independently. The futures are
-                // held in a `FuturesUnordered` that this loop drives INLINE —
-                // which, unlike `buffer_unordered`/`tokio::spawn`, does NOT
-                // require `Send + 'static`: the set polls the futures in place,
-                // so they may keep borrowing `write_path`/`schema`/`hop`/`state`
-                // /`row`. That is what dissolves the old "Send is not general
-                // enough" wall WITHOUT the clone-per-neighbor restructure the
-                // task forbids — the only owned input is `nid`, exactly as
-                // before.
-                //
-                // In-flight is capped at HOP_HYDRATION_CONCURRENCY so a
-                // high-degree hub cannot launch unbounded concurrent reads, and
-                // `cap_this_hop` (LIMIT push-down) still stops the moment the
-                // cap is met, keeping the bounded-query storage-touch guarantee
-                // (http_limit_short_circuits_expansion_hydration).
-                //
-                // Ordering: results are drained in completion order, so a
-                // `cap_this_hop` prefix could differ from the sequential order.
-                // Capped hops therefore stay STRICTLY SEQUENTIAL (concurrency
-                // would change which rows a LIMIT returns); only uncapped hops —
-                // where the full fan-out is consumed and order is re-established
-                // downstream — hydrate concurrently.
-                if cap_this_hop.is_some() {
-                    for (row, nid) in pairs_iter {
-                        if let Some(st) = hydrate_hop_neighbor(
-                            write_path,
-                            schema,
-                            hop,
-                            state,
-                            vertex_key,
-                            edge_meta.as_ref(),
-                            vertex_meta.as_ref(),
-                            row,
-                            nid,
-                        )
-                        .await?
-                        {
-                            push_state_with_fan_out_limit(
-                                &mut next_states,
-                                st,
-                                config.max_fan_out_per_hop,
-                            )?;
-                            if cap_this_hop.is_some_and(|cap| next_states.len() >= cap) {
-                                break 'states;
-                            }
-                        }
-                    }
-                } else {
-                    use futures::stream::{FuturesUnordered, StreamExt as _};
-                    let mut in_flight = FuturesUnordered::new();
-                    loop {
-                        while in_flight.len() < HOP_HYDRATION_CONCURRENCY {
-                            let Some((row, nid)) = pairs_iter.next() else {
-                                break;
-                            };
-                            in_flight.push(hydrate_hop_neighbor(
-                                write_path,
-                                schema,
-                                hop,
-                                state,
-                                vertex_key,
-                                edge_meta.as_ref(),
-                                vertex_meta.as_ref(),
-                                row,
-                                nid,
-                            ));
-                        }
-                        let Some(hydrated) = in_flight.next().await else {
-                            break;
-                        };
-                        if let Some(st) = hydrated? {
-                            push_state_with_fan_out_limit(
-                                &mut next_states,
-                                st,
-                                config.max_fan_out_per_hop,
-                            )?;
-                        }
-                    }
-                }
+        // The frontier is pulled one state at a time: the anchor frontier is a
+        // spilled run, so it is never resident as a whole.
+        let mut frontier = current_states.into_stream();
+        while let Some(state) = frontier.next().await {
+            let state = state?;
+            let capped = expand_state_across_hop(
+                write_path,
+                schema,
+                config,
+                &adj_table_id,
+                hop,
+                cap_this_hop,
+                &state,
+                &mut next_states,
+                &mut stats,
+            )
+            .await?;
+            if capped {
+                break;
             }
         }
-
         if let Some(cap) = cap_this_hop {
             next_states.truncate(cap);
         }
         stats.vertices_read += next_states.len();
-        current_states = next_states;
+        current_states = Frontier::Resident(next_states);
     }
 
     // Apply WHERE predicates that reference hop-bound variables. The required
     // pattern is now fully matched, so every variable (anchor + each hop's
     // target) is bound in each state — these predicates would wrongly filter
     // everything out if evaluated earlier at the anchor scan.
-    if !post_filters.is_empty() {
+    if post_filters_pending && !post_filters.is_empty() {
+        // Pending only when traversal hops ran (or the edge-anchored path
+        // produced the frontier), and both leave a resident, fan-out-limited
+        // frontier.
+        let Frontier::Resident(states) = current_states else {
+            return Err(GraphError::Internal(
+                "post-MATCH filters pending over a spilled anchor frontier".to_string(),
+            ));
+        };
         let anchor_var = anchor.var.as_deref().unwrap_or("");
-        let mut kept = Vec::with_capacity(current_states.len());
-        for state in current_states {
-            let mut passes = true;
-            for filter in post_filters {
-                if !graph_filter_passes(
-                    filter,
-                    write_path,
-                    keyspace,
-                    schema,
-                    &state.bindings,
-                    anchor_var,
-                    &state.current_key,
-                )
-                .await?
-                {
-                    passes = false;
-                    break;
-                }
-            }
-            if passes {
+        let mut kept = Vec::with_capacity(states.len());
+        for state in states {
+            if state_passes_filters(post_filters, ctx, anchor_var, &state).await? {
                 kept.push(state);
             }
         }
-        current_states = kept;
+        current_states = Frontier::Resident(kept);
     }
 
     if !optional_hops.is_empty() {
@@ -2028,108 +2008,137 @@ async fn expand_to_states(plan: ExpandPlan<'_>, ctx: ExpandCtx<'_>) -> Result<Ex
     }
 
     if let Some(with_pipeline) = with_pipeline {
-        current_states = apply_with_pipeline(current_states, with_pipeline)?;
+        current_states = match current_states {
+            Frontier::Resident(states) => {
+                Frontier::Resident(apply_with_pipeline(states, with_pipeline)?)
+            }
+            Frontier::Spilled(states) => {
+                Frontier::Spilled(with_pipeline_stream(states, with_pipeline, config).await?)
+            }
+        };
     }
 
     Ok(ExpandStates::Materialized(current_states, stats))
 }
 
-/// Phase B, buffered: project every surviving state, then `ORDER BY`,
-/// `DISTINCT` and `LIMIT` over the materialized rows.
-///
-/// This is the pipeline-breaking tail. `execute_expand_streaming` keeps it
-/// unchanged for any query with an `ORDER BY`, and replaces it with
-/// `project_states_stream` (+ `dedup_stream` + `take`) otherwise.
-async fn finish_expand_buffered(
-    current_states: Vec<ExpandState>,
-    mut stats: QueryStats,
-    plan: ExpandPlan<'_>,
-    ctx: ExpandCtx<'_>,
-) -> Result<GraphResult> {
-    let ExpandPlan {
-        anchor,
-        return_clause,
-        ..
-    } = plan;
-    let ExpandCtx {
-        write_path,
-        keyspace,
-        config,
-        schema,
-        start,
-        ..
-    } = ctx;
-    // Step 3: Build result from return clause, projecting property values.
-    let columns = build_columns(return_clause);
+/// Expand ONE frontier state across `hop`, appending its surviving neighbor
+/// states to `next_states` (fan-out limited). Returns `true` once the hop's
+/// LIMIT push-down cap is met, so the caller stops pulling states.
+#[allow(clippy::too_many_arguments)]
+async fn expand_state_across_hop(
+    write_path: &dyn GraphWrite,
+    schema: Option<&Schema>,
+    config: &GraphEngineConfig,
+    adj_table_id: &TableId,
+    hop: &Hop,
+    cap_this_hop: Option<usize>,
+    state: &ExpandState,
+    next_states: &mut Vec<ExpandState>,
+    stats: &mut QueryStats,
+) -> Result<bool> {
+    let vertex_key = &state.current_key;
+    // Read adjacency entries for this vertex.
+    let adj_partition = write_path.read(adj_table_id, vertex_key).await?;
+    if let Some(partition) = adj_partition {
+        stats.edges_read += partition.rows.len();
 
-    // Pattern comprehensions in the projection need graph traversal keyed on
-    // the anchor (start) variable. Only take the graph-aware path when a
-    // comprehension is actually present, to avoid per-row overhead otherwise.
-    let needs_graph_projection = return_clause
-        .items
-        .iter()
-        .any(|item| expr_has_pattern_comprehension(&item.expr));
-    let anchor_var = anchor.var.as_deref().unwrap_or("");
+        // If this hop has property filters and an edge table, read
+        // the edge partition once so we can check edge properties.
+        let edge_meta = hop
+            .edge_table
+            .as_ref()
+            .and_then(|et| table_metadata_for(schema, &et.keyspace, &et.table));
+        let vertex_meta = hop
+            .vertex_table
+            .as_ref()
+            .and_then(|vt| table_metadata_for(schema, &vt.keyspace, &vt.table));
 
-    // Project every surviving state. The old `max_result_rows` break here
-    // SILENTLY TRUNCATED the result — no error, no flag, so a client could not
-    // tell a partial answer from a complete one. Removed (t_4ce82a3e): an
-    // unbounded ORDER BY now SPILLS instead of being capped, which is the
-    // honest answer rather than a quiet wrong one.
-    //
-    // An ORDER BY goes through the same sink as the streaming entry point:
-    // each projected row goes straight INTO it with its sort keys attached as
-    // hidden columns, so a non-projected term (Cypher permits ordering by
-    // expressions not in RETURN) no longer needs the per-state clones and the
-    // whole-result in-memory sort it used to (t_3f2f961a). Collecting the
-    // sorted stream below is this function's buffered `GraphResult` contract
-    // and nothing else; the streaming entry point does not collect.
-    let rows = if return_clause.order_by.is_empty() {
-        let mut rows = Vec::new();
-        for state in &current_states {
-            rows.push(
-                project_state(
-                    return_clause,
-                    needs_graph_projection,
+        let mut pairs_iter = partition.rows.iter().filter_map(|row| {
+            traversable_neighbor_id(
+                row,
+                hop.edge_label.as_deref(),
+                expected_adjacency_direction(hop.direction),
+            )
+            .map(|nid| (row, nid))
+        });
+
+        // Hydrate this vertex's neighbors with BOUNDED CONCURRENCY
+        // (t_4ce82a3e increment 3).
+        //
+        // Every input to `hydrate_hop_neighbor` is shared/immutable, so
+        // neighbors of one vertex hydrate independently. The futures are
+        // held in a `FuturesUnordered` that this loop drives INLINE —
+        // which, unlike `buffer_unordered`/`tokio::spawn`, does NOT
+        // require `Send + 'static`: the set polls the futures in place,
+        // so they may keep borrowing `write_path`/`schema`/`hop`/`state`
+        // /`row`. That is what dissolves the old "Send is not general
+        // enough" wall WITHOUT the clone-per-neighbor restructure the
+        // task forbids — the only owned input is `nid`, exactly as
+        // before.
+        //
+        // In-flight is capped at HOP_HYDRATION_CONCURRENCY so a
+        // high-degree hub cannot launch unbounded concurrent reads, and
+        // `cap_this_hop` (LIMIT push-down) still stops the moment the
+        // cap is met, keeping the bounded-query storage-touch guarantee
+        // (http_limit_short_circuits_expansion_hydration).
+        //
+        // Ordering: results are drained in completion order, so a
+        // `cap_this_hop` prefix could differ from the sequential order.
+        // Capped hops therefore stay STRICTLY SEQUENTIAL (concurrency
+        // would change which rows a LIMIT returns); only uncapped hops —
+        // where the full fan-out is consumed and order is re-established
+        // downstream — hydrate concurrently.
+        if cap_this_hop.is_some() {
+            for (row, nid) in pairs_iter {
+                if let Some(st) = hydrate_hop_neighbor(
                     write_path,
-                    keyspace,
                     schema,
-                    anchor_var,
+                    hop,
                     state,
+                    vertex_key,
+                    edge_meta.as_ref(),
+                    vertex_meta.as_ref(),
+                    row,
+                    nid,
                 )
-                .await?,
-            );
+                .await?
+                {
+                    push_state_with_fan_out_limit(next_states, st, config.max_fan_out_per_hop)?;
+                    if cap_this_hop.is_some_and(|cap| next_states.len() >= cap) {
+                        return Ok(true);
+                    }
+                }
+            }
+        } else {
+            use futures::stream::{FuturesUnordered, StreamExt as _};
+            let mut in_flight = FuturesUnordered::new();
+            loop {
+                while in_flight.len() < HOP_HYDRATION_CONCURRENCY {
+                    let Some((row, nid)) = pairs_iter.next() else {
+                        break;
+                    };
+                    in_flight.push(hydrate_hop_neighbor(
+                        write_path,
+                        schema,
+                        hop,
+                        state,
+                        vertex_key,
+                        edge_meta.as_ref(),
+                        vertex_meta.as_ref(),
+                        row,
+                        nid,
+                    ));
+                }
+                let Some(hydrated) = in_flight.next().await else {
+                    break;
+                };
+                if let Some(st) = hydrated? {
+                    push_state_with_fan_out_limit(next_states, st, config.max_fan_out_per_hop)?;
+                }
+            }
         }
-        // Apply DISTINCT.
-        if return_clause.distinct {
-            dedup_preserving_order(&mut rows);
-        }
-        // Apply LIMIT.
-        if let Some(limit) = return_clause.limit {
-            rows.truncate(limit.max(0) as usize);
-        }
-        rows
-    } else {
-        let proj = ExpandProjection {
-            return_clause: return_clause.clone(),
-            anchor_var: anchor_var.to_string(),
-            needs_graph_projection,
-            write_path,
-            keyspace,
-            schema,
-        };
-        let sorted =
-            order_states_stream(&current_states, &proj, config, start, "graph_order_by").await?;
-        crate::executor::stream::collect_rows(sorted).await?
-    };
-
-    stats.execution_ms = start.elapsed().as_millis() as u64;
-
-    Ok(GraphResult {
-        columns,
-        rows,
-        stats,
-    })
+    }
+    Ok(false)
 }
 
 /// Stream the anchor table's candidate partitions: a direct primary-key lookup
@@ -2304,27 +2313,33 @@ struct ExpandProjection<'a> {
 /// bound as the hop loop. The buffered tail historically skipped that check —
 /// a gap, not a behavior worth preserving.
 async fn project_states_into_sink(
-    states: &[ExpandState],
+    states: Frontier,
     proj: &ExpandProjection<'_>,
-    sink: &mut crate::executor::spill::OrderBySink,
+    sink: crate::executor::spill::OrderBySink,
     start: Instant,
     query_timeout: std::time::Duration,
-) -> Result<()> {
-    for state in states {
-        check_timeout(start, query_timeout)?;
-        let row = project_state(
-            &proj.return_clause,
-            proj.needs_graph_projection,
-            proj.write_path,
-            proj.keyspace,
-            proj.schema,
-            &proj.anchor_var,
-            state,
-        )
-        .await?;
-        sink.push(row, &state.bindings)?;
-    }
-    Ok(())
+) -> Result<crate::executor::spill::OrderBySink> {
+    use futures::TryStreamExt as _;
+    // The sink is threaded through the fold by value: each pulled state is
+    // projected and handed to the spill-bounded sink before the next is read.
+    states
+        .into_stream()
+        .try_fold(sink, |mut sink, state| async move {
+            check_timeout(start, query_timeout)?;
+            let row = project_state(
+                &proj.return_clause,
+                proj.needs_graph_projection,
+                proj.write_path,
+                proj.keyspace,
+                proj.schema,
+                &proj.anchor_var,
+                &state,
+            )
+            .await?;
+            sink.push(row, &state.bindings)?;
+            Ok(sink)
+        })
+        .await
 }
 
 /// Phase B for an ordered Expand, shared by the streaming and buffered entry
@@ -2338,14 +2353,14 @@ async fn project_states_into_sink(
 ///
 /// [`OrderBySink`]: crate::executor::spill::OrderBySink
 async fn order_states_stream(
-    states: &[ExpandState],
+    states: impl Into<Frontier>,
     proj: &ExpandProjection<'_>,
     config: &GraphEngineConfig,
     start: Instant,
     label: &str,
 ) -> Result<RowStream<'static>> {
     let columns = build_columns(&proj.return_clause);
-    let Some(mut sink) = crate::executor::spill::OrderBySink::new(
+    let Some(sink) = crate::executor::spill::OrderBySink::new(
         &columns,
         &proj.return_clause,
         config,
@@ -2357,7 +2372,8 @@ async fn order_states_stream(
             "ordered Expand tail reached without an ORDER BY".to_string(),
         ));
     };
-    project_states_into_sink(states, proj, &mut sink, start, config.query_timeout).await?;
+    let sink =
+        project_states_into_sink(states.into(), proj, sink, start, config.query_timeout).await?;
     Ok(crate::executor::spill::distinct_then_limit(
         sink.finish_stream()?,
         &proj.return_clause,
@@ -2381,23 +2397,27 @@ async fn order_states_stream(
 /// The states themselves are still materialized by the hop loop; making the
 /// hops lazy is a later increment.
 fn project_states_stream<'a>(
-    states: Vec<ExpandState>,
+    states: impl Into<Frontier>,
     projection: ExpandProjection<'a>,
 ) -> RowStream<'a> {
+    use futures::StreamExt as _;
     let properties = if projection.needs_graph_projection {
         None
     } else {
         owned_property_layout(projection.return_clause.items.iter().map(|item| &item.expr))
     };
     Box::pin(futures::stream::unfold(
-        (states.into_iter(), projection, properties, false),
+        (states.into().into_stream(), projection, properties, false),
         |(mut states, projection, properties, failed)| async move {
             // Stop after a failure rather than projecting the rest: a caller
             // that kept pulling would see a partial result follow an error.
             if failed {
                 return None;
             }
-            let state = states.next()?;
+            let state = match states.next().await? {
+                Ok(state) => state,
+                Err(e) => return Some((Err(e), (states, projection, properties, true))),
+            };
             let row = match properties.as_deref() {
                 Some(properties) => Ok(project_owned_properties(state, properties)),
                 None => {
@@ -2581,46 +2601,37 @@ fn apply_with_pipeline(
 ) -> Result<Vec<ExpandState>> {
     let mut projected = Vec::with_capacity(states.len());
     for state in states {
-        let mut bindings = HashMap::new();
-        for item in &with_pipeline.clause.items {
-            let value = eval::eval_expr(&item.expr, &state.bindings)?;
-            let name = item
-                .alias
-                .clone()
-                .unwrap_or_else(|| expr_to_column_name(&item.expr));
-            bindings.insert(name, value);
+        if let Some(state) = with_project_state(with_pipeline, state)? {
+            projected.push(state);
         }
-        if let Some(where_clause) = &with_pipeline.where_clause {
-            if !eval::filter_passes(where_clause, &bindings)? {
-                continue;
-            }
-        }
-        projected.push(ExpandState {
-            current_key: state.current_key,
-            bindings,
-        });
     }
 
     if with_pipeline.clause.distinct {
         let mut seen = std::collections::HashSet::new();
-        projected.retain(|state| {
-            let key = serde_json::to_string(&state.bindings).unwrap_or_default();
-            seen.insert(key)
-        });
+        let mut distinct = Vec::with_capacity(projected.len());
+        for state in projected {
+            if seen.insert(canonical_bindings_key(&state.bindings)) {
+                distinct.push(state);
+            }
+        }
+        projected = distinct;
     }
 
     if !with_pipeline.clause.order_by.is_empty() {
         let order_by = &with_pipeline.clause.order_by;
         let mut keyed = Vec::with_capacity(projected.len());
         for state in projected {
-            let keys = order_by
-                .iter()
-                .map(|order| eval::eval_expr(&order.expr, &state.bindings))
-                .collect::<Result<Vec<_>>>()?;
+            let mut keys = Vec::with_capacity(order_by.len());
+            for order in order_by {
+                keys.push(eval::eval_expr(&order.expr, &state.bindings)?);
+            }
             keyed.push((keys, state));
         }
         keyed.sort_by(|(a, _), (b, _)| compare_order_keys(a, b, order_by));
-        projected = keyed.into_iter().map(|(_, state)| state).collect();
+        projected = Vec::with_capacity(keyed.len());
+        for (_, state) in keyed {
+            projected.push(state);
+        }
     }
 
     if let Some(limit) = with_pipeline.clause.limit {
@@ -2633,13 +2644,13 @@ fn apply_with_pipeline(
 async fn execute_optional_hops(
     write_path: &dyn GraphWrite,
     keyspace: &str,
-    states: Vec<ExpandState>,
+    states: Frontier,
     optional_hops: &[Hop],
     config: &GraphEngineConfig,
     start: Instant,
     schema: Option<&Schema>,
     stats: &mut QueryStats,
-) -> Result<Vec<ExpandState>> {
+) -> Result<Frontier> {
     let optional_vars: Vec<String> = optional_hops
         .iter()
         .flat_map(|hop| hop.var.iter().chain(hop.rel_var.iter()))
@@ -2652,7 +2663,9 @@ async fn execute_optional_hops(
     for hop in optional_hops {
         check_timeout(start, config.query_timeout)?;
         let mut next_states = Vec::new();
-        for state in &current_states {
+        let mut frontier = current_states.into_stream();
+        while let Some(state) = frontier.next().await {
+            let state = &state?;
             let before_len = next_states.len();
             let vertex_key = &state.current_key;
             if matches!(hop.direction, Direction::In) {
@@ -2795,7 +2808,7 @@ async fn execute_optional_hops(
             }
         }
         stats.vertices_read += next_states.len();
-        current_states = next_states;
+        current_states = Frontier::Resident(next_states);
     }
     Ok(current_states)
 }
@@ -3241,7 +3254,7 @@ fn decode_bytes_to_json(column_type: &str, bytes: &[u8]) -> serde_json::Value {
         "bigint" | "counter" | "timestamp" if bytes.len() == 8 => {
             let raw = i64::from_be_bytes(bytes.try_into().unwrap());
             if column_type == "timestamp" {
-                let value = chrono::DateTime::from_timestamp_millis(raw)
+                let value = ferrosa_common::temporal::DateTime::from_timestamp_millis(raw)
                     .map(|dt| dt.to_rfc3339())
                     .unwrap_or_else(|| raw.to_string());
                 serde_json::Value::String(value)
@@ -4227,18 +4240,18 @@ async fn execute_create(
         });
         let (key, row, hex_key) = create_row_from_schema(op, meta.as_ref(), timestamp)?;
 
+        let adjacency = explicit_adjacency_for(schema, &table_id, &key, &row, timestamp);
         write_path
             .write(
                 &table_id,
                 &key,
-                row.clone(),
+                Arc::new(row),
                 timestamp,
                 graph_write_consistency(),
                 &strategy,
             )
             .await?;
-        write_explicit_adjacency_entries(write_path, &table_id, &key, &row, timestamp, schema)
-            .await?;
+        write_explicit_adjacency_entries(write_path, &table_id, adjacency, schema).await?;
         stats.vertices_written += 1;
         var_keys.push((op.var.clone(), hex_key));
     }
@@ -4546,11 +4559,12 @@ async fn execute_merge(
                 primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
             };
 
+            let adjacency = explicit_adjacency_for(schema, &table_id, &key, &row, timestamp);
             write_path
                 .write(
                     &table_id,
                     &key,
-                    row.clone(),
+                    Arc::new(row),
                     timestamp,
                     graph_write_consistency(),
                     &strategy,
@@ -4566,8 +4580,7 @@ async fn execute_merge(
                     );
                     e
                 })?;
-            write_explicit_adjacency_entries(write_path, &table_id, &key, &row, timestamp, schema)
-                .await?;
+            write_explicit_adjacency_entries(write_path, &table_id, adjacency, schema).await?;
             stats.vertices_written += 1;
         }
         // Existing row: no create needed, count as read.
@@ -4590,7 +4603,7 @@ async fn execute_merge(
                     key: shape.key.clone(),
                     deletion: DeletionTime::LIVE,
                     static_row: None,
-                    rows: vec![row.clone()],
+                    rows: vec![Arc::new(row.clone())],
                 };
                 Some(row_to_json(&meta, &partition, &row))
             }) {
@@ -4658,7 +4671,7 @@ async fn execute_merge(
             .write(
                 table_id,
                 key,
-                update_row,
+                Arc::new(update_row),
                 timestamp,
                 graph_write_consistency(),
                 &strategy,
@@ -4689,229 +4702,6 @@ async fn execute_merge(
         ))]],
         stats,
     })
-}
-
-async fn write_explicit_adjacency_entries(
-    write_path: &dyn GraphWrite,
-    table_id: &TableId,
-    key: &DecoratedKey,
-    row: &Row,
-    timestamp: i64,
-    schema: Option<&Schema>,
-) -> Result<()> {
-    let Some(schema) = schema else {
-        return Ok(());
-    };
-
-    let mutation = Mutation::new(
-        table_id.keyspace.clone(),
-        table_id.table.clone(),
-        key.clone(),
-        vec![row.clone()],
-        timestamp,
-    );
-
-    for derived in derive_adjacency_mutations(schema, table_id, &mutation) {
-        let adj_table_id = TableId::new(&derived.keyspace, &derived.table);
-        let strategy = graph_replication_strategy(Some(schema), &derived.keyspace)?;
-        for derived_row in derived.rows {
-            adjacency_write_with_retry(
-                write_path,
-                &adj_table_id,
-                &derived.key,
-                derived_row,
-                derived.timestamp,
-                &strategy,
-                table_id,
-            )
-            .await?;
-        }
-    }
-
-    Ok(())
-}
-
-/// After `DELETE r` tombstoned edge `deleted`'s adjacency entries, write back
-/// any of them that another live edge in the same partition still derives.
-///
-/// An entry is keyed by (vertex, label, neighbour), so edges that differ only
-/// in a non-endpoint key column share it — agent_memory's `typed_edges` keeps
-/// one row per `edge_type` between the same pair, in one partition. Deleting
-/// one of them tombstoned the entry its siblings need. The restore is written
-/// one microsecond after the delete, so it outranks both the explicit
-/// tombstone and the one the observer derived. (A sibling in ANOTHER partition
-/// is not seen here; the background reconcile restores that entry.)
-async fn restore_entries_shared_with_live_edges(
-    write_path: &dyn GraphWrite,
-    table_id: &TableId,
-    key: &DecoratedKey,
-    deleted: &Row,
-    timestamp: i64,
-    schema: Option<&Schema>,
-) -> Result<()> {
-    let Some(schema) = schema else {
-        return Ok(());
-    };
-    let derive = |row: &Row, ts: i64| {
-        let edge = Mutation::new(
-            table_id.keyspace.clone(),
-            table_id.table.clone(),
-            key.clone(),
-            vec![row.clone()],
-            ts,
-        );
-        derive_adjacency_mutations(schema, table_id, &edge)
-    };
-    let tombstoned: HashSet<(Vec<u8>, Vec<u8>)> = derive(deleted, timestamp)
-        .iter()
-        .flat_map(|m| {
-            m.rows
-                .iter()
-                .map(|r| (m.key.key.as_bytes().to_vec(), r.clustering.clone()))
-        })
-        .collect();
-    if tombstoned.is_empty() {
-        return Ok(());
-    }
-    let strategy = graph_replication_strategy(Some(schema), &table_id.keyspace)?;
-    let Some(partition) = write_path
-        .pk_read(table_id, key, graph_write_consistency(), &strategy)
-        .await?
-    else {
-        return Ok(());
-    };
-    let restore_at = timestamp.saturating_add(1);
-    let siblings = partition.rows.iter().filter(|row| {
-        row.clustering != deleted.clustering && !crate::adjacency::schema::row_is_deleted(row)
-    });
-    for sibling in siblings {
-        for derived in derive(sibling, restore_at) {
-            let adj_table_id = TableId::new(&derived.keyspace, &derived.table);
-            let adj_strategy = graph_replication_strategy(Some(schema), &derived.keyspace)?;
-            for entry in derived.rows {
-                let entry_id = (
-                    derived.key.key.as_bytes().to_vec(),
-                    entry.clustering.clone(),
-                );
-                if !tombstoned.contains(&entry_id) {
-                    continue;
-                }
-                adjacency_write_with_retry(
-                    write_path,
-                    &adj_table_id,
-                    &derived.key,
-                    entry,
-                    restore_at,
-                    &adj_strategy,
-                    table_id,
-                )
-                .await?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Write a derived adjacency row, retrying on transient failures that arise
-/// when the `system_graph_<ks>.adjacency` table was just created via Raft DDL
-/// and a follower hasn't yet finished applying the CREATE TABLE on its own
-/// state machine.
-///
-/// The window is narrow — openraft commits once a majority has replicated the
-/// log entry, but each follower's `apply` to the local StorageEngine happens
-/// in a separate task and can lag a few hundred ms behind on a busy CI
-/// runner. When the coordinator immediately fans out the first derived
-/// adjacency write at CL=QUORUM, lagging followers reject it with
-/// `table not registered: system_graph_<ks>.adjacency` (logged as
-/// `MutationForward write failed — not sending ACK`), the coordinator
-/// returns `WriteTimeout(received=1, required=2)`, and the graph HTTP
-/// request hangs until the client's read timeout.
-///
-/// Retrying with exponential backoff lets the followers catch up. The write
-/// is content-addressed and idempotent (LWW with monotonic timestamps), so
-/// duplicate forwards to replicas that already applied are safe.
-async fn adjacency_write_with_retry(
-    write_path: &dyn GraphWrite,
-    adj_table_id: &TableId,
-    key: &DecoratedKey,
-    row: Row,
-    timestamp: i64,
-    strategy: &ReplicationStrategy,
-    edge_table_id: &TableId,
-) -> Result<()> {
-    // Total budget is ~3 seconds across 6 attempts: 100, 200, 400, 800,
-    // 1600 ms. Picks up where DDL_AGREEMENT_APPLY_DRAIN (50 ms) stops.
-    const BACKOFFS_MS: &[u64] = &[100, 200, 400, 800, 1600];
-    let mut attempt = 0usize;
-    let mut backoffs = BACKOFFS_MS.iter().copied();
-    loop {
-        match write_path
-            .write(
-                adj_table_id,
-                key,
-                row.clone(),
-                timestamp,
-                graph_write_consistency(),
-                strategy,
-            )
-            .await
-        {
-            Ok(()) => {
-                if attempt > 0 {
-                    tracing::info!(
-                        adj_table = %adj_table_id,
-                        attempt,
-                        "adjacency write succeeded after retries (follower apply lag)"
-                    );
-                }
-                return Ok(());
-            }
-            Err(e) => {
-                if !is_transient_replica_lag(&e) {
-                    return Err(GraphError::Storage(ferrosa_common::Error::InvalidData(
-                        format!(
-                            "failed to write derived adjacency row for {}.{}: {e}",
-                            edge_table_id.keyspace, edge_table_id.table
-                        ),
-                    )));
-                }
-                let Some(backoff_ms) = backoffs.next() else {
-                    // Retry budget exhausted — surface the last transient error
-                    // so the operator sees the actual cluster state.
-                    return Err(GraphError::Storage(ferrosa_common::Error::InvalidData(
-                        format!(
-                            "failed to write derived adjacency row for {}.{} after \
-                             {attempt} retries: {e}",
-                            edge_table_id.keyspace, edge_table_id.table
-                        ),
-                    )));
-                };
-                tracing::warn!(
-                    adj_table = %adj_table_id,
-                    attempt = attempt + 1,
-                    backoff_ms,
-                    %e,
-                    "adjacency write hit replica schema lag — retrying"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                attempt += 1;
-            }
-        }
-    }
-}
-
-/// Distinguish a transient replica-schema-lag write timeout (retryable) from
-/// a real cluster failure (not retryable). The cluster coordinator surfaces a
-/// write timeout as the typed `Error::WriteTimeout` (t_43f70b3a; it was once
-/// `InvalidData("cluster: write timeout: …")`, and that text is still accepted
-/// from a path that wraps it). Any other error (unavailable, validation,
-/// storage I/O) is final.
-fn is_transient_replica_lag(e: &ferrosa_common::Error) -> bool {
-    if matches!(e, ferrosa_common::Error::WriteTimeout { .. }) {
-        return true;
-    }
-    let msg = e.to_string();
-    msg.contains("cluster: write timeout") || msg.contains("table not registered")
 }
 
 fn build_merge_write_shape(
@@ -5560,11 +5350,15 @@ fn encode_expr_for_column_type(expr: &Expr, column_type: &str) -> Result<Vec<u8>
         Expr::Literal(Literal::String(s))
             if lower == "timestamp" || lower.ends_with("timestamptype") =>
         {
-            let ms = chrono::DateTime::parse_from_rfc3339(s)
-                .map_err(|e| {
-                    GraphError::Validation(format!("invalid timestamp literal '{s}': {e}"))
-                })?
-                .timestamp_millis();
+            let ms = match ferrosa_common::temporal::parse::rfc3339(s) {
+                Ok(instant) => instant.timestamp_millis(),
+                Err(e) => {
+                    let reason = e.message();
+                    return Err(GraphError::Validation(format!(
+                        "invalid timestamp literal '{s}': {reason}"
+                    )));
+                }
+            };
             Ok(ms.to_be_bytes().to_vec())
         }
         Expr::Literal(Literal::Integer(i))
@@ -5604,35 +5398,296 @@ fn encode_expr_for_column_type(expr: &Expr, column_type: &str) -> Result<Vec<u8>
     }
 }
 
-/// Does this plan's projection READ STORAGE, rather than only the values
-/// already bound by the match?
-///
-/// SET and REMOVE consume their inner expand as a stream, so its projection is
-/// interleaved with their writes. That is only sound when the projection cannot
-/// observe those writes. `project_state` touches storage exactly when a RETURN
-/// item contains a pattern comprehension (`graph_eval_expr`); otherwise it
-/// evaluates against `state.bindings`, which were captured before any write.
-///
-/// The planner synthesizes plain `Expr::Var` projections for SET/REMOVE
-/// (`plan_set` / `plan_remove`), so this is false in practice. It exists so
-/// that if that ever changes, the caller drains the projection BEFORE writing
-/// instead of silently letting a comprehension read half-written state.
-fn projection_reads_storage(plan: &PhysicalPlan) -> bool {
-    let return_clause = match plan {
-        PhysicalPlan::Expand { return_clause, .. } => return_clause,
-        // Any other shape is not the plain expand SET/REMOVE plan for; be
-        // conservative and make the caller materialize first.
-        _ => return true,
-    };
-    return_clause
-        .items
-        .iter()
-        .any(|item| expr_has_pattern_comprehension(&item.expr))
+/// Where one matched row's write goes: its physical key, clustering and table,
+/// decoded from the variable's projected binding. `None` when the row binds
+/// nothing writable for this variable (no `_id`).
+struct MatchedTarget<'v> {
+    table_name: &'v str,
+    table_id: TableId,
+    key: DecoratedKey,
+    clustering: Vec<u8>,
 }
 
-/// Execute a SET plan: run the inner expand to find matching vertices, apply the
-/// assignments, and — when the statement carries a trailing RETURN — project the
-/// selected rows with the assignments applied.
+/// Decode the storage target of `col_name` in a matched row. A vertex binding
+/// is a JSON object with `_id` (or a bare hex string from older projections);
+/// an edge binding also carries its physical `__ferrosa_key` /
+/// `__ferrosa_clustering`.
+fn matched_target<'v>(
+    keyspace: &str,
+    schema: Option<&Schema>,
+    variable_tables: &'v HashMap<String, String>,
+    col_name: &'v str,
+    value: Option<&serde_json::Value>,
+) -> Result<Option<MatchedTarget<'v>>> {
+    let hex_id = match value {
+        Some(serde_json::Value::String(s)) => s.as_str(),
+        Some(serde_json::Value::Object(_)) => match object_str(value, "_id") {
+            Some(id) => id,
+            None => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    let table_name = match variable_tables.get(col_name) {
+        Some(table) => table.as_str(),
+        None => col_name,
+    };
+    let is_edge_table = is_edge_table(schema, keyspace, table_name);
+    let key_hex = match object_str(value, "__ferrosa_key") {
+        Some(physical) if is_edge_table => physical,
+        _ => hex_id,
+    };
+    let key_bytes = decode_storage_hex(key_hex, "key")?;
+    let clustering = match object_str(value, "__ferrosa_clustering") {
+        Some(physical) if is_edge_table => decode_storage_hex(physical, "clustering")?,
+        _ => Vec::new(),
+    };
+    Ok(Some(MatchedTarget {
+        table_name,
+        table_id: TableId::new(keyspace, table_name),
+        key: DecoratedKey::new(PartitionKey::new(key_bytes)),
+        clustering,
+    }))
+}
+
+/// A string field of a JSON object binding; `None` for any other shape.
+fn object_str<'a>(value: Option<&'a serde_json::Value>, field: &str) -> Option<&'a str> {
+    let Some(serde_json::Value::Object(map)) = value else {
+        return None;
+    };
+    match map.get(field) {
+        Some(serde_json::Value::String(s)) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+/// Whether `table_name` is a graph edge table (`graph.type = 'edge'`).
+fn is_edge_table(schema: Option<&Schema>, keyspace: &str, table_name: &str) -> bool {
+    let Some(meta) = table_metadata_for(schema, keyspace, table_name) else {
+        return false;
+    };
+    matches!(meta.extensions.get("graph.type"), Some(graph_type) if graph_type == "edge")
+}
+
+/// `hex::FromHexError`'s message, word for word as its `Display` writes it.
+/// Spelled out here so the decode paths extract to Lean without `hex`'s
+/// formatting instance, which the Lean backend cannot synthesize.
+fn hex_error_text(e: &hex::FromHexError) -> String {
+    match e {
+        hex::FromHexError::InvalidHexCharacter { c, index } => {
+            format!("Invalid character {c:?} at position {index}")
+        }
+        hex::FromHexError::OddLength => "Odd number of digits".to_string(),
+        hex::FromHexError::InvalidStringLength => "Invalid string length".to_string(),
+    }
+}
+
+/// Decode a hex storage key or clustering from a binding, failing loud on bad hex.
+fn decode_storage_hex(hex_text: &str, what: &str) -> Result<Vec<u8>> {
+    match hex::decode(hex_text) {
+        Ok(bytes) => Ok(bytes),
+        Err(e) => Err(GraphError::Internal(format!(
+            "invalid hex storage {what}: {}",
+            hex_error_text(&e)
+        ))),
+    }
+}
+
+/// Read the inner expand's WHOLE match set into a spill-backed run before the
+/// caller writes anything, and hand it back for replay.
+///
+/// This is the read-then-write separation SET / REMOVE / DELETE rely on: a
+/// write made while the match is still being pulled could change the rows the
+/// same statement is still reading (the Halloween problem — an index-anchored
+/// `SET n.x = n.x + 1` re-matching the row it just moved). The run spills past
+/// `spill_threshold_bytes`, so a large match set costs disk, not memory.
+async fn spill_match_set<'a>(
+    expand: PhysicalPlan,
+    ctx: ExpandCtx<'a>,
+    label: &str,
+) -> Result<(Vec<String>, RowStream<'static>, QueryStats)> {
+    let (columns, matched, stats) = Box::pin(execute_streaming(
+        expand,
+        ctx.write_path,
+        ctx.keyspace,
+        ctx.config,
+        ctx.virtual_tables,
+        ctx.schema,
+    ))
+    .await?;
+    let run = crate::executor::spill::spill_run(&columns, matched, ctx.config, label).await?;
+    Ok((columns, run, stats))
+}
+
+/// The per-statement inputs of a SET, shared by every matched row.
+struct SetStatement<'a> {
+    write_path: &'a dyn GraphWrite,
+    keyspace: &'a str,
+    assignments: &'a [(String, String, Expr)],
+    variable_tables: &'a HashMap<String, String>,
+    return_clause: Option<&'a ReturnClause>,
+    schema: Option<&'a Schema>,
+    timestamp: i64,
+    strategy: ReplicationStrategy,
+}
+
+/// What one matched row contributed: how many property rows it wrote, and —
+/// with a trailing RETURN — its projected post-SET row and the bindings it was
+/// projected from (for ORDER BY keys that are not projected).
+struct SetRowOutcome {
+    written: usize,
+    returned: Option<(Vec<serde_json::Value>, HashMap<String, serde_json::Value>)>,
+}
+
+/// Encode one variable's evaluated assignments as live cells.
+fn set_cells(
+    statement: &SetStatement<'_>,
+    col_name: &str,
+    table_name: &str,
+    row_assignments: &[(&str, serde_json::Value)],
+) -> Result<Vec<(u16, CellValue)>> {
+    let (keyspace, schema) = (statement.keyspace, statement.schema);
+    let mut cells = Vec::with_capacity(row_assignments.len());
+    for (prop, value) in row_assignments {
+        let Some(column_idx) =
+            regular_column_index_for_property(schema, keyspace, table_name, prop)
+        else {
+            if matches!(
+                column_kind_for_property(schema, keyspace, table_name, prop),
+                Some(
+                    ferrosa_schema::metadata::column::ColumnKind::PartitionKey
+                        | ferrosa_schema::metadata::column::ColumnKind::Clustering
+                )
+            ) {
+                continue;
+            }
+            return Err(GraphError::Validation(format!(
+                "execute_set: SET references unknown property '{}' on table '{}.{}'",
+                prop, keyspace, table_name
+            )));
+        };
+        let Some(value_expr) = json_value_to_expr(value) else {
+            return Err(GraphError::Validation(format!(
+                "execute_set: SET {col_name}.{prop} evaluated to {value}, which is \
+                 not a scalar property value"
+            )));
+        };
+        let bytes =
+            encode_property_value_for_table(schema, keyspace, table_name, prop, &value_expr)?;
+        cells.push((column_idx, CellValue::live(bytes, statement.timestamp)));
+    }
+    Ok(cells)
+}
+
+/// Apply the SET to one row of the (already fully read) match set.
+async fn set_matched_row(
+    statement: &SetStatement<'_>,
+    columns: &[String],
+    row_values: Vec<serde_json::Value>,
+) -> Result<SetRowOutcome> {
+    // The matched row, by column name: every assignment RHS and the trailing
+    // RETURN evaluate against this.
+    let bindings: HashMap<String, serde_json::Value> = columns
+        .iter()
+        .zip(row_values.iter())
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+
+    // Evaluate each assignment once, against the row as the MATCH selected
+    // it, and only for variables this row actually binds. Evaluating the
+    // whole list before writing any cell is what makes `SET n.a = 1,
+    // n.b = n.a` read the old `n.a`.
+    let mut assigned_values: HashMap<&str, Vec<(&str, serde_json::Value)>> = HashMap::new();
+    for (var, property, value_expr) in statement.assignments {
+        if !columns.iter().any(|name| name == var) {
+            continue;
+        }
+        let value = eval::eval_expr(value_expr, &bindings)
+            .map_err(|e| GraphError::Validation(format!("SET {var}.{property}: {e}")))?;
+        assigned_values
+            .entry(var.as_str())
+            .or_default()
+            .push((property.as_str(), value));
+    }
+
+    // The row's post-SET bindings, for the trailing RETURN. Only variables
+    // whose cells were actually written are patched; a SET that resolved no
+    // cell leaves the row exactly as the MATCH projected it.
+    let mut post_set: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut written = 0;
+
+    for (col_idx, col_name) in columns.iter().enumerate() {
+        let Some(row_assignments) = assigned_values.get(col_name.as_str()) else {
+            continue;
+        };
+        let Some(target) = matched_target(
+            statement.keyspace,
+            statement.schema,
+            statement.variable_tables,
+            col_name,
+            row_values.get(col_idx),
+        )?
+        else {
+            continue;
+        };
+        let cells = set_cells(statement, col_name, target.table_name, row_assignments)?;
+        if cells.is_empty() {
+            continue;
+        }
+
+        let update_row = Row {
+            clustering: target.clustering,
+            cells,
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::NONE,
+        };
+
+        // Integration-test scheduling only: suspend after evaluating the
+        // dependent read, without replacing any storage operation.
+        #[cfg(debug_assertions)]
+        crate::engine::before_property_write_for_test().await;
+
+        statement
+            .write_path
+            .write(
+                &target.table_id,
+                &target.key,
+                Arc::new(update_row),
+                statement.timestamp,
+                graph_write_consistency(),
+                &statement.strategy,
+            )
+            .await?;
+        written += 1;
+
+        // Mirror the write into the row's bindings so the trailing RETURN
+        // reports the value the statement just wrote.
+        let mut patched = row_values
+            .get(col_idx)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        if let serde_json::Value::Object(map) = &mut patched {
+            for (prop, value) in row_assignments {
+                map.insert((*prop).to_string(), value.clone());
+            }
+        }
+        post_set.insert(col_name.clone(), patched);
+    }
+
+    let returned = match statement.return_clause {
+        Some(return_clause) => {
+            let mut row_bindings = bindings;
+            row_bindings.extend(post_set);
+            let row = eval_return_items(&return_clause.items, &row_bindings)?;
+            Some((row, row_bindings))
+        }
+        None => None,
+    };
+    Ok(SetRowOutcome { written, returned })
+}
+
+/// Execute a SET plan: read the inner expand's whole match set, apply the
+/// assignments, and — when the statement carries a trailing RETURN — project
+/// the selected rows with the assignments applied.
 ///
 /// Assignment right-hand sides are **evaluated against the matched row**, so
 /// `SET n.age = n.age + 1` reads the row it is updating (a raw, unevaluated
@@ -5640,11 +5695,18 @@ fn projection_reads_storage(plan: &PhysicalPlan) -> bool {
 /// against the row *as the MATCH selected it*, before any property of that row is
 /// written: `SET n.a = 1, n.b = n.a` reads the old `n.a`, matching openCypher.
 ///
+/// # Read, then write
+///
+/// The match set is read COMPLETELY, into a spill-backed run, before the first
+/// property is written (see [`spill_match_set`]), and the writes replay that
+/// run. Neither the match set nor the RETURN rows are held in a `Vec`: both
+/// spill past `spill_threshold_bytes`.
+///
 /// The optional trailing RETURN sees the **post-SET** state (`... SET n.age = 31
 /// RETURN n.age` yields 31) and produces one row per matched row, so a SET that
 /// matches nothing returns nothing. DISTINCT / ORDER BY / LIMIT are applied over
-/// the projected rows. Without a trailing RETURN the statement keeps its
-/// `updated N vertices` status row.
+/// the projected rows, on the merged spill stream. Without a trailing RETURN the
+/// statement keeps its `updated N vertices` status row.
 #[allow(clippy::too_many_arguments)]
 async fn execute_set(
     write_path: &dyn GraphWrite,
@@ -5657,262 +5719,128 @@ async fn execute_set(
     virtual_tables: Option<&VirtualTableRegistry>,
     start: Instant,
     schema: Option<&Schema>,
-) -> Result<GraphResult> {
-    // Execute the inner expand to find matching vertices.
-    // Consume the inner expand as a STREAM: its projected rows are never
-    // collected into a `Vec`, so a SET/REMOVE across a large MATCH no longer
-    // buffers one row per matched vertex. Columns arrive before rows, which is
-    // all the write loop below needs.
-    //
-    // Soundness of interleaving projection with our writes: the projection only
-    // touches storage when it contains a pattern comprehension, and
-    // `projection_reads_storage` makes us drain the stream first in that case,
-    // so a projection can never observe a write this statement is making.
-    use futures::StreamExt as _;
+) -> StreamingPlanResult<'static> {
+    use crate::executor::spill::{OrderSemantics, RowAcc};
+    use futures::TryStreamExt as _;
 
-    let drain_first = projection_reads_storage(&expand);
-    let (columns, rows_stream, expand_stats) = Box::pin(execute_streaming(
-        expand,
+    let ctx = ExpandCtx {
         write_path,
         keyspace,
         config,
         virtual_tables,
         schema,
-    ))
-    .await?;
-    let mut rows_stream = if drain_first {
-        stream_from_rows(crate::executor::stream::collect_rows(rows_stream).await?)
-    } else {
-        rows_stream
+        start,
     };
+    let (columns, matched, expand_stats) = spill_match_set(expand, ctx, "graph_set_match").await?;
     let mut stats = QueryStats {
         vertices_read: expand_stats.vertices_read,
         edges_read: expand_stats.edges_read,
         ..Default::default()
     };
 
-    let timestamp = now_micros();
-    let strategy = graph_replication_strategy(schema, keyspace)?;
-    let mut projected_rows: Vec<Vec<serde_json::Value>> = Vec::new();
+    let statement = SetStatement {
+        write_path,
+        keyspace,
+        assignments,
+        variable_tables,
+        return_clause,
+        schema,
+        timestamp: now_micros(),
+        strategy: graph_replication_strategy(schema, keyspace)?,
+    };
+    // `sort_rows` semantics (projected columns), as the in-memory tail used.
+    let returned = return_clause
+        .map(|rc| {
+            RowAcc::new(
+                &build_columns(rc),
+                rc,
+                config,
+                "graph_set_return",
+                OrderSemantics::ProjectedColumns,
+            )
+        })
+        .transpose()?;
 
-    // For each matched vertex, apply the assignments.
-    // The expand result rows contain vertex IDs (hex-encoded).
-    // We need to reconstruct the partition key from the hex ID.
-    while let Some(row_values) = rows_stream.next().await {
-        let row_values = row_values?;
-
-        // The matched row, by column name: every assignment RHS and the trailing
-        // RETURN evaluate against this.
-        let bindings: HashMap<String, serde_json::Value> = columns
-            .iter()
-            .zip(row_values.iter())
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect();
-
-        // Evaluate each assignment once, against the row as the MATCH selected
-        // it, and only for variables this row actually binds. Evaluating the
-        // whole list before writing any cell is what makes `SET n.a = 1,
-        // n.b = n.a` read the old `n.a`.
-        let mut assigned_values: HashMap<&str, Vec<(&str, serde_json::Value)>> = HashMap::new();
-        for (var, property, value_expr) in assignments {
-            if !columns.iter().any(|name| name == var) {
-                continue;
-            }
-            let value = eval::eval_expr(value_expr, &bindings)
-                .map_err(|e| GraphError::Validation(format!("SET {var}.{property}: {e}")))?;
-            assigned_values
-                .entry(var.as_str())
-                .or_default()
-                .push((property.as_str(), value));
-        }
-
-        // The row's post-SET bindings, for the trailing RETURN. Only variables
-        // whose cells were actually written are patched; a SET that resolved no
-        // cell leaves the row exactly as the MATCH projected it.
-        let mut post_set: HashMap<String, serde_json::Value> = HashMap::new();
-
-        for (col_idx, col_name) in columns.iter().enumerate() {
-            let Some(row_assignments) = assigned_values.get(col_name.as_str()) else {
-                continue;
-            };
-
-            // Get the vertex ID from the row. `RETURN n`/`Expr::Var` produces a
-            // JSON object with `_id`; older/simple projections can still be a
-            // bare hex string.
-            let hex_id = match row_values.get(col_idx) {
-                Some(serde_json::Value::String(s)) => Some(s.as_str()),
-                Some(serde_json::Value::Object(map)) => map.get("_id").and_then(|v| v.as_str()),
-                _ => None,
-            };
-
-            if let Some(hex_id) = hex_id {
-                let table_name = variable_tables
-                    .get(col_name)
-                    .map(String::as_str)
-                    .unwrap_or(col_name);
-                let table_id = TableId::new(keyspace, table_name);
-                let table_meta = table_metadata_for(schema, keyspace, table_name);
-                let is_edge_table = table_meta.as_ref().is_some_and(|meta| {
-                    meta.extensions
-                        .get("graph.type")
-                        .is_some_and(|graph_type| graph_type == "edge")
-                });
-                let key_hex = if is_edge_table {
-                    row_values
-                        .get(col_idx)
-                        .and_then(|value| value.as_object())
-                        .and_then(|map| map.get("__ferrosa_key"))
-                        .and_then(|value| value.as_str())
-                        .unwrap_or(hex_id)
-                } else {
-                    hex_id
-                };
-                let key_bytes = hex::decode(key_hex)
-                    .map_err(|e| GraphError::Internal(format!("invalid hex storage key: {e}")))?;
-                let key = DecoratedKey::new(PartitionKey::new(key_bytes));
-                let clustering = if is_edge_table {
-                    row_values
-                        .get(col_idx)
-                        .and_then(|value| value.as_object())
-                        .and_then(|map| map.get("__ferrosa_clustering"))
-                        .and_then(|value| value.as_str())
-                        .map(hex::decode)
-                        .transpose()
-                        .map_err(|e| {
-                            GraphError::Internal(format!("invalid hex storage clustering: {e}"))
-                        })?
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-
-                let mut cells = Vec::with_capacity(row_assignments.len());
-                for (prop, value) in row_assignments {
-                    let Some(column_idx) =
-                        regular_column_index_for_property(schema, keyspace, table_name, prop)
-                    else {
-                        if matches!(
-                            column_kind_for_property(schema, keyspace, table_name, prop),
-                            Some(
-                                ferrosa_schema::metadata::column::ColumnKind::PartitionKey
-                                    | ferrosa_schema::metadata::column::ColumnKind::Clustering
-                            )
-                        ) {
-                            continue;
-                        }
-                        return Err(GraphError::Validation(format!(
-                            "execute_set: SET references unknown property '{}' on table '{}.{}'",
-                            prop, keyspace, table_name
-                        )));
-                    };
-                    let value_expr = json_value_to_expr(value).ok_or_else(|| {
-                        GraphError::Validation(format!(
-                            "execute_set: SET {col_name}.{prop} evaluated to {value}, which is \
-                             not a scalar property value"
-                        ))
-                    })?;
-                    let bytes = encode_property_value_for_table(
-                        schema,
-                        keyspace,
-                        table_name,
-                        prop,
-                        &value_expr,
-                    )?;
-                    cells.push((column_idx, CellValue::live(bytes, timestamp)));
+    // Replay the run: one write per matched row, its RETURN row (if any)
+    // straight into the spill-backed result accumulator.
+    let (returned, written) = matched
+        .try_fold((returned, 0usize), |(mut returned, written), row_values| {
+            let (statement, columns) = (&statement, &columns);
+            async move {
+                let outcome = set_matched_row(statement, columns, row_values).await?;
+                if let (Some(acc), Some((row, bindings))) = (returned.as_mut(), outcome.returned) {
+                    acc.push(row, &bindings)?;
                 }
-
-                if cells.is_empty() {
-                    continue;
-                }
-
-                let update_row = Row {
-                    clustering,
-                    cells,
-                    deletion: DeletionTime::LIVE,
-                    primary_key_liveness: LivenessInfo::NONE,
-                };
-
-                // Integration-test scheduling only: suspend after evaluating the
-                // dependent read, without replacing any storage operation.
-                #[cfg(debug_assertions)]
-                crate::engine::before_property_write_for_test().await;
-
-                write_path
-                    .write(
-                        &table_id,
-                        &key,
-                        update_row,
-                        timestamp,
-                        graph_write_consistency(),
-                        &strategy,
-                    )
-                    .await?;
-                stats.vertices_written += 1;
-
-                // Mirror the write into the row's bindings so the trailing RETURN
-                // reports the value the statement just wrote.
-                let mut patched = row_values
-                    .get(col_idx)
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                if let serde_json::Value::Object(map) = &mut patched {
-                    for (prop, value) in row_assignments {
-                        map.insert((*prop).to_string(), value.clone());
-                    }
-                }
-                post_set.insert(col_name.clone(), patched);
+                Ok((returned, written + outcome.written))
             }
-        }
-
-        if let Some(return_clause) = return_clause {
-            let mut row_bindings = bindings;
-            for (name, value) in post_set {
-                row_bindings.insert(name, value);
-            }
-            let mut row = Vec::with_capacity(return_clause.items.len());
-            for item in &return_clause.items {
-                row.push(eval::eval_expr(&item.expr, &row_bindings)?);
-            }
-            projected_rows.push(row);
-        }
-    }
-
+        })
+        .await?;
+    stats.vertices_written = written;
     stats.execution_ms = start.elapsed().as_millis() as u64;
 
-    if let Some(return_clause) = return_clause {
-        let columns = build_columns(return_clause);
-        // DISTINCT: dedup whole projected rows, preserving first-seen order.
-        if return_clause.distinct {
-            let mut seen: HashSet<String> = HashSet::new();
-            projected_rows
-                .retain(|row| seen.insert(serde_json::to_string(row).unwrap_or_default()));
-        }
-        sort_rows(&mut projected_rows, &columns, &return_clause.order_by);
-        if let Some(limit) = return_clause.limit {
-            projected_rows.truncate(limit.max(0) as usize);
-        }
-        return Ok(GraphResult {
-            columns,
-            rows: projected_rows,
+    if let (Some(return_clause), Some(returned)) = (return_clause, returned) {
+        return Ok((
+            build_columns(return_clause),
+            returned.into_stream(return_clause)?,
             stats,
-        });
+        ));
     }
 
-    Ok(GraphResult {
+    Ok(produced(GraphResult {
         columns: vec!["status".to_string()],
         rows: vec![vec![serde_json::Value::String(format!(
             "updated {} vertices",
             stats.vertices_written
         ))]],
         stats,
-    })
+    }))
 }
 
-/// Execute a REMOVE plan: run the inner expand to find matching vertices, then
-/// for each `REMOVE n.prop` write a cell-level tombstone so the property is
-/// unset and invisible to subsequent reads (URS-QEC-D06 / T-QEC-D07).
+/// Encode one variable's `REMOVE n.prop` items as cell tombstones.
+fn remove_cells(
+    keyspace: &str,
+    schema: Option<&Schema>,
+    table_name: &str,
+    props: &[&str],
+    timestamp: i64,
+    local_deletion_time: i32,
+) -> Result<Vec<(u16, CellValue)>> {
+    let mut cells = Vec::with_capacity(props.len());
+    for prop in props {
+        let Some(column_idx) =
+            regular_column_index_for_property(schema, keyspace, table_name, prop)
+        else {
+            if matches!(
+                column_kind_for_property(schema, keyspace, table_name, prop),
+                Some(
+                    ferrosa_schema::metadata::column::ColumnKind::PartitionKey
+                        | ferrosa_schema::metadata::column::ColumnKind::Clustering
+                )
+            ) {
+                return Err(GraphError::Validation(format!(
+                    "execute_remove: REMOVE cannot unset key column '{}' on table '{}.{}'",
+                    prop, keyspace, table_name
+                )));
+            }
+            return Err(GraphError::Validation(format!(
+                "execute_remove: REMOVE references unknown property '{}' on table '{}.{}'",
+                prop, keyspace, table_name
+            )));
+        };
+        cells.push((
+            column_idx,
+            CellValue::tombstone(timestamp, local_deletion_time),
+        ));
+    }
+    Ok(cells)
+}
+
+/// Execute a REMOVE plan: read the inner expand's whole match set, then for
+/// each `REMOVE n.prop` write a cell-level tombstone so the property is unset
+/// and invisible to subsequent reads (URS-QEC-D06 / T-QEC-D07).
 ///
-/// Mirrors `execute_set`, but instead of writing a live cell it writes a
+/// Mirrors `execute_set`, including its read-then-write separation over a
+/// spilled match set, but instead of writing a live cell it writes a
 /// `CellValue::tombstone` at the property's column. `REMOVE n:Label` has no
 /// representation in this label-as-table storage model, so it fails loud rather
 /// than silently no-op (URS-QEC-X01).
@@ -5939,32 +5867,16 @@ async fn execute_remove(
         }
     }
 
-    // Consume the inner expand as a STREAM: its projected rows are never
-    // collected into a `Vec`, so a SET/REMOVE across a large MATCH no longer
-    // buffers one row per matched vertex. Columns arrive before rows, which is
-    // all the write loop below needs.
-    //
-    // Soundness of interleaving projection with our writes: the projection only
-    // touches storage when it contains a pattern comprehension, and
-    // `projection_reads_storage` makes us drain the stream first in that case,
-    // so a projection can never observe a write this statement is making.
-    use futures::StreamExt as _;
-
-    let drain_first = projection_reads_storage(&expand);
-    let (columns, rows_stream, expand_stats) = Box::pin(execute_streaming(
-        expand,
+    let ctx = ExpandCtx {
         write_path,
         keyspace,
         config,
         virtual_tables,
         schema,
-    ))
-    .await?;
-    let mut rows_stream = if drain_first {
-        stream_from_rows(crate::executor::stream::collect_rows(rows_stream).await?)
-    } else {
-        rows_stream
+        start,
     };
+    let (columns, mut matched, expand_stats) =
+        spill_match_set(expand, ctx, "graph_remove_match").await?;
     let mut stats = QueryStats {
         vertices_read: expand_stats.vertices_read,
         edges_read: expand_stats.edges_read,
@@ -5975,7 +5887,7 @@ async fn execute_remove(
     let local_deletion_time = timestamp.div_euclid(1_000_000).clamp(0, i32::MAX as i64) as i32;
     let strategy = graph_replication_strategy(schema, keyspace)?;
 
-    while let Some(row_values) = rows_stream.next().await {
+    while let Some(row_values) = matched.next().await {
         let row_values = row_values?;
         for (col_idx, col_name) in columns.iter().enumerate() {
             let matching_props: Vec<&str> = items
@@ -5990,88 +5902,30 @@ async fn execute_remove(
             if matching_props.is_empty() {
                 continue;
             }
-
-            let hex_id = match row_values.get(col_idx) {
-                Some(serde_json::Value::String(s)) => Some(s.as_str()),
-                Some(serde_json::Value::Object(map)) => map.get("_id").and_then(|v| v.as_str()),
-                _ => None,
+            let Some(target) = matched_target(
+                keyspace,
+                schema,
+                variable_tables,
+                col_name,
+                row_values.get(col_idx),
+            )?
+            else {
+                continue;
             };
-            let Some(hex_id) = hex_id else { continue };
-
-            let table_name = variable_tables
-                .get(col_name)
-                .map(String::as_str)
-                .unwrap_or(col_name);
-            let table_id = TableId::new(keyspace, table_name);
-            let table_meta = table_metadata_for(schema, keyspace, table_name);
-            let is_edge_table = table_meta.as_ref().is_some_and(|meta| {
-                meta.extensions
-                    .get("graph.type")
-                    .is_some_and(|graph_type| graph_type == "edge")
-            });
-            let key_hex = if is_edge_table {
-                row_values
-                    .get(col_idx)
-                    .and_then(|value| value.as_object())
-                    .and_then(|map| map.get("__ferrosa_key"))
-                    .and_then(|value| value.as_str())
-                    .unwrap_or(hex_id)
-            } else {
-                hex_id
-            };
-            let key_bytes = hex::decode(key_hex)
-                .map_err(|e| GraphError::Internal(format!("invalid hex storage key: {e}")))?;
-            let key = DecoratedKey::new(PartitionKey::new(key_bytes));
-            let clustering = if is_edge_table {
-                row_values
-                    .get(col_idx)
-                    .and_then(|value| value.as_object())
-                    .and_then(|map| map.get("__ferrosa_clustering"))
-                    .and_then(|value| value.as_str())
-                    .map(hex::decode)
-                    .transpose()
-                    .map_err(|e| {
-                        GraphError::Internal(format!("invalid hex storage clustering: {e}"))
-                    })?
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-
-            let mut cells = Vec::with_capacity(matching_props.len());
-            for prop in &matching_props {
-                let Some(column_idx) =
-                    regular_column_index_for_property(schema, keyspace, table_name, prop)
-                else {
-                    if matches!(
-                        column_kind_for_property(schema, keyspace, table_name, prop),
-                        Some(
-                            ferrosa_schema::metadata::column::ColumnKind::PartitionKey
-                                | ferrosa_schema::metadata::column::ColumnKind::Clustering
-                        )
-                    ) {
-                        return Err(GraphError::Validation(format!(
-                            "execute_remove: REMOVE cannot unset key column '{}' on table '{}.{}'",
-                            prop, keyspace, table_name
-                        )));
-                    }
-                    return Err(GraphError::Validation(format!(
-                        "execute_remove: REMOVE references unknown property '{}' on table '{}.{}'",
-                        prop, keyspace, table_name
-                    )));
-                };
-                cells.push((
-                    column_idx,
-                    CellValue::tombstone(timestamp, local_deletion_time),
-                ));
-            }
-
+            let cells = remove_cells(
+                keyspace,
+                schema,
+                target.table_name,
+                &matching_props,
+                timestamp,
+                local_deletion_time,
+            )?;
             if cells.is_empty() {
                 continue;
             }
 
             let update_row = Row {
-                clustering,
+                clustering: target.clustering,
                 cells,
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::NONE,
@@ -6079,9 +5933,9 @@ async fn execute_remove(
 
             write_path
                 .write(
-                    &table_id,
-                    &key,
-                    update_row,
+                    &target.table_id,
+                    &target.key,
+                    Arc::new(update_row),
                     timestamp,
                     graph_write_consistency(),
                     &strategy,
@@ -6125,13 +5979,10 @@ fn tombstone_mutation(
         keyspace.to_string(),
         table.to_string(),
         key.clone(),
-        vec![row],
+        vec![Arc::new(row)],
         timestamp,
     )
 }
-
-type AdjacencyEntryKey = (Vec<u8>, Vec<u8>);
-type PhysicalEdgeRowKey = (String, Vec<u8>, Vec<u8>);
 
 struct VertexDeleteTarget<'a> {
     table: &'a TableId,
@@ -6139,13 +5990,6 @@ struct VertexDeleteTarget<'a> {
     key: &'a DecoratedKey,
     clustering: &'a [u8],
     logical_key: &'a DecoratedKey,
-}
-
-#[derive(Default)]
-struct IncidentEdgeDeletes {
-    mutations: Vec<Mutation>,
-    index_updates: HashMap<AdjacencyEntryKey, Mutation>,
-    removed_rows: HashSet<PhysicalEdgeRowKey>,
 }
 
 /// Match the declared endpoint and its relationship scope back to one exact
@@ -6195,115 +6039,6 @@ async fn edge_is_incident(
         }
     }
     Ok(false)
-}
-
-/// Stream declared legacy tables, retaining only incident row/index mutations.
-async fn collect_incident_edge_deletes(
-    write_path: &dyn GraphWrite,
-    schema: &Schema,
-    edges: &[ferrosa_schema::metadata::table::TableMetadata],
-    target: &VertexDeleteTarget<'_>,
-    timestamp: i64,
-) -> Result<IncidentEdgeDeletes> {
-    let mut batch = IncidentEdgeDeletes::default();
-    for edge in edges {
-        let table = TableId::new(&edge.keyspace, &edge.name);
-        let mut partitions = write_path.range_read_stream_all(&table, 0).await?;
-        while let Some(partition) = partitions.next().await {
-            let partition = partition?;
-            if is_partition_dead(&partition) {
-                continue;
-            }
-            for row in &partition.rows {
-                if crate::adjacency::schema::row_is_deleted(row)
-                    || !edge_is_incident(write_path, schema, target, edge, &partition, row).await?
-                {
-                    continue;
-                }
-                for entry in
-                    derive_adjacency_row_mutations(schema, &table, &partition.key, row, timestamp)
-                {
-                    let key = (
-                        entry.key.key.as_bytes().to_vec(),
-                        entry.rows[0].clustering.clone(),
-                    );
-                    let deleted = tombstone_mutation(
-                        &entry.keyspace,
-                        &entry.table,
-                        &entry.key,
-                        Some(entry.rows[0].clustering.clone()),
-                        timestamp,
-                    );
-                    batch.index_updates.insert(key, deleted);
-                }
-                batch.removed_rows.insert((
-                    edge.name.clone(),
-                    partition.key.key.as_bytes().to_vec(),
-                    row.clustering.clone(),
-                ));
-                batch.mutations.push(tombstone_mutation(
-                    &edge.keyspace,
-                    &edge.name,
-                    &partition.key,
-                    Some(row.clustering.clone()),
-                    timestamp,
-                ));
-            }
-        }
-    }
-    Ok(batch)
-}
-
-/// Index tuples omit tenant scope. Replace candidate tombstones with live
-/// entries supported by surviving physical rows, outranking observer-derived
-/// tombstones at timestamp+1. Memory stays proportional to the deletion batch.
-async fn protect_shared_index_entries(
-    write_path: &dyn GraphWrite,
-    schema: &Schema,
-    edges: &[ferrosa_schema::metadata::table::TableMetadata],
-    batch: &mut IncidentEdgeDeletes,
-    timestamp: i64,
-) -> Result<()> {
-    if batch.index_updates.is_empty() {
-        return Ok(());
-    }
-    for edge in edges {
-        let table = TableId::new(&edge.keyspace, &edge.name);
-        let mut partitions = write_path.range_read_stream_all(&table, 0).await?;
-        while let Some(partition) = partitions.next().await {
-            let partition = partition?;
-            if is_partition_dead(&partition) {
-                continue;
-            }
-            for row in &partition.rows {
-                if crate::adjacency::schema::row_is_deleted(row)
-                    || batch.removed_rows.contains(&(
-                        edge.name.clone(),
-                        partition.key.key.as_bytes().to_vec(),
-                        row.clustering.clone(),
-                    ))
-                {
-                    continue;
-                }
-                for entry in derive_adjacency_row_mutations(
-                    schema,
-                    &table,
-                    &partition.key,
-                    row,
-                    timestamp.saturating_add(1),
-                ) {
-                    let key = (
-                        entry.key.key.as_bytes().to_vec(),
-                        entry.rows[0].clustering.clone(),
-                    );
-                    if let Some(update) = batch.index_updates.get_mut(&key) {
-                        *update = entry;
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 fn graph_edge_tables(
@@ -6442,6 +6177,10 @@ async fn scoped_vertex_has_incident_edges(
 
 /// Delete exact physical edge/vertex rows in one atomic batch. Neither legacy
 /// edges nor a clustered vertex may be reconstructed from a logical UUID alone.
+///
+/// The batch is staged and committed through
+/// [`GraphWrite::write_staged_batch`], never held as a `Vec<Mutation>`; see
+/// [`detach_delete`] for how it is built in bounded memory.
 #[allow(clippy::too_many_arguments)]
 async fn delete_with_adjacency(
     write_path: &dyn GraphWrite,
@@ -6452,6 +6191,7 @@ async fn delete_with_adjacency(
     timestamp: i64,
     strategy: &ReplicationStrategy,
     schema: Option<&Schema>,
+    config: &GraphEngineConfig,
 ) -> Result<usize> {
     let schema = schema.ok_or_else(|| {
         GraphError::Validation("DETACH DELETE requires vertex and edge schema metadata".into())
@@ -6477,21 +6217,13 @@ async fn delete_with_adjacency(
         logical_key: &logical_key,
     };
     let edges = graph_edge_tables(schema, keyspace);
-    let mut batch =
-        collect_incident_edge_deletes(write_path, schema, &edges, &target, timestamp).await?;
-    protect_shared_index_entries(write_path, schema, &edges, &mut batch, timestamp).await?;
-    let edges_deleted = batch.removed_rows.len();
-    batch.mutations.extend(batch.index_updates.into_values());
-    batch.mutations.push(tombstone_mutation(
-        &vertex_table.keyspace,
-        &vertex_table.table,
-        vertex_key,
-        Some(vertex_clustering.to_vec()),
-        timestamp,
-    ));
+    let staged =
+        detach_delete::stage_detach_delete(write_path, schema, &edges, &target, timestamp, config)
+            .await?;
+    let edges_deleted = staged.edges_deleted;
     write_path
-        .write_batch(
-            batch.mutations,
+        .write_staged_batch(
+            staged.batch,
             graph_write_consistency(),
             strategy.replication_factor(),
         )
@@ -6528,14 +6260,15 @@ async fn vertex_has_incident_edges(
 /// whole `DELETE` deletes nothing. Read-only.
 async fn check_plain_delete_constraint(
     write_path: &dyn GraphWrite,
-    expand_result: &GraphResult,
+    columns: &[String],
+    row_values: &[serde_json::Value],
     keyspace: &str,
     variables: &[String],
     schema: Option<&Schema>,
     variable_tables: &HashMap<String, String>,
 ) -> Result<()> {
-    for row_values in &expand_result.rows {
-        for (col_idx, col_name) in expand_result.columns.iter().enumerate() {
+    {
+        for (col_idx, col_name) in columns.iter().enumerate() {
             if !variables.iter().any(|v| v == col_name) {
                 continue;
             }
@@ -6630,7 +6363,9 @@ async fn execute_delete(
     schema: Option<&Schema>,
     variable_tables: &HashMap<String, String>,
 ) -> Result<GraphResult> {
-    let expand_result = Box::pin(execute(
+    use futures::{StreamExt as _, TryStreamExt as _};
+
+    let (columns, matched, expand_stats) = Box::pin(execute_streaming(
         expand,
         write_path,
         keyspace,
@@ -6639,9 +6374,11 @@ async fn execute_delete(
         schema,
     ))
     .await?;
-    let mut stats = QueryStats::default();
-    stats.vertices_read = expand_result.stats.vertices_read;
-    stats.edges_read = expand_result.stats.edges_read;
+    let mut stats = QueryStats {
+        vertices_read: expand_stats.vertices_read,
+        edges_read: expand_stats.edges_read,
+        ..QueryStats::default()
+    };
 
     let timestamp = now_micros();
     let local_deletion_time = std::time::SystemTime::now()
@@ -6654,21 +6391,36 @@ async fn execute_delete(
     // no-surviving-relationships constraint across ALL matched vertices BEFORE
     // writing any tombstone, so a failure deletes NOTHING even when several
     // vertices match. Probing is read-only.
-    if !detach {
-        check_plain_delete_constraint(
-            write_path,
-            &expand_result,
-            keyspace,
-            variables,
-            schema,
-            variable_tables,
-        )
-        .await?;
-    }
+    //
+    // The whole match set is read — and, for a plain DELETE, every row checked
+    // — before the first tombstone: the check runs as the drain pulls each row,
+    // and the drain completes before the write loop starts. The match set
+    // SPILLS past `spill_threshold_bytes` instead of being held in a `Vec`.
+    let checked: RowStream<'_> = if detach {
+        matched
+    } else {
+        let columns = &columns;
+        Box::pin(matched.and_then(move |row| async move {
+            check_plain_delete_constraint(
+                write_path,
+                columns,
+                &row,
+                keyspace,
+                variables,
+                schema,
+                variable_tables,
+            )
+            .await?;
+            Ok(row)
+        }))
+    };
+    let mut matched =
+        crate::executor::spill::spill_run(&columns, checked, config, "graph_delete_match").await?;
 
     // For each matched vertex in the specified variables, write a tombstone.
-    for row_values in &expand_result.rows {
-        for (col_idx, col_name) in expand_result.columns.iter().enumerate() {
+    while let Some(row_values) = matched.next().await {
+        let row_values = row_values?;
+        for (col_idx, col_name) in columns.iter().enumerate() {
             if !variables.iter().any(|v| v == col_name) {
                 continue;
             }
@@ -6741,6 +6493,7 @@ async fn execute_delete(
                         timestamp,
                         &strategy,
                         schema,
+                        config,
                     )
                     .await?;
                     stats.edges_deleted += edges_deleted;
@@ -6764,7 +6517,7 @@ async fn execute_delete(
                     .write(
                         &table_id,
                         &key,
-                        tombstone_row.clone(),
+                        Arc::new(tombstone_row.clone()),
                         timestamp,
                         graph_write_consistency(),
                         &strategy,
@@ -6774,15 +6527,10 @@ async fn execute_delete(
                     // The edge's OUT and IN adjacency entries go with it, as
                     // MERGE writes them explicitly; otherwise every hop over
                     // the adjacency index still finds the deleted edge.
-                    write_explicit_adjacency_entries(
-                        write_path,
-                        &table_id,
-                        &key,
-                        &tombstone_row,
-                        timestamp,
-                        schema,
-                    )
-                    .await?;
+                    let adjacency =
+                        explicit_adjacency_for(schema, &table_id, &key, &tombstone_row, timestamp);
+                    write_explicit_adjacency_entries(write_path, &table_id, adjacency, schema)
+                        .await?;
                     restore_entries_shared_with_live_edges(
                         write_path,
                         &table_id,
@@ -7006,10 +6754,13 @@ async fn execute_aggregate(
                 )));
             }
 
-            let state = match groups.entry(group_key_str) {
-                std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
+            // A new group keeps its first row for the GroupKey projections. It
+            // starts empty and receives the row by move once the accumulators
+            // below have read it, so the row is never cloned.
+            let (state, new_group) = match groups.entry(group_key_str) {
+                std::collections::btree_map::Entry::Occupied(e) => (e.into_mut(), false),
                 std::collections::btree_map::Entry::Vacant(v) => {
-                    v.insert(new_group_state(row.clone())?)
+                    (v.insert(new_group_state(Vec::new())?), true)
                 }
             };
 
@@ -7026,6 +6777,9 @@ async fn execute_aggregate(
                         acc.accumulate(&value);
                     }
                 }
+            }
+            if new_group {
+                state.first_row = row;
             }
         }
     }
@@ -7518,13 +7272,18 @@ pub(crate) fn extract_neighbor_id_for_direction(
 /// deletion with no surviving cells and no live static row). Such
 /// partitions represent deleted vertices that have not yet been purged
 /// by compaction and must be skipped during graph traversal.
+/// Whether the partition has no static row, or one with no cells.
+fn static_row_is_empty(partition: &ferrosa_sstable::types::Partition) -> bool {
+    match &partition.static_row {
+        Some(static_row) => static_row.cells.is_empty(),
+        None => true,
+    }
+}
+
 fn is_partition_dead(partition: &ferrosa_sstable::types::Partition) -> bool {
     // Partition-level deletion with no surviving rows.
     if !partition.deletion.is_live() && partition.rows.is_empty() {
-        return partition
-            .static_row
-            .as_ref()
-            .is_none_or(|sr| sr.cells.is_empty());
+        return static_row_is_empty(partition);
     }
 
     // If there are no rows at all and no static row, the partition is empty
@@ -7535,20 +7294,14 @@ fn is_partition_dead(partition: &ferrosa_sstable::types::Partition) -> bool {
 
     // Check whether every row is tombstoned: the row has a deletion marker
     // and no surviving cells.
-    let all_rows_dead = partition
-        .rows
-        .iter()
-        .all(|row| !row.deletion.is_live() && row.cells.is_empty());
-
-    if !all_rows_dead {
-        return false;
+    for row in &partition.rows {
+        if row.deletion.is_live() || !row.cells.is_empty() {
+            return false;
+        }
     }
 
     // If all rows are dead, also check the static row.
-    partition
-        .static_row
-        .as_ref()
-        .is_none_or(|sr| sr.cells.is_empty())
+    static_row_is_empty(partition)
 }
 
 /// Check whether the query has exceeded its timeout.
@@ -7646,15 +7399,13 @@ mod tests {
     fn adjacency_hop_does_not_collect_a_partition_sized_neighbor_vector() {
         let src = include_str!("expand.rs");
         let body = src
-            .split("async fn expand_to_states")
+            .split("async fn expand_state_across_hop")
             .nth(1)
-            .expect("expand_to_states must exist");
-        let body = &body[..body
-            .find("// Apply WHERE predicates")
-            .expect("the hop body must end before post-filters")];
+            .expect("the per-state hop expansion must exist");
+        let body = &body[..body.find("\n}\n").expect("the hop body must end")];
 
         assert!(
-            body.contains("write_path.read(&adj_table_id, vertex_key)"),
+            body.contains("write_path.read(adj_table_id, vertex_key)"),
             "an anchored vertex must read its adjacency partition by key"
         );
         assert!(
@@ -7947,7 +7698,7 @@ mod tests {
             ] {
                 let proj = projection_ctx(&wp, clause, false);
                 let result = match order_states_stream(
-                    &[projection_state("Alice"), projection_state("Bob")],
+                    vec![projection_state("Alice"), projection_state("Bob")],
                     &proj,
                     &config,
                     Instant::now(),
@@ -8058,8 +7809,8 @@ mod tests {
             .nth(1)
             .expect("execute_streaming_inner must exist");
         let dispatch = &dispatch[..dispatch
-            .find("// --- everything else")
-            .expect("the buffered fallback arm must exist")];
+            .find("// --- write and blocking operators")
+            .expect("the write/blocking operator arms must exist")];
         assert!(dispatch.contains("PhysicalPlan::ExpandVarLength"));
         assert!(
             dispatch.contains("execute_var_length_streaming"),
@@ -8137,7 +7888,14 @@ mod tests {
             let reserver = TempDirReserver::new(spill_dir.path());
             let config = spilling_config(reserver.clone(), GraphEngineConfig::default());
             let proj = projection_ctx(&wp, return_clause.clone(), false);
-            let sorted = order_states_stream(&states, &proj, &config, Instant::now(), "t")
+            let copies: Vec<ExpandState> = states
+                .iter()
+                .map(|s| ExpandState {
+                    current_key: s.current_key.clone(),
+                    bindings: s.bindings.clone(),
+                })
+                .collect();
+            let sorted = order_states_stream(copies, &proj, &config, Instant::now(), "t")
                 .await
                 .unwrap();
             assert!(
@@ -8147,38 +7905,6 @@ mod tests {
             let spilled = crate::executor::stream::collect_rows(sorted).await.unwrap();
             assert_eq!(spilled, reference, "{direction:?}");
         }
-    }
-
-    /// DISTINCT must not discard the ORDER BY the query asked for.
-    ///
-    /// The buffered tail sorted by debug representation and then `dedup()`ed,
-    /// because `Vec::dedup` only removes consecutive duplicates. That sort ran
-    /// AFTER the ORDER BY sort, so `RETURN DISTINCT x ORDER BY x DESC` came
-    /// back in debug-string ascending order — the requested order silently
-    /// replaced, with no error and nothing in the result to show it.
-    #[test]
-    fn distinct_dedups_without_reordering() {
-        use serde_json::json;
-
-        // Already in the order an `ORDER BY n DESC` would have produced, with
-        // duplicates that are not adjacent.
-        let mut rows: Vec<super::super::stream::RowVals> = vec![
-            vec![json!(30)],
-            vec![json!(20)],
-            vec![json!(30)],
-            vec![json!(10)],
-            vec![json!(20)],
-        ];
-
-        super::dedup_preserving_order(&mut rows);
-
-        let got: Vec<i64> = rows.iter().map(|r| r[0].as_i64().unwrap()).collect();
-        assert_eq!(
-            got,
-            vec![30, 20, 10],
-            "duplicates must go and the descending order must stay; sorting to \
-             make duplicates adjacent throws away the ORDER BY"
-        );
     }
 
     /// `WcoJoin` must reach the transport as a stream, not as a collected Vec.
@@ -8200,8 +7926,8 @@ mod tests {
             .nth(1)
             .expect("execute_streaming_inner must exist");
         let dispatch = &dispatch[..dispatch
-            .find("// --- everything else")
-            .expect("the buffered fallback arm must exist")];
+            .find("// --- write and blocking operators")
+            .expect("the write/blocking operator arms must exist")];
 
         assert!(
             dispatch.contains("PhysicalPlan::WcoJoin"),
@@ -8812,8 +8538,15 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn execute_merge_writes_adjacency_rows_without_registered_observer() {
+    /// A merged `(a:Entity)-[r:TYPED_EDGE]->(b:Entity)` on agent_memory, written
+    /// through a direct write path with no adjacency observer registered.
+    async fn merged_typed_edge_fixture() -> (
+        tempfile::TempDir,
+        Arc<ferrosa_schema::Schema>,
+        ferrosa_cluster::write_path::WritePath,
+        uuid::Uuid,
+        uuid::Uuid,
+    ) {
         let tmp = tempfile::tempdir().unwrap();
         let storage = test_storage_engine(tmp.path());
         let schema = Arc::new(
@@ -8912,7 +8645,7 @@ mod tests {
             .write(
                 &entity_tid,
                 &DecoratedKey::new(PartitionKey::new(partition_key.clone())),
-                src_row,
+                Arc::new(src_row),
                 1000,
             )
             .unwrap();
@@ -8920,7 +8653,7 @@ mod tests {
             .write(
                 &entity_tid,
                 &DecoratedKey::new(PartitionKey::new(partition_key)),
-                dst_row,
+                Arc::new(dst_row),
                 1000,
             )
             .unwrap();
@@ -9005,6 +8738,81 @@ mod tests {
         .await
         .unwrap();
 
+        (tmp, schema, write_path, src_id, dst_id)
+    }
+
+    /// CREATE/MERGE/DELETE derive an edge's adjacency entries from the row they
+    /// write. They used to copy that row twice to do it: `row.clone()` into the
+    /// base write so the row survived for the derive, and `vec![row.clone()]`
+    /// inside the helper to build a Mutation it only read. Deriving from the
+    /// borrowed row must produce exactly what the Mutation-based derive does,
+    /// so the caller can derive first and move the row into its write.
+    #[tokio::test]
+    async fn adjacency_derived_from_a_borrowed_row_matches_the_mutation_derive() {
+        let (_tmp, schema, write_path, src_id, dst_id) = merged_typed_edge_fixture().await;
+        let edge_tid = TableId::new("agent_memory", "typed_edges");
+        // typed_edges is partitioned by (tenant_id, session_id), as the fixture writes it.
+        let edge_key = DecoratedKey::new(PartitionKey::new(encode_partition_components(&[
+            uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001")
+                .unwrap()
+                .as_bytes()
+                .to_vec(),
+            uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111")
+                .unwrap()
+                .as_bytes()
+                .to_vec(),
+        ])));
+        let edge = write_path
+            .read(&edge_tid, &edge_key)
+            .await
+            .unwrap()
+            .expect("the merged edge partition");
+        let row = edge.rows.first().expect("the merged edge row");
+
+        let borrowed = explicit_adjacency_for(Some(&schema), &edge_tid, &edge.key, row, 7);
+        let via_mutation = derive_adjacency_mutations(
+            &schema,
+            &edge_tid,
+            &Mutation::new(
+                "agent_memory".into(),
+                "typed_edges".into(),
+                edge.key.clone(),
+                vec![row.clone()],
+                7,
+            ),
+        );
+
+        let shape = |ms: &[Mutation]| {
+            ms.iter()
+                .map(|m| {
+                    (
+                        m.keyspace.clone(),
+                        m.table.clone(),
+                        m.key.clone(),
+                        m.rows.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&borrowed), shape(&via_mutation));
+        let keys: Vec<Vec<u8>> = borrowed
+            .iter()
+            .map(|m| m.key.key.as_bytes().to_vec())
+            .collect();
+        assert!(
+            keys.contains(&src_id.as_bytes().to_vec())
+                && keys.contains(&dst_id.as_bytes().to_vec()),
+            "an edge derives an OUT entry on its source and an IN entry on its target: {keys:?}"
+        );
+        assert!(
+            explicit_adjacency_for(None, &edge_tid, &edge.key, row, 7).is_empty(),
+            "no schema, no adjacency"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_merge_writes_adjacency_rows_without_registered_observer() {
+        let (_tmp, _schema, write_path, src_id, dst_id) = merged_typed_edge_fixture().await;
         let adj_tid = TableId::new(adjacency_keyspace_name("agent_memory"), "adjacency");
         let src_adj = write_path
             .read(
@@ -9789,6 +9597,23 @@ mod tests {
     }
 
     #[test]
+    fn hex_error_text_matches_hex_display_for_every_variant() {
+        let errors = [
+            hex::FromHexError::InvalidHexCharacter { c: 'g', index: 3 },
+            hex::FromHexError::OddLength,
+            hex::FromHexError::InvalidStringLength,
+        ];
+        for error in errors {
+            assert_eq!(hex_error_text(&error), error.to_string());
+        }
+        // And the decode path really reports it.
+        let Err(GraphError::Internal(msg)) = decode_storage_hex("abc", "key") else {
+            panic!("odd-length hex must fail loud");
+        };
+        assert_eq!(msg, "invalid hex storage key: Odd number of digits");
+    }
+
+    #[test]
     fn compare_json_values_nulls_sort_first() {
         let result = compare_json_values(
             Some(&serde_json::Value::Null),
@@ -9828,11 +9653,10 @@ mod tests {
             order_by: Vec::new(),
             limit: Some(2),
         };
-        let res = execute_unwind(&list, "x", None, &limited, Instant::now())
-            .await
-            .expect("unwind with limit");
+        let (_columns, rows, _stats) =
+            execute_unwind(&list, "x", None, limited, Instant::now()).expect("unwind with limit");
         assert_eq!(
-            res.rows,
+            crate::executor::stream::collect_rows(rows).await.unwrap(),
             vec![vec![serde_json::json!(10)], vec![serde_json::json!(20)]],
             "LIMIT 2 must yield the first two list elements, in order"
         );
@@ -9843,10 +9667,16 @@ mod tests {
             order_by: Vec::new(),
             limit: None,
         };
-        let res = execute_unwind(&list, "x", None, &unlimited, Instant::now())
-            .await
+        let (_columns, rows, _stats) = execute_unwind(&list, "x", None, unlimited, Instant::now())
             .expect("unwind without limit");
-        assert_eq!(res.rows.len(), 5, "no LIMIT must yield every element");
+        assert_eq!(
+            crate::executor::stream::collect_rows(rows)
+                .await
+                .unwrap()
+                .len(),
+            5,
+            "no LIMIT must yield every element"
+        );
     }
 
     #[test]
@@ -10526,6 +10356,54 @@ mod tests {
         }))
     }
 
+    /// `UNION` (without ALL) must reach the consumer row by row: the client
+    /// sees arm 1's row before arm 2 is ever projected. The second arm's
+    /// projection fails, so a path that drains the union before returning
+    /// (the old `collect_rows` + `retain`) fails at SETUP and the consumer
+    /// never sees a row; a streamed union yields row 1 and then the error.
+    #[tokio::test]
+    async fn union_distinct_yields_first_row_before_later_arms_are_produced() {
+        use crate::parser::{Expr, ReturnClause, ReturnItem};
+        use futures::StreamExt as _;
+
+        let (_tmp, wp) = streaming_test_write_path();
+        let failing_arm = PhysicalPlan::ReturnOnly {
+            return_clause: ReturnClause {
+                distinct: false,
+                items: vec![ReturnItem {
+                    expr: Expr::Function {
+                        name: "bogus".to_string(),
+                        args: vec![],
+                    },
+                    alias: Some("a".to_string()),
+                }],
+                order_by: vec![],
+                limit: None,
+            },
+        };
+        let plan = PhysicalPlan::Union {
+            arms: vec![
+                return_one_plan(&[("a", 1)], None),
+                return_one_plan(&[("a", 1)], None),
+                failing_arm,
+            ],
+            all: false,
+        };
+        let config = GraphEngineConfig::default();
+        let (_columns, mut rows, _stats) =
+            match execute_streaming(plan, &wp, "social", &config, None, None).await {
+                Ok(started) => started,
+                Err(e) => panic!("UNION must hand back a stream before producing arm 3: {e}"),
+            };
+        assert_eq!(
+            rows.next().await.unwrap().unwrap(),
+            vec![serde_json::json!(1)]
+        );
+        // The duplicate from arm 2 is dropped, so the next item is arm 3's
+        // failure — surfaced, never swallowed.
+        assert!(matches!(rows.next().await, Some(Err(_))));
+    }
+
     // --- converted: ReturnOnly -------------------------------------------
 
     #[tokio::test]
@@ -10779,60 +10657,6 @@ mod tests {
                 vec![serde_json::json!(2)]
             ]
         );
-    }
-
-    // ---------------------------------------------------------------------
-    // SET / REMOVE stream their INNER EXPAND (their own output is one summary
-    // row, only knowable after the last write). `projection_reads_storage` is
-    // the guard that makes interleaving the inner projection with those writes
-    // sound.
-    // ---------------------------------------------------------------------
-
-    #[test]
-    fn projection_reads_storage_is_false_for_the_planner_shape_set_and_remove_use() {
-        // `plan_set` / `plan_remove` synthesize plain `Expr::Var` projections.
-        use crate::parser::{Expr, ReturnClause, ReturnItem};
-        let plan = PhysicalPlan::Expand {
-            anchor: Anchor {
-                var: Some("n".to_string()),
-                table: crate::planner::logical::ResolvedTable {
-                    keyspace: "social".to_string(),
-                    table: "person".to_string(),
-                    graph_type: "vertex".to_string(),
-                    label: "Person".to_string(),
-                },
-                props: vec![],
-                filters: vec![],
-            },
-            hops: vec![],
-            optional_hops: vec![],
-            post_filters: vec![],
-            with_pipeline: None,
-            return_clause: ReturnClause {
-                distinct: false,
-                items: vec![ReturnItem {
-                    expr: Expr::Var("n".to_string()),
-                    alias: None,
-                }],
-                order_by: vec![],
-                limit: None,
-            },
-        };
-        assert!(
-            !projection_reads_storage(&plan),
-            "a plain Expr::Var projection reads only the bindings, so SET/REMOVE may \
-             stream the inner expand and interleave their writes with it"
-        );
-    }
-
-    #[test]
-    fn projection_reads_storage_is_true_for_a_non_expand_inner_plan() {
-        // Anything that is not the plain expand SET/REMOVE plan for must be
-        // materialized before writing — conservative by construction.
-        assert!(projection_reads_storage(&return_one_plan(
-            &[("a", 1)],
-            None
-        )));
     }
 
     // ---------------------------------------------------------------------
@@ -11162,6 +10986,336 @@ mod tests {
         assert!(
             !is_transient_replica_lag(&unavailable),
             "unavailability is final for this retry"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // DETACH DELETE as one spilled, atomic batch (p0-oom-audit
+    // stream-push-accumulation at collect_incident_edge_deletes)
+    // ---------------------------------------------------------------------
+
+    const DETACH_TENANT: u128 = 0x0000_0000_0000_0000_0000_0000_0000_0001;
+    const DETACH_SESSION: u128 = 0x1111_1111_1111_1111_1111_1111_1111_1111;
+
+    fn detach_scope_key() -> DecoratedKey {
+        DecoratedKey::new(PartitionKey::new(encode_partition_components(&[
+            uuid::Uuid::from_u128(DETACH_TENANT).as_bytes().to_vec(),
+            uuid::Uuid::from_u128(DETACH_SESSION).as_bytes().to_vec(),
+        ])))
+    }
+
+    /// One more `src -[TYPED_EDGE {edge_type}]-> dst`, through the real MERGE
+    /// path so its adjacency entries are derived exactly as production does.
+    async fn merge_typed_edge(
+        write_path: &WritePath,
+        schema: &ferrosa_schema::Schema,
+        src: uuid::Uuid,
+        dst: uuid::Uuid,
+        edge_type: &str,
+    ) {
+        let entity = |var: &str, id: uuid::Uuid| MergeOp {
+            var: Some(var.to_string()),
+            table: crate::planner::logical::ResolvedTable {
+                keyspace: "agent_memory".to_string(),
+                table: "entity_store".to_string(),
+                label: "Entity".to_string(),
+                graph_type: "vertex".to_string(),
+            },
+            match_props: vec![(
+                "entity_id".to_string(),
+                Expr::Literal(Literal::String(id.to_string())),
+            )],
+            create_props: vec![],
+            src_match_props: None,
+            src_var: None,
+            dst_match_props: None,
+            dst_var: None,
+        };
+        let merges = vec![
+            entity("a", src),
+            entity("b", dst),
+            MergeOp {
+                var: Some("r".to_string()),
+                table: crate::planner::logical::ResolvedTable {
+                    keyspace: "agent_memory".to_string(),
+                    table: "typed_edges".to_string(),
+                    label: "TYPED_EDGE".to_string(),
+                    graph_type: "edge".to_string(),
+                },
+                match_props: vec![(
+                    "edge_type".to_string(),
+                    Expr::Literal(Literal::String(edge_type.to_string())),
+                )],
+                create_props: vec![],
+                src_match_props: Some(vec![(
+                    "entity_id".to_string(),
+                    Expr::Literal(Literal::String(src.to_string())),
+                )]),
+                src_var: Some("a".to_string()),
+                dst_match_props: Some(vec![(
+                    "entity_id".to_string(),
+                    Expr::Literal(Literal::String(dst.to_string())),
+                )]),
+                dst_var: Some("b".to_string()),
+            },
+        ];
+        execute_merge(
+            write_path,
+            &merges,
+            &[],
+            None,
+            &GraphEngineConfig::default(),
+            Instant::now(),
+            Some(schema),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// The fixture's one edge plus `extra` parallel edges src -> dst: every one
+    /// derives the same two adjacency entries, so the protect pass has real
+    /// candidates to decide.
+    async fn detach_fixture(
+        extra: usize,
+    ) -> (
+        tempfile::TempDir,
+        Arc<ferrosa_schema::Schema>,
+        WritePath,
+        uuid::Uuid,
+        uuid::Uuid,
+    ) {
+        let (tmp, schema, write_path, src, dst) = merged_typed_edge_fixture().await;
+        for i in 0..extra {
+            merge_typed_edge(&write_path, &schema, src, dst, &format!("kind-{i:03}")).await;
+        }
+        (tmp, schema, write_path, src, dst)
+    }
+
+    /// DETACH DELETE `src` with `config`; returns the deleted-edge count.
+    async fn detach_src(
+        write_path: &dyn GraphWrite,
+        schema: &ferrosa_schema::Schema,
+        src: uuid::Uuid,
+        config: &GraphEngineConfig,
+    ) -> Result<usize> {
+        let entity = TableId::new("agent_memory", "entity_store");
+        let strategy = graph_replication_strategy(Some(schema), "agent_memory").unwrap();
+        delete_with_adjacency(
+            write_path,
+            "agent_memory",
+            &detach_scope_key(),
+            &encode_clustering_components(&[src.as_bytes().to_vec()]),
+            &entity,
+            2_000_000_000_000_000,
+            &strategy,
+            Some(schema),
+            config,
+        )
+        .await
+    }
+
+    /// Every row the delete can touch, as (table, partition, clustering, live).
+    async fn detach_snapshot(
+        write_path: &dyn GraphWrite,
+        src: uuid::Uuid,
+        dst: uuid::Uuid,
+    ) -> Vec<(String, Vec<u8>, Vec<u8>, bool)> {
+        let adjacency = TableId::new(adjacency_keyspace_name("agent_memory"), "adjacency");
+        let reads = [
+            (
+                TableId::new("agent_memory", "entity_store"),
+                detach_scope_key(),
+            ),
+            (
+                TableId::new("agent_memory", "typed_edges"),
+                detach_scope_key(),
+            ),
+            (
+                adjacency.clone(),
+                DecoratedKey::new(PartitionKey::new(src.as_bytes().to_vec())),
+            ),
+            (
+                adjacency,
+                DecoratedKey::new(PartitionKey::new(dst.as_bytes().to_vec())),
+            ),
+        ];
+        let mut out = Vec::new();
+        for (table, key) in reads {
+            let Some(partition) = write_path.read(&table, &key).await.unwrap() else {
+                continue;
+            };
+            for row in &partition.rows {
+                out.push((
+                    table.to_string(),
+                    key.key.as_bytes().to_vec(),
+                    row.clustering.clone(),
+                    !is_partition_dead(&partition)
+                        && !crate::adjacency::schema::row_is_deleted(row),
+                ));
+            }
+        }
+        out
+    }
+
+    /// RED for the stream-push-accumulation finding: a DETACH DELETE whose
+    /// vertex degree exceeds the spill threshold stages its batch on disk,
+    /// commits it as ONE batch, and ends in exactly the state the resident
+    /// build produces.
+    #[tokio::test]
+    async fn a_detach_delete_past_the_spill_threshold_spills_and_matches_the_resident_build() {
+        use crate::executor::spill::test_support::{spilling_config, TempDirReserver};
+        const EXTRA: usize = 24;
+
+        let (_tmp, schema, write_path, src, dst) = detach_fixture(EXTRA).await;
+        let spill_dir = tempfile::tempdir().unwrap();
+        let reserver = TempDirReserver::new(spill_dir.path());
+        let spilling = spilling_config(Arc::clone(&reserver), GraphEngineConfig::default());
+        let spilled_before = detach_delete::detach_delete_spilled_batches();
+        let deleted = detach_src(&write_path, &schema, src, &spilling)
+            .await
+            .unwrap();
+        assert_eq!(deleted, EXTRA + 1, "every parallel edge is deleted");
+        assert!(
+            detach_delete::detach_delete_spilled_batches() > spilled_before,
+            "a batch past the spill threshold must be staged on disk"
+        );
+        assert!(
+            !reserver.reserved_paths().is_empty(),
+            "the spill backend was used"
+        );
+        let spilled = detach_snapshot(&write_path, src, dst).await;
+
+        let (_tmp2, schema2, write_path2, src2, dst2) = detach_fixture(EXTRA).await;
+        assert_eq!((src2, dst2), (src, dst), "the fixture ids are fixed");
+        let resident = detach_src(&write_path2, &schema2, src, &GraphEngineConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(resident, deleted);
+        assert_eq!(
+            spilled,
+            detach_snapshot(&write_path2, src, dst).await,
+            "spilling must change memory, not the result"
+        );
+        assert!(
+            spilled.iter().all(|(table, _, clustering, live)| {
+                !*live
+                    || (table.ends_with("entity_store")
+                        && *clustering != encode_clustering_components(&[src.as_bytes().to_vec()]))
+            }),
+            "only the other vertex survives: {spilled:?}"
+        );
+    }
+
+    /// Delegates reads to a real `WritePath`; every write fails the test except
+    /// the one staged commit, which fails like a storage error would.
+    struct RefusingCommit {
+        inner: WritePath,
+    }
+
+    #[async_trait::async_trait]
+    impl GraphWrite for RefusingCommit {
+        async fn read(
+            &self,
+            table_id: &TableId,
+            key: &DecoratedKey,
+        ) -> ferrosa_common::Result<Option<ferrosa_sstable::types::Partition>> {
+            GraphWrite::read(&self.inner, table_id, key).await
+        }
+        async fn pk_read(
+            &self,
+            table_id: &TableId,
+            key: &DecoratedKey,
+            cl: ConsistencyLevel,
+            strategy: &ReplicationStrategy,
+        ) -> ferrosa_common::Result<Option<ferrosa_sstable::types::Partition>> {
+            GraphWrite::pk_read(&self.inner, table_id, key, cl, strategy).await
+        }
+        async fn range_read_stream_all(
+            &self,
+            table_id: &TableId,
+            row_limit: usize,
+        ) -> ferrosa_cluster::error::Result<PartitionResultStream> {
+            GraphWrite::range_read_stream_all(&self.inner, table_id, row_limit).await
+        }
+        async fn count_range_with(
+            &self,
+            table_id: &TableId,
+            cl: ConsistencyLevel,
+            strategy: &ReplicationStrategy,
+        ) -> ferrosa_cluster::error::Result<u64> {
+            GraphWrite::count_range_with(&self.inner, table_id, cl, strategy).await
+        }
+        fn declares_index_locally(&self, table_id: &TableId, index_name: &str) -> bool {
+            GraphWrite::declares_index_locally(&self.inner, table_id, index_name)
+        }
+        fn index_is_current(&self, table_id: &TableId, index_name: &str) -> bool {
+            GraphWrite::index_is_current(&self.inner, table_id, index_name)
+        }
+        async fn index_read_stream(
+            &self,
+            table_id: &TableId,
+            index_name: &str,
+            index_key: &ferrosa_index::IndexKey,
+            after: Option<&ferrosa_index::RowPosition>,
+        ) -> ferrosa_cluster::error::Result<PartitionResultStream> {
+            GraphWrite::index_read_stream(&self.inner, table_id, index_name, index_key, after).await
+        }
+        async fn write(
+            &self,
+            _table_id: &TableId,
+            _key: &DecoratedKey,
+            _row: Arc<Row>,
+            _timestamp: i64,
+            _cl: ConsistencyLevel,
+            _strategy: &ReplicationStrategy,
+        ) -> ferrosa_common::Result<()> {
+            panic!("DETACH DELETE must write only through its one staged batch");
+        }
+        async fn write_batch(
+            &self,
+            _mutations: Vec<Mutation>,
+            _cl: ConsistencyLevel,
+            _rf: usize,
+        ) -> ferrosa_common::Result<()> {
+            panic!("DETACH DELETE must not build a resident batch");
+        }
+        async fn write_staged_batch(
+            &self,
+            _batch: ferrosa_storage::write_set_stage::StagedWriteSet,
+            _cl: ConsistencyLevel,
+            _rf: usize,
+        ) -> ferrosa_common::Result<()> {
+            Err(ferrosa_common::Error::InvalidData(
+                "injected commit failure".to_string(),
+            ))
+        }
+    }
+
+    /// A DETACH DELETE whose commit fails leaves nothing applied: it writes
+    /// nothing before its one atomic commit.
+    #[tokio::test]
+    async fn a_failed_detach_delete_commit_leaves_nothing_applied() {
+        use crate::executor::spill::test_support::{spilling_config, TempDirReserver};
+        let (_tmp, schema, write_path, src, dst) = detach_fixture(8).await;
+        let before = detach_snapshot(&write_path, src, dst).await;
+        assert!(
+            before.iter().filter(|(_, _, _, live)| *live).count() > 4,
+            "positive control: edges, entries and vertices are live: {before:?}"
+        );
+        let spill_dir = tempfile::tempdir().unwrap();
+        let spilling = spilling_config(
+            TempDirReserver::new(spill_dir.path()),
+            GraphEngineConfig::default(),
+        );
+        let refusing = RefusingCommit { inner: write_path };
+        let err = detach_src(&refusing, &schema, src, &spilling)
+            .await
+            .expect_err("the injected commit failure surfaces");
+        assert!(err.to_string().contains("injected commit failure"), "{err}");
+        assert_eq!(
+            detach_snapshot(&refusing.inner, src, dst).await,
+            before,
+            "a failed commit must leave every row as it was"
         );
     }
 }

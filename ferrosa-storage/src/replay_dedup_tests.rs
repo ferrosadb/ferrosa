@@ -15,6 +15,7 @@
 //! id each.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use ferrosa_common::cell::CellValue;
 use ferrosa_common::key::{DecoratedKey, PartitionKey};
@@ -68,7 +69,7 @@ fn mutation(pk: &str, value: &[u8], ts: i64, mutation_id: [u8; 16]) -> Mutation 
         keyspace: KEYSPACE.to_string(),
         table: TABLE.to_string(),
         key: key(pk),
-        rows: vec![row(value, ts)],
+        rows: vec![Arc::new(row(value, ts))],
         timestamp: ts,
     }
 }

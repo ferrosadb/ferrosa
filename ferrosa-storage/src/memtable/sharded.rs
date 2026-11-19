@@ -174,7 +174,7 @@ impl ShardedBTreeMemtable {
 }
 
 impl Memtable for ShardedBTreeMemtable {
-    fn put(&self, key: &DecoratedKey, row: Row, schema: &TableSchema) -> Result<()> {
+    fn put(&self, key: &DecoratedKey, row: Arc<Row>, schema: &TableSchema) -> Result<()> {
         // Fail-loud guard: reject mis-sized cells before they reach the
         // memtable. Without this check the `now()`-into-TimeUUID bug
         // would land an 8-byte cell in a 16-byte column, wedging every
@@ -401,7 +401,11 @@ pub(crate) fn estimate_partition_size(partition: &Partition) -> usize {
     std::mem::size_of::<Partition>()
         + partition.key.key.as_bytes().len()
         + partition.static_row.as_ref().map_or(0, estimate_row_size)
-        + partition.rows.iter().map(estimate_row_size).sum::<usize>()
+        + partition
+            .rows
+            .iter()
+            .map(|row| estimate_row_size(row))
+            .sum::<usize>()
 }
 
 /// Estimate the in-memory size of one row in bytes.
@@ -441,9 +445,14 @@ fn static_row_size(partition: &Partition) -> isize {
 /// static row and the one clustered row the merge touched, so a write costs
 /// the same whatever the partition's size (t_32b6670b; T-F4-3 in
 /// `tests/memtable_write_cost_scale.rs`).
+///
+/// The incoming row is shared, not copied: a row for a clustering key the
+/// partition does not hold yet is stored as the writer's own `Arc`. Only a
+/// merge into an existing row (or the static row) mutates, and then a row still
+/// shared elsewhere is copied on write.
 pub(crate) fn merge_row_into_partition(
     partition: &mut Partition,
-    new_row: Row,
+    new_row: Arc<Row>,
     schema: &TableSchema,
 ) -> Result<isize> {
     // A partition-tombstone marker is a partition-level DELETE: merge it into
@@ -464,6 +473,7 @@ pub(crate) fn merge_row_into_partition(
     // the partition's static row: merge it into `Partition::static_row` with
     // the same cell-level rules as a clustered row, never into `rows`.
     if super::is_static_row_marker(&new_row, schema) {
+        let new_row = Arc::unwrap_or_clone(new_row);
         match partition.static_row.as_mut() {
             Some(existing) => merge_into_existing_row(existing, new_row, schema)?,
             None => partition.static_row = Some(new_row),
@@ -486,9 +496,12 @@ pub(crate) fn merge_row_into_partition(
     let row_delta = match pos {
         // Row with same clustering key exists — merge cells
         Ok(idx) => {
-            let existing = &mut partition.rows[idx];
+            // A genuine mutation: copy-on-write only if a reader still holds
+            // this row, and take the incoming row's cells by move unless the
+            // writer still shares it.
+            let existing = Arc::make_mut(&mut partition.rows[idx]);
             let before = estimate_row_size(existing) as isize;
-            merge_into_existing_row(existing, new_row, schema)?;
+            merge_into_existing_row(existing, Arc::unwrap_or_clone(new_row), schema)?;
             estimate_row_size(existing) as isize - before
         }
         Err(idx) => {
@@ -507,17 +520,23 @@ pub(crate) fn merge_row_into_partition(
 /// regular cells. Without clustering columns a partition has one row and no
 /// separate static row (Cassandra refuses statics there); the flush still
 /// moves such cells into the SSTable static row, and readers overlay it.
-fn lift_static_cells(partition: &mut Partition, mut row: Row, schema: &TableSchema) -> Result<Row> {
+fn lift_static_cells(
+    partition: &mut Partition,
+    mut shared: Arc<Row>,
+    schema: &TableSchema,
+) -> Result<Arc<Row>> {
     let static_count = schema.static_columns.len();
     if static_count == 0
         || schema.clustering_columns.is_empty()
-        || !row
+        || !shared
             .cells
             .iter()
             .any(|(idx, _)| usize::from(*idx) < static_count)
     {
-        return Ok(row);
+        return Ok(shared);
     }
+    // Splitting the cells rewrites the row: copy-on-write if still shared.
+    let row = Arc::make_mut(&mut shared);
     let (statics, regulars): (Vec<_>, Vec<_>) = std::mem::take(&mut row.cells)
         .into_iter()
         .partition(|(idx, _)| usize::from(*idx) < static_count);
@@ -532,7 +551,7 @@ fn lift_static_cells(partition: &mut Partition, mut row: Row, schema: &TableSche
         Some(existing) => merge_into_existing_row(existing, marker, schema)?,
         None => partition.static_row = Some(marker),
     }
-    Ok(row)
+    Ok(shared)
 }
 
 /// Merge `new_row` into `existing_row` (same clustering, or both the static
@@ -878,8 +897,18 @@ mod tests {
         // paths both survive — the convergence a single whole-collection cell cannot
         // express, and the reason a list-append no longer needs a read-modify-write.
         let mut p = empty_partition();
-        merge_row_into_partition(&mut p, complex_row(0, b"pA", b"a", 10), &test_schema()).unwrap();
-        merge_row_into_partition(&mut p, complex_row(0, b"pB", b"b", 11), &test_schema()).unwrap();
+        merge_row_into_partition(
+            &mut p,
+            Arc::new(complex_row(0, b"pA", b"a", 10)),
+            &test_schema(),
+        )
+        .unwrap();
+        merge_row_into_partition(
+            &mut p,
+            Arc::new(complex_row(0, b"pB", b"b", 11)),
+            &test_schema(),
+        )
+        .unwrap();
         let cells = &p.rows[0].cells;
         assert_eq!(cells.len(), 2, "both element cells retained");
         // Cells stay sorted by (col, path): pA before pB.
@@ -891,10 +920,18 @@ mod tests {
     #[test]
     fn merge_reconciles_same_path_by_lww() {
         let mut p = empty_partition();
-        merge_row_into_partition(&mut p, complex_row(0, b"pA", b"old", 10), &test_schema())
-            .unwrap();
-        merge_row_into_partition(&mut p, complex_row(0, b"pA", b"new", 20), &test_schema())
-            .unwrap();
+        merge_row_into_partition(
+            &mut p,
+            Arc::new(complex_row(0, b"pA", b"old", 10)),
+            &test_schema(),
+        )
+        .unwrap();
+        merge_row_into_partition(
+            &mut p,
+            Arc::new(complex_row(0, b"pA", b"new", 20)),
+            &test_schema(),
+        )
+        .unwrap();
         assert_eq!(
             p.rows[0].cells.len(),
             1,
@@ -905,8 +942,12 @@ mod tests {
             Some(b"new".as_slice())
         );
         // A stale write (lower ts) does not win.
-        merge_row_into_partition(&mut p, complex_row(0, b"pA", b"stale", 5), &test_schema())
-            .unwrap();
+        merge_row_into_partition(
+            &mut p,
+            Arc::new(complex_row(0, b"pA", b"stale", 5)),
+            &test_schema(),
+        )
+        .unwrap();
         assert_eq!(
             p.rows[0].cells[0].1.value.as_deref(),
             Some(b"new".as_slice())
@@ -916,11 +957,16 @@ mod tests {
     #[test]
     fn merge_same_path_tombstone_wins_equal_timestamp() {
         let mut p = empty_partition();
-        merge_row_into_partition(&mut p, complex_row(0, b"pA", b"v", 10), &test_schema()).unwrap();
+        merge_row_into_partition(
+            &mut p,
+            Arc::new(complex_row(0, b"pA", b"v", 10)),
+            &test_schema(),
+        )
+        .unwrap();
         // A remove (tombstone) at the SAME timestamp wins the tie — element gone.
         let mut remove = complex_row(0, b"pA", b"v", 10);
         remove.cells[0].1 = CellValue::tombstone(10, i32::MAX).with_path(b"pA".to_vec());
-        merge_row_into_partition(&mut p, remove, &test_schema()).unwrap();
+        merge_row_into_partition(&mut p, Arc::new(remove), &test_schema()).unwrap();
         assert!(
             p.rows[0].cells[0].1.is_tombstone(),
             "tombstone wins the equal-ts tie"
@@ -930,9 +976,13 @@ mod tests {
     #[test]
     fn merge_rejects_path_cell_for_scalar_column() {
         let mut p = empty_partition();
-        merge_row_into_partition(&mut p, make_row(0, b"s", 10), &test_schema()).unwrap();
-        let err = merge_row_into_partition(&mut p, complex_row(0, b"pA", b"c", 11), &test_schema())
-            .unwrap_err();
+        merge_row_into_partition(&mut p, Arc::new(make_row(0, b"s", 10)), &test_schema()).unwrap();
+        let err = merge_row_into_partition(
+            &mut p,
+            Arc::new(complex_row(0, b"pA", b"c", 11)),
+            &test_schema(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("non-collection column val"));
     }
 
@@ -966,7 +1016,7 @@ mod tests {
         let key = make_key("pk1");
         // 8-byte payload — exactly the buggy `now()` Timestamp shape.
         let row = make_row(0, &[0u8; 8], 1000);
-        let result = mem.put(&key, row, &schema);
+        let result = mem.put(&key, Arc::new(row), &schema);
         assert!(
             result.is_err(),
             "memtable must reject 8-byte cell in TimeUUID column"
@@ -1005,7 +1055,7 @@ mod tests {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };
-        let result = mem.put(&key, row, &schema);
+        let result = mem.put(&key, Arc::new(row), &schema);
         assert!(
             result.is_err(),
             "memtable must reject 8-byte clustering on TimeUUID column"
@@ -1049,7 +1099,7 @@ mod tests {
             deletion: DeletionTime::new(2000, 100),
             primary_key_liveness: LivenessInfo::NONE,
         };
-        mem.put(&key, row, &schema)
+        mem.put(&key, Arc::new(row), &schema)
             .expect("partition tombstone must be accepted on clustered table");
     }
 
@@ -1091,16 +1141,16 @@ mod tests {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(100),
         };
-        mem.put(&key, row1, &schema).unwrap();
-        mem.put(&key, row2, &schema).unwrap();
+        mem.put(&key, Arc::new(row1), &schema).unwrap();
+        mem.put(&key, Arc::new(row2), &schema).unwrap();
         mem.put(
             &key,
-            Row {
+            Arc::new(Row {
                 clustering: vec![],
                 cells: vec![],
                 deletion: DeletionTime::new(200, 0),
                 primary_key_liveness: LivenessInfo::NONE,
-            },
+            }),
             &schema,
         )
         .unwrap();
@@ -1125,7 +1175,7 @@ mod tests {
         let schema = timeuuid_schema();
         let key = make_key("pk1");
         let row = make_row(0, &[0u8; 16], 1000);
-        mem.put(&key, row, &schema).unwrap();
+        mem.put(&key, Arc::new(row), &schema).unwrap();
     }
 
     #[test]
@@ -1133,14 +1183,14 @@ mod tests {
         let mem = ShardedBTreeMemtable::new(4);
         let schema = test_schema();
         assert_eq!(mem.min_timestamp(), i64::MAX, "nothing written yet");
-        mem.put(&make_key("a"), make_row(0, b"x", 5_000), &schema)
+        mem.put(&make_key("a"), Arc::new(make_row(0, b"x", 5_000)), &schema)
             .unwrap();
         assert_eq!(mem.min_timestamp(), 5_000);
         // A later write with an OLDER timestamp (a replayed hint, a client-supplied
         // timestamp) lowers it; a newer one does not raise it.
-        mem.put(&make_key("b"), make_row(0, b"y", 1_000), &schema)
+        mem.put(&make_key("b"), Arc::new(make_row(0, b"y", 1_000)), &schema)
             .unwrap();
-        mem.put(&make_key("c"), make_row(0, b"z", 9_000), &schema)
+        mem.put(&make_key("c"), Arc::new(make_row(0, b"z", 9_000)), &schema)
             .unwrap();
         assert_eq!(mem.min_timestamp(), 1_000);
     }
@@ -1151,7 +1201,7 @@ mod tests {
         let schema = timeuuid_schema();
         // 8-byte value in a TimeUUID column is rejected before it is stored.
         assert!(mem
-            .put(&make_key("a"), make_row(0, &[0u8; 8], 1), &schema)
+            .put(&make_key("a"), Arc::new(make_row(0, &[0u8; 8], 1)), &schema)
             .is_err());
         assert_eq!(mem.min_timestamp(), i64::MAX);
     }
@@ -1162,7 +1212,7 @@ mod tests {
         let schema = test_schema();
         let key = make_key("pk1");
         let row = make_row(0, b"hello", 1000);
-        mem.put(&key, row, &schema).unwrap();
+        mem.put(&key, Arc::new(row), &schema).unwrap();
         let result = mem.get(&key).unwrap();
         assert!(result.is_some());
         let partition = result.unwrap();
@@ -1188,11 +1238,11 @@ mod tests {
         let schema = test_schema();
         assert_eq!(mem.partition_count(), 0);
         assert_eq!(mem.size_bytes(), 0);
-        mem.put(&make_key("k1"), make_row(0, b"v1", 1000), &schema)
+        mem.put(&make_key("k1"), Arc::new(make_row(0, b"v1", 1000)), &schema)
             .unwrap();
         assert_eq!(mem.partition_count(), 1);
         assert!(mem.size_bytes() > 0);
-        mem.put(&make_key("k2"), make_row(0, b"v2", 1000), &schema)
+        mem.put(&make_key("k2"), Arc::new(make_row(0, b"v2", 1000)), &schema)
             .unwrap();
         assert_eq!(mem.partition_count(), 2);
     }
@@ -1202,8 +1252,10 @@ mod tests {
         let mem = ShardedBTreeMemtable::new(4);
         let schema = test_schema();
         let key = make_key("pk1");
-        mem.put(&key, make_row(0, b"old", 1000), &schema).unwrap();
-        mem.put(&key, make_row(0, b"new", 2000), &schema).unwrap();
+        mem.put(&key, Arc::new(make_row(0, b"old", 1000)), &schema)
+            .unwrap();
+        mem.put(&key, Arc::new(make_row(0, b"new", 2000)), &schema)
+            .unwrap();
         let partition = mem.get(&key).unwrap().unwrap();
         assert_eq!(partition.rows.len(), 1);
         assert_eq!(
@@ -1219,8 +1271,10 @@ mod tests {
         let mem = ShardedBTreeMemtable::new(4);
         let schema = test_schema();
         let key = make_key("pk1");
-        mem.put(&key, make_row(0, b"new", 2000), &schema).unwrap();
-        mem.put(&key, make_row(0, b"old", 1000), &schema).unwrap();
+        mem.put(&key, Arc::new(make_row(0, b"new", 2000)), &schema)
+            .unwrap();
+        mem.put(&key, Arc::new(make_row(0, b"old", 1000)), &schema)
+            .unwrap();
         let partition = mem.get(&key).unwrap().unwrap();
         assert_eq!(
             partition.rows[0].cells[0].1.value.as_deref(),
@@ -1234,8 +1288,10 @@ mod tests {
         let mem = ShardedBTreeMemtable::new(4);
         let schema = test_schema();
         let key = make_key("pk1");
-        mem.put(&key, make_row(0, b"val0", 1000), &schema).unwrap();
-        mem.put(&key, make_row(1, b"val1", 1000), &schema).unwrap();
+        mem.put(&key, Arc::new(make_row(0, b"val0", 1000)), &schema)
+            .unwrap();
+        mem.put(&key, Arc::new(make_row(1, b"val1", 1000)), &schema)
+            .unwrap();
         let partition = mem.get(&key).unwrap().unwrap();
         assert_eq!(partition.rows[0].cells.len(), 2);
         assert_eq!(partition.rows[0].cells[0].0, 0);
@@ -1248,8 +1304,12 @@ mod tests {
         let schema = test_schema();
         for i in 0..20 {
             let key = make_key(&format!("key_{i}"));
-            mem.put(&key, make_row(0, format!("v{i}").as_bytes(), 1000), &schema)
-                .unwrap();
+            mem.put(
+                &key,
+                Arc::new(make_row(0, format!("v{i}").as_bytes(), 1000)),
+                &schema,
+            )
+            .unwrap();
         }
         let snapshot = mem.snapshot();
         assert_eq!(snapshot.len(), 20);
@@ -1274,8 +1334,12 @@ mod tests {
         let schema = test_schema();
         for i in 0..100 {
             let key = make_key(&format!("k_{i:03}"));
-            mem.put(&key, make_row(0, format!("v{i}").as_bytes(), 1000), &schema)
-                .unwrap();
+            mem.put(
+                &key,
+                Arc::new(make_row(0, format!("v{i}").as_bytes(), 1000)),
+                &schema,
+            )
+            .unwrap();
         }
         let collected: Vec<_> = mem.range_iter(None, None).collect();
         assert_eq!(collected.len(), 100);
@@ -1307,8 +1371,12 @@ mod tests {
         let schema = test_schema();
         for i in 0..100 {
             let key = make_key(&format!("k_{i:03}"));
-            mem.put(&key, make_row(0, format!("v{i}").as_bytes(), 1000), &schema)
-                .unwrap();
+            mem.put(
+                &key,
+                Arc::new(make_row(0, format!("v{i}").as_bytes(), 1000)),
+                &schema,
+            )
+            .unwrap();
         }
         // Every (start, end) pair over a handful of keys, plus unbounded ends.
         let bounds = [
@@ -1348,8 +1416,12 @@ mod tests {
         let one = ShardedBTreeMemtable::new(1);
         for i in 0..10 {
             let key = make_key(&format!("k_{i:02}"));
-            one.put(&key, make_row(0, format!("v{i}").as_bytes(), 1000), &schema)
-                .unwrap();
+            one.put(
+                &key,
+                Arc::new(make_row(0, format!("v{i}").as_bytes(), 1000)),
+                &schema,
+            )
+            .unwrap();
         }
         let keys: Vec<_> = one.range_iter(None, None).map(|p| p.key.clone()).collect();
         assert_eq!(keys.len(), 10);
@@ -1367,8 +1439,12 @@ mod tests {
         let schema = test_schema();
         for i in 0..200 {
             let key = make_key(&format!("k_{i:03}"));
-            mem.put(&key, make_row(0, format!("v{i}").as_bytes(), 1000), &schema)
-                .unwrap();
+            mem.put(
+                &key,
+                Arc::new(make_row(0, format!("v{i}").as_bytes(), 1000)),
+                &schema,
+            )
+            .unwrap();
         }
         let scanned: Vec<_> = mem.range_iter(None, None).map(|p| p.key.clone()).collect();
         assert_eq!(scanned.len(), 200, "every partition must be yielded once");
@@ -1386,7 +1462,8 @@ mod tests {
         let schema = test_schema();
         for i in 0..100 {
             let key = make_key(&format!("key_{i}"));
-            mem.put(&key, make_row(0, b"v", 1000), &schema).unwrap();
+            mem.put(&key, Arc::new(make_row(0, b"v", 1000)), &schema)
+                .unwrap();
         }
         assert_eq!(mem.partition_count(), 100);
         let non_empty = mem.shards.iter().filter(|s| !s.read().is_empty()).count();
@@ -1411,7 +1488,7 @@ mod tests {
                     for k in 0..keys_per_thread {
                         let key = make_key(&format!("t{t}_k{k}"));
                         let row = make_row(0, format!("v{t}_{k}").as_bytes(), 1000 + t as i64);
-                        mem.put(&key, row, &schema).unwrap();
+                        mem.put(&key, Arc::new(row), &schema).unwrap();
                     }
                 })
             })
@@ -1440,7 +1517,7 @@ mod tests {
         // Write a single key — no contention expected.
         let key = make_key("single");
         let row = make_row(0, b"val", 1000);
-        mem.put(&key, row, &test_schema()).unwrap();
+        mem.put(&key, Arc::new(row), &test_schema()).unwrap();
         // Counter should still be zero (single-threaded, uncontended).
         assert_eq!(
             mem.write_contention_count.load(Ordering::Relaxed),
@@ -1500,13 +1577,13 @@ mod tests {
         let mut p = empty_partition();
         merge_row_into_partition(
             &mut p,
-            complex_row(list_ordinal, b"pA", b"first", 10),
+            Arc::new(complex_row(list_ordinal, b"pA", b"first", 10)),
             &schema,
         )
         .unwrap();
         merge_row_into_partition(
             &mut p,
-            legacy_blob_row(list_ordinal, &[b"x", b"y"], 20),
+            Arc::new(legacy_blob_row(list_ordinal, &[b"x", b"y"], 20)),
             &schema,
         )
         .unwrap();
@@ -1540,8 +1617,10 @@ mod tests {
             ..test_schema()
         };
         let mut p = empty_partition();
-        merge_row_into_partition(&mut p, complex_row(0, b"k1", b"", 10), &schema).unwrap();
-        merge_row_into_partition(&mut p, legacy_blob_row(0, &[b"k2"], 20), &schema).unwrap();
+        merge_row_into_partition(&mut p, Arc::new(complex_row(0, b"k1", b"", 10)), &schema)
+            .unwrap();
+        merge_row_into_partition(&mut p, Arc::new(legacy_blob_row(0, &[b"k2"], 20)), &schema)
+            .unwrap();
 
         let paths: Vec<_> = p.rows[0]
             .cells
@@ -1577,8 +1656,8 @@ mod tests {
             primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(ts),
         };
         let mut p = empty_partition();
-        merge_row_into_partition(&mut p, row(1, b"s-new", b"a1", 20), &schema).unwrap();
-        merge_row_into_partition(&mut p, row(2, b"s-old", b"a2", 10), &schema).unwrap();
+        merge_row_into_partition(&mut p, Arc::new(row(1, b"s-new", b"a1", 20)), &schema).unwrap();
+        merge_row_into_partition(&mut p, Arc::new(row(2, b"s-old", b"a2", 10)), &schema).unwrap();
 
         let statics = &p.static_row.as_ref().expect("static row").cells;
         assert_eq!(statics, &vec![(0, CellValue::live(b"s-new".to_vec(), 20))]);
@@ -1603,8 +1682,9 @@ mod tests {
         first
             .cells
             .insert(0, (1, CellValue::live(b"text".to_vec(), 10)));
-        merge_row_into_partition(&mut p, first, &schema).unwrap();
-        merge_row_into_partition(&mut p, legacy_blob_row(2, &[b"x"], 20), &schema).unwrap();
+        merge_row_into_partition(&mut p, Arc::new(first), &schema).unwrap();
+        merge_row_into_partition(&mut p, Arc::new(legacy_blob_row(2, &[b"x"], 20)), &schema)
+            .unwrap();
 
         let a_cells: Vec<_> = p.rows[0].cells.iter().filter(|(i, _)| *i == 1).collect();
         assert_eq!(a_cells.len(), 1);
@@ -1692,7 +1772,7 @@ mod tests {
         let mut p = empty_partition();
         for (shape, row) in shapes {
             let before = estimate_partition_size(&p) as isize;
-            let delta = merge_row_into_partition(&mut p, row, &schema).unwrap();
+            let delta = merge_row_into_partition(&mut p, Arc::new(row), &schema).unwrap();
             let after = estimate_partition_size(&p) as isize;
             assert_eq!(delta, after - before, "{shape}: delta vs full walk");
         }

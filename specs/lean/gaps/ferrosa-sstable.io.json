@@ -1,0 +1,38 @@
+{
+  "stage": "aeneas",
+  "llbc": "/tmp/oomcat/main-wt/ferrosa_sstable.llbc",
+  "lean": "/tmp/leangap-ferrosa-sstable-gtd1edhk/FerrosaSstable.lean",
+  "translation_errors": 0,
+  "translation_unique_reported": null,
+  "translation_messages": [],
+  "aeneas_exit": 1,
+  "lean_errors": 3,
+  "errors": [
+    {
+      "location": "FerrosaSstable.lean:328:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `core.num.nonzero.ZeroablePrimitive`"
+    },
+    {
+      "location": "FerrosaSstable.lean:350:2",
+      "kind": "lean.unknownIdentifier",
+      "message": "Unknown identifier `core.num.nonzero.ZeroablePrimitive`"
+    },
+    {
+      "location": "FerrosaSstable.lean:975:36",
+      "kind": "lean.synthInstanceFailed",
+      "message": "failed to synthesize instance of type class"
+    }
+  ],
+  "sorry_declarations": 96,
+  "compiled": false,
+  "crate": "ferrosa-sstable",
+  "prefix": "ferrosa_sstable::io::*",
+  "generated_at": "2026-11-17T18:41:07+00:00",
+  "memory_max": "9600M",
+  "toolchain": {
+    "charon": "/tmp/oomcat/aeneas-arc/charon/bin/charon",
+    "aeneas": "/tmp/oomcat/aeneas-arc/src/_build/default/main.exe",
+    "lean_pkg": "/tmp/oomcat/aeneas-arc/backends/lean"
+  }
+}

@@ -276,24 +276,29 @@ fn seed_engine(dir: &Path) -> StorageEngine {
         .write(
             &users,
             &pk(1),
-            single_cell_row(b"alice".to_vec(), 1000),
+            Arc::new(single_cell_row(b"alice".to_vec(), 1000)),
             1000,
         )
         .unwrap();
     engine
-        .write(&users, &pk(2), single_cell_row(b"bob".to_vec(), 1001), 1001)
+        .write(
+            &users,
+            &pk(2),
+            Arc::new(single_cell_row(b"bob".to_vec(), 1001)),
+            1001,
+        )
         .unwrap();
 
     // orders: oid=10 -> uid 1, oid=11 -> uid 1, oid=12 -> uid 2.
     let int_cell = |v: i32, ts: i64| single_cell_row(v.to_be_bytes().to_vec(), ts);
     engine
-        .write(&orders, &pk(10), int_cell(1, 1002), 1002)
+        .write(&orders, &pk(10), Arc::new(int_cell(1, 1002)), 1002)
         .unwrap();
     engine
-        .write(&orders, &pk(11), int_cell(1, 1003), 1003)
+        .write(&orders, &pk(11), Arc::new(int_cell(1, 1003)), 1003)
         .unwrap();
     engine
-        .write(&orders, &pk(12), int_cell(2, 1004), 1004)
+        .write(&orders, &pk(12), Arc::new(int_cell(2, 1004)), 1004)
         .unwrap();
 
     engine

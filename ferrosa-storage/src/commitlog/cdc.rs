@@ -504,6 +504,7 @@ impl CdcReader {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     /// The CDC checkpoint had the same shared-temp-path defect the commit log
     /// checkpoint did: one fixed `cdc_checkpoint.json.tmp` for every writer, so
     /// concurrent saves land in one file and steal each other's rename. Same
@@ -757,7 +758,8 @@ mod tests {
         let cl = CommitLog::new(config).unwrap();
         for table in ["one", "two", "three"] {
             let mut mutation = test_mutation("ks", table);
-            mutation.rows[0].cells[0].1 = CellValue::live(vec![0x5a; 600 * 1024], 1000);
+            Arc::make_mut(&mut mutation.rows[0]).cells[0].1 =
+                CellValue::live(vec![0x5a; 600 * 1024], 1000);
             cl.append(&mutation).unwrap();
         }
         cl.shutdown().unwrap();
@@ -865,7 +867,7 @@ mod tests {
         };
         let cl = CommitLog::new(config).unwrap();
         let mut mutation = test_mutation("ks", "oversized");
-        mutation.rows[0].cells[0].1 =
+        Arc::make_mut(&mut mutation.rows[0]).cells[0].1 =
             CellValue::live(vec![0x5a; MAX_DURABLE_CDC_PAGE_BYTES + 1], 1000);
         cl.append(&mutation).unwrap();
         cl.shutdown().unwrap();
@@ -941,12 +943,12 @@ mod tests {
             keyspace: ks.to_string(),
             table: table.to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"pk1".to_vec())),
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![1, 2, 3],
                 cells: vec![(0, CellValue::live(b"v".to_vec(), 1000))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1000),
-            }],
+            })],
             timestamp: 1000,
         }
     }

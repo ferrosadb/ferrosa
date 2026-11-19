@@ -4519,7 +4519,7 @@ mod production_wiring_tests {
             KS.to_string(),
             TABLE.to_string(),
             key,
-            vec![make_row(value, cell_ts)],
+            vec![Arc::new(make_row(value, cell_ts))],
             cell_ts,
         );
         let mut buf = vec![0u8; m.serialized_size()];
@@ -4597,7 +4597,7 @@ mod production_wiring_tests {
             KS.to_string(),
             "unregistered_table".to_string(),
             key.clone(),
-            vec![make_row(b"x", 2001)],
+            vec![Arc::new(make_row(b"x", 2001))],
             2001,
         );
         let mut payload = vec![0u8; m.serialized_size()];

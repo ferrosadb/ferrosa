@@ -321,6 +321,10 @@ pub enum Message {
     // Keyed secondary-index consult, routed to one partition's replicas
     IndexReadInPartitionRequest(Bytes),
     IndexReadInPartitionResponse(Bytes),
+    /// Streaming keyed secondary-index read; payload is a bincoded
+    /// `IndexReadInPartitionStreamRequestPayload` (ferrosa-cluster). Answered
+    /// with `RangeReadStream*` frames under the request's `request_id`.
+    IndexReadInPartitionStreamRequest(Bytes),
     /// Opaque ferrosa-cql payload: fetch a result cursor's next page.
     ResultCursorPage(Bytes),
     /// Opaque ferrosa-cql payload: the page or a named refusal.
@@ -462,6 +466,9 @@ impl Message {
             Self::FulltextSearchRequest(_) => MsgType::FulltextSearchRequest,
             Self::FulltextSearchResponse(_) => MsgType::FulltextSearchResponse,
             Self::IndexReadInPartitionRequest(_) => MsgType::IndexReadInPartitionRequest,
+            Self::IndexReadInPartitionStreamRequest(_) => {
+                MsgType::IndexReadInPartitionStreamRequest
+            }
             Self::IndexReadInPartitionResponse(_) => MsgType::IndexReadInPartitionResponse,
             Self::ResultCursorPage(_) => MsgType::ResultCursorPage,
             Self::ResultCursorPageReply(_) => MsgType::ResultCursorPageReply,
@@ -654,6 +661,7 @@ impl Message {
             | Self::FulltextSearchRequest(b)
             | Self::FulltextSearchResponse(b)
             | Self::IndexReadInPartitionRequest(b)
+            | Self::IndexReadInPartitionStreamRequest(b)
             | Self::IndexReadInPartitionResponse(b)
             | Self::ResultCursorPage(b)
             | Self::ResultCursorPageReply(b)
@@ -929,6 +937,9 @@ impl Message {
             }
             MsgType::IndexReadInPartitionRequest => {
                 Self::IndexReadInPartitionRequest(body.split_to(body.remaining()))
+            }
+            MsgType::IndexReadInPartitionStreamRequest => {
+                Self::IndexReadInPartitionStreamRequest(body.split_to(body.remaining()))
             }
             MsgType::IndexReadInPartitionResponse => {
                 Self::IndexReadInPartitionResponse(body.split_to(body.remaining()))
@@ -1752,6 +1763,10 @@ mod tests {
             (
                 MsgType::RangeReadStreamRequest,
                 Message::RangeReadStreamRequest(Bytes::from_static(b"req-payload")),
+            ),
+            (
+                MsgType::IndexReadInPartitionStreamRequest,
+                Message::IndexReadInPartitionStreamRequest(Bytes::from_static(b"keyed-req")),
             ),
             (
                 MsgType::RangeReadStreamChunk,

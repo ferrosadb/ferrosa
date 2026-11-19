@@ -882,10 +882,18 @@ mod tests {
         );
     }
 
+    /// Serializes the tests that measure [`cross_dc_pending_repairs_total`]
+    /// deltas: run in parallel, one test's owed copy landed inside the other's
+    /// "nothing was owed" window (observed 2026-11-16: left 1, right 0).
+    static PENDING_REPAIRS_COUNTER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// I6: a local/quorum level commits and records the copy as OWED — the
     /// client is not blocked, and the debt is counted rather than dropped.
     #[tokio::test]
     async fn local_cl_commits_and_records_the_copy_as_owed() {
+        // The pending-repair counter is process-global; a test that measures
+        // its delta must not overlap another that moves it.
+        let _counter = PENDING_REPAIRS_COUNTER.lock().await;
         let peers = [peer(2, 7002), peer(5, 7005)];
         let dcs = with_dcs(&[(Uuid::from_u128(2), "dc2"), (Uuid::from_u128(5), "dc3")]);
         let registry = dc_registry(&peers, &dcs, "dc1");
@@ -922,6 +930,9 @@ mod tests {
     /// levels are Complete too, without accruing debt.
     #[tokio::test]
     async fn every_remote_dc_acking_is_complete_at_any_level() {
+        // The pending-repair counter is process-global; a test that measures
+        // its delta must not overlap another that moves it.
+        let _counter = PENDING_REPAIRS_COUNTER.lock().await;
         let peers = [peer(2, 7002), peer(5, 7005)];
         let dcs = with_dcs(&[(Uuid::from_u128(2), "dc2"), (Uuid::from_u128(5), "dc3")]);
         let registry = dc_registry(&peers, &dcs, "dc1");

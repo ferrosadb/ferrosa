@@ -20,7 +20,7 @@ fn backpressure_e1_gated_flush_bounds_active_memtable_and_recovers() {
         .write(
             &tid,
             &make_key("before-flush"),
-            make_row(&value, 1000),
+            Arc::new(make_row(&value, 1000)),
             1000,
         )
         .unwrap();
@@ -57,7 +57,7 @@ fn backpressure_e1_gated_flush_bounds_active_memtable_and_recovers() {
     let mut rejected = false;
     for n in 0..16 {
         let key = format!("during-flush-{n}");
-        match engine.write(&tid, &make_key(&key), make_row(&value, 1000), 1000) {
+        match engine.write(&tid, &make_key(&key), Arc::new(make_row(&value, 1000)), 1000) {
             Ok(()) => accepted.push(key),
             Err(error) => {
                 assert!(error.to_string().contains("overloaded"), "{error}");
@@ -78,7 +78,7 @@ fn backpressure_e1_gated_flush_bounds_active_memtable_and_recovers() {
     );
     for _ in 0..100 {
         let error = engine
-            .write(&tid, &make_key("rejected"), make_row(&value, 1000), 1000)
+            .write(&tid, &make_key("rejected"), Arc::new(make_row(&value, 1000)), 1000)
             .unwrap_err();
         assert!(error.to_string().contains("overloaded"), "{error}");
         assert_eq!(engine.memtable_size(&tid), plateau);
@@ -96,7 +96,7 @@ fn backpressure_e1_gated_flush_bounds_active_memtable_and_recovers() {
         .write(
             &tid,
             &make_key("after-release"),
-            make_row(&value, 1000),
+            Arc::new(make_row(&value, 1000)),
             1000,
         )
         .unwrap();
@@ -135,7 +135,7 @@ fn backpressure_engine_with_inputs(
         .collect();
     for key in ["input-one", "input-two"] {
         engine
-            .write(&tid, &make_key(key), make_row(&value, 1000), 1000)
+            .write(&tid, &make_key(key), Arc::new(make_row(&value, 1000)), 1000)
             .unwrap();
         engine.flush(&tid).unwrap();
     }
@@ -191,7 +191,7 @@ fn backpressure_e3_flush_completes_while_compaction_remains_gated() {
         .write(
             &tid,
             &make_key("independent-flush"),
-            make_row(&value, 1000),
+            Arc::new(make_row(&value, 1000)),
             1000,
         )
         .unwrap();
@@ -328,7 +328,7 @@ fn backpressure_b8_flush_readback_holds_publication_and_wal_retirement() {
             .write(
                 &tid,
                 &make_key(&format!("wal-{n}")),
-                make_row(b"value", 1000 + n),
+                Arc::new(make_row(b"value", 1000 + n)),
                 1000 + n,
             )
             .unwrap();

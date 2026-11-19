@@ -16,6 +16,7 @@ use ferrosa_common::key::{DecoratedKey, PartitionKey};
 use ferrosa_common::{CellValue, Token};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 use ferrosa_storage::Mutation;
+use std::sync::Arc;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -35,12 +36,12 @@ fn test_mutation(idx: u8, ts: i64) -> Mutation {
             token: Token(ts),
             key: PartitionKey::new(vec![idx]),
         },
-        rows: vec![Row {
+        rows: vec![Arc::new(Row {
             clustering: vec![],
             cells: vec![(0, CellValue::live(vec![idx], ts))],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(ts),
-        }],
+        })],
         timestamp: ts,
     }
 }

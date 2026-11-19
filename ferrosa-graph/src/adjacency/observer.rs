@@ -77,14 +77,15 @@ pub(crate) fn derive_adjacency_into(
     mutation: &Mutation,
     out: &mut Vec<Mutation>,
 ) {
-    derive_adjacency_rows_into(
-        schema,
-        table,
-        &mutation.key,
-        &mutation.rows,
-        mutation.timestamp,
-        out,
-    );
+    let snap = schema.schema_ref().load();
+    let Some(edges) = EdgeTable::resolve(&snap, table) else {
+        return;
+    };
+    // Two entries per live edge row, so reserve exactly once instead of growing.
+    out.reserve(mutation.rows.len() * 2);
+    for row in &mutation.rows {
+        edges.derive_row_into(&mutation.key, row, mutation.timestamp, out);
+    }
 }
 
 /// Derive index entries from one borrowed physical row without copying its
@@ -97,100 +98,96 @@ pub(crate) fn derive_adjacency_row_mutations(
     timestamp: i64,
 ) -> Vec<Mutation> {
     let mut out = Vec::new();
-    derive_adjacency_rows_into(
-        schema,
-        table,
-        key,
-        std::slice::from_ref(row),
-        timestamp,
-        &mut out,
-    );
+    let snap = schema.schema_ref().load();
+    if let Some(edges) = EdgeTable::resolve(&snap, table) {
+        out.reserve(2);
+        edges.derive_row_into(key, row, timestamp, &mut out);
+    }
     out
 }
 
-fn derive_adjacency_rows_into(
-    schema: &Schema,
-    table: &TableId,
-    partition_key: &ferrosa_common::DecoratedKey,
-    rows: &[ferrosa_sstable::types::Row],
-    timestamp: i64,
-    out: &mut Vec<Mutation>,
-) {
-    let snap = schema.schema_ref().load();
-    let key = (table.keyspace.clone(), table.table.clone());
-    let meta = match snap.tables.get(&key) {
-        Some(m) => m,
-        None => return,
-    };
+/// What deriving adjacency entries needs from an edge table's schema, resolved
+/// once per write rather than once per row.
+struct EdgeTable<'m> {
+    meta: &'m ferrosa_schema::metadata::table::TableMetadata,
+    source_col: &'m str,
+    target_col: &'m str,
+    adj_ks: String,
+    edge_label: String,
+    edge_table: String,
+}
 
-    // Verify this is a valid edge table with source and target extensions.
-    // Phase 1 uses partition key as source and clustering as target;
-    // full column-name mapping will use these values in a later phase.
-    if !meta.extensions.contains_key("graph.source")
-        || !meta.extensions.contains_key("graph.target")
-    {
-        return;
+impl<'m> EdgeTable<'m> {
+    /// `None` unless `table` is an edge table with source and target extensions.
+    ///
+    /// Phase 1 uses partition key as source and clustering as target; full
+    /// column-name mapping will use these values in a later phase.
+    fn resolve(snap: &'m ferrosa_schema::SchemaSnapshot, table: &TableId) -> Option<EdgeTable<'m>> {
+        let key = (table.keyspace.clone(), table.table.clone());
+        let meta = snap.tables.get(&key)?;
+        let source_col = meta.extensions.get("graph.source")?;
+        let target_col = meta.extensions.get("graph.target")?;
+        // Use the graph label from schema extensions (e.g. "KNOWS") so that the
+        // adjacency clustering key matches what the hop executor filters by.
+        // Fall back to the table name if the extension is missing.
+        let edge_label = match meta.extensions.get("graph.label") {
+            Some(label) => label.clone(),
+            None => table.table.clone(),
+        };
+        Some(EdgeTable {
+            meta,
+            source_col,
+            target_col,
+            adj_ks: adjacency_keyspace_name(&table.keyspace),
+            edge_label,
+            edge_table: format!("{}.{}", table.keyspace, table.table),
+        })
     }
-    let Some(source_col) = meta.extensions.get("graph.source") else {
-        return;
-    };
-    let Some(target_col) = meta.extensions.get("graph.target") else {
-        return;
-    };
 
-    let adj_ks = adjacency_keyspace_name(&table.keyspace);
-    // Use the graph label from schema extensions (e.g. "KNOWS") so that the
-    // adjacency clustering key matches what the hop executor filters by.
-    // Fall back to the table name if the extension is missing.
-    let edge_label = meta
-        .extensions
-        .get("graph.label")
-        .cloned()
-        .unwrap_or_else(|| table.table.clone());
-    let edge_table = format!("{}.{}", table.keyspace, table.table);
-
-    // Two entries per live edge row, so reserve exactly once instead of growing.
-    out.reserve(rows.len() * 2);
-    for row in rows {
-        let Some(source_id) =
-            extract_graph_column_bytes(meta, partition_key.key.as_bytes(), row, source_col)
+    /// Append the OUT and IN entries of one edge row to `out`.
+    fn derive_row_into(
+        &self,
+        partition_key: &ferrosa_common::DecoratedKey,
+        row: &ferrosa_sstable::types::Row,
+        timestamp: i64,
+        out: &mut Vec<Mutation>,
+    ) {
+        let pk = partition_key.key.as_bytes();
+        let Some(source_id) = extract_graph_column_bytes(self.meta, pk, row, self.source_col)
         else {
-            continue;
+            return;
         };
-        let Some(target_id) =
-            extract_graph_column_bytes(meta, partition_key.key.as_bytes(), row, target_col)
+        let Some(target_id) = extract_graph_column_bytes(self.meta, pk, row, self.target_col)
         else {
-            continue;
+            return;
         };
-
+        let deleted = crate::adjacency::schema::row_is_deleted(row);
         for (vertex, direction, neighbor) in [
             (&source_id, DIRECTION_OUT, &target_id),
             (&target_id, DIRECTION_IN, &source_id),
         ] {
-            let mut entry = make_adjacency_mutation(
-                &adj_ks,
-                vertex,
+            let mut entry = adjacency_row(
                 direction,
-                &edge_label,
+                &self.edge_label,
                 neighbor,
-                &edge_table,
+                &self.edge_table,
                 timestamp,
             );
             // A deleted edge must delete its entries. Deriving live entries
-            // from the edge's tombstone would keep the edge traversable.
-            if crate::adjacency::schema::row_is_deleted(row) {
-                for adjacency_row in &mut entry.rows {
-                    adjacency_row.cells.clear();
-                    adjacency_row.deletion = row.deletion;
-                    adjacency_row.primary_key_liveness = ferrosa_sstable::types::LivenessInfo::NONE;
-                }
+            // from the edge's tombstone would keep the edge traversable. The
+            // entry is still a plain row here, so this edits it in place.
+            if deleted {
+                entry.cells.clear();
+                entry.deletion = row.deletion;
+                entry.primary_key_liveness = ferrosa_sstable::types::LivenessInfo::NONE;
             }
-            out.push(entry);
+            out.push(adjacency_mutation(&self.adj_ks, vertex, entry, timestamp));
         }
     }
 }
 
-/// Build an adjacency table mutation.
+/// Build an adjacency table mutation (tests build expected entries with it).
+#[cfg(test)]
 pub(crate) fn make_adjacency_mutation(
     adj_keyspace: &str,
     vertex_id: &[u8],
@@ -200,11 +197,20 @@ pub(crate) fn make_adjacency_mutation(
     edge_table: &str,
     timestamp: i64,
 ) -> Mutation {
-    use ferrosa_common::cell::CellValue;
-    use ferrosa_common::key::{DecoratedKey, PartitionKey};
-    use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+    let row = adjacency_row(direction, edge_label, neighbor_id, edge_table, timestamp);
+    adjacency_mutation(adj_keyspace, vertex_id, row, timestamp)
+}
 
-    let key = DecoratedKey::new(PartitionKey::new(vertex_id.to_vec()));
+/// One adjacency entry row, before it is shared: callers may still edit it.
+fn adjacency_row(
+    direction: u8,
+    edge_label: &str,
+    neighbor_id: &[u8],
+    edge_table: &str,
+    timestamp: i64,
+) -> ferrosa_sstable::types::Row {
+    use ferrosa_common::cell::CellValue;
+    use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 
     // Clustering uses standard composite layout: each component is
     // [u16 BE length][bytes]. Required by the SSTable writer's multi-column
@@ -220,7 +226,7 @@ pub(crate) fn make_adjacency_mutation(
     clustering.extend_from_slice(&(neighbor_id.len() as u16).to_be_bytes());
     clustering.extend_from_slice(neighbor_id);
 
-    let row = Row {
+    Row {
         clustering,
         cells: vec![(
             0,
@@ -228,13 +234,22 @@ pub(crate) fn make_adjacency_mutation(
         )],
         deletion: DeletionTime::LIVE,
         primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
-    };
+    }
+}
 
+/// Wrap a finished adjacency row as the mutation for `vertex_id`'s partition.
+fn adjacency_mutation(
+    adj_keyspace: &str,
+    vertex_id: &[u8],
+    row: ferrosa_sstable::types::Row,
+    timestamp: i64,
+) -> Mutation {
+    use ferrosa_common::key::{DecoratedKey, PartitionKey};
     Mutation::new(
         adj_keyspace.to_string(),
         "adjacency".to_string(),
-        key,
-        vec![row],
+        DecoratedKey::new(PartitionKey::new(vertex_id.to_vec())),
+        vec![Arc::new(row)],
         timestamp,
     )
 }

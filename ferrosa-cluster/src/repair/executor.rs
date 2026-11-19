@@ -107,7 +107,7 @@ pub trait RepairStore: Send + Sync {
     async fn apply_partitions(
         &self,
         table: &TableId,
-        partitions: &[Partition],
+        partitions: Vec<Partition>,
     ) -> Result<(), String>;
 
     /// Build a Merkle tree summarising this store's content for the
@@ -222,11 +222,11 @@ impl RepairStore for StorageEngineRepairStore {
     async fn apply_partitions(
         &self,
         table: &TableId,
-        partitions: &[Partition],
+        partitions: Vec<Partition>,
     ) -> Result<(), String> {
         let engine = self.engine.clone();
         let table = table.clone();
-        let parts = partitions.to_vec();
+        let parts = partitions;
         TaskPool::current("repair-apply")
             .spawn_blocking(move || {
                 // The whole partition — deletion, static row and rows. The plan
@@ -442,13 +442,15 @@ impl SessionExecutor for LocalRepairExecutor {
                 })?;
                 if a_to_b_queue.len() >= REPAIR_APPLY_CHUNK_PARTITIONS {
                     streamed_out += a_to_b_queue.len() as u64;
-                    remote.apply_partitions(table, &a_to_b_queue).await?;
-                    a_to_b_queue.clear();
+                    remote
+                        .apply_partitions(table, std::mem::take(&mut a_to_b_queue))
+                        .await?;
                 }
                 if b_to_a_queue.len() >= REPAIR_APPLY_CHUNK_PARTITIONS {
                     streamed_in += b_to_a_queue.len() as u64;
-                    self.local.apply_partitions(table, &b_to_a_queue).await?;
-                    b_to_a_queue.clear();
+                    self.local
+                        .apply_partitions(table, std::mem::take(&mut b_to_a_queue))
+                        .await?;
                 }
                 // Carry the "future" half forward in the input
                 // vecs so we don't pay a re-read for it.
@@ -471,13 +473,15 @@ impl SessionExecutor for LocalRepairExecutor {
             // End-of-span flush.
             if !a_to_b_queue.is_empty() {
                 streamed_out += a_to_b_queue.len() as u64;
-                remote.apply_partitions(table, &a_to_b_queue).await?;
-                a_to_b_queue.clear();
+                remote
+                    .apply_partitions(table, std::mem::take(&mut a_to_b_queue))
+                    .await?;
             }
             if !b_to_a_queue.is_empty() {
                 streamed_in += b_to_a_queue.len() as u64;
-                self.local.apply_partitions(table, &b_to_a_queue).await?;
-                b_to_a_queue.clear();
+                self.local
+                    .apply_partitions(table, std::mem::take(&mut b_to_a_queue))
+                    .await?;
             }
         }
 
@@ -579,7 +583,7 @@ impl InMemoryRepairStore {
                 Some(i) => {
                     let existing = dst.rows.remove(i);
                     dst.rows
-                        .insert(i, ferrosa_storage::merge::merge_rows(existing, row));
+                        .insert(i, ferrosa_storage::merge::merge_shared_rows(existing, row));
                 }
                 None => dst.rows.push(row),
             }
@@ -619,10 +623,10 @@ impl RepairStore for InMemoryRepairStore {
     async fn apply_partitions(
         &self,
         _table: &TableId,
-        partitions: &[Partition],
+        partitions: Vec<Partition>,
     ) -> Result<(), String> {
         for p in partitions {
-            self.apply_one(p.clone()).await;
+            self.apply_one(p).await;
         }
         Ok(())
     }
@@ -670,7 +674,7 @@ mod tests {
             key: dk,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row],
+            rows: vec![Arc::new(row)],
         }
     }
 
@@ -701,7 +705,7 @@ mod tests {
         fx::seed_stale_row(&storage);
 
         StorageEngineRepairStore::new(storage.clone())
-            .apply_partitions(&fx::table_id(), &[fx::source_partition()])
+            .apply_partitions(&fx::table_id(), vec![fx::source_partition()])
             .await
             .unwrap();
 

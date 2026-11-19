@@ -182,7 +182,7 @@ impl SystemTableWriter {
         for (_, cell) in &mut row.cells {
             cell.timestamp = ts;
         }
-        self.engine.write(table, key, row, ts)
+        self.engine.write(table, key, std::sync::Arc::new(row), ts)
     }
 
     /// Apply a system table mutation by writing to the storage engine.

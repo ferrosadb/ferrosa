@@ -213,66 +213,63 @@ pub fn eval_if_conditions(
     if_exists: bool,
     existing_row: Option<HashMap<String, Option<CqlValue>>>,
 ) -> LwtResult {
-    // IF EXISTS check: row must exist.
-    let row = match existing_row {
-        None => {
-            if if_exists || !conditions.is_empty() {
-                return LwtResult {
-                    applied: false,
-                    current_values: HashMap::new(),
-                };
-            }
-            // No conditions and no IF EXISTS — unconditional, always applied.
-            return LwtResult {
-                applied: true,
-                current_values: HashMap::new(),
-            };
-        }
-        Some(r) => r,
+    let applied = if_conditions_hold(
+        conditions,
+        if_exists,
+        existing_row
+            .as_ref()
+            .map(|row| |column: &str| row.get(column).and_then(Option::as_ref)),
+    );
+    // Move the row into the result rather than cloning every cell.
+    let current_values = match applied {
+        true => HashMap::new(),
+        false => existing_row.unwrap_or_default(),
     };
+    LwtResult {
+        applied,
+        current_values,
+    }
+}
 
-    // Evaluate each condition against the row.
-    for cond in conditions {
-        let current_val = row.get(&cond.column).cloned().flatten();
+/// Whether an IF clause holds, reading the current row through `lookup`
+/// (column name to its value, `None` for null or absent) instead of an owned
+/// map, so a caller holding the row in another shape does not copy it.
+///
+/// `existing` is `None` when the row does not exist: then only an
+/// unconditional statement (no conditions, no IF EXISTS) applies.
+pub fn if_conditions_hold<'r>(
+    conditions: &[IfCondition],
+    if_exists: bool,
+    existing: Option<impl Fn(&str) -> Option<&'r CqlValue>>,
+) -> bool {
+    let Some(lookup) = existing else {
+        return !if_exists && conditions.is_empty();
+    };
+    conditions.iter().all(|cond| {
+        let current = lookup(&cond.column);
         let expected = term_to_cql_value_simple(&cond.value);
-
-        let matches = match cond.operator {
-            IfOperator::Eq => values_eq(&current_val, &expected),
-            IfOperator::NotEq => !values_eq(&current_val, &expected),
-            IfOperator::Lt => cmp_values(&current_val, &expected) == Some(std::cmp::Ordering::Less),
-            IfOperator::Gt => {
-                cmp_values(&current_val, &expected) == Some(std::cmp::Ordering::Greater)
-            }
+        let ord = || cmp_values(current, expected.as_ref());
+        match cond.operator {
+            IfOperator::Eq => values_eq(current, expected.as_ref()),
+            IfOperator::NotEq => !values_eq(current, expected.as_ref()),
+            IfOperator::Lt => ord() == Some(std::cmp::Ordering::Less),
+            IfOperator::Gt => ord() == Some(std::cmp::Ordering::Greater),
             IfOperator::LtEq => matches!(
-                cmp_values(&current_val, &expected),
+                ord(),
                 Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
             ),
             IfOperator::GtEq => matches!(
-                cmp_values(&current_val, &expected),
+                ord(),
                 Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
             ),
             IfOperator::In => match &cond.value {
-                Term::InList(items) => items.iter().any(|item| {
-                    let item_val = term_to_cql_value_simple(item);
-                    values_eq(&current_val, &item_val)
-                }),
+                Term::InList(items) => items
+                    .iter()
+                    .any(|item| values_eq(current, term_to_cql_value_simple(item).as_ref())),
                 _ => false,
             },
-        };
-
-        if !matches {
-            // Move the row into the result rather than cloning every cell.
-            return LwtResult {
-                applied: false,
-                current_values: row,
-            };
         }
-    }
-
-    LwtResult {
-        applied: true,
-        current_values: HashMap::new(),
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -545,7 +542,7 @@ fn as_integer(value: &CqlValue) -> Option<num_bigint::BigInt> {
 /// integer literal to `Int(i32)` meant `IF <bigint_col> = ?` could never be
 /// true, and — worse — `IF <bigint_col> != ?` was always true, so a guarded
 /// update fired exactly when its guard said it must not.
-fn values_eq(a: &Option<CqlValue>, b: &Option<CqlValue>) -> bool {
+fn values_eq(a: Option<&CqlValue>, b: Option<&CqlValue>) -> bool {
     if let (Some(a), Some(b)) = (a, b) {
         if let (Some(a), Some(b)) = (as_integer(a), as_integer(b)) {
             return a == b;
@@ -557,7 +554,7 @@ fn values_eq(a: &Option<CqlValue>, b: &Option<CqlValue>) -> bool {
 /// Compare two optional CqlValues for ordering.
 ///
 /// Returns None if the values are not comparable (different types or nulls).
-fn cmp_values(a: &Option<CqlValue>, b: &Option<CqlValue>) -> Option<std::cmp::Ordering> {
+fn cmp_values(a: Option<&CqlValue>, b: Option<&CqlValue>) -> Option<std::cmp::Ordering> {
     // Integers first, so widths are compared by value rather than by variant.
     if let (Some(x), Some(y)) = (a, b) {
         if let (Some(x), Some(y)) = (as_integer(x), as_integer(y)) {
@@ -1088,6 +1085,75 @@ mod tests {
     // -----------------------------------------------------------------------
     // A3.5: LWT IF Conditions on UPDATE/DELETE
     // -----------------------------------------------------------------------
+
+    /// The local (non-Accord) LWT path holds the row as a positional slice and
+    /// used to `.cloned()` every cell into a name-keyed HashMap just to ask
+    /// whether the IF clause holds. The borrowed evaluator must reach the same
+    /// verdict as the owned one for every operator shape, reading the row in
+    /// place.
+    #[test]
+    fn the_borrowed_if_evaluator_agrees_with_the_owned_one() {
+        let names = ["k", "v", "t"];
+        let row: Vec<Option<CqlValue>> =
+            vec![Some(CqlValue::Int(1)), Some(CqlValue::Bigint(10)), None];
+        let owned: HashMap<String, Option<CqlValue>> = names
+            .iter()
+            .map(|n| n.to_string())
+            .zip(row.iter().cloned())
+            .collect();
+        let lookup = |c: &str| {
+            names
+                .iter()
+                .position(|n| *n == c)
+                .and_then(|i| row[i].as_ref())
+        };
+        let cond = |column: &str, operator, value| IfCondition {
+            column: column.into(),
+            operator,
+            value,
+        };
+        let cases: Vec<(Vec<IfCondition>, bool)> = vec![
+            (
+                vec![cond("v", IfOperator::Eq, Term::IntegerLiteral(10))],
+                false,
+            ),
+            (
+                vec![cond("v", IfOperator::NotEq, Term::IntegerLiteral(10))],
+                false,
+            ),
+            (
+                vec![cond("v", IfOperator::Gt, Term::IntegerLiteral(3))],
+                false,
+            ),
+            (
+                vec![cond("v", IfOperator::LtEq, Term::IntegerLiteral(3))],
+                false,
+            ),
+            (
+                vec![cond("t", IfOperator::Eq, Term::IntegerLiteral(0))],
+                false,
+            ),
+            (
+                vec![cond("missing", IfOperator::Eq, Term::IntegerLiteral(0))],
+                false,
+            ),
+            (vec![], true),
+            (vec![], false),
+        ];
+        let mut saw = [false, false];
+        for (conds, if_exists) in &cases {
+            for present in [true, false] {
+                let want = eval_if_conditions(conds, *if_exists, present.then(|| owned.clone()));
+                let got = if_conditions_hold(conds, *if_exists, present.then_some(lookup));
+                assert_eq!(
+                    got, want.applied,
+                    "conds={conds:?} if_exists={if_exists} present={present}"
+                );
+                saw[usize::from(got)] = true;
+            }
+        }
+        assert_eq!(saw, [true, true], "cases must cover both verdicts");
+    }
 
     #[test]
     fn lwt_update_if_condition() {

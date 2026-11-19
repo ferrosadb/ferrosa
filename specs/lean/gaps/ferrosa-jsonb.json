@@ -1,7 +1,7 @@
 {
   "stage": "aeneas",
-  "llbc": "/home/bkearns/.hermes/cache/scratch/ferrosa-ratchet/ferrosa_jsonb.llbc",
-  "lean": "/home/bkearns/.hermes/cache/scratch/leangap-ferrosa-jsonb-k790d8f5/FerrosaJsonb.lean",
+  "llbc": "/home/bkearns/src/ferrosa-suite/ferrosa-wt-oom-burndown/ferrosa_jsonb.llbc",
+  "lean": "/tmp/leangap-ferrosa-jsonb-d8q50tiy/FerrosaJsonb.lean",
   "translation_errors": 0,
   "translation_unique_reported": null,
   "translation_messages": [],
@@ -19,150 +19,150 @@
       "message": "Unknown constant `ferrosa_jsonb.core.option.IntoIter.Insts.CoreIterTraitsIteratorIterator`"
     },
     {
-      "location": "FerrosaJsonb.lean:3945:2",
+      "location": "FerrosaJsonb.lean:3911:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serializer`"
     },
     {
-      "location": "FerrosaJsonb.lean:6255:7",
+      "location": "FerrosaJsonb.lean:6221:7",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown constant `Aeneas.Std.core.iter.adapters.map.Map.Insts.CoreIterTraitsIteratorIterator`"
     },
     {
-      "location": "FerrosaJsonb.lean:6489:24",
+      "location": "FerrosaJsonb.lean:6455:24",
       "kind": "lean.invalidField",
       "message": "Invalid field `Limits`: The environment does not contain `ferrosa_jsonb.limits.Limits.Limits`, so it is not possible to project the field `Limits` from an expression"
     },
     {
-      "location": "FerrosaJsonb.lean:6707:7",
+      "location": "FerrosaJsonb.lean:6673:7",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown constant `Aeneas.Std.core.iter.adapters.map.Map.Insts.CoreIterTraitsIteratorIterator`"
     },
     {
-      "location": "FerrosaJsonb.lean:10071:10",
+      "location": "FerrosaJsonb.lean:10037:10",
       "kind": "lean.invalidField",
       "message": "Invalid field `record_fault`: The environment does not contain `Ordering.record_fault`, so it is not possible to project the field `record_fault` from an expression"
     },
     {
-      "location": "FerrosaJsonb.lean:10132:34",
+      "location": "FerrosaJsonb.lean:10098:34",
       "kind": "lean.invalidField",
       "message": "Invalid field `write_usize`: The environment does not contain `Aeneas.Std.core.hash.Hasher.write_usize`, so it is not possible to project the field `write_usize` from an expression"
     },
     {
-      "location": "FerrosaJsonb.lean:10217:38",
+      "location": "FerrosaJsonb.lean:10183:38",
       "kind": "lean.invalidField",
       "message": "Invalid field `write_u8`: The environment does not contain `Aeneas.Std.core.hash.Hasher.write_u8`, so it is not possible to project the field `write_u8` from an expression"
     },
     {
-      "location": "FerrosaJsonb.lean:10229:42",
+      "location": "FerrosaJsonb.lean:10195:42",
       "kind": "lean.invalidField",
       "message": "Invalid field `write_u8`: The environment does not contain `Aeneas.Std.core.hash.Hasher.write_u8`, so it is not possible to project the field `write_u8` from an expression"
     },
     {
-      "location": "FerrosaJsonb.lean:10226:42",
+      "location": "FerrosaJsonb.lean:10192:42",
       "kind": "lean.invalidField",
       "message": "Invalid field `write_u8`: The environment does not contain `Aeneas.Std.core.hash.Hasher.write_u8`, so it is not possible to project the field `write_u8` from an expression"
     },
     {
-      "location": "FerrosaJsonb.lean:10238:38",
+      "location": "FerrosaJsonb.lean:10204:38",
       "kind": "lean.invalidField",
       "message": "Invalid field `write_u8`: The environment does not contain `Aeneas.Std.core.hash.Hasher.write_u8`, so it is not possible to project the field `write_u8` from an expression"
     },
     {
-      "location": "FerrosaJsonb.lean:10253:38",
+      "location": "FerrosaJsonb.lean:10219:38",
       "kind": "lean.invalidField",
       "message": "Invalid field `write_u8`: The environment does not contain `Aeneas.Std.core.hash.Hasher.write_u8`, so it is not possible to project the field `write_u8` from an expression"
     },
     {
-      "location": "FerrosaJsonb.lean:10281:42",
+      "location": "FerrosaJsonb.lean:10247:42",
       "kind": "lean.invalidField",
       "message": "Invalid field `write_u8`: The environment does not contain `Aeneas.Std.core.hash.Hasher.write_u8`, so it is not possible to project the field `write_u8` from an expression"
     },
     {
-      "location": "FerrosaJsonb.lean:10283:42",
+      "location": "FerrosaJsonb.lean:10249:42",
       "kind": "lean.invalidField",
       "message": "Invalid field `write_usize`: The environment does not contain `Aeneas.Std.core.hash.Hasher.write_usize`, so it is not possible to project the field `write_usize` from an expression"
     },
     {
-      "location": "FerrosaJsonb.lean:10276:42",
+      "location": "FerrosaJsonb.lean:10242:42",
       "kind": "lean.invalidField",
       "message": "Invalid field `write_u8`: The environment does not contain `Aeneas.Std.core.hash.Hasher.write_u8`, so it is not possible to project the field `write_u8` from an expression"
     },
     {
-      "location": "FerrosaJsonb.lean:10278:42",
+      "location": "FerrosaJsonb.lean:10244:42",
       "kind": "lean.invalidField",
       "message": "Invalid field `write_usize`: The environment does not contain `Aeneas.Std.core.hash.Hasher.write_usize`, so it is not possible to project the field `write_usize` from an expression"
     },
     {
-      "location": "FerrosaJsonb.lean:12172:7",
+      "location": "FerrosaJsonb.lean:12138:7",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown constant `ferrosa_jsonb.core.iter.adapters.chain.Chain.Insts.CoreIterTraitsIteratorIterator`"
     },
     {
-      "location": "FerrosaJsonb.lean:12178:5",
+      "location": "FerrosaJsonb.lean:12144:5",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown constant `ferrosa_jsonb.core.iter.adapters.take_while.TakeWhile.Insts.CoreIterTraitsIteratorIterator`"
     },
     {
-      "location": "FerrosaJsonb.lean:12200:7",
+      "location": "FerrosaJsonb.lean:12166:7",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown constant `ferrosa_jsonb.core.iter.adapters.chain.Chain.Insts.CoreIterTraitsIteratorIterator`"
     },
     {
-      "location": "FerrosaJsonb.lean:12205:7",
+      "location": "FerrosaJsonb.lean:12171:7",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown constant `ferrosa_jsonb.core.iter.adapters.skip.Skip.Insts.CoreIterTraitsIteratorIterator`"
     },
     {
-      "location": "FerrosaJsonb.lean:12209:7",
+      "location": "FerrosaJsonb.lean:12175:7",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown constant `ferrosa_jsonb.core.iter.adapters.skip.Skip.Insts.CoreIterTraitsIteratorIterator`"
     },
     {
-      "location": "FerrosaJsonb.lean:12215:7",
+      "location": "FerrosaJsonb.lean:12181:7",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown constant `ferrosa_jsonb.core.iter.adapters.copied.Copied.Insts.CoreIterTraitsIteratorIterator`"
     },
     {
-      "location": "FerrosaJsonb.lean:12234:7",
+      "location": "FerrosaJsonb.lean:12200:7",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown constant `ferrosa_jsonb.core.iter.sources.repeat_n.RepeatN.Insts.CoreIterTraitsIteratorIterator`"
     },
     {
-      "location": "FerrosaJsonb.lean:12406:7",
+      "location": "FerrosaJsonb.lean:12372:7",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown constant `ferrosa_jsonb.core.iter.adapters.take_while.TakeWhile.Insts.CoreIterTraitsIteratorIterator`"
     },
     {
-      "location": "FerrosaJsonb.lean:14569:17",
+      "location": "FerrosaJsonb.lean:14529:17",
       "kind": "lean.invalidField",
       "message": "Invalid field `Limits`: The environment does not contain `ferrosa_jsonb.limits.Limits.Limits`, so it is not possible to project the field `Limits` from an expression"
     },
     {
-      "location": "FerrosaJsonb.lean:15090:56",
+      "location": "FerrosaJsonb.lean:15050:56",
       "kind": "lean.synthInstanceFailed",
       "message": "failed to synthesize instance of type class"
     },
     {
-      "location": "FerrosaJsonb.lean:16556:2",
+      "location": "FerrosaJsonb.lean:16516:2",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serializer`"
     },
     {
-      "location": "FerrosaJsonb.lean:16576:52",
+      "location": "FerrosaJsonb.lean:16536:52",
       "kind": "lean.unknownIdentifier",
       "message": "Unknown identifier `serde_core.ser.Serialize`"
     }
   ],
-  "sorry_declarations": 373,
+  "sorry_declarations": 369,
   "compiled": false,
   "crate": "ferrosa-jsonb",
   "prefix": "ferrosa_jsonb::*",
-  "generated_at": "2026-11-01T05:54:45+00:00",
-  "memory_max": "18G",
+  "generated_at": "2026-11-18T15:44:18+00:00",
+  "memory_max": "9600M",
   "toolchain": {
-    "charon": "/home/bkearns/src/aeneas/charon/bin/charon",
-    "aeneas": "/home/bkearns/.hermes/cache/scratch/aeneas-pin/src/_build/default/main.exe",
-    "lean_pkg": "/home/bkearns/.local/aeneas/backends/lean"
+    "charon": "/tmp/oomcat/aeneas-arc/charon/bin/charon",
+    "aeneas": "/tmp/oomcat/aeneas-arc/src/_build/default/main.exe",
+    "lean_pkg": "/tmp/oomcat/aeneas-arc/backends/lean"
   }
 }

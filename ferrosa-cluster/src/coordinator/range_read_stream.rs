@@ -126,7 +126,7 @@ const DEFAULT_MERGE_SOURCE_FRAGMENT_TIMEOUT: Duration = STREAMING_IDLE_TIMEOUT;
 /// through [`set_merge_source_fragment_timeout_for_test`]; production always
 /// reads the default, so the override does not exist there at all.
 #[cfg(test)]
-fn merge_source_fragment_timeout() -> Duration {
+pub(crate) fn merge_source_fragment_timeout() -> Duration {
     match MERGE_SOURCE_FRAGMENT_TIMEOUT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
         0 => DEFAULT_MERGE_SOURCE_FRAGMENT_TIMEOUT,
         ms => Duration::from_millis(ms),
@@ -134,7 +134,7 @@ fn merge_source_fragment_timeout() -> Duration {
 }
 
 #[cfg(not(test))]
-fn merge_source_fragment_timeout() -> Duration {
+pub(crate) fn merge_source_fragment_timeout() -> Duration {
     DEFAULT_MERGE_SOURCE_FRAGMENT_TIMEOUT
 }
 
@@ -1026,7 +1026,8 @@ where
         &mut self,
         token: i64,
         first: bool,
-    ) -> Result<Option<(Option<TokenHeader>, Vec<ferrosa_sstable::types::Row>)>, ClusterError> {
+    ) -> Result<Option<(Option<TokenHeader>, Vec<Arc<ferrosa_sstable::types::Row>>)>, ClusterError>
+    {
         self.ensure_peeked().await?;
         match self.peeked.as_ref() {
             Some(p) if p.key.token.0 == token => {
@@ -1055,7 +1056,7 @@ where
 struct TokenRowPuller<'c, S> {
     cursor: &'c mut FragmentCursor<S>,
     token: i64,
-    rows: std::vec::IntoIter<ferrosa_sstable::types::Row>,
+    rows: std::vec::IntoIter<Arc<ferrosa_sstable::types::Row>>,
     first: bool,
     exhausted: bool,
     header: Option<TokenHeader>,
@@ -1090,7 +1091,7 @@ where
     }
 
     /// Next row of this token, or `None` when the token is exhausted.
-    async fn next_row(&mut self) -> Result<Option<ferrosa_sstable::types::Row>, ClusterError> {
+    async fn next_row(&mut self) -> Result<Option<Arc<ferrosa_sstable::types::Row>>, ClusterError> {
         loop {
             if let Some(row) = self.rows.next() {
                 return Ok(Some(row));
@@ -1207,16 +1208,19 @@ fn suppress_static_under_partition_deletion(header: &mut TokenHeader) {
 /// `ferrosa_storage::merge::apply_deletions`. Returns `true` if the row survives
 /// (caller emits it), `false` if it is suppressed by the partition tombstone.
 fn suppress_row_deletions(
-    row: &mut ferrosa_sstable::types::Row,
+    row: &mut Arc<ferrosa_sstable::types::Row>,
     partition_deleted: bool,
     partition_cut: i64,
 ) -> bool {
     if partition_deleted && row.primary_key_liveness.timestamp < partition_cut {
         return false;
     }
-    if !row.deletion.is_live() {
-        let cut = row.deletion.marked_for_delete_at;
-        row.cells.retain(|(_c, cell)| cell.timestamp >= cut);
+    let cut = row.deletion.marked_for_delete_at;
+    // Copy on write only a shared row that actually loses a cell.
+    if !row.deletion.is_live() && row.cells.iter().any(|(_c, cell)| cell.timestamp < cut) {
+        Arc::make_mut(row)
+            .cells
+            .retain(|(_c, cell)| cell.timestamp >= cut);
     }
     true
 }
@@ -1331,7 +1335,8 @@ async fn run_fragment_merge_nway_inner<S>(
         let partition_cut = header.deletion.marked_for_delete_at;
 
         // Prime one head row per live source.
-        let mut heads: Vec<Option<ferrosa_sstable::types::Row>> = Vec::with_capacity(pullers.len());
+        let mut heads: Vec<Option<Arc<ferrosa_sstable::types::Row>>> =
+            Vec::with_capacity(pullers.len());
         for p in pullers.iter_mut() {
             let head = match p {
                 Some(puller) => try_or_forward!(puller.next_row().await),
@@ -1340,7 +1345,7 @@ async fn run_fragment_merge_nway_inner<S>(
             heads.push(head);
         }
 
-        let mut out_rows: Vec<ferrosa_sstable::types::Row> = Vec::with_capacity(k);
+        let mut out_rows: Vec<Arc<ferrosa_sstable::types::Row>> = Vec::with_capacity(k);
         let mut first_fragment = true;
 
         loop {
@@ -1363,12 +1368,12 @@ async fn run_fragment_merge_nway_inner<S>(
             // Fold every source whose head matches `ck`, advancing those
             // sources. `merge_rows` is order-independent, so left-fold across
             // the participating sources reproduces `merge_partitions`.
-            let mut merged: Option<ferrosa_sstable::types::Row> = None;
+            let mut merged: Option<Arc<ferrosa_sstable::types::Row>> = None;
             for (i, head) in heads.iter_mut().enumerate() {
                 if head.as_ref().map(|r| r.clustering == ck).unwrap_or(false) {
                     let row = head.take().expect("matched head");
                     merged = Some(match merged.take() {
-                        Some(prev) => ferrosa_storage::merge::merge_rows(prev, row),
+                        Some(prev) => ferrosa_storage::merge::merge_shared_rows(prev, row),
                         None => row,
                     });
                     if let Some(puller) = pullers[i].as_mut() {
@@ -1424,7 +1429,7 @@ async fn run_fragment_merge<L, R>(
 fn build_out_fragment(
     header: &mut TokenHeader,
     first_fragment: &mut bool,
-    out_rows: &mut Vec<ferrosa_sstable::types::Row>,
+    out_rows: &mut Vec<Arc<ferrosa_sstable::types::Row>>,
 ) -> Partition {
     let rows = std::mem::take(out_rows);
     if *first_fragment {
@@ -1570,6 +1575,10 @@ struct WindowedReplicaForwarder {
     wanted: Option<Vec<u16>>,
     index_name: Option<String>,
     index_key: Option<Vec<u8>>,
+    /// `Some(pk)` for a keyed index read: every window is an
+    /// `IndexReadInPartitionStreamRequest` scoped to this partition rather
+    /// than a global index or range request.
+    keyed_partition: Option<Vec<u8>>,
     window_chunks: u32,
     /// Set true ONLY when this replica's logical stream ends for a reason that
     /// makes a silent `remote_tx` close SAFE for the merge to read as "this
@@ -1583,6 +1592,45 @@ struct WindowedReplicaForwarder {
 }
 
 impl WindowedReplicaForwarder {
+    /// The request message for one window starting at the given resume
+    /// position: the keyed index request when this forwarder is scoped to a
+    /// partition, otherwise the range/global-index stream request.
+    fn window_request(
+        &self,
+        request_id: u32,
+        start_key: Option<Vec<u8>>,
+        start_clustering: Option<Vec<u8>>,
+    ) -> crate::error::Result<Message> {
+        let Some(partition_key) = &self.keyed_partition else {
+            return self
+                .encode_request(request_id, start_key, start_clustering)
+                .map(Message::RangeReadStreamRequest);
+        };
+        if start_key.as_ref().is_some_and(|key| key != partition_key) {
+            return Err(ClusterError::Internal(
+                "keyed index stream: a window ended outside its partition".into(),
+            ));
+        }
+        let (Some(index_name), Some(index_key)) = (&self.index_name, &self.index_key) else {
+            return Err(ClusterError::Internal(
+                "keyed index stream: forwarder has no index to read".into(),
+            ));
+        };
+        let payload = crate::raft::handlers::IndexReadInPartitionStreamRequestPayload {
+            request_id,
+            keyspace: self.keyspace.clone(),
+            table: self.table.clone(),
+            index_name: index_name.clone(),
+            index_key: index_key.clone(),
+            partition_key: partition_key.clone(),
+            after_clustering: start_clustering,
+            max_chunks: self.window_chunks,
+        };
+        bincode::serialize(&payload)
+            .map(|body| Message::IndexReadInPartitionStreamRequest(Bytes::from(body)))
+            .map_err(|e| ClusterError::Internal(format!("keyed index stream: encode request: {e}")))
+    }
+
     fn encode_request(
         &self,
         request_id: u32,
@@ -1674,27 +1722,19 @@ impl WindowedReplicaForwarder {
                 .next_request_id
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             receiver = self.router.register(request_id, STREAM_RECEIVER_BUFFER);
-            let body = match self.encode_request(
+            let request = match self.window_request(
                 request_id,
                 Some(resume.partition_key),
                 Some(resume.clustering),
             ) {
-                Ok(body) => body,
+                Ok(request) => request,
                 Err(e) => {
                     self.router.unregister(request_id);
                     let _ = remote_tx.send(Err(e)).await;
                     return;
                 }
             };
-            if let Err(e) = self
-                .peers
-                .fire(
-                    self.host_id,
-                    Message::RangeReadStreamRequest(body),
-                    Lane::Bulk,
-                )
-                .await
-            {
+            if let Err(e) = self.peers.fire(self.host_id, request, Lane::Bulk).await {
                 // A continuation fire failure mid-scan is a hard, loud error:
                 // the consumer already holds a prefix, so silently ending the
                 // stream here would return PARTIAL data as success.
@@ -1757,7 +1797,7 @@ impl ClusterCoordinator {
     /// windowed continuation forwarder. Returns the bounded, consumer-paced
     /// partition stream for that replica, or `Err` when the initial fire
     /// fails (the caller counts fan-out failures).
-    async fn spawn_replica_fragment_stream(
+    pub(crate) async fn spawn_replica_fragment_stream(
         &self,
         table_id: &TableId,
         host_id: uuid::Uuid,
@@ -1775,12 +1815,6 @@ impl ClusterCoordinator {
                  {host_id}; the local replica must be served from the local engine"
             )));
         }
-        let request_id = self.next_stream_request_id();
-        let receiver = self
-            .stream_router
-            .register(request_id, STREAM_RECEIVER_BUFFER);
-
-        let clean_end = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let forwarder = WindowedReplicaForwarder {
             router: self.stream_router.clone(),
             peers: self.peer_manager.clone(),
@@ -1791,21 +1825,74 @@ impl ClusterCoordinator {
             wanted: projected_regular_ordinals.map(|w| w.to_vec()),
             index_name: index.map(|(name, _)| name.to_string()),
             index_key: index.map(|(_, key)| key.to_vec()),
+            keyed_partition: None,
             window_chunks,
-            clean_end: clean_end.clone(),
+            clean_end: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
-        let body = forwarder
-            .encode_request(
-                request_id,
-                resume.map(|r| r.key.key.as_bytes().to_vec()),
-                resume.and_then(|r| r.clustering.clone()),
-            )
+        self.launch_windowed_forwarder(
+            forwarder,
+            resume.map(|r| r.key.key.as_bytes().to_vec()),
+            resume.and_then(|r| r.clustering.clone()),
+        )
+        .await
+    }
+
+    /// Open a STREAMING keyed index read of one partition on remote replica
+    /// `host_id`: `IndexReadInPartitionStreamRequest` windows of
+    /// `STREAM_WINDOW_CHUNKS` frames, each continued from the last row the
+    /// previous one delivered once the consumer drains it. Dropping the
+    /// returned stream cancels the producer. The peer must have advertised
+    /// `CAP_INDEX_PARTITION_STREAM`; the caller checks.
+    pub(crate) async fn spawn_replica_keyed_index_stream(
+        &self,
+        table_id: &TableId,
+        host_id: uuid::Uuid,
+        index_name: &str,
+        index_key: &[u8],
+        partition_key: &[u8],
+    ) -> crate::error::Result<ClusterPartitionStream> {
+        if host_id == self.peer_manager.local_host_id() {
+            return Err(ClusterError::Internal(format!(
+                "keyed index stream: refusing to fire a stream request to the local host_id \
+                 {host_id}; the local replica must be served from the local engine"
+            )));
+        }
+        let forwarder = WindowedReplicaForwarder {
+            router: self.stream_router.clone(),
+            peers: self.peer_manager.clone(),
+            next_request_id: self.next_request_id.clone(),
+            host_id,
+            keyspace: table_id.keyspace.clone(),
+            table: table_id.table.clone(),
+            wanted: None,
+            index_name: Some(index_name.to_string()),
+            index_key: Some(index_key.to_vec()),
+            keyed_partition: Some(partition_key.to_vec()),
+            window_chunks: STREAM_WINDOW_CHUNKS,
+            clean_end: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        self.launch_windowed_forwarder(forwarder, None, None).await
+    }
+
+    /// Fire `forwarder`'s first window from the given resume position and
+    /// spawn its continuation loop. Returns the bounded, consumer-paced
+    /// stream for that replica, or `Err` when the first fire fails.
+    async fn launch_windowed_forwarder(
+        &self,
+        forwarder: WindowedReplicaForwarder,
+        start_key: Option<Vec<u8>>,
+        start_clustering: Option<Vec<u8>>,
+    ) -> crate::error::Result<ClusterPartitionStream> {
+        let host_id = forwarder.host_id;
+        let clean_end = forwarder.clean_end.clone();
+        let request_id = self.next_stream_request_id();
+        let receiver = self
+            .stream_router
+            .register(request_id, STREAM_RECEIVER_BUFFER);
+        let request = forwarder
+            .window_request(request_id, start_key, start_clustering)
             .inspect_err(|_| self.stream_router.unregister(request_id))?;
-        if let Err(e) = self
-            .peer_manager
-            .fire(host_id, Message::RangeReadStreamRequest(body), Lane::Bulk)
-            .await
-        {
+        if let Err(e) = self.peer_manager.fire(host_id, request, Lane::Bulk).await {
             self.stream_router.unregister(request_id);
             return Err(ClusterError::Internal(format!(
                 "streaming range read: failed to fire request to {host_id}: {e}"
@@ -2729,7 +2816,7 @@ fn index_hit_position(partition: &Partition) -> (&[u8], &[u8]) {
 /// Only the local source is wrapped: a remote whose walk is slow but
 /// progressing (an R2 rehydrate) keeps its stream open through progress-gated
 /// heartbeats, and a per-row bound on it would undo that.
-fn bounded_local_index_source(
+pub(crate) fn bounded_local_index_source(
     source: ClusterPartitionStream,
     budget: Duration,
 ) -> ClusterPartitionStream {
@@ -2827,12 +2914,12 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(pk.to_vec())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: ck.to_vec(),
                 cells: Vec::new(),
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1),
-            }],
+            })],
         })
     }
 
@@ -2935,7 +3022,7 @@ mod tests {
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1),
             };
-            engine.write(&tid, &key, row, 1).unwrap();
+            engine.write(&tid, &key, Arc::new(row), 1).unwrap();
         }
 
         let local: ClusterPartitionStream = Box::pin(
@@ -3117,12 +3204,12 @@ mod tests {
             key: DecoratedKey::new(PartitionKey::new(pk.to_vec())),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: Vec::new(),
                 cells: Vec::new(),
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1),
-            }],
+            })],
         }
     }
 
@@ -3682,13 +3769,13 @@ mod tests {
             key: dk(b"alpha"),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![trow(1, b"prefix", 1000)],
+            rows: vec![Arc::new(trow(1, b"prefix", 1000))],
         };
         let replica_prefix = Partition {
             key: dk(b"bravo"),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![trow(1, b"replica-prefix", 1000)],
+            rows: vec![Arc::new(trow(1, b"replica-prefix", 1000))],
         };
         let failing: BoxedFragmentStream = Box::pin(futures::stream::iter(vec![
             Ok(replica_prefix),
@@ -3741,7 +3828,7 @@ mod tests {
             key: dk(b"alpha"),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![trow(1, b"v", 1)],
+            rows: vec![Arc::new(trow(1, b"v", 1))],
         }))
         .await
         .unwrap();
@@ -3777,7 +3864,7 @@ mod tests {
             key: dk(b"alpha"),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![trow(1, b"v", 1)],
+            rows: vec![Arc::new(trow(1, b"v", 1))],
         }))
         .await
         .unwrap();
@@ -3901,6 +3988,7 @@ mod tests {
             static_row: None,
             rows: (0..30)
                 .map(|c| trow(c, format!("L{c}").as_bytes(), 1000))
+                .map(Arc::new)
                 .collect(),
         };
         let remote0 = Partition {
@@ -3910,6 +3998,7 @@ mod tests {
             rows: (0..30)
                 .filter(|c| c % 2 == 0)
                 .map(|c| trow(c, format!("R{c}").as_bytes(), 2000))
+                .map(Arc::new)
                 .collect(),
         };
         // key1: local-only (disjoint token from remote).
@@ -3919,6 +4008,7 @@ mod tests {
             static_row: None,
             rows: (0..12)
                 .map(|c| trow(c, format!("x{c}").as_bytes(), 1500))
+                .map(Arc::new)
                 .collect(),
         };
         // key2: remote-only.
@@ -3928,6 +4018,7 @@ mod tests {
             static_row: None,
             rows: (0..7)
                 .map(|c| trow(c, format!("y{c}").as_bytes(), 1500))
+                .map(Arc::new)
                 .collect(),
         };
         // key3: both sides, with a static row on local and a partition
@@ -3943,6 +4034,7 @@ mod tests {
             }),
             rows: (0..20)
                 .map(|c| trow(c, format!("o{c}").as_bytes(), 1000))
+                .map(Arc::new)
                 .collect(),
         };
         local3.rows.sort_by(|a, b| a.clustering.cmp(&b.clustering));
@@ -3952,6 +4044,7 @@ mod tests {
             static_row: None,
             rows: (20..40)
                 .map(|c| trow(c, format!("n{c}").as_bytes(), 3000))
+                .map(Arc::new)
                 .collect(),
         };
 
@@ -4053,13 +4146,13 @@ mod tests {
             key: keys[0].clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![trow(0, b"prefix", 1000)],
+            rows: vec![Arc::new(trow(0, b"prefix", 1000))],
         };
         let stalled = Partition {
             key: keys[1].clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![trow(0, b"stalled", 1000)],
+            rows: vec![Arc::new(trow(0, b"stalled", 1000))],
         };
         let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
         let stalled_stream = OneFragmentThenPending {
@@ -4323,6 +4416,7 @@ mod tests {
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
                 })
+                .map(Arc::new)
                 .collect(),
         };
 
@@ -4406,7 +4500,7 @@ mod tests {
             key: key.clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: (0..n_rows).map(|c| mk_row(c, ts)).collect(),
+            rows: (0..n_rows).map(|c| mk_row(c, ts)).map(Arc::new).collect(),
         };
         // Three replicas, identical row SET, but each fragmented at a DIFFERENT
         // k so boundaries never line up. The coordinator merge k is yet another
@@ -4464,7 +4558,7 @@ mod tests {
                         key: key.clone(),
                         deletion: DeletionTime::LIVE,
                         static_row: None,
-                        rows,
+                        rows: rows.into_iter().map(Arc::new).collect(),
                     };
                     fragment_partition(&whole, k)
                 })
@@ -4512,6 +4606,7 @@ mod tests {
             static_row: None,
             rows: (0..30)
                 .map(|c| trow(c, format!("a{c}").as_bytes(), 1000))
+                .map(Arc::new)
                 .collect(),
         };
         let s1k0 = Partition {
@@ -4521,6 +4616,7 @@ mod tests {
             rows: (0..30)
                 .filter(|c| c % 2 == 0)
                 .map(|c| trow(c, format!("b{c}").as_bytes(), 2000))
+                .map(Arc::new)
                 .collect(),
         };
         let s2k0 = Partition {
@@ -4530,6 +4626,7 @@ mod tests {
             rows: (0..30)
                 .filter(|c| c % 3 == 0)
                 .map(|c| trow(c, format!("c{c}").as_bytes(), 3000))
+                .map(Arc::new)
                 .collect(),
         };
         // key1: only s1 has it (disjoint).
@@ -4539,6 +4636,7 @@ mod tests {
             static_row: None,
             rows: (0..9)
                 .map(|c| trow(c, format!("d{c}").as_bytes(), 1500))
+                .map(Arc::new)
                 .collect(),
         };
         // key2: s0 + s2, with a partition tombstone on s2 suppressing s0's old rows.
@@ -4553,6 +4651,7 @@ mod tests {
             }),
             rows: (0..20)
                 .map(|c| trow(c, format!("o{c}").as_bytes(), 1000))
+                .map(Arc::new)
                 .collect(),
         };
         let s2k2 = Partition {
@@ -4561,6 +4660,7 @@ mod tests {
             static_row: None,
             rows: (20..36)
                 .map(|c| trow(c, format!("n{c}").as_bytes(), 3000))
+                .map(Arc::new)
                 .collect(),
         };
 
@@ -4608,7 +4708,7 @@ mod tests {
     /// simulation can compare against the whole-merge reference and apply the
     /// skip-≤-last cursor in true (token, clustering) order, exactly as the CQL
     /// paging collector does.
-    fn flatten_to_rows(parts: &[Partition]) -> Vec<(DecoratedKey, Vec<u8>, Row)> {
+    fn flatten_to_rows(parts: &[Partition]) -> Vec<(DecoratedKey, Vec<u8>, Arc<Row>)> {
         let mut out = Vec::new();
         for p in parts {
             for r in &p.rows {
@@ -4667,6 +4767,7 @@ mod tests {
             rows: (0..50)
                 .filter(|c| c % modulo == 0)
                 .map(|c| trow(c, format!("{tag}{c}").as_bytes(), ts))
+                .map(Arc::new)
                 .collect(),
         };
         let s0w = wide('a', 1, 1000); // every clustering
@@ -4680,6 +4781,7 @@ mod tests {
             static_row: None,
             rows: (0..9)
                 .map(|c| trow(c, format!("d{c}").as_bytes(), 1500))
+                .map(Arc::new)
                 .collect(),
         };
         let s0k2 = Partition {
@@ -4693,6 +4795,7 @@ mod tests {
             }),
             rows: (0..20)
                 .map(|c| trow(c, format!("o{c}").as_bytes(), 1000))
+                .map(Arc::new)
                 .collect(),
         };
         let s2k2 = Partition {
@@ -4701,6 +4804,7 @@ mod tests {
             static_row: None,
             rows: (20..36)
                 .map(|c| trow(c, format!("n{c}").as_bytes(), 3000))
+                .map(Arc::new)
                 .collect(),
         };
 
@@ -4727,7 +4831,7 @@ mod tests {
         for page_size in [1usize, 3, 7, 50] {
             for k in [1usize, 4, 8] {
                 let mut cursor: Option<(DecoratedKey, Vec<u8>)> = None;
-                let mut paged: Vec<(DecoratedKey, Vec<u8>, Row)> = Vec::new();
+                let mut paged: Vec<(DecoratedKey, Vec<u8>, Arc<Row>)> = Vec::new();
 
                 // Hard iteration cap: at most one page per reference row, plus a
                 // final empty page. Guards against a paging bug looping forever.
@@ -4822,6 +4926,7 @@ mod tests {
             static_row: None,
             rows: (0..40)
                 .map(|c| trow(c, format!("a{c}").as_bytes(), 1000))
+                .map(Arc::new)
                 .collect(),
         };
         let s1k0 = Partition {
@@ -4831,6 +4936,7 @@ mod tests {
             rows: (0..40)
                 .filter(|c| c % 2 == 0)
                 .map(|c| trow(c, format!("b{c}").as_bytes(), 2000))
+                .map(Arc::new)
                 .collect(),
         };
         let s1k1 = Partition {
@@ -4839,6 +4945,7 @@ mod tests {
             static_row: None,
             rows: (0..15)
                 .map(|c| trow(c, format!("d{c}").as_bytes(), 1500))
+                .map(Arc::new)
                 .collect(),
         };
         let s0k2 = Partition {
@@ -4852,6 +4959,7 @@ mod tests {
             }),
             rows: (0..10)
                 .map(|c| trow(c, format!("o{c}").as_bytes(), 1000))
+                .map(Arc::new)
                 .collect(),
         };
 

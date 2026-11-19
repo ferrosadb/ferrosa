@@ -22,9 +22,14 @@
 //! relevant slice — walk `mach_vm_region(VM_REGION_EXTENDED_INFO)`, join the
 //! backing path with `proc_regionfilename`, and sum `pages_resident` /
 //! `pages_dirtied` for the component under test.
-#![cfg(target_os = "macos")]
+//!
+//! Only the mach inspector (`mod vm`) and the tests that read it are gated on
+//! macOS. The fixtures and the byte-identity test compile on every target, so
+//! Linux clippy type-checks them against the shared SSTable types: when the
+//! whole file was macOS-only, a change to `Partition.rows` broke only the
+//! release's macOS build (v2026.11.18.2009).
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
 use ferrosa_sstable::io::{FileReadAt, ReadAt};
@@ -47,6 +52,7 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 // ── VM-region inspector (in-process, no permission needed) ──────────────────
 
+#[cfg(target_os = "macos")]
 mod vm {
     use std::ffi::CStr;
 
@@ -270,12 +276,12 @@ fn partition(idx: usize) -> Partition {
         key,
         deletion: DeletionTime::LIVE,
         static_row: None,
-        rows: vec![Row {
+        rows: vec![Arc::new(Row {
             clustering: 1i32.to_be_bytes().to_vec(),
             cells: vec![(0, CellValue::live(vec![b'x'; 16], 1))],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1),
-        }],
+        })],
     }
 }
 
@@ -311,6 +317,7 @@ fn write_sstable(n: usize) -> (tempfile::TempDir, std::path::PathBuf, u64) {
 
 /// Read every byte of the component through the reader (this is what makes a
 /// whole-file mapping resident).
+#[cfg(target_os = "macos")]
 fn touch_all(reader: &FileReadAt) {
     let len = reader.len().expect("len");
     let mut buf = vec![0u8; 64 * 1024];
@@ -327,11 +334,14 @@ fn touch_all(reader: &FileReadAt) {
 
 /// N partitions — an index component that is a few MiB, far above the 1 MiB
 /// ceiling used below.
+#[cfg(target_os = "macos")]
 const N: usize = 150_000;
+#[cfg(target_os = "macos")]
 const BUDGET_BYTES: u64 = 1024 * 1024;
 
 /// A part of a `Partitions.db` is read back byte-exactly regardless of which
 /// reader mode the ceiling selects.
+#[cfg(target_os = "macos")]
 fn read_back_first_key(path: &std::path::Path) -> u64 {
     let reader = FileReadAt::open(path).expect("open");
     let mut buf = vec![0u8; 16];
@@ -382,6 +392,7 @@ fn bounded_and_mapped_readers_return_identical_bytes() {
 ///
 /// RED before the fix: `FileReadAt::open` maps every `-Partitions.db` whole,
 /// so the measured residency reads back the file size however large it is.
+#[cfg(target_os = "macos")]
 #[test]
 fn index_component_residency_is_bounded_by_the_tunable_buffer() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -420,6 +431,7 @@ fn index_component_residency_is_bounded_by_the_tunable_buffer() {
 /// separate file-backed memory from anonymous memory; if that call names a file
 /// for anonymous pages, the class split is wrong and so is any conclusion drawn
 /// from it (e.g. "the SSTable mappings dominate the COMMIT peak").
+#[cfg(target_os = "macos")]
 #[test]
 fn anonymous_memory_is_not_attributed_to_a_file_path() {
     const ANON_BYTES: usize = 256 * 1024 * 1024;
@@ -442,6 +454,7 @@ fn anonymous_memory_is_not_attributed_to_a_file_path() {
 /// NEGATIVE CONTROL: with the ceiling lifted, the same measurement must show
 /// the whole file resident — otherwise the guard above is vacuous (it would
 /// pass for a reason unrelated to the ceiling).
+#[cfg(target_os = "macos")]
 #[test]
 fn control_lifting_the_ceiling_maps_the_whole_index_resident() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());

@@ -136,7 +136,12 @@ fn write_model_value(
     value: Vec<u8>,
 ) {
     engine
-        .write(table, &key(id), live_row(&value, timestamp), timestamp)
+        .write(
+            table,
+            &key(id),
+            Arc::new(live_row(&value, timestamp)),
+            timestamp,
+        )
         .expect("write model value");
     model.insert(id, Some(value));
 }
@@ -265,7 +270,7 @@ async fn run_program(table_name: &str, program: &[u8]) {
                     .write(
                         &table,
                         &key(id),
-                        partition_tombstone(timestamp, 0),
+                        Arc::new(partition_tombstone(timestamp, 0)),
                         timestamp,
                     )
                     .expect("delete model key");
@@ -349,11 +354,16 @@ async fn purge_readiness_drops_old_tombstones_without_resurrection() {
         .expect("register purge table");
 
     engine
-        .write(&table, &key(0), live_row(b"old", 1_000), 1_000)
+        .write(&table, &key(0), Arc::new(live_row(b"old", 1_000)), 1_000)
         .expect("write old value");
     for id in 1u8..4 {
         engine
-            .write(&table, &key(id), live_row(b"survivor", 1_000), 1_000)
+            .write(
+                &table,
+                &key(id),
+                Arc::new(live_row(b"survivor", 1_000)),
+                1_000,
+            )
             .expect("write survivor");
     }
     engine.flush(&table).expect("flush old value");
@@ -361,7 +371,7 @@ async fn purge_readiness_drops_old_tombstones_without_resurrection() {
         .write(
             &table,
             &key(0),
-            partition_tombstone(2_000, 1_000_000_000),
+            Arc::new(partition_tombstone(2_000, 1_000_000_000)),
             2_000,
         )
         .expect("delete old value");

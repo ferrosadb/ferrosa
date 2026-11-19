@@ -105,7 +105,10 @@ use those same stored endpoint keys.
   `max_groups` / `max_collect_size` / `max_var_path_visited` in aggregation and
   var-length paths). `max_result_rows` is a deprecated field that no
   executor path enforces: result truncation was removed and an unbounded
-  `ORDER BY` spills instead (`executor/spill.rs`).
+  `ORDER BY` spills instead (`executor/spill.rs`). Results stream end to end;
+  write operators (SET/REMOVE/DELETE) and the MATCH anchor frontier spill past
+  `spill_threshold_bytes`. `GraphEngine::execute` is test-only — use
+  `execute_stream_with_params`.
 - **Streaming entry point** (`executor/stream.rs`, `executor/expand.rs`) —
   `execute_streaming()` returns `(columns, RowStream<'a>, QueryStats)`;
   `execute()` is a thin `collect` over it, so there is one executor, not two.
@@ -458,7 +461,10 @@ stops at the first owned relationship. A foreign tenant's matching UUID does not
 prohibit deletion of this vertex.
 
 `DETACH DELETE` streams declared edge tables and deletes exact incident edge
-and vertex rows in one batch, preserving sibling rows. Shared adjacency entries
+and vertex rows in one atomic batch, preserving sibling rows. The batch is
+staged and spills past the spill threshold (`expand/detach_delete.rs`; counters
+`detach_delete_spilled_batches` / `detach_delete_in_memory_batches`); in Cluster
+mode the batchlog still holds it in memory (t_1ce56235, logged at WARN). Shared adjacency entries
 remain live while another physical edge supports them, including edges in other
 tenant partitions. Reconciliation checks that support before deleting entries
 from legacy layouts whose physical keys cannot be recovered from adjacency.
@@ -521,7 +527,7 @@ label, is what would attribute it.
   `WriteObserver` / `ObserverMode` (the observer hook).
 
 External: `axum`/`axum-server` (`tls-rustls-no-provider`), `rustls`, `tokio-rustls`, `tokio`, `serde`/`serde_json`, `arc-swap`,
-`parking_lot`, `indexmap`, `phf`, `blake3`, `uuid`, `base64`, `hex`, `chrono`.
+`parking_lot`, `indexmap`, `phf`, `blake3`, `uuid`, `base64`, `hex`. Timestamp text uses `ferrosa_common::temporal` (no date library).
 
 **Called by** (crates that depend on this):
 

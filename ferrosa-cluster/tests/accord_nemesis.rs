@@ -117,7 +117,7 @@ fn nemesis_mutation(key: &[u8], value: i32) -> Vec<u8> {
         NEMESIS_KS.to_string(),
         NEMESIS_TABLE.to_string(),
         DecoratedKey::new(PartitionKey::new(key.to_vec())),
-        vec![row],
+        vec![Arc::new(row)],
         1,
     );
     let mut buf = vec![0u8; m.serialized_size()];
