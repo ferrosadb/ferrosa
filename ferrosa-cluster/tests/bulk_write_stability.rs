@@ -404,3 +404,116 @@ async fn bulk_writes_do_not_starve_probe_latency() {
          followers would miss heartbeats under this write load"
     );
 }
+
+/// A pair write replicates while the primary's own commit-log sync is still
+/// in flight, so its latency is the SLOWER of the two device flushes, not
+/// their sum.
+///
+/// Both nodes must still be durable before the write is acknowledged; only
+/// the order changes. Until 2026-11-18 the primary fsynced, and only then sent
+/// the mutation to the secondary, which fsynced again. Two serial flushes on a
+/// disk shared with other writers put p99 at 137 ms and a probe at 384 ms on
+/// CI (run 44390667223), past the 100 ms and 300 ms bounds above.
+///
+/// Holding the primary's real flush mutex stalls its local sync
+/// deterministically; the secondary must receive and apply the row anyway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn replication_proceeds_while_the_primary_sync_is_blocked() {
+    let (node1, _node2, storage1, storage2) = setup_pair().await;
+    let mutation = make_mutation(42, 42_000);
+    let table_id = TableId::new("test_ks", "test_tbl");
+    let runtime = tokio::runtime::Handle::current();
+
+    let mut write = None;
+    let mut replicated_while_blocked = false;
+    storage1.with_commit_log_flush_held_for_test(|| {
+        let coordinator = node1.coordinator().clone();
+        let sent = mutation.clone();
+        write = Some(runtime.spawn(async move { coordinator.coordinate_write(&sent).await }));
+        // Bounded poll for the positive event; 5 s is the failure verdict.
+        for _ in 0..5_000 {
+            if storage2.read(&table_id, &mutation.key).unwrap().is_some() {
+                replicated_while_blocked = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+
+    let acked = write.expect("write spawned").await.expect("write task");
+    assert!(
+        replicated_while_blocked,
+        "the secondary did not receive the write within 5 s while the primary's \
+         sync was blocked: replication waits for the primary's local fsync"
+    );
+    assert!(acked.is_ok(), "write failed after both syncs: {acked:?}");
+    assert!(storage1.read(&table_id, &mutation.key).unwrap().is_some());
+}
+
+/// A pair batch reaches the secondary as ONE atomic apply and one sync, not
+/// as one durable round trip per mutation.
+///
+/// `WritePath::write_batch` used to send every mutation through
+/// `coordinate_write_with` in turn: a batch of N paid N serial round trips,
+/// each waiting for a device flush on both nodes, and the secondary applied
+/// the batch one mutation at a time. Holding the secondary's real flush mutex
+/// makes the old shape visible: the secondary logs the first mutation and
+/// blocks on its sync, and the rest are never sent. With one atomic batch it
+/// logs all of them before the sync (`write_atomic_batch` makes the batch
+/// durable before any of it is visible, so the commit log, not a read, is the
+/// observable).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn a_pair_batch_reaches_the_secondary_whole() {
+    use ferrosa_cluster::write_path::WritePath;
+    use ferrosa_cluster::ConsistencyLevel;
+
+    let (node1, _node2, storage1, storage2) = setup_pair().await;
+    let table_id = TableId::new("test_ks", "test_tbl");
+    let batch: Vec<Mutation> = (0..3u64)
+        .map(|i| make_mutation(7_000 + i, 7_000_000 + i as i64))
+        .collect();
+    let keys: Vec<_> = batch.iter().map(|m| m.key.clone()).collect();
+    let whole: u64 = batch
+        .iter()
+        .map(|m| ferrosa_storage::commitlog::CommitLog::entry_size(m) as u64)
+        .sum();
+    let path = WritePath::Pair(node1.coordinator().clone());
+    let runtime = tokio::runtime::Handle::current();
+    let before = storage2.commit_log_position();
+
+    let mut write = None;
+    let mut logged = 0;
+    storage2.with_commit_log_flush_held_for_test(|| {
+        let sent = batch.clone();
+        write = Some(
+            runtime.spawn(async move { path.write_batch(sent, ConsistencyLevel::All, 2).await }),
+        );
+        // Bounded poll for the positive event; 5 s is the failure verdict.
+        for _ in 0..5_000 {
+            let now = storage2.commit_log_position();
+            assert_eq!(
+                now.segment_id, before.segment_id,
+                "the secondary rotated mid-test"
+            );
+            logged = now.offset - before.offset;
+            if logged >= whole {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+
+    let acked = write.expect("batch spawned").await.expect("batch task");
+    assert!(
+        logged >= whole,
+        "the secondary logged {logged} B of the {whole} B batch while its sync was \
+         blocked: the batch is replicated one durable round trip at a time"
+    );
+    assert!(acked.is_ok(), "batch failed after both syncs: {acked:?}");
+    for key in &keys {
+        assert!(storage1.read(&table_id, key).unwrap().is_some());
+        assert!(storage2.read(&table_id, key).unwrap().is_some());
+    }
+}

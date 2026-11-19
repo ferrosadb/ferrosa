@@ -546,10 +546,11 @@ impl WritePath {
     }
 
     /// Write a logged batch atomically. In standalone mode this goes
-    /// through `StorageEngine::write_atomic_batch()`. In pair mode each
-    /// mutation is forwarded individually (atomic guarantee comes from
-    /// the batchlog). In cluster mode the `ClusterCoordinator` handles
-    /// the 3-phase batchlog protocol.
+    /// through `StorageEngine::write_atomic_batch()`. In pair mode each node
+    /// applies the whole batch atomically with one commit-log sync, and the
+    /// primary sends it to the secondary as one `PairBatchForward`
+    /// (`PairCoordinator::coordinate_batch_returning`). In cluster mode the
+    /// `ClusterCoordinator` handles the 3-phase batchlog protocol.
     pub async fn write_batch(
         &self,
         mutations: Vec<Mutation>,
@@ -571,11 +572,11 @@ impl WritePath {
                 "pair mode: primary unavailable, writes rejected until operator promotes".into(),
             )),
             Self::Pair(coordinator) => {
-                for mutation in mutations {
-                    coordinator
-                        .coordinate_write_with(&mutation, cl, rf)
-                        .await
-                        .map_err(|e| ferrosa_common::Error::InvalidData(format!("pair: {e}")))?;
+                let committed = coordinator
+                    .coordinate_batch_returning(mutations, uuid::Uuid::new_v4(), cl, rf)
+                    .await
+                    .map_err(|e| ferrosa_common::Error::InvalidData(format!("pair: {e}")))?;
+                for mutation in &committed {
                     if let Some((bus, event)) = committed_cdc_event(
                         coordinator.local_storage(),
                         &TableId::new(&mutation.keyspace, &mutation.table),

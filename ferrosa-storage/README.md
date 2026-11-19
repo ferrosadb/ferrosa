@@ -92,7 +92,10 @@ controls already passed before the fix (`tests/count_payload_alloc.rs`).
   rewritten and a reader tailing the open segment never sees a marker change.
   A full or sealed segment closes its final head with `next = 0`. Segments
   from older binaries (which patched the previous marker in place) still
-  replay unchanged. Three sync strategies
+  replay unchanged. Forced syncs group-commit: a `force_sync` closes its
+  section only once it holds the flush lock, so one fsync covers every caller
+  queued behind it, and a caller whose entries an earlier flush already made
+  durable returns without I/O (FMEA ST-113). Three sync strategies
   (`Batch`, `Periodic`, `Group`); **default is `Periodic`** → a bounded
   durability window (see FMEA). Open-time replay re-logs every mutation it
   keeps only in memory into the new log generation (`ReplayRelog`) and fsyncs
