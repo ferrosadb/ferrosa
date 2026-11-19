@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-sstable
 status: implemented
-last_updated: 2026-09-26
+last_updated: 2026-11-15
 executive_summary: >
   The Cassandra-compatible BTI (Big Trie-Indexed) SSTable reader and writer —
   the engine's on-disk data layer. Reads and writes the 8-component BTI format
@@ -58,7 +58,7 @@ async/S3 wrapper (`S3ReadAt`) deliberately lives one layer up in
 | `statistics` (`src/statistics.rs`) | ~1006 | Statistics.db, `SerializationHeader` |
 | `partition_index` / `row_index` | ~875 | Trie-backed Partitions.db / Rows.db |
 | `byte_comparable` | ~347 | Byte-comparable key encoding for the index |
-| `compression` | ~500 | `Compression` enum, chunk compress/decompress + CRC. `compress_bound`/`compress_into` (T-036) compress into a caller-owned buffer for the write pump's `ChunkCompressor` (T-038) |
+| `compression` | ~500 | `Compression` enum, chunk compress/decompress + CRC. `compress_bound`/`compress_into` (T-036) compress into a caller-owned buffer for the write pump's `ChunkCompressor` (T-038); `decompress_into` writes into caller-owned storage, and `decompress` delegates to it to enforce the caller's output-size bound  |
 | `varint` / `marshal` | ~473 | Cassandra VInt codec, `AbstractType` marshalling |
 | `bloom` | ~293 | Cassandra-compatible double-hashing bloom filter |
 | `toc` | ~156 | TOC.txt read/write, standard component lists |
@@ -163,6 +163,12 @@ skips the opt-in) keeps working.
    same `SerializationHeader` baseline or every timestamp/TTL decodes wrong.
 4. **Bounded allocation on read.** Any length-prefixed buffer over
    `MAX_VALUE_LEN` (256 MiB) is rejected as corruption before allocating.
+   The compression codec also enforces a per-call output bound:
+   `decompress` must not return more bytes than the caller's
+   `uncompressed_len`, and `decompress_into` must not write beyond
+   the destination buffer. This does not impose a process-wide
+   memory limit; `chunk_length` from `CompressionInfo.db` remains
+   separately constrained only to be greater than zero.
 5. **No async dependency.** Positional I/O is synchronous; the S3/runtime
    wrapper lives in `ferrosa-storage`.
 6. **Checksums cover on-disk bytes, not logical content.** `Digest.crc32`
