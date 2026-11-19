@@ -1,6 +1,8 @@
 package ferrosa.test;
 
 import com.datastax.oss.driver.api.core.CqlSession;
+import com.datastax.oss.driver.api.core.config.DefaultDriverOption;
+import com.datastax.oss.driver.api.core.config.DriverConfigLoader;
 import com.datastax.oss.driver.api.core.cql.BatchStatement;
 import com.datastax.oss.driver.api.core.cql.DefaultBatchType;
 import com.datastax.oss.driver.api.core.cql.PreparedStatement;
@@ -44,6 +46,25 @@ public class CqlSmokeTest {
 
     private static int passed = 0;
     private static int failed = 0;
+
+    /**
+     * A session with LZ4 negotiated on protocol v5.
+     *
+     * Protocol and compression are set on the config loader because
+     * {@code withCompression} does not exist on the builder in 4.x; the
+     * behaviour is selected by {@link DefaultDriverOption#PROTOCOL_COMPRESSION}.
+     */
+    private static CqlSession lz4Session() {
+        return CqlSession.builder()
+                .addContactPoint(new InetSocketAddress(ferrosaHost(), ferrosaPort()))
+                .withLocalDatacenter("datacenter1")
+                .withConfigLoader(DriverConfigLoader.programmaticBuilder()
+                        .withString(DefaultDriverOption.PROTOCOL_VERSION, "V5")
+                        .withString(DefaultDriverOption.PROTOCOL_COMPRESSION, "lz4")
+                        .withDuration(DefaultDriverOption.REQUEST_TIMEOUT, java.time.Duration.ofSeconds(10))
+                        .build())
+                .build();
+    }
 
     private static void test(String name, Runnable fn) {
         try {
@@ -105,6 +126,61 @@ public class CqlSmokeTest {
             Row row = rs.one();
             assertTrue(row != null, "expected at least 1 row");
             assertTrue(row.getString("cluster_name") != null, "cluster_name should not be null");
+        });
+
+        // ---- LZ4 compression on protocol v5 ---------------------------------
+        //
+        // ferrosa-cql#664. easy-db-lab runs cassandra-easy-stress, which uses
+        // this driver with LZ4 on by default, and it could not open a session:
+        // the server decompressed v5 envelope bodies a second time and closed
+        // the connection at its very first query.
+        //
+        // This smoke test is the acceptance that the Rust-level fixtures cannot
+        // give: they are captured Python-driver bytes, and that driver leaves
+        // the envelope flags at 0x00, so nothing in CI ever negotiated LZ4 with
+        // a real driver. The assertion below is the exact statement the issue
+        // reports failing, over a connection whose compression is checked to be
+        // LZ4 and not silently absent.
+        test("lz4 compression on v5 (issue #664)", () -> {
+            try (CqlSession compressed = lz4Session()) {
+                assertEqual(
+                        compressed.getContext().getProtocolVersion().name(),
+                        "V5",
+                        "compression test must run on protocol V5");
+                assertEqual(
+                        compressed.getContext().getConfig()
+                                .getDefaultProfile()
+                                .getString(DefaultDriverOption.PROTOCOL_COMPRESSION),
+                        "lz4",
+                        "compression test must actually negotiate LZ4");
+
+                // The statement from the issue's failure trace, step 3.
+                Row row = compressed
+                        .execute("SELECT cluster_name FROM system.local")
+                        .one();
+                assertTrue(row != null, "expected a row from system.local");
+                assertTrue(
+                        row.getString("cluster_name") != null,
+                        "cluster_name should not be null over LZ4");
+
+                // More than the setup query: DDL and a read/write round trip
+                // prove the compressed framing survives response bodies too,
+                // not only requests.
+                compressed.execute(
+                        "CREATE KEYSPACE IF NOT EXISTS " + KEYSPACE + "_lz4"
+                                + " WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}");
+                compressed.execute(
+                        "CREATE TABLE IF NOT EXISTS " + KEYSPACE + "_lz4.kv (k text PRIMARY KEY, v text)");
+                compressed.execute(
+                        "INSERT INTO " + KEYSPACE + "_lz4.kv (k, v) VALUES ('a', 'lz4-roundtrip')");
+                Row kv = compressed
+                        .execute("SELECT v FROM " + KEYSPACE + "_lz4.kv WHERE k = 'a'")
+                        .one();
+                assertTrue(kv != null, "expected the written row back");
+                assertEqual(kv.getString("v"), "lz4-roundtrip", "value over LZ4");
+
+                compressed.execute("DROP KEYSPACE IF EXISTS " + KEYSPACE + "_lz4");
+            }
         });
 
         test("system.peers", () -> {

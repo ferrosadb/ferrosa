@@ -22,6 +22,18 @@
             <artifactId>java-driver-core</artifactId>
             <version>4.18.1</version>
         </dependency>
+        <!--
+            The driver declares lz4-java as <optional>true</optional>, so it is
+            NOT pulled in transitively and LZ4 cannot be negotiated without this
+            explicit dependency. Lz4Compressor throws
+            "Could not find the LZ4 library on the classpath" otherwise, which
+            would make the compression test pass for the wrong reason.
+        -->
+        <dependency>
+            <groupId>org.lz4</groupId>
+            <artifactId>lz4-java</artifactId>
+            <version>1.8.1</version>
+        </dependency>
     </dependencies>
 
     <build>

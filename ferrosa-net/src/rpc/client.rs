@@ -267,12 +267,7 @@ impl RpcClient {
             let framed = Framed::new(stream?, InternodeCodec::new(config.max_frame_body_size));
             return Self::finish_connect(config, local_host_id, peer_addr, framed, task_pool).await;
         }
-        // Bounded: an unroutable or SYN-dropping peer would otherwise hang here
-        // for the OS connect timeout (minutes), stalling every retry loop.
-        let tcp_stream =
-            tokio::time::timeout(config.connect_timeout, TcpStream::connect(peer_addr))
-                .await
-                .map_err(|_| NetError::Timeout(format!("tcp connect to {peer_addr}")))??;
+        let tcp_stream = dial_tcp(peer_addr, config.connect_timeout).await?;
 
         // Perform the protocol handshake (and TLS if configured) using a helper
         // that handles the stream type generically.
@@ -568,6 +563,36 @@ impl RpcClient {
     }
 }
 
+/// Open the TCP connection to a peer for [`RpcClient::connect`].
+///
+/// Bounded: an unroutable or SYN-dropping peer would otherwise hang here for
+/// the OS connect timeout (minutes), stalling every retry loop.
+///
+/// Nagle is disabled, as the inbound side (`RpcServer`) already does. Every
+/// request on a lane shares this one connection, so with Nagle on a request
+/// written while an earlier one is unacknowledged waits for the peer's ACK,
+/// which rides on the earlier request's response: a pair write issued beside
+/// another waited out the other write's fsync before the secondary read it.
+/// A socket that refuses the option still carries traffic, only slower, so
+/// that is logged at WARN rather than failing the connection.
+async fn dial_tcp(
+    peer_addr: std::net::SocketAddr,
+    connect_timeout: std::time::Duration,
+) -> Result<TcpStream> {
+    let stream = tokio::time::timeout(connect_timeout, TcpStream::connect(peer_addr))
+        .await
+        .map_err(|_| NetError::Timeout(format!("tcp connect to {peer_addr}")))??;
+    if let Err(error) = stream.set_nodelay(true) {
+        tracing::warn!(
+            %peer_addr,
+            %error,
+            "could not set TCP_NODELAY on the internode socket; requests that \
+             overlap on this connection will wait for each other's responses"
+        );
+    }
+    Ok(stream)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -709,6 +734,30 @@ mod tests {
             .unwrap();
         let alive_rx = client.alive_rx();
         assert!(*alive_rx.borrow(), "alive_rx should start as true");
+    }
+
+    /// The outbound internode socket disables Nagle, as the inbound one does.
+    ///
+    /// Requests share one connection per lane. With Nagle on, a request
+    /// written while an earlier one is still unacknowledged is held until the
+    /// peer's ACK, and that ACK rides on the earlier request's RESPONSE: a pair
+    /// write issued while another was in flight waited for the other write's
+    /// whole fsync before the secondary could even read it (5.8 ms p50,
+    /// 18.5 ms p99 on that hop, against 16 us for a request sent alone).
+    #[tokio::test]
+    async fn dialed_peer_sockets_disable_nagle() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.map(|(s, _)| s) });
+        let stream = dial_tcp(addr, std::time::Duration::from_secs(5))
+            .await
+            .expect("dial the local listener");
+        let _peer = accept.await.unwrap().unwrap();
+        assert!(
+            stream.nodelay().unwrap(),
+            "the dialed internode socket left Nagle on: a second request on the \
+             connection waits for the first one's response before it is sent"
+        );
     }
 
     #[tokio::test]

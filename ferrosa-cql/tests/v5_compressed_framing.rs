@@ -24,6 +24,26 @@ const DRIVER_COMPRESSED_COMPRESSIBLE: &str =
 const DRIVER_COMPRESSED_NOT_WORTH_COMPRESSING: &str =
     "11000000048e9ea305000002070000000853454c4543542031251f7480";
 
+/// The DataStax Java driver's actual setup request — `SELECT cluster_name FROM
+/// system.local` on stream 42, protocol v5, LZ4 negotiated, issue #664.
+///
+/// Two things are load-bearing and neither was covered by the fixtures above:
+///
+/// * The segment carries `uncompressed length = 0` (the request is too small to
+///   be worth compressing), so its payload is the plaintext envelope.
+/// * The envelope's flags byte is **0x01**. The driver still sets the deprecated
+///   compression bit on every non-STARTUP/OPTIONS envelope at v5, even though
+///   §2.4.1.2 of the spec says it is ignored.
+///
+/// A decoder that honours that bit decompresses plaintext. The body's first four
+/// bytes are `0x00000025` — the query-string length, 37 — which LZ4 reads as an
+/// uncompressed length, and the decode fails with "the offset to copy is not
+/// contained in the decompressed buffer". This fixture is constructed from the
+/// driver's own encoding rules (`SegmentCodec.encodeHeader`,
+/// `FrameCodec.computeFlags`, `ByteBufCompressor`); only the query text is ours.
+const DRIVER_V5_QUERY_ENVELOPE_FLAG_SET: &str =
+    "35000000047ce7e20501002a070000002c0000002553454c45435420636c75737465725f6e616d652046524f4d2073797374656d2e6c6f63616c000100090ceb66";
+
 fn hex_to_bytes(hex: &str) -> Vec<u8> {
     (0..hex.len())
         .step_by(2)
@@ -173,4 +193,70 @@ fn error_frames_on_a_compressed_connection_still_use_the_wide_header() {
     assert!(wire.is_empty());
     assert_eq!(decoded.header.opcode, Opcode::Error);
     assert_eq!(&decoded.body[..], &body[..]);
+}
+
+#[test]
+fn decodes_the_java_driver_setup_query_whose_envelope_flag_is_set() {
+    // Issue #664. The driver's control connection fails at "step 3 (QUERY
+    // (SELECT cluster_name FROM system.local))" against a v5 connection with
+    // LZ4 negotiated. This is that request, byte for byte.
+    let mut codec = compressed_v5_codec();
+    let mut src = BytesMut::from(&hex_to_bytes(DRIVER_V5_QUERY_ENVELOPE_FLAG_SET)[..]);
+
+    let frame = codec
+        .decode(&mut src)
+        .expect("the driver's own setup query must decode")
+        .expect("frame must be complete");
+
+    assert!(src.is_empty(), "decoder must consume the whole frame");
+    assert_eq!(frame.header.stream_id, 42);
+    assert_eq!(frame.header.opcode, Opcode::Query);
+
+    // The body must be the plaintext envelope body the driver encoded, read
+    // back through the same fields the server parses: [long string][consistency][flags].
+    assert_eq!(
+        frame.body.len(),
+        44,
+        "body must be the plaintext bytes, not an attempted LZ4 decode of them"
+    );
+    let query = b"SELECT cluster_name FROM system.local";
+    let mut cursor = &frame.body[..];
+    assert_eq!(
+        u32::from_be_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]) as usize,
+        query.len()
+    );
+    assert_eq!(&cursor[4..4 + query.len()], &query[..]);
+    cursor = &cursor[4 + query.len()..];
+    assert_eq!(&cursor[..2], &[0x00, 0x01], "consistency LOCAL_ONE");
+    assert_eq!(cursor[2], 0x00, "query flags: none");
+}
+
+#[test]
+fn the_envelope_flag_is_the_only_difference_from_a_working_frame() {
+    // Control: the same request with the deprecated bit CLEARED, CRC32
+    // recomputed so the frame is valid. That shape already worked, which is why
+    // this bug survived every fixture captured from the Python driver. The pair
+    // proves the flag alone decides whether a v5 body is decoded or destroyed.
+    const WITHOUT_FLAG: &str =
+        "35000000047ce7e20500002a070000002c0000002553454c45435420636c75737465725f6e616d652046524f4d2073797374656d2e6c6f63616c00010004f0270f";
+
+    let mut codec = compressed_v5_codec();
+    let mut src = BytesMut::from(&hex_to_bytes(DRIVER_V5_QUERY_ENVELOPE_FLAG_SET)[..]);
+    let flagged = codec.decode(&mut src).expect("flagged").expect("complete");
+
+    let mut codec = compressed_v5_codec();
+    let mut src = BytesMut::from(&hex_to_bytes(WITHOUT_FLAG)[..]);
+    let plain = codec
+        .decode(&mut src)
+        .expect("unflagged")
+        .expect("complete");
+
+    // The two wires are identical apart from the envelope flags byte (offset 9)
+    // and the trailing CRC32, which covers that byte.
+    assert_eq!(flagged.header.stream_id, plain.header.stream_id);
+    assert_eq!(flagged.header.opcode, plain.header.opcode);
+    assert_eq!(
+        flagged.body, plain.body,
+        "the deprecated 0x01 bit must not change how a v5 body is decoded"
+    );
 }
