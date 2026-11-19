@@ -2,7 +2,7 @@
 //
 // Assertions about the red table. They run on every `cargo test`; nothing here is ignored.
 
-use red_ledger::REDS;
+use red_ledger::{ClaimKind, METS, REDS};
 use std::collections::HashSet;
 
 /// **Every red is addressable.** Names are unique, so a closing test can take a red's name without
@@ -41,13 +41,73 @@ fn every_red_names_its_reason_and_witness() {
     }
 }
 
+/// **Every discharged row names its proof.** A `.met` row with no theorem is the same waiver a red
+/// with no witness is, only harder to notice because it reads as good news.
+#[test]
+fn every_met_names_its_proof() {
+    for met in METS {
+        assert!(!met.claim.is_empty(), "{}: empty claim", met.name);
+        assert!(!met.proof.is_empty(), "{}: no theorem proves it", met.name);
+    }
+}
+
+/// **A name is either red or discharged, never both.** The two tables partition the corpus, so a
+/// row cannot be dropped by being written twice.
+#[test]
+fn red_and_met_tables_are_disjoint() {
+    let reds: HashSet<&str> = REDS.iter().map(|r| r.name).collect();
+    for met in METS {
+        assert!(
+            !reds.contains(met.name),
+            "{} is both red and discharged",
+            met.name
+        );
+    }
+}
+
+/// **The discharged count is pinned.** Same rule as the reds: closing a claim moves this number in
+/// the same commit, so a `.met` row cannot vanish silently.
+#[test]
+fn met_count_is_pinned() {
+    assert_eq!(
+        METS.len(),
+        352,
+        "the number of discharged claims changed; update this pin and say why"
+    );
+}
+
+/// **The `code:` marker is load-bearing, so it must actually be reachable.** A `ClaimKind::Code` row is
+/// the only kind a reader may act on as assurance. If the marker stopped matching — a rename, a
+/// missing prefix on a flip, a generator bug — every row would silently become `Design` and nothing
+/// would fail. This test makes that a build failure instead: at least one row of each kind must
+/// exist in the corpus.
+#[test]
+fn both_claim_kinds_are_represented() {
+    let reds_code = REDS
+        .iter()
+        .filter(|r| r.claim_kind == ClaimKind::Code)
+        .count();
+    let mets_code = METS
+        .iter()
+        .filter(|m| m.claim_kind == ClaimKind::Code)
+        .count();
+    assert!(
+        reds_code > 0,
+        "no red row is marked `code:`, so the marker is not matching and every row would          read as a design claim"
+    );
+    assert!(
+        mets_code > 0,
+        "no discharged row is marked `code:`. A `.met` row is only assurance about the          shipping code when it carries the marker; verify a claim against the code and rename it          `code: …` in the same commit that flips it"
+    );
+}
+
 /// **Reds only change in review.** A count pinned here means a red cannot be dropped from the
 /// ledger without the number moving. Update it in the same commit that adds or closes a red.
 #[test]
 fn red_count_is_pinned() {
     assert_eq!(
         REDS.len(),
-        107,
+        113,
         "the number of reds changed; update this pin and say why"
     );
 }
