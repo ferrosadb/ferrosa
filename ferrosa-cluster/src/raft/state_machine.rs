@@ -4347,7 +4347,7 @@ mod tests {
             primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
         };
         engine
-            .write(&table_id, &key, row, 1)
+            .write(&table_id, &key, Arc::new(row), 1)
             .expect("recovered Raft snapshot must also register the table with StorageEngine");
     }
 
@@ -4503,12 +4503,12 @@ mod tests {
             .write(
                 &tid,
                 &key,
-                ferrosa_sstable::types::Row {
+                Arc::new(ferrosa_sstable::types::Row {
                     clustering: vec![],
                     cells: vec![],
                     deletion: ferrosa_sstable::types::DeletionTime::LIVE,
                     primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
-                },
+                }),
                 1,
             )
             .unwrap();
@@ -4546,12 +4546,12 @@ mod tests {
             .write(
                 &tid,
                 &key,
-                ferrosa_sstable::types::Row {
+                Arc::new(ferrosa_sstable::types::Row {
                     clustering: vec![],
                     cells: vec![],
                     deletion: ferrosa_sstable::types::DeletionTime::LIVE,
                     primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
-                },
+                }),
                 1,
             )
             .unwrap();
@@ -4679,12 +4679,12 @@ mod tests {
             .write(
                 &tid,
                 &key,
-                ferrosa_sstable::types::Row {
+                std::sync::Arc::new(ferrosa_sstable::types::Row {
                     clustering: vec![],
                     cells: vec![],
                     deletion: ferrosa_sstable::types::DeletionTime::LIVE,
                     primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
-                },
+                }),
                 1,
             )
             .unwrap();
@@ -4806,12 +4806,12 @@ mod tests {
             .write(
                 &tid,
                 &key,
-                ferrosa_sstable::types::Row {
+                Arc::new(ferrosa_sstable::types::Row {
                     clustering: vec![],
                     cells: vec![],
                     deletion: ferrosa_sstable::types::DeletionTime::LIVE,
                     primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
-                },
+                }),
                 1,
             )
             .unwrap();
@@ -4882,7 +4882,7 @@ mod tests {
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
             primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
         };
-        engine.write(&tid, &key, row, 1).unwrap();
+        engine.write(&tid, &key, Arc::new(row), 1).unwrap();
         assert!(engine.read(&tid, &key).unwrap().is_some());
         let mut replacement = old.clone();
         replacement.id = Uuid::new_v4();
@@ -9803,12 +9803,12 @@ mod tests {
             .write(
                 &table,
                 &key,
-                ferrosa_sstable::types::Row {
+                Arc::new(ferrosa_sstable::types::Row {
                     clustering: vec![],
                     cells: vec![],
                     deletion: ferrosa_sstable::types::DeletionTime::LIVE,
                     primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
-                },
+                }),
                 1,
             )
             .unwrap();

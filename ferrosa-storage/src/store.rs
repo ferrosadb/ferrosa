@@ -59,6 +59,8 @@ use crate::memtable::vector_index::VectorMemtableIndex;
 use crate::memtable::Memtable;
 use crate::merge;
 use crate::range_merger::ColumnOrdinalMapping;
+mod index_read;
+mod write;
 
 /// What a flush did to the table's SSTable set.
 ///
@@ -181,12 +183,6 @@ impl PartitionSource {
     }
 }
 
-/// Maximum number of row positions retained by partition-scoped and geo index
-/// reads. Global index reads are consumed by the CQL layer, which owns the
-/// inbound LIMIT/paging contract and must not turn a large, valid edge lookup
-/// into an empty result.
-const INDEX_RESULT_CAP: usize = 10_000;
-const RANGE_READ_MATERIALIZATION_CAP: usize = 10_000;
 const QVEC_HNSW_MAGIC: &[u8] = b"FERROSA-QVEC-HNSW-V1\n";
 
 fn build_quantized_vector_artifact<V: AsRef<[f32]>>(
@@ -331,8 +327,21 @@ impl PlanningComponents {
 /// liveness, row deletion) from legacy nanoseconds to microseconds, and count
 /// them under `legacy_ns_timestamps_normalised_total{source="memtable_write"}`.
 /// TTL and local deletion times are seconds and untouched (t_cf637b6e).
-fn normalise_legacy_ns_row(row: &mut Row) {
+///
+/// The row is shared with its writer, so it is only written to (copied on
+/// write if still shared) when it actually carries a legacy timestamp.
+fn normalise_legacy_ns_row(shared: &mut Arc<Row>) {
     use ferrosa_common::{is_legacy_ns, normalize_cell_ts};
+    let legacy = is_legacy_ns(shared.primary_key_liveness.timestamp)
+        || is_legacy_ns(shared.deletion.marked_for_delete_at)
+        || shared
+            .cells
+            .iter()
+            .any(|(_, cell)| is_legacy_ns(cell.timestamp));
+    if !legacy {
+        return;
+    }
+    let row = Arc::make_mut(shared);
     let mut count = 0u64;
     let mut normalise = |ts: &mut i64| {
         if is_legacy_ns(*ts) {
@@ -1618,7 +1627,11 @@ fn scalar_index_from_rows(
         let pk_bytes = partition.key.key.as_bytes();
         if let Some(position) = find(&catalog.indexed_columns) {
             let predicate = catalog.index_filter_predicates.get(index_name);
-            for row in partition.static_row.iter().chain(partition.rows.iter()) {
+            for row in partition
+                .static_row
+                .iter()
+                .chain(partition.rows.iter().map(|row| &**row))
+            {
                 insert_scalar_memtable_index_row(
                     &index, index_name, position, index_type, predicate, pk_bytes, row,
                 );
@@ -1670,7 +1683,11 @@ fn vector_index_from_rows(
     for partition in partitions {
         // One scope per partition, shared by its rows' entries.
         let mut scope: Option<Arc<[u8]>> = None;
-        for row in partition.static_row.iter().chain(partition.rows.iter()) {
+        for row in partition
+            .static_row
+            .iter()
+            .chain(partition.rows.iter().map(|row| &**row))
+        {
             let Some(value) = row
                 .cells
                 .iter()
@@ -1984,34 +2001,47 @@ fn write_streamed_vector_sidecar<F: FlushTarget + ?Sized, V: AsRef<[f32]>>(
 /// is the vectors plus one row, not the vectors plus every row.
 fn partition_vectors(
     static_row: Option<Row>,
-    rows: Vec<Row>,
+    rows: Vec<Arc<Row>>,
     column_position: usize,
 ) -> Result<Vec<(ferrosa_index::vector::RowPosition, Vec<f32>)>> {
-    let rows = static_row.into_iter().chain(rows);
     // Sized once from the row count: growing by doubling would hold up to
     // twice the vectors' table while it reallocates.
-    let mut entries = Vec::with_capacity(rows.size_hint().0);
+    let mut entries = Vec::with_capacity(rows.len() + usize::from(static_row.is_some()));
+    if let Some(row) = static_row {
+        push_row_vector(&row, column_position, &mut entries)?;
+    }
+    // Consume the rows: each one is released as soon as its vector is out, so
+    // the rows are never held beside the vectors built from them.
     for row in rows {
-        if !row.deletion.is_live() {
-            continue;
-        }
-        let Some(value) = row
-            .cells
-            .iter()
-            .find(|(idx, _)| *idx as usize == column_position)
-            .and_then(|(_, cell)| cell.value.as_deref())
-        else {
-            continue;
-        };
-        let vector = ferrosa_index::bytes_to_vec_f32(value).map_err(|e| {
-            ferrosa_common::Error::InvalidData(format!(
-                "a vector-indexed cell does not hold a float vector: {e}"
-            ))
-        })?;
-        let position = ferrosa_index::vector::RowPosition::new(entries.len() as u64);
-        entries.push((position, vector));
+        push_row_vector(&row, column_position, &mut entries)?;
     }
     Ok(entries)
+}
+
+fn push_row_vector(
+    row: &Row,
+    column_position: usize,
+    entries: &mut Vec<(ferrosa_index::vector::RowPosition, Vec<f32>)>,
+) -> Result<()> {
+    if !row.deletion.is_live() {
+        return Ok(());
+    }
+    let Some(value) = row
+        .cells
+        .iter()
+        .find(|(idx, _)| *idx as usize == column_position)
+        .and_then(|(_, cell)| cell.value.as_deref())
+    else {
+        return Ok(());
+    };
+    let vector = ferrosa_index::bytes_to_vec_f32(value).map_err(|e| {
+        ferrosa_common::Error::InvalidData(format!(
+            "a vector-indexed cell does not hold a float vector: {e}"
+        ))
+    })?;
+    let position = ferrosa_index::vector::RowPosition::new(entries.len() as u64);
+    entries.push((position, vector));
+    Ok(())
 }
 
 /// How one delivery attempt by a pausable producer ended.
@@ -2994,11 +3024,11 @@ fn partition_with_matching_clustering(
     partition: &Partition,
     clustering: &[u8],
 ) -> Option<Partition> {
-    let rows: Vec<Row> = partition
+    let rows: Vec<Arc<Row>> = partition
         .rows
         .iter()
         .filter(|row| row.clustering == clustering)
-        .cloned()
+        .map(Arc::clone)
         .collect();
 
     if rows.is_empty() && partition.deletion.is_live() && partition.static_row.is_none() {
@@ -3850,237 +3880,6 @@ impl<F: FlushTarget> TableStore<F> {
             .sum()
     }
 
-    /// Write a row into the active memtable and update secondary indexes.
-    ///
-    /// Loads the current view atomically, then delegates to the memtable's
-    /// `put`. After the memtable write, each declared secondary index is
-    /// updated by extracting the indexed column value from the row cells.
-    ///
-    /// The whole write — index postings and memtable put — runs against ONE
-    /// loaded view, admitted through that view's memtable gate, and posts
-    /// under the catalog and schema bound to that memtable. A flush publishes
-    /// the next memtable before it seals this one, and waits for the writers
-    /// inside before it snapshots, so a write never posts into one memtable's
-    /// indexes and puts its row into another, never lands in a frozen
-    /// memtable after its snapshot, and never posts under a catalog its
-    /// memtable's flush will not write sidecars for. A writer that meets a
-    /// sealed gate reloads the view and writes to the new memtable; no writer
-    /// ever waits for a flush.
-    ///
-    /// Legacy nanosecond timestamps are normalised to microseconds before the
-    /// row reaches the indexes or the memtable (t_cf637b6e), so no producer can
-    /// put one where a comparison would see it.
-    pub fn write(&self, key: &DecoratedKey, mut row: Row) -> Result<()> {
-        if self.retired.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(ferrosa_common::Error::InvalidData(
-                "write refused: store is retired".into(),
-            ));
-        }
-        normalise_legacy_ns_row(&mut row);
-        for _ in 0..MAX_SEALED_MEMTABLE_RETRIES {
-            let guard = self.view.load();
-            if let Some(_admitted) = guard.indexes.gate.try_enter() {
-                // Retirement may close admission after the first check. An
-                // earlier writer that already passed this check is counted by
-                // the same gate that retire_checked seals and drains.
-                if self.retired.load(std::sync::atomic::Ordering::SeqCst) {
-                    return Err(ferrosa_common::Error::InvalidData(
-                        "write refused: store is retired".into(),
-                    ));
-                }
-                return self.write_admitted(&guard, key, row);
-            }
-            // Sealed: a flush already published the next memtable.
-            std::thread::yield_now();
-        }
-        tracing::error!(
-            attempts = MAX_SEALED_MEMTABLE_RETRIES,
-            "store: every memtable this write loaded was already sealed; the write is refused"
-        );
-        Err(ferrosa_common::Error::InvalidData(format!(
-            "write refused: met a sealed memtable {MAX_SEALED_MEMTABLE_RETRIES} times in a row"
-        )))
-    }
-
-    /// [`Self::write`] once it holds an admission to `guard`'s memtable.
-    ///
-    /// A whole-value (path-less, live) cell on a non-frozen collection column
-    /// must parse as a collection, or the write is refused before anything
-    /// sees it: a complex-framed flush or compaction later expands that cell
-    /// into elements, and a value that cannot be expanded would fail every
-    /// flush of the table. Every write producer (CQL, mixed-version forwards,
-    /// hints, batchlog, graph writes, commit-log replay) passes through here.
-    /// It is checked against the schema bound to the admitted memtable, the
-    /// same schema its flush writes under, so a racing `ALTER` cannot pass a
-    /// cell under one schema and flush it under another.
-    fn write_admitted(&self, guard: &StoreView, key: &DecoratedKey, row: Row) -> Result<()> {
-        crate::memtable::validate_legacy_collection_blobs(&row, &guard.indexes.schema)?;
-        let catalog = Arc::clone(&guard.indexes.catalog);
-
-        // Secondary index maintenance: extract indexed column values and insert
-        // before the memtable put (which consumes the row reference via move).
-        if !catalog.indexed_columns.is_empty() {
-            for (index_name, col_pos) in &catalog.indexed_columns {
-                if let Some(index) = guard.indexes.get(index_name) {
-                    insert_scalar_memtable_index_row(
-                        index,
-                        index_name,
-                        *col_pos,
-                        catalog.index_type_for(index_name),
-                        catalog.index_filter_predicates.get(index_name),
-                        key.key.as_bytes(),
-                        &row,
-                    );
-                }
-            }
-        }
-
-        // Partition-key index maintenance: a partition-key column's value is
-        // not a cell either, so it is extracted from the row's composite
-        // partition-key bytes at the declared component.
-        if !catalog.indexed_partition_key_columns.is_empty() {
-            let total = self.partition_key_column_count();
-            let components = ferrosa_row_bridge::decode_pk(key, total);
-            for (index_name, component) in &catalog.indexed_partition_key_columns {
-                let Some(value) = components.get(*component) else {
-                    tracing::warn!(
-                        index_name,
-                        component,
-                        total,
-                        "store: partition-key index component missing from key bytes"
-                    );
-                    continue;
-                };
-                let index_type = catalog.index_type_for(index_name);
-                match crate::index::scheduler::encode_index_key(index_type, value) {
-                    Ok(Some(index_key)) => {
-                        // One posting per PARTITION (t_c5bccc65): every row of
-                        // the partition shares this value, so the posting names
-                        // the partition and the read streams its rows. A later
-                        // write to the same partition posts the same position,
-                        // which the index ignores.
-                        let row_pos = RowPosition {
-                            partition_key: key.key.as_bytes().to_vec(),
-                            clustering_key: Vec::new(),
-                        };
-                        match guard.indexes.get(index_name) {
-                            Some(idx) => idx.insert(index_key, row_pos),
-                            // Declared but absent from the live map: the write
-                            // is not indexed and a later read of this index
-                            // would report a short answer as a complete one.
-                            None => tracing::error!(
-                                index_name,
-                                "store: declared partition-key index is missing from the live index \
-                                 map; this write is NOT indexed and reads of this index \
-                                 will be incomplete"
-                            ),
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::warn!(
-                            index_name,
-                            %e,
-                            "store: skipping partition-key index entry; key encoding failed"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Clustering-column index maintenance (t_430c4188): a clustering
-        // column's value is not a cell, so it is extracted from the row's
-        // composite clustering-key bytes at the declared component.
-        if !catalog.indexed_clustering_columns.is_empty() && !row.clustering.is_empty() {
-            let total = self.clustering_column_count();
-            let components = ferrosa_row_bridge::decode_clustering(&row.clustering, total);
-            for (index_name, component) in &catalog.indexed_clustering_columns {
-                let Some(value) = components.get(*component) else {
-                    tracing::warn!(
-                        index_name,
-                        component,
-                        total,
-                        "store: clustering index component missing from row clustering bytes"
-                    );
-                    continue;
-                };
-                let index_type = catalog.index_type_for(index_name);
-                match crate::index::scheduler::encode_index_key(index_type, value) {
-                    Ok(Some(index_key)) => {
-                        let row_pos = RowPosition {
-                            partition_key: key.key.as_bytes().to_vec(),
-                            clustering_key: row.clustering.clone(),
-                        };
-                        match guard.indexes.get(index_name) {
-                            Some(idx) => idx.insert(index_key, row_pos),
-                            // Declared but absent from the live map: the write
-                            // is not indexed and a later read of this index
-                            // would report a short answer as a complete one.
-                            None => tracing::error!(
-                                index_name,
-                                "store: declared clustering index is missing from the live index \
-                                 map; this write is NOT indexed and reads of this index \
-                                 will be incomplete"
-                            ),
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::warn!(
-                            index_name,
-                            %e,
-                            "store: skipping clustering memtable index entry; key encoding failed"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Vector index maintenance: extract vector column values and insert into
-        // the in-memory HNSW/brute-force index for the active memtable.
-        // Row byte offset is unknown until the SSTable is written; we use 0 as a
-        // placeholder. The drain→HNSW build at flush time re-inserts with
-        // the final on-disk offset. For now, the memtable search is by position
-        // within the memtable (ordering only), not absolute file offset.
-        if !catalog.vector_index_configs.is_empty() {
-            for cfg in &catalog.vector_index_configs {
-                if let Some(cell) = row
-                    .cells
-                    .iter()
-                    .find(|(idx, _)| *idx as usize == cfg.column_position)
-                {
-                    if let Some(ref value) = cell.1.value {
-                        if let Ok(vector) = ferrosa_index::bytes_to_f32s::<Arc<[f32]>>(value) {
-                            // Use a sequential position based on current index size
-                            // (placeholder offset; not a true file offset).
-                            let pos = ferrosa_index::vector::RowPosition::new(
-                                guard
-                                    .vector_indexes
-                                    .get(&cfg.index_name)
-                                    .map(|vi| vi.len() as u64)
-                                    .unwrap_or(0),
-                            );
-                            if let Some(vi) = guard.vector_indexes.get(&cfg.index_name) {
-                                vi.insert_with_scope(
-                                    pos,
-                                    vector,
-                                    Some(Arc::from(key.key.as_bytes())),
-                                );
-                            }
-                        }
-                        // If bytes_to_vec_f32 fails, the cell contains non-vector
-                        // data — skip silently (the schema enforces the type).
-                    }
-                }
-            }
-        }
-
-        // The caller holds an admission to this memtable's gate, so the flush
-        // that freezes it has not snapshotted it yet: the row lands in the
-        // memtable its postings were added for, under that memtable's schema.
-        guard.active.put(key, row, &guard.indexes.schema)
-    }
-
     /// Read a partition by merging all sources: active memtable, flushing
     /// memtable (if present), and SSTables (newest first).
     ///
@@ -4532,45 +4331,6 @@ impl<F: FlushTarget> TableStore<F> {
     /// refill from a healthy replica.
     pub fn quarantined_sstable_gens(&self) -> Vec<String> {
         self.quarantined_sstables.to_vec()
-    }
-
-    /// Refuse an index consult while a generation overlapping it is
-    /// quarantined. `token` narrows the check to one partition's token; `None`
-    /// means the consult spans every token, so ANY quarantined generation in
-    /// `view` counts.
-    ///
-    /// An index's postings come from sidecars, which are not the SSTables the
-    /// rows live in. A generation whose objects are lost can leave its
-    /// sidecar readable (or absent) and the postings pointing at rows the
-    /// store can no longer read: the consult then reports zero or fewer rows
-    /// as success. Refuse it the way a stale index is refused (FMEA ST-56).
-    fn refuse_index_read_over_quarantine(
-        &self,
-        view: &StoreView,
-        token: Option<i64>,
-        op: &'static str,
-    ) -> Result<()> {
-        if self.quarantined_sstables.is_empty() && self.index_unavailable_sstables.is_empty() {
-            return Ok(());
-        }
-        let overlapping = view.sstables.iter().find(|desc| {
-            (self.is_sstable_quarantined(&desc.gen)
-                || self.index_unavailable_sstables.contains(&desc.gen))
-                && token.is_none_or(|t| t >= desc.min_token && t <= desc.max_token)
-        });
-        let Some(desc) = overlapping else {
-            return Ok(());
-        };
-        tracing::debug!(
-            op,
-            gen = %desc.gen,
-            "index read refused: a quarantined SSTable overlaps it, so its result could be short"
-        );
-        Err(ferrosa_common::Error::corrupt_sstable(
-            desc.gen.clone(),
-            desc.min_token,
-            desc.max_token,
-        ))
     }
 
     /// The table-level tombstone currently visible in `guard`, or
@@ -5148,7 +4908,7 @@ impl<F: FlushTarget> TableStore<F> {
         let guard = self.view.load();
         let schema = self.schema.load();
         let mut partition_delete_at = ferrosa_sstable::types::DeletionTime::LIVE;
-        let mut mem_row_iters: Vec<std::vec::IntoIter<Row>> = Vec::new();
+        let mut mem_row_iters: Vec<std::vec::IntoIter<Arc<Row>>> = Vec::new();
 
         if let Some(partition) = guard.active.get(key)? {
             if partition.deletion.marked_for_delete_at > partition_delete_at.marked_for_delete_at {
@@ -5223,11 +4983,11 @@ impl<F: FlushTarget> TableStore<F> {
             return Ok(0);
         }
 
-        let mut mem_heads: Vec<Option<Row>> =
+        let mut mem_heads: Vec<Option<Arc<Row>>> =
             mem_row_iters.iter_mut().map(|iter| iter.next()).collect();
-        let mut sst_heads: Vec<Option<Row>> = Vec::with_capacity(sst_sources.len());
+        let mut sst_heads: Vec<Option<Arc<Row>>> = Vec::with_capacity(sst_sources.len());
         for (iter, mapping) in sst_sources.iter_mut() {
-            sst_heads.push(next_remapped_clustered_row(iter, mapping)?);
+            sst_heads.push(next_remapped_clustered_row(iter, mapping)?.map(Arc::new));
         }
 
         let mut visited = 0;
@@ -5246,7 +5006,7 @@ impl<F: FlushTarget> TableStore<F> {
                 break;
             };
 
-            let mut merged_row: Option<Row> = None;
+            let mut merged_row: Option<Arc<Row>> = None;
             for (idx, head) in mem_heads.iter_mut().enumerate() {
                 if head
                     .as_ref()
@@ -5255,7 +5015,7 @@ impl<F: FlushTarget> TableStore<F> {
                 {
                     let row = head.take().expect("checked as present");
                     merged_row = match merged_row.take() {
-                        Some(prev) => Some(crate::merge::merge_rows(prev, row)),
+                        Some(prev) => Some(crate::merge::merge_shared_rows(prev, row)),
                         None => Some(row),
                     };
                     *head = mem_row_iters[idx].next();
@@ -5269,11 +5029,11 @@ impl<F: FlushTarget> TableStore<F> {
                 {
                     let row = head.take().expect("checked as present");
                     merged_row = match merged_row.take() {
-                        Some(prev) => Some(crate::merge::merge_rows(prev, row)),
+                        Some(prev) => Some(crate::merge::merge_shared_rows(prev, row)),
                         None => Some(row),
                     };
                     let (iter, mapping) = &mut sst_sources[idx];
-                    *head = next_remapped_clustered_row(iter, mapping)?;
+                    *head = next_remapped_clustered_row(iter, mapping)?.map(Arc::new);
                 }
             }
 
@@ -5285,8 +5045,16 @@ impl<F: FlushTarget> TableStore<F> {
             }
             if !row.deletion.is_live() {
                 let row_delete_at = row.deletion.marked_for_delete_at;
-                row.cells
-                    .retain(|(_column, cell)| cell.timestamp >= row_delete_at);
+                // Copy on write only a shared row that actually loses a cell.
+                if row
+                    .cells
+                    .iter()
+                    .any(|(_column, cell)| cell.timestamp < row_delete_at)
+                {
+                    Arc::make_mut(&mut row)
+                        .cells
+                        .retain(|(_column, cell)| cell.timestamp >= row_delete_at);
+                }
                 if row.cells.is_empty() {
                     continue;
                 }
@@ -7280,10 +7048,8 @@ impl<F: FlushTarget> TableStore<F> {
     /// same-key partitions merged and deletions suppressed inline.
     ///
     /// Memory profile: peak is O(num_sources) partitions held by
-    /// the merger, regardless of total table size. Unlike
-    /// `read_range_limited_rows` there is no
-    /// `RANGE_READ_MATERIALIZATION_CAP`; the caller drives the rate
-    /// of consumption via mpsc back-pressure (`STREAM_BUFFER` items).
+    /// the merger, regardless of total table size; the caller drives the
+    /// rate of consumption via mpsc back-pressure (`STREAM_BUFFER` items).
     pub fn range_iter(
         &self,
         start: Option<&DecoratedKey>,
@@ -7539,7 +7305,7 @@ impl<F: FlushTarget> TableStore<F> {
         }
         p.key.key.as_bytes().len()
             + p.static_row.as_ref().map_or(0, row_bytes)
-            + p.rows.iter().map(row_bytes).sum::<usize>()
+            + p.rows.iter().map(|row| row_bytes(row)).sum::<usize>()
     }
 
     /// Token-ordered, budget-bounded chunked read for anti-entropy repair.
@@ -8285,7 +8051,7 @@ impl<F: FlushTarget> TableStore<F> {
 
                 // Per-source memtable rows (sorted by clustering)
                 // and per-source SSTable iter indices.
-                let mut mem_row_iters: Vec<std::vec::IntoIter<ferrosa_sstable::types::Row>> =
+                let mut mem_row_iters: Vec<std::vec::IntoIter<Arc<ferrosa_sstable::types::Row>>> =
                     Vec::new();
                 let mut headers: Vec<(
                     DecoratedKey,
@@ -8294,9 +8060,8 @@ impl<F: FlushTarget> TableStore<F> {
                 )> = Vec::with_capacity(total_sources);
 
                 for &vi in &vec_match_indices {
-                    // Fragment/streaming path materialises owned rows anyway
-                    // (it sorts and consumes them), so unwrap the memtable's
-                    // `Arc` here rather than widening the merge signature.
+                    // Unwrapping the memtable's `Arc<Partition>` copies only
+                    // the row handles: the rows themselves stay shared.
                     let p = Arc::unwrap_or_clone(vec_sources[vi].next().expect("peeked"));
                     let key_p = p.key.clone();
                     let deletion = p.deletion;
@@ -8344,14 +8109,15 @@ impl<F: FlushTarget> TableStore<F> {
                     &ferrosa_sstable::types::Row,
                 ) -> Result<()>|
                  -> Result<()> {
-                    let mut mem_heads: Vec<Option<ferrosa_sstable::types::Row>> =
+                    let mut mem_heads: Vec<Option<Arc<ferrosa_sstable::types::Row>>> =
                         mem_row_iters.iter_mut().map(|it| it.next()).collect();
-                    let mut sst_heads: Vec<Option<ferrosa_sstable::types::Row>> =
+                    let mut sst_heads: Vec<Option<Arc<ferrosa_sstable::types::Row>>> =
                         Vec::with_capacity(sst_local_indices.len());
                     for &si in &sst_local_indices {
                         sst_heads.push(
                             next_remapped_clustered_row(&mut sst_iters[si], &sst_mappings[si])
-                                .map_err(|e| fail(si, "row", e))?,
+                                .map_err(|e| fail(si, "row", e))?
+                                .map(Arc::new),
                         );
                     }
                     loop {
@@ -8373,7 +8139,7 @@ impl<F: FlushTarget> TableStore<F> {
                         // Collect every source's row at that
                         // clustering, merging cells one pair at
                         // a time. Peak in-flight: two rows.
-                        let mut merged_row: Option<ferrosa_sstable::types::Row> = None;
+                        let mut merged_row: Option<Arc<ferrosa_sstable::types::Row>> = None;
                         for (i_local, _i_global) in mem_indices.iter().enumerate() {
                             if mem_heads[i_local]
                                 .as_ref()
@@ -8382,7 +8148,7 @@ impl<F: FlushTarget> TableStore<F> {
                             {
                                 let row = mem_heads[i_local].take().unwrap();
                                 merged_row = match merged_row.take() {
-                                    Some(prev) => Some(crate::merge::merge_rows(prev, row)),
+                                    Some(prev) => Some(crate::merge::merge_shared_rows(prev, row)),
                                     None => Some(row),
                                 };
                                 mem_heads[i_local] = mem_row_iters[i_local].next();
@@ -8396,14 +8162,15 @@ impl<F: FlushTarget> TableStore<F> {
                             {
                                 let row = sst_heads[h_idx].take().unwrap();
                                 merged_row = match merged_row.take() {
-                                    Some(prev) => Some(crate::merge::merge_rows(prev, row)),
+                                    Some(prev) => Some(crate::merge::merge_shared_rows(prev, row)),
                                     None => Some(row),
                                 };
                                 sst_heads[h_idx] = next_remapped_clustered_row(
                                     &mut sst_iters[si],
                                     &sst_mappings[si],
                                 )
-                                .map_err(|e| fail(si, "row", e))?;
+                                .map_err(|e| fail(si, "row", e))?
+                                .map(Arc::new);
                             }
                         }
                         let row = merged_row.expect("at least one source matched");
@@ -8449,6 +8216,25 @@ impl<F: FlushTarget> TableStore<F> {
     ) -> Result<()>
     where
         Cb: FnMut(&Partition) -> Result<()>,
+    {
+        self.walk_token_range_owned_once(start_token, end_token, delivered, |partition| {
+            cb(&partition)?;
+            Ok(std::ops::ControlFlow::Continue(()))
+        })
+    }
+
+    /// One pass of the token-range walk, handing each merged partition to
+    /// `cb` by value (the walk is done with it) and stopping early when `cb`
+    /// returns [`std::ops::ControlFlow::Break`].
+    fn walk_token_range_owned_once<Cb>(
+        &self,
+        start_token: i64,
+        end_token: i64,
+        delivered: &std::cell::Cell<bool>,
+        mut cb: Cb,
+    ) -> Result<()>
+    where
+        Cb: FnMut(Partition) -> Result<std::ops::ControlFlow<()>>,
     {
         let guard = self.view.load();
         let schema = self.schema.load();
@@ -8597,23 +8383,30 @@ impl<F: FlushTarget> TableStore<F> {
                 }
             }
 
-            let merged = if group.len() == 1 {
+            let mut merged = if group.len() == 1 {
                 group.into_iter().next().expect("len 1")
             } else {
-                let mut m = crate::merge::merge_partitions(group);
-                crate::merge::apply_deletions(&mut m);
-                m
+                crate::merge::merge_partitions(group)
             };
+            // A partition from ONE source needs suppression too: the
+            // memtable's merge-on-write sets deletion markers without
+            // suppressing the cells they cover, so a single-source partition
+            // reached the callback with deleted rows still in it.
+            crate::merge::apply_deletions(&mut merged);
             delivered.set(true);
-            cb(&merged)?;
-            drop(merged);
+            if cb(merged)?.is_break() {
+                return Ok(());
+            }
         }
         Ok(())
     }
 
-    /// Materializing range read. An SSTable in the view that cannot be opened
-    /// or read fails the read (typed [`ferrosa_common::Error::CorruptSstable`])
-    /// after the fresh-view retry bound; it never returns fewer rows as `Ok`.
+    /// Range read of the first `limit` partitions of `[start, end]` in key
+    /// order, merged across the memtables and every SSTable, each trimmed to
+    /// `row_limit` rows when `row_limit > 0`. The caller's `limit` is the only
+    /// bound. An SSTable in the view that cannot be opened or read fails the
+    /// read (typed [`ferrosa_common::Error::CorruptSstable`]) after the
+    /// fresh-view retry bound; it never returns fewer rows as `Ok`.
     pub fn read_range_limited_rows(
         &self,
         start: Option<&DecoratedKey>,
@@ -8621,16 +8414,16 @@ impl<F: FlushTarget> TableStore<F> {
         limit: usize,
         row_limit: usize,
     ) -> Result<Vec<Partition>> {
-        if limit > RANGE_READ_MATERIALIZATION_CAP {
-            return Err(ferrosa_common::Error::InvalidData(format!(
-                "range read limit {limit} exceeds materialization cap {RANGE_READ_MATERIALIZATION_CAP}; use a paged/streaming read path"
-            )));
-        }
         self.with_retried_scan("read_range_limited_rows", || {
             self.read_range_limited_rows_once(start, end, limit, row_limit)
         })
     }
 
+    /// One attempt of [`Self::read_range_limited_rows`]: the token-range walk
+    /// over the key bounds, stopped after `limit` partitions. It used to read
+    /// each source's first partitions under a shrinking budget and sort
+    /// afterwards, so the memtable took the whole budget and lower keys on
+    /// disk were never returned.
     fn read_range_limited_rows_once(
         &self,
         start: Option<&DecoratedKey>,
@@ -8638,80 +8431,16 @@ impl<F: FlushTarget> TableStore<F> {
         limit: usize,
         row_limit: usize,
     ) -> Result<Vec<Partition>> {
-        let guard = self.view.load();
-        let schema = self.schema.load();
-
-        // Collect partitions from bounded sources only. This is still a
-        // materializing read path, so fail closed once the requested window is
-        // exhausted instead of continuing to decode arbitrary table volume.
-        let mut all_partitions: Vec<Partition> = Vec::new();
-
-        let trim_rows = |partitions: &mut Vec<Partition>| {
-            if row_limit > 0 {
-                for partition in partitions {
-                    partition.rows.truncate(row_limit);
-                }
-            }
-        };
-
-        // Active memtable: clone only the requested window, not the whole
-        // active memtable. This keeps CQL LIMIT/page-size scans from hanging
-        // behind full-table materialization.
-        let mut active = guard.active.snapshot_range_limited(start, end, limit);
-        trim_rows(&mut active);
-        all_partitions.extend(active);
-
-        // Flushing memtable
-        if all_partitions.len() < limit {
-            for flushing in guard.flushing.iter().map(|sealed| &sealed.memtable) {
-                let remaining = limit.saturating_sub(all_partitions.len());
-                let mut flushing_parts = flushing.snapshot_range_limited(start, end, remaining);
-                trim_rows(&mut flushing_parts);
-                all_partitions.extend(flushing_parts);
-            }
+        let mut out = Vec::new();
+        // The walk is half-open by token; `end` is an inclusive key, so walk
+        // through its token. (A key at token `i64::MAX` is not reachable by a
+        // half-open walk: t_83e3a0d5.)
+        let start_token = start.map_or(i64::MIN, |k| k.token.0);
+        let end_token = end.map_or(i64::MAX, |k| k.token.0.saturating_add(1));
+        if limit == 0 || start_token >= end_token {
+            return Ok(out);
         }
-
-        // SSTables — read only the remaining budget from each, and when a row
-        // cap is requested skip unretained rows while decoding instead of
-        // materializing full wide partitions and truncating afterwards.
-        for desc in guard.sstables.iter() {
-            let remaining = limit.saturating_sub(all_partitions.len());
-            if remaining == 0 {
-                break;
-            }
-            // One reader open at a time — opened, drained, dropped per loop.
-            let sstable = self
-                .open_reader(desc)
-                .map_err(|e| self.unreadable_sstable("read_range", "open", desc, &e))?;
-            let mut parts = sstable
-                .read_partitions_limited_rows(remaining, row_limit)
-                .map_err(|e| self.unreadable_sstable("read_range", "read", desc, &e))?;
-            let mapping = ColumnOrdinalMapping::for_header(&schema, sstable.header());
-            for partition in &mut parts {
-                mapping.remap_partition(partition);
-            }
-            all_partitions.extend(parts);
-        }
-
-        // Deduplicate and merge partitions with the same key
-        all_partitions.sort_by(|a, b| a.key.cmp(&b.key));
-        let mut merged: Vec<Partition> = Vec::new();
-        for p in all_partitions {
-            if let Some(last) = merged.last_mut() {
-                if last.key == p.key {
-                    *last = merge::merge_partitions(vec![last.clone(), p]);
-                    continue;
-                }
-            }
-            merged.push(p);
-        }
-
-        // Apply deletion suppression to all partitions. Partitions that
-        // came from a single source (no multi-source merge above) still
-        // need row-level and partition-level deletions applied because
-        // the memtable's merge-on-write sets deletion markers but does
-        // not suppress the covered cells.
-        let (table_delete, probe_corrupt) = self.table_deletion(&guard)?;
+        let (table_delete, probe_corrupt) = self.table_deletion(&self.view.load())?;
         if let Some(c) = probe_corrupt {
             // `with_retried_scan` retries this typed error against a fresh view:
             // the retired input's merged output holds the rows.
@@ -8721,183 +8450,33 @@ impl<F: FlushTarget> TableStore<F> {
                 c.max_token,
             ));
         }
-        for p in &mut merged {
-            merge::apply_table_deletion(p, table_delete);
-        }
-
-        // Apply range filter and limit
-        let filtered: Vec<Partition> = merged
-            .into_iter()
-            .filter(|p| {
-                if crate::table_tombstone::is_table_tombstone_key(&p.key) {
-                    return false;
-                }
-                if let Some(s) = start {
-                    if p.key < *s {
-                        return false;
-                    }
-                }
-                if let Some(e) = end {
-                    if p.key > *e {
-                        return false;
-                    }
-                }
-                true
-            })
-            .take(limit)
-            .collect();
-
-        Ok(filtered)
-    }
-
-    /// Visit every row matching a secondary-index key, in row order. See
-    /// [`Self::read_by_index_each_after`].
-    pub fn read_by_index_each(
-        &self,
-        index_name: &str,
-        key: &IndexKey,
-        visitor: &mut dyn FnMut(Partition) -> std::ops::ControlFlow<()>,
-    ) -> Result<()> {
-        self.read_by_index_each_after(index_name, key, None, visitor)
-    }
-
-    /// Visit the rows matching a secondary-index key in row order —
-    /// `(partition key, clustering)` bytes — strictly after `after` when
-    /// given. The visitor owns back-pressure: [`std::ops::ControlFlow::Break`]
-    /// ends the walk once a page is full, and the caller resumes it with the
-    /// last row it kept as `after`.
-    ///
-    /// Memory is O(posting sources), never O(result): every source (the
-    /// active memtable index and each SSTable sidecar) holds its postings in
-    /// row order, so one `OrderedPostings` merge yields them in order, and a
-    /// row held by two sources is dropped by comparing it with the previous
-    /// row rather than by remembering every row seen (t_50c8bc7d). A row
-    /// posting is point-read as it is reached; a partition posting (pk, []),
-    /// which a partition-key index writes, streams the partition's rows in
-    /// bounded chunks instead of one point read per row (t_c5bccc65).
-    pub fn read_by_index_each_after(
-        &self,
-        index_name: &str,
-        key: &IndexKey,
-        after: Option<&RowPosition>,
-        visitor: &mut dyn FnMut(Partition) -> std::ops::ControlFlow<()>,
-    ) -> Result<()> {
-        // An index this node does not declare cannot answer, and must not
-        // answer "nothing". The planner selects indexes from the CQL schema,
-        // so a consult arrives here only when schema and engine disagree — a
-        // restart that failed to re-register the index, or a DROP racing the
-        // read. An empty answer from here is unioned by the coordinator into
-        // a short result that reads as the rows not existing (t_50c8bc7d:
-        // 101,848 entities read as an empty database). Refusing is still
-        // never stale: a dropped index's sidecars are not consulted.
-        if !self.secondary_index_declared(index_name) {
-            return Err(ferrosa_common::Error::InvalidData(format!(
-                "secondary index '{index_name}' is not declared on this node's \
-                 table, so it cannot answer; refusing to report its absence as \
-                 zero matching rows"
-            )));
-        }
-        let Some(lookup_key) = self.encode_index_lookup_key(index_name, key)? else {
-            return Ok(());
-        };
-
-        let guard = self.view.load();
-        self.refuse_index_read_over_quarantine(&guard, None, "read_by_index_each_after")?;
-        let memtables = memtable_posting_lists(&guard, index_name, &lookup_key);
-        // Seek to the cursor's PARTITION, inclusive: a partition posting
-        // (pk, []) sorts before every row of pk, and a page that stopped
-        // inside pk must reopen it. Rows at or before the cursor are dropped
-        // as they are reached.
-        let from = after.map(|cursor| RowPosition {
-            partition_key: cursor.partition_key.clone(),
-            clustering_key: Vec::new(),
-        });
-        let sources =
-            index_posting_sources(&guard, &memtables, index_name, &lookup_key, from.as_ref());
-
-        // The partition last streamed whole: a row posting for it (a sidecar
-        // written before partition postings) names a row already delivered.
-        let mut streamed_partition: Option<&[u8]> = None;
-        for position in OrderedPostings::new(sources) {
-            if streamed_partition == Some(position.partition_key) {
-                continue;
+        let delivered = std::cell::Cell::new(false);
+        self.walk_token_range_owned_once(start_token, end_token, &delivered, |mut partition| {
+            use std::ops::ControlFlow::{Break, Continue};
+            if end.is_some_and(|e| partition.key > *e) {
+                return Ok(Break(()));
             }
-            let resume = after
-                .filter(|cursor| cursor.partition_key.as_slice() == position.partition_key)
-                .map(|cursor| cursor.clustering_key.as_slice());
-            let flow = if position.clustering_key.is_empty() {
-                streamed_partition = Some(position.partition_key);
-                self.stream_partition_rows(position.partition_key, resume, visitor)?
-            } else if resume.is_some_and(|cursor| position.clustering_key <= cursor) {
-                continue;
+            if crate::table_tombstone::is_table_tombstone_key(&partition.key)
+                || start.is_some_and(|s| partition.key < *s)
+            {
+                return Ok(Continue(()));
+            }
+            merge::apply_table_deletion(&mut partition, table_delete);
+            if row_limit > 0 {
+                partition.rows.truncate(row_limit);
+            }
+            out.push(partition);
+            Ok(if out.len() >= limit {
+                Break(())
             } else {
-                self.visit_indexed_row(position, visitor)?
-            };
-            if flow.is_break() {
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    /// Whether an index key names so large a share of the table that one
-    /// sequential scan beats a point read per match.
-    ///
-    /// Serving an index key point-reads every row it names, and each point
-    /// read probes every SSTable. A tenant index over a single-tenant table
-    /// names the whole table: ferrosa-memory's edge count point-read 193,181
-    /// rows through `co_occurs_with`'s tenant index in 87 s (2026-09-29),
-    /// where a scan takes well under a second. The postings are counted only
-    /// up to the threshold, so a selective key costs a handful of posting
-    /// reads, never a walk of the whole index.
-    pub fn index_key_is_unselective(&self, index_name: &str, key: &IndexKey) -> Result<bool> {
-        if !self.secondary_index_declared(index_name) {
-            // The read path refuses an undeclared index loudly; not here.
-            return Ok(false);
-        }
-        let Some(lookup_key) = self.encode_index_lookup_key(index_name, key)? else {
-            return Ok(false);
-        };
-        let guard = self.view.load();
-        let partitions = guard
-            .sstables
-            .iter()
-            .map(|sstable| sstable.partition_count)
-            .sum::<u64>()
-            .saturating_add(guard.active.partition_count() as u64)
-            .saturating_add(
-                guard
-                    .flushing
-                    .iter()
-                    .map(|sealed| sealed.memtable.partition_count() as u64)
-                    .sum::<u64>(),
-            );
-        let threshold = usize::try_from(partitions / UNSELECTIVE_INDEX_SHARE_DENOMINATOR)
-            .unwrap_or(usize::MAX)
-            .max(UNSELECTIVE_INDEX_MIN_MATCHES);
-        let memtables = memtable_posting_lists(&guard, index_name, &lookup_key);
-        let sources = index_posting_sources(&guard, &memtables, index_name, &lookup_key, None);
-        Ok(OrderedPostings::new(sources).take(threshold).count() >= threshold)
-    }
-
-    /// Point-read the one row a row posting names and hand it to `visitor`.
-    /// A posting that outlived its row (deleted since it was indexed) yields
-    /// nothing.
-    fn visit_indexed_row(
-        &self,
-        position: RowPositionRef<'_>,
-        visitor: &mut dyn FnMut(Partition) -> std::ops::ControlFlow<()>,
-    ) -> Result<std::ops::ControlFlow<()>> {
-        #[cfg(test)]
-        INDEX_POINT_READS.with(|count| count.set(count.get() + 1));
-        let decorated = DecoratedKey::new(ferrosa_common::key::PartitionKey::new(
-            position.partition_key.to_vec(),
-        ));
-        let row = self.read_clustering_row(&decorated, position.clustering_key)?;
-        Ok(match row {
-            Some(partition) => visitor(partition),
-            None => std::ops::ControlFlow::Continue(()),
-        })
+                Continue(())
+            })
+        })?;
+        debug_assert!(
+            out.len() <= limit,
+            "never more partitions than the caller asked for"
+        );
+        Ok(out)
     }
 
     /// Stream one partition's rows to `visitor` — a partition posting means
@@ -8962,403 +8541,6 @@ impl<F: FlushTarget> TableStore<F> {
                 _ => return Ok(std::ops::ControlFlow::Continue(())),
             }
         }
-    }
-
-    /// Encode a raw query term into the index's native key space. A phonetic
-    /// index is keyed by the phonetic *code* of the term (both the memtable
-    /// index and the flushed sidecar store codes), so `WHERE name = 'Jon'`
-    /// must look up Jon's code, not its bytes; BTree/Hash/Composite are
-    /// identity-encoded. `None` for a term that encodes to nothing (e.g.
-    /// empty or non-UTF-8 text on a phonetic index): it cannot match any
-    /// stored entry.
-    fn encode_index_lookup_key(
-        &self,
-        index_name: &str,
-        key: &IndexKey,
-    ) -> Result<Option<IndexKey>> {
-        let index_type = self.index_type_for(index_name);
-        crate::index::scheduler::encode_index_key(index_type, &key.0).map_err(|e| {
-            ferrosa_common::Error::InvalidFormat(format!(
-                "secondary index '{index_name}' read key encoding failed: {e}"
-            ))
-        })
-    }
-
-    /// Re-evaluate a candidate against the current scalar index declaration.
-    /// Used after canonical row reconciliation as well as local posting lookup.
-    /// The caller supplies a deletion-reconciled row; no data scan occurs here.
-    pub fn index_row_matches(
-        &self,
-        index_name: &str,
-        query: &IndexKey,
-        key: &DecoratedKey,
-        row: &Row,
-    ) -> Result<bool> {
-        let catalog = self.catalog();
-        let (family, position, kind, predicate) =
-            catalog.scalar_definition(index_name).ok_or_else(|| {
-                ferrosa_common::Error::InvalidData(format!(
-                    "index {index_name} has no scalar row predicate"
-                ))
-            })?;
-        if matches!(kind, IndexType::Vector | IndexType::FullText) {
-            return Err(ferrosa_common::Error::InvalidData(format!(
-                "{kind} cannot verify scalar index rows"
-            )));
-        }
-        let schema = self.schema.load();
-        if !schema.clustering_columns.is_empty() && row.clustering.is_empty() {
-            return Err(ferrosa_common::Error::InvalidData(
-                "empty clustered index rows are unsupported by the current writer contract".into(),
-            ));
-        }
-
-        if family == 0 && position < schema.static_columns.len()
-            || predicate.is_some_and(|p| {
-                p.clauses
-                    .iter()
-                    .any(|clause| clause.column_position < schema.static_columns.len())
-            })
-        {
-            return Err(ferrosa_common::Error::InvalidData(
-                "static-column index predicates require a canonical static-row read".into(),
-            ));
-        }
-        if kind == IndexType::Filtered && predicate.is_none() {
-            return Err(ferrosa_common::Error::InvalidData(format!(
-                "filtered index {index_name} has no predicate"
-            )));
-        }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            .min(i32::MAX as u64) as i32;
-        let cell_value = |position: usize| {
-            row.cells
-                .iter()
-                .find(|(ordinal, _)| usize::from(*ordinal) == position)
-                .filter(|(_, cell)| {
-                    cell.timestamp >= row.deletion.marked_for_delete_at
-                        && ferrosa_row_bridge::cell_is_live(cell, now)
-                })
-                .and_then(|(_, cell)| cell.value.as_deref())
-        };
-        if predicate
-            .is_some_and(|predicate| !ferrosa_index::evaluate_predicate_row(predicate, cell_value))
-        {
-            return Ok(false);
-        }
-        let encode_matches = |value: &[u8]| match kind {
-            // These index families use identity encoding. Equality borrows both
-            // sides; allocating two full cell copies here adds no information.
-            IndexType::BTree | IndexType::Hash | IndexType::Composite | IndexType::Filtered => {
-                Ok(value == query.0.as_slice())
-            }
-            IndexType::Phonetic | IndexType::Geo => {
-                let encoded_query = crate::index::scheduler::encode_index_key(kind, &query.0)
-                    .map_err(ferrosa_common::Error::InvalidData)?;
-                let Some(encoded_query) = encoded_query else {
-                    return Ok(false);
-                };
-                crate::index::scheduler::encode_index_key(kind, value)
-                    .map(|encoded| encoded.as_ref() == Some(&encoded_query))
-                    .map_err(ferrosa_common::Error::InvalidData)
-            }
-            IndexType::Vector | IndexType::FullText => Err(ferrosa_common::Error::InvalidData(
-                "non-scalar index does not support scalar equality".into(),
-            )),
-        };
-        match family {
-            0 => {
-                if row
-                    .cells
-                    .iter()
-                    .any(|(ordinal, cell)| usize::from(*ordinal) == position && cell.path.is_some())
-                {
-                    return Err(ferrosa_common::Error::InvalidData(
-                        "complex-cell scalar index predicates are unsupported".into(),
-                    ));
-                }
-                cell_value(position).map_or(Ok(false), encode_matches)
-            }
-            1 | 2 => {
-                let live_key = row.primary_key_liveness.timestamp != i64::MIN
-                    && row.primary_key_liveness.timestamp >= row.deletion.marked_for_delete_at
-                    && !(row.primary_key_liveness.has_ttl()
-                        && ferrosa_row_bridge::ldt_is_expired(
-                            row.primary_key_liveness.local_deletion_time,
-                            now,
-                        ));
-                if !live_key
-                    && !row
-                        .cells
-                        .iter()
-                        .any(|(ordinal, _)| cell_value(usize::from(*ordinal)).is_some())
-                {
-                    return Ok(false);
-                }
-                let components = if family == 1 {
-                    ferrosa_row_bridge::decode_clustering(
-                        &row.clustering,
-                        schema.clustering_columns.len(),
-                    )
-                } else {
-                    ferrosa_row_bridge::decode_pk(key, self.partition_key_column_count())
-                };
-                let value = components.get(position).ok_or_else(|| {
-                    ferrosa_common::Error::InvalidData(format!(
-                        "index {index_name} key component {position} is missing"
-                    ))
-                })?;
-                encode_matches(value)
-            }
-            _ => Err(ferrosa_common::Error::InvalidData(
-                "unknown scalar index key family".into(),
-            )),
-        }
-    }
-
-    /// Query by secondary index restricted to ONE partition (t_430c4188):
-    /// looks up the index key in the memtable index and all SSTable sidecar
-    /// indexes, keeps only the postings whose `RowPosition.partition_key`
-    /// equals `partition_key`, and point-reads exactly those rows.
-    ///
-    /// This serves the fully-keyed CQL shape `WHERE <full partition key> AND
-    /// <indexed_col> = ?`: work and memory are O(rows matching the value in
-    /// the partition), never O(partition rows). Postings from other partitions
-    /// are dropped per batch BEFORE retention, so a value that is hot globally
-    /// cannot blow the `INDEX_RESULT_CAP` bound (or memory) for a keyed query
-    /// that matches only a few rows in its partition. Postings retained after
-    /// keying are still capped by `INDEX_RESULT_CAP` — the same fail-loud
-    /// bound as the geo candidate consult, never a silent truncation.
-    ///
-    /// The secondary index is keyed globally by value (not by `(partition,
-    /// value)`), so this consult still walks the per-node postings list for
-    /// the value; only the retained set is partition-scoped. Staleness
-    /// semantics match the global streaming consult — both read the same
-    /// memtable index + sidecar layers.
-    pub fn read_by_index_in_partition(
-        &self,
-        index_name: &str,
-        key: &IndexKey,
-        partition_key: &[u8],
-    ) -> Result<Vec<Partition>> {
-        if !self.secondary_index_declared(index_name) {
-            return Ok(Vec::new());
-        }
-
-        let guard = self.view.load();
-        let partition_token = DecoratedKey::new(ferrosa_common::key::PartitionKey::new(
-            partition_key.to_vec(),
-        ))
-        .token
-        .0;
-        self.refuse_index_read_over_quarantine(
-            &guard,
-            Some(partition_token),
-            "read_by_index_in_partition",
-        )?;
-
-        // Same per-type key encoding as `read_by_index` (see there for why a
-        // phonetic index must be probed by code, not raw bytes).
-        let index_type = self.index_type_for(index_name);
-        let lookup_key = match crate::index::scheduler::encode_index_key(index_type, &key.0) {
-            Ok(Some(encoded)) => encoded,
-            Ok(None) => return Ok(Vec::new()),
-            Err(e) => {
-                return Err(ferrosa_common::Error::InvalidFormat(format!(
-                    "secondary index '{index_name}' read key encoding failed: {e}"
-                )));
-            }
-        };
-        let query_key = key;
-        let key = &lookup_key;
-
-        let mut positions: Vec<RowPosition> = Vec::new();
-        let mut append_in_partition = |batch: Vec<RowPosition>| -> Result<()> {
-            for pos in batch {
-                if pos.partition_key != partition_key {
-                    continue;
-                }
-                if positions.len() >= INDEX_RESULT_CAP {
-                    return Err(ferrosa_common::Error::InvalidFormat(format!(
-                        "secondary index query exceeded {} row limit; \
-                         use ALLOW FILTERING for unbounded scans",
-                        INDEX_RESULT_CAP
-                    )));
-                }
-                positions.push(pos);
-            }
-            Ok(())
-        };
-
-        // 1. Memtable indexes: the active memtable's and the flushing one's.
-        for idx in memtable_indexes_named(&guard, index_name) {
-            append_in_partition(idx.lookup(key))?;
-        }
-
-        // 2. SSTable sidecar indexes (same lenient per-sidecar error handling
-        // as `read_by_index`: a missing/failed sidecar contributes nothing).
-        for sidecar in guard.sidecar_indexes.iter() {
-            if let Some(reader) = sidecar.get(index_name) {
-                let results = reader.lookup(key).map_err(|e| {
-                    ferrosa_common::Error::InvalidFormat(format!(
-                        "secondary index '{index_name}' read failed: {e}"
-                    ))
-                })?;
-                append_in_partition(results)?;
-            }
-        }
-
-        // 3. Deduplicate by clustering key (the partition key is fixed).
-        let mut seen = std::collections::HashSet::new();
-        positions.retain(|p| seen.insert(p.clustering_key.clone()));
-
-        // 4. Point-read exactly the matching rows — never the whole partition.
-        let dk = DecoratedKey::new(ferrosa_common::key::PartitionKey::new(
-            partition_key.to_vec(),
-        ));
-        let partition_wide = self.partition_key_index_def(index_name).is_some();
-        let clustered = self.clustering_column_count() > 0;
-        let mut partitions = Vec::new();
-        for pos in &positions {
-            if clustered && pos.clustering_key.is_empty() && !partition_wide {
-                return Err(ferrosa_common::Error::InvalidData(
-                    "empty clustered index posting is unsupported; refusing a partition-wide fallback".into(),
-                ));
-            }
-            let read = if partition_wide {
-                self.read(&dk)
-            } else {
-                self.read_clustering_row(&dk, &pos.clustering_key)
-            };
-            let partition = read?;
-            if let Some(mut partition) = partition {
-                let mut matching = Vec::with_capacity(partition.rows.len());
-                for row in partition.rows.drain(..) {
-                    if self.index_row_matches(index_name, query_key, &dk, &row)? {
-                        matching.push(row);
-                    }
-                }
-                partition.rows = matching;
-                if !partition.rows.is_empty() {
-                    partitions.push(partition);
-                }
-            }
-        }
-
-        Ok(partitions)
-    }
-
-    /// Query a geo (cell-id) secondary index by a set of `[start, end]` cell-id
-    /// ranges, returning the matching base-table partitions.
-    ///
-    /// Unlike a keyed secondary-index lookup — which does a point lookup on an
-    /// exact key — a geo index is keyed by an 8-byte big-endian
-    /// space-filling-curve cell id, so a spatial query maps to a small bounded
-    /// set of contiguous cell-id ranges (produced by `ferrosa_index::geo::cover_*`).
-    /// Each `(start, end)` is an **inclusive** range of `u64` cell ids; this
-    /// scans the ordered memtable index and every SSTable sidecar for entries
-    /// whose big-endian key falls inside any range, deduplicates by
-    /// `(partition_key, clustering_key)`, and fetches the rows.
-    ///
-    /// The same fail-loud `INDEX_RESULT_CAP` bound as the keyed consult applies:
-    /// the candidate set is never silently truncated — exceeding the cap returns
-    /// an error suggesting `ALLOW FILTERING`. The geo cover ranges are already
-    /// bounded (<= a few thousand cells), so the candidate count is bounded by
-    /// the data that actually lives in those cells. Refinement with exact
-    /// distance / containment is the caller's responsibility (the cover is an
-    /// over-approximation).
-    pub fn read_by_index_cell_ranges(
-        &self,
-        index_name: &str,
-        ranges: &[(u64, u64)],
-    ) -> Result<Vec<Partition>> {
-        if !self.secondary_index_declared(index_name) {
-            return Ok(Vec::new());
-        }
-
-        let guard = self.view.load();
-        self.refuse_index_read_over_quarantine(&guard, None, "read_by_index_cell_ranges")?;
-
-        let mut positions: Vec<RowPosition> = Vec::new();
-        let mut append_positions = |batch: Vec<RowPosition>| -> Result<()> {
-            if positions.len().saturating_add(batch.len()) > INDEX_RESULT_CAP {
-                return Err(ferrosa_common::Error::InvalidFormat(format!(
-                    "geo index query exceeded {} row limit; \
-                     use ALLOW FILTERING for unbounded scans",
-                    INDEX_RESULT_CAP
-                )));
-            }
-            positions.extend(batch);
-            Ok(())
-        };
-
-        // Encode each (start, end) cell id to its big-endian key bounds once.
-        let key_ranges: Vec<(IndexKey, IndexKey)> = ranges
-            .iter()
-            .map(|(start, end)| {
-                (
-                    IndexKey(start.to_be_bytes().to_vec()),
-                    IndexKey(end.to_be_bytes().to_vec()),
-                )
-            })
-            .collect();
-
-        // 1. Memtable indexes (active and flushing): ordered range scan per range.
-        for idx in memtable_indexes_named(&guard, index_name) {
-            for (start_key, end_key) in &key_ranges {
-                append_positions(idx.range(start_key, end_key))?;
-            }
-        }
-
-        // 2. SSTable sidecar indexes: ordered range scan per range.
-        //
-        // A failing range read is REPORTED, not skipped. This used to be
-        // `if let Ok(results) = ...` with no else, so an unreadable sidecar —
-        // a short read, a truncated file, a decode failure — contributed no
-        // positions and the query returned the rows it could find as though
-        // they were all of them. A caller cannot tell that from a genuinely
-        // smaller result, which is how unreadable data gets reported as absent
-        // data.
-        for sidecar in guard.sidecar_indexes.iter() {
-            if let Some(reader) = sidecar.get(index_name) {
-                for (start_key, end_key) in &key_ranges {
-                    let results = reader.range(start_key, end_key).map_err(|e| {
-                        ferrosa_common::Error::InvalidFormat(format!(
-                            "geo index '{index_name}' range read failed: {e}"
-                        ))
-                    })?;
-                    append_positions(results)?;
-                }
-            }
-        }
-
-        // 3. Deduplicate by (partition_key, clustering_key). A point may appear
-        //    in overlapping ranges and across memtable + sidecars.
-        let mut seen = std::collections::HashSet::new();
-        positions.retain(|p| seen.insert((p.partition_key.clone(), p.clustering_key.clone())));
-
-        // 4. Fetch base-table rows, carrying the clustering key so wide clustered
-        //    tables do not materialize the whole partition per hit.
-        let mut partitions = Vec::new();
-        for pos in &positions {
-            let dk = DecoratedKey::new(ferrosa_common::key::PartitionKey::new(
-                pos.partition_key.clone(),
-            ));
-            let read = if pos.clustering_key.is_empty() {
-                self.read(&dk)
-            } else {
-                self.read_clustering_row(&dk, &pos.clustering_key)
-            };
-            let partition = read?;
-            if let Some(partition) = partition {
-                partitions.push(partition);
-            }
-        }
-
-        Ok(partitions)
     }
 
     /// Replace the view with one derived from the current view, by
@@ -12150,7 +11332,7 @@ fn segment_partitions_by_window(
             static_row,
             rows,
         } = partition;
-        let mut by_window: std::collections::BTreeMap<i64, Vec<Row>> =
+        let mut by_window: std::collections::BTreeMap<i64, Vec<Arc<Row>>> =
             std::collections::BTreeMap::new();
         for row in rows {
             let Some(ts) = time_series_row_timestamp(&row, timestamp_unit) else {
@@ -12312,8 +11494,8 @@ fn segmented_partition_needs_replay(images: &[&Partition], late: &Partition) -> 
     {
         return true;
     }
-    let mut flushed_rows: Vec<&Row> = union.rows.iter().collect();
-    let mut late_rows: Vec<&Row> = late.rows.iter().collect();
+    let mut flushed_rows: Vec<&Row> = union.rows.iter().map(|row| &**row).collect();
+    let mut late_rows: Vec<&Row> = late.rows.iter().map(|row| &**row).collect();
     flushed_rows.sort_by(|x, y| x.clustering.cmp(&y.clustering));
     late_rows.sort_by(|x, y| x.clustering.cmp(&y.clustering));
     flushed_rows
@@ -12341,10 +11523,12 @@ mod tests {
             vec![],
         );
         let key = make_key("retired");
-        store.write(&key, make_row(b"before", 10)).unwrap();
+        store
+            .write(&key, Arc::new(make_row(b"before", 10)))
+            .unwrap();
         store.retire_checked(MEMTABLE_SEAL_DEADLINE).unwrap();
         assert!(
-            store.write(&key, make_row(b"after", 20)).is_err(),
+            store.write(&key, Arc::new(make_row(b"after", 20))).is_err(),
             "checked retirement must close store write admission"
         );
         let retained = store.read(&key).unwrap().unwrap();
@@ -12363,7 +11547,9 @@ mod tests {
             vec![],
         );
         let key = make_key("retained");
-        store.write(&key, make_row(b"before", 10)).unwrap();
+        store
+            .write(&key, Arc::new(make_row(b"before", 10)))
+            .unwrap();
         store.retire_checked(MEMTABLE_SEAL_DEADLINE).unwrap();
         assert!(
             store.truncate().is_err(),
@@ -12394,7 +11580,7 @@ mod tests {
             "unconfirmed writer drain must not return success"
         );
         assert!(store
-            .write(&make_key("closed"), make_row(b"late", 20))
+            .write(&make_key("closed"), Arc::new(make_row(b"late", 20)))
             .is_err());
         store.retire_checked(MEMTABLE_SEAL_DEADLINE).unwrap();
     }
@@ -12437,7 +11623,7 @@ mod tests {
             // ticket still prevents retirement from certifying completion.
             let key = make_key("old-view-writer");
             store
-                .write_admitted(&view, &key, make_row(b"completed", 30))
+                .write_admitted(&view, &key, Arc::new(make_row(b"completed", 30)))
                 .unwrap();
             drop(ticket);
             if early.is_none() && !finished_before_release {
@@ -12516,7 +11702,9 @@ mod tests {
             vec![("val_idx".into(), 0)],
         );
         let key = make_key("key");
-        store.write(&key, make_row_with_ck(7, b"X", 10)).unwrap();
+        store
+            .write(&key, Arc::new(make_row_with_ck(7, b"X", 10)))
+            .unwrap();
         // Simulate an unsupported/corrupt persisted posting, not an accepted
         // empty clustering write. It must not trigger a whole partition read.
         store.get_memtable_index("val_idx").unwrap().insert(
@@ -12527,9 +11715,13 @@ mod tests {
             },
         );
         assert!(
-            store
-                .read_by_index_in_partition("val_idx", &IndexKey(b"X".to_vec()), key.key.as_bytes())
-                .is_err(),
+            collect_keyed(
+                &store,
+                "val_idx",
+                &IndexKey(b"X".to_vec()),
+                key.key.as_bytes()
+            )
+            .is_err(),
             "an unsupported empty clustered posting must refuse, never broaden its read"
         );
     }
@@ -12550,10 +11742,14 @@ mod tests {
         let key = make_key("key");
         let mut row = make_row(b"X", 10);
         row.clustering.clear();
-        store.write(&key, row).unwrap();
-        let found = store
-            .read_by_index_in_partition("val_idx", &IndexKey(b"X".to_vec()), key.key.as_bytes())
-            .unwrap();
+        store.write(&key, Arc::new(row)).unwrap();
+        let found = collect_keyed(
+            &store,
+            "val_idx",
+            &IndexKey(b"X".to_vec()),
+            key.key.as_bytes(),
+        )
+        .unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].rows.len(), 1);
     }
@@ -12611,8 +11807,43 @@ mod tests {
             key: make_key(key),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![make_row(value, timestamp)],
+            rows: vec![Arc::new(make_row(value, timestamp))],
         }
+    }
+
+    /// A keyed index read's partitions, collected — test-only.
+    fn collect_keyed(
+        store: &TableStore<InMemoryFlushTarget>,
+        index_name: &str,
+        key: &IndexKey,
+        partition_key: &[u8],
+    ) -> Result<Vec<Partition>> {
+        let mut results = Vec::new();
+        store.read_by_index_in_partition_each_after(
+            index_name,
+            key,
+            partition_key,
+            None,
+            &mut |partition| {
+                results.push(partition);
+                std::ops::ControlFlow::Continue(())
+            },
+        )?;
+        Ok(results)
+    }
+
+    /// A geo index read's partitions, collected — test-only.
+    fn collect_geo(
+        store: &TableStore<InMemoryFlushTarget>,
+        index_name: &str,
+        ranges: &[(u64, u64)],
+    ) -> Result<Vec<Partition>> {
+        let mut results = Vec::new();
+        store.read_by_index_cell_ranges_each(index_name, ranges, &mut |partition| {
+            results.push(partition);
+            std::ops::ControlFlow::Continue(())
+        })?;
+        Ok(results)
     }
 
     fn collect_index_results(
@@ -12759,12 +11990,15 @@ mod tests {
         store
             .write(
                 &crate::table_tombstone::table_tombstone_key(),
-                crate::table_tombstone::table_tombstone_row(marked_for_delete_at, 1_700_000_000),
+                Arc::new(crate::table_tombstone::table_tombstone_row(
+                    marked_for_delete_at,
+                    1_700_000_000,
+                )),
             )
             .expect("write the table tombstone");
     }
 
-    fn visible_rows(store: &TableStore<InMemoryFlushTarget>, key: &DecoratedKey) -> Vec<Row> {
+    fn visible_rows(store: &TableStore<InMemoryFlushTarget>, key: &DecoratedKey) -> Vec<Arc<Row>> {
         store
             .read_limited_rows(key, 0)
             .expect("read")
@@ -12778,10 +12012,10 @@ mod tests {
     fn table_tombstone_hides_rows_written_before_it_immediately() {
         let store = test_store();
         store
-            .write(&make_key("a"), make_row(b"before", 100))
+            .write(&make_key("a"), Arc::new(make_row(b"before", 100)))
             .unwrap();
         store
-            .write(&make_key("b"), make_row(b"before", 100))
+            .write(&make_key("b"), Arc::new(make_row(b"before", 100)))
             .unwrap();
         assert_eq!(visible_rows(&store, &make_key("a")).len(), 1);
 
@@ -12799,11 +12033,11 @@ mod tests {
     fn a_row_written_after_the_table_tombstone_survives() {
         let store = test_store();
         store
-            .write(&make_key("a"), make_row(b"before", 100))
+            .write(&make_key("a"), Arc::new(make_row(b"before", 100)))
             .unwrap();
         write_table_tombstone(&store, 200);
         store
-            .write(&make_key("a"), make_row(b"after", 300))
+            .write(&make_key("a"), Arc::new(make_row(b"after", 300)))
             .unwrap();
 
         let rows = visible_rows(&store, &make_key("a"));
@@ -12814,7 +12048,7 @@ mod tests {
         // row at exactly the tombstone timestamp survives (>= predicate).
         let store2 = test_store();
         store2
-            .write(&make_key("e"), make_row(b"edge", 200))
+            .write(&make_key("e"), Arc::new(make_row(b"edge", 200)))
             .unwrap();
         write_table_tombstone(&store2, 200);
         assert_eq!(
@@ -12834,14 +12068,14 @@ mod tests {
     fn a_stale_older_copy_cannot_resurrect_a_truncated_row() {
         let store = test_store();
         store
-            .write(&make_key("a"), make_row(b"before", 100))
+            .write(&make_key("a"), Arc::new(make_row(b"before", 100)))
             .unwrap();
         write_table_tombstone(&store, 200);
 
         // A stale replica's copy of the pre-truncate row, replayed at its original
         // older timestamp (what repair / read-repair would write back).
         store
-            .write(&make_key("a"), make_row(b"before", 100))
+            .write(&make_key("a"), Arc::new(make_row(b"before", 100)))
             .unwrap();
 
         assert!(
@@ -12856,7 +12090,7 @@ mod tests {
     fn without_a_table_tombstone_an_earlier_row_stays_visible() {
         let store = test_store();
         store
-            .write(&make_key("a"), make_row(b"before", 100))
+            .write(&make_key("a"), Arc::new(make_row(b"before", 100)))
             .unwrap();
         assert_eq!(
             visible_rows(&store, &make_key("a")).len(),
@@ -12871,10 +12105,10 @@ mod tests {
     fn table_tombstone_hides_rows_from_scans_and_counts() {
         let store = test_store();
         store
-            .write(&make_key("a"), make_row(b"before", 100))
+            .write(&make_key("a"), Arc::new(make_row(b"before", 100)))
             .unwrap();
         store
-            .write(&make_key("b"), make_row(b"before", 100))
+            .write(&make_key("b"), Arc::new(make_row(b"before", 100)))
             .unwrap();
         write_table_tombstone(&store, 200);
 
@@ -12923,7 +12157,10 @@ mod tests {
     fn add_index_backfills_existing_active_memtable_rows() {
         let store = test_store();
         store
-            .write(&make_key("before-index"), make_row(b"match", 1000))
+            .write(
+                &make_key("before-index"),
+                Arc::new(make_row(b"match", 1000)),
+            )
             .unwrap();
 
         let _rotation: FlushOutcome = store
@@ -12961,7 +12198,10 @@ mod tests {
                 std::thread::spawn(move || {
                     for i in 0..ROWS_PER_WRITER {
                         store
-                            .write(&make_key(&format!("w{w}-{i:04}")), make_row(b"v", 1000))
+                            .write(
+                                &make_key(&format!("w{w}-{i:04}")),
+                                Arc::new(make_row(b"v", 1000)),
+                            )
                             .unwrap();
                     }
                     done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -13010,7 +12250,7 @@ mod tests {
         // One more row, so the final flush publishes an SSTable whose memtable
         // was created after every DDL above.
         store
-            .write(&make_key("zz-last"), make_row(b"v", 1000))
+            .write(&make_key("zz-last"), Arc::new(make_row(b"v", 1000)))
             .unwrap();
         store.flush().unwrap();
 
@@ -13080,7 +12320,10 @@ mod tests {
                 std::thread::spawn(move || {
                     (0..ROWS_PER_WRITER).for_each(|i| {
                         store
-                            .write(&make_key(&format!("w{w}-{i:05}")), make_row(b"v", 1000))
+                            .write(
+                                &make_key(&format!("w{w}-{i:05}")),
+                                Arc::new(make_row(b"v", 1000)),
+                            )
                             .unwrap();
                     });
                     done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -13128,7 +12371,9 @@ mod tests {
     #[test]
     fn flushes_queued_behind_a_running_flush_coalesce_into_one_rotation() {
         let store = Arc::new(test_store());
-        store.write(&make_key("a"), make_row(b"v", 1000)).unwrap();
+        store
+            .write(&make_key("a"), Arc::new(make_row(b"v", 1000)))
+            .unwrap();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let first = {
@@ -13146,8 +12391,12 @@ mod tests {
             .unwrap();
         assert_eq!(store.rotations_started(), 1);
 
-        store.write(&make_key("b"), make_row(b"v", 1000)).unwrap();
-        store.write(&make_key("c"), make_row(b"v", 1000)).unwrap();
+        store
+            .write(&make_key("b"), Arc::new(make_row(b"v", 1000)))
+            .unwrap();
+        store
+            .write(&make_key("c"), Arc::new(make_row(b"v", 1000)))
+            .unwrap();
         let queued: Vec<_> = (0..2)
             .map(|_| {
                 let store = Arc::clone(&store);
@@ -13193,7 +12442,7 @@ mod tests {
             .add_index("idx_main".to_string(), 0, IndexType::BTree)
             .unwrap();
         store
-            .write(&make_key("first"), make_row(b"v", 1000))
+            .write(&make_key("first"), Arc::new(make_row(b"v", 1000)))
             .unwrap();
         store.flush().unwrap();
         let first_gen = store.view.load().sstable_ids[0].0.clone();
@@ -13204,7 +12453,10 @@ mod tests {
             std::thread::spawn(move || {
                 (0..ROUNDS).for_each(|i| {
                     store
-                        .write(&make_key(&format!("k{i:04}")), make_row(b"v", 1000))
+                        .write(
+                            &make_key(&format!("k{i:04}")),
+                            Arc::new(make_row(b"v", 1000)),
+                        )
                         .unwrap();
                     store.flush().unwrap();
                 });
@@ -13340,7 +12592,9 @@ mod tests {
         let _rotation: FlushOutcome = store
             .add_index("val_idx".to_string(), 0, IndexType::BTree)
             .unwrap();
-        store.write(&make_key("k"), make_row(b"v", 1000)).unwrap();
+        store
+            .write(&make_key("k"), Arc::new(make_row(b"v", 1000)))
+            .unwrap();
 
         let before_drop =
             collect_index_results(&store, "val_idx", &IndexKey(b"v".to_vec())).unwrap();
@@ -13396,7 +12650,9 @@ mod tests {
     #[test]
     fn generation_ids_name_the_sstables_the_store_holds() {
         let store = test_store();
-        store.write(&make_key("k1"), make_row(b"v", 1000)).unwrap();
+        store
+            .write(&make_key("k1"), Arc::new(make_row(b"v", 1000)))
+            .unwrap();
         store.flush().unwrap();
         // Generations do not stay dense. `advance_gen_past` is called on
         // recovery and around compaction output so new files cannot collide
@@ -13404,7 +12660,9 @@ mod tests {
         // set is {1, 1001} while the arithmetic guess covers {1000, 1001}:
         // one id that never existed, one real SSTable never named.
         store.advance_gen_past(1000);
-        store.write(&make_key("k2"), make_row(b"v", 2000)).unwrap();
+        store
+            .write(&make_key("k2"), Arc::new(make_row(b"v", 2000)))
+            .unwrap();
         store.flush().unwrap();
 
         assert!(
@@ -13456,14 +12714,24 @@ mod tests {
             vec![("val_idx".to_string(), 0_usize)],
         );
         // Sidecar: k3, k1. Memtable afterwards: k4, k2, and k1 again.
-        store.write(&make_key("k3"), make_row(b"v", 1000)).unwrap();
-        store.write(&make_key("k1"), make_row(b"v", 1000)).unwrap();
-        store.flush().unwrap();
-        store.write(&make_key("k4"), make_row(b"v", 2000)).unwrap();
-        store.write(&make_key("k2"), make_row(b"v", 2000)).unwrap();
-        store.write(&make_key("k1"), make_row(b"v", 2000)).unwrap();
         store
-            .write(&make_key("x9"), make_row(b"other", 2000))
+            .write(&make_key("k3"), Arc::new(make_row(b"v", 1000)))
+            .unwrap();
+        store
+            .write(&make_key("k1"), Arc::new(make_row(b"v", 1000)))
+            .unwrap();
+        store.flush().unwrap();
+        store
+            .write(&make_key("k4"), Arc::new(make_row(b"v", 2000)))
+            .unwrap();
+        store
+            .write(&make_key("k2"), Arc::new(make_row(b"v", 2000)))
+            .unwrap();
+        store
+            .write(&make_key("k1"), Arc::new(make_row(b"v", 2000)))
+            .unwrap();
+        store
+            .write(&make_key("x9"), Arc::new(make_row(b"other", 2000)))
             .unwrap();
 
         let key = IndexKey(b"v".to_vec());
@@ -13503,7 +12771,7 @@ mod tests {
     /// the previous row, nothing that grows with the result.
     #[test]
     fn the_index_walk_holds_no_result_sized_collection() {
-        let source = include_str!("store.rs");
+        let source = include_str!("store/index_read.rs");
         let body = source
             .split("pub fn read_by_index_each_after(")
             .nth(1)
@@ -13531,7 +12799,9 @@ mod tests {
             },
             vec![("val_idx".to_string(), 0_usize)],
         );
-        store.write(&make_key("k"), make_row(b"v", 1000)).unwrap();
+        store
+            .write(&make_key("k"), Arc::new(make_row(b"v", 1000)))
+            .unwrap();
         store.flush().unwrap();
 
         assert_eq!(
@@ -13603,7 +12873,7 @@ mod tests {
     }
 
     impl Memtable for SnapshotMemtable {
-        fn put(&self, _key: &DecoratedKey, _row: Row, _schema: &TableSchema) -> Result<()> {
+        fn put(&self, _key: &DecoratedKey, _row: Arc<Row>, _schema: &TableSchema) -> Result<()> {
             panic!("SnapshotMemtable is read-only and only used as a legacy flush snapshot")
         }
 
@@ -13666,7 +12936,7 @@ mod tests {
                 key: make_key("pk_bad"),
                 deletion: DeletionTime::LIVE,
                 static_row: None,
-                rows: vec![bad_row],
+                rows: vec![Arc::new(bad_row)],
             }],
         );
 
@@ -13787,7 +13057,7 @@ mod tests {
                 ..WriteOptions::default()
             },
         );
-        legacy.write(key, row).unwrap();
+        legacy.write(key, Arc::new(row)).unwrap();
         legacy.flush().unwrap();
 
         let legacy_view = legacy.view.load();
@@ -14009,22 +13279,34 @@ mod tests {
             store
                 .write(
                     &make_key("hot"),
-                    make_row_with_ck(ck, format!("flushed{ck}").as_bytes(), 1000 + ck as i64),
+                    Arc::new(make_row_with_ck(
+                        ck,
+                        format!("flushed{ck}").as_bytes(),
+                        1000 + ck as i64,
+                    )),
                 )
                 .unwrap();
         }
-        store.write(&make_key("aaa"), make_row(b"a", 1000)).unwrap();
+        store
+            .write(&make_key("aaa"), Arc::new(make_row(b"a", 1000)))
+            .unwrap();
         store.flush().unwrap();
         // Memtable half (newer ts on even cks — LWW must keep these).
         for ck in (0..40i32).filter(|c| c % 2 == 0) {
             store
                 .write(
                     &make_key("hot"),
-                    make_row_with_ck(ck, format!("memtable{ck}").as_bytes(), 5000 + ck as i64),
+                    Arc::new(make_row_with_ck(
+                        ck,
+                        format!("memtable{ck}").as_bytes(),
+                        5000 + ck as i64,
+                    )),
                 )
                 .unwrap();
         }
-        store.write(&make_key("zzz"), make_row(b"z", 1000)).unwrap();
+        store
+            .write(&make_key("zzz"), Arc::new(make_row(b"z", 1000)))
+            .unwrap();
 
         // Whole-partition reference.
         let mut whole_stream = store.range_iter(None, None);
@@ -14221,18 +13503,51 @@ mod tests {
         assert_eq!(cells[0][1].1.value.as_deref(), Some(b"bee".as_slice()));
     }
 
+    /// A limited range read returns the FIRST `limit` partitions in key order
+    /// across every source. It used to give the memtable the whole budget,
+    /// then each SSTable what was left, and sort afterwards: with the low keys
+    /// on disk and high keys in the memtable it returned the high keys.
     #[test]
-    fn range_read_rejects_unbounded_materialization_limit() {
+    fn a_limited_range_read_returns_the_lowest_keys_across_sources() {
         let store = test_store();
+        let mut keys: Vec<DecoratedKey> = (0..20).map(|i| make_key(&format!("k{i:02}"))).collect();
+        keys.sort();
+        for k in &keys[..10] {
+            store.write(k, Arc::new(make_row(b"disk", 1000))).unwrap();
+        }
+        store.flush().unwrap();
+        for k in &keys[10..] {
+            store.write(k, Arc::new(make_row(b"mem", 1000))).unwrap();
+        }
 
-        let err = store
-            .read_range(None, None, RANGE_READ_MATERIALIZATION_CAP + 1)
-            .expect_err("range reads above the materialization cap must fail closed");
+        let got: Vec<DecoratedKey> = store
+            .read_range(None, None, 3)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.key)
+            .collect();
 
-        assert!(
-            err.to_string().contains("paged/streaming read path"),
-            "error should direct callers away from materializing scans: {err}"
+        assert_eq!(
+            got,
+            keys[..3].to_vec(),
+            "the three lowest keys, from the SSTable"
         );
+    }
+
+    /// The only bound is the caller's limit: no server-side materialization
+    /// cap refuses a read, and a limit beyond the data returns all of it.
+    #[test]
+    fn a_range_read_is_bounded_only_by_its_limit() {
+        let store = test_store();
+        for i in 0..5 {
+            store
+                .write(&make_key(&format!("k{i}")), Arc::new(make_row(b"v", 1000)))
+                .unwrap();
+        }
+
+        let all = store.read_range(None, None, 10_001).unwrap();
+
+        assert_eq!(all.len(), 5);
     }
 
     /// Regression for the COUNT(*) undercount bug (t_8c4e44e8): a bare
@@ -14273,7 +13588,7 @@ mod tests {
             store
                 .write(
                     &make_composite_key(&[owner, &format!("s{i}")]),
-                    make_row(b"v", 1000 + i),
+                    Arc::new(make_row(b"v", 1000 + i)),
                 )
                 .unwrap();
         }
@@ -14311,7 +13626,10 @@ mod tests {
         const N: i64 = 50;
         for i in 0..N {
             store
-                .write(&make_key(&format!("k{i:04}")), make_row(b"v", 1000 + i))
+                .write(
+                    &make_key(&format!("k{i:04}")),
+                    Arc::new(make_row(b"v", 1000 + i)),
+                )
                 .unwrap();
         }
         // Repeat to expose any per-call nondeterminism (the live repro
@@ -14333,7 +13651,10 @@ mod tests {
         const N: i64 = 50;
         for i in 0..N {
             store
-                .write(&make_key(&format!("k{i:04}")), make_row(b"v", 1000 + i))
+                .write(
+                    &make_key(&format!("k{i:04}")),
+                    Arc::new(make_row(b"v", 1000 + i)),
+                )
                 .unwrap();
         }
         store.flush().unwrap();
@@ -14345,7 +13666,10 @@ mod tests {
         // Add N more distinct partitions into the fresh active memtable.
         for i in N..(2 * N) {
             store
-                .write(&make_key(&format!("k{i:04}")), make_row(b"v", 1000 + i))
+                .write(
+                    &make_key(&format!("k{i:04}")),
+                    Arc::new(make_row(b"v", 1000 + i)),
+                )
                 .unwrap();
         }
         assert_eq!(
@@ -14382,7 +13706,7 @@ mod tests {
                 // identity (pk+clustering) is unchanged.
                 let ts = 1000 + copy as i64;
                 store
-                    .write(&make_key("p0"), make_row_with_ck(ck, b"v", ts))
+                    .write(&make_key("p0"), Arc::new(make_row_with_ck(ck, b"v", ts)))
                     .unwrap();
             }
             store.flush().unwrap();
@@ -14456,9 +13780,9 @@ mod tests {
                 deletion: DeletionTime::LIVE,
                 static_row: None,
                 rows: vec![
-                    make_row_with_ck(1, b"v", ts),
-                    make_row_with_ck(2, b"v", ts),
-                    make_row_with_ck(3, b"v", ts),
+                    Arc::new(make_row_with_ck(1, b"v", ts)),
+                    Arc::new(make_row_with_ck(2, b"v", ts)),
+                    Arc::new(make_row_with_ck(3, b"v", ts)),
                 ],
             }]
         };
@@ -14845,7 +14169,9 @@ mod tests {
         let schema = test_schema();
         let key = make_key("k-resolvable");
 
-        store.write(&key, make_row(b"live", 2000)).unwrap();
+        store
+            .write(&key, Arc::new(make_row(b"live", 2000)))
+            .unwrap();
 
         let truncated = Arc::new(sstable_reader_from_partitions(
             &schema,
@@ -15556,12 +14882,10 @@ mod tests {
         let err = collect_index_results(&store, "val_idx", &IndexKey(b"missing".to_vec()))
             .expect_err("an index read over a table with a quarantined generation must not be Ok");
         assert_names_sstable(&err, "missing-gen");
-        let err = store
-            .read_by_index_in_partition("val_idx", &IndexKey(b"missing".to_vec()), b"c")
+        let err = collect_keyed(&store, "val_idx", &IndexKey(b"missing".to_vec()), b"c")
             .expect_err("a partition-scoped index read must refuse too");
         assert_names_sstable(&err, "missing-gen");
-        let err = store
-            .read_by_index_cell_ranges("val_idx", &[(0, u64::MAX)])
+        let err = collect_geo(&store, "val_idx", &[(0, u64::MAX)])
             .expect_err("a cell-range index read must refuse too");
         assert_names_sstable(&err, "missing-gen");
     }
@@ -15651,7 +14975,9 @@ mod tests {
     fn write_then_read_from_memtable() {
         let store = test_store();
         let key = make_key("pk1");
-        store.write(&key, make_row(b"hello", 1000)).unwrap();
+        store
+            .write(&key, Arc::new(make_row(b"hello", 1000)))
+            .unwrap();
 
         let result = store.read(&key).unwrap();
         assert!(result.is_some(), "expected Some partition");
@@ -15682,11 +15008,15 @@ mod tests {
         assert_eq!(store.memtable_partition_count(), 0);
         assert_eq!(store.memtable_size(), 0);
 
-        store.write(&make_key("k1"), make_row(b"v1", 1000)).unwrap();
+        store
+            .write(&make_key("k1"), Arc::new(make_row(b"v1", 1000)))
+            .unwrap();
         assert_eq!(store.memtable_partition_count(), 1);
         assert!(store.memtable_size() > 0);
 
-        store.write(&make_key("k2"), make_row(b"v2", 1000)).unwrap();
+        store
+            .write(&make_key("k2"), Arc::new(make_row(b"v2", 1000)))
+            .unwrap();
         assert_eq!(store.memtable_partition_count(), 2);
     }
 
@@ -15696,7 +15026,9 @@ mod tests {
     #[test]
     fn flush_creates_sstable() {
         let store = test_store();
-        store.write(&make_key("k1"), make_row(b"v1", 1000)).unwrap();
+        store
+            .write(&make_key("k1"), Arc::new(make_row(b"v1", 1000)))
+            .unwrap();
         assert_eq!(store.sstable_count(), 0);
 
         store.flush().unwrap();
@@ -15730,7 +15062,11 @@ mod tests {
             store
                 .write(
                     &key,
-                    make_row_with_ck(i as i32, format!("r{i}").as_bytes(), i as i64 + 1),
+                    Arc::new(make_row_with_ck(
+                        i as i32,
+                        format!("r{i}").as_bytes(),
+                        i as i64 + 1,
+                    )),
                 )
                 .unwrap();
         }
@@ -15758,15 +15094,15 @@ mod tests {
             key: key.clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![make_row_with_ck(1, b"before", 1000)],
+            rows: vec![Arc::new(make_row_with_ck(1, b"before", 1000))],
         };
         let late_same_key = Partition {
             key: key.clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
             rows: vec![
-                make_row_with_ck(1, b"before", 1000),
-                make_row_with_ck(2, b"late", 2000),
+                Arc::new(make_row_with_ck(1, b"before", 1000)),
+                Arc::new(make_row_with_ck(2, b"late", 2000)),
             ],
         };
         let flushed_by_key = std::collections::BTreeMap::from([(key.clone(), &flushed)]);
@@ -15784,7 +15120,7 @@ mod tests {
             key: key.clone(),
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![make_row_with_ck(1, b"before", 1000)],
+            rows: vec![Arc::new(make_row_with_ck(1, b"before", 1000))],
         };
         let flushed_by_key = std::collections::BTreeMap::from([(key.clone(), &flushed)]);
 
@@ -15801,7 +15137,9 @@ mod tests {
     fn read_after_flush_finds_partition() {
         let store = test_store();
         let key = make_key("pk_flushed");
-        store.write(&key, make_row(b"flushed_val", 2000)).unwrap();
+        store
+            .write(&key, Arc::new(make_row(b"flushed_val", 2000)))
+            .unwrap();
         store.flush().unwrap();
 
         let result = store.read(&key).unwrap();
@@ -15822,11 +15160,15 @@ mod tests {
         let key = make_key("shared_key");
 
         // Write old value and flush to SSTable.
-        store.write(&key, make_row(b"old_val", 1000)).unwrap();
+        store
+            .write(&key, Arc::new(make_row(b"old_val", 1000)))
+            .unwrap();
         store.flush().unwrap();
 
         // Write newer value — stays in memtable.
-        store.write(&key, make_row(b"new_val", 2000)).unwrap();
+        store
+            .write(&key, Arc::new(make_row(b"new_val", 2000)))
+            .unwrap();
 
         let result = store.read(&key).unwrap();
         assert!(result.is_some());
@@ -15847,12 +15189,16 @@ mod tests {
         let store = test_store();
 
         // First flush: k1
-        store.write(&make_key("k1"), make_row(b"v1", 1000)).unwrap();
+        store
+            .write(&make_key("k1"), Arc::new(make_row(b"v1", 1000)))
+            .unwrap();
         store.flush().unwrap();
         assert_eq!(store.sstable_count(), 1);
 
         // Second flush: k2
-        store.write(&make_key("k2"), make_row(b"v2", 2000)).unwrap();
+        store
+            .write(&make_key("k2"), Arc::new(make_row(b"v2", 2000)))
+            .unwrap();
         store.flush().unwrap();
         assert_eq!(store.sstable_count(), 2);
 
@@ -15877,7 +15223,7 @@ mod tests {
         let store = test_store();
         let key = make_key("k1");
 
-        store.write(&key, make_row(b"v1", 1000)).unwrap();
+        store.write(&key, Arc::new(make_row(b"v1", 1000))).unwrap();
         store.flush().unwrap();
 
         let view = store.view.load();
@@ -15897,7 +15243,7 @@ mod tests {
         for i in 0..5 {
             let key = make_key(&format!("k{i}"));
             store
-                .write(&key, make_row(format!("v{i}").as_bytes(), 1000))
+                .write(&key, Arc::new(make_row(format!("v{i}").as_bytes(), 1000)))
                 .unwrap();
         }
 
@@ -15917,7 +15263,7 @@ mod tests {
         let store = test_store();
         for i in 0..10 {
             store
-                .write(&make_key(&format!("k{i}")), make_row(b"v", 1000))
+                .write(&make_key(&format!("k{i}")), Arc::new(make_row(b"v", 1000)))
                 .unwrap();
         }
         let results = store.read_range(None, None, 3).unwrap();
@@ -15984,7 +15330,7 @@ mod tests {
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };
 
-        store.write(&key, row).unwrap();
+        store.write(&key, Arc::new(row)).unwrap();
 
         // The memtable index should contain the email value
         let index = store
@@ -16042,8 +15388,8 @@ mod tests {
             primary_key_liveness: LivenessInfo::with_timestamp(2000),
         };
 
-        store.write(&make_key("user1"), row1).unwrap();
-        store.write(&make_key("user2"), row2).unwrap();
+        store.write(&make_key("user1"), Arc::new(row1)).unwrap();
+        store.write(&make_key("user2"), Arc::new(row2)).unwrap();
 
         let index = store
             .get_memtable_index("city_idx")
@@ -16097,7 +15443,7 @@ mod tests {
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };
 
-        store.write(&make_key("user1"), row).unwrap();
+        store.write(&make_key("user1"), Arc::new(row)).unwrap();
 
         let index = store
             .get_memtable_index("val_idx")
@@ -16146,7 +15492,7 @@ mod tests {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };
-        store.write(&make_key("user1"), row).unwrap();
+        store.write(&make_key("user1"), Arc::new(row)).unwrap();
 
         // Verify index has the entry before flush
         let pre_flush_index = store
@@ -16181,7 +15527,9 @@ mod tests {
         // The original `new()` constructor should still work identically
         let store = test_store();
         let key = make_key("pk1");
-        store.write(&key, make_row(b"hello", 1000)).unwrap();
+        store
+            .write(&key, Arc::new(make_row(b"hello", 1000)))
+            .unwrap();
 
         let result = store.read(&key).unwrap();
         assert!(result.is_some());
@@ -16202,7 +15550,7 @@ mod tests {
             store
                 .write(
                     &make_key(&format!("k{i}")),
-                    make_row(format!("v{i}").as_bytes(), i as i64 * 1000),
+                    Arc::new(make_row(format!("v{i}").as_bytes(), i as i64 * 1000)),
                 )
                 .unwrap();
             store.flush().unwrap();
@@ -16211,7 +15559,7 @@ mod tests {
 
         // Create a new SSTable to be the compaction output (flush a new entry).
         store
-            .write(&make_key("compacted"), make_row(b"merged", 9000))
+            .write(&make_key("compacted"), Arc::new(make_row(b"merged", 9000)))
             .unwrap();
         store.flush().unwrap();
         let view = store.view.load();
@@ -16268,7 +15616,7 @@ mod tests {
             .add_index("idx_main".to_string(), 0, IndexType::BTree)
             .unwrap();
         store
-            .write(&make_key("before"), make_row(b"v", 1000))
+            .write(&make_key("before"), Arc::new(make_row(b"v", 1000)))
             .unwrap();
 
         let (rotated_tx, rotated_rx) = std::sync::mpsc::channel();
@@ -16307,9 +15655,13 @@ mod tests {
     #[test]
     fn a_compaction_swap_after_truncate_does_not_resurrect_rows() {
         let store = test_store();
-        store.write(&make_key("a"), make_row(b"va", 1000)).unwrap();
+        store
+            .write(&make_key("a"), Arc::new(make_row(b"va", 1000)))
+            .unwrap();
         store.flush().unwrap();
-        store.write(&make_key("b"), make_row(b"vb", 2000)).unwrap();
+        store
+            .write(&make_key("b"), Arc::new(make_row(b"vb", 2000)))
+            .unwrap();
         store.flush().unwrap();
         let inputs: Vec<(String, std::path::PathBuf)> =
             store.view.load().sstable_ids.iter().cloned().collect();
@@ -16363,7 +15715,7 @@ mod tests {
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
             primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(100),
         };
-        store.write(&key, row1).unwrap();
+        store.write(&key, Arc::new(row1)).unwrap();
         store.flush().unwrap();
 
         // Batch 2: write row with DIFFERENT clustering key "ck2" to SAME partition.
@@ -16373,7 +15725,7 @@ mod tests {
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
             primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(200),
         };
-        store.write(&key, row2).unwrap();
+        store.write(&key, Arc::new(row2)).unwrap();
         store.flush().unwrap();
 
         // Read: BOTH rows must be present.
@@ -16408,7 +15760,7 @@ mod tests {
                 deletion: ferrosa_sstable::types::DeletionTime::LIVE,
                 primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1000),
             };
-            store.write(&key, row).unwrap();
+            store.write(&key, Arc::new(row)).unwrap();
         }
         store.flush().unwrap();
 
@@ -16424,7 +15776,7 @@ mod tests {
                 deletion: ferrosa_sstable::types::DeletionTime::LIVE,
                 primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(2000),
             };
-            store.write(&key, row).unwrap();
+            store.write(&key, Arc::new(row)).unwrap();
         }
         store.flush().unwrap();
 
@@ -16466,7 +15818,11 @@ mod tests {
             store
                 .write(
                     &key,
-                    make_row_with_ck(ck, format!("batch1-{ck}").as_bytes(), 1000 + ck as i64),
+                    Arc::new(make_row_with_ck(
+                        ck,
+                        format!("batch1-{ck}").as_bytes(),
+                        1000 + ck as i64,
+                    )),
                 )
                 .unwrap();
         }
@@ -16476,7 +15832,11 @@ mod tests {
             store
                 .write(
                     &key,
-                    make_row_with_ck(ck, format!("batch2-{ck}").as_bytes(), 2000 + ck as i64),
+                    Arc::new(make_row_with_ck(
+                        ck,
+                        format!("batch2-{ck}").as_bytes(),
+                        2000 + ck as i64,
+                    )),
                 )
                 .unwrap();
         }
@@ -16501,7 +15861,11 @@ mod tests {
             store
                 .write(
                     &key,
-                    make_row_with_ck(ck, format!("mem-{ck}").as_bytes(), 1000 + ck as i64),
+                    Arc::new(make_row_with_ck(
+                        ck,
+                        format!("mem-{ck}").as_bytes(),
+                        1000 + ck as i64,
+                    )),
                 )
                 .unwrap();
         }
@@ -16525,14 +15889,14 @@ mod tests {
             store
                 .write(
                     &key,
-                    make_row_with_ck(ck, format!("sst-{ck}").as_bytes(), 1000),
+                    Arc::new(make_row_with_ck(ck, format!("sst-{ck}").as_bytes(), 1000)),
                 )
                 .unwrap();
         }
         store.flush().unwrap();
 
         store
-            .write(&key, make_row_with_ck(42, b"mem-newer", 2000))
+            .write(&key, Arc::new(make_row_with_ck(42, b"mem-newer", 2000)))
             .unwrap();
 
         let partition = store
@@ -16562,9 +15926,13 @@ mod tests {
         let store = test_store();
 
         // Flush 2 SSTables — they get PathBuf::new() in the view.
-        store.write(&make_key("a"), make_row(b"val_a", 1)).unwrap();
+        store
+            .write(&make_key("a"), Arc::new(make_row(b"val_a", 1)))
+            .unwrap();
         store.flush().unwrap();
-        store.write(&make_key("b"), make_row(b"val_b", 2)).unwrap();
+        store
+            .write(&make_key("b"), Arc::new(make_row(b"val_b", 2)))
+            .unwrap();
         store.flush().unwrap();
         assert_eq!(store.sstable_count(), 2);
 
@@ -16584,7 +15952,7 @@ mod tests {
 
         // Create a compaction output SSTable.
         store
-            .write(&make_key("merged"), make_row(b"merged", 3))
+            .write(&make_key("merged"), Arc::new(make_row(b"merged", 3)))
             .unwrap();
         store.flush().unwrap();
         let view = store.view.load();
@@ -16660,24 +16028,24 @@ mod tests {
         store
             .write(
                 &make_key("user1"),
-                Row {
+                Arc::new(Row {
                     clustering: vec![0x00, 0x00, 0x00, 0x01],
                     cells: vec![(0, CellValue::live(b"alice@test.com".to_vec(), 1000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                },
+                }),
             )
             .unwrap();
 
         store
             .write(
                 &make_key("user2"),
-                Row {
+                Arc::new(Row {
                     clustering: vec![0x00, 0x00, 0x00, 0x01],
                     cells: vec![(0, CellValue::live(b"bob@test.com".to_vec(), 1000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                },
+                }),
             )
             .unwrap();
 
@@ -16738,12 +16106,12 @@ mod tests {
             store
                 .write(
                     &make_key(&format!("edge-{i:06}")),
-                    Row {
+                    Arc::new(Row {
                         clustering: vec![0x00, 0x00, 0x00, 0x01],
                         cells: vec![(0, CellValue::live(b"t-1".to_vec(), 1000))],
                         deletion: DeletionTime::LIVE,
                         primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                    },
+                    }),
                 )
                 .unwrap();
         }
@@ -16791,24 +16159,24 @@ mod tests {
         store
             .write(
                 &make_key("user1"),
-                Row {
+                Arc::new(Row {
                     clustering: vec![0x00, 0x00, 0x00, 0x01],
                     cells: vec![(0, CellValue::live(b"NYC".to_vec(), 1000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                },
+                }),
             )
             .unwrap();
 
         store
             .write(
                 &make_key("user2"),
-                Row {
+                Arc::new(Row {
                     clustering: vec![0x00, 0x00, 0x00, 0x01],
                     cells: vec![(0, CellValue::live(b"NYC".to_vec(), 2000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(2000),
-                },
+                }),
             )
             .unwrap();
 
@@ -16827,7 +16195,9 @@ mod tests {
     fn read_by_index_unknown_index_is_refused_not_empty() {
         use ferrosa_index::IndexKey;
         let store = test_store();
-        store.write(&make_key("k"), make_row(b"v", 1000)).unwrap();
+        store
+            .write(&make_key("k"), Arc::new(make_row(b"v", 1000)))
+            .unwrap();
         let err = collect_index_results(&store, "nonexistent_idx", &IndexKey(b"anything".to_vec()))
             .expect_err("an undeclared index must not answer with zero rows");
         assert!(
@@ -16887,12 +16257,12 @@ mod tests {
         store
             .write(
                 &key,
-                Row {
+                Arc::new(Row {
                     clustering: vec![],
                     cells: vec![(0, CellValue::live(geo_tuple_bytes(lat, lon), 1000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                },
+                }),
             )
             .unwrap();
     }
@@ -16913,7 +16283,7 @@ mod tests {
             .iter()
             .map(|r| (r.start, r.end))
             .collect();
-        let partitions = store.read_by_index_cell_ranges("loc_geo", &ranges).unwrap();
+        let partitions = collect_geo(&store, "loc_geo", &ranges).unwrap();
 
         // The cover is an over-approximation, but it must contain both SF cells
         // and must not contain NYC's cell.
@@ -16931,42 +16301,269 @@ mod tests {
     }
 
     #[test]
-    fn read_by_index_cell_ranges_dedups_and_bounds() {
+    fn read_by_index_cell_ranges_unknown_index_is_empty() {
         let store = geo_store();
-        // Insert one well-formed point, then >cap raw entries at one cell id to
-        // trip the fail-loud bound.
-        write_geo_point(&store, "p1", 0.0, 0.0);
+        write_geo_point(&store, "p1", 1.0, 2.0);
+        let result = collect_geo(&store, "nonexistent", &[(0, u64::MAX)]).unwrap();
+        assert!(result.is_empty());
+    }
 
-        let idx = store.get_memtable_index("loc_geo").unwrap();
-        let cell = ferrosa_index::geo::encode_point(0.0, 0.0);
-        let key = IndexKey(cell.to_be_bytes().to_vec());
-        for i in 0..(INDEX_RESULT_CAP as u32 + 1) {
-            idx.insert(
-                key.clone(),
-                RowPosition {
-                    partition_key: format!("pk{i}").into_bytes(),
-                    clustering_key: vec![],
-                },
-            );
+    // =========================================================================
+    // Streaming keyed (in-partition) and geo index reads: no result cap.
+    // =========================================================================
+
+    /// Every row a keyed index read hands its visitor, as `(pk, ck)`.
+    fn keyed_rows(
+        store: &TableStore<InMemoryFlushTarget>,
+        index_name: &str,
+        key: &[u8],
+        partition_key: &[u8],
+        after: Option<&[u8]>,
+    ) -> Result<Vec<RowPosition>> {
+        let mut delivered = Vec::new();
+        store.read_by_index_in_partition_each_after(
+            index_name,
+            &IndexKey(key.to_vec()),
+            partition_key,
+            after,
+            &mut |partition| {
+                delivered.extend(partition.rows.iter().map(|row| RowPosition {
+                    partition_key: partition.key.key.as_bytes().to_vec(),
+                    clustering_key: row.clustering.clone(),
+                }));
+                std::ops::ControlFlow::Continue(())
+            },
+        )?;
+        Ok(delivered)
+    }
+
+    fn keyed_val_store() -> TableStore<InMemoryFlushTarget> {
+        TableStore::new_with_indexes(
+            test_schema(),
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+            vec![("val_idx".into(), 0)],
+        )
+    }
+
+    #[test]
+    fn keyed_index_read_streams_more_matches_than_the_old_cap() {
+        let store = keyed_val_store();
+        let hot = make_key("hot");
+        let other = make_key("other");
+        let total = 10_001_i32;
+        for ck in 0..total {
+            store
+                .write(&hot, Arc::new(make_row_with_ck(ck, b"X", 10)))
+                .unwrap();
+            if ck == total / 2 {
+                // Half the postings come from a sidecar, half from the memtable.
+                store.flush().unwrap();
+            }
         }
-        let ranges = vec![(cell, cell)];
-        let result = store.read_by_index_cell_ranges("loc_geo", &ranges);
-        assert!(result.is_err(), "should fail loud when cap exceeded");
-        let msg = format!("{}", result.unwrap_err());
+        store
+            .write(&other, Arc::new(make_row_with_ck(1, b"X", 10)))
+            .unwrap();
+        store
+            .write(&hot, Arc::new(make_row_with_ck(total, b"Y", 10)))
+            .unwrap();
+
+        let delivered = keyed_rows(&store, "val_idx", b"X", hot.key.as_bytes(), None)
+            .expect("a keyed read past 10,000 matches must stream, not refuse");
+        assert_eq!(delivered.len(), total as usize, "every match, once");
         assert!(
-            msg.contains("10000") || msg.contains("ALLOW FILTERING"),
-            "error should mention the cap or ALLOW FILTERING, got: {msg}"
+            delivered
+                .iter()
+                .all(|p| p.partition_key == hot.key.as_bytes()),
+            "only the keyed partition"
+        );
+        assert!(
+            delivered.windows(2).all(|w| w[0] < w[1]),
+            "in clustering order, no duplicates"
+        );
+
+        // Resuming strictly after a row yields exactly the remainder.
+        let cursor = 9_000_i32.to_be_bytes();
+        let rest = keyed_rows(&store, "val_idx", b"X", hot.key.as_bytes(), Some(&cursor)).unwrap();
+        assert_eq!(rest.len(), (total - 9_001) as usize);
+        assert_eq!(rest[0].clustering_key, 9_001_i32.to_be_bytes().to_vec());
+    }
+
+    #[test]
+    fn keyed_index_read_stops_when_its_consumer_stops() {
+        let store = keyed_val_store();
+        let hot = make_key("hot");
+        for ck in 0..500 {
+            store
+                .write(&hot, Arc::new(make_row_with_ck(ck, b"X", 10)))
+                .unwrap();
+        }
+        INDEX_POINT_READS.with(|count| count.set(0));
+        let mut seen = 0;
+        store
+            .read_by_index_in_partition_each_after(
+                "val_idx",
+                &IndexKey(b"X".to_vec()),
+                hot.key.as_bytes(),
+                None,
+                &mut |_| {
+                    seen += 1;
+                    std::ops::ControlFlow::Break(())
+                },
+            )
+            .unwrap();
+        assert_eq!(seen, 1);
+        assert_eq!(
+            INDEX_POINT_READS.with(|count| count.get()),
+            1,
+            "an early-stopping consumer must not drive the walk to the end"
         );
     }
 
     #[test]
-    fn read_by_index_cell_ranges_unknown_index_is_empty() {
+    fn keyed_partition_key_index_read_streams_the_partition_in_chunks() {
+        let store = clustered_entity_store();
+        write_session(&store, "tenant-a", "s1", 6);
+        write_session(&store, "tenant-a", "s2", 3);
+        let pk = make_composite_key(&["tenant-a", "s1"]);
+        INDEX_POINT_READS.with(|count| count.set(0));
+        let delivered = keyed_rows(
+            &store,
+            "idx_by_tenant",
+            b"tenant-a",
+            pk.key.as_bytes(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(delivered.len(), 6, "every row of s1 and none of s2");
+        assert_eq!(INDEX_POINT_READS.with(|count| count.get()), 0);
+        let after = 4_i32.to_be_bytes();
+        let rest = keyed_rows(
+            &store,
+            "idx_by_tenant",
+            b"tenant-a",
+            pk.key.as_bytes(),
+            Some(&after),
+        )
+        .unwrap();
+        assert_eq!(rest.len(), 2, "resumes strictly after entity 4");
+    }
+
+    fn geo_cover(lat: f64, lon: f64, radius_m: f64) -> Vec<(u64, u64)> {
+        ferrosa_index::geo::cover_radius(
+            lat,
+            lon,
+            radius_m,
+            ferrosa_index::geo::DEFAULT_COVER_LEVEL,
+        )
+        .iter()
+        .map(|r| (r.start, r.end))
+        .collect()
+    }
+
+    fn geo_keys(
+        store: &TableStore<InMemoryFlushTarget>,
+        ranges: &[(u64, u64)],
+    ) -> Result<Vec<Vec<u8>>> {
+        let mut keys = Vec::new();
+        store.read_by_index_cell_ranges_each("loc_geo", ranges, &mut |partition| {
+            keys.push(partition.key.key.as_bytes().to_vec());
+            std::ops::ControlFlow::Continue(())
+        })?;
+        Ok(keys)
+    }
+
+    #[test]
+    fn geo_index_read_streams_more_candidates_than_the_old_cap() {
         let store = geo_store();
-        write_geo_point(&store, "p1", 1.0, 2.0);
-        let result = store
-            .read_by_index_cell_ranges("nonexistent", &[(0, u64::MAX)])
+        let total = 10_001_u32;
+        for i in 0..total {
+            let jitter = f64::from(i) * 1e-7;
+            write_geo_point(&store, &format!("p{i:05}"), 37.7955 + jitter, -122.3937);
+            if i == total / 2 {
+                store.flush().unwrap();
+            }
+        }
+        let keys = geo_keys(&store, &geo_cover(37.7955, -122.3937, 3000.0))
+            .expect("a geo read past 10,000 candidates must stream, not refuse");
+        assert_eq!(keys.len(), total as usize, "every candidate, once");
+        let mut sorted = keys.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), keys.len(), "no candidate twice");
+    }
+
+    #[test]
+    fn geo_index_read_drops_postings_a_moved_point_left_behind() {
+        let store = geo_store();
+        // `moved` starts in range and moves elsewhere in range; `left` starts
+        // in range and moves out of it. Their old postings outlive the move.
+        write_geo_point(&store, "moved", 37.7955, -122.3937);
+        write_geo_point(&store, "left", 37.7880, -122.4074);
+        store.flush().unwrap();
+        let key = make_key("moved");
+        store
+            .write(
+                &key,
+                Arc::new(Row {
+                    clustering: vec![],
+                    cells: vec![(
+                        0,
+                        CellValue::live(geo_tuple_bytes(37.7900, -122.4000), 2000),
+                    )],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(2000),
+                }),
+            )
             .unwrap();
-        assert!(result.is_empty());
+        let key = make_key("left");
+        store
+            .write(
+                &key,
+                Arc::new(Row {
+                    clustering: vec![],
+                    cells: vec![(0, CellValue::live(geo_tuple_bytes(40.7580, -73.9855), 2000))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(2000),
+                }),
+            )
+            .unwrap();
+        let keys = geo_keys(&store, &geo_cover(37.7955, -122.3937, 3000.0)).unwrap();
+        assert_eq!(
+            keys,
+            vec![b"moved".to_vec()],
+            "the moved point once, the departed point not at all"
+        );
+    }
+
+    #[test]
+    fn geo_index_read_stops_when_its_consumer_stops() {
+        let store = geo_store();
+        for i in 0..200_u32 {
+            write_geo_point(
+                &store,
+                &format!("p{i:03}"),
+                37.7955 + f64::from(i) * 1e-6,
+                -122.3937,
+            );
+        }
+        INDEX_POINT_READS.with(|count| count.set(0));
+        let mut seen = 0;
+        store
+            .read_by_index_cell_ranges_each(
+                "loc_geo",
+                &geo_cover(37.7955, -122.3937, 3000.0),
+                &mut |_| {
+                    seen += 1;
+                    std::ops::ControlFlow::Break(())
+                },
+            )
+            .unwrap();
+        assert_eq!(seen, 1);
+        assert_eq!(INDEX_POINT_READS.with(|count| count.get()), 1);
     }
 
     // =========================================================================
@@ -17009,7 +16606,7 @@ mod tests {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };
-        store.write(&key, row).unwrap();
+        store.write(&key, Arc::new(row)).unwrap();
 
         // Index should be empty (tombstone not indexed)
         let idx = store.get_memtable_index("email_idx").unwrap();
@@ -17066,7 +16663,7 @@ mod tests {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };
-        store.write(&key, row).unwrap();
+        store.write(&key, Arc::new(row)).unwrap();
 
         // Index should be empty — indexed column was not present
         let idx = store.get_memtable_index("email_idx").unwrap();
@@ -17115,12 +16712,12 @@ mod tests {
         store
             .write(
                 &make_key("user1"),
-                Row {
+                Arc::new(Row {
                     clustering: vec![0x00, 0x00, 0x00, 0x01],
                     cells: vec![(0, CellValue::live(b"NYC".to_vec(), 1000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                },
+                }),
             )
             .unwrap();
         store.flush().unwrap();
@@ -17177,12 +16774,12 @@ mod tests {
         store
             .write(
                 &make_key("user1"),
-                Row {
+                Arc::new(Row {
                     clustering: vec![0x00, 0x00, 0x00, 0x01],
                     cells: vec![(0, CellValue::live(b"NYC".to_vec(), 1000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                },
+                }),
             )
             .unwrap();
         store.flush().unwrap();
@@ -17191,12 +16788,12 @@ mod tests {
         store
             .write(
                 &make_key("user2"),
-                Row {
+                Arc::new(Row {
                     clustering: vec![0x00, 0x00, 0x00, 0x01],
                     cells: vec![(0, CellValue::live(b"NYC".to_vec(), 2000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(2000),
-                },
+                }),
             )
             .unwrap();
 
@@ -17253,12 +16850,12 @@ mod tests {
         store
             .write(
                 &make_key("user1"),
-                Row {
+                Arc::new(Row {
                     clustering: vec![0x00, 0x00, 0x00, 0x01],
                     cells: vec![(0, CellValue::live(b"John".to_vec(), 1000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                },
+                }),
             )
             .unwrap();
 
@@ -17325,13 +16922,13 @@ mod tests {
         store
             .write(
                 &make_key("user1"),
-                Row {
+                Arc::new(Row {
                     clustering: vec![0x00, 0x00, 0x00, 0x01],
                     // Post-ALTER layout: cell ordinal 1 is "name".
                     cells: vec![(1, CellValue::live(b"John".to_vec(), 1000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                },
+                }),
             )
             .unwrap();
 
@@ -17379,12 +16976,12 @@ mod tests {
         store
             .write(
                 &make_key("user1"),
-                Row {
+                Arc::new(Row {
                     clustering: vec![0x00, 0x00, 0x00, 0x01],
                     cells: vec![(0, CellValue::live(b"John".to_vec(), 1000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                },
+                }),
             )
             .unwrap();
         store.flush().unwrap();
@@ -17445,12 +17042,12 @@ mod tests {
         store
             .write(
                 &make_key("user1"),
-                Row {
+                Arc::new(Row {
                     clustering: vec![0x00, 0x00, 0x00, 0x01],
                     cells: vec![(0, CellValue::live(b"John".to_vec(), 1000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                },
+                }),
             )
             .unwrap();
         store.flush().unwrap();
@@ -17471,8 +17068,12 @@ mod tests {
     #[test]
     fn sstable_metadata_reports_nonzero_size() {
         let store = test_store();
-        store.write(&make_key("k1"), make_row(b"v1", 1000)).unwrap();
-        store.write(&make_key("k2"), make_row(b"v2", 2000)).unwrap();
+        store
+            .write(&make_key("k1"), Arc::new(make_row(b"v1", 1000)))
+            .unwrap();
+        store
+            .write(&make_key("k2"), Arc::new(make_row(b"v2", 2000)))
+            .unwrap();
         store.flush().unwrap();
 
         let table_dir = std::path::Path::new("/tmp/test_sstables");
@@ -17496,7 +17097,7 @@ mod tests {
             store
                 .write(
                     &make_key(&format!("bounded-{index:03}")),
-                    make_row(b"x", index as i64 + 1),
+                    Arc::new(make_row(b"x", index as i64 + 1)),
                 )
                 .unwrap();
             store.flush().unwrap();
@@ -17524,13 +17125,13 @@ mod tests {
 
         // Write multiple partitions with distinct keys to ensure different tokens
         store
-            .write(&make_key("alpha"), make_row(b"v1", 1000))
+            .write(&make_key("alpha"), Arc::new(make_row(b"v1", 1000)))
             .unwrap();
         store
-            .write(&make_key("beta"), make_row(b"v2", 2000))
+            .write(&make_key("beta"), Arc::new(make_row(b"v2", 2000)))
             .unwrap();
         store
-            .write(&make_key("gamma"), make_row(b"v3", 3000))
+            .write(&make_key("gamma"), Arc::new(make_row(b"v3", 3000)))
             .unwrap();
         store.flush().unwrap();
 
@@ -17580,7 +17181,7 @@ mod tests {
         store
             .write(
                 &make_key("still-readable-through-open-fd"),
-                make_row(b"v1", 1000),
+                Arc::new(make_row(b"v1", 1000)),
             )
             .unwrap();
         store.flush().unwrap();
@@ -17618,7 +17219,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = file_backed_test_store(tmp.path());
         store
-            .write(&make_key("evicted-planning"), make_row(b"v1", 1000))
+            .write(
+                &make_key("evicted-planning"),
+                Arc::new(make_row(b"v1", 1000)),
+            )
             .unwrap();
         store.flush().unwrap();
         let gen = store.last_flush_generation();
@@ -17673,7 +17277,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = file_backed_test_store(tmp.path());
         store
-            .write(&make_key("unplannable"), make_row(b"v1", 1000))
+            .write(&make_key("unplannable"), Arc::new(make_row(b"v1", 1000)))
             .unwrap();
         store.flush().unwrap();
         let gen = store.last_flush_generation();
@@ -17868,9 +17472,15 @@ mod tests {
     #[test]
     fn sstable_metadata_reports_max_timestamp() {
         let store = test_store();
-        store.write(&make_key("k1"), make_row(b"v1", 5000)).unwrap();
-        store.write(&make_key("k2"), make_row(b"v2", 3000)).unwrap();
-        store.write(&make_key("k3"), make_row(b"v3", 7000)).unwrap();
+        store
+            .write(&make_key("k1"), Arc::new(make_row(b"v1", 5000)))
+            .unwrap();
+        store
+            .write(&make_key("k2"), Arc::new(make_row(b"v2", 3000)))
+            .unwrap();
+        store
+            .write(&make_key("k3"), Arc::new(make_row(b"v3", 7000)))
+            .unwrap();
         store.flush().unwrap();
 
         let table_dir = std::path::Path::new("/tmp/test_sstables");
@@ -18010,13 +17620,22 @@ mod tests {
             .unwrap();
 
         store
-            .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+            .write(
+                &make_key("k0"),
+                Arc::new(make_vector_row(&[1.0, 0.0, 0.0], 1000)),
+            )
             .unwrap();
         store
-            .write(&make_key("k1"), make_vector_row(&[0.9, 0.1, 0.0], 1001))
+            .write(
+                &make_key("k1"),
+                Arc::new(make_vector_row(&[0.9, 0.1, 0.0], 1001)),
+            )
             .unwrap();
         store
-            .write(&make_key("k2"), make_vector_row(&[0.0, 1.0, 0.0], 1002))
+            .write(
+                &make_key("k2"),
+                Arc::new(make_vector_row(&[0.0, 1.0, 0.0], 1002)),
+            )
             .unwrap();
         store.flush().unwrap();
 
@@ -18083,7 +17702,7 @@ mod tests {
                 key: make_key(&format!("key{i}")),
                 deletion: ferrosa_sstable::types::DeletionTime::LIVE,
                 static_row: None,
-                rows: vec![make_row(b"value", 1000)],
+                rows: vec![Arc::new(make_row(b"value", 1000))],
             })
             .collect();
         partitions.sort_by(|a, b| a.key.cmp(&b.key));
@@ -18138,8 +17757,10 @@ mod tests {
                     static_row: None,
                     rows: Vec::new(),
                 };
-                p.rows
-                    .push(make_row(format!("val{i:05}").as_bytes(), 1000 + i));
+                p.rows.push(Arc::new(make_row(
+                    format!("val{i:05}").as_bytes(),
+                    1000 + i,
+                )));
                 p
             })
             .collect();
@@ -18204,7 +17825,10 @@ mod tests {
             let key = format!("key{i:05}");
             let val = format!("val{i:05}");
             store
-                .write(&make_key(&key), make_row(val.as_bytes(), 1000 + i as i64))
+                .write(
+                    &make_key(&key),
+                    Arc::new(make_row(val.as_bytes(), 1000 + i as i64)),
+                )
                 .unwrap();
         }
 
@@ -18274,13 +17898,13 @@ mod tests {
         store
             .write(
                 &make_key("flushed-0"),
-                make_vector_row(&[0.0, 1.0, 0.0], 1000),
+                Arc::new(make_vector_row(&[0.0, 1.0, 0.0], 1000)),
             )
             .unwrap();
         store
             .write(
                 &make_key("flushed-1"),
-                make_vector_row(&[0.0, 0.0, 1.0], 1001),
+                Arc::new(make_vector_row(&[0.0, 0.0, 1.0], 1001)),
             )
             .unwrap();
         store.flush().unwrap();
@@ -18291,7 +17915,7 @@ mod tests {
         store
             .write(
                 &make_key("active-exact"),
-                make_vector_row(&[1.0, 0.0, 0.0], 1002),
+                Arc::new(make_vector_row(&[1.0, 0.0, 0.0], 1002)),
             )
             .unwrap();
 
@@ -18334,13 +17958,22 @@ mod tests {
         //   k1 = [0.9, 0.1, 0.0]   small distance
         //   k2 = [0.0, 1.0, 0.0]   larger distance
         store
-            .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+            .write(
+                &make_key("k0"),
+                Arc::new(make_vector_row(&[1.0, 0.0, 0.0], 1000)),
+            )
             .unwrap();
         store
-            .write(&make_key("k1"), make_vector_row(&[0.9, 0.1, 0.0], 1001))
+            .write(
+                &make_key("k1"),
+                Arc::new(make_vector_row(&[0.9, 0.1, 0.0], 1001)),
+            )
             .unwrap();
         store
-            .write(&make_key("k2"), make_vector_row(&[0.0, 1.0, 0.0], 1002))
+            .write(
+                &make_key("k2"),
+                Arc::new(make_vector_row(&[0.0, 1.0, 0.0], 1002)),
+            )
             .unwrap();
 
         // Flush: this should drain the VectorMemtableIndex and persist a
@@ -18415,7 +18048,10 @@ mod tests {
             })
             .unwrap();
         store
-            .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+            .write(
+                &make_key("k0"),
+                Arc::new(make_vector_row(&[1.0, 0.0, 0.0], 1000)),
+            )
             .unwrap();
 
         let (rotated_tx, rotated_rx) = std::sync::mpsc::channel();
@@ -18468,10 +18104,16 @@ mod tests {
             },
         );
         store
-            .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+            .write(
+                &make_key("k0"),
+                Arc::new(make_vector_row(&[1.0, 0.0, 0.0], 1000)),
+            )
             .unwrap();
         store
-            .write(&make_key("k1"), make_vector_row(&[0.0, 1.0, 0.0], 1001))
+            .write(
+                &make_key("k1"),
+                Arc::new(make_vector_row(&[0.0, 1.0, 0.0], 1001)),
+            )
             .unwrap();
         let _rotation: FlushOutcome = store
             .add_vector_index(VectorIndexConfig {
@@ -18517,7 +18159,7 @@ mod tests {
             .unwrap();
         for (key, vector) in [("k0", [1.0, 0.0, 0.0]), ("k1", [0.0, 1.0, 0.0])] {
             store
-                .write(&make_key(key), make_vector_row(&vector, 1000))
+                .write(&make_key(key), Arc::new(make_vector_row(&vector, 1000)))
                 .unwrap();
         }
         store.flush().unwrap();
@@ -18561,7 +18203,7 @@ mod tests {
         );
         for (key, vector) in [("k0", [1.0, 0.0, 0.0]), ("k1", [0.0, 1.0, 0.0])] {
             store
-                .write(&make_key(key), make_vector_row(&vector, 1000))
+                .write(&make_key(key), Arc::new(make_vector_row(&vector, 1000)))
                 .unwrap();
         }
         store.flush().unwrap();
@@ -18642,13 +18284,22 @@ mod tests {
 
         // k0 is the exact match for the query, k1 close, k2 far.
         store
-            .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+            .write(
+                &make_key("k0"),
+                Arc::new(make_vector_row(&[1.0, 0.0, 0.0], 1000)),
+            )
             .unwrap();
         store
-            .write(&make_key("k1"), make_vector_row(&[0.9, 0.1, 0.0], 1001))
+            .write(
+                &make_key("k1"),
+                Arc::new(make_vector_row(&[0.9, 0.1, 0.0], 1001)),
+            )
             .unwrap();
         store
-            .write(&make_key("k2"), make_vector_row(&[0.0, 1.0, 0.0], 1002))
+            .write(
+                &make_key("k2"),
+                Arc::new(make_vector_row(&[0.0, 1.0, 0.0], 1002)),
+            )
             .unwrap();
 
         let partitions = store
@@ -18685,10 +18336,16 @@ mod tests {
             );
 
             store
-                .write(&make_key("near"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+                .write(
+                    &make_key("near"),
+                    Arc::new(make_vector_row(&[1.0, 0.0, 0.0], 1000)),
+                )
                 .unwrap();
             store
-                .write(&make_key("far"), make_vector_row(&[0.0, 1.0, 0.0], 1001))
+                .write(
+                    &make_key("far"),
+                    Arc::new(make_vector_row(&[0.0, 1.0, 0.0], 1001)),
+                )
                 .unwrap();
 
             let config = VectorIndexConfig {
@@ -18735,10 +18392,16 @@ mod tests {
             .unwrap();
 
         store
-            .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+            .write(
+                &make_key("k0"),
+                Arc::new(make_vector_row(&[1.0, 0.0, 0.0], 1000)),
+            )
             .unwrap();
         store
-            .write(&make_key("k1"), make_vector_row(&[0.0, 1.0, 0.0], 1001))
+            .write(
+                &make_key("k1"),
+                Arc::new(make_vector_row(&[0.0, 1.0, 0.0], 1001)),
+            )
             .unwrap();
         // Flush moves the vectors into the persisted (scoped) sidecars; the row
         // payloads live in the SSTable. The index-consult path must still recover
@@ -18775,11 +18438,17 @@ mod tests {
             .unwrap();
 
         store
-            .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+            .write(
+                &make_key("k0"),
+                Arc::new(make_vector_row(&[1.0, 0.0, 0.0], 1000)),
+            )
             .unwrap();
         store.flush().unwrap();
         store
-            .write(&make_key("k1"), make_vector_row(&[0.9, 0.1, 0.0], 1001))
+            .write(
+                &make_key("k1"),
+                Arc::new(make_vector_row(&[0.9, 0.1, 0.0], 1001)),
+            )
             .unwrap();
         store.flush().unwrap();
 
@@ -18822,10 +18491,10 @@ mod tests {
         let scope_a = make_key("tenant-a|session-1");
         let scope_b = make_key("tenant-b|session-1");
         store
-            .write(&scope_a, make_vector_row(&[0.0, 1.0, 0.0], 1000))
+            .write(&scope_a, Arc::new(make_vector_row(&[0.0, 1.0, 0.0], 1000)))
             .unwrap();
         store
-            .write(&scope_b, make_vector_row(&[1.0, 0.0, 0.0], 1001))
+            .write(&scope_b, Arc::new(make_vector_row(&[1.0, 0.0, 0.0], 1001)))
             .unwrap();
 
         let query = [1.0, 0.0, 0.0];
@@ -18881,12 +18550,15 @@ mod tests {
         let scope_a = make_key("tenant-a|session-1");
         let scope_b = make_key("tenant-b|session-1");
         store
-            .write(&scope_a, make_vector_row(&[0.0, 1.0, 0.0], 1000))
+            .write(&scope_a, Arc::new(make_vector_row(&[0.0, 1.0, 0.0], 1000)))
             .unwrap();
         for i in 0..16 {
             let x = 1.0 - (i as f32 * 0.01);
             store
-                .write(&scope_b, make_vector_row(&[x, 0.0, 0.0], 2000 + i))
+                .write(
+                    &scope_b,
+                    Arc::new(make_vector_row(&[x, 0.0, 0.0], 2000 + i)),
+                )
                 .unwrap();
         }
         store.flush().unwrap();
@@ -18966,12 +18638,12 @@ mod tests {
         store
             .write(
                 &key,
-                Row {
+                Arc::new(Row {
                     clustering: clustering.clone(),
                     cells: vec![(0, CellValue::live(b"compile-project".to_vec(), 1000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                },
+                }),
             )
             .unwrap();
         assert!(
@@ -18988,12 +18660,12 @@ mod tests {
         store
             .write(
                 &key,
-                Row {
+                Arc::new(Row {
                     clustering: clustering.clone(),
                     cells: vec![(1, CellValue::live(embedding.clone(), 2000))],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(2000),
-                },
+                }),
             )
             .unwrap();
 
@@ -19054,7 +18726,10 @@ mod tests {
         for i in 0..n_sstables {
             let key = make_key(&format!("pk-{}", i % distinct_keys.max(1)));
             store
-                .write(&key, make_row(format!("v{i}").as_bytes(), 1000 + i as i64))
+                .write(
+                    &key,
+                    Arc::new(make_row(format!("v{i}").as_bytes(), 1000 + i as i64)),
+                )
                 .unwrap();
             store.flush().unwrap();
         }
@@ -19440,7 +19115,7 @@ mod tests {
                     key: key.clone(),
                     deletion,
                     static_row: static_row.cloned(),
-                    rows,
+                    rows: rows.into_iter().map(Arc::new).collect(),
                 });
                 Ok(())
             })
@@ -19475,7 +19150,7 @@ mod tests {
                 store
                     .write(
                         &key,
-                        make_row(format!("v{s}-{k}").as_bytes(), 1000 + s as i64),
+                        Arc::new(make_row(format!("v{s}-{k}").as_bytes(), 1000 + s as i64)),
                     )
                     .unwrap();
             }
@@ -19737,7 +19412,7 @@ mod tests {
             store
                 .write(
                     &make_key(&format!("k{i}")),
-                    make_row(format!("v{i}").as_bytes(), 1000 + i as i64),
+                    Arc::new(make_row(format!("v{i}").as_bytes(), 1000 + i as i64)),
                 )
                 .unwrap();
             store.flush().unwrap();
@@ -19874,7 +19549,11 @@ mod tests {
             store
                 .write(
                     &key,
-                    make_row_with_ck(ck, format!("c{ck}").as_bytes(), 1000 + ck as i64),
+                    Arc::new(make_row_with_ck(
+                        ck,
+                        format!("c{ck}").as_bytes(),
+                        1000 + ck as i64,
+                    )),
                 )
                 .unwrap();
         }
@@ -19892,7 +19571,7 @@ mod tests {
 
         // Read the full partition through the held reader BEFORE eviction to get
         // the ground-truth row set.
-        let before: Vec<Row> = held.get_partition(&key).unwrap().unwrap().rows;
+        let before: Vec<Arc<Row>> = held.get_partition(&key).unwrap().unwrap().rows;
         assert_eq!(
             before.len(),
             16,
@@ -19910,7 +19589,7 @@ mod tests {
 
         // The held Arc must still read the COMPLETE, correct partition — no
         // panic, no truncation, no use-after-evict. Re-read mid/post eviction.
-        let after: Vec<Row> = held.get_partition(&key).unwrap().unwrap().rows;
+        let after: Vec<Arc<Row>> = held.get_partition(&key).unwrap().unwrap().rows;
         assert_eq!(
             after, before,
             "held reader must yield identical, complete results across eviction"
@@ -19992,12 +19671,12 @@ mod tests {
             store
                 .write(
                     &key,
-                    Row {
+                    Arc::new(Row {
                         clustering: vec![],
                         cells: vec![(0, CellValue::live(format!("row-{i}").into_bytes(), 1000))],
                         deletion: DeletionTime::LIVE,
                         primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                    },
+                    }),
                 )
                 .unwrap();
         }
@@ -20070,7 +19749,7 @@ mod tests {
         let key = make_composite_key(&[tenant, session]);
         for entity in 1..=rows {
             store
-                .write(&key, make_row_with_ck(entity, b"entity", 1000))
+                .write(&key, Arc::new(make_row_with_ck(entity, b"entity", 1000)))
                 .unwrap();
         }
     }
@@ -20246,12 +19925,12 @@ mod tests {
             store
                 .write(
                     &key,
-                    Row {
+                    Arc::new(Row {
                         clustering: vec![],
                         cells: vec![(0, CellValue::live(format!("row-{i}").into_bytes(), 1000))],
                         deletion: DeletionTime::LIVE,
                         primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                    },
+                    }),
                 )
                 .unwrap();
         }
@@ -20271,12 +19950,12 @@ mod tests {
             store
                 .write(
                     &key,
-                    Row {
+                    Arc::new(Row {
                         clustering: vec![],
                         cells: vec![(0, CellValue::live(format!("row-{i}").into_bytes(), 1000))],
                         deletion: DeletionTime::LIVE,
                         primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                    },
+                    }),
                 )
                 .unwrap();
         }
@@ -20352,12 +20031,12 @@ mod tests {
             store
                 .write(
                     &key,
-                    Row {
+                    Arc::new(Row {
                         clustering: vec![],
                         cells: vec![(0, CellValue::live(format!("row-{i}").into_bytes(), 1000))],
                         deletion: DeletionTime::LIVE,
                         primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                    },
+                    }),
                 )
                 .unwrap();
         }
@@ -20484,7 +20163,10 @@ mod tests {
         let store = test_store();
         for i in 0..partitions {
             store
-                .write(&make_key(&format!("k{i:05}")), make_row(b"v", 1000))
+                .write(
+                    &make_key(&format!("k{i:05}")),
+                    Arc::new(make_row(b"v", 1000)),
+                )
                 .unwrap();
             if i == partitions / 3 || i == 2 * partitions / 3 {
                 store.flush().unwrap();
@@ -20693,12 +20375,15 @@ mod tests {
                 // New partitions, overwrites of existing ones, and a flush, all
                 // while the scan is mid-range.
                 writer
-                    .write(&make_key(&format!("new{seen:05}")), make_row(b"n", 2000))
+                    .write(
+                        &make_key(&format!("new{seen:05}")),
+                        Arc::new(make_row(b"n", 2000)),
+                    )
                     .unwrap();
                 writer
                     .write(
                         &make_key(&format!("k{:05}", seen % N)),
-                        make_row(b"o", 3000),
+                        Arc::new(make_row(b"o", 3000)),
                     )
                     .unwrap();
                 if seen % 50 == 0 {
@@ -20734,7 +20419,7 @@ mod tests {
         store
             .write(
                 &make_key("old"),
-                make_two_column_row(b"match", b"kept", 1000),
+                Arc::new(make_two_column_row(b"match", b"kept", 1000)),
             )
             .unwrap();
         let mut new_schema = old_schema;
@@ -20791,7 +20476,7 @@ mod tests {
         for (position, _) in &mut row.cells {
             *position += 1;
         }
-        store.write(&make_key("old"), row).unwrap();
+        store.write(&make_key("old"), Arc::new(row)).unwrap();
         let mut new_schema = old_schema;
         new_schema.regular_columns.insert(
             1,
@@ -20845,7 +20530,7 @@ mod tests {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(2000),
         };
-        store.write(&make_key("new"), row).unwrap();
+        store.write(&make_key("new"), Arc::new(row)).unwrap();
         assert_eq!(
             collect_index_results(&store, "pk_idx", &IndexKey(b"fresh".to_vec()))
                 .unwrap()
@@ -20888,7 +20573,7 @@ mod scan_resume_tests {
             key: key(k),
             deletion: DeletionTime::new(5, 5),
             static_row: Some(row(0)),
-            rows: rows.iter().map(|c| row(*c)).collect(),
+            rows: rows.iter().map(|c| row(*c)).map(Arc::new).collect(),
         }
     }
 

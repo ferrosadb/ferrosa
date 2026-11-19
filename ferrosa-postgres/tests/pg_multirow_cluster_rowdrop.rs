@@ -433,7 +433,7 @@ fn users_mutation(id: i32, name: &str) -> Mutation {
         deletion: DeletionTime::LIVE,
         primary_key_liveness: LivenessInfo::with_timestamp(1),
     };
-    Mutation::new("public".into(), "users".into(), key, vec![row], 1)
+    Mutation::new("public".into(), "users".into(), key, vec![Arc::new(row)], 1)
 }
 
 fn transaction_write(mutation: &Mutation) -> ferrosa_storage::accord::TransactionWrite {

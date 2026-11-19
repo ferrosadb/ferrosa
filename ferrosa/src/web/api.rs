@@ -1146,7 +1146,10 @@ mod tests {
                         1000,
                     ),
                 };
-                state.storage.write(&tid, &key, row, 1000).unwrap();
+                state
+                    .storage
+                    .write(&tid, &key, Arc::new(row), 1000)
+                    .unwrap();
                 state.storage.flush(&tid).unwrap();
             }
         }

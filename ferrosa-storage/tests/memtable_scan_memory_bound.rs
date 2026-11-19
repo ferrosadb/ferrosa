@@ -35,6 +35,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::Arc;
 
 use ferrosa_common::cell::CellValue;
 use ferrosa_common::key::{DecoratedKey, PartitionKey};
@@ -134,7 +135,7 @@ fn row(ck: i32, value: &[u8], ts: i64) -> Row {
 fn seed(mem: &dyn Memtable, schema: &TableSchema, count: usize) {
     for i in 0..count {
         let k = key(&format!("pk_{i:07}"));
-        mem.put(&k, row(0, b"payload", 1), schema)
+        mem.put(&k, Arc::new(row(0, b"payload", 1)), schema)
             .expect("seed put must succeed");
     }
 }

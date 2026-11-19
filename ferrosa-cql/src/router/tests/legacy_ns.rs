@@ -41,14 +41,15 @@ fn apply_old_style(state: &SharedState, ctx: &RequestContext<'_>, stmt: &str, t_
     let LwtWrite { mutation, .. } = build_lwt_mutation(state, ctx, &stmt).unwrap();
     let m = ferrosa_storage::Mutation::deserialize_from(&mutation).unwrap();
     let table = ferrosa_storage::TableId::new(&m.keyspace, &m.table);
-    for mut row in m.rows {
+    for mut shared in m.rows {
+        let row = std::sync::Arc::make_mut(&mut shared);
         for (_, cell) in &mut row.cells {
             cell.timestamp = t_ns;
         }
         if row.primary_key_liveness.has_timestamp() {
             row.primary_key_liveness.timestamp = t_ns;
         }
-        state.engine.write(&table, &m.key, row, t_ns).unwrap();
+        state.engine.write(&table, &m.key, shared, t_ns).unwrap();
     }
 }
 

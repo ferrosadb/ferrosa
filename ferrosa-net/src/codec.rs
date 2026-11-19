@@ -196,6 +196,13 @@ pub enum MsgType {
     ResultCursorPage = 0x68,
     /// Reply to [`MsgType::ResultCursorPage`]: the page, or a named refusal.
     ResultCursorPageReply = 0x69,
+    /// Streaming keyed secondary-index read: one partition's index matches,
+    /// answered with the `RangeReadStream*` response frames (ADR-020
+    /// windows and back-pressure) instead of one materialized
+    /// `IndexReadInPartitionResponse`. Sent only to a peer that advertised
+    /// [`crate::handshake::CAP_INDEX_PARTITION_STREAM`]: an older node does
+    /// not know this byte and would drop the whole connection.
+    IndexReadInPartitionStreamRequest = 0x6A,
     // Accord consensus
     AccordPreAccept = 0x70,
     AccordPreAcceptOK = 0x71,
@@ -351,6 +358,7 @@ impl TryFrom<u8> for MsgType {
             0x64 => Ok(Self::FulltextSearchRequest),
             0x65 => Ok(Self::FulltextSearchResponse),
             0x66 => Ok(Self::IndexReadInPartitionRequest),
+            0x6A => Ok(Self::IndexReadInPartitionStreamRequest),
             0x67 => Ok(Self::IndexReadInPartitionResponse),
             0x68 => Ok(Self::ResultCursorPage),
             0x69 => Ok(Self::ResultCursorPageReply),
@@ -923,6 +931,19 @@ mod tests {
     /// legacy single-shot RangeReadRequest/RangeReadResponse (0x25,
     /// 0x26) so a rolling upgrade can negotiate the protocol version
     /// without breaking older peers.
+    /// The streaming keyed index request owns wire byte 0x6A, and it is a
+    /// producer-side request: never run inline on the frame reader.
+    #[test]
+    fn index_read_in_partition_stream_request_owns_byte_0x6a() {
+        let ty = MsgType::try_from(0x6Au8).expect("0x6A decodes");
+        assert_eq!(ty, MsgType::IndexReadInPartitionStreamRequest);
+        assert_eq!(MsgType::IndexReadInPartitionStreamRequest as u8, 0x6A);
+        assert!(!ty.is_ordered_stream_response());
+        // The legacy keyed index pair keeps its bytes.
+        assert_eq!(MsgType::IndexReadInPartitionRequest as u8, 0x66);
+        assert_eq!(MsgType::IndexReadInPartitionResponse as u8, 0x67);
+    }
+
     #[test]
     fn msg_type_round_trip_for_streaming_range_read_variants() {
         for (byte, expected) in [

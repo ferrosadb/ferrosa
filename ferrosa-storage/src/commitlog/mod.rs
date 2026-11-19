@@ -660,7 +660,7 @@ impl CommitLog {
         keyspace: &str,
         table: &str,
         key: &DecoratedKey,
-        rows: &[Row],
+        rows: &[Arc<Row>],
         timestamp: i64,
         mutation_id: [u8; 16],
     ) {
@@ -1116,7 +1116,7 @@ impl CommitLog {
         &self,
         table_id: &TableId,
         key: &DecoratedKey,
-        row: &Row,
+        row: &Arc<Row>,
         timestamp: i64,
     ) -> ferrosa_common::Result<CommitLogPosition> {
         let total_size =
@@ -1600,6 +1600,34 @@ impl CommitLog {
         self.active.load().with_flush_held_for_test(hold);
     }
 
+    /// How far the active segment must be durable to cover every entry
+    /// appended before this call.
+    pub fn sync_target(&self) -> SyncTarget {
+        let segment = self.active.load_full();
+        let offset = segment.current_position();
+        SyncTarget { segment, offset }
+    }
+
+    /// Make `target` durable: return at once if a flush already covered it,
+    /// otherwise flush (sharing the flush with every caller queued with it).
+    ///
+    /// An already-durable target returns before the sync health is touched,
+    /// so a caller that needed no I/O can never clear the stall clock while
+    /// the sync machinery is stuck on later entries.
+    pub fn force_sync_through(&self, target: SyncTarget) -> ferrosa_common::Result<()> {
+        let SyncTarget { segment, offset } = target;
+        if segment.is_durable_through(offset) {
+            return Ok(());
+        }
+        // A forced sync is accounted like the thread's own fsync: a completed
+        // one clears the stall clock and a failed one leaves it running. The
+        // flush can still find the target durable once it holds the lock, but
+        // only because a flush that started after this call succeeded.
+        sync::forced_sync(self.sync_strategy.sync_health(), || {
+            segment.flush_through(offset)
+        })
+    }
+
     /// Force-syncs the active segment to disk.
     ///
     /// Waits for all in-flight writers to complete, then flushes the
@@ -1608,11 +1636,10 @@ impl CommitLog {
     pub fn force_sync(&self) -> ferrosa_common::Result<()> {
         // Every flush closes its section (reserve-ahead; see the segment
         // module docs), so a forced sync is an ordinary flush. No marker that
-        // is already on disk is ever rewritten. It is accounted in the sync
-        // health like the thread's own fsync, so a completed one clears the
-        // stall clock and a failed one leaves it running.
-        let active = self.active.load();
-        sync::forced_sync(self.sync_strategy.sync_health(), || active.flush_to_disk())
+        // is already on disk is ever rewritten. Its target is everything
+        // appended before this call, so a caller another flush already covered
+        // returns without I/O (group commit; see `force_sync_through`).
+        self.force_sync_through(self.sync_target())
     }
 
     /// Health of the sync machinery, for the node supervisor and metrics.
@@ -1677,6 +1704,13 @@ impl CommitLog {
     }
 }
 
+/// A point in one segment that a caller needs durable: everything allocated
+/// below `offset` when [`CommitLog::sync_target`] was taken.
+pub struct SyncTarget {
+    segment: Arc<Segment>,
+    offset: u64,
+}
+
 /// Parses a segment ID from a filename like `commitlog-42.log`.
 fn parse_segment_id(filename: &str) -> Option<u64> {
     let name = filename.strip_prefix("commitlog-")?;
@@ -1698,12 +1732,12 @@ mod tests {
             keyspace: "test_ks".to_string(),
             table: "test_table".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"pk1".to_vec())),
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![1, 2, 3],
                 cells: vec![(0, CellValue::live(b"hello".to_vec(), 1000))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1000),
-            }],
+            })],
             timestamp: 42_000,
         }
     }
@@ -2001,12 +2035,12 @@ mod tests {
             keyspace: keyspace.to_string(),
             table: table.to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"pk1".to_vec())),
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![1, 2, 3],
                 cells: vec![(0, CellValue::live(b"hello".to_vec(), 1000))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1000),
-            }],
+            })],
             timestamp: 42_000,
         }
     }
@@ -2052,6 +2086,7 @@ mod tests {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(2000),
         };
+        let row = Arc::new(row);
         cl.append_single_row(&table_id, &key, &row, 99_000).unwrap();
 
         let event = sub
@@ -2061,7 +2096,11 @@ mod tests {
         assert_eq!(event.keyspace, "ks2");
         assert_eq!(event.table, "t2");
         assert_eq!(event.key, key);
-        assert_eq!(event.rows, vec![row]);
+        assert!(
+            Arc::ptr_eq(&event.rows[0], &row),
+            "CDC shares the appended row"
+        );
+        assert_eq!(event.rows.len(), 1);
         assert_eq!(event.timestamp, 99_000);
         // mutation_id is generated by the single-row path; just confirm it is non-legacy.
         assert_ne!(event.mutation_id, [0u8; 16]);
@@ -2930,7 +2969,8 @@ mod tests {
             } else {
                 mutation_for_table("test_ks", "newer")
             };
-            mutation.rows[0].cells[0] = (0, CellValue::live(vec![b'x'; 300], index as i64 + 1));
+            Arc::make_mut(&mut mutation.rows[0]).cells[0] =
+                (0, CellValue::live(vec![b'x'; 300], index as i64 + 1));
             cl.append(&mutation).unwrap();
             cl.force_rotate().unwrap();
         }
@@ -3135,6 +3175,114 @@ mod tests {
         assert_eq!(
             after[SENTINEL_OFFSET], sentinel,
             "force_sync rewrote the already-flushed prefix of the segment"
+        );
+        cl.shutdown().unwrap();
+    }
+
+    /// Group commit: callers queued behind an in-flight flush are made durable
+    /// by ONE later flush, not by one fsync each.
+    ///
+    /// A pair write calls `force_sync` after every mutation, so without this
+    /// N concurrent writers pay N serial device flushes and throughput stays
+    /// flat however many writers there are (the CI `bulk_write_stability`
+    /// failures on 2026-11-18). The process-global sync counters race with the
+    /// rest of this binary, so the proof is in the file: every flush closes a
+    /// section and writes exactly one `SYNC_MARKER_SIZE` head marker.
+    #[test]
+    fn force_sync_callers_queued_behind_a_flush_share_one_sync() {
+        const CALLERS: u64 = 16;
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig {
+            segment_size: 1024 * 1024,
+            // Batch has no sync thread; explicit-sync appends do not fsync inline.
+            ..CommitLogConfig::test_config(dir.path())
+        };
+        let cl = Arc::new(CommitLog::new(config).unwrap());
+        let path = cl.active.load().path().to_path_buf();
+        cl.append_for_explicit_sync(&simple_mutation()).unwrap();
+        cl.force_sync().unwrap();
+        let before = std::fs::metadata(&path).unwrap().len();
+        let entry = Segment::entry_total_size(&simple_mutation()) as u64;
+
+        let mut callers = Vec::new();
+        cl.with_flush_held_for_test(|| {
+            for _ in 0..CALLERS {
+                let cl = Arc::clone(&cl);
+                callers.push(std::thread::spawn(move || {
+                    cl.append_for_explicit_sync(&simple_mutation())?;
+                    cl.force_sync()
+                }));
+            }
+            let segment = cl.active.load();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while segment.flush_waiters_for_test() < CALLERS {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "only {} of {CALLERS} callers queued on the held flush",
+                    segment.flush_waiters_for_test()
+                );
+                std::thread::yield_now();
+            }
+        });
+        for caller in callers {
+            caller.join().unwrap().unwrap();
+        }
+
+        let grown = std::fs::metadata(&path).unwrap().len() - before;
+        let entries = CALLERS * entry;
+        assert!(
+            grown >= entries,
+            "only {grown} B reached the file for {entries} B of entries"
+        );
+        let markers = (grown - entries) / segment::SYNC_MARKER_SIZE as u64;
+        assert_eq!(
+            grown,
+            entries + markers * segment::SYNC_MARKER_SIZE as u64,
+            "the growth is not whole entries plus whole markers"
+        );
+        assert_eq!(
+            markers, 1,
+            "{CALLERS} callers queued behind one flush wrote {markers} sections, one fsync \
+             each; a single flush must make the whole queue durable"
+        );
+        cl.shutdown().unwrap();
+    }
+
+    /// A caller whose entries an earlier flush already made durable returns
+    /// without writing, even when another writer has appended since.
+    ///
+    /// Without this a queued caller that wins the flush lock fsyncs whatever
+    /// arrived after its own entry, so every waiter in a convoy pays a device
+    /// flush: 128 concurrent pair writers did 0.41 fsyncs per apply and waited
+    /// up to 581 ms on the flush lock for 9.6 ms fsyncs.
+    #[test]
+    fn force_sync_through_an_already_durable_target_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig {
+            segment_size: 64 * 1024,
+            ..CommitLogConfig::test_config(dir.path())
+        };
+        let cl = CommitLog::new(config).unwrap();
+        let path = cl.active.load().path().to_path_buf();
+
+        cl.append_for_explicit_sync(&simple_mutation()).unwrap();
+        let mine = cl.sync_target();
+        cl.force_sync().unwrap(); // someone else's flush covers my entry
+        let durable = std::fs::metadata(&path).unwrap().len();
+
+        cl.append_for_explicit_sync(&simple_mutation()).unwrap(); // a later writer
+        cl.force_sync_through(mine).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            durable,
+            "a caller whose entry was already durable flushed a later writer's entry"
+        );
+
+        let later = cl.sync_target();
+        cl.force_sync_through(later).unwrap();
+        assert!(
+            std::fs::metadata(&path).unwrap().len() > durable,
+            "a target that was not yet durable must still be flushed"
         );
         cl.shutdown().unwrap();
     }

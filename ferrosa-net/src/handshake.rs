@@ -81,17 +81,26 @@ pub const CAP_PAIR_AUTHORITY: u32 = 1 << 8;
 /// connection.
 pub const CAP_PURGED_READ: u32 = 1 << 9;
 
+/// The node serves `MsgType::IndexReadInPartitionStreamRequest`: a keyed
+/// secondary-index read streamed back in `RangeReadStream*` frames. A
+/// coordinator sends it ONLY to a peer that advertised this bit; a peer
+/// without it is served through the requests it already understands (see
+/// `ferrosa_cluster`'s keyed index stream), because an unknown type byte
+/// would drop the whole connection.
+pub const CAP_INDEX_PARTITION_STREAM: u32 = 1 << 10;
+
 /// The node serves `MsgType::RaftRepairSnapshotRequest`: it hands a
 /// quarantined peer a committed snapshot covering that peer's repair target,
 /// building a newer one when its current snapshot is too old. A peer without
 /// the bit is never asked; an unknown type byte would drop the connection.
-pub const CAP_RAFT_REPAIR_SNAPSHOT: u32 = 1 << 10;
+pub const CAP_RAFT_REPAIR_SNAPSHOT: u32 = 1 << 11;
 
 /// Every capability this build understands, advertised in its Handshake and
 /// HandshakeAck.
 pub const LOCAL_CAPABILITIES: u32 = CAP_PAIR_AUTHORITY
     | CAP_RAFT_REPAIR_SNAPSHOT
     | CAP_PURGED_READ
+    | CAP_INDEX_PARTITION_STREAM
     | CAP_RPC_ERROR_REPLY
     | CAP_RESULT_CURSOR_PAGE
     | CAP_PAIR_DISSOLVE

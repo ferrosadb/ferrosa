@@ -119,18 +119,28 @@ impl PairCoordinator {
                 alive: available,
             });
         }
-        self.apply_locally_async(mutation.clone(), Some(Arc::clone(&_admitted_write)))
-            .await?;
-        let replicated = if available > 1 {
-            let result = self.replicate_to_peer(mutation).await;
-            if required > 1 {
+        // The local apply (memtable + commit-log fsync) and the replica round
+        // trip (which fsyncs on the secondary) run concurrently: latency is the
+        // slower of the two device flushes instead of their sum. The ack still
+        // waits for both, so durability is unchanged; a failure on either side
+        // is returned exactly as before. A single mutation has no atomicity to
+        // tear, so the secondary may apply it before the primary's sync lands,
+        // the same unknown outcome a timed-out write already has.
+        let local = self.apply_locally_async(mutation.clone(), Some(Arc::clone(&_admitted_write)));
+        let (local, replica) = if available > 1 {
+            let (local, replica) = tokio::join!(local, self.replicate_to_peer(mutation));
+            (local, Some(replica))
+        } else {
+            (local.await, None)
+        };
+        local?;
+        let replicated = match replica {
+            Some(result) if required > 1 => {
                 result?;
                 true
-            } else {
-                result.is_ok()
             }
-        } else {
-            false
+            Some(result) => result.is_ok(),
+            None => false,
         };
         if self.strict_quorum
             && rf == 2
@@ -229,25 +239,8 @@ impl PairCoordinator {
 
     /// Forward a batch to the primary (secondary -> primary) as one RPC.
     async fn forward_batch_to_primary(&self, mutations: &[Mutation], batch_id: Uuid) -> Result<()> {
-        let body = encode_batch(batch_id, mutations)?;
-        let resp = self
-            .peer_manager
-            .send_with_timeout(
-                self.peer_host_id,
-                Message::PairBatchForward(body),
-                Lane::Data,
-                Duration::from_secs(5),
-            )
+        self.replicate_batch_to_peer(encode_batch(batch_id, mutations)?)
             .await
-            .map_err(ClusterError::Net)?;
-
-        match resp {
-            Message::PairBatchAck(_) => Ok(()),
-            other => Err(ClusterError::ReplicationFailed(format!(
-                "expected PairBatchAck, got {:?}",
-                other.msg_type()
-            ))),
-        }
     }
 
     /// Coordinate an atomic local batch with RF2 ALL by default.
@@ -256,19 +249,46 @@ impl PairCoordinator {
             .await
     }
 
-    /// Preserve the caller's consistency for batches. The follower applies the
-    /// ordinary mutation RPCs durably; every mutation must ACK for two copies.
+    /// Preserve the caller's consistency for batches. Each node applies the
+    /// whole batch atomically and syncs once; see
+    /// [`coordinate_batch_returning`](Self::coordinate_batch_returning).
     pub async fn coordinate_batch_with(
         &self,
         mutations: Vec<Mutation>,
-        _batch_id: Uuid,
+        batch_id: Uuid,
         cl: ConsistencyLevel,
         rf: usize,
     ) -> Result<()> {
-        let _admitted_write = Arc::new(self.handoff_gate.clone().read_owned().await);
+        self.coordinate_batch_returning(mutations, batch_id, cl, rf)
+            .await
+            .map(drop)
+    }
+
+    /// Coordinate an atomic batch and hand the mutations back once it is
+    /// acknowledged, so the caller can publish committed CDC events without
+    /// copying them.
+    ///
+    /// The primary applies the batch with `write_atomic_batch` and one
+    /// commit-log sync, and CONCURRENTLY sends the same encoded batch to the
+    /// secondary as one `PairBatchForward`, which the secondary applies the
+    /// same way. A batch of N therefore costs one round trip and one device
+    /// flush per node, not N of each in series, and neither node ever holds
+    /// part of it. The ack waits for both nodes, as for a single write; a
+    /// failure on either side is returned, and the secondary may hold a batch
+    /// the primary failed to make durable, the same unknown outcome a timed-out
+    /// write has.
+    pub async fn coordinate_batch_returning(
+        &self,
+        mutations: Vec<Mutation>,
+        batch_id: Uuid,
+        cl: ConsistencyLevel,
+        rf: usize,
+    ) -> Result<Vec<Mutation>> {
+        let admitted_write = Arc::new(self.handoff_gate.clone().read_owned().await);
         // As for single writes: a secondary forwards the batch so the primary applies it atomically.
         if **self.role.load() != PairRole::Primary {
-            return self.forward_batch_to_primary(&mutations, _batch_id).await;
+            self.forward_batch_to_primary(&mutations, batch_id).await?;
+            return Ok(mutations);
         }
         let required = match cl {
             ConsistencyLevel::Quorum | ConsistencyLevel::LocalQuorum if rf == 2 => 1,
@@ -289,36 +309,29 @@ impl PairCoordinator {
                 alive: available,
             });
         }
-        let storage = Arc::clone(&self.storage);
-        let admission = Arc::clone(&_admitted_write);
-        let mutations = ferrosa_net::task_pool::TaskPool::current("pair-storage")
-            .spawn_blocking(move || {
-                let _admission = admission;
-                storage
-                    .write_atomic_batch(mutations.as_slice())
-                    .map_err(ClusterError::Storage)?;
-                storage
-                    .force_commit_log_sync()
-                    .map_err(ClusterError::Storage)?;
-                Ok::<_, ClusterError>(mutations)
-            })
-            .await
-            .await
-            .map_err(|error| {
-                ClusterError::Internal(format!("pair batch storage task failed: {error}"))
-            })??;
-        let mut replicated = available > 1;
-        if replicated {
-            for mutation in &mutations {
-                let result = self.replicate_to_peer(mutation).await;
-                if required > 1 {
-                    result?;
-                } else if result.is_err() {
-                    replicated = false;
-                    break;
-                }
+        // Encode while the batch is still borrowed: the local apply takes it.
+        let body = if available > 1 {
+            Some(encode_batch(batch_id, &mutations)?)
+        } else {
+            None
+        };
+        let local = self.apply_batch_locally_async(mutations, Some(admitted_write));
+        let (local, replica) = match body {
+            Some(body) => {
+                let (local, replica) = tokio::join!(local, self.replicate_batch_to_peer(body));
+                (local, Some(replica))
             }
-        }
+            None => (local.await, None),
+        };
+        let mutations = local?;
+        let replicated = match replica {
+            Some(result) if required > 1 => {
+                result?;
+                true
+            }
+            Some(result) => result.is_ok(),
+            None => false,
+        };
         if self.strict_quorum
             && rf == 2
             && matches!(cl, ConsistencyLevel::Quorum | ConsistencyLevel::LocalQuorum)
@@ -329,7 +342,55 @@ impl PairCoordinator {
                 .await
                 .map_err(ClusterError::Storage)?;
         }
-        Ok(())
+        Ok(mutations)
+    }
+
+    /// Apply a batch atomically to local storage on the bounded `pair-storage`
+    /// pool and return it to the caller. `write_atomic_batch` makes the whole
+    /// batch durable with one commit-log sync before any of it is visible.
+    /// Peer handlers pass no admission lease, as for
+    /// [`apply_locally_async`](Self::apply_locally_async).
+    pub(crate) async fn apply_batch_locally_async(
+        &self,
+        mutations: Vec<Mutation>,
+        admission: Option<Arc<tokio::sync::OwnedRwLockReadGuard<()>>>,
+    ) -> Result<Vec<Mutation>> {
+        let storage = Arc::clone(&self.storage);
+        ferrosa_net::task_pool::TaskPool::current("pair-storage")
+            .spawn_blocking(move || {
+                let _admission = admission;
+                storage
+                    .write_atomic_batch(mutations.as_slice())
+                    .map_err(ClusterError::Storage)?;
+                Ok::<_, ClusterError>(mutations)
+            })
+            .await
+            .await
+            .map_err(|error| {
+                ClusterError::Internal(format!("pair batch storage task failed: {error}"))
+            })?
+    }
+
+    /// Send an encoded batch to the peer as one `PairBatchForward` and wait
+    /// for its ACK.
+    pub(crate) async fn replicate_batch_to_peer(&self, body: Bytes) -> Result<()> {
+        let resp = self
+            .peer_manager
+            .send_with_timeout(
+                self.peer_host_id,
+                Message::PairBatchForward(body),
+                Lane::Data,
+                Duration::from_secs(5),
+            )
+            .await
+            .map_err(ClusterError::Net)?;
+        match resp {
+            Message::PairBatchAck(_) => Ok(()),
+            other => Err(ClusterError::ReplicationFailed(format!(
+                "expected PairBatchAck, got {:?}",
+                other.msg_type()
+            ))),
+        }
     }
 
     /// Get current role.
@@ -488,7 +549,7 @@ mod tests {
             keyspace: "test_ks".to_string(),
             table: "test_tbl".to_string(),
             key,
-            rows: vec![row],
+            rows: vec![Arc::new(row)],
             timestamp: 1000,
         }
     }
@@ -1405,7 +1466,7 @@ mod tests {
             primary_coordinator_with_archive_options(dir.path(), Some(store.clone()), true).await;
         let coordinator = Arc::new(coordinator.with_strict_quorum(true));
         let mut mutation = test_mutation();
-        mutation.rows[0].cells[0].1 = CellValue::live(vec![7; 1800], 1000);
+        Arc::make_mut(&mut mutation.rows[0]).cells[0].1 = CellValue::live(vec![7; 1800], 1000);
         for _ in 0..3 {
             coordinator.apply_locally(&mutation).unwrap();
         }

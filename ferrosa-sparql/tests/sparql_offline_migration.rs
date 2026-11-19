@@ -3,6 +3,7 @@ use ferrosa_common::CellValue;
 use ferrosa_sparql::triple_store::{partition_key, rdf_triples_v1_schema};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 use ferrosa_storage::{CommitLog, Mutation, StorageEngine, StorageEngineConfig, TableId};
+use std::sync::Arc;
 
 const KS: &str = "rdf";
 const INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
@@ -51,7 +52,7 @@ fn corrupt_wal(dir: &std::path::Path, valid_crc: bool) {
             KS.into(),
             "rdf_triples".into(),
             partition_key("urn:g", "urn:s"),
-            vec![legacy_row("01", "literal", Some(INTEGER), None)],
+            vec![Arc::new(legacy_row("01", "literal", Some(INTEGER), None))],
             1,
         );
         log.append(&mutation).unwrap();

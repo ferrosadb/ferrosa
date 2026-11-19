@@ -384,13 +384,35 @@ fn collection_type_at(schema: &TableSchema, idx: u16) -> Option<CollectionType<'
 /// still carry such cells; replay expands them here. Rows that reach a flush
 /// or compaction unexpanded are handled by
 /// [`expand_collection_blobs_in_place`].
-pub(crate) fn expand_legacy_collection_blobs(row: &mut Row, schema: &TableSchema) -> Result<()> {
-    let expanded = expand_row_collection_blobs(row, |idx| collection_type_at(schema, idx))?;
+///
+/// The row is shared (replay hands in the commit-log mutation's `Arc`), so it
+/// is only copied on write when it actually holds such a cell.
+pub(crate) fn expand_legacy_collection_blobs(
+    row: &mut Arc<Row>,
+    schema: &TableSchema,
+) -> Result<()> {
+    let type_at = |idx| collection_type_at(schema, idx);
+    if !row_has_collection_blob(row, &type_at) {
+        return Ok(());
+    }
+    let expanded = expand_row_collection_blobs(Arc::make_mut(row), type_at)?;
     record_blob_expansions(
         &schema_table_label(schema),
         schema_column_names(schema, &expanded),
     );
     Ok(())
+}
+
+/// True when `row` holds a live path-less cell on a collection column, i.e.
+/// when [`expand_row_collection_blobs`] would rewrite it. Lets a caller holding
+/// a shared row copy it on write only when it really changes.
+fn row_has_collection_blob<'s>(
+    row: &Row,
+    type_at: &impl Fn(u16) -> Option<CollectionType<'s>>,
+) -> bool {
+    row.cells
+        .iter()
+        .any(|(idx, cell)| cell.path.is_none() && !cell.is_tombstone() && type_at(*idx).is_some())
 }
 
 /// The expansion behind [`expand_legacy_collection_blobs`] and
@@ -402,14 +424,10 @@ fn expand_row_collection_blobs<'s>(
     row: &mut Row,
     type_at: impl Fn(u16) -> Option<CollectionType<'s>>,
 ) -> Result<Vec<u16>> {
-    let is_blob = |cell: &CellValue| cell.path.is_none() && !cell.is_tombstone();
-    if !row
-        .cells
-        .iter()
-        .any(|(idx, cell)| is_blob(cell) && type_at(*idx).is_some())
-    {
+    if !row_has_collection_blob(row, &type_at) {
         return Ok(Vec::new());
     }
+    let is_blob = |cell: &CellValue| cell.path.is_none() && !cell.is_tombstone();
     let mut expanded = Vec::new();
     // Move the cells rather than cloning them: `cell.clone()` copies row data
     // (P0 OOM audit, rule `clone-on-row-data`). Taking the vec is safe because
@@ -525,10 +543,12 @@ pub(crate) fn expand_collection_blobs_in_place(
             None => Vec::new(),
         };
         let mut regular_indices = Vec::new();
+        let type_at = |idx| header_collection_type(&header.regular_columns, idx);
         for row in partition.rows.iter_mut() {
-            regular_indices.extend(expand_row_collection_blobs(row, |idx| {
-                header_collection_type(&header.regular_columns, idx)
-            })?);
+            // Copy on write only for a row that is rewritten.
+            if row_has_collection_blob(row, &type_at) {
+                regular_indices.extend(expand_row_collection_blobs(Arc::make_mut(row), type_at)?);
+            }
         }
         Ok((static_indices, regular_indices))
     })();
@@ -675,8 +695,9 @@ pub const UNTRACKED_WRITE_EPOCH: u64 = u64::MAX;
 
 pub trait Memtable: Send + Sync {
     /// Insert or update a row. Merges with existing data by timestamp
-    /// (cell-level last-write-wins).
-    fn put(&self, key: &DecoratedKey, row: Row, schema: &TableSchema) -> Result<()>;
+    /// (cell-level last-write-wins). The row is shared, not copied: a new
+    /// clustering key stores the caller's `Arc` as is.
+    fn put(&self, key: &DecoratedKey, row: Arc<Row>, schema: &TableSchema) -> Result<()>;
 
     /// Read a single partition. Returns `Arc` to avoid deep clones.
     fn get(&self, key: &DecoratedKey) -> Result<Option<Arc<Partition>>>;

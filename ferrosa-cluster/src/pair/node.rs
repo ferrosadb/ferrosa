@@ -183,6 +183,11 @@ impl PairNode {
             self.coordinator.clone(),
         ));
         registry.register(MsgType::PairWriteForward, handler);
+        let batch_handler = Arc::new(crate::pair::handler::PairBatchForwardHandler::new(
+            self.role.clone(),
+            self.coordinator.clone(),
+        ));
+        registry.register(MsgType::PairBatchForward, batch_handler);
 
         let catchup_handler = Arc::new(crate::pair::catchup::PairCatchUpHandler::new(
             self.storage.clone(),

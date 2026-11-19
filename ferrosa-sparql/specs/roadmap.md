@@ -40,15 +40,12 @@ stubs), the FMEA ([fmea.md](fmea.md)), and the dependency/usage review.
   a scalability limit rather than an OOM — but a pattern that could stream
   end-to-end still cannot. Needs pattern reordering (most-selective first) plus
   either a pipelined or hash join.
-- **Index-driven property-path expansion (FMEA SP-4).** The adjacency read
-  streams and its buffer is bounded, but BFS still materializes every edge for
-  the predicate before traversing. Expand neighbours through the index instead,
-  with a hop cap.
-- **Paginate instead of failing at the bound.** Crossing `max_rows` is now a
-  loud error, which is correct but blunt: the right answer for a large honest
-  result set is a continuation token over the streaming scan (`ScanResume` in
-  `WritePath` already supports it) rather than asking the operator to raise a
-  limit.
+- **Stream the join without re-scanning the inner side (t_abf43246).** Joins and
+  paths are block nested-loop joins (outer streamed in 1024-row blocks, inner
+  re-scanned per block); a large outer side multiplies the inner work. A
+  variable-start closure runs one BFS per distinct subject.
+- **Retire the collecting `SparqlEngine::execute` (t_c9fb250b).** Only tests use it;
+  the served path streams.
 
 ## Later
 

@@ -4,11 +4,11 @@
 //!   `collect_to_graph_result` reproduces the buffered `GraphResult` byte-for-
 //!   byte — so an operator can be converted to streaming without any observable
 //!   behavior change.
-//! Last revised: 2026-07-25
-//! Last changed: Added `chain_streams` — the `UNION ALL` concatenation operator
-//!   used by `expand::execute_streaming` (t_4ce82a3e,
-//!   specs/streaming-executor-design.md increment 2). The row stream type and
-//!   the collect bridges landed in increment 1.
+//! Last revised: 2026-11-16
+//! Last changed: The collect bridges are test-only. No production path drains
+//!   a `RowStream` into a `Vec`: transports write rows as they are pulled, and
+//!   operators that must see every row first spill (`spill::spill_run`,
+//!   `spill::RowAcc`) instead of collecting (fix/oom-graph-stream).
 //!
 //! # Why
 //!
@@ -21,10 +21,11 @@
 //!
 //! # Migration contract
 //!
-//! Operators are converted one at a time. Each converted operator produces a
-//! [`RowStream`]; callers that still need a buffered result use
-//! [`collect_to_graph_result`], which is behavior-identical to the old path.
-//! That keeps every increment green against the existing integration suite.
+//! Every operator produces a [`RowStream`], and every production consumer
+//! pulls it: HTTP writes each row into the chunked body, Bolt sends a RECORD
+//! per pull, and SUBSCRIBE serializes each row into its event payload. The
+//! collect bridges (`collect_to_graph_result`, `collect_rows`) exist only under
+//! `cfg(test)`, for tests that compare whole results.
 //!
 //! The `'a` lifetime is also why a transport cannot consume a [`RowStream`]
 //! directly: a response body outlives the handler frame, so it needs `'static`.
@@ -34,6 +35,7 @@
 use futures::stream::{Stream, StreamExt};
 use std::pin::Pin;
 
+#[cfg(test)]
 use super::result::{GraphResult, QueryStats};
 use crate::error::Result;
 
@@ -54,18 +56,13 @@ pub type RowVals = Vec<serde_json::Value>;
 /// §3: inline-driven `FuturesUnordered`, not `buffer_unordered`).
 pub type RowStream<'a> = Pin<Box<dyn Stream<Item = Result<RowVals>> + Send + 'a>>;
 
-/// Drain a [`RowStream`] into the buffered [`GraphResult`] the current callers
-/// expect.
-///
-/// This is the bridge that keeps each streaming increment behavior-preserving:
-/// a converted operator streams, and any caller not yet converted collects here.
-/// It is also the honest boundary — a `collect` is a materialization, so every
-/// remaining use marks a caller still to convert (the last of them disappears in
-/// the transport increment, where rows go straight to HTTP/Bolt).
+/// Drain a [`RowStream`] into a buffered [`GraphResult`]. Test-only: a
+/// `collect` is a materialization, and no production path performs one.
 ///
 /// `max_rows` mirrors the executor's `max_result_rows` cap: collection stops
 /// once that many rows are buffered, exactly like the materializing loop's
 /// `if rows.len() >= config.max_result_rows { break }`.
+#[cfg(test)]
 pub async fn collect_to_graph_result(
     columns: Vec<String>,
     mut rows_stream: RowStream<'_>,
@@ -86,13 +83,15 @@ pub async fn collect_to_graph_result(
     })
 }
 
-/// Drain a [`RowStream`] into its rows.
+/// Drain a [`RowStream`] into its rows. Test-only, like
+/// [`collect_to_graph_result`].
 ///
 /// The un-wrapped half of [`collect_to_graph_result`], for callers that build
 /// the `GraphResult` themselves. The stream's own `take`/`Limit` is what bounds
 /// this — there is no separate cap here, so a caller relying on a row cap must
 /// express it in the stream (e.g. `.take(limit)`), which is the point: the limit
 /// stops upstream production instead of truncating a materialized Vec.
+#[cfg(test)]
 pub async fn collect_rows(mut rows_stream: RowStream<'_>) -> Result<Vec<RowVals>> {
     let mut rows = Vec::new();
     while let Some(row) = rows_stream.next().await {

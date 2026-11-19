@@ -667,6 +667,7 @@ fn reserve_stage_dir(root: &std::path::Path) -> Result<TempSortTableReservation>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn temp_root(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -972,12 +973,12 @@ mod tests {
             // The cell timestamp is the token here, so a frame decoded out of
             // order is detectable: the row's `primary_key_liveness` timestamp
             // carries the intended position.
-            rows: vec![Row {
+            rows: vec![Arc::new(Row {
                 clustering: vec![],
                 cells: vec![(0, CellValue::live(value.to_vec(), ts))],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(ts),
-            }],
+            })],
             timestamp: ts,
         };
         let mut frame = vec![0u8; mutation.serialized_size()];

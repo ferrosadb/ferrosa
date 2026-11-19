@@ -7,8 +7,8 @@
 //! resulting ground triple via the same coordinated write path as
 //! `DELETE DATA`. Genuinely unimplemented ops fail loud (URS-QEC-X01).
 //! Correctness: legacy RDF identity tests and COUNT/JSON/protocol regressions.
-//! Last revised: 2026-10-27
-//! Last changed: Reject unsupported bound RDF 1.2 terms before mutations.
+//! Last revised: 2026-11-16
+//! Last changed: Stream WHERE solutions into spilled update staging; drop the row bound.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,7 +25,7 @@ use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 use ferrosa_storage::engine::StorageEngine;
 
 use crate::error::SparqlError;
-use crate::executor::ExecutionLimits;
+use crate::executor::ExecutionContext;
 use crate::results::Binding;
 use crate::triple_store;
 
@@ -46,7 +46,7 @@ pub async fn execute_update(
     keyspace: &str,
     storage: &Arc<StorageEngine>,
     write_path: &Arc<WritePath>,
-    limits: &ExecutionLimits,
+    cx: &ExecutionContext,
 ) -> Result<UpdateResult, SparqlError> {
     triple_store::refuse_legacy(storage, keyspace)?;
     // The parser recurses per nesting level without a limit.
@@ -87,16 +87,15 @@ pub async fn execute_update(
                 using: _,
                 pattern,
             } => {
-                let (d, i) = exec_delete_insert(
-                    delete, insert, pattern, keyspace, storage, write_path, limits,
-                )
-                .await?;
+                let (d, i) =
+                    exec_delete_insert(delete, insert, pattern, keyspace, storage, write_path, cx)
+                        .await?;
                 total_deleted += d;
                 total_inserted += i;
             }
             spargebra::GraphUpdateOperation::Clear { graph, .. }
             | spargebra::GraphUpdateOperation::Drop { graph, .. } => {
-                total_deleted += exec_clear(graph, keyspace, storage, write_path, limits).await?;
+                total_deleted += exec_clear(graph, keyspace, storage, write_path).await?;
             }
             spargebra::GraphUpdateOperation::Load { .. } => {
                 // URS-QEC-X01: LOAD fetches and parses an external RDF document.
@@ -391,7 +390,7 @@ async fn exec_delete_insert(
     keyspace: &str,
     _storage: &Arc<StorageEngine>,
     write_path: &Arc<WritePath>,
-    limits: &ExecutionLimits,
+    cx: &ExecutionContext,
 ) -> Result<(usize, usize), SparqlError> {
     // Resolve the single graph this request reads and writes (already validated,
     // re-derived here so the executor keys its read, its deletes, and its
@@ -406,65 +405,35 @@ async fn exec_delete_insert(
     // `DELETE WHERE { ?s ?p ?o }` must clear the default graph only.
     let scope = crate::planner::TripleScope::isolated(keyspace, target_graph);
     let plan = crate::planner::plan_where(pattern, &scope)?;
-    let solutions = crate::executor::execute_bindings(&plan, write_path, limits).await?;
-
-    // Validate only terms actually referenced by a write template, before the
-    // first mutation. RDF 1.2 results are valid in SELECT but not in the v2 codec.
-    for solution in &solutions {
-        for template in insert {
-            match &template.object {
-                TermPattern::Variable(v) => {
-                    if let Some(term) = solution.get(v.as_str()) {
-                        term.storage_parts()?;
-                    }
-                }
-                TermPattern::Literal(l) => {
-                    Binding::from_literal(l).storage_parts()?;
-                }
-                TermPattern::Triple(_) => {
-                    return Err(SparqlError::Plan(
-                        "stored RDF 1.2 triple terms are not implemented".into(),
-                    ))
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let deletes: Vec<_> = solutions
-        .iter()
-        .flat_map(|sol| {
-            delete
-                .iter()
-                .filter_map(move |tmpl| instantiate_ground_delete(tmpl, sol))
+    // SPARQL 1.1: the WHERE pattern is evaluated completely, and every
+    // instantiated triple validated, before the first mutation. The solutions
+    // stream; what they instantiate is staged in spilling bags, so a large
+    // pattern-delete holds a bounded working set rather than every solution.
+    use futures::TryStreamExt;
+    let solutions =
+        crate::executor::where_solutions(Arc::new(plan), Arc::clone(write_path), cx.clone());
+    let mut deletes = cx.bag::<GroundTriple>("sparql-update-deletes");
+    let mut inserts = cx.bag::<InsertTriple>("sparql-update-inserts");
+    let mut deleted = 0usize;
+    let mut inserted = 0usize;
+    solutions
+        .try_for_each(|solution| {
+            let staged =
+                stage_solution(&solution, delete, insert, target_graph).and_then(|(d, i)| {
+                    deleted += d.len();
+                    inserted += i.len();
+                    d.into_iter().try_for_each(|t| deletes.push(t))?;
+                    i.into_iter().try_for_each(|t| inserts.push(t))
+                });
+            std::future::ready(staged)
         })
-        .collect();
-    let inserts: Vec<_> = solutions
-        .iter()
-        .flat_map(|sol| {
-            insert
-                .iter()
-                .filter_map(move |tmpl| instantiate_insert(tmpl, sol))
-        })
-        .collect();
-    for t in &deletes {
-        validate_key(target_graph, &t.subject, &t.predicate, &t.object)?;
+        .await?;
+
+    for triple in deletes.drain()? {
+        delete_ground_triple(keyspace, target_graph, &triple?, write_path).await?;
     }
-    for t in &inserts {
-        let term = triple_store::canonical_term(
-            &t.obj_type,
-            &t.object,
-            t.datatype.as_deref(),
-            t.language.as_deref(),
-        )?;
-        validate_key(target_graph, &t.subject, &t.predicate, &term)?;
-    }
-    let deleted = deletes.len();
-    let inserted = inserts.len();
-    for triple in &deletes {
-        delete_ground_triple(keyspace, target_graph, triple, write_path).await?;
-    }
-    for triple in &inserts {
+    for triple in inserts.drain()? {
+        let triple = triple?;
         write_triple(
             keyspace,
             target_graph,
@@ -490,7 +459,6 @@ async fn exec_clear(
     keyspace: &str,
     _storage: &Arc<StorageEngine>,
     write_path: &Arc<WritePath>,
-    limits: &ExecutionLimits,
 ) -> Result<usize, SparqlError> {
     use futures::StreamExt;
     let table = triple_store::triples_table_id(keyspace);
@@ -500,7 +468,6 @@ async fn exec_clear(
     let mut deleted = 0usize;
     for apply in [false, true] {
         let mut partitions = write_path.range_read_stream_all(&table, 0).await?;
-        let mut rows_read = 0usize;
         while let Some(partition) = partitions.next().await {
             let partition = partition?;
             let (graph, subject) = triple_store::decode_partition(partition.key.key.as_bytes())?;
@@ -514,13 +481,6 @@ async fn exec_clear(
                 continue;
             }
             for row in &partition.rows {
-                rows_read += 1;
-                if rows_read > limits.max_rows {
-                    return Err(SparqlError::Execution(format!(
-                        "SPARQL scan read more than {} storage rows during CLEAR/DROP",
-                        limits.max_rows
-                    )));
-                }
                 if let Some((predicate, object)) = triple_store::decode_v2_row(row)? {
                     validate_key(&graph, &subject, &predicate, &object)?;
                     if apply {
@@ -544,6 +504,57 @@ async fn exec_clear(
     Ok(deleted)
 }
 
+/// Validate one WHERE solution against the templates and instantiate them.
+///
+/// Validates only terms actually referenced by a write template. RDF 1.2
+/// results are valid in SELECT but not in the v2 codec.
+fn stage_solution(
+    solution: &HashMap<String, Binding>,
+    delete: &[GroundQuadPattern],
+    insert: &[QuadPattern],
+    target_graph: &str,
+) -> Result<(Vec<GroundTriple>, Vec<InsertTriple>), SparqlError> {
+    for template in insert {
+        match &template.object {
+            TermPattern::Variable(v) => {
+                if let Some(term) = solution.get(v.as_str()) {
+                    term.storage_parts()?;
+                }
+            }
+            TermPattern::Literal(l) => {
+                Binding::from_literal(l).storage_parts()?;
+            }
+            TermPattern::Triple(_) => {
+                return Err(SparqlError::Plan(
+                    "stored RDF 1.2 triple terms are not implemented".into(),
+                ))
+            }
+            _ => {}
+        }
+    }
+    let deletes: Vec<_> = delete
+        .iter()
+        .filter_map(|tmpl| instantiate_ground_delete(tmpl, solution))
+        .collect();
+    let inserts: Vec<_> = insert
+        .iter()
+        .filter_map(|tmpl| instantiate_insert(tmpl, solution))
+        .collect();
+    for t in &deletes {
+        validate_key(target_graph, &t.subject, &t.predicate, &t.object)?;
+    }
+    for t in &inserts {
+        let term = triple_store::canonical_term(
+            &t.obj_type,
+            &t.object,
+            t.datatype.as_deref(),
+            t.language.as_deref(),
+        )?;
+        validate_key(target_graph, &t.subject, &t.predicate, &term)?;
+    }
+    Ok((deletes, inserts))
+}
+
 /// A ground triple to tombstone. The graph it lives in is supplied by the
 /// caller (the request's resolved target graph).
 struct GroundTriple {
@@ -552,7 +563,40 @@ struct GroundTriple {
     object: Binding,
 }
 
+impl serde::Serialize for GroundTriple {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        (
+            &self.subject,
+            &self.predicate,
+            crate::spill::TermRef::from(&self.object),
+        )
+            .serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for GroundTriple {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (subject, predicate, object): (String, String, crate::spill::Term) =
+            serde::Deserialize::deserialize(deserializer)?;
+        Ok(Self {
+            subject,
+            predicate,
+            object: object.into_binding(),
+        })
+    }
+}
+
+impl ferrosa_storage::external_sort::SpillRow for GroundTriple {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.subject.capacity()
+            + self.predicate.capacity()
+            + crate::spill::binding_heap_bytes(&self.object)
+    }
+}
+
 /// A ground triple to insert, carrying object typing metadata.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct InsertTriple {
     subject: String,
     predicate: String,
@@ -560,6 +604,19 @@ struct InsertTriple {
     obj_type: String,
     datatype: Option<String>,
     language: Option<String>,
+}
+
+impl ferrosa_storage::external_sort::SpillRow for InsertTriple {
+    fn retained_bytes(&self) -> usize {
+        let opt = |s: &Option<String>| s.as_ref().map_or(0, String::capacity);
+        std::mem::size_of::<Self>()
+            + self.subject.capacity()
+            + self.predicate.capacity()
+            + self.object.capacity()
+            + self.obj_type.capacity()
+            + opt(&self.datatype)
+            + opt(&self.language)
+    }
 }
 
 /// Resolve a `TermPattern` (subject/object position) against a solution into a
@@ -869,14 +926,14 @@ async fn write_row(
     match path {
         WritePath::Cluster(coordinator) => {
             coordinator
-                .coordinate_write(table, key, row, timestamp)
+                .coordinate_write(table, key, Arc::new(row), timestamp)
                 .await?;
         }
         _ => {
             path.write(
                 table,
                 key,
-                row,
+                Arc::new(row),
                 timestamp,
                 ferrosa_cluster::consistency::ConsistencyLevel::Quorum,
                 &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {

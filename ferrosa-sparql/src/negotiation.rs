@@ -1,14 +1,22 @@
 //! Query-form-aware HTTP negotiation, including the SPARQL 1.2 JSON media version.
 //! Correctness: q=0 exclusions and explicit versions win over wildcard ranges.
-//! Last revised: 2026-10-27
-//! Last changed: Negotiate only formats that preserve the result's RDF terms.
-use crate::{engine::SparqlResult, results::ResultFormat};
+//! Last revised: 2026-11-16
+//! Last changed: Negotiate from the result's shape, known before its rows stream.
+use crate::results::ResultFormat;
+
+/// What negotiation needs to know about a result before any row is written.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ResultShape {
+    /// CONSTRUCT/DESCRIBE (RDF graph) rather than SELECT/ASK.
+    pub(crate) graph: bool,
+    /// Rows may carry RDF 1.2 terms, which only the 1.2 JSON form represents.
+    pub(crate) rdf12: bool,
+}
 
 /// Select a supported representation using RFC 9110 range specificity and quality.
 /// Candidate order supplies the server preference when the client is indifferent.
-pub(crate) fn negotiate(accept: &str, result: &SparqlResult) -> Option<ResultFormat> {
-    let graph = matches!(result, SparqlResult::Graph(_));
-    let rdf12 = matches!(result,SparqlResult::Select(rows) if rows.requires_json12());
+pub(crate) fn negotiate(accept: &str, shape: ResultShape) -> Option<ResultFormat> {
+    let ResultShape { graph, rdf12 } = shape;
     let candidates: &[ResultFormat] = if graph {
         &[ResultFormat::NTriples, ResultFormat::Turtle]
     } else if rdf12 {

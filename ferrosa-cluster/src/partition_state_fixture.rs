@@ -108,7 +108,7 @@ pub(crate) fn source_partition() -> Partition {
         key: key(),
         deletion: DeletionTime::new(PARTITION_DELETED_AT, 1_700_000_000),
         static_row: Some(static_row()),
-        rows: vec![clustered(1, "after-delete", 700)],
+        rows: vec![Arc::new(clustered(1, "after-delete", 700))],
     }
 }
 
@@ -119,14 +119,14 @@ pub(crate) fn seed_stale_row(storage: &StorageEngine) {
         .write(
             &table_id(),
             &key(),
-            clustered(2, "deleted-on-source", 100),
+            Arc::new(clustered(2, "deleted-on-source", 100)),
             100,
         )
         .unwrap();
 }
 
 /// Rows a reader may see: those not shadowed by the partition deletion.
-fn visible_rows(p: &Partition) -> Vec<Row> {
+fn visible_rows(p: &Partition) -> Vec<std::sync::Arc<Row>> {
     let deleted_at = p.deletion.marked_for_delete_at;
     p.rows
         .iter()

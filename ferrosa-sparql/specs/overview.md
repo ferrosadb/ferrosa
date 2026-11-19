@@ -43,9 +43,11 @@ explicit migration before serving.
 |--------|----------------|
 | `engine` (`src/engine.rs`, ~600 LoC) | `SparqlEngine`: parse→plan→execute orchestration, `SparqlResult`, ASK/CONSTRUCT/DESCRIBE graph assembly, JSON/XML/NT/Turtle dispatch |
 | `planner` (`src/planner.rs`, ~770 LoC) | `spargebra` algebra → `QueryPlan` of `TripleOp`s; per-pattern access-method selection; CONSTRUCT/DESCRIBE mode detection |
-| `executor` (`src/executor.rs`, ~1150 LoC) | Streaming triple-pattern scans + `ExecutionLimits` row bound, LIMIT pushdown, nested-loop join, constant-term enforcement, FILTER/ORDER BY/DISTINCT/LIMIT, composite-key decode, tombstone skipping, ObjectScan index |
+| `executor` (`src/executor.rs`) | Lazy solution streams end to end (`select_stream`, `where_solutions`), streaming triple-pattern scans, block nested-loop joins, spilling ORDER BY (ferrosa-storage `ExternalSorter`) and DISTINCT (`SpillingDedup`), LIMIT/OFFSET by pull, constant-term enforcement, composite-key decode, tombstone skipping, ObjectScan index |
+| `spill` (`src/spill.rs`) | `ExecutionContext` (spill root, threshold, per-query `ExecutionStats`), round-trippable spill encoding of RDF terms and solutions, spilling membership sets and arrival-order bags |
+| `response` (`src/response.rs`) | Incremental HTTP bodies: SELECT JSON/XML/N-Triples and graph N-Triples written row by row in ~64 KiB chunks; a mid-stream error aborts the body |
 | `update` (`src/update.rs`, ~730 LoC) | INSERT/DELETE DATA, DELETE WHERE, DELETE/INSERT WHERE, CLEAR, DROP, CREATE; up-front atomicity validation; one shared tombstone primitive |
-| `property_path` (`src/property_path.rs`, ~440 LoC) | `+ * ? ^` evaluation via BFS with cycle detection over a streamed, bounded adjacency read |
+| `property_path` (`src/property_path.rs`) | `+ * ? ^` as a stream of pairs; closure is a BFS that expands each node by a point lookup of its partition, with a spilling visited set and spilling frontier levels |
 | `bind` (`src/bind.rs`) | RDF-term-preserving Extend expressions, checked integer arithmetic and bounded decimal division |
 | `filter` (`src/filter.rs`, ~490 LoC) | `Expression` evaluation: comparisons, boolean ops, arithmetic, a function subset; `unsupported_expr` gate for ORDER BY fail-loud |
 | `aggregate` (`src/aggregate.rs`) | Bounded global/grouped COUNT with RDF-term DISTINCT identity |
@@ -116,23 +118,22 @@ through one `tombstone_triple` primitive that writes a deletion-marker row with
    `SparqlError::Plan`, not approximate results.
 5. **Deleted rows never surface.** The executor skips any row whose deletion
    marker is non-live (URS-QEC-D05).
-6. **Complete result, or an error — never a silent truncation.**
-   `ExecutionLimits::max_rows` (from `SparqlConfig::max_rows`) is the one row
-   bound. It is enforced at the SOURCE, as storage rows arrive from the
-   partition stream, and on every operator's solution buffer. Crossing it
-   returns `SparqlError::Execution`. Blocking operators (`ORDER BY`, `DISTINCT`,
-   property-path BFS) may buffer but not exceed it.
+6. **Complete result, or an error — never a silent truncation, never a cap.**
+   There is no row bound. Solutions are a lazy stream from the storage scan to
+   the HTTP body, which pulls them; blocking operators (`ORDER BY`, `DISTINCT`,
+   grouped `COUNT`, property-path closure, DELETE/INSERT staging) keep a
+   bounded working set and spill the rest under `<data_dir>/tmp_sparql_spill`
+   once `SparqlConfig::spill_threshold_bytes` is buffered. Every spill
+   directory is removed on drop, so a cancelled request cleans up too.
 7. **A constant is a match constraint in every position.** The access method is
    chosen from ONE bound term, but `try_bind_triple` re-checks subject,
    predicate, and object — including kind, datatype and language, so an IRI constant never matches
    a literal spelling the same characters. A blank node in a pattern is a
    non-selectable variable and constrains nothing.
-8. **LIMIT pushdown only where it is provably safe.** The scan stops after
-   `offset + limit` solutions only for a single triple pattern with no
-   `ORDER BY`, `DISTINCT`, `FILTER`, or graph query form above it; those
-   operators either block or drop rows after binding, so an early stop would
-   return the wrong rows or too few. LIMIT/OFFSET arithmetic saturates — both
-   values are attacker-controlled `usize`.
+8. **LIMIT is an optimization, not a bound.** Because every stage is pulled,
+   the slice stops pulling after `offset + limit` solutions and the scan below
+   stops with it; blocking operators and FILTERs above the scan naturally read
+   what they need. An error inside the OFFSET window is never skipped.
 
 ## Position in the dependency graph
 
@@ -147,8 +148,8 @@ on only by the `ferrosa` binary. See the
 scoped Join steps. The storage access inventory remains in `ops`; it does not
 control expression ordering. Each Join operand starts with the empty solution
 mapping and its own expression scope. BGP joins still stream the storage side;
-explicit Join operands and their compatible combinations obey `max_rows`.
-LIMIT pushdown is disabled for explicit Join steps and for any FILTER.
+explicit Join operands are re-evaluated per outer block of
+`JOIN_BLOCK_SOLUTIONS` (block nested loop), so neither side is materialized.
 
 The shared executor evaluates Extend per solution, retaining the row when the
 expression has an unbound operand, invalid type/value, overflow or zero divisor.
@@ -188,10 +189,10 @@ error leaves the data unchanged; this is not a transaction over concurrent write
 
 ## COUNT and SPARQL 1.2 results
 
-The supported COUNT subset streams a single triple pattern, FILTER and BIND
-into counters. Group keys and explicit DISTINCT sets are bounded by max_rows;
-complex joins/path input use the existing bounded evaluator. COUNT scans decode
-triples and are O(N). Unsupported aggregate/input algebra fails during planning.
+COUNT consumes its input stream into counters. DISTINCT keys go through a
+spilling set; grouped counts pre-aggregate in memory up to the spill threshold
+and then flush partial groups into an external sort that sums them on merge.
+COUNT scans decode triples and are O(N). Unsupported aggregate/input algebra fails during planning.
 
 Bindings are typed RDF terms, with recursive triple objects and directional
 literals for JSON 1.2 SELECT expressions. Scalar v2 storage identities and

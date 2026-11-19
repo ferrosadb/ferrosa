@@ -102,7 +102,7 @@ fn write_op(table: &str, key: &DecoratedKey, ck: Vec<u8>, val: &[u8], ts: i64) -
         keyspace: "ks".into(),
         table: table.into(),
         key: key.clone(),
-        row: live_row(ck, val, ts),
+        row: Arc::new(live_row(ck, val, ts)),
         timestamp: ts,
     }
 }

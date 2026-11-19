@@ -94,7 +94,7 @@ and `ParameterDescription` before binding parameters.
 ## Position in the dependency graph
 
 Depends on `ferrosa-storage` for spilling and `ferrosa-jsonb` for validated JSON
-values, plus `ordered-float`, `num-bigint`, `uuid`, `chrono`, `serde`, `serde_json`,
+values, plus `ordered-float`, `num-bigint`, `uuid`, `serde`, `serde_json`,
 and `tracing`. Depended on by
 `ferrosa-postgres`. See the [root crate index](../../specs/crates.md) for the
 full graph.

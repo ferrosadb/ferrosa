@@ -11,6 +11,7 @@
 //! include `Digest.crc32`/`CRC.db`); RE5 and the allocation counts are in
 //! `tests/data_sink_alloc.rs`.
 
+use std::sync::Arc;
 mod support;
 
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
@@ -41,12 +42,12 @@ fn one_big_value_partition(key: &[u8], value_len: usize, fill: u8) -> Partition 
         key: DecoratedKey::new(PartitionKey::new(key.to_vec())),
         deletion: DeletionTime::LIVE,
         static_row: None,
-        rows: vec![Row {
+        rows: vec![Arc::new(Row {
             clustering: vec![],
             cells: vec![(0, CellValue::live(vec![fill; value_len], 1))],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1),
-        }],
+        })],
     }
 }
 
@@ -144,6 +145,7 @@ fn many_rows_partition(
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp((i as i64) + 1),
         })
+        .map(Arc::new)
         .collect();
     Partition {
         key: DecoratedKey::new(PartitionKey::new(key.to_vec())),
@@ -542,12 +544,12 @@ fn data_sink_u8_incompressible_input_chunk_may_exceed_chunk_size() {
         key: DecoratedKey::new(PartitionKey::new(b"rand".to_vec())),
         deletion: DeletionTime::LIVE,
         static_row: None,
-        rows: vec![Row {
+        rows: vec![Arc::new(Row {
             clustering: vec![],
             cells: vec![(0, CellValue::live(value.clone(), 1))],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1),
-        }],
+        })],
     };
     let (_dir, written) = write_file_backed(options, header, &[partition]);
     let info = read_compression_info(&written);

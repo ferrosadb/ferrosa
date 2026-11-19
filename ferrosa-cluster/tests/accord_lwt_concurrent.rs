@@ -146,7 +146,7 @@ fn e2e_mutation_bytes(pk: &str, value: i32, cell_ts: i64) -> Vec<u8> {
         E2E_KS.to_string(),
         E2E_TABLE.to_string(),
         key,
-        vec![row],
+        vec![Arc::new(row)],
         cell_ts,
     );
     let mut buf = vec![0u8; m.serialized_size()];

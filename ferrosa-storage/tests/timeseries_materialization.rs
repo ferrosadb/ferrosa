@@ -329,7 +329,7 @@ fn read_first_value(engine: &StorageEngine, table_id: &TableId, key: &DecoratedK
     engine
         .read(table_id, key)
         .unwrap()
-        .and_then(|partition| partition.rows.first().map(row_double))
+        .and_then(|partition| partition.rows.first().map(|row| row_double(row)))
 }
 
 struct RustStddevExecutor;
@@ -383,20 +383,20 @@ fn keyed_time_series_window_cursor_streams_rows_without_returning_partitions() {
     engine.register_table(timeseries_schema()).unwrap();
 
     engine
-        .write(&table_id, &sensor, sensor_row(0, 1.0), 0)
+        .write(&table_id, &sensor, Arc::new(sensor_row(0, 1.0)), 0)
         .unwrap();
     engine
-        .write(&table_id, &sensor, sensor_row(5, 2.0), 5)
+        .write(&table_id, &sensor, Arc::new(sensor_row(5, 2.0)), 5)
         .unwrap();
     engine
-        .write(&table_id, &other, sensor_row(7, 99.0), 7)
+        .write(&table_id, &other, Arc::new(sensor_row(7, 99.0)), 7)
         .unwrap();
     engine.flush(&table_id).unwrap();
     engine
-        .write(&table_id, &sensor, sensor_row(10, 3.0), 10)
+        .write(&table_id, &sensor, Arc::new(sensor_row(10, 3.0)), 10)
         .unwrap();
     engine
-        .write(&table_id, &sensor, sensor_row(15, 4.0), 15)
+        .write(&table_id, &sensor, Arc::new(sensor_row(15, 4.0)), 15)
         .unwrap();
 
     let mut values = Vec::new();
@@ -420,14 +420,14 @@ fn keyed_time_series_window_cursor_merges_duplicate_rows_across_sources() {
     engine.register_table(timeseries_schema()).unwrap();
 
     engine
-        .write(&table_id, &sensor, sensor_row(5, 2.0), 5)
+        .write(&table_id, &sensor, Arc::new(sensor_row(5, 2.0)), 5)
         .unwrap();
     engine.flush(&table_id).unwrap();
     engine
         .write(
             &table_id,
             &sensor,
-            sensor_row_with_cell_timestamp(5, 7.0, 50),
+            Arc::new(sensor_row_with_cell_timestamp(5, 7.0, 50)),
             50,
         )
         .unwrap();
@@ -452,7 +452,7 @@ fn keyed_time_series_window_cursor_visits_zero_for_missing_or_empty_windows() {
     let sensor = key(b"sensor-1");
     engine.register_table(timeseries_schema()).unwrap();
     engine
-        .write(&table_id, &sensor, sensor_row(10, 3.0), 10)
+        .write(&table_id, &sensor, Arc::new(sensor_row(10, 3.0)), 10)
         .unwrap();
 
     let mut called = false;
@@ -499,14 +499,14 @@ fn keyed_time_series_window_cursor_merges_overlapping_sources_by_clustering_key(
     engine.register_table(timeseries_schema()).unwrap();
 
     engine
-        .write(&table_id, &sensor, sensor_row(5, 1.0), 5)
+        .write(&table_id, &sensor, Arc::new(sensor_row(5, 1.0)), 5)
         .unwrap();
     engine.flush(&table_id).unwrap();
     engine
-        .write(&table_id, &sensor, sensor_row(5, 9.0), 50)
+        .write(&table_id, &sensor, Arc::new(sensor_row(5, 9.0)), 50)
         .unwrap();
     engine
-        .write(&table_id, &sensor, sensor_row(7, 3.0), 70)
+        .write(&table_id, &sensor, Arc::new(sensor_row(7, 3.0)), 70)
         .unwrap();
 
     let mut values = Vec::new();
@@ -534,13 +534,18 @@ fn storage_materialization_observability_reports_live_queue_lag() {
             .write(
                 &table_id,
                 &sensor,
-                sensor_row(ts * 1_000_000, ts as f64),
+                Arc::new(sensor_row(ts * 1_000_000, ts as f64)),
                 ts,
             )
             .unwrap();
     }
     engine
-        .write(&table_id, &sensor, sensor_row(10_000_000, 10.0), 10_000_000)
+        .write(
+            &table_id,
+            &sensor,
+            Arc::new(sensor_row(10_000_000, 10.0)),
+            10_000_000,
+        )
         .unwrap();
 
     let mut queues = Vec::new();
@@ -582,10 +587,10 @@ fn storage_materialization_observability_reports_alerting_queue_state() {
         .unwrap();
 
     engine
-        .write(&table_id, &sensor, sensor_row(0, 1.0), 0)
+        .write(&table_id, &sensor, Arc::new(sensor_row(0, 1.0)), 0)
         .unwrap();
     engine
-        .write(&table_id, &sensor, sensor_row(1_000, 2.0), 1_000)
+        .write(&table_id, &sensor, Arc::new(sensor_row(1_000, 2.0)), 1_000)
         .unwrap();
     std::thread::sleep(Duration::from_millis(5));
 
@@ -615,7 +620,7 @@ fn materialization_drain_writes_queryable_rollup_rows() {
             .write(
                 &source_table,
                 &sensor,
-                sensor_row(ts * 1_000_000, ts as f64),
+                Arc::new(sensor_row(ts * 1_000_000, ts as f64)),
                 ts * 1_000_000,
             )
             .unwrap();
@@ -654,7 +659,7 @@ fn materialization_drain_streams_values_into_wasm_stddev_rollup() {
             .write(
                 &source_table,
                 &sensor,
-                sensor_row(ts as i64 * 1_000_000, value),
+                Arc::new(sensor_row(ts as i64 * 1_000_000, value)),
                 ts as i64 * 1_000_000,
             )
             .unwrap();
@@ -663,7 +668,7 @@ fn materialization_drain_streams_values_into_wasm_stddev_rollup() {
         .write(
             &source_table,
             &sensor,
-            sensor_row(10_000_000, 11.0),
+            Arc::new(sensor_row(10_000_000, 11.0)),
             10_000_000,
         )
         .unwrap();
@@ -692,13 +697,13 @@ fn rrd_materialization_failure_is_visible_in_status_snapshot() {
         .unwrap();
 
     engine
-        .write(&source_table, &sensor, sensor_row(0, 2.0), 0)
+        .write(&source_table, &sensor, Arc::new(sensor_row(0, 2.0)), 0)
         .unwrap();
     engine
         .write(
             &source_table,
             &sensor,
-            sensor_row(10_000_000, 4.0),
+            Arc::new(sensor_row(10_000_000, 4.0)),
             10_000_000,
         )
         .unwrap();
@@ -742,7 +747,7 @@ fn materialization_drain_recomputes_from_storage_when_ring_window_is_incomplete(
             .write(
                 &source_table,
                 &sensor,
-                sensor_row(ts * 1_000_000, ts as f64),
+                Arc::new(sensor_row(ts * 1_000_000, ts as f64)),
                 ts * 1_000_000,
             )
             .unwrap();
@@ -772,13 +777,13 @@ fn materialization_drain_excludes_row_deleted_source_values() {
     engine.register_table(live_consolidation_schema()).unwrap();
 
     engine
-        .write(&source_table, &sensor, sensor_row(0, 10.0), 0)
+        .write(&source_table, &sensor, Arc::new(sensor_row(0, 10.0)), 0)
         .unwrap();
     engine
         .write(
             &source_table,
             &sensor,
-            deleted_sensor_row(0, 5_000_000),
+            Arc::new(deleted_sensor_row(0, 5_000_000)),
             5_000_000,
         )
         .unwrap();
@@ -786,7 +791,7 @@ fn materialization_drain_excludes_row_deleted_source_values() {
         .write(
             &source_table,
             &sensor,
-            sensor_row(10_000_000, 20.0),
+            Arc::new(sensor_row(10_000_000, 20.0)),
             10_000_000,
         )
         .unwrap();
@@ -821,7 +826,7 @@ fn stale_late_materialization_task_is_dropped_without_rewriting_rollup() {
             .write(
                 &source_table,
                 &sensor,
-                sensor_row(ts * 1_000_000, ts as f64),
+                Arc::new(sensor_row(ts * 1_000_000, ts as f64)),
                 ts * 1_000_000,
             )
             .unwrap();
@@ -836,7 +841,12 @@ fn stale_late_materialization_task_is_dropped_without_rewriting_rollup() {
     assert!((before - 4.5).abs() < f64::EPSILON);
 
     engine
-        .write(&source_table, &sensor, sensor_row(0, 100.0), 40_000_000)
+        .write(
+            &source_table,
+            &sensor,
+            Arc::new(sensor_row(0, 100.0)),
+            40_000_000,
+        )
         .unwrap();
     assert_eq!(
         engine
@@ -873,7 +883,7 @@ fn materialization_drain_dispatches_rollup_writes_to_cascade_observers() {
             .write(
                 &source_table,
                 &sensor,
-                sensor_row(ts * 1_000_000, ts as f64),
+                Arc::new(sensor_row(ts * 1_000_000, ts as f64)),
                 ts * 1_000_000,
             )
             .unwrap();
@@ -910,7 +920,7 @@ async fn background_materialization_worker_eventually_writes_rollups() {
             .write(
                 &source_table,
                 &sensor,
-                sensor_row(ts * 1_000_000, ts as f64),
+                Arc::new(sensor_row(ts * 1_000_000, ts as f64)),
                 ts * 1_000_000,
             )
             .unwrap();

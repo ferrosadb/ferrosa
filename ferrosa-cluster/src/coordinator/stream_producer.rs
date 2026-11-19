@@ -50,9 +50,9 @@ pub trait ChunkSink: Send + Sync {
 /// `chunk_size` must be at least 1.
 ///
 /// `truncated` is set on the Done frame to signal that the partition
-/// list was bounded externally (Phase 1: by the existing
-/// `RANGE_READ_MATERIALIZATION_CAP` in `ferrosa-storage`). Phase 2's
-/// lazy iterator removes that cap and the flag becomes unused.
+/// list was bounded externally (Phase 1: by `ferrosa-storage`'s former
+/// range-read materialization cap, since removed). Phase 2's lazy
+/// iterator removes that bound and the flag becomes unused.
 ///
 /// # Panics
 /// Panics if `chunk_size == 0` (would loop forever otherwise).

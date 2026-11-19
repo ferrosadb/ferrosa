@@ -14,6 +14,7 @@ use num_bigint::BigInt;
 use crate::ast::{CqlTypeName, Term};
 use crate::error::CqlError;
 use crate::types::{decode_value, CqlType, CqlValue};
+use ferrosa_common::temporal::{self, parse::formats};
 use ferrosa_schema::Schema;
 
 // ---------------------------------------------------------------------------
@@ -29,14 +30,16 @@ pub(crate) const UUID_EPOCH_OFFSET: u64 = 0x01B2_1DD2_1381_4000;
 ///
 /// CQL `timestamp` is a signed 64-bit millisecond count, but a value must
 /// still round-trip through a calendar date on both the server and every
-/// client driver. We bound it to `chrono`'s representable `DateTime<Utc>`
-/// range so a scan can never emit millis that crash a driver's date decode.
+/// client driver. We bound it to the calendar range of
+/// [`ferrosa_common::temporal`] (years -262143..=262142, the range client
+/// drivers built on chrono decode) so a scan can never emit millis that crash
+/// a driver's date decode.
 /// Forensic corruption (Bug C) stored a value near `i64` extremes that decodes
 /// to `days=-1917935064` — this bound rejects exactly that class of value at
 /// the write boundary.
-pub(crate) const TIMESTAMP_MIN_MS: i64 = -8_334_601_228_800_000; // chrono MIN_UTC millis
+pub(crate) const TIMESTAMP_MIN_MS: i64 = -8_334_601_228_800_000; // -262143-01-01T00:00:00Z
 /// Maximum representable CQL `timestamp` value, in Unix-epoch milliseconds.
-pub(crate) const TIMESTAMP_MAX_MS: i64 = 8_210_266_876_799_999; // chrono MAX_UTC millis
+pub(crate) const TIMESTAMP_MAX_MS: i64 = 8_210_266_876_799_999; // +262142-12-31T23:59:59.999Z
 
 /// Validate a millisecond `timestamp` value at the write boundary.
 ///
@@ -242,43 +245,17 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
             }
             CqlType::Timestamp => {
                 // Parse timestamps in all common CQL/ISO formats
-                let ms = if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-                    dt.timestamp_millis()
-                } else if let Ok(dt) = chrono::DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%z") {
-                    dt.timestamp_millis()
-                } else if let Ok(dt) = chrono::DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f%z")
-                {
-                    dt.timestamp_millis()
-                } else if let Ok(dt) =
-                    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
-                {
-                    dt.and_utc().timestamp_millis()
-                } else if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
-                {
-                    dt.and_utc().timestamp_millis()
-                } else if let Ok(dt) =
-                    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
-                {
-                    dt.and_utc().timestamp_millis()
-                } else if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
-                {
-                    dt.and_utc().timestamp_millis()
-                } else if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-                    d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis()
-                } else {
-                    return Err(CqlError::Invalid(format!(
-                        "cannot parse timestamp from string: {s}"
-                    )));
-                };
+                let ms = parse_timestamp_text_ms(s).ok_or_else(|| {
+                    CqlError::Invalid(format!("cannot parse timestamp from string: {s}"))
+                })?;
                 Ok(CqlValue::Timestamp(validate_timestamp_ms(ms)?))
             }
             CqlType::Date => {
                 // Parse ISO date: "2024-01-15"
                 // CQL date is days since epoch (1970-01-01), stored as u32 with 2^31 offset
-                let d = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-                    .map_err(|e| CqlError::Invalid(format!("cannot parse date: {e}")))?;
-                let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                let days = (d - epoch).num_days();
+                let days = temporal::parse::date(s, formats::YMD)
+                    .map_err(|e| CqlError::Invalid(format!("cannot parse date: {e}")))?
+                    .days_since_epoch();
                 // CQL date encoding: days since epoch + 2^31 (to make it unsigned/sortable)
                 let encoded = (days + (1i64 << 31)) as u32;
                 Ok(CqlValue::Date(encoded))
@@ -286,13 +263,10 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
             CqlType::Time => {
                 // Parse time: "10:30:00" or "10:30:00.123456789"
                 // CQL time is nanoseconds since midnight
-                let t = chrono::NaiveTime::parse_from_str(s, "%H:%M:%S%.f")
-                    .or_else(|_| chrono::NaiveTime::parse_from_str(s, "%H:%M:%S"))
-                    .map_err(|e| CqlError::Invalid(format!("cannot parse time: {e}")))?;
-                let nanos = t
-                    .signed_duration_since(chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap())
-                    .num_nanoseconds()
-                    .unwrap_or(0);
+                let nanos = temporal::parse::time(s, formats::HMS_FRAC)
+                    .or_else(|_| temporal::parse::time(s, formats::HMS))
+                    .map_err(|e| CqlError::Invalid(format!("cannot parse time: {e}")))?
+                    .nanos_since_midnight();
                 Ok(CqlValue::Time(nanos))
             }
             CqlType::Bigint
@@ -708,7 +682,7 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                 },
                 "currenttimestamp" if args.is_empty() => match target {
                     CqlType::Timestamp => {
-                        Ok(CqlValue::Timestamp(chrono::Utc::now().timestamp_millis()))
+                        Ok(CqlValue::Timestamp(temporal::now().timestamp_millis()))
                     }
                     CqlType::Ascii | CqlType::Bigint | CqlType::Blob | CqlType::Boolean | CqlType::Counter | CqlType::Decimal | CqlType::Double | CqlType::Float | CqlType::Int | CqlType::Uuid | CqlType::Varchar | CqlType::Varint | CqlType::Timeuuid | CqlType::Inet | CqlType::Date | CqlType::Time | CqlType::Smallint | CqlType::Tinyint | CqlType::Duration | CqlType::List(_) | CqlType::Map(_, _) | CqlType::Set(_) | CqlType::Tuple(_) | CqlType::Udt { .. } | CqlType::Vector(_, _)
             | CqlType::Jsonb => Err(CqlError::Invalid(format!(
@@ -892,12 +866,38 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
     }
 }
 
+/// Milliseconds since the epoch named by CQL timestamp text, trying each
+/// accepted form in turn: RFC 3339, `yyyy-mm-dd hh:mm:ss[.f]` with an offset,
+/// the same without one (UTC), the `T`-separated forms, then a bare date
+/// (midnight UTC). `None` when no form matches.
+fn parse_timestamp_text_ms(s: &str) -> Option<i64> {
+    use temporal::parse::{datetime_with_offset, naive_datetime, rfc3339};
+    let with_offset = [formats::YMD_HMS_OFFSET, formats::YMD_HMS_FRAC_OFFSET];
+    let naive = [
+        formats::YMD_HMS_FRAC,
+        formats::YMD_HMS,
+        formats::YMD_T_HMS_FRAC,
+        formats::YMD_T_HMS,
+    ];
+    let instant = rfc3339(s)
+        .ok()
+        .or_else(|| {
+            with_offset
+                .iter()
+                .find_map(|f| datetime_with_offset(s, f).ok())
+        })
+        .or_else(|| naive.iter().find_map(|f| naive_datetime(s, f).ok()));
+    if let Some(instant) = instant {
+        return Some(instant.timestamp_millis());
+    }
+    let date = temporal::parse::date(s, formats::YMD).ok()?;
+    Some(date.days_since_epoch() * 86_400_000)
+}
+
 /// Today's date as a Cassandra `date` value (days from the Unix epoch, offset by
 /// `2^31`).
 fn today_cql_date() -> u32 {
-    let today = chrono::Utc::now().date_naive();
-    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid epoch");
-    let days = today.signed_duration_since(epoch).num_days();
+    let days = temporal::now().date().days_since_epoch();
     (days + (1i64 << 31)) as u32
 }
 
@@ -1521,6 +1521,7 @@ fn format_json_float_f64(f: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     // Encoders moved to ferrosa-row-bridge (re-exported above); the tests below
     // still reference these directly.
     use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
@@ -1806,7 +1807,7 @@ mod tests {
     #[test]
     fn term_out_of_range_integer_timestamp_is_rejected() {
         // Value whose /86_400_000 == -1917935064 days — the exact corruption
-        // signature seen on disk. Far outside chrono's representable range.
+        // signature seen on disk. Far outside the representable calendar range.
         let corrupt_ms: i64 = -1917935064i64 * 86_400_000;
         let err = term_to_cql_value(&Term::IntegerLiteral(corrupt_ms), &CqlType::Timestamp)
             .expect_err("out-of-range timestamp integer literal must be rejected");
@@ -1860,23 +1861,23 @@ mod tests {
         );
     }
 
-    /// The hardcoded representable-range bounds must track chrono's own
-    /// `DateTime<Utc>` millisecond limits so validation never rejects a value a
-    /// client could legitimately decode, nor accepts one it cannot.
+    /// The hardcoded representable-range bounds must track the calendar's
+    /// millisecond limits so validation never rejects a value a client could
+    /// legitimately decode, nor accepts one it cannot.
     #[test]
-    fn timestamp_bounds_match_chrono() {
-        assert_eq!(
-            TIMESTAMP_MIN_MS,
-            chrono::DateTime::<chrono::Utc>::MIN_UTC.timestamp_millis()
-        );
+    fn timestamp_bounds_match_the_calendar_range() {
+        use ferrosa_common::temporal::{Date, DateTime, MAX_YEAR, MIN_YEAR};
+        let first = Date::from_ymd(i64::from(MIN_YEAR), 1, 1).unwrap();
+        let last = Date::from_ymd(i64::from(MAX_YEAR), 12, 31).unwrap();
+        assert_eq!(TIMESTAMP_MIN_MS, first.days_since_epoch() * 86_400_000);
         assert_eq!(
             TIMESTAMP_MAX_MS,
-            chrono::DateTime::<chrono::Utc>::MAX_UTC.timestamp_millis()
+            (last.days_since_epoch() + 1) * 86_400_000 - 1
         );
-        assert!(chrono::DateTime::from_timestamp_millis(TIMESTAMP_MIN_MS).is_some());
-        assert!(chrono::DateTime::from_timestamp_millis(TIMESTAMP_MAX_MS).is_some());
-        assert!(chrono::DateTime::from_timestamp_millis(TIMESTAMP_MIN_MS - 1).is_none());
-        assert!(chrono::DateTime::from_timestamp_millis(TIMESTAMP_MAX_MS + 1).is_none());
+        assert!(DateTime::from_timestamp_millis(TIMESTAMP_MIN_MS).is_some());
+        assert!(DateTime::from_timestamp_millis(TIMESTAMP_MAX_MS).is_some());
+        assert!(DateTime::from_timestamp_millis(TIMESTAMP_MIN_MS - 1).is_none());
+        assert!(DateTime::from_timestamp_millis(TIMESTAMP_MAX_MS + 1).is_none());
     }
 
     /// A well-formed bound timestamp blob still decodes.
@@ -1910,7 +1911,7 @@ mod tests {
         let CqlValue::Timestamp(millis) = val else {
             panic!("expected Timestamp, got {val:?}");
         };
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_ms = ferrosa_common::temporal::now().timestamp_millis();
         let diff = (millis - now_ms).abs();
         assert!(
             diff < 5_000,
@@ -2236,7 +2237,7 @@ mod tests {
             key: dk,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row],
+            rows: vec![Arc::new(row)],
         };
 
         let column_names = vec!["id".into(), "name".into()];
@@ -2275,7 +2276,7 @@ mod tests {
             key: dk,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![tombstone_row],
+            rows: vec![Arc::new(tombstone_row)],
         };
 
         let rows =
@@ -2302,7 +2303,7 @@ mod tests {
             key: dk,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row],
+            rows: vec![Arc::new(row)],
         };
 
         let rows = partition_to_rows(
@@ -2341,7 +2342,7 @@ mod tests {
             key: dk,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row],
+            rows: vec![Arc::new(row)],
         };
 
         let rows = partition_to_rows(
@@ -2378,7 +2379,7 @@ mod tests {
             key: dk,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row],
+            rows: vec![Arc::new(row)],
         };
 
         let rows = partition_to_rows(
@@ -2416,7 +2417,7 @@ mod tests {
             key: dk,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row],
+            rows: vec![Arc::new(row)],
         };
 
         let rows = partition_to_rows(
@@ -3249,7 +3250,7 @@ mod tests {
             key: dk,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row],
+            rows: vec![Arc::new(row)],
         };
 
         let column_names = vec!["id".into(), "name".into()];
@@ -3313,7 +3314,7 @@ mod tests {
             key: dk,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row],
+            rows: vec![Arc::new(row)],
         };
 
         let column_names = vec!["id".into(), "v".into()];
@@ -3376,7 +3377,7 @@ mod tests {
             key: dk,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row],
+            rows: vec![Arc::new(row)],
         };
 
         let column_names = vec!["id".into(), "v".into()];
@@ -3418,7 +3419,7 @@ mod tests {
             key: dk,
             deletion: DeletionTime::LIVE,
             static_row: None,
-            rows: vec![row],
+            rows: vec![Arc::new(row)],
         };
 
         let column_names = vec!["id".into(), "v".into()];

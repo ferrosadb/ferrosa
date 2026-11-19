@@ -16,6 +16,11 @@ Sourced from the FMEA gaps ([fmea.md](fmea.md)), the code review (no in-source
 
 ## Now (highest value)
 
+- **DETACH DELETE without an in-memory batch (t_70c8e6ae).** The incident-edge
+  batch is one atomic `write_batch(Vec<Mutation>)` per vertex; needs a spilled
+  atomic batch (in progress with the shared-rows workstream).
+- **Per-row SUBSCRIBE events (t_1fc4dce9).** Each SSE event carries a whole
+  result; per-row events are a protocol decision.
 - **Scan allocation progress.** Empty property predicates avoid node/binding-map
   clones; scalar property lookup borrows the parent and clones only the selected
   value. Allocation regressions and null/ownership checks cover these paths.
