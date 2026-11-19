@@ -41,6 +41,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
 use ferrosa_sstable::compression::Compression;
@@ -140,7 +141,7 @@ fn partition(idx: usize, rows: usize) -> Partition {
         key: DecoratedKey::new(PartitionKey::new(format!("pk-{idx:016}").into_bytes())),
         deletion: DeletionTime::LIVE,
         static_row: None,
-        rows: (0..rows as i32).map(|i| row(idx, i)).collect(),
+        rows: (0..rows as i32).map(|i| Arc::new(row(idx, i))).collect(),
     }
 }
 
