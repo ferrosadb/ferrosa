@@ -22,6 +22,8 @@ import argparse
 import json
 import pathlib
 import re
+import shutil
+import subprocess
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -271,6 +273,30 @@ def kind_variant(kind: str) -> str:
     return "Code" if kind == "code" else "Design"
 
 
+def rustfmt_clean(text: str) -> str:
+    """The generated text must already be what rustfmt would write.
+
+    CI runs both `cargo fmt --check` and `red_ledger.py --check`, so if rustfmt would rewrite a
+    generated file then one of the two must fail -- formatting breaks the staleness check, and not
+    formatting breaks the format check. Neither can be given up, so the generator emits formatted
+    text and both agree by construction.
+
+    Normalising here rather than hand-matching rustfmt's line-breaking is deliberate: rustfmt
+    collapses a one-element array to `&[Red {` and keeps a 352-element one multi-line, so no fixed
+    emitter shape is clean at every size. The test suite pins this by generating from a one-row
+    synthetic ledger.
+    """
+    rustfmt = shutil.which("rustfmt")
+    if rustfmt is None:
+        return text
+    out = subprocess.run([rustfmt, "--edition", "2021", "--emit", "stdout"],
+                         input=text, capture_output=True, text=True)
+    if out.returncode != 0:
+        sys.stderr.write(f"rustfmt failed on generated text: {out.stderr}\n")
+        raise SystemExit(2)
+    return out.stdout
+
+
 def generate(data: dict) -> dict[str, str]:
     """The generated files, keyed by their path relative to the repo root."""
     reds = reds_of(data)
@@ -303,7 +329,8 @@ def generate(data: dict) -> dict[str, str]:
     tests = (TESTS_TEMPLATE
              .replace("__COUNT__", str(len(reds)))
              .replace("__MET_COUNT__", str(len(mets))))
-    return {DATA: "".join(rows), MET: "".join(mrows), TESTS: tests}
+    return {p: rustfmt_clean(t) for p, t in
+            ((DATA, "".join(rows)), (MET, "".join(mrows)), (TESTS, tests))}
 
 
 def main() -> int:
