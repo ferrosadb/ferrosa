@@ -72,6 +72,31 @@ fn consensus_gate_error(consensus_healthy: bool, opcode: Opcode) -> Option<CqlEr
     Some(CqlError::Overloaded(CONSENSUS_UNAVAILABLE_MESSAGE.into()))
 }
 
+/// Account for a request the server refused instead of executing.
+///
+/// Shedding load is legitimate, but it is a *failure* from the client's side and
+/// it never passes through a `RequestTimer`, because there is no work to time.
+/// Recording it here is the only way the exported `outcome="error"` series can
+/// reflect it — and a node that refuses tens of thousands of requests while
+/// reporting zero errors is worse than one that reports them, because the
+/// operator reads a healthy node.
+///
+/// Control opcodes (OPTIONS, STARTUP, AUTH_RESPONSE) have no request kind and are
+/// never admitted against this limit, so they are not counted.
+fn note_shed_request(opcode: Opcode, peer: std::net::SocketAddr) {
+    match RequestKind::from_opcode(opcode) {
+        Some(kind) => {
+            tracing::debug!(
+                %peer,
+                kind = kind.label(),
+                "in-flight limit reached; rejecting request as ERROR(Overloaded)"
+            );
+            request_metrics::record_rejection(kind);
+        }
+        None => tracing::debug!(%peer, "in-flight limit reached for a control opcode"),
+    }
+}
+
 fn build_event_frame(event: CqlEvent, response_version: u8) -> CqlFrame {
     let protocol_version = response_version & 0x7F;
     let body = event.encode_body(protocol_version).freeze();
@@ -511,6 +536,9 @@ pub(crate) async fn handle_connection<S>(
                         state.mode_controller.consensus_is_healthy(),
                         maybe_frame.header.opcode,
                     ) {
+                        // Same accounting as the in-flight-limit arm: a refusal
+                        // is a finished request with a failed outcome.
+                        note_shed_request(maybe_frame.header.opcode, peer);
                         let frame = CqlFrame {
                             header: FrameHeader {
                                 version: response_version,
@@ -538,7 +566,7 @@ pub(crate) async fn handle_connection<S>(
                     match in_flight.clone().try_acquire_owned() {
                         Ok(permit) => Some(permit),
                         Err(_) => {
-                            debug!("in-flight limit reached for {peer}, rejecting request");
+                            note_shed_request(maybe_frame.header.opcode, peer);
                             let err = CqlError::Overloaded("request backpressure".into());
                             let body = err.encode_body().freeze();
                             let frame = CqlFrame {
@@ -3486,6 +3514,60 @@ fn extract_keyspace_table(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request the connection sheds at the in-flight limit must appear in the
+    /// exported error series. Before this, the server replied
+    /// ERROR(Overloaded("request backpressure")) and counted nothing, so a node
+    /// refusing tens of thousands of requests reported
+    /// `ferrosa_cql_requests_total{outcome="error"} 0` — an operator saw a
+    /// healthy node while every client saw failures.
+    ///
+    /// This drives the real accounting function, so it fails if the recording is
+    /// removed from the shedding path rather than merely being absent from this
+    /// test.
+    #[test]
+    fn a_request_shed_at_the_in_flight_limit_is_counted_as_an_error() {
+        let peer: std::net::SocketAddr = "127.0.0.1:9042".parse().expect("valid socket addr");
+        let before =
+            request_total("ferrosa_cql_requests_total{kind=\"execute\",outcome=\"error\"}");
+
+        note_shed_request(Opcode::Execute, peer);
+
+        let after = request_total("ferrosa_cql_requests_total{kind=\"execute\",outcome=\"error\"}");
+        assert_eq!(
+            after,
+            before + 1.0,
+            "a shed request must increment the exported error series"
+        );
+    }
+
+    /// The converse: control opcodes are never admitted against the request
+    /// limit, so shedding one must not pollute the data-request error series.
+    #[test]
+    fn shedding_a_control_opcode_does_not_count_as_a_request_error() {
+        let peer: std::net::SocketAddr = "127.0.0.1:9042".parse().expect("valid socket addr");
+        let before = request_total("ferrosa_cql_requests_total{kind=\"query\",outcome=\"error\"}");
+
+        note_shed_request(Opcode::Options, peer);
+
+        let after = request_total("ferrosa_cql_requests_total{kind=\"query\",outcome=\"error\"}");
+        assert_eq!(after, before, "OPTIONS is not a data request");
+    }
+
+    /// Read one exported series from the process-wide metric registry.
+    fn request_total(series: &str) -> f64 {
+        let mut out = String::new();
+        request_metrics::render_prometheus(&mut out);
+        out.lines()
+            .find_map(|line| {
+                line.strip_prefix(series)?
+                    .strip_prefix(' ')?
+                    .trim()
+                    .parse()
+                    .ok()
+            })
+            .unwrap_or(0.0)
+    }
 
     #[test]
     fn a_reply_carrying_an_error_opcode_is_an_error_outcome_and_anything_else_is_ok() {
