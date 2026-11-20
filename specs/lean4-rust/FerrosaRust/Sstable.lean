@@ -22,7 +22,6 @@ set_option maxRecDepth 2048
 noncomputable section
 
 namespace ferrosa_sstable
-def core.error.Erased (Self : Type _) : Type := sorry
 
 /-- [core::cell::RefCell]
     Source: '/rustc/library/core/src/cell.rs', lines 852:0-852:29
@@ -159,7 +158,7 @@ def std.thread.local.LocalKey (T : Type _) : Type := sorry
 @[reducible, rust_trait_impl "core::convert::From<Box<@>, &'0 str>"]
 def Box.Insts.CoreConvertFromShared0Str : core.convert.From (Dyn (fun _dyn =>
   core.error.Error _dyn)) Str := {
-  sorry
+  «from» := sorry
 }
 
 /-- [alloc::fmt::format]:
@@ -254,7 +253,7 @@ def zstd_safe.CCtx : Type := sorry
 def zstd_safe.get_error_name : Std.Usize → Result Str := sorry
 
 /-- [ferrosa_sstable::compression::Compression]
-    Source: 'ferrosa-sstable/src/compression.rs', lines 32:0-39:1
+    Source: 'ferrosa-sstable/src/compression.rs', lines 33:0-40:1
     Visibility: public -/
 @[discriminant isize]
 inductive compression.Compression where
@@ -263,29 +262,29 @@ inductive compression.Compression where
 | Zstd : Std.I32 → compression.Compression
 
 /-- [ferrosa_sstable::compression::ZSTD_DCTX::{const}::{closure}]
-    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 63:20-69:21; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 41:0-96:1 -/
+    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 63:20-69:21; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 42:0-97:1 -/
 @[reducible]
 def compression.ZSTD_DCTX.const.closure := Unit
 
 /-- [ferrosa_sstable::compression::ZSTD_CCTX::{const}::{closure}]
-    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 63:20-69:21; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 41:0-96:1 -/
+    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 63:20-69:21; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 42:0-97:1 -/
 @[reducible]
 def compression.ZSTD_CCTX.const.closure := Unit
 
 /-- [ferrosa_sstable::compression::LZ4_TABLES::{const}::{closure}]
-    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 63:20-69:21; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 41:0-96:1 -/
+    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 63:20-69:21; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 42:0-97:1 -/
 @[reducible]
 def compression.LZ4_TABLES.const.closure := Unit
 
 /-- [ferrosa_sstable::compression::ZSTD_DCTX::__RUST_STD_INTERNAL_INIT]
-    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 58:8-58:51; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 41:0-96:1 -/
+    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 58:8-58:51; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 42:0-97:1 -/
 @[global_simps, irreducible]
 def compression.ZSTD_DCTX.__RUST_STD_INTERNAL_INIT
   : Result (core.cell.RefCell (Option zstd.bulk.decompressor.Decompressor)) :=
   core.cell.RefCell.new none
 
 /-- [ferrosa_sstable::compression::ZSTD_DCTX::{const}::{closure}::__RUST_STD_INTERNAL_VAL]
-    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 66:24-67:102; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 41:0-96:1 -/
+    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 66:24-67:102; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 42:0-97:1 -/
 @[global_simps, irreducible]
 def compression.ZSTD_DCTX.const.closure.__RUST_STD_INTERNAL_VAL
   :
@@ -295,7 +294,7 @@ def compression.ZSTD_DCTX.const.closure.__RUST_STD_INTERNAL_VAL
   sorry
 
 /-- [ferrosa_sstable::compression::ZSTD_DCTX::{const}::{impl core::ops::function::Fn<(core::option::Option<&'_2 mut core::option::Option<core::cell::RefCell<core::option::Option<zstd::bulk::decompressor::Decompressor<'_0>>>>>,), *const core::cell::RefCell<core::option::Option<zstd::bulk::decompressor::Decompressor<'_1>>>> for ferrosa_sstable::compression::ZSTD_DCTX::{const}::{closure}<'_0, '_1>}::call]:
-    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 63:20-69:21; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 41:0-96:1 -/
+    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 63:20-69:21; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 42:0-97:1 -/
 def
   compression.ZSTD_DCTX.const.closure.Insts.CoreOpsFunctionFnTupleOptionMut2OptionRefCellOptionDecompressorRawPtrConstRefCellOptionDecompressor.call
   (c : compression.ZSTD_DCTX.const.closure)
@@ -308,7 +307,7 @@ def
   sorry
 
 /-- [ferrosa_sstable::compression::ZSTD_DCTX::{const}::{impl core::ops::function::FnMut<(core::option::Option<&'_2 mut core::option::Option<core::cell::RefCell<core::option::Option<zstd::bulk::decompressor::Decompressor<'_0>>>>>,), *const core::cell::RefCell<core::option::Option<zstd::bulk::decompressor::Decompressor<'_1>>>> for ferrosa_sstable::compression::ZSTD_DCTX::{const}::{closure}<'_0, '_1>}::call_mut]:
-    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 63:20-69:21; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 41:0-96:1 -/
+    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 63:20-69:21; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 42:0-97:1 -/
 def
   compression.ZSTD_DCTX.const.closure.Insts.CoreOpsFunctionFnMutTupleOptionMut2OptionRefCellOptionDecompressorRawPtrConstRefCellOptionDecompressor.call_mut
   (state : compression.ZSTD_DCTX.const.closure)
@@ -322,7 +321,7 @@ def
   sorry
 
 /-- [ferrosa_sstable::compression::ZSTD_DCTX::{const}::{impl core::ops::function::FnOnce<(core::option::Option<&'_2 mut core::option::Option<core::cell::RefCell<core::option::Option<zstd::bulk::decompressor::Decompressor<'_0>>>>>,), *const core::cell::RefCell<core::option::Option<zstd::bulk::decompressor::Decompressor<'_1>>>> for ferrosa_sstable::compression::ZSTD_DCTX::{const}::{closure}<'_0, '_1>}::call_once]:
-    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 63:20-69:21; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 41:0-96:1 -/
+    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 63:20-69:21; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 42:0-97:1 -/
 def
   compression.ZSTD_DCTX.const.closure.Insts.CoreOpsFunctionFnOnceTupleOptionMut2OptionRefCellOptionDecompressorRawPtrConstRefCellOptionDecompressor.call_once
   (c : compression.ZSTD_DCTX.const.closure)
@@ -335,7 +334,7 @@ def
   sorry
 
 /-- [ferrosa_sstable::compression::ZSTD_DCTX::{const}::{closure}::{as_fn}]:
-    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 63:20-69:21; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 41:0-96:1 -/
+    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 63:20-69:21; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 42:0-97:1 -/
 def compression.ZSTD_DCTX.const.closure.as_fn
   (arg1 : Option (Option (core.cell.RefCell (Option
   zstd.bulk.decompressor.Decompressor)))) :
@@ -346,14 +345,14 @@ def compression.ZSTD_DCTX.const.closure.as_fn
   sorry
 
 /-- [ferrosa_sstable::compression::ZSTD_CCTX::__RUST_STD_INTERNAL_INIT]
-    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 58:8-58:51; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 41:0-96:1 -/
+    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 58:8-58:51; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 42:0-97:1 -/
 @[global_simps, irreducible]
 def compression.ZSTD_CCTX.__RUST_STD_INTERNAL_INIT
   : Result (core.cell.RefCell (Option (Std.I32 × zstd_safe.CCtx))) :=
   core.cell.RefCell.new none
 
 /-- [ferrosa_sstable::compression::ZSTD_CCTX::{const}::{closure}::__RUST_STD_INTERNAL_VAL]
-    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 66:24-67:102; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 41:0-96:1 -/
+    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 66:24-67:102; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 42:0-97:1 -/
 @[global_simps, irreducible]
 def compression.ZSTD_CCTX.const.closure.__RUST_STD_INTERNAL_VAL
   :
@@ -363,7 +362,7 @@ def compression.ZSTD_CCTX.const.closure.__RUST_STD_INTERNAL_VAL
   sorry
 
 /-- [ferrosa_sstable::compression::ZSTD_CCTX::{const}::{impl core::ops::function::Fn<(core::option::Option<&'_2 mut core::option::Option<core::cell::RefCell<core::option::Option<(i32, zstd_safe::CCtx<'_0>)>>>>,), *const core::cell::RefCell<core::option::Option<(i32, zstd_safe::CCtx<'_1>)>>> for ferrosa_sstable::compression::ZSTD_CCTX::{const}::{closure}<'_0, '_1>}::call]:
-    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 63:20-69:21; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 41:0-96:1 -/
+    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 63:20-69:21; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 42:0-97:1 -/
 def
   compression.ZSTD_CCTX.const.closure.Insts.CoreOpsFunctionFnTupleOptionMut2OptionRefCellOptionPairI32CCtxRawPtrConstRefCellOptionPairI32CCtx.call
   (c : compression.ZSTD_CCTX.const.closure)
@@ -376,7 +375,7 @@ def
   sorry
 
 /-- [ferrosa_sstable::compression::ZSTD_CCTX::{const}::{impl core::ops::function::FnMut<(core::option::Option<&'_2 mut core::option::Option<core::cell::RefCell<core::option::Option<(i32, zstd_safe::CCtx<'_0>)>>>>,), *const core::cell::RefCell<core::option::Option<(i32, zstd_safe::CCtx<'_1>)>>> for ferrosa_sstable::compression::ZSTD_CCTX::{const}::{closure}<'_0, '_1>}::call_mut]:
-    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 63:20-69:21; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 41:0-96:1 -/
+    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 63:20-69:21; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 42:0-97:1 -/
 def
   compression.ZSTD_CCTX.const.closure.Insts.CoreOpsFunctionFnMutTupleOptionMut2OptionRefCellOptionPairI32CCtxRawPtrConstRefCellOptionPairI32CCtx.call_mut
   (state : compression.ZSTD_CCTX.const.closure)
@@ -389,7 +388,7 @@ def
   sorry
 
 /-- [ferrosa_sstable::compression::ZSTD_CCTX::{const}::{impl core::ops::function::FnOnce<(core::option::Option<&'_2 mut core::option::Option<core::cell::RefCell<core::option::Option<(i32, zstd_safe::CCtx<'_0>)>>>>,), *const core::cell::RefCell<core::option::Option<(i32, zstd_safe::CCtx<'_1>)>>> for ferrosa_sstable::compression::ZSTD_CCTX::{const}::{closure}<'_0, '_1>}::call_once]:
-    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 63:20-69:21; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 41:0-96:1 -/
+    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 63:20-69:21; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 42:0-97:1 -/
 def
   compression.ZSTD_CCTX.const.closure.Insts.CoreOpsFunctionFnOnceTupleOptionMut2OptionRefCellOptionPairI32CCtxRawPtrConstRefCellOptionPairI32CCtx.call_once
   (c : compression.ZSTD_CCTX.const.closure)
@@ -402,7 +401,7 @@ def
   sorry
 
 /-- [ferrosa_sstable::compression::ZSTD_CCTX::{const}::{closure}::{as_fn}]:
-    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 63:20-69:21; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 41:0-96:1 -/
+    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 63:20-69:21; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 42:0-97:1 -/
 def compression.ZSTD_CCTX.const.closure.as_fn
   (arg1 : Option (Option (core.cell.RefCell (Option (Std.I32 ×
   zstd_safe.CCtx))))) :
@@ -413,20 +412,20 @@ def compression.ZSTD_CCTX.const.closure.as_fn
   sorry
 
 /-- [ferrosa_sstable::compression::Lz4Tables]
-    Source: 'ferrosa-sstable/src/compression.rs', lines 104:0-107:1 -/
+    Source: 'ferrosa-sstable/src/compression.rs', lines 105:0-108:1 -/
 structure compression.Lz4Tables where
   small : lz4_flex.block.compress.CompressTable
   large : lz4_flex.block.compress.CompressTable
 
 /-- [ferrosa_sstable::compression::LZ4_TABLES::__RUST_STD_INTERNAL_INIT]
-    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 58:8-58:51; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 41:0-96:1 -/
+    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 58:8-58:51; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 42:0-97:1 -/
 @[global_simps, irreducible]
 def compression.LZ4_TABLES.__RUST_STD_INTERNAL_INIT
   : Result (core.cell.RefCell (Option compression.Lz4Tables)) :=
   core.cell.RefCell.new none
 
 /-- [ferrosa_sstable::compression::LZ4_TABLES::{const}::{closure}::__RUST_STD_INTERNAL_VAL]
-    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 66:24-67:102; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 41:0-96:1 -/
+    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 66:24-67:102; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 42:0-97:1 -/
 @[global_simps, irreducible]
 def compression.LZ4_TABLES.const.closure.__RUST_STD_INTERNAL_VAL
   :
@@ -437,7 +436,7 @@ def compression.LZ4_TABLES.const.closure.__RUST_STD_INTERNAL_VAL
   std.sys.thread_local.native.eager.Storage.new rc
 
 /-- [ferrosa_sstable::compression::LZ4_TABLES::{const}::{impl core::ops::function::Fn<(core::option::Option<&'_0 mut core::option::Option<core::cell::RefCell<core::option::Option<ferrosa_sstable::compression::Lz4Tables>>>>,), *const core::cell::RefCell<core::option::Option<ferrosa_sstable::compression::Lz4Tables>>> for ferrosa_sstable::compression::LZ4_TABLES::{const}::{closure}}::call]:
-    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 63:20-69:21; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 41:0-96:1 -/
+    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 63:20-69:21; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 42:0-97:1 -/
 def
   compression.LZ4_TABLES.const.closure.Insts.CoreOpsFunctionFnTupleOptionMut0OptionRefCellOptionLz4TablesRawPtrConstRefCellOptionLz4Tables.call
   (c : compression.LZ4_TABLES.const.closure)
@@ -451,7 +450,7 @@ def
   ok (p, tupled_args)
 
 /-- [ferrosa_sstable::compression::LZ4_TABLES::{const}::{impl core::ops::function::FnMut<(core::option::Option<&'_0 mut core::option::Option<core::cell::RefCell<core::option::Option<ferrosa_sstable::compression::Lz4Tables>>>>,), *const core::cell::RefCell<core::option::Option<ferrosa_sstable::compression::Lz4Tables>>> for ferrosa_sstable::compression::LZ4_TABLES::{const}::{closure}}::call_mut]:
-    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 63:20-69:21; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 41:0-96:1 -/
+    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 63:20-69:21; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 42:0-97:1 -/
 def
   compression.LZ4_TABLES.const.closure.Insts.CoreOpsFunctionFnMutTupleOptionMut0OptionRefCellOptionLz4TablesRawPtrConstRefCellOptionLz4Tables.call_mut
   (state : compression.LZ4_TABLES.const.closure)
@@ -466,7 +465,7 @@ def
   ok (p, args1, state)
 
 /-- [ferrosa_sstable::compression::LZ4_TABLES::{const}::{impl core::ops::function::FnOnce<(core::option::Option<&'_0 mut core::option::Option<core::cell::RefCell<core::option::Option<ferrosa_sstable::compression::Lz4Tables>>>>,), *const core::cell::RefCell<core::option::Option<ferrosa_sstable::compression::Lz4Tables>>> for ferrosa_sstable::compression::LZ4_TABLES::{const}::{closure}}::call_once]:
-    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 63:20-69:21; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 41:0-96:1 -/
+    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 63:20-69:21; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 42:0-97:1 -/
 def
   compression.LZ4_TABLES.const.closure.Insts.CoreOpsFunctionFnOnceTupleOptionMut0OptionRefCellOptionLz4TablesRawPtrConstRefCellOptionLz4Tables.call_once
   (c : compression.LZ4_TABLES.const.closure)
@@ -480,7 +479,7 @@ def
   ok (p, o1)
 
 /-- [ferrosa_sstable::compression::LZ4_TABLES::{const}::{closure}::{as_fn}]:
-    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 63:20-69:21; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 41:0-96:1 -/
+    Source: '/rustc/library/std/src/sys/thread_local/native/mod.rs', lines 63:20-69:21; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 42:0-97:1 -/
 def compression.LZ4_TABLES.const.closure.as_fn
   (arg1 : Option (Option (core.cell.RefCell (Option compression.Lz4Tables)))) :
   Result ((ConstRawPtr (core.cell.RefCell (Option compression.Lz4Tables))) ×
@@ -490,7 +489,7 @@ def compression.LZ4_TABLES.const.closure.as_fn
     () arg1
 
 /-- [ferrosa_sstable::compression::ZSTD_DCTX]
-    Source: '/rustc/library/std/src/thread/local.rs', lines 284:25-285:100; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 41:0-96:1 -/
+    Source: '/rustc/library/std/src/thread/local.rs', lines 284:25-285:100; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 42:0-97:1 -/
 @[global_simps, irreducible]
 def compression.ZSTD_DCTX
   :
@@ -500,7 +499,7 @@ def compression.ZSTD_DCTX
   sorry
 
 /-- [ferrosa_sstable::compression::ZSTD_CCTX]
-    Source: '/rustc/library/std/src/thread/local.rs', lines 284:25-285:100; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 41:0-96:1 -/
+    Source: '/rustc/library/std/src/thread/local.rs', lines 284:25-285:100; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 42:0-97:1 -/
 @[global_simps, irreducible]
 def compression.ZSTD_CCTX
   :
@@ -510,7 +509,7 @@ def compression.ZSTD_CCTX
   sorry
 
 /-- [ferrosa_sstable::compression::LZ4_TABLES]
-    Source: '/rustc/library/std/src/thread/local.rs', lines 284:25-285:100; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 41:0-96:1 -/
+    Source: '/rustc/library/std/src/thread/local.rs', lines 284:25-285:100; this code is generated from a macro invocation at: 'ferrosa-sstable/src/compression.rs', lines 42:0-97:1 -/
 @[global_simps, irreducible]
 def compression.LZ4_TABLES
   :
@@ -520,12 +519,12 @@ def compression.LZ4_TABLES
   sorry
 
 /-- [ferrosa_sstable::compression::zstd_error]:
-    Source: 'ferrosa-sstable/src/compression.rs', lines 130:0-132:1 -/
+    Source: 'ferrosa-sstable/src/compression.rs', lines 131:0-133:1 -/
 def compression.zstd_error
   : Std.Usize → Result ferrosa_common.error.Error := sorry
 
 /-- [ferrosa_sstable::compression::CompressionInfo]
-    Source: 'ferrosa-sstable/src/compression.rs', lines 347:0-358:1
+    Source: 'ferrosa-sstable/src/compression.rs', lines 346:0-357:1
     Visibility: public -/
 structure compression.CompressionInfo where
   compression : compression.Compression
@@ -535,12 +534,12 @@ structure compression.CompressionInfo where
   chunk_offsets : alloc.vec.Vec Std.U64
 
 /-- [ferrosa_sstable::compression::take_bytes::{closure#1}]
-    Source: 'ferrosa-sstable/src/compression.rs', lines 499:20-499:73 -/
+    Source: 'ferrosa-sstable/src/compression.rs', lines 498:20-498:73 -/
 @[reducible]
 def compression.take_bytes.closure_1 := Str
 
 /-- [ferrosa_sstable::compression::take_bytes::{impl core::ops::function::FnOnce<(), ferrosa_common::error::Error> for ferrosa_sstable::compression::take_bytes::{closure#1}<'_0, '_1>}::call_once]:
-    Source: 'ferrosa-sstable/src/compression.rs', lines 499:20-499:73 -/
+    Source: 'ferrosa-sstable/src/compression.rs', lines 498:20-498:73 -/
 def
   compression.take_bytes.closure_1.Insts.CoreOpsFunctionFnOnceTupleError.call_once
   (c : compression.take_bytes.closure_1) (_ : Unit) :
@@ -560,7 +559,7 @@ def
   ok (ferrosa_common.error.Error.InvalidFormat s1)
 
 /-- Trait implementation: [ferrosa_sstable::compression::take_bytes::{impl core::ops::function::FnOnce<(), ferrosa_common::error::Error> for ferrosa_sstable::compression::take_bytes::{closure#1}<'_0, '_1>}]
-    Source: 'ferrosa-sstable/src/compression.rs', lines 499:20-499:73 -/
+    Source: 'ferrosa-sstable/src/compression.rs', lines 498:20-498:73 -/
 @[reducible]
 def compression.take_bytes.closure_1.Insts.CoreOpsFunctionFnOnceTupleError :
   core.ops.function.FnOnce compression.take_bytes.closure_1 Unit
@@ -570,12 +569,12 @@ def compression.take_bytes.closure_1.Insts.CoreOpsFunctionFnOnceTupleError :
 }
 
 /-- [ferrosa_sstable::compression::take_bytes::{closure}]
-    Source: 'ferrosa-sstable/src/compression.rs', lines 496:20-496:85 -/
+    Source: 'ferrosa-sstable/src/compression.rs', lines 495:20-495:85 -/
 @[reducible]
 def compression.take_bytes.closure := Str
 
 /-- [ferrosa_sstable::compression::take_bytes::{impl core::ops::function::FnOnce<(), ferrosa_common::error::Error> for ferrosa_sstable::compression::take_bytes::{closure}<'_0, '_1>}::call_once]:
-    Source: 'ferrosa-sstable/src/compression.rs', lines 496:20-496:85 -/
+    Source: 'ferrosa-sstable/src/compression.rs', lines 495:20-495:85 -/
 def
   compression.take_bytes.closure.Insts.CoreOpsFunctionFnOnceTupleError.call_once
   (c : compression.take_bytes.closure) (_ : Unit) :
@@ -596,7 +595,7 @@ def
   ok (ferrosa_common.error.Error.InvalidFormat s1)
 
 /-- Trait implementation: [ferrosa_sstable::compression::take_bytes::{impl core::ops::function::FnOnce<(), ferrosa_common::error::Error> for ferrosa_sstable::compression::take_bytes::{closure}<'_0, '_1>}]
-    Source: 'ferrosa-sstable/src/compression.rs', lines 496:20-496:85 -/
+    Source: 'ferrosa-sstable/src/compression.rs', lines 495:20-495:85 -/
 @[reducible]
 def compression.take_bytes.closure.Insts.CoreOpsFunctionFnOnceTupleError :
   core.ops.function.FnOnce compression.take_bytes.closure Unit
@@ -606,7 +605,7 @@ def compression.take_bytes.closure.Insts.CoreOpsFunctionFnOnceTupleError :
 }
 
 /-- [ferrosa_sstable::compression::take_bytes]:
-    Source: 'ferrosa-sstable/src/compression.rs', lines 493:0-502:1 -/
+    Source: 'ferrosa-sstable/src/compression.rs', lines 492:0-501:1 -/
 def compression.take_bytes
   (data : Slice Std.U8) (pos : Std.Usize) (len : Std.Usize) (field : Str) :
   Result ((core.result.Result (Slice Std.U8) ferrosa_common.error.Error) ×
@@ -645,12 +644,12 @@ def compression.take_bytes
     ok (r1, pos)
 
 /-- [ferrosa_sstable::compression::take_array::{closure}]
-    Source: 'ferrosa-sstable/src/compression.rs', lines 507:17-507:71 -/
+    Source: 'ferrosa-sstable/src/compression.rs', lines 506:17-506:71 -/
 @[reducible]
 def compression.take_array.closure (N : Std.Usize) := Str
 
 /-- [ferrosa_sstable::compression::take_array::{impl core::ops::function::FnOnce<(core::array::TryFromSliceError,), ferrosa_common::error::Error> for ferrosa_sstable::compression::take_array::{closure}<'_0, '_1, N>}::call_once]:
-    Source: 'ferrosa-sstable/src/compression.rs', lines 507:17-507:71 -/
+    Source: 'ferrosa-sstable/src/compression.rs', lines 506:17-506:71 -/
 def
   compression.take_array.closure.Insts.CoreOpsFunctionFnOnceTupleTryFromSliceErrorError.call_once
   {N : Std.Usize} (c : compression.take_array.closure N)
@@ -671,7 +670,7 @@ def
   ok (ferrosa_common.error.Error.InvalidFormat s1)
 
 /-- Trait implementation: [ferrosa_sstable::compression::take_array::{impl core::ops::function::FnOnce<(core::array::TryFromSliceError,), ferrosa_common::error::Error> for ferrosa_sstable::compression::take_array::{closure}<'_0, '_1, N>}]
-    Source: 'ferrosa-sstable/src/compression.rs', lines 507:17-507:71 -/
+    Source: 'ferrosa-sstable/src/compression.rs', lines 506:17-506:71 -/
 @[reducible]
 def
   compression.take_array.closure.Insts.CoreOpsFunctionFnOnceTupleTryFromSliceErrorError
@@ -682,7 +681,7 @@ def
 }
 
 /-- [ferrosa_sstable::compression::take_array]:
-    Source: 'ferrosa-sstable/src/compression.rs', lines 504:0-508:1 -/
+    Source: 'ferrosa-sstable/src/compression.rs', lines 503:0-507:1 -/
 def compression.take_array
   (N : Std.Usize) (data : Slice Std.U8) (pos : Std.Usize) (field : Str) :
   Result ((core.result.Result (Array Std.U8 N) ferrosa_common.error.Error) ×
@@ -707,7 +706,7 @@ def compression.take_array
     ok (r1, pos1)
 
 /-- [ferrosa_sstable::compression::write_compression_info_header]:
-    Source: 'ferrosa-sstable/src/compression.rs', lines 521:0-537:1 -/
+    Source: 'ferrosa-sstable/src/compression.rs', lines 520:0-536:1 -/
 def compression.write_compression_info_header
   (compressor_name : Str) (chunk_length : Std.Usize)
   (max_compressed_size : Std.Usize) (data_length : Std.U64)
@@ -749,3 +748,4 @@ def compression.write_compression_info_header
   alloc.vec.Vec.extend_from_slice core.clone.CloneU8 buf6 s6
 
 end ferrosa_sstable
+end
