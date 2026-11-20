@@ -93,6 +93,30 @@ def broken : List Item := [
    "A query's whole response page is built in memory before any of it is sent, so a slow client keeps all of it held on the coordinator until it has finished reading.",
    "ferrosa-cql/src/result.rs:133-164 encodes the whole page into one `BytesMut` (`let mut buf = BytesMut::new()` at :143, returned whole) and ferrosa-cql/src/connection.rs:757-779 only then freezes and sends it, so occupancy is the whole response and a slow client parks all of it in the coordinator; ferrosa-cql/src/router.rs:2967-2991 feeds it from a fully built `Vec<Vec<Option<CqlValue>>>`",
    "Ferrosa.Storage.Streaming", "a slow client cannot grow the coordinator's memory"⟩,
+  ⟨"Format", "a corrupt trie can never return a wrong value",
+   "A damaged index file can make a lookup return a different key's rows. Only one byte of the key's hash is checked, and the partition found at that offset is returned without confirming it is the key that was asked for.",
+   "ferrosa-sstable/src/partition_index.rs:116-122 verifies only `(h2 & 0xFF) as u8`, and ferrosa-sstable/src/reader.rs:993-1017 decodes whatever partition sits at the returned offset with no comparison against the requested key; ferrosa-storage/src/store.rs:4552 pushes it and ferrosa-storage/src/merge.rs:60 (`let result_key = first.key`) adopts it",
+   "Ferrosa.Storage.Format", "a wrong or corrupt trie can never return a wrong value"⟩,
+  ⟨"Format", "the index is only a speed-up, never the authority on the answer",
+   "A damaged index can change the answer rather than just the speed: the wrong rows come back and nothing reports that the index was at fault.",
+   "the same one-byte verification and missing key comparison (ferrosa-sstable/src/partition_index.rs:116-122, ferrosa-sstable/src/reader.rs:993-1017) means index damage is indistinguishable from a correct lookup",
+   "Ferrosa.Storage.Format", "the index is a speed-up, not an authority"⟩,
+  ⟨"Format", "a corrupt index block is detected",
+   "An index file that has been damaged reads as valid. Checksums cover the row data only, so corruption in the index used to find that data is never noticed.",
+   "checksums are scoped to Data.db (ferrosa-sstable/src/checksum.rs:1-6, Digest.crc32/CRC.db); no crc or checksum exists anywhere in ferrosa-sstable/src/trie/, partition_index.rs or row_index.rs",
+   "Ferrosa.Storage.Format", "a corrupt trie block is detected"⟩,
+  ⟨"Format", "a damaged byte costs one record, not the rest of the file",
+   "One bad byte loses everything after it in the same file rather than a single record: the file is pulled from service and its tail becomes unreadable.",
+   "a mid-read decode error becomes CorruptSstableId and the generation is quarantined after retries (ferrosa-storage/src/store.rs:4556-4580, :3954-3990); salvage abandons the header walk at the first bad header (ferrosa-sstable/src/reader.rs:1347-1361, \"later partitions not attempted\")",
+   "Ferrosa.Storage.Format", "one damaged byte costs one record"⟩,
+  ⟨"Format", "an absent index footer is recoverable",
+   "A table whose index file is truncated cannot be opened at all. It is refused outright rather than read as far as it is intact.",
+   "ferrosa-sstable/src/partition_index.rs:60-72 returns InvalidFormat \"partition index file too small for footer\" when the file is shorter than FOOTER_SIZE, and ferrosa-storage/src/engine.rs:13555-13568 refuses a generation without Partitions.db or Rows.db",
+   "Ferrosa.Storage.Format", "an absent footer is a recoverable state, not a failure"⟩,
+  ⟨"Format", "a long TTL expires rather than never expiring",
+   "A TTL that reaches past January 2038 stores a deletion time the field cannot hold. The cell is then treated as having no expiry at all, so data asked to expire is kept permanently with no error.",
+   "the cell's local deletion time is an i32 (ferrosa-common/src/cell.rs:52) and NO_DELETION_TIME is i32::MAX (cell.rs:30); ferrosa-row-bridge/src/row.rs:846-848 saturates `now+ttl` to that sentinel, which ldt_is_expired (:54-56) reads as never, and ferrosa-sstable/src/data.rs:1113,1531,1801 decode with wrapping_add",
+   "Ferrosa.Storage.Format", "a local deletion time cannot wrap"⟩,
   ⟨"Streaming", "acks are coalesced so a high-latency pipe is not ack-starved",
    "Model only: this row is stale. The socket setting it says is missing, TCP_NODELAY, is set on every client and internode socket. Whether replies still go out as several small writes, and what that costs, has not been measured.",
    "unverified: stale as written. The premise that NODELAY exists only on unmerged c38add89 is false — `git merge-base --is-ancestor c38add89 HEAD` exits 0, and ferrosa-cql/src/server.rs:303-311 sets `stream.set_nodelay(true)` on every accepted CQL socket (same at ferrosa-postgres/src/server.rs:2237-2245, ferrosa-graph/src/bolt/server.rs:136-142, ferrosa-net/src/rpc/server.rs:267-273). Whether replies are still several small writes, and what that costs per statement, has not been re-measured. Do not re-site this row before measuring",
@@ -282,7 +306,7 @@ the system-table projection layer was modelled, nine when the memory-discipline 
 against the read and transform paths, five when the canonical-form and codec-seam audit found that
 the pipeline's value type and the file layout both live in four crates it should not, and six when
 the ownership machine was audited against the peer send, snapshot and observer paths. -/
-theorem broken_has_fifty_six_items : broken.length = 56 := by native_decide
+theorem broken_has_sixty_two_items : broken.length = 62 := by native_decide
 
 /-- The surfaces are where the damage concentrates: five of the thirty-one are SQL or SPARQL, which
     are the two places where a client is most likely to be told something confidently wrong. -/
@@ -299,7 +323,7 @@ theorem five_rows_have_no_verified_site :
 /-- The remainder - the rows that name a real location — are what the list's opening claim is about:
     code that was read, not inferred. -/
 theorem fifty_one_rows_name_a_site :
-    (broken.filter fun i => !i.site.startsWith "unverified:").length = 51 := by native_decide
+    (broken.filter fun i => !i.site.startsWith "unverified:").length = 57 := by native_decide
 
 /-- What a reader of the specification is shown for a row: the sentence that says what is wrong. -/
 def readerText (i : Item) : String := i.plain

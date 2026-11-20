@@ -3,6 +3,15 @@
 // One row per red item in the Lean ledgers. A row leaves this table when its Lean item is closed,
 // which happens after the owning crate has a test that pins the claim.
 
+/// Which kind of claim a row is. See `Ferrosa.Ledger.Claim`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimKind {
+    /// Proved of a model; carries no claim about the shipping implementation.
+    Design,
+    /// A claim about the shipping implementation.
+    Code,
+}
+
 /// One unmet claim of the Lean specification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Red {
@@ -16,6 +25,8 @@ pub struct Red {
     pub why: &'static str,
     /// The theorem that proves the property absent.
     pub witness: &'static str,
+    /// Whether this row is about the code or about a model.
+    pub claim_kind: ClaimKind,
 }
 
 pub const REDS: &[Red] = &[
@@ -25,6 +36,7 @@ pub const REDS: &[Red] = &[
         claim: "a failure is attributable to a statement",
         why: "FAILURE carries no statement identity, and in a pipelined session the position is exactly what the client cannot recover",
         witness: "Bolt.ignored_messages_shift_every_later_reply",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "bolt_session__queued_result_streams_are_bounded",
@@ -32,6 +44,7 @@ pub const REDS: &[Red] = &[
         claim: "queued result streams are bounded",
         why: "RUN without PULL grows the server-side queue with no protocol backpressure",
         witness: "Bolt.unconsumed_runs_grow_the_queue",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "bolt_session__replies_can_be_paired_to_messages_by_index",
@@ -39,6 +52,7 @@ pub const REDS: &[Red] = &[
         claim: "replies can be paired to messages by index",
         why: "a failed session ignores messages silently, so the reply stream is shorter than the message stream and shifts; a counting driver desynchronises",
         witness: "Bolt.replies_are_not_one_per_message",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "cdc_subscribe__a_cancelled_subscription_reports_its_final_cursor",
@@ -46,6 +60,7 @@ pub const REDS: &[Red] = &[
         claim: "a cancelled subscription reports its final cursor",
         why: "SubscriptionHandle drops the stream id without recording the last position delivered, so a cancelled subscriber cannot resume",
         witness: "Commons.Stream.a_cancellation_reports_the_position_to_resume_from",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "cdc_subscribe__a_slow_consumer_s_overflow_spills_to_disk_instead_of_being_dropped",
@@ -53,6 +68,7 @@ pub const REDS: &[Red] = &[
         claim: "a slow consumer's overflow spills to disk instead of being dropped",
         why: "the bus is a tokio broadcast with a fixed in-memory capacity and no pool accounting: falling behind drops events and raises Lagged(n) with no spill and no persistence, so a slow consumer loses data and a restart loses the backlog",
         witness: "Commons.Flow.a_consumer_over_its_share_costs_disk_not_the_pool",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "cdc_subscribe__the_fair_share_is_driven_by_a_proportional_controller",
@@ -60,6 +76,7 @@ pub const REDS: &[Red] = &[
         claim: "the fair share is driven by a proportional controller",
         why: "there is no controller: the share is recomputed and dropped-on-lag, with no error term and no saturation handling",
         witness: "Commons.Flow.a_proportional_loop_holds_a_steady_offset",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "cdc_subscribe__the_wire_gap_signal_carries_the_position_to_replay_from",
@@ -67,6 +84,7 @@ pub const REDS: &[Red] = &[
         claim: "the wire gap signal carries the position to replay from",
         why: "subscribe.rs sends CdcRecvError::Lagged(n) with a count and no position, so a lagged subscriber can neither replay nor tell whether its position is still in retention",
         witness: "Commons.Stream.a_gap_is_either_resumable_or_an_explicit_reset",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "codec_audit__a_deletion_time_is_computed_the_same_and_width_safe_on_every_path",
@@ -74,6 +92,7 @@ pub const REDS: &[Red] = &[
         claim: "a deletion time is computed the same, and width-safe, on every path",
         why: "ferrosa-cluster/src/telemetry/writer.rs:131 casts a microsecond timestamp to i32 seconds with no clamp while ferrosa-graph/src/executor/expand.rs:6082 and ferrosa-graph/src/adjacency/reconcile.rs:866 clamp the same quantity; past 2038 the unclamped path wraps negative and the cell reads as already purged",
         witness: "none (implementation item)",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "codec_audit__an_artifact_records_which_format_version_wrote_it",
@@ -81,6 +100,7 @@ pub const REDS: &[Red] = &[
         claim: "an artifact records which format version wrote it",
         why: "nothing in ferrosa-sstable records a format version: reader.rs opens a table from component handles without a version check, statistics.rs:147-172 has no version field, and toc.rs:16-37 lists filenames. ADR-022 puts a version in the fnf header; until then a reader cannot refuse an artifact from a different writer",
         witness: "none (implementation item)",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "codec_audit__every_path_hands_the_pipeline_one_canonical_value_type",
@@ -88,6 +108,7 @@ pub const REDS: &[Red] = &[
         claim: "every path hands the pipeline one canonical value type",
         why: "the pipeline's value type is the codec crate's: 540 references from 101 shipping files in 12 crates, and the type's own module says it is format-specific (ferrosa-sstable/src/types.rs:1-14). Two front-end value types are converted into it at one door (ferrosa-row-bridge/src/row.rs:804) while 210 sites in 41 shipping files build cells without it",
         witness: "none (implementation item)",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "codec_audit__on_disk_layout_knowledge_is_confined_to_the_codec_module",
@@ -95,6 +116,7 @@ pub const REDS: &[Red] = &[
         claim: "on-disk layout knowledge is confined to the codec module",
         why: "437 literal component filenames in 21 shipping files across 4 crates, while the codec exports them as constants (ferrosa-sstable/src/toc.rs:16-37); the flush path re-derives the Statistics header's field width and sentinel (ferrosa-storage/src/flush.rs:123-129)",
         witness: "none (implementation item)",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "codec_audit__the_canonical_form_is_a_function_of_the_request_not_of_the_writer_s_clock",
@@ -102,6 +124,7 @@ pub const REDS: &[Red] = &[
         claim: "the canonical form is a function of the request, not of the writer's clock",
         why: "a tombstone's local deletion time and a TTL's expiry are stamped from SystemTime::now() at ferrosa-row-bridge/src/row.rs:815-817 and :826-830, so the same statement executed twice produces different cells and the merged result can depend on which execution landed",
         witness: "none (implementation item)",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "commons_hll__a_hyperloglog_estimator_backs_count_estimate_distinct",
@@ -109,6 +132,7 @@ pub const REDS: &[Red] = &[
         claim: "a HyperLogLog estimator backs COUNT(ESTIMATE_DISTINCT)",
         why: "not implemented: count.rs uses a Bloom probe and returns a lower bound bounded by the false-positive rate, which cannot merge across shards",
         witness: "Commons.Hll.merge_is_commutative",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "commons_hll__the_relative_error_is_bounded_by_1_04_sqrt_m",
@@ -116,6 +140,7 @@ pub const REDS: &[Red] = &[
         claim: "the relative error is bounded by 1.04/sqrt(m)",
         why: "not proved: the bound needs a probability model over the hash, which this corpus does not build. It is the one quantitative claim the estimator rests on",
         witness: "Commons.Hll.the_footprint_does_not_grow_with_the_distinct_count",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "cql_aggregateobligations__count_distinct_is_o_1_in_memory",
@@ -123,6 +148,7 @@ pub const REDS: &[Red] = &[
         claim: "COUNT(DISTINCT) is O(1) in memory",
         why: "the model threads the visited set as a List, one entry per distinct value; the Rust DistinctExact is O(1) but the refinement is unproved",
         witness: "AggregateObligations.model_visited_set_length_is_the_count",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "cql_aggregateobligations__count_distinct_merges_across_shards",
@@ -130,6 +156,7 @@ pub const REDS: &[Red] = &[
         claim: "COUNT(DISTINCT) merges across shards",
         why: "per-shard counts cannot be summed; a value on every shard is one distinct value",
         witness: "AggregateObligations.sum_of_shard_counts_overcounts",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "cql_aggregateobligations__count_estimate_distinct_has_a_relative_error_bound",
@@ -137,6 +164,7 @@ pub const REDS: &[Red] = &[
         claim: "COUNT(ESTIMATE_DISTINCT) has a relative error bound",
         why: "only monotonicity is proved; the quantitative bound is unproved, and exactness is refuted",
         witness: "AggregateObligations.exactness_does_not_hold",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "cql_aggregateobligations__count_estimate_distinct_merges_across_shards",
@@ -144,6 +172,7 @@ pub const REDS: &[Red] = &[
         claim: "COUNT(ESTIMATE_DISTINCT) merges across shards",
         why: "Bloom bits do not determine a count, so merged filters cannot yield a merged estimate; needs HLL or a re-scan",
         witness: "AggregateObligations.bloom_bits_do_not_determine_the_count",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "cql_aggregateobligations__cql_surface_accepts_count_distinct_c",
@@ -151,6 +180,7 @@ pub const REDS: &[Red] = &[
         claim: "CQL surface accepts COUNT(DISTINCT c)",
         why: "no AST node and no planner arm; the router recognises COUNT by name-matching only",
         witness: "none (implementation item)",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "cql_aggregateobligations__cql_surface_accepts_count_estimate_distinct_c",
@@ -158,6 +188,7 @@ pub const REDS: &[Red] = &[
         claim: "CQL surface accepts COUNT(ESTIMATE_DISTINCT c)",
         why: "same, and the function name does not exist in CQL, so it needs a Ferrosa-specific keyword",
         witness: "none (implementation item)",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "flight_subscribe__plan_rs_can_produce_a_stream_ticket",
@@ -165,6 +196,7 @@ pub const REDS: &[Red] = &[
         claim: "plan.rs can produce a stream ticket",
         why: "plan.rs only builds token-range SELECT tickets; there is no stream ticket type and do_get has no subscription path, so the Flight surface cannot serve SUBSCRIBE at all today",
         witness: "Flight.a_stream_ticket_is_not_a_range_select",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "ownership_obligations__a_replication_send_does_not_copy_the_mutation_it_is_about_to_encode",
@@ -172,6 +204,7 @@ pub const REDS: &[Red] = &[
         claim: "a replication send does not copy the mutation it is about to encode",
         why: "the pair coordinator clones the whole Mutation for the local apply at pair/coordinator.rs:122 and the primary forward path does the same at pair/handler.rs:47, while the peer send only borrows it to encode; one cloned Mutation per write, and clone-then-encode would let the row move",
         witness: "Ownership.a_second_copy_is_a_second_residence",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "ownership_obligations__a_snapshot_build_does_not_duplicate_the_state_it_is_about_to_encode",
@@ -179,6 +212,7 @@ pub const REDS: &[Red] = &[
         claim: "a snapshot build does not duplicate the state it is about to encode",
         why: "build_snapshot clones RaftState into SnapshotData at state_machine.rs:2541 although encode_snapshot takes &SnapshotData, and encode_snapshot clones the bootstrap map again at :248",
         witness: "Ownership.a_second_copy_is_a_second_residence",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "ownership_obligations__a_snapshot_is_served_to_every_follower_through_a_handle_rather_than_a_copy",
@@ -186,6 +220,7 @@ pub const REDS: &[Red] = &[
         claim: "a snapshot is served to every follower through a handle rather than a copy",
         why: "current_snapshot_cloned returns Vec<u8> (state_machine.rs:599), so get_current_snapshot hands every follower that asks its own copy of the whole snapshot: k followers, k resident copies",
         witness: "Ownership.k_follower_copies_cost_k_times_the_snapshot",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "ownership_obligations__a_write_that_hands_a_row_to_an_observer_does_not_give_the_observer_a_second_payload",
@@ -193,6 +228,7 @@ pub const REDS: &[Red] = &[
         claim: "a write that hands a row to an observer does not give the observer a second payload",
         why: "StorageEngine::write clones the row into a Mutation at engine.rs:10203 (and the batch path at :10325) because the memtable takes the original by value; the code's own comment says the two owners are concurrent, which is what an Arc<Row> handle is for",
         witness: "Ownership.two_payloads_are_twice_the_bytes",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "ownership_obligations__an_observer_drain_moves_rows_out_of_the_mutation_it_owns",
@@ -200,6 +236,7 @@ pub const REDS: &[Red] = &[
         claim: "an observer drain moves rows out of the mutation it owns",
         why: "engine.rs:9651 and :9698 iterate &dm.rows and clone each row into the target memtable although the derived mutation is owned and dropped at the end of the loop",
         witness: "Ownership.k_row_copies_cost_k_times_the_row",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "ownership_obligations__the_encoded_snapshot_is_not_resident_three_times_during_a_build",
@@ -207,6 +244,7 @@ pub const REDS: &[Red] = &[
         claim: "the encoded snapshot is not resident three times during a build",
         why: "state_machine.rs:2567 clones the encoded bytes into the published slot and :2571 clones them again for the disk write, while the original is still moved into the returned cursor",
         witness: "Ownership.three_copies_cost_three_times",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "raft_obligations__a_failed_local_side_effect_is_repaired_without_a_restart",
@@ -214,6 +252,7 @@ pub const REDS: &[Red] = &[
         claim: "a failed local side effect is repaired without a restart",
         why: "an engine or schema effect that fails during apply becomes RaftResponse::Error (state_machine.rs:2142-2155), which is not durable and not replayed, while the entry publishes and the state adopts the mutation; the effect is re-attempted only by a replay from a snapshot behind it — register_table is unconditional at :1435-1444, so it re-runs on replay — and a replay needs a restart or an install, so until then the node advertises a table its engine cannot serve",
         witness: "Raft.a_failed_local_effect_leaves_a_permanent_gap",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "raft_obligations__a_restart_cannot_repeat_a_persistent_projection_failure_without_progress",
@@ -221,6 +260,7 @@ pub const REDS: &[Red] = &[
         claim: "a restart cannot repeat a persistent projection failure without progress",
         why: "a persistent precondition - a disk below its write reserve refusing engine.write via check_write_admission (ferrosa-storage/src/engine.rs:3354-3372, :10109), or a commit-log fsync that keeps failing (ferrosa-cluster/src/raft/state_machine.rs:2196) - re-fails the same entry on every boot. The cycle restart, boot, physical, projectionFail is a fixed point, so applied never passes the entry and the node alternates between openraft Fatal and replaying the same failure; 6c270518 widened this set by making every WarnReplay site fatal as well. Repairing in place would discharge it - Raft.three_repair_cycles_pass_the_poisoned_entry proves the entry is passed once the node adopts a peer's state instead of re-running its own - but the code still has no such path and no repair position to resume from (Raft.the_code_never_passes_the_poisoned_entry)",
         witness: "Raft.restart_cycle_never_passes_a_poisoned_entry",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "raft_obligations__a_restart_or_a_resync_repairs_an_entry_whose_destructive_effect_already_landed",
@@ -228,6 +268,7 @@ pub const REDS: &[Red] = &[
         claim: "a restart or a resync repairs an entry whose destructive effect already landed",
         why: "apply_command runs engine.unregister_table before the ordered write is attempted, which records a durable drop in dropped-tables.json and deletes the SSTable directory (ferrosa-storage/src/engine.rs:5865-5899, :6020-6059); when the ordered write then fails the entry never publishes, and the snapshot restored on the next boot still describes the table, so sync_schema_and_engine_from_state re-registers it empty and apply_snapshot's additive merge (ferrosa-schema/src/registry.rs:346-364) never removes it. The node advertises a table whose rows are gone, every component agrees, and no replay, restart or resync puts the rows back",
         witness: "Raft.a_drop_that_never_publishes_is_read_as_an_empty_table",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "raft_obligations__a_snapshot_is_restored_as_a_whole_or_the_node_does_not_boot_on_it",
@@ -235,6 +276,7 @@ pub const REDS: &[Red] = &[
         claim: "a snapshot is restored as a whole or the node does not boot on it",
         why: "apply_snapshot_data adopts the state and the published index (state_machine.rs:838-839) before sync_schema_and_engine_from_state (:841-844) can fail, and controller/cluster.rs:1459-1465 downgrades that failure to a warning, so the process runs with RaftState at the snapshot index and a shared Schema and StorageEngine that never saw it; nothing on the apply path closes the gap, and the retirement of superseded incarnations (:1001-1005) happens before the sync that can still fail. The classifier cannot see it either: it is asked about last_applied, which the failed restore already advanced (:1485-1489), so it answers Usable. Ferrosa/Raft/Partial.lean classifies what the node then holds — corrupt for a destructive entry, divergent for an additive one",
         witness: "Raft.a_failed_restore_boots_with_a_stale_schema",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "raft_obligations__a_startup_inconsistency_is_repaired_in_place_serves_consistent_state_or_stays_quarantined_naming_the_c",
@@ -242,6 +284,7 @@ pub const REDS: &[Red] = &[
         claim: "a startup inconsistency is repaired in place, serves consistent state, or stays quarantined naming the cause",
         why: "two boot paths report an index the node cannot honour. apply_snapshot_data_from adopts state and last_applied (ferrosa-cluster/src/raft/state_machine.rs:959-960) before sync_schema_and_engine_from_state (:1100-1180) can fail, and controller/cluster.rs:1467-1472 logs that failure and boots, so the classifier - asked about the already-adopted last_applied (:1492-1496) - answers Usable; and when the snapshot does not decode at all, last_applied stays None, recover_from_purge_point (:713-724) sets it to the purge point without restoring state, and the node publishes above the purge point forever with an empty RaftState. Both run, both open readiness, and neither has a retry or a repair: /readyz (ferrosa/src/web/readiness.rs:191-372) and is_cql_ready (ferrosa-cluster/src/controller/mod.rs:994-999) never compare the state the node would answer from against the index it reports. The third branch is not a discharge either: the path that returns without openraft (controller/cluster.rs:1588-1594, then :1439-1445) leaves the node up and permanently outside the cluster (Raft.the_refusal_path_is_terminal). What the operator now requires is quarantine-and-repair: refuse traffic, stay a member, pull the state from a peer, and verify it before serving again - modelled in Ferrosa/Raft/Quarantine.lean, where Raft.a_sufficient_peer_repairs_the_node is the proof that it works and Raft.the_code_answers_from_state_it_does_not_have is the code that does not have it",
         witness: "Raft.an_unreadable_snapshot_skips_the_purged_log",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "raft_obligations__code_a_latched_node_cannot_install_the_snapshot_that_would_repair_it_and_never_becomes_healthy_again",
@@ -249,6 +292,7 @@ pub const REDS: &[Red] = &[
         claim: "code: a latched node cannot install the snapshot that would repair it, and never becomes healthy again",
         why: "install_snapshot (ferrosa-cluster/src/raft/state_machine.rs:2801-2837) begins with finish_pending_apply (:2804), which returns the apply_failure error for every call while the latch is set (:527-529), so the repair path sits behind the state it would repair; and ConsensusHealth (ferrosa-cluster/src/consensus_health.rs:97-125) has fail/is_healthy/failure/failure_count and no reset, so a failure is process-lifetime and only a restart clears it - the restart that re-derives the same failure from the same durable facts. A node with no reachable peer has nowhere to say so either: nothing between /readyz and the operator distinguishes 'waiting for a peer' from 'failed', so the third acceptable discharge (quarantine forever, with the reason) is not expressible today",
         witness: "Raft.a_latched_node_cannot_install_the_snapshot_that_would_fix_it",
+        claim_kind: ClaimKind::Code,
     },
     Red {
         name: "raft_obligations__code_a_node_whose_projection_diverged_still_votes_and_is_counted_toward_quorum",
@@ -256,6 +300,7 @@ pub const REDS: &[Red] = &[
         claim: "code: a node whose projection diverged still votes and is counted toward quorum",
         why: "RaftVoteHandler (ferrosa-cluster/src/raft/handlers.rs:1014-1019) forwards a VoteRequest straight to raft.vote(req) with no state-machine or health term, so a node that booted with last_applied ahead of its RaftState (ferrosa-cluster/src/raft/state_machine.rs:960, ferrosa-cluster/src/controller/cluster.rs:1467-1472) answers votes and is counted - it can be part of the quorum that elects a leader while holding a state machine it cannot honour. Only the openraft-fatal path closes anything, and it closes the node rather than the vote",
         witness: "Raft.a_divergent_node_still_votes",
+        claim_kind: ClaimKind::Code,
     },
     Red {
         name: "raft_obligations__code_a_node_whose_restore_failed_answers_reads_and_reports_ready_on_state_it_does_not_have",
@@ -263,6 +308,7 @@ pub const REDS: &[Red] = &[
         claim: "code: a node whose restore failed answers reads and reports ready on state it does not have",
         why: "apply_snapshot_data_from adopts last_applied from the snapshot (ferrosa-cluster/src/raft/state_machine.rs:960) and a failing sync_schema_and_engine_from_state rolls back the state but not the boot (ferrosa-cluster/src/controller/cluster.rs:1467-1472 logs and boots), so the node runs with last_applied=4 and a RaftState the schema and engine never saw. ModeController::is_cql_ready (ferrosa-cluster/src/controller/mod.rs:994-999) checks consensus health, write path, DDL path and declared topology, and /readyz (ferrosa/src/web/readiness.rs:191-372) checks supervised tasks, listeners, set-aside mutations and Raft liveness: neither reads the difference between synced and applied. There is no quarantine state anywhere in the process - every quarantin* in the tree is SSTable- or range-level (ferrosa-cluster/src/repair/trigger.rs:1-20). The snapshot builder is worse than passive: build_snapshot (ferrosa-cluster/src/raft/state_machine.rs:2528-2583) publishes the unhonoured state at last_applied and mark_durably_applied (:2576) then lets the log purge to it, so the node becomes consistent by fiat and the entries that could have repaired it are gone",
         witness: "Raft.the_code_answers_from_state_it_does_not_have",
+        claim_kind: ClaimKind::Code,
     },
     Red {
         name: "raft_obligations__code_a_repair_replaces_local_state_wholesale_and_records_nothing_it_discarded",
@@ -270,6 +316,7 @@ pub const REDS: &[Red] = &[
         claim: "code: a repair replaces local state wholesale and records nothing it discarded",
         why: "apply_snapshot_data_from assigns self.state = data.state (ferrosa-cluster/src/raft/state_machine.rs:959) and last_applied = meta.last_log_id (:960); the guards it does have refuse a snapshot that drops a table carrying local artifacts (:947-952, :997-1016) and, since 45a6af1d, a persisted startup snapshot that cannot prove replacement order (:1138-1146) - none of them merges, or records a row for, a table the snapshot also carries. A locally durable row above the peer's index survives as an SSTable while the metadata describing it is replaced. A repair merge by timestamp is not a way out: the projection has no per-cell generation (specs/lean4/Ferrosa/SystemTables/Projection.lean:13-24) and Raft.a_repair_merge_by_timestamp_keeps_the_older_cell is that model's tsOnly_tie_breaks_toward_the_older_write applied to the pair a repair would compare",
         witness: "Raft.a_repair_that_replaces_state_drops_the_newer_rows",
+        claim_kind: ClaimKind::Code,
     },
     Red {
         name: "raft_obligations__code_a_restart_replays_the_same_failure_and_the_repair_position_is_not_durable",
@@ -277,6 +324,7 @@ pub const REDS: &[Red] = &[
         claim: "code: a restart replays the same failure and the repair position is not durable",
         why: "apply_failure is a field on the in-memory machine (ferrosa-cluster/src/raft/state_machine.rs:435), absent from SnapshotData (:390-400) and set to None by the constructor (:670), so a restart clears it and the next boot re-derives the same failure from the same durable facts (Raft.restart_cycle_never_passes_a_poisoned_entry); no durable repair cursor exists either, so a restart during a snapshot transfer starts it again (Raft.a_restart_forgets_the_repair_position). The reset path that does make progress (ferrosa-cluster/src/controller/cluster.rs:1531-1552) does it by moving the raft directory aside and taking a fresh snapshot, which discards the log rather than repairing from it, and when the reset itself fails the node returns without raft (ferrosa-cluster/src/controller/cluster.rs:1588-1594, 'needs operator repair') - the refusal the operator has ruled out as a discharge (Raft.the_refusal_path_is_terminal)",
         witness: "Raft.the_code_never_passes_the_poisoned_entry",
+        claim_kind: ClaimKind::Code,
     },
     Red {
         name: "raft_obligations__code_the_node_exits_an_inconsistent_state_on_an_index_it_was_told_not_on_state_it_holds",
@@ -284,6 +332,7 @@ pub const REDS: &[Red] = &[
         claim: "code: the node exits an inconsistent state on an index it was told, not on state it holds",
         why: "the classifier compares two numbers, last_applied and last_purged (ferrosa-cluster/src/raft/local_state.rs:88-102), and recover_from_purge_point (ferrosa-cluster/src/raft/state_machine.rs:713-724) sets last_applied to the purge point without touching state, so the node reports the whole log applied while holding an empty RaftState and never replays the entries below it. That is an exit on a claim about an index: nothing in the boot path compares RaftState against the entries it says it applied. Raft.a_trusting_policy_exits_on_a_claim is the same trace with the claim made in words, which is the shape a repair driven by a peer saying 'you are caught up' would take",
         witness: "Raft.the_code_exits_on_the_purge_point_without_the_state",
+        claim_kind: ClaimKind::Code,
     },
     Red {
         name: "raft_obligations__no_durable_effect_belongs_to_an_entry_the_published_index_does_not_cover",
@@ -291,6 +340,7 @@ pub const REDS: &[Red] = &[
         claim: "no durable effect belongs to an entry the published index does not cover",
         why: "force_commit_log_sync (state_machine.rs:2193-2197) makes the ordered system-table rows durable inside the job, and finish_pending_apply advances last_applied only when the job's result is polled (:476-477); a process that dies between the two leaves a durable projection row for an entry last_applied does not cover. Replay re-issues it and converges, so the window is only unbounded when the cause of a later failure persists, or when the raft directory is reset and the entry is never replayed on this node",
         witness: "Raft.a_durable_projection_without_publication",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "raft_obligations__the_apply_latch_survives_a_restart",
@@ -298,6 +348,7 @@ pub const REDS: &[Red] = &[
         claim: "the apply latch survives a restart",
         why: "apply_failure is a plain Option<String> on the in-memory state machine (ferrosa-cluster/src/raft/state_machine.rs:435), absent from SnapshotData (:390-400), and the constructor sets it to None (:670), so every restart clears it: the latch describes a process, not a node, and nothing at boot asks whether the condition that set it is still true. Under quarantine the same requirement is stronger and still unmet - the quarantine reason and any repair position must survive a restart too, and neither has a durable field (Raft.a_restart_forgets_the_repair_position)",
         witness: "Raft.restart_clears_the_latch",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "raft_obligations__the_durable_snapshot_on_disk_never_moves_backwards",
@@ -305,6 +356,7 @@ pub const REDS: &[Red] = &[
         claim: "the durable snapshot on disk never moves backwards",
         why: "build_snapshot discards publish_snapshot's refusal (state_machine.rs:2218) and writes snapshot_path unconditionally (:2225), so a builder taken before an install persists its older snapshot over the installed one while mark_durably_applied stays at the newer index; the slot keeps the newer snapshot so replication is unaffected, and the log store is free to purge to it, so the node boots as StrandedBehindPurge and discards its raft directory",
         witness: "Raft.stale_builder_overwrites_the_durable_snapshot",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "raft_obligations__the_projection_orders_two_writes_by_the_log_not_by_the_wall_clock",
@@ -312,6 +364,7 @@ pub const REDS: &[Red] = &[
         claim: "the projection orders two writes by the log, not by the wall clock",
         why: "grant_to_row stamps every row with now_micros() (ferrosa-schema/src/system/persistence.rs:417-432) and PermissionRevoked stamps its tombstone the same way (ferrosa-cluster/src/system_table_writer.rs:164-181), and reconcile_ref gives an equal-timestamp tie to the tombstone (ferrosa-common/src/complex_cell.rs:65-75). Within one entry the pair that needed a tie is gone after 1a89858a — one mutation per entry (state_machine.rs:1892-1939) — but across entries the order of two rows is the wall clock's, not the log's: a revoke to empty followed by a re-grant in the next entry is masked if the second now_micros() is equal to or behind the first, which nothing prevents because SystemTime is not monotone. The row then keeps the tombstone and the role loses permissions that the state machine and every peer still hold",
         witness: "Raft.a_tie_goes_to_the_tombstone",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "raft_obligations__the_staged_copy_leaves_no_trace_until_it_publishes",
@@ -319,6 +372,7 @@ pub const REDS: &[Red] = &[
         claim: "the staged copy leaves no trace until it publishes",
         why: "staged_apply clones the metadata but shares the schema, engine and system-writer handles, so the physical transition is visible on the blocking thread while the published index still points at the previous entry",
         witness: "Raft.shared_exposes_effects_before_publication",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "sparql_semantics__optional_scoping_is_specified",
@@ -326,6 +380,7 @@ pub const REDS: &[Red] = &[
         claim: "OPTIONAL scoping is specified",
         why: "`{A OPTIONAL {B FILTER(c)}}` and `{A OPTIONAL {B} FILTER(c)}` differ; the plan types carry no representation of the distinction",
         witness: "none (not modelled)",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "sparql_semantics__p_returns_each_pair_once",
@@ -333,6 +388,7 @@ pub const REDS: &[Red] = &[
         claim: "`p+` returns each pair once",
         why: "expansion follows every path; a cycle yields one row per path, not per pair, and a self-loop only terminates because of the fuel bound",
         witness: "Sparql.closure_without_a_visited_set_duplicates_pairs",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "sparql_semantics__rdf_star_terms_are_distinct_from_iris_in_the_store",
@@ -340,6 +396,7 @@ pub const REDS: &[Red] = &[
         claim: "RDF-star terms are distinct from IRIs in the store",
         why: "the natural numeric encoding of a quoted triple aliases with an IRI, so a lookup returns rows it must not",
         witness: "Sparql.encoding_is_not_injective",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "sql_consistency__the_coordinator_enforces_the_per_datacenter_requirement_for_every_write_not_a_total",
@@ -347,6 +404,7 @@ pub const REDS: &[Red] = &[
         claim: "the coordinator enforces the per-datacenter requirement for every write, not a total",
         why: "row writes delegate to dc_quorum::progress, but the truncate path at write.rs:753 counts a bare total: five acks in the primary and none in the secondary satisfies it on {5,3}",
         witness: "Consistency.a_total_count_can_hide_a_missing_datacenter",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "sql_consistency__the_write_path_captures_a_transaction_s_read_set_and_validates_it_before_committing",
@@ -354,6 +412,7 @@ pub const REDS: &[Red] = &[
         claim: "the write path captures a transaction's read set and validates it before committing",
         why: "no read set is captured and no validation runs: dc_quorum compares acknowledgement counts only, so a write skew commits and no exception is raised",
         witness: "Consistency.the_last_writer_is_the_one_told_to_retry",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "sql_index__index_and_table_cannot_diverge",
@@ -361,6 +420,7 @@ pub const REDS: &[Red] = &[
         claim: "index and table cannot diverge",
         why: "only if the index write is inside the same atomic boundary as the row write; today maintenance is a separate step",
         witness: "Index.a_non_atomic_index_write_is_inconsistent",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "sql_semantics__a_multi_statement_transaction_is_atomic",
@@ -368,6 +428,7 @@ pub const REDS: &[Red] = &[
         claim: "a multi-statement transaction is atomic",
         why: "statements execute independently; a crash leaves a strict prefix, and the surface still answers BEGIN/COMMIT with InTransaction",
         witness: "Sql.commit_is_not_atomic_across_statements",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "sql_semantics__aggregates_follow_sql_s_empty_set_rules",
@@ -375,6 +436,7 @@ pub const REDS: &[Red] = &[
         claim: "aggregates follow SQL's empty-set rules",
         why: "SUM over no rows must be NULL; an accumulator that starts at 0 returns 0",
         witness: "Sql.sum_of_no_rows_is_null_not_zero",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "sql_semantics__three_valued_logic_is_preserved",
@@ -382,6 +444,7 @@ pub const REDS: &[Red] = &[
         claim: "three-valued logic is preserved",
         why: "a naive `<>` admission of NULL rows; the two agree whenever no NULL is involved, which hides it",
         witness: "Sql.null_passes_a_naive_not_equal",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "sql_txn__serializable_isolation_is_available",
@@ -389,6 +452,7 @@ pub const REDS: &[Red] = &[
         claim: "SERIALIZABLE isolation is available",
         why: "requires the read set: SSI or Accord dependency tracking. Neither is wired to the SQL surface, and SNAPSHOT alone admits write skew",
         witness: "Txn.serializable_requires_the_read_set",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "sql_txn__the_commit_decision_is_durable_before_the_acknowledgement",
@@ -396,6 +460,15 @@ pub const REDS: &[Red] = &[
         claim: "the commit decision is durable before the acknowledgement",
         why: "needs the commit record to be synced before ack; the premise is the same one Storage.Recovery.acked_survives_crash names for data records",
         witness: "none (ordering obligation)",
+        claim_kind: ClaimKind::Design,
+    },
+    Red {
+        name: "storage_format__a_corrupt_trie_block_is_detected",
+        module: "Ferrosa.Storage.Format",
+        claim: "a corrupt trie block is detected",
+        why: "checksums cover Data.db only (ferrosa-sstable/src/checksum.rs:1-6, Digest.crc32/CRC.db); no crc or checksum exists in src/trie/, partition_index.rs or row_index.rs, so trie damage is silent",
+        witness: "Format.corrupt_trie_block_is_detected",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "storage_format__a_flush_can_resume_at_the_last_verified_record",
@@ -403,6 +476,15 @@ pub const REDS: &[Red] = &[
         claim: "a flush can resume at the last verified record",
         why: "nothing in the layout prevents it — no record points forward — but the writer has no resume path yet",
         witness: "none (implementation item)",
+        claim_kind: ClaimKind::Design,
+    },
+    Red {
+        name: "storage_format__a_local_deletion_time_cannot_wrap",
+        module: "Ferrosa.Storage.Format",
+        claim: "a local deletion time cannot wrap",
+        why: "the cell's local deletion time is an i32 (ferrosa-common/src/cell.rs:52) whose sentinel NO_DELETION_TIME is i32::MAX (cell.rs:30); a TTL past 2038 saturates to that sentinel, so the cell never expires rather than wrapping (ferrosa-row-bridge/src/row.rs:846-848), and decode uses wrapping_add (ferrosa-sstable/src/data.rs:1113,1531,1801). Only partition/row DeletionTime is u32",
+        witness: "Format.i32_ldt_wraps_where_u64_does_not",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "storage_format__a_table_can_be_exported_to_bti_for_cassandra_by_compaction",
@@ -410,6 +492,31 @@ pub const REDS: &[Red] = &[
         claim: "a table can be exported to BTI for Cassandra by compaction",
         why: "requires SSTableWriter to select a format per table; today the writer is BTI-only",
         witness: "none (implementation item)",
+        claim_kind: ClaimKind::Design,
+    },
+    Red {
+        name: "storage_format__a_wrong_or_corrupt_trie_can_never_return_a_wrong_value",
+        module: "Ferrosa.Storage.Format",
+        claim: "a wrong or corrupt trie can never return a wrong value",
+        why: "the seek verifies only (h2 & 0xFF) as one byte (ferrosa-sstable/src/partition_index.rs:116-122) and the reader decodes whatever partition sits at that offset without comparing the requested key (ferrosa-sstable/src/reader.rs:993-1017); the merge then adopts that partition's key (ferrosa-storage/src/merge.rs:60), so a corrupt Partitions.db returns another key's rows",
+        witness: "Format.trie_cannot_produce_a_wrong_value",
+        claim_kind: ClaimKind::Design,
+    },
+    Red {
+        name: "storage_format__an_absent_footer_is_a_recoverable_state_not_a_failure",
+        module: "Ferrosa.Storage.Format",
+        claim: "an absent footer is a recoverable state, not a failure",
+        why: "a partition index shorter than FOOTER_SIZE is refused outright (ferrosa-sstable/src/partition_index.rs:60-72, InvalidFormat \"partition index file too small for footer\") and a generation without Partitions.db or Rows.db is unopenable (ferrosa-storage/src/engine.rs:13555-13568)",
+        witness: "Format.absent_footer_is_recoverable",
+        claim_kind: ClaimKind::Design,
+    },
+    Red {
+        name: "storage_format__one_damaged_byte_costs_one_record",
+        module: "Ferrosa.Storage.Format",
+        claim: "one damaged byte costs one record",
+        why: "a mid-read decode error is recorded as CorruptSstableId and the whole generation is quarantined after retries (ferrosa-storage/src/store.rs:4556-4580, :3954-3990), and salvage abandons the header walk at the first bad header (ferrosa-sstable/src/reader.rs:1347-1361, \"later partitions not attempted\"). The cost is the file's tail, not one record",
+        witness: "Format.corruption_stops_the_scan",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "storage_format__record_crcs_cost_less_than_5_of_point_read_p99",
@@ -417,6 +524,15 @@ pub const REDS: &[Red] = &[
         claim: "record CRCs cost less than 5% of point-read p99",
         why: "a measurement, not a theorem: the CRC is over bytes already in the read buffer, but the budget must be measured against BTI on the same data",
         witness: "none (measurement gate, ADR-022)",
+        claim_kind: ClaimKind::Design,
+    },
+    Red {
+        name: "storage_format__the_index_is_a_speed_up_not_an_authority",
+        module: "Ferrosa.Storage.Format",
+        claim: "the index is a speed-up, not an authority",
+        why: "same defect as the trie row: index damage changes the answer rather than the latency, because one hash byte and no key-equality check decide which partition is decoded (ferrosa-sstable/src/partition_index.rs:116-122, ferrosa-sstable/src/reader.rs:993-1017)",
+        witness: "Format.trie_answer_agrees_with_the_scan",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "storage_mvcc__a_snapshot_lookup_can_stop_at_the_first_file_holding_the_key",
@@ -424,6 +540,7 @@ pub const REDS: &[Red] = &[
         claim: "a snapshot lookup can stop at the first file holding the key",
         why: "false, and that is the cost driver: the newest file's version may be invisible to the snapshot, so every file holding a version must be consulted. One probe per SSTable in the view is the real bound",
         witness: "Mvcc.a_version_per_file_is_not_a_constant_read",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "storage_mvcc__compaction_carries_the_spill_pointer_forward",
@@ -431,6 +548,7 @@ pub const REDS: &[Red] = &[
         claim: "compaction carries the spill pointer forward",
         why: "nothing carries it yet: a compaction that rewrites the record drops the pointer and every version behind it becomes unreachable, indistinguishable from a version that never existed",
         witness: "Mvcc.spilled_versions_are_lost_if_compaction_drops_the_pointer",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "storage_mvcc__the_write_path_records_a_predicate_lock_for_every_read_it_takes",
@@ -438,6 +556,7 @@ pub const REDS: &[Red] = &[
         claim: "the write path records a predicate lock for every read it takes",
         why: "no locks are recorded: the read path takes no tag, so a concurrent write sees nothing to conflict with",
         witness: "Mvcc.a_tag_table_is_the_read_sets_indexed_by_row",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "storage_mvcc__vacuum_runs_asynchronously_after_the_committing_transaction_completes_off_the_write_path",
@@ -445,6 +564,7 @@ pub const REDS: &[Red] = &[
         claim: "vacuum runs asynchronously after the committing transaction completes, off the write path",
         why: "no vacuum exists: nothing advances the floor, no reference counts are held, and no background process runs",
         witness: "Mvcc.a_vacuum_step_is_one_decrement",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "storage_mvcc__versions_are_stored_in_the_fnf_record_so_the_probe_stays_constant",
@@ -452,6 +572,7 @@ pub const REDS: &[Red] = &[
         claim: "versions are stored in the fnf record so the probe stays constant",
         why: "the cell format holds one value per column; an in-record chain bounded by chainBound is designed here but not implemented",
         witness: "Mvcc.in_record_versions_keep_the_probe_constant",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "storage_recovery__a_corrupted_payload_is_detected",
@@ -459,6 +580,7 @@ pub const REDS: &[Red] = &[
         claim: "a corrupted payload is detected",
         why: "the record format has no checksum: lengths catch truncation, nothing catches a bit flip in a payload",
         witness: "Recovery.no_checksum_detects_only_truncation",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "storage_recovery__corruption_is_quarantined_never_deleted",
@@ -466,6 +588,7 @@ pub const REDS: &[Red] = &[
         claim: "corruption is quarantined, never deleted",
         why: "the action is not modelled in the engine; only the policy table is specified here, and delete/ignore lose the data",
         witness: "Recovery.only_quarantine_preserves_data",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "storage_recovery__replay_is_idempotent",
@@ -473,6 +596,7 @@ pub const REDS: &[Red] = &[
         claim: "replay is idempotent",
         why: "put/del are idempotent but inc is not, and a zero mutation_id is never deduplicated, so a legacy segment with counters double-applies",
         witness: "Recovery.zero_id_replay_duplicates_a_nonidempotent_mutation",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "storage_streaming__a_decoded_chunk_is_written_into_a_caller_supplied_buffer_rather_than_returned_as_a_new_vec",
@@ -480,6 +604,7 @@ pub const REDS: &[Red] = &[
         claim: "a decoded chunk is written into a caller-supplied buffer rather than returned as a new Vec",
         why: "compression.rs decompress takes the uncompressed length and ignores it, returning a fresh Vec per chunk: one allocation and one copy for every byte read",
         witness: "Streaming.a_per_chunk_decoder_copies_the_whole_input",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "storage_streaming__a_slow_client_cannot_grow_the_coordinator_s_memory",
@@ -487,6 +612,7 @@ pub const REDS: &[Red] = &[
         claim: "a slow client cannot grow the coordinator's memory",
         why: "encode_rows_with_writer returns one BytesMut for the whole page and the write happens after, so occupancy is the entire response: a slow client parks all of it in the coordinator",
         witness: "Streaming.without_flow_control_occupancy_follows_the_producer",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "storage_streaming__acks_are_coalesced_so_a_high_latency_pipe_is_not_ack_starved",
@@ -494,6 +620,7 @@ pub const REDS: &[Red] = &[
         claim: "acks are coalesced so a high-latency pipe is not ack-starved",
         why: "TCP_NODELAY exists only as c38add89, which is not on main, and it coalesces nothing: replies are still several small writes, so main pays ~46 ms per statement over a real network",
         witness: "Streaming.one_ack_per_packet_starves_a_high_latency_pipe",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "storage_streaming__buffer_memory_is_one_shared_pool_sized_by_a_shared_memory_setting",
@@ -501,6 +628,7 @@ pub const REDS: &[Red] = &[
         claim: "buffer memory is one shared pool sized by a shared_memory setting",
         why: "there is no shared pool and no such setting: each response allocates its own BytesMut, so memory is per-connection and grows with concurrency rather than being scheduled",
         witness: "Streaming.the_pool_is_never_overcommitted",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "storage_streaming__the_row_buffer_is_never_built_as_vec_vec_option_cqlvalue_on_the_scan_path",
@@ -508,6 +636,7 @@ pub const REDS: &[Red] = &[
         claim: "the row buffer is never built as Vec<Vec<Option<CqlValue>>> on the scan path",
         why: "the response encoder visits rows one at a time, but the scan side accumulates up to a full page before the encoder is called",
         witness: "Streaming.materialising_grows_with_the_input",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "storage_streaming__the_scan_s_page_bound_is_a_bound_in_bytes",
@@ -515,6 +644,7 @@ pub const REDS: &[Red] = &[
         claim: "the scan's page bound is a bound in bytes",
         why: "it is a bound in rows: DEFAULT_SCAN_PAGE_SIZE is 5000, which is 5 MB of narrow rows and 5 GB of 1 MiB rows on the same coordinator",
         witness: "Streaming.a_row_count_page_bound_is_not_a_memory_bound",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "storage_tombstone__a_local_deletion_time_is_representable_for_every_valid_ttl",
@@ -522,6 +652,7 @@ pub const REDS: &[Red] = &[
         claim: "a local deletion time is representable for every valid TTL",
         why: "cell ldt is an i32: any TTL pushing it past 2^31 seconds wraps negative and reads as already expired; a ~12-year TTL from today is enough",
         witness: "Tombstone.ldt_overflows_before_2038_reachable_now",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "storage_tombstone__deleted_data_cannot_be_resurrected",
@@ -529,6 +660,7 @@ pub const REDS: &[Red] = &[
         claim: "deleted data cannot be resurrected",
         why: "dominance holds in any order, but the purge path does not check either condition, so today the property rests on there being no purge at all. Purging before propagation resurrects",
         witness: "Tombstone.purge_before_propagation_resurrects",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "storage_tombstone__the_merge_is_order_independent",
@@ -536,6 +668,7 @@ pub const REDS: &[Red] = &[
         claim: "the merge is order-independent",
         why: "commutativity is checked on the colliding cases, not proved in general; the general statement needs a total order on (ts, tombstone, value)",
         witness: "Tombstone.ts_only_merge_does_not_converge",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "storage_tombstone__the_purge_path_checks_the_grace_window_and_propagation_before_removing_a_tombstone",
@@ -543,6 +676,7 @@ pub const REDS: &[Red] = &[
         claim: "the purge path checks the grace window and propagation before removing a tombstone",
         why: "gc_grace is a display default with no purge path behind it, so the precondition is never checked",
         witness: "Tombstone.purge_requires_all_replicas_applied",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "streaming_audit__a_node_admits_memory_bearing_work_through_one_permit",
@@ -550,6 +684,7 @@ pub const REDS: &[Red] = &[
         claim: "a node admits memory-bearing work through one permit",
         why: "no such guarantee: there are three independent limits (cql/connection.rs:391, cql/result_cursor.rs:513, postgres/portal_limits.rs:221) and no shared pool, and raft's `physical_apply.rs:45 admit` counts active jobs without limiting them, so the node's bound is their sum",
         witness: "Streaming.pool_limits_add",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "streaming_audit__a_pitr_rewrap_publishes_a_new_version_atomically",
@@ -557,6 +692,7 @@ pub const REDS: &[Red] = &[
         claim: "a PITR rewrap publishes a new version atomically",
         why: "no such operator exists: the only PITR path in the tree is `run_pitr_replay_e2e` (storage/engine.rs:26579), a replay test, so there is no transform to hold to the precondition",
         witness: "Streaming.a_successful_transform_publishes_one_entry",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "streaming_audit__a_snapshot_build_does_not_copy_its_payload_once_per_publisher",
@@ -564,6 +700,7 @@ pub const REDS: &[Red] = &[
         claim: "a snapshot build does not copy its payload once per publisher",
         why: "`build_snapshot` clones the whole state (state_machine.rs:2533), encodes it (2546), then clones the bytes for the publish slot (2567) and again for the disk job (2571): three copies of cluster state live at once",
         witness: "Streaming.no_constant_bounds_a_materialising_reader",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "streaming_audit__a_snapshot_restore_does_not_read_the_whole_artifact_into_memory",
@@ -571,6 +708,7 @@ pub const REDS: &[Red] = &[
         claim: "a snapshot restore does not read the whole artifact into memory",
         why: "`recover_from_persisted_snapshot` does `std::fs::read(&path)` and then `bincode::deserialize` (raft/state_machine.rs:1376), holding the file and the decoded value together with no streaming apply",
         witness: "Streaming.no_constant_bounds_a_materialising_reader",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "streaming_audit__a_spill_reserves_disk_space_before_it_writes",
@@ -578,6 +716,7 @@ pub const REDS: &[Red] = &[
         claim: "a spill reserves disk space before it writes",
         why: "no such guarantee: `reserve_query_temp_table` (storage/engine.rs:5305) creates the directory and returns a guard, and the only free-space check in the engine is `check_write_admission` (:3354) on the write path, so a spill discovers ENOSPC inside the merge",
         witness: "Streaming.an_unadmitted_spill_fails_midway",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "streaming_audit__a_spilling_sort_s_input_is_not_already_a_vector_of_every_row",
@@ -585,6 +724,7 @@ pub const REDS: &[Red] = &[
         claim: "a spilling sort's input is not already a vector of every row",
         why: "variable-length path expansion pushes one row per path into `rows` (graph/executor/varpath.rs:437) and only then sorts, spilling or not (varpath.rs:445-451); the spill bounds the sort buffer, not the input",
         witness: "Streaming.a_reordering_stage_without_spill_is_proportional",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "streaming_audit__a_system_table_load_does_not_hold_the_whole_table",
@@ -592,6 +732,7 @@ pub const REDS: &[Red] = &[
         claim: "a system-table load does not hold the whole table",
         why: "the loader walks partitions one at a time and pushes every one: `roles.push` at system_table_loader.rs:172 and `grants.push` at :370, which is unbounded in the number of roles and grants",
         witness: "Streaming.no_constant_bounds_a_materialising_reader",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "streaming_audit__an_operator_that_spills_does_not_re_collect_its_result",
@@ -599,6 +740,7 @@ pub const REDS: &[Red] = &[
         claim: "an operator that spills does not re-collect its result",
         why: "the graph ORDER BY spills correctly and then collects every merged row back with `Vec::with_capacity(rows_pushed)` (graph/executor/spill.rs:242), so peak memory is the result set and the temp-sort threshold bounds nothing",
         witness: "Streaming.a_collected_result_defeats_the_bound",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "streaming_audit__an_order_by_that_cannot_spill_refuses_instead_of_sorting_in_memory",
@@ -606,6 +748,7 @@ pub const REDS: &[Red] = &[
         claim: "an ORDER BY that cannot spill refuses instead of sorting in memory",
         why: "the graph sink returns None when an order term is not a projected column (graph/executor/spill.rs:200-202) and the caller then sorts the whole accumulated vector in memory (varpath.rs:450), so an eligibility check silently widens the bound",
         witness: "Streaming.a_spill_nothing_calls_is_not_a_bound",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "streaming_audit__blocking_work_is_queued_against_a_capacity",
@@ -613,6 +756,7 @@ pub const REDS: &[Red] = &[
         claim: "blocking work is queued against a capacity",
         why: "`spawn_blocking` submits to tokio's blocking pool (common/task_pool.rs:60) whose queue has no capacity, and a queued closure keeps its owned payload — the snapshot bytes cloned at state_machine.rs:2571 sit in that queue",
         witness: "Streaming.an_unbounded_queue_is_the_leak",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "streaming_audit__no_durable_artifact_changes_under_a_reader",
@@ -620,6 +764,7 @@ pub const REDS: &[Red] = &[
         claim: "no durable artifact changes under a reader",
         why: "the commit-log sync marker is rewritten in place: `repair_marker_in_place` pwrites 8 bytes below the flush watermark into a region the previous flush already made durable (segment.rs:231-247, reached at :898 and :931), so a reader of the open segment can see the same offset change from EOF to the next section",
         witness: "Streaming.a_pinned_view_changes_under_an_in_place_edit",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "streaming_audit__orphaned_spill_directories_are_reconciled_at_startup",
@@ -627,6 +772,7 @@ pub const REDS: &[Red] = &[
         claim: "orphaned spill directories are reconciled at startup",
         why: "no such guarantee for the engine's roots: `sweep_orphans_once` (sql/spill.rs:475) covers only `$FERROSA_SQL_TEMP_DIR`, and reservations under `<data_dir>/tmp_order_by_sort` and `tmp_distinct` rely on `Drop`, so a crash leaves them until the disk fills",
         witness: "Streaming.reconciliation_clears_orphans",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "streaming_audit__spill_files_land_on_a_filesystem_that_is_not_memory",
@@ -634,6 +780,7 @@ pub const REDS: &[Red] = &[
         claim: "spill files land on a filesystem that is not memory",
         why: "no such guarantee: `default_temp_root` is the system temp directory (sql/spill.rs:466-471) and nothing checks whether it is tmpfs, so on a node with a memory-backed /tmp the spill threshold is a RAM threshold",
         witness: "Streaming.a_spill_to_tmpfs_stays_in_memory",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "streaming_audit__the_spill_threshold_is_the_process_bound_not_each_operator_s_share_of_it",
@@ -641,6 +788,7 @@ pub const REDS: &[Red] = &[
         claim: "the spill threshold is the process bound, not each operator's share of it",
         why: "`SpillCtx::default()` is built per call (sql/plan.rs:255, postgres/result_stream.rs:211) at `process_spill_threshold_bytes()`, which is half the detected budget (storage/spill_budget.rs:232) with no divisor for concurrency, so three operators hold one and a half budgets",
         witness: "Streaming.per_operator_thresholds_multiply",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "systemtables_projection__a_cell_re_granted_after_a_full_revoke_is_visible_again",
@@ -648,6 +796,7 @@ pub const REDS: &[Red] = &[
         claim: "a cell re-granted after a full revoke is visible again",
         why: "PermissionRevoked writes a row-level deletion (ferrosa-cluster/src/system_table_writer.rs:164-181) and load_role_permissions skips every row whose merged deletion is not live (ferrosa-cluster/src/system_table_loader.rs:333-335). merge_rows_into keeps the maximum deletion and merge_into_existing_row only raises it (ferrosa-storage/src/merge.rs:137-143, ferrosa-storage/src/memtable/sharded.rs:549), so a later live write never clears the marker; only a compaction purge after gc_grace drops it (ferrosa-storage/src/compaction/purge.rs:119-153). A revoke followed by a grant inside that window is lost on the next boot, and the direct DDL path writes the same tombstone for a partial revoke while its in-memory schema keeps the remainder (ferrosa-cluster/src/ddl_path.rs:444-467), so single-node mode loses the remaining permissions the same way",
         witness: "SystemTables.absorbing_tombstone_buries_a_later_grant",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "systemtables_projection__a_cell_s_persisted_row_converges_to_its_in_memory_value_under_the_code_s_merge_rule",
@@ -655,6 +804,7 @@ pub const REDS: &[Red] = &[
         claim: "a cell's persisted row converges to its in-memory value under the code's merge rule",
         why: "there is no sequence or generation column: grant_to_row stamps now_micros() (ferrosa-schema/src/system/persistence.rs:417-432) and PermissionRevoked does the same (ferrosa-cluster/src/system_table_writer.rs:164-181), while cell_supersedes orders an equal timestamp by the greater payload (ferrosa-storage/src/merge.rs:177-190), and that payload is serde_json of a HashSet-derived Vec (persistence.rs:421-423), so its order is the hash order. Two live writes to one cell in one microsecond can therefore resolve to the earlier write, so a restart reads back a permission set the state machine no longer holds. One apply emits at most one write per cell (state_machine.rs:1883-1947), but two applies can share a microsecond and the projection has nothing else to order them by",
         witness: "SystemTables.tsOnly_tie_fails_convergence",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "systemtables_projection__a_revoked_permission_is_not_resurrected_by_an_equal_timestamp_write",
@@ -662,6 +812,7 @@ pub const REDS: &[Red] = &[
         claim: "a revoked permission is not resurrected by an equal-timestamp write",
         why: "the later revoke writes the remaining set and the earlier grant wrote the larger set; at an equal timestamp cell_supersedes keeps the greater payload (ferrosa-storage/src/merge.rs:177-190), which can be the earlier one because the payload's order is the set's hash order (ferrosa-schema/src/system/persistence.rs:421-423), so the removed permission is present again after a restart and the role's authorization answers change with nothing logged and nothing failing",
         witness: "SystemTables.tsOnly_tie_resurrects_a_revoked_permission",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "systemtables_projection__a_timestamp_with_a_per_cell_sequence_converges_for_every_clock",
@@ -669,6 +820,7 @@ pub const REDS: &[Red] = &[
         claim: "a timestamp with a per-cell sequence converges for every clock",
         why: "timestampSeq still compares the timestamp first, so a later write whose now_micros() is smaller than the write it supersedes loses to it. SystemTime is not monotone (an NTP step, a suspended VM, two nodes' clocks), and nothing on the projection path derives the timestamp from the Raft log index, so a later apply can carry an earlier timestamp and a restart then restores the superseded value",
         witness: "SystemTables.timestampSeq_needs_a_monotone_clock",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "systemtables_projection__convergence_does_not_rest_on_a_caller_convention",
@@ -676,6 +828,7 @@ pub const REDS: &[Red] = &[
         claim: "convergence does not rest on a caller convention",
         why: "the apply arms happen to emit one mutation per cell (state_machine.rs:1883-1947), which is a property of three match arms, not of the projection: system_table_writer.rs has no per-cell guard or version, and REVOKE emits one Raft operation per permission (ferrosa-cql/src/router.rs:14140-14167), so one statement writes the same cell in consecutive applies. A new mutation kind that emits two writes for a cell re-opens the tie, and the convention does not help a clock that goes backwards",
         witness: "SystemTables.one_per_apply_is_insufficient",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "systemtables_projection__the_write_path_and_the_read_path_agree_on_an_equal_timestamp_tie",
@@ -683,6 +836,7 @@ pub const REDS: &[Red] = &[
         claim: "the write path and the read path agree on an equal-timestamp tie",
         why: "the memtable applies reconcile_ref, where a tombstone wins an equal-timestamp tie (ferrosa-common/src/complex_cell.rs:63-77, called from ferrosa-storage/src/memtable/sharded.rs:556-585), while the read and compaction merge applies cell_supersedes, where a live cell wins (ferrosa-storage/src/merge.rs:137-190). The same pair of versions resolves to opposite winners depending on whether the row is still in the memtable or has reached an SSTable, so the durable outcome also depends on flush timing",
         witness: "SystemTables.two_tie_rules_disagree",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "systemtables_projection__two_writes_to_one_cell_with_equal_timestamps_the_later_one_wins",
@@ -690,6 +844,7 @@ pub const REDS: &[Red] = &[
         claim: "two writes to one cell with equal timestamps: the later one wins",
         why: "with no sequence the tie is broken by the serialized payload (ferrosa-storage/src/merge.rs:177-190), not by which write the log applied later. That payload is serde_json of a HashSet-derived Vec (ferrosa-schema/src/system/persistence.rs:421-423), so its element order is the hash iteration order: a removal can lose to the set it shortened, and which side wins is not a function of the permission sets at all. The fix's structural rule (one mutation per cell per apply, state_machine.rs:1883-1947) removes the intra-apply pair but not a tie between two applies, and it does not make the order the log's",
         witness: "SystemTables.tsOnly_tie_breaks_toward_the_older_write",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "testing_histories__every_durability_run_issues_a_final_read_after_healing_and_a_final_read_that_fails_is_a_run_failure_n",
@@ -697,6 +852,7 @@ pub const REDS: &[Red] = &[
         claim: "every durability run issues a final read after healing, and a final read that fails is a run failure, not a verdict",
         why: "not implemented: no workload issues a final read, so loss is never measured; without one every acknowledged write would count as lost (specs/jepsen-evidence D8, packet JE-5)",
         witness: "Histories.a_run_without_a_final_read_loses_every_acknowledged_write",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "testing_histories__every_run_records_lost_unexpected_and_recovered_as_multisets_not_as_a_single_error_count",
@@ -704,6 +860,7 @@ pub const REDS: &[Red] = &[
         claim: "every run records lost, unexpected and recovered as multisets, not as a single error count",
         why: "not implemented: no workload in ferrosa-jepsen issues a final read or keeps an attempted/acknowledged/recovered book, so there are no lost or unexpected multisets to preserve; a run reports conservation and linearizability verdicts, and the alert summarises those as pass/fail/inconclusive (specs/jepsen-evidence D7, packet JE-5)",
         witness: "Histories.a_loss_and_a_fabrication_do_not_cancel",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "testing_histories__every_run_separates_recovered_indeterminate_writes_from_fabricated_values_and_only_fabrication_refute",
@@ -711,6 +868,7 @@ pub const REDS: &[Red] = &[
         claim: "every run separates recovered indeterminate writes from fabricated values, and only fabrication refutes",
         why: "not implemented: no workload records which writes ended without a definite answer, so a timed-out write that landed cannot be told from a fabrication (specs/jepsen-evidence D7, packet JE-5)",
         witness: "Histories.a_timed_out_write_that_landed_is_not_fabricated",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "testing_jepsen__the_checker_runs_elle_with_read_only_transactions_in_the_graph",
@@ -718,6 +876,7 @@ pub const REDS: &[Red] = &[
         claim: "the checker runs Elle with read-only transactions in the graph",
         why: "not run: the in-process checker `checker::strict_serializable` keeps read-only transactions, and its test `a_read_only_transaction_can_carry_the_only_cycle` rejects this file's history; but neither it nor Elle is invoked on a suite run, so no run's verdict depends on it",
         witness: "Jepsen.a_read_only_transaction_can_carry_the_only_cycle",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "testing_jepsen__the_jepsen_suite_asserts_strict_serializability_for_multi_key_transactions",
@@ -725,6 +884,7 @@ pub const REDS: &[Red] = &[
         claim: "the Jepsen suite asserts strict serializability for multi-key transactions",
         why: "not true: no transactional checker runs on a CQL run. `UnifiedChecker::check_all` leaves Elle unset, and `checker::strict_serializable` is called only by the Postgres integration test, so multi-key workloads such as `bank` are judged by `check_invariant` (conservation) alone. A green multi-key run does not establish strict serializability. Wiring a checker is not enough on its own: a SELECT inside a CQL transaction reads committed state outside Accord and COMMIT discards the transaction's reads, so no client can observe a multi-key read-only transaction, which is the shape this row's witness needs (specs/jepsen-evidence D5, packet JE-9)",
         witness: "Jepsen.a_read_only_transaction_can_carry_the_only_cycle",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "testing_jepsenmodels__jepsen_s_generators_nemeses_and_stats_assertions_are_ported",
@@ -732,6 +892,7 @@ pub const REDS: &[Red] = &[
         claim: "Jepsen's generators, nemeses and stats assertions are ported",
         why: "out of scope by decision: generators produce histories, nemeses inject faults, and the stats/plot tests assert reporting. None of them are correctness predicates on a history, so porting them would not strengthen the checker",
         witness: "Models.the_queue_models_differ_on_the_same_history",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "testing_jepsenmodels__the_set_full_and_unique_ids_models_are_ported",
@@ -739,6 +900,7 @@ pub const REDS: &[Red] = &[
         claim: "the set-full and unique-ids models are ported",
         why: "not ported: set-full counts recovered/acknowledged/ok attempts, and unique-ids checks that every requested id is present; both need the multiset bookkeeping in checker_test.clj, not just a verdict",
         witness: "Models.the_queue_models_differ_on_the_same_history",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "testing_jepsenmodels__the_set_model_is_ported_including_its_multi_value_reads",
@@ -746,6 +908,7 @@ pub const REDS: &[Red] = &[
         claim: "the set model is ported, including its multi-value reads",
         why: "not ported: a set read observes a whole set, so the observation type is not a single Nat. Modelling it needs a set-valued observation and a multiset comparison, which is a different checker shape from the register-shaped ones here",
         witness: "Models.the_queue_models_differ_on_the_same_history",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "unsafe_invariants__every_unsafe_site_in_docs_unsafe_ledger_md_is_discharged_by_a_kani_harness_not_by_review",
@@ -753,6 +916,7 @@ pub const REDS: &[Red] = &[
         claim: "every `unsafe` site in `docs/unsafe-ledger.md` is discharged by a Kani harness, not by review",
         why: "not implemented: no Kani integration exists. Kani is the only reachable tool that reasons about raw pointers, allocation layouts and uninitialised memory in actual MIR, but it is bounded — a green harness proves the property to a bound, and the bound has to be argued in the harness comment. This is the gap that review currently covers",
         witness: "Unsafe.a_block_freed_with_a_different_layout_corrupts_the_heap",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "unsafe_invariants__the_aeneas_separation_logic_route_to_proving_unsafe_is_not_available_yet",
@@ -760,6 +924,7 @@ pub const REDS: &[Red] = &[
         claim: "the Aeneas/separation-logic route to proving `unsafe` is not available yet",
         why: "not available: Aeneas documents `unsafe` and concurrency as unsupported pending an ongoing separation-logic extension. RefinedRust and RustBelt are research prototypes outside this toolchain. Until that lands, the trusted base for `unsafe` is: this specification, Kani to a bound, Miri on executed paths, and hand audit",
         witness: "Unsafe.a_reference_used_past_its_owner_is_invalid",
+        claim_kind: ClaimKind::Design,
     },
     Red {
         name: "unsafe_invariants__the_truncation_contract_is_enforced_in_the_safe_rename_gc_paths_where_it_can_be_proved",
@@ -767,5 +932,6 @@ pub const REDS: &[Red] = &[
         claim: "the truncation contract is enforced in the safe rename/GC paths, where it can be proved",
         why: "not established: the invariant is stated and the seven mmap sites inherit it, but nothing prevents a truncate-while-mapped. It lives in safe code, so it is reachable by model or by Kani without touching `unsafe` — this is the cheapest of the open items",
         witness: "Unsafe.a_truncation_below_a_mapping_makes_the_tail_unreadable",
+        claim_kind: ClaimKind::Design,
     },
 ];

@@ -742,19 +742,29 @@ def ledger : List SpecItem := [
   ⟨"a torn file yields a verified prefix",
    .met "Format.scan_is_a_prefix"⟩,
   ⟨"one damaged byte costs one record",
-   .met "Format.corruption_stops_the_scan"⟩,
+   .failing
+     "a mid-read decode error is recorded as CorruptSstableId and the whole generation is quarantined after retries (ferrosa-storage/src/store.rs:4556-4580, :3954-3990), and salvage abandons the header walk at the first bad header (ferrosa-sstable/src/reader.rs:1347-1361, \"later partitions not attempted\"). The cost is the file's tail, not one record"
+     "Format.corruption_stops_the_scan"⟩,
   ⟨"data is readable without the index",
    .met "Format.scan_finds_every_verified_frame"⟩,
   ⟨"a wrong or corrupt trie can never return a wrong value",
-   .met "Format.trie_cannot_produce_a_wrong_value"⟩,
+   .failing
+     "the seek verifies only (h2 & 0xFF) as one byte (ferrosa-sstable/src/partition_index.rs:116-122) and the reader decodes whatever partition sits at that offset without comparing the requested key (ferrosa-sstable/src/reader.rs:993-1017); the merge then adopts that partition's key (ferrosa-storage/src/merge.rs:60), so a corrupt Partitions.db returns another key's rows"
+     "Format.trie_cannot_produce_a_wrong_value"⟩,
   ⟨"the index is a speed-up, not an authority",
-   .met "Format.trie_answer_agrees_with_the_scan"⟩,
+   .failing
+     "same defect as the trie row: index damage changes the answer rather than the latency, because one hash byte and no key-equality check decide which partition is decoded (ferrosa-sstable/src/partition_index.rs:116-122, ferrosa-sstable/src/reader.rs:993-1017)"
+     "Format.trie_answer_agrees_with_the_scan"⟩,
   ⟨"the fast path reads at most one record",
    .met "Format.trie_reads_at_most_one_record"⟩,
   ⟨"a corrupt trie block is detected",
-   .met "Format.corrupt_trie_block_is_detected"⟩,
+   .failing
+     "checksums cover Data.db only (ferrosa-sstable/src/checksum.rs:1-6, Digest.crc32/CRC.db); no crc or checksum exists in src/trie/, partition_index.rs or row_index.rs, so trie damage is silent"
+     "Format.corrupt_trie_block_is_detected"⟩,
   ⟨"an absent footer is a recoverable state, not a failure",
-   .met "Format.absent_footer_is_recoverable"⟩,
+   .failing
+     "a partition index shorter than FOOTER_SIZE is refused outright (ferrosa-sstable/src/partition_index.rs:60-72, InvalidFormat \"partition index file too small for footer\") and a generation without Partitions.db or Rows.db is unopenable (ferrosa-storage/src/engine.rs:13555-13568)"
+     "Format.absent_footer_is_recoverable"⟩,
   ⟨"a footer count that disagrees with the data is not trusted",
    .met "Format.count_mismatch_downgrades_to_recoverable"⟩,
   ⟨"a projection costs one deref per projected column",
@@ -762,7 +772,9 @@ def ledger : List SpecItem := [
   ⟨"corruption costs one record even during a scan",
    .met "Format.collectAt_complete"⟩,
   ⟨"a local deletion time cannot wrap",
-   .met "Format.i32_ldt_wraps_where_u64_does_not"⟩,
+   .failing
+     "the cell's local deletion time is an i32 (ferrosa-common/src/cell.rs:52) whose sentinel NO_DELETION_TIME is i32::MAX (cell.rs:30); a TTL past 2038 saturates to that sentinel, so the cell never expires rather than wrapping (ferrosa-row-bridge/src/row.rs:846-848), and decode uses wrapping_add (ferrosa-sstable/src/data.rs:1113,1531,1801). Only partition/row DeletionTime is u32"
+     "Format.i32_ldt_wraps_where_u64_does_not"⟩,
   ⟨"a cell that shares its row's timestamp costs 12 bytes, not 28",
    .met "Format.two_tier_never_costs_more"⟩,
   ⟨"the bitmap slot map is order-preserving, so slots never collide",
@@ -803,10 +815,16 @@ def ledger : List SpecItem := [
      "none (measurement gate, ADR-022)"⟩
 ]
 
-/-- Three obligations in this area are recorded red — a flush with no resume path, a BTI-to-Cassandra
-    export, and the 5% CRC budget, which is a measurement rather than a theorem. The count is pinned
-    so that none of them can be dropped from the ledger quietly. -/
-theorem format_has_three_red_items : redCount ledger = 3 := by decide
+/-- Nine obligations in this area are recorded red. Three were always red: a flush with no resume
+    path, a BTI-to-Cassandra export, and the 5% CRC budget, which is a measurement rather than a
+    theorem. Six were `.met` until the 2026-11-19 audit read them against the code and found the
+    shipping reader contradicts them: one damaged byte costs the file's tail rather than one record,
+    the trie is verified by one byte and can return another key's rows, the index is therefore an
+    authority rather than a speed-up, no checksum covers the trie at all, a footerless index is
+    unopenable rather than recoverable, and a cell's local deletion time is an i32 that saturates to
+    "never expires". The count is pinned so that none of them can leave the ledger quietly in either
+    direction. -/
+theorem format_has_nine_red_items : redCount ledger = 9 := by decide
 
 def main : IO Unit :=
   printLedger "fnf framing obligations (ADR-022)" ledger
