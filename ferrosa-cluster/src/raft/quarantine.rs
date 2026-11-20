@@ -92,6 +92,38 @@ impl RecoveryAdmission {
         self.publication_released.notify_waiters();
         epoch
     }
+    /// Clear `group`'s fault after its verified repair, at the epoch the repair
+    /// was prepared under.
+    ///
+    /// Any fault raised since then has advanced the epoch, so a stale repair
+    /// cannot reopen a gate a newer failure closed. Other groups' faults are
+    /// untouched, so admission stays closed while any of them remains.
+    pub fn release(&self, group: &str, epoch: u64) -> Result<u64, RecoveryRefusal> {
+        let mut state = self.transition.write();
+        if state.epoch != epoch {
+            return Err(RecoveryRefusal {
+                kind: RecoveryRefusalKind::EpochChanged,
+                epoch: state.epoch,
+                reason: format!("a fault was raised after {group}'s repair was prepared"),
+            });
+        }
+        if state.faults.remove(group).is_none() {
+            return Err(RecoveryRefusal {
+                kind: RecoveryRefusalKind::InvalidDrain,
+                epoch: state.epoch,
+                reason: format!("{group} holds no recovery fault to release"),
+            });
+        }
+        let reopened = Self::advance(&mut state);
+        drop(state);
+        tracing::info!(
+            group,
+            epoch = reopened,
+            "recovery fault released after verified repair"
+        );
+        self.epoch_changed.notify_waiters();
+        Ok(reopened)
+    }
     /// Register before checking state so a transition cannot be lost before
     /// suspension. Terminal epoch exhaustion also wakes; callers must recheck
     /// admission after every wake, even when the returned epoch is unchanged.
@@ -339,6 +371,45 @@ mod tests {
         })
         .await;
         assert!(gate.admits().is_err());
+    }
+
+    #[test]
+    fn a_verified_repair_releases_its_own_fault_at_its_own_epoch() {
+        let gate = RecoveryAdmission::new();
+        let closed = gate.quarantine("local-raft", "interrupted apply");
+        let reopened = gate.release("local-raft", closed).unwrap();
+        assert!(gate.admits().is_ok());
+        assert!(
+            reopened > closed,
+            "release is a transition consumers observe"
+        );
+        assert!(gate.admits_epoch(reopened).is_ok());
+    }
+
+    #[test]
+    fn a_fault_raised_after_preparation_keeps_the_gate_closed() {
+        let gate = RecoveryAdmission::new();
+        let prepared = gate.quarantine("local-raft", "interrupted apply");
+        gate.quarantine("local-raft", "a second failure during repair");
+        assert_eq!(
+            gate.release("local-raft", prepared).unwrap_err().kind,
+            RecoveryRefusalKind::EpochChanged
+        );
+        assert!(gate.admits().is_err());
+    }
+
+    #[test]
+    fn releasing_one_group_does_not_clear_another() {
+        let gate = RecoveryAdmission::new();
+        gate.quarantine("local-raft", "interrupted apply");
+        let current = gate.quarantine("other", "unrelated fault");
+        gate.release("local-raft", current).unwrap();
+        assert!(gate.reason().unwrap().contains("unrelated fault"));
+        assert!(gate.admits().is_err());
+        assert_eq!(
+            gate.release("missing", gate.epoch()).unwrap_err().kind,
+            RecoveryRefusalKind::InvalidDrain
+        );
     }
 
     #[test]

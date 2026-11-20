@@ -129,6 +129,16 @@ impl RetiredRaftGroup {
     pub fn owners(&self) -> &[RetiredRaftOwner] {
         &self.owners
     }
+
+    /// Retirement evidence for tests that exercise the journal without a Core.
+    #[cfg(test)]
+    pub(crate) fn for_test(group: RaftGroupId, owners: Vec<RetiredRaftOwner>) -> Self {
+        Self {
+            scope: uuid::Uuid::new_v4(),
+            group,
+            owners,
+        }
+    }
 }
 
 /// Only the actual SM owns this token; staged copies/builders must not clone it.
@@ -300,6 +310,73 @@ impl PhysicalRaftWorkers {
             group,
             owners: reports,
         }))
+    }
+
+    /// Lift `group`'s replacement fence once its repair is verified and durable.
+    ///
+    /// Only the retirement that fenced the group can lift it. The retired
+    /// owners have already ended and drained, so they are dropped from the
+    /// registry; the replacement owner reserved next is the group's only one.
+    pub(crate) fn finish_recovery(
+        &self,
+        group: RaftGroupId,
+        scope: uuid::Uuid,
+    ) -> Result<(), String> {
+        let mut registry = self.registry.lock();
+        Self::fenced_and_idle(&registry, group, scope)?;
+        registry.recovering.remove(&group);
+        registry.groups.retain(|owner| owner.group != group);
+        Ok(())
+    }
+
+    /// Hand `group`'s Raft log back from its retired owners, keeping the
+    /// fence up. Each owner still holds the sled tree it was bound to, and so
+    /// the directory lock; the repair has to open that log to install and
+    /// purge before it may lift the fence. Returns how many handles were
+    /// released. A later retirement of a released owner fails loudly
+    /// ("retired owner has no bound log metadata") rather than skip its check.
+    pub(crate) fn release_retired_log(
+        &self,
+        group: RaftGroupId,
+        scope: uuid::Uuid,
+    ) -> Result<usize, String> {
+        let registry = self.registry.lock();
+        Self::fenced_and_idle(&registry, group, scope)?;
+        Ok(registry
+            .groups
+            .iter()
+            .filter(|owner| owner.group == group)
+            .filter(|owner| owner.committed.lock().take().is_some())
+            .count())
+    }
+
+    /// `group` is fenced by exactly `scope` and none of its owners still runs.
+    fn fenced_and_idle(
+        registry: &Registry,
+        group: RaftGroupId,
+        scope: uuid::Uuid,
+    ) -> Result<(), String> {
+        match registry.recovering.get(&group) {
+            Some(fenced) if *fenced == scope => {}
+            Some(fenced) => {
+                return Err(format!(
+                    "Raft group {group:?} is fenced by retirement {fenced}, not {scope}"
+                ))
+            }
+            None => return Err(format!("Raft group {group:?} is not fenced for repair")),
+        }
+        let still_running = registry.groups.iter().any(|owner| {
+            owner.group == group && {
+                let activity = owner.lifecycle.activity.lock();
+                !(activity.owner_ended && activity.active == 0)
+            }
+        });
+        if still_running {
+            return Err(format!(
+                "Raft group {group:?} still has a running physical owner; refusing to unfence"
+            ));
+        }
+        Ok(())
     }
 
     /// Cancellation retains the sealed registry, every owner, and every Raft
@@ -551,6 +628,90 @@ mod tests {
             "group recovery sealed the global Pair registry"
         );
         assert!(first.lifecycle.activity.lock().owner_ended);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_verified_repair_unfences_only_its_own_retirement() {
+        let workers = Arc::new(PhysicalRaftWorkers::default());
+        let group = RaftGroupId::for_dc("repaired");
+        let first = owned_group(&workers, "repaired", 1).await;
+        let published = HashMap::from([(group, Arc::clone(&first.raft))]);
+        let retired = workers
+            .stop_group_for_recovery(group, &published)
+            .await
+            .unwrap();
+        let (fenced, _fenced_owner) = PhysicalApplyLifecycle::new_owner();
+        assert!(workers.reserve(group, fenced).is_err());
+
+        assert!(
+            workers
+                .finish_recovery(group, uuid::Uuid::new_v4())
+                .is_err(),
+            "another retirement's scope cannot unfence this group"
+        );
+        workers.finish_recovery(group, retired.scope()).unwrap();
+        let (replacement, _replacement_owner) = PhysicalApplyLifecycle::new_owner();
+        workers
+            .reserve(group, replacement)
+            .expect("the repaired group starts again");
+        assert_eq!(
+            workers
+                .registry
+                .lock()
+                .groups
+                .iter()
+                .filter(|owner| owner.group == group)
+                .count(),
+            1,
+            "the retired owner is forgotten, so a later retirement drains only the replacement"
+        );
+        assert!(
+            workers.finish_recovery(group, retired.scope()).is_err(),
+            "a repair is finished once"
+        );
+    }
+
+    /// The repair must open the group's log while the fence still stands, so
+    /// the retired owners give up their handle on it first, and only to the
+    /// retirement that fenced the group.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repair_takes_the_retired_log_handles_without_lifting_the_fence() {
+        let workers = Arc::new(PhysicalRaftWorkers::default());
+        let group = RaftGroupId::for_dc("repaired");
+        let first = owned_group(&workers, "repaired", 1).await;
+        let published = HashMap::from([(group, Arc::clone(&first.raft))]);
+        let retired = workers
+            .stop_group_for_recovery(group, &published)
+            .await
+            .unwrap();
+        let registration = Arc::clone(
+            workers
+                .registry
+                .lock()
+                .groups
+                .iter()
+                .find(|owner| owner.group == group)
+                .unwrap(),
+        );
+        assert!(registration.committed.lock().is_some());
+
+        assert!(workers
+            .release_retired_log(group, uuid::Uuid::new_v4())
+            .is_err());
+        assert_eq!(
+            workers.release_retired_log(group, retired.scope()).unwrap(),
+            1
+        );
+        assert!(
+            registration.committed.lock().is_none(),
+            "a released owner no longer holds the sled tree, and so its lock"
+        );
+        let (fenced, _fenced_owner) = PhysicalApplyLifecycle::new_owner();
+        assert!(
+            workers.reserve(group, fenced).is_err(),
+            "releasing the log does not lift the fence"
+        );
+        workers.finish_recovery(group, retired.scope()).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -8342,3 +8342,184 @@ async fn cold_quarantine_retirement_uses_real_committed_and_purged_bounds() {
     );
     assert_eq!(std::fs::read(snapshot).unwrap(), original_snapshot);
 }
+
+/// A node whose apply of committed entry 3 (`CREATE TABLE smoke_ks.second`)
+/// was interrupted mid-effect: entries 1-2 are applied and snapshotted, the
+/// log is purged through 2 and committed through 3. Returns the cold storage
+/// the restarted node opens, the entries a healthy peer applied, and the
+/// raft directory.
+async fn interrupted_create_table_node(
+    dir: &std::path::Path,
+) -> (
+    Arc<StorageEngine>,
+    Vec<openraft::Entry<crate::raft::FerrosRaftConfig>>,
+    std::path::PathBuf,
+) {
+    use crate::raft::log_store::SledLogStore;
+    use crate::raft::state_machine::FerrosStateMachine;
+    use crate::raft::{FerrosRaftConfig, RaftCommand, RaftOp};
+    use ferrosa_common::{DecoratedKey, PartitionKey};
+    use ferrosa_storage::TableId;
+    use openraft::storage::{RaftLogStorage, RaftSnapshotBuilder, RaftStateMachine};
+    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+    let entry = |index, op| Entry::<FerrosRaftConfig> {
+        log_id: LogId::new(CommittedLeaderId::new(1, 1), index),
+        payload: EntryPayload::Normal(RaftCommand {
+            op,
+            schema_version: Uuid::new_v4(),
+        }),
+    };
+    let storage = test_storage(dir);
+    storage.register_system_tables().unwrap();
+    let schema = test_schema();
+    let table = switchover_kv_table(false);
+    let mut second = switchover_kv_table(false);
+    second.name = "second".into();
+    second.id = Uuid::from_u128(0x5ec0);
+    let tid = TableId::new(&table.keyspace, &table.name);
+    let dc = ClusterConfig::default().data_center;
+    let raft_dir = super::cluster::raft_log_dir_for_dc(&dir.join("raft"), &dc);
+    let snapshot = raft_dir.join("state-machine.snapshot.bin");
+    let mut sm = FerrosStateMachine::with_side_effects_and_snapshot_path(
+        schema.clone(),
+        storage.clone(),
+        snapshot,
+    );
+    let keyspace = ferrosa_schema::metadata::keyspace::KeyspaceMetadata {
+        name: table.keyspace.clone(),
+        durable_writes: true,
+        replication: ferrosa_schema::metadata::keyspace::ReplicationParams {
+            strategy: "SimpleStrategy".into(),
+            options: [("replication_factor".into(), "1".into())]
+                .into_iter()
+                .collect(),
+        },
+    };
+    let setup = vec![
+        entry(1, RaftOp::CreateKeyspace(keyspace)),
+        entry(2, RaftOp::CreateTable(Box::new(table.clone()))),
+    ];
+    sm.apply(setup.clone()).await.unwrap();
+    let key = DecoratedKey::new(PartitionKey::new(b"acknowledged-row".to_vec()));
+    storage
+        .write(
+            &tid,
+            &key,
+            std::sync::Arc::new(ferrosa_sstable::types::Row {
+                clustering: vec![],
+                cells: vec![],
+                deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
+            }),
+            1,
+        )
+        .unwrap();
+    storage.flush(&tid).unwrap();
+    sm.build_snapshot().await.unwrap();
+    let purged = LogId::new(CommittedLeaderId::new(1, 1), 2);
+    let mut log = SledLogStore::new(&raft_dir).unwrap();
+    log.append_recovery_fixture(setup.clone()).await.unwrap();
+    log.save_committed(Some(purged)).await.unwrap();
+    log.durable_applied_handle()
+        .store(2, std::sync::atomic::Ordering::Release);
+    log.purge(purged).await.unwrap();
+    let create_second = entry(3, RaftOp::CreateTable(Box::new(second)));
+    log.append_recovery_fixture(vec![create_second.clone()])
+        .await
+        .unwrap();
+    log.save_committed(Some(create_second.log_id))
+        .await
+        .unwrap();
+    drop(log);
+    storage
+        .unregister_table(&TableId::new("system_schema", "tables"))
+        .unwrap();
+    assert!(sm.apply(vec![create_second.clone()]).await.is_err());
+    drop(sm);
+    drop(storage);
+    drop(schema);
+    let (cold, pending) = StorageEngine::open(test_storage_config(dir), None).unwrap();
+    cold.register_system_tables().unwrap();
+    cold.replay_mutations(pending).unwrap();
+    let mut applied = setup;
+    applied.push(create_second);
+    (Arc::new(cold), applied, raft_dir)
+}
+
+/// t_6f2ba27a: a prepared repair used to wait forever. Installing a healthy
+/// peer's cut through the committed target must end quarantine, keep the
+/// node's acknowledged rows, add what it never finished applying, and start
+/// Raft from the installed snapshot. A cut short of the target changes nothing.
+#[tokio::test]
+async fn a_prepared_repair_installs_a_peer_cut_and_restarts_the_group() {
+    use crate::raft::state_machine::FerrosStateMachine;
+    use ferrosa_common::{DecoratedKey, PartitionKey};
+    use ferrosa_storage::TableId;
+    use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+    let dir = tempfile::tempdir().unwrap();
+    let (cold, applied, raft_dir) = interrupted_create_table_node(dir.path()).await;
+    let dc = ClusterConfig::default().data_center;
+    let schema = test_schema();
+    let (controller, peer, _) =
+        boot_gate_controller_with_storage(dir.path(), cold.clone(), schema.clone()).await;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    controller.transition_to_cluster(vec![(peer, listener.local_addr().unwrap())]);
+    let prepared = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        controller.wait_for_raft_repair_preparation(&dc),
+    )
+    .await
+    .expect("preparation must finish")
+    .expect("preparation must succeed");
+    assert_eq!(
+        prepared.minimum_index(),
+        3,
+        "the committed target bounds the cut"
+    );
+    drop(prepared);
+    assert!(controller.recovery_admission().admits().is_err());
+
+    let mut short = FerrosStateMachine::new();
+    short.apply(applied[..2].to_vec()).await.unwrap();
+    let short_cut = short.build_snapshot().await.unwrap();
+    let refused = controller
+        .complete_raft_repair(short_cut.meta, short_cut.snapshot.into_inner(), 7)
+        .await
+        .unwrap_err();
+    assert!(refused.is_retryable(), "{refused}");
+    assert!(controller.recovery_admission().admits().is_err());
+
+    let mut healthy = FerrosStateMachine::new();
+    healthy.apply(applied).await.unwrap();
+    let cut = healthy.build_snapshot().await.unwrap();
+    controller
+        .complete_raft_repair(cut.meta, cut.snapshot.into_inner(), 7)
+        .await
+        .expect("a covering peer cut completes the repair");
+
+    assert!(controller.recovery_admission().admits().is_ok());
+    assert!(controller
+        .repair_preparations
+        .lock()
+        .get(&crate::raft::RaftGroupId::for_dc(&dc))
+        .is_none());
+    let tables = schema.snapshot().tables.clone();
+    assert!(tables.contains_key(&("smoke_ks".into(), "second".into())));
+    assert!(tables.contains_key(&("smoke_ks".into(), "kv".into())));
+    let key = DecoratedKey::new(PartitionKey::new(b"acknowledged-row".to_vec()));
+    assert!(cold
+        .read(&TableId::new("smoke_ks", "kv"), &key)
+        .unwrap()
+        .is_some());
+    assert!(cold
+        .table_schema(&TableId::new("smoke_ks", "second"))
+        .is_some());
+    assert!(raft_dir.join("state-machine.snapshot.bin").exists());
+    let started = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while controller.raft().is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(started.is_ok(), "the re-driven transition must start Raft");
+}

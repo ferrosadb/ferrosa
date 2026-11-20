@@ -483,6 +483,13 @@ build; the codec's own cost is its delta against `none`.
   heartbeat to lagging followers; `INSTALLSNAPSHOT_PUSHES_TOTAL`.
 - `snapshot_transport.rs` — snapshots travel on `Lane::Bulk` (not `Lane::Raft`),
   3 MiB chunks, 60 s per-chunk timeout.
+- `repair_snapshot.rs` + `controller/raft_repair.rs` — the repair installer
+  (t_6f2ba27a). A node whose group was quarantined by an interrupted apply pulls
+  a committed snapshot covering its committed target from a same-DC peer
+  advertising `CAP_RAFT_REPAIR_SNAPSHOT`, installs and fsyncs it (refusing one
+  that would orphan local rows), purges its log, records `SnapshotSynced`, lifts
+  the fence, releases admission and restarts the group. Peers refuse while their
+  own admission is closed. A partially applied `DROP TABLE` stays refused.
 - `multi_dc_apply.rs` / `group_id.rs` — per-DC Raft groups (UUID-v5 group ids),
   HLC reorder buffer + applied-txn ledger for cross-DC Accord apply (ADR-015).
 - `raft_forward.rs` — forward client writes / membership updates to the leader.

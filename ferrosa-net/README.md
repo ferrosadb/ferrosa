@@ -88,6 +88,11 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   whole-partition full read answered without what its own compaction would drop,
   so the coordinator sends it only to a peer with the bit and the plain
   `ReadRequest` to any other;
+  `CAP_RAFT_REPAIR_SNAPSHOT` (1<<10) — the peer serves
+  `RaftRepairSnapshotRequest` (`0x17`) / `RaftRepairSnapshotResponse` (`0x18`),
+  opaque ferrosa-cluster bodies with which a quarantined Raft node pulls a
+  committed snapshot covering its repair target (t_6f2ba27a). They travel on the
+  snapshot (Bulk) lane;
   `CAP_RESULT_CURSOR_PAGE`
   `CAP_PAIR_DISSOLVE` gates `PairDissolve` / `PairDissolveAck` (0x4A/0x4B),
   phase 1 of the operator downgrade from cluster to pair (t_47bbeb66).

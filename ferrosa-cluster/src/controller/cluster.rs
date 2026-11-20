@@ -1223,6 +1223,20 @@ impl ModeController {
         });
     }
 
+    /// This node's per-DC Raft directory: the log store, the persisted
+    /// snapshot and, beside it, the recovery journal.
+    pub(super) fn local_raft_dir(&self) -> std::path::PathBuf {
+        let local_dc = &self.config.data_center;
+        let raft_base = if let Some(dir) = self.config.raft_data_dir_for_dc(local_dc) {
+            dir
+        } else {
+            let data_dir =
+                std::env::var("FERROSA_DATA_DIR").unwrap_or_else(|_| "/var/lib/ferrosa".into());
+            std::path::Path::new(&data_dir).join("raft")
+        };
+        raft_log_dir_for_dc(&raft_base, local_dc)
+    }
+
     /// 4. TokenRing with deterministic initial token assignment
     /// 5. ClusterCoordinator for replica-aware writes
     /// 6. Swaps write path, DDL path, and cluster state atomically
@@ -1453,14 +1467,7 @@ impl ModeController {
         // (ADR-015 R3). W6.8: a per-DC override
         // (`FERROSA_RAFT_DATA_DIR_<DC>`) takes precedence over the
         // node-level default.
-        let raft_base = if let Some(dir) = self.config.raft_data_dir_for_dc(&local_dc) {
-            dir
-        } else {
-            let data_dir =
-                std::env::var("FERROSA_DATA_DIR").unwrap_or_else(|_| "/var/lib/ferrosa".into());
-            std::path::Path::new(&data_dir).join("raft")
-        };
-        let raft_dir = raft_log_dir_for_dc(&raft_base, &local_dc);
+        let raft_dir = self.local_raft_dir();
         if let Err(e) = std::fs::create_dir_all(&raft_dir) {
             tracing::error!(%e, dir = %raft_dir.display(), "failed to create per-DC raft log dir");
             return;
@@ -1485,6 +1492,24 @@ impl ModeController {
         // the watermark stays 0 and the guard is inert.
         state_machine.set_durable_applied_handle(log_store.durable_applied_handle());
         self.bind_raft_recovery_admission(&mut state_machine, &mut log_store);
+        // Serve repairing peers from this group's committed snapshots. It is
+        // registered before the quarantine check so a quarantined node answers
+        // with a named refusal (its admission is closed) instead of leaving the
+        // asker to time out. Raft handlers resolve the instance lazily.
+        use crate::raft::handlers::LazyRaft;
+        let (raft_tx, lazy_raft) = LazyRaft::channel();
+        self.registry.register(
+            MsgType::RaftRepairSnapshotRequest,
+            Arc::new(
+                crate::raft::repair_snapshot::RaftRepairSnapshotHandler::new(
+                    self.config.data_center.clone(),
+                    state_machine.snapshot_slot(),
+                    Arc::clone(&self.recovery_admission),
+                    lazy_raft.clone(),
+                    crate::raft::repair_snapshot::DEFAULT_BUILD_WAIT,
+                ),
+            ),
+        );
         let mut physical_registration = match self.physical_raft_workers.reserve(
             crate::raft::RaftGroupId::for_dc(&self.config.data_center),
             state_machine.physical_lifecycle(),
@@ -1522,6 +1547,7 @@ impl ModeController {
             let groups = self.raft_groups.load_full();
             let preparations = Arc::clone(&self.repair_preparations);
             let changed = Arc::clone(&self.repair_preparation_changed);
+            let controller = self.self_weak.get().cloned();
             preparations.lock().insert(
                 group,
                 crate::raft::recovery_session::RepairPreparationState::Pending,
@@ -1567,6 +1593,7 @@ impl ModeController {
                     Ok::<_, String>(prepared)
                 }
                 .await;
+                let prepared = result.is_ok();
                 preparations.lock().insert(
                     group,
                     match result {
@@ -1582,6 +1609,15 @@ impl ModeController {
                 drop(workers);
                 drop(preparations);
                 changed.notify_waiters();
+                if prepared {
+                    match controller.and_then(|weak| weak.upgrade()) {
+                        Some(controller) => controller.spawn_raft_repair_driver(),
+                        None => tracing::error!(
+                            "Raft repair prepared after its controller was dropped; \
+                             no installer runs"
+                        ),
+                    }
+                }
             });
             return;
         }
@@ -2051,9 +2087,6 @@ impl ModeController {
         // Handlers use LazyRaft to wait for the instance to be ready.
         // This eliminates the race where vote requests arrive before
         // handlers are registered.
-        use crate::raft::handlers::LazyRaft;
-        let (raft_tx, lazy_raft) = LazyRaft::channel();
-
         let append_handler = Arc::new(RaftAppendHandler::new(
             lazy_raft.clone(),
             self.leader_contact.clone(),
@@ -4256,7 +4289,7 @@ const LOG_STORE_RECOVERY_PAUSES_MS: [u64; 4] = [200, 400, 800, 1600];
 /// transition. The lock is released within milliseconds to seconds of the
 /// give-up, so a short bounded re-open recovers the node instead of abandoning
 /// consensus (t_4e9a3e61).
-fn open_raft_log_store_with_recovery(
+pub(super) fn open_raft_log_store_with_recovery(
     raft_dir: &std::path::Path,
 ) -> Result<SledLogStore, sled::Error> {
     let first = match SledLogStore::new(raft_dir) {
