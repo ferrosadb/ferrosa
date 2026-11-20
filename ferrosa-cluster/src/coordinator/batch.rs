@@ -14,6 +14,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
+use crate::ConsistencyLevel;
 use ferrosa_net::task_pool::TaskPool;
 use ferrosa_storage::batchlog::BatchlogEntry;
 use ferrosa_storage::Mutation;
@@ -44,9 +45,19 @@ impl ClusterCoordinator {
     /// 1. Write batchlog entry to batchlog replicas.
     /// 2. Fan out individual mutations to their replicas (using `coordinate_write`).
     /// 3. Delete batchlog entry from batchlog replicas.
+    ///
+    /// `cl` and `rf` are the level the batch ASKED for, forwarded to every row's
+    /// `coordinate_write_with`. Before this they were not parameters at all, so
+    /// the fan-out fell through `coordinate_write` to `self.default_cl`: a batch
+    /// issued at QUORUM against a coordinator defaulting to ONE was applied at
+    /// ONE, silently. `WritePath::write_batch` already forwards both on the Pair
+    /// path (`write_path.rs:576`), so this removes the asymmetry rather than
+    /// introducing a new convention.
     pub async fn coordinate_logged_batch(
         &self,
         mutations: Vec<Mutation>,
+        cl: ConsistencyLevel,
+        rf: usize,
     ) -> crate::error::Result<()> {
         if mutations.is_empty() {
             return Ok(());
@@ -86,7 +97,9 @@ impl ClusterCoordinator {
                 let ts = m.timestamp;
                 let tid = table_id.clone();
                 futs.push(async move {
-                    let result = self.coordinate_write(&tid, &key, row, ts).await;
+                    let result = self
+                        .coordinate_write_with(&tid, &key, row, ts, cl, rf)
+                        .await;
                     drop(permit);
                     result
                 });
@@ -558,7 +571,7 @@ mod tests {
         }];
 
         coordinator
-            .coordinate_logged_batch(mutations)
+            .coordinate_logged_batch(mutations, ConsistencyLevel::One, 1)
             .await
             .unwrap();
 
@@ -569,6 +582,76 @@ mod tests {
         let table_id = TableId::new("test_ks", "test_tbl");
         let result = storage.read(&table_id, &test_key()).unwrap();
         assert!(result.is_some());
+    }
+
+    /// **A batch is applied at the consistency level it asked for, not at the
+    /// coordinator's default.**
+    ///
+    /// `ClusterCoordinator::coordinate_logged_batch` takes no consistency level
+    /// and fans every mutation out through `coordinate_write`, which resolves
+    /// its level from `self.default_cl` (`write.rs:247-263`). So a batch issued
+    /// at QUORUM against a coordinator defaulting to ONE is applied at ONE —
+    /// while the Pair path in `WritePath::write_batch` forwards `cl` correctly
+    /// (`write_path.rs:576`). The two paths disagree, and the cluster one is
+    /// the silent one.
+    ///
+    /// The observable here is deliberately `coordinate_all_serving_write`,
+    /// which takes `cl` explicitly and fails loudly when a replica does not
+    /// acknowledge (`write.rs` doc: "no quorum shortcut and no hint fallback").
+    /// A ONE write succeeds against a ring where the only peer cannot be
+    /// reached; a QUORUM write cannot. So "the batch succeeded" is exactly the
+    /// assertion that distinguishes the requested level from the default.
+    ///
+    /// RED as written: the batch is applied at the coordinator's ONE, so this
+    /// succeeds and the assertion fails. It fails on the behaviour, not on a
+    /// missing symbol.
+    #[tokio::test]
+    async fn a_batch_is_applied_at_its_requested_consistency_not_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let local_node_id = 1u64;
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, make_node("10.0.0.1:7000"));
+        // A second node owns the token range the test key hashes into, and no
+        // peer is reachable, so a QUORUM write cannot reach its acknowledgement
+        // count while a ONE write can.
+        ring.add_node(2, make_node("10.0.0.2:7000"));
+        ring.assign_tokens(local_node_id, &[0]);
+        ring.assign_tokens(2, &[100, 200]);
+
+        let coordinator = ClusterCoordinator::new(
+            Arc::new(ArcSwap::from_pointee(ring)),
+            noop_peer_manager(),
+            local_node_id,
+            storage.clone(),
+            3,
+            // The node's DEFAULT is ONE. The batch below asks for QUORUM.
+            ConsistencyLevel::One,
+        );
+
+        let mutations = vec![Mutation {
+            mutation_id: [0x93u8; 16],
+            keyspace: "test_ks".to_string(),
+            table: "test_tbl".to_string(),
+            key: test_key(),
+            rows: vec![Arc::new(test_row())],
+            timestamp: 1000,
+        }];
+
+        // The EXISTING entry point, so the red is behavioural rather than a
+        // missing symbol. The requested level is the batch's own, carried by
+        // the mutation set; today this call ignores it entirely.
+        let outcome = coordinator
+            .coordinate_logged_batch(mutations, ConsistencyLevel::Quorum, 3)
+            .await;
+
+        assert!(
+            outcome.is_err(),
+            "a batch requested at QUORUM was reported successful while the \
+             coordinator defaulted to ONE; the requested level was dropped"
+        );
     }
 
     #[tokio::test]

@@ -2721,7 +2721,7 @@ mod tests {
 
         // The batch should fail (partial failure)
         let result = coordinator
-            .coordinate_logged_batch(vec![good_mutation, bad_mutation])
+            .coordinate_logged_batch(vec![good_mutation, bad_mutation], ConsistencyLevel::One, 1)
             .await;
 
         // The good mutation should be in storage

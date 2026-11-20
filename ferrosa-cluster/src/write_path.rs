@@ -605,7 +605,7 @@ impl WritePath {
                     })
                     .collect();
                 let res = coordinator
-                    .coordinate_logged_batch(mutations)
+                    .coordinate_logged_batch(mutations, cl, rf)
                     .await
                     .map_err(cluster_error_to_common);
                 if res.is_ok() {
