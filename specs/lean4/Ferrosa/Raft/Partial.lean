@@ -354,12 +354,33 @@ def idem : String → Idem
   | "engine.write" => .same
   | "GrantUpdated" => .same
   | "PermissionRevoked" => .same
+  -- The type/function/aggregate effects are `.same` only since 2026-11-19, when the apply arms
+  -- began treating `*Exists` and `*NotFound` as "already applied" rather than as a failure
+  -- (`schema_already_reflects` in `ferrosa-cluster/src/raft/state_machine.rs`). Before that they
+  -- were `.latches`, and a single replayed DDL entry fenced the replica permanently.
+  | "create_type_internal" => .same
+  | "drop_type_internal" => .same
+  | "create_function_internal" => .same
+  | "drop_function_internal" => .same
+  | "create_aggregate_internal" => .same
+  | "drop_aggregate_internal" => .same
   | _ => .latches
 
-/-- The effects a replay re-issues. -/
+/-- The effects a replay re-issues.
+
+The type, function and aggregate effects are members because a replay really does re-issue them: a
+committed DDL entry whose schema effect landed before the entry published is re-applied on the next
+boot. They were **not** members of this list until the 2026-11-19 audit, and the omission was not
+cosmetic — the first six are idempotent in the schema registry, and these six were not.
+`create_type_internal` returned `TypeExists` for a name that was already present, and because the
+apply arm turned any schema error into `ApplyError::Other`, whose `fences_replica()` is `true`, a
+replayed `CreateType` latched the node. `a_replayed_create_type_does_not_latch_the_node` is the
+Rust test that pins the repair. -/
 def prePublicationEffects : List String :=
   ["create_keyspace_internal", "create_table_internal", "apply_snapshot", "register_table",
-   "unregister_table", "engine.write"]
+   "unregister_table", "engine.write",
+   "create_type_internal", "drop_type_internal", "create_function_internal",
+   "drop_function_internal", "create_aggregate_internal", "drop_aggregate_internal"]
 
 /-- **REPLAY IDEMPOTENCY (PROVED OF THE TABLE).** Every effect that can land before publication has
     a second application that produces the same state: no latch, no duplicate. So replay is not a
