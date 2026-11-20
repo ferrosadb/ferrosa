@@ -127,6 +127,34 @@ pub enum ApplyError {
     Other(String),
 }
 
+/// **A replayed schema effect is a no-op, not a failure.**
+///
+/// `Ferrosa/Raft/Partial.lean` proves `every_prepublication_effect_is_idempotent` over
+/// `prePublicationEffects`, with `idem e = .same` for every member — "the second application does
+/// not make the state worse". The type, function and aggregate effects were not in that list, and
+/// they were not idempotent: `create_type_internal` returns `TypeExists` when the name is present
+/// (`ferrosa-schema/src/registry.rs:1830-1835`), and `drop_type_internal` returns `TypeNotFound`
+/// when it is absent. Because the arms below turn any schema error into `ApplyError::Other`, whose
+/// `fences_replica()` is `true`, a replay latched the machine.
+///
+/// Replay is not hypothetical: it is what a node does on boot when the effect landed before the
+/// entry published, so a single replayed DDL entry made a node permanently unable to apply.
+///
+/// This returns `true` for "the schema is already in the state this effect asked for", which is
+/// exactly `.same`. It is deliberately narrow — only the two errors that mean "already applied" are
+/// absorbed. Every other schema error still fences.
+fn schema_already_reflects(result: &ferrosa_schema::Result<()>) -> bool {
+    matches!(
+        result,
+        Err(ferrosa_schema::SchemaError::TypeExists(..))
+            | Err(ferrosa_schema::SchemaError::TypeNotFound(..))
+            | Err(ferrosa_schema::SchemaError::FunctionExists(..))
+            | Err(ferrosa_schema::SchemaError::FunctionNotFound(..))
+            | Err(ferrosa_schema::SchemaError::AggregateExists(..))
+            | Err(ferrosa_schema::SchemaError::AggregateNotFound(..))
+    )
+}
+
 impl ApplyError {
     fn unregister(
         keyspace: String,
@@ -2123,11 +2151,14 @@ impl FerrosStateMachine {
                     });
                 }
                 if let Some(schema) = &self.schema {
-                    if let Err(e) = schema.create_type_internal(&udt) {
-                        tracing::error!(%e, "Raft apply: schema.create_type_internal failed");
-                        apply_errors.push(ApplyError::Other(format!(
-                            "schema.create_type_internal failed: {e}"
-                        )));
+                    let result = schema.create_type_internal(&udt);
+                    if !schema_already_reflects(&result) {
+                        if let Err(e) = result {
+                            tracing::error!(%e, "Raft apply: schema.create_type_internal failed");
+                            apply_errors.push(ApplyError::Other(format!(
+                                "schema.create_type_internal failed: {e}"
+                            )));
+                        }
                     }
                 }
             }
@@ -2144,11 +2175,14 @@ impl FerrosStateMachine {
                     });
                 }
                 if let Some(schema) = &self.schema {
-                    if let Err(e) = schema.drop_type_internal(&keyspace, &name) {
-                        tracing::error!(%e, "Raft apply: schema.drop_type_internal failed");
-                        apply_errors.push(ApplyError::Other(format!(
-                            "schema.drop_type_internal failed: {e}"
-                        )));
+                    let result = schema.drop_type_internal(&keyspace, &name);
+                    if !schema_already_reflects(&result) {
+                        if let Err(e) = result {
+                            tracing::error!(%e, "Raft apply: schema.drop_type_internal failed");
+                            apply_errors.push(ApplyError::Other(format!(
+                                "schema.drop_type_internal failed: {e}"
+                            )));
+                        }
                     }
                 }
             }
@@ -2172,11 +2206,14 @@ impl FerrosStateMachine {
                     });
                 }
                 if let Some(schema) = &self.schema {
-                    if let Err(e) = schema.create_function_internal(&func) {
-                        tracing::error!(%e, "Raft apply: schema.create_function_internal failed");
-                        apply_errors.push(ApplyError::Other(format!(
-                            "schema.create_function_internal failed: {e}"
-                        )));
+                    let result = schema.create_function_internal(&func);
+                    if !schema_already_reflects(&result) {
+                        if let Err(e) = result {
+                            tracing::error!(%e, "Raft apply: schema.create_function_internal failed");
+                            apply_errors.push(ApplyError::Other(format!(
+                                "schema.create_function_internal failed: {e}"
+                            )));
+                        }
                     }
                 }
             }
@@ -2199,11 +2236,14 @@ impl FerrosStateMachine {
                     });
                 }
                 if let Some(schema) = &self.schema {
-                    if let Err(e) = schema.drop_function_internal(&keyspace, &name, &arg_types) {
-                        tracing::error!(%e, "Raft apply: schema.drop_function_internal failed");
-                        apply_errors.push(ApplyError::Other(format!(
-                            "schema.drop_function_internal failed: {e}"
-                        )));
+                    let result = schema.drop_function_internal(&keyspace, &name, &arg_types);
+                    if !schema_already_reflects(&result) {
+                        if let Err(e) = result {
+                            tracing::error!(%e, "Raft apply: schema.drop_function_internal failed");
+                            apply_errors.push(ApplyError::Other(format!(
+                                "schema.drop_function_internal failed: {e}"
+                            )));
+                        }
                     }
                 }
             }
@@ -2220,11 +2260,14 @@ impl FerrosStateMachine {
                     .entry(key)
                     .or_insert_with(|| agg.clone());
                 if let Some(schema) = &self.schema {
-                    if let Err(e) = schema.create_aggregate_internal(&agg) {
-                        tracing::error!(%e, "Raft apply: schema.create_aggregate_internal failed");
-                        apply_errors.push(ApplyError::Other(format!(
-                            "schema.create_aggregate_internal failed: {e}"
-                        )));
+                    let result = schema.create_aggregate_internal(&agg);
+                    if !schema_already_reflects(&result) {
+                        if let Err(e) = result {
+                            tracing::error!(%e, "Raft apply: schema.create_aggregate_internal failed");
+                            apply_errors.push(ApplyError::Other(format!(
+                                "schema.create_aggregate_internal failed: {e}"
+                            )));
+                        }
                     }
                 }
             }
@@ -2236,11 +2279,14 @@ impl FerrosStateMachine {
                 let key = (keyspace.clone(), name.clone(), arg_types.clone());
                 self.state.aggregates.remove(&key);
                 if let Some(schema) = &self.schema {
-                    if let Err(e) = schema.drop_aggregate_internal(&keyspace, &name, &arg_types) {
-                        tracing::error!(%e, "Raft apply: schema.drop_aggregate_internal failed");
-                        apply_errors.push(ApplyError::Other(format!(
-                            "schema.drop_aggregate_internal failed: {e}"
-                        )));
+                    let result = schema.drop_aggregate_internal(&keyspace, &name, &arg_types);
+                    if !schema_already_reflects(&result) {
+                        if let Err(e) = result {
+                            tracing::error!(%e, "Raft apply: schema.drop_aggregate_internal failed");
+                            apply_errors.push(ApplyError::Other(format!(
+                                "schema.drop_aggregate_internal failed: {e}"
+                            )));
+                        }
                     }
                 }
             }
@@ -6048,6 +6094,100 @@ mod tests {
             .unwrap();
 
         assert!(sm2.state().approved_nodes.contains(&host_id));
+    }
+
+    /// **A replayed `CreateType` must not latch the node.**
+    ///
+    /// `Ferrosa/Raft/Partial.lean` proves `every_prepublication_effect_is_idempotent` over
+    /// `prePublicationEffects`, and that list names six effects: create_keyspace_internal,
+    /// create_table_internal, apply_snapshot, register_table, unregister_table, engine.write.
+    /// `create_type_internal` is not among them — and it is *not* idempotent:
+    /// `ferrosa-schema/src/registry.rs:1830-1835` returns `SchemaError::TypeExists` when the name is
+    /// present, which this module turns into `ApplyError::Other` (`:2128`), whose `fences_replica()`
+    /// is `true` (`:163`). So a replay latches the machine.
+    ///
+    /// Replay is exactly what a crash between a durable effect and publication produces, and what a
+    /// restarted node runs on boot — so one replayed DDL entry makes a node permanently unable to
+    /// apply, which is the failure the latch's own `.failing` row records.
+    #[tokio::test]
+    async fn a_replayed_create_type_does_not_latch_the_node() {
+        use ferrosa_common::CqlType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let mut sm =
+            FerrosStateMachine::with_side_effects(Arc::clone(&schema), Arc::clone(&engine));
+
+        let udt = UserTypeMetadata {
+            keyspace: "ks".to_string(),
+            name: "address".to_string(),
+            fields: vec![("street".to_string(), CqlType::Varchar)],
+        };
+
+        sm.apply(vec![
+            make_entry(1, 1, RaftOp::CreateKeyspace(simple_keyspace("ks"))),
+            make_entry(1, 2, RaftOp::CreateType(udt.clone())),
+        ])
+        .await
+        .expect("the first application must succeed");
+        assert!(
+            sm.apply_failure.is_none(),
+            "the first CreateType must not latch: {:?}",
+            sm.apply_failure
+        );
+
+        // Replay the same entry, as a restart or a post-crash replay would.
+        let replay = sm
+            .apply(vec![make_entry(1, 2, RaftOp::CreateType(udt))])
+            .await;
+
+        assert!(
+            replay.is_ok(),
+            "a replayed CreateType latched the node: {replay:?}"
+        );
+        assert!(
+            sm.apply_failure.is_none(),
+            "a replayed CreateType left the node latched, so it can never apply again: {:?}",
+            sm.apply_failure
+        );
+    }
+
+    /// **A genuine schema failure still latches.** The companion of
+    /// `a_replayed_create_type_does_not_latch_the_node`: absorbing "already applied" must not absorb
+    /// "cannot apply". A `CreateType` whose keyspace does not exist is a real divergence — replicas
+    /// would hold different type sets — so it must still fence the replica, exactly as
+    /// `ApplyError::Other` does.
+    #[tokio::test]
+    async fn a_create_type_for_a_missing_keyspace_still_latches() {
+        use ferrosa_common::CqlType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let mut sm =
+            FerrosStateMachine::with_side_effects(Arc::clone(&schema), Arc::clone(&engine));
+
+        let udt = UserTypeMetadata {
+            keyspace: "no_such_keyspace".to_string(),
+            name: "orphan".to_string(),
+            fields: vec![("f".to_string(), CqlType::Varchar)],
+        };
+
+        let outcome = sm
+            .apply(vec![make_entry(1, 1, RaftOp::CreateType(udt))])
+            .await;
+
+        assert!(
+            outcome.is_err(),
+            "a CreateType against a missing keyspace must not publish as applied: {outcome:?}"
+        );
+        assert!(
+            sm.apply_failure.is_some(),
+            "a genuine schema divergence must still latch the replica"
+        );
     }
 
     #[tokio::test]
