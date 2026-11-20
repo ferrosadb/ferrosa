@@ -144,9 +144,16 @@ rm -f "$llbc"
 # toolchain belongs in the record: the same sources under a different translator are a different
 # extraction, and the diff between the two files is the only place that shows.
 hash=$(source_hash "$crate_dir" "$sources")
+# The checkout the extraction is recorded against is the one the binaries came from, so it is
+# `AENEAS_DIR` when that is set — the same variable `check-sync.sh` uses to compare a row's
+# translator. Reading `$HOME/src/aeneas` unconditionally recorded the identity of whatever checkout
+# happened to live there: on this host that is a `main` build (e7795715) while the pinned toolchain
+# is 0d04b2ae, so a regenerated row claimed a translator it had not used, and `check-sync.sh` then
+# reported a mismatch against the very pin the file was produced from.
+aeneas_src=${AENEAS_DIR:-$HOME/src/aeneas}
 tools=$(printf 'aeneas %s charon %s' \
-  "$(git -C "$HOME/src/aeneas" rev-parse --short HEAD 2>/dev/null || echo unknown)" \
-  "$(awk '!/^#/ && NF {print $1; exit}' "$HOME/src/aeneas/charon-pin" 2>/dev/null || echo unknown)")
+  "$(git -C "$aeneas_src" rev-parse --short HEAD 2>/dev/null || echo unknown)" \
+  "$(awk '!/^#/ && NF {print $1; exit}' "$aeneas_src/charon-pin" 2>/dev/null || echo unknown)")
 tmp=$work/sync.lock
 if [ -f sync.lock ]; then grep -vE "^$module[[:space:]]" sync.lock > "$tmp"; else : > "$tmp"; fi
 printf '%-10s %-16s %s  %s  %s  %s  ok\n' "$module" "$crate" "$hash" "$sources" "$scope" "$tools" >> "$tmp"
