@@ -10,6 +10,8 @@
 // absence of `unsafe` is enforced rather than merely true (docs/unsafe-policy.md §7).
 #![forbid(unsafe_code)]
 
+mod met;
 mod reds;
 
-pub use reds::{Red, REDS};
+pub use met::{Met, METS};
+pub use reds::{ClaimKind, Red, REDS};

@@ -260,11 +260,17 @@ def leanFiles : IO (Array String) := do
 -/
 
 def statusJson (i : Ferrosa.Ledger.SpecItem) : Json :=
+  let kind :=
+    match Ferrosa.Ledger.claimKind i with
+    | .code => "code"
+    | .design => "design"
   match i.status with
-  | .met proof => Json.mkObj [("claim", Json.str i.name), ("kind", Json.str "met"), ("proof", Json.str proof)]
+  | .met proof =>
+    Json.mkObj [("claim", Json.str i.name), ("kind", Json.str "met"),
+      ("claimKind", Json.str kind), ("proof", Json.str proof)]
   | .failing why wit =>
     Json.mkObj [("claim", Json.str i.name), ("kind", Json.str "failing"),
-      ("why", Json.str why), ("witness", Json.str wit)]
+      ("claimKind", Json.str kind), ("why", Json.str why), ("witness", Json.str wit)]
 
 /-- `full` ends with the segment sequence `segs`, on segment boundaries. -/
 def endsWithSegs (full : String) (segs : List String) : Bool :=
