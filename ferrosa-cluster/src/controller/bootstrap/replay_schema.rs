@@ -97,7 +97,8 @@ pub fn is_retryable_forward_error(error: &ClusterError) -> bool {
         | ClusterError::ReadTimeout { .. }
         | ClusterError::ReplicationFailed(_)
         | ClusterError::CatchUpRequired
-        | ClusterError::DdlProposalNotAgreed { .. } => true,
+        | ClusterError::DdlProposalNotAgreed { .. }
+        | ClusterError::DdlFormationInProgress { .. } => true,
         ClusterError::Storage(_)
         | ClusterError::PairWriteUnavailable
         | ClusterError::NotPrimary
