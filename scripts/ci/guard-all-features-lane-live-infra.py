@@ -158,8 +158,73 @@ def covers(target: str, test: str, excluded: list[str], binaries: list[str], ski
     return any(pattern in test for pattern in skips)
 
 
-def check(repo: Path) -> list[str]:
+# The one lane that runs on a developer's Mac rather than on Linux.
+PREPUSH_LANE = "scripts/pre-push-mirror-ci.sh"
+LINUX_ONLY_GATE = re.compile(
+    r'#\[cfg\(all\(feature = "live-infra-tests",\s*not\(target_os = "linux"\)\)\)\]'
+)
+
+
+def linux_only_live_tests(repo: Path) -> list[tuple[str, str]]:
+    """(file, test) for every live-infra test whose non-Linux build panics.
+
+    These are real on Linux, so the Linux lanes (ci.yml, nightly) must run them.
+    The pre-push mirror also runs on macOS, where the same test name compiles to
+    a panic by design; the mirror has to skip it there. Scans src/ AND tests/,
+    because these are usually lib unit tests (dio_align lives in src/).
+    """
+    found: list[tuple[str, str]] = []
+    for crate_dir in sorted(p for p in repo.iterdir() if p.is_dir()):
+        if not (crate_dir / "Cargo.toml").is_file():
+            continue
+        for sub in ("src", "tests"):
+            for path in sorted((crate_dir / sub).rglob("*.rs")):
+                lines = path.read_text(errors="replace").splitlines()
+                for index, line in enumerate(lines):
+                    if not LINUX_ONLY_GATE.search(line):
+                        continue
+                    for body in lines[index + 1 : index + 5]:
+                        match = FN_DECL.search(body)
+                        if match:
+                            found.append((str(path.relative_to(repo)), match.group(1)))
+                            break
+    return found
+
+
+def non_linux_skips(text: str) -> tuple[list[str], bool]:
+    """(`--skip` patterns in NON_LINUX_SKIPS=( ... ), whether the script applies them)."""
+    match = re.search(r"NON_LINUX_SKIPS=\((.*?)\n\s*\)", text, re.S)
+    if not match:
+        return [], False
+    applied = re.search(r'SKIPS\+=\(\s*"\$\{NON_LINUX_SKIPS\[@\]\}"\s*\)', text) is not None
+    return re.findall(r"--skip\s+(\S+)", match.group(1)), applied
+
+
+def check_prepush_off_linux(repo: Path) -> list[str]:
+    """The pre-push mirror must skip, off Linux, every Linux-only live test."""
+    lane = repo / PREPUSH_LANE
+    if not lane.is_file():
+        return []  # already reported as a missing lane by check()
+    text = lane.read_text(errors="replace")
+    skips, applied = non_linux_skips(text)
     problems: list[str] = []
+    linux_only = linux_only_live_tests(repo)
+    if linux_only and skips and not applied:
+        problems.append(
+            f"{PREPUSH_LANE}: NON_LINUX_SKIPS is declared but never appended to SKIPS "
+            '(expected `SKIPS+=("${NON_LINUX_SKIPS[@]}")` under a non-Linux `uname` check)'
+        )
+    for path, test in linux_only:
+        if not applied or not any(pattern in test for pattern in skips):
+            problems.append(
+                f"{PREPUSH_LANE}: Linux-only live-infra test `{test}` ({path}) panics by design "
+                f"off Linux, so a macOS push can never pass — add `--skip {test}` to NON_LINUX_SKIPS"
+            )
+    return problems
+
+
+def check(repo: Path) -> list[str]:
+    problems: list[str] = check_prepush_off_linux(repo)
     live = live_infra_tests(repo)
     if not live:
         return [f"no live-infra test targets found under {repo}: the scan is broken, not the tree"]
