@@ -76,11 +76,19 @@ class ClusterDataLossWorkflowTest(unittest.TestCase):
         run_tests = workflow.split("- name: Run tests", 1)[1]
         run_tests = run_tests.split("# ── Stage 2a", 1)[0]
         pre_push = PRE_PUSH_MIRROR.read_text(encoding="utf-8")
+        # NON_LINUX_SKIPS is mirror-only by design: tests that are real on Linux
+        # (where CI runs them) and compile to a panic on any other host. Compare
+        # the shared SKIPS array, and require the non-Linux list to stay out of CI.
+        shared, rest = pre_push.split("SKIPS=(", 1)[1].split("\n)", 1)
+        non_linux = rest.split("NON_LINUX_SKIPS=(", 1)[1].split("\n)", 1)[0]
 
         ci_skips = set(re.findall(r"--skip ([A-Za-z0-9_:]+)", run_tests))
-        pre_push_skips = set(re.findall(r"--skip ([A-Za-z0-9_:]+)", pre_push))
+        pre_push_skips = set(re.findall(r"--skip ([A-Za-z0-9_:]+)", shared))
+        non_linux_skips = set(re.findall(r"--skip ([A-Za-z0-9_:]+)", non_linux))
 
         self.assertSetEqual(ci_skips, pre_push_skips)
+        self.assertTrue(non_linux_skips, "NON_LINUX_SKIPS parse found nothing")
+        self.assertFalse(non_linux_skips & ci_skips, "a Linux-only test is skipped in CI")
 
 
 if __name__ == "__main__":
