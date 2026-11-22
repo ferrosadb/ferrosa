@@ -80,6 +80,12 @@ SKIPS=(
   # tests" CI job, as in ci.yml.
   --skip replicated_jsonb_index_builds_on_every_node
   --skip strict_pair_live_s3_ack_replays_exact_mutation
+  # Real-process 3-node harness (ferrosa/tests/formation_late_node_first_ddl_process.rs).
+  # ci.yml excludes the binary from the parallel run with `-E 'not
+  # binary(formation_late_node_first_ddl_process)'` and runs it in the isolated
+  # harness step; as above, `cargo test` cannot filter a binary, so the mirror
+  # skips its test name and ci.yml carries the same `--skip` to keep the sets equal.
+  --skip first_ddl_after_formation_with_a_late_node_succeeds_and_is_visible
 )
 
 # Linux-only live-infra tests: real on Linux (ci.yml and nightly run them
