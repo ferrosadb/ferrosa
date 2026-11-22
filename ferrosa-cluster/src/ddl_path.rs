@@ -1425,6 +1425,64 @@ impl ferrosa_net::rpc::handler::RpcHandler for ClusterDdlForwardHandler {
     }
 }
 
+/// [`ClusterDdlForwardHandler`] registered the moment a node enters cluster
+/// mode, before its Raft instance exists.
+///
+/// A forwarded DDL must never meet the pair-mode `PairDdlForwardHandler` on a
+/// node that has left pair mode: that handler applies the DDL to the local
+/// schema only and acks with an empty payload, which the forwarder reads as a
+/// committed DDL. The client is told CREATE succeeded while the change exists on
+/// the one node that handled it and in no Raft log (forge t_0cfbb511, measured:
+/// keyspace readable on the leader only). The real handler used to be
+/// registered only after the leader's own topology wait, while followers
+/// publish their Cluster path, and start forwarding, as soon as theirs ends.
+/// Registering this one at the transition closes that window: until the Raft
+/// instance is published a forward waits for it ([`LazyRaft::get`], bounded),
+/// then goes through Raft like any other.
+///
+/// [`LazyRaft::get`]: crate::raft::handlers::LazyRaft
+pub(crate) struct LazyClusterDdlForwardHandler {
+    raft: crate::raft::handlers::LazyRaft,
+    peer_manager: Arc<PeerManager>,
+    node_map: Arc<RwLock<HashMap<u64, Uuid>>>,
+}
+
+impl LazyClusterDdlForwardHandler {
+    pub(crate) fn new(
+        raft: crate::raft::handlers::LazyRaft,
+        peer_manager: Arc<PeerManager>,
+        node_map: Arc<RwLock<HashMap<u64, Uuid>>>,
+    ) -> Self {
+        Self {
+            raft,
+            peer_manager,
+            node_map,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ferrosa_net::rpc::handler::RpcHandler for LazyClusterDdlForwardHandler {
+    async fn handle(
+        &self,
+        from: ferrosa_net::rpc::handler::PeerId,
+        msg: Message,
+    ) -> Option<Message> {
+        let Some(raft) = self.raft.get().await else {
+            tracing::error!(
+                from_host = %from.0,
+                "refused a forwarded DDL: this node is in cluster mode but its Raft \
+                 instance never started; nothing was applied, the forwarder gets no ack \
+                 and must retry"
+            );
+            return None;
+        };
+        ClusterDdlForwardHandler::new(raft, self.peer_manager.clone(), self.node_map.clone())
+            .handle(from, msg)
+            .await
+    }
+}
+
 /// True for the refusal a node gives while no leader is known: it has just
 /// stepped down (or never led) and the election has not finished.
 pub(crate) fn is_election_window_rejection(error: &ClusterError) -> bool {

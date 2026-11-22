@@ -257,7 +257,7 @@ use crate::coordinator::{
     batch::{BatchlogDeleteHandler, BatchlogReplayHandler, BatchlogWriteHandler},
     ClusterCoordinator, RepairWriteHandler, TruncateForwardHandler,
 };
-use crate::ddl_path::{execute_via_raft, ClusterDdlForwardHandler, DdlPath};
+use crate::ddl_path::{execute_via_raft, DdlPath};
 use crate::mode::DeploymentMode;
 use crate::pair::ddl::{DdlOperation, PairSchemaSyncHandler};
 use crate::raft::handlers::{
@@ -2097,6 +2097,22 @@ impl ModeController {
         let vote_handler = Arc::new(RaftVoteHandler::new(lazy_raft.clone()));
         self.registry.register(MsgType::RaftVote, vote_handler);
 
+        // Replace the pair-mode DDL forward handler NOW, not after the leader's
+        // topology wait. A follower publishes its Cluster DDL path and starts
+        // forwarding as soon as its own wait ends; a leader that still has the
+        // pair handler applies the forwarded DDL locally, outside Raft, and acks
+        // it as done (forge t_0cfbb511). Until the Raft instance is published a
+        // forward waits for it.
+        let cluster_ddl_handler = Arc::new(crate::ddl_path::LazyClusterDdlForwardHandler::new(
+            lazy_raft.clone(),
+            peer_manager_for_ddl.clone(),
+            node_map_for_ddl.clone(),
+        ));
+        self.registry.register(
+            MsgType::PairDdlForward,
+            Arc::new(super::membership::control::DdlHandler(cluster_ddl_handler)),
+        );
+
         // The PreVote receive side is registered unconditionally, even while
         // `raft_enable_pre_vote` is false. A node must be able to ANSWER a
         // pre-vote before any node is allowed to SEND one, or the first node
@@ -3555,18 +3571,10 @@ impl ModeController {
                             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                         }
                     }
-                    // Register the cluster DDL forward handler so that when a
-                    // non-leader forwards a PairDdlForward to the leader, the
-                    // leader proposes it through Raft rather than applying
-                    // directly (which would bypass consensus).
-                    let cluster_ddl_handler = Arc::new(ClusterDdlForwardHandler::new(
-                        raft_arc.clone(),
-                        peer_manager_for_ddl.clone(),
-                        node_map_for_ddl.clone(),
-                    ));
-                    let cluster_ddl_handler=Arc::new(super::membership::control::DdlHandler(cluster_ddl_handler));
-                    registry.register(MsgType::PairDdlForward, cluster_ddl_handler);
-
+                    // The cluster DDL forward handler is already registered: it
+                    // replaced the pair handler at the start of this transition
+                    // (`LazyClusterDdlForwardHandler`), so a forward that raced
+                    // this point was proposed through Raft, not applied locally.
                     ddl_path.store(Arc::new(DdlPath::Cluster {
                         raft: raft_arc.clone(),
                         peer_manager: peer_manager_for_ddl,
