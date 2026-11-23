@@ -815,7 +815,12 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   keyspaces and tables (inserting, replacing a stale definition, dropping what
   the primary dropped), verifies, adopts the primary's schema version and acks
   with it (CL-33). Switchover refuses until the peer confirms that version and
-  no rejoin data replay is running or failed (`CatchUpGate`, CL-34).
+  no rejoin data replay is running or failed (`CatchUpGate`, CL-34). A lane
+  that is still reconnecting has not carried the request, so the schema push
+  waits for it inside `SWITCHOVER_TIMEOUT` rather than reading the refusal as
+  "unconfirmed"; a lane that never comes up still refuses the handoff
+  (`push_admits_only_on_the_pushed_version`,
+  `push_refuses_when_every_attempt_is_a_reconnecting_lane`).
   `ModeController::choose_pair_role` gives `Primary` to the **lowest** host_id
   (`local_host_id <= peer_host_id`). A node with no `FERROSA_HOST_ID` generates
   a random UUID on first boot, so any deployment that needs a predictable

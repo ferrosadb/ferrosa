@@ -337,6 +337,11 @@ before opening its writer and consumes the challenge once. Wrong peers,
 malformed messages, replayed grants and legacy `RoleSwap` cannot promote.
 Timeout/cancellation after withdrawal leaves the sender fenced. The same
 handoff gate drains admitted writes and DDL and is retained across re-pairing.
+Before the authority exchange the primary pushes its schema and requires an ack
+naming the version it pushed; a `Bulk` lane that is still reconnecting has not
+carried that request, so the push waits for the redial inside the switchover
+timeout instead of reporting the peer unconfirmed, and a peer that never
+answers still refuses the handoff.
 Reconnect takes this gate before choosing or installing a role; a busy transfer
 or admitted write defers reconnect without consuming operator promotion state.
 Mixed-version handoff fails with an upgrade error. Replica promotion remains an

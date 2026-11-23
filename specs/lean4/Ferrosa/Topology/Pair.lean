@@ -196,4 +196,87 @@ theorem degraded_pair_stays_read_only {s : Pair} (h : Reachable false s)
   intro hw
   simp_all [Writable]
 
+/-! ## Switchover admission: a transport refusal is not an answer from the peer
+
+  Before handing over, the primary pushes its schema to the secondary and waits for an ack naming
+  the version it pushed. A secondary that has just restarted refuses the first attempt with
+  `Reconnecting` until its bulk lane redials, and that refusal carries no information about the
+  peer's schema — the request never left the primary. The push therefore waits inside a fixed
+  budget, and only a reply decides. Two things have to stay true while it waits: the handoff is
+  admitted only on an ack that names the pushed version, and a peer that never answers still
+  refuses the handoff. `pushWithin` makes both checkable without a socket.
+-/
+
+/-- One attempt's outcome: the peer answered with the schema version it converged to (`ack`), the
+    lane had not finished reconnecting (`reconnecting`), or the attempt reached the peer and
+    failed (`failed`). -/
+inductive PushOutcome where
+  | ack (version : Nat)
+  | reconnecting
+  | failed (reason : Nat)
+  deriving DecidableEq, Repr
+
+/-- Run the schema push with `n` attempts left in the budget. A `reconnecting` lane costs one
+    attempt and decides nothing; an `ack` or a `failed` attempt decides immediately. -/
+def pushWithin : Nat → Nat → List PushOutcome → Option (Bool × Nat)
+  | 0, _, _ => none
+  | _ + 1, _, [] => none
+  | _ + 1, want, .ack version :: _ => some (version == want, version)
+  | _ + 1, _, .failed reason :: _ => some (false, reason)
+  | n + 1, want, .reconnecting :: rest => pushWithin n want rest
+
+/-- **The handoff is admitted only on the pushed version.** Whatever the sequence of attempts, a
+    `true` verdict names the version that was pushed, so a stale or foreign ack cannot admit a
+    switchover. -/
+theorem push_admits_only_on_the_pushed_version :
+    ∀ (n want : Nat) (os : List PushOutcome) (v : Nat),
+      pushWithin n want os = some (true, v) → v = want := by
+  intro n
+  induction n with
+  | zero => intro want os v h; simp [pushWithin] at h
+  | succ n ih =>
+      intro want os v h
+      cases os with
+      | nil => simp [pushWithin] at h
+      | cons o rest =>
+          cases o with
+          | ack w =>
+              simp only [pushWithin, Option.some.injEq, Prod.mk.injEq] at h
+              obtain ⟨hbeq, hw⟩ := h
+              subst hw
+              exact beq_iff_eq.mp hbeq
+          | failed r => simp [pushWithin] at h
+          | reconnecting => exact ih want rest v h
+
+/-- **A lane that redials inside the budget does not fail the handoff.** Any number of
+    `reconnecting` refusals followed by an ack naming the pushed version is admitted, which is the
+    nightly's Phase 5 case: the lane came up 14 ms after the refusal. -/
+theorem push_succeeds_when_the_lane_redials_within_the_budget :
+    ∀ (k want : Nat) (rest : List PushOutcome),
+      pushWithin (k + 1) want (List.replicate k .reconnecting ++ .ack want :: rest) =
+        some (true, want) := by
+  intro k
+  induction k with
+  | zero => intro want rest; simp [pushWithin, List.replicate_zero]
+  | succ k ih => intro want rest; simp [pushWithin, List.replicate_succ, ih]
+
+/-- **A peer that never answers still refuses the handoff.** When every attempt in the budget is a
+    reconnecting lane, the push returns no verdict, so the switchover is refused exactly as it was
+    before the wait existed. -/
+theorem push_refuses_when_every_attempt_is_a_reconnecting_lane :
+    ∀ (n want : Nat), pushWithin n want (List.replicate n .reconnecting) = none := by
+  intro n
+  induction n with
+  | zero => intro want; simp [pushWithin, List.replicate_zero]
+  | succ n ih => intro want; simp [pushWithin, List.replicate_succ, ih]
+
+/-- **A delivered failure is not retried.** An attempt that reached the peer and failed decides
+    the handoff at once; the budget does not turn it into a second attempt. -/
+theorem push_refuses_a_delivered_failure :
+    ∀ (want r : Nat) (rest : List PushOutcome),
+      pushWithin 2 want (.reconnecting :: .failed r :: rest) = some (false, r) := by
+  intro want r rest
+  simp [pushWithin]
+
+
 end Ferrosa.Topology.Pair
