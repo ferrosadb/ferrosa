@@ -14,10 +14,8 @@ use std::fmt;
 /// Errors that can occur across Ferrosa crates.
 ///
 /// `#[non_exhaustive]` allows adding variants without semver breakage.
-
 #[derive(Debug)]
 #[non_exhaustive]
-
 pub enum Error {
     /// I/O error (disk, network, S3).
     Io(std::io::Error),
