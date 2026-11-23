@@ -82,6 +82,24 @@ SKIPS=(
   --skip strict_pair_live_s3_ack_replays_exact_mutation
 )
 
+# Linux-only live-infra tests: real on Linux (ci.yml and nightly run them
+# there), but on any other host the same name compiles to a panic by design.
+# CI never sees this list; it exists because this hook also runs on macOS, where
+# without it every push failed deterministically (2026-11-22). The guard
+# (scripts/ci/guard-all-features-lane-live-infra.py) fails if a new
+# `cfg(all(feature = "live-infra-tests", not(target_os = "linux")))` test is
+# missing here.
+NON_LINUX_SKIPS=(
+  --skip dio_align_probe_runs_on_a_real_linux_file
+)
+if [ "$(uname -s)" != Linux ]; then
+  echo "pre-push: $(uname -s) host, so these Linux-only tests are skipped here (CI runs them on Linux):" >&2
+  for arg in "${NON_LINUX_SKIPS[@]}"; do
+    [ "$arg" = --skip ] || echo "  $arg" >&2
+  done
+  SKIPS+=("${NON_LINUX_SKIPS[@]}")
+fi
+
 # `cargo nextest run` hangs on this workspace's lib targets on macOS
 # arm64 (no progress for 30+ min after `Finished` compile). cargo
 # test does not exhibit the hang. See task #15. Until the nextest

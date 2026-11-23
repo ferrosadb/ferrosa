@@ -36,6 +36,46 @@ fn needs_containers() {
 }
 '''
 
+# A lib unit test (under src/, not tests/) that is real on Linux and panics by
+# policy elsewhere. CI lanes run on Linux, so only the pre-push mirror, which
+# runs on a developer's Mac, must skip it there.
+LINUX_ONLY_SRC = '''pub fn probe() {}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(all(feature = "live-infra-tests", target_os = "linux"))]
+    #[test]
+    fn probe_runs_on_a_real_linux_file() {
+        super::probe();
+    }
+
+    #[cfg(all(feature = "live-infra-tests", not(target_os = "linux")))]
+    #[test]
+    fn probe_runs_on_a_real_linux_file() {
+        panic!("requires a Linux host");
+    }
+}
+'''
+
+PREPUSH_WITH_NON_LINUX = """#!/usr/bin/env bash
+set -euo pipefail
+SKIPS=(
+  --skip a_noisy_test
+  --skip needs_a_cluster
+)
+NON_LINUX_SKIPS=(
+@EXTRA_NON_LINUX@
+)
+if [ "$(uname -s)" != Linux ]; then
+  SKIPS+=("${NON_LINUX_SKIPS[@]}")
+fi
+exec cargo test \\
+  --all-features \\
+  --workspace --lib --tests \\
+  --exclude fake-jepsen \\
+  -- "${SKIPS[@]}"
+"""
+
 PLAIN_TARGET = '''#[test]
 fn an_ordinary_unit_test() {
     assert_eq!(2 + 2, 4);
@@ -226,6 +266,43 @@ class GuardTest(unittest.TestCase):
             },
         )
         self.assertIn("the scan is broken", got.stderr, got.stderr)
+
+    def linux_only_fixture_kwargs(self, non_linux: str, prepush: str = PREPUSH_WITH_NON_LINUX) -> dict:
+        return dict(
+            extra_ci="--skip needs_a_cluster",
+            extra_nightly="--skip needs_a_cluster",
+            prepush=prepush.replace("@EXTRA_NON_LINUX@", non_linux),
+            files={"fake-crate/src/probe.rs": LINUX_ONLY_SRC},
+        )
+
+    def test_a_linux_only_test_the_mirror_runs_on_a_mac_is_reported(self):
+        # The 2026-11-22 failure: every macOS `git push` ran
+        # dio_align_probe_runs_on_a_real_linux_file, whose non-Linux variant
+        # panics by design, so the hook could never pass on a Mac.
+        got = self.expect(1, "mirror does not skip the Linux-only test",
+                          **self.linux_only_fixture_kwargs(non_linux=""))
+        self.assertIn("probe_runs_on_a_real_linux_file", got.stderr, got.stderr)
+        self.assertIn("pre-push-mirror-ci.sh", got.stderr, got.stderr)
+        self.assertIn("NON_LINUX_SKIPS", got.stderr, got.stderr)
+
+    def test_a_linux_only_test_in_the_non_linux_skips_passes(self):
+        self.expect(0, "mirror skips it off Linux",
+                    **self.linux_only_fixture_kwargs(non_linux="  --skip probe_runs_on_a_real_linux_file"))
+
+    def test_a_non_linux_skip_list_the_script_never_applies_fails(self):
+        # Declaring the list is not skipping: the script must append it.
+        unused = PREPUSH_WITH_NON_LINUX.replace('  SKIPS+=("${NON_LINUX_SKIPS[@]}")\n', "  :\n")
+        got = self.expect(1, "list declared, never applied",
+                          **self.linux_only_fixture_kwargs(
+                              non_linux="  --skip probe_runs_on_a_real_linux_file", prepush=unused))
+        self.assertIn("NON_LINUX_SKIPS", got.stderr, got.stderr)
+
+    def test_ci_lanes_need_not_skip_a_linux_only_test(self):
+        # CI and nightly run on Linux, where the test is real: they must NOT be
+        # told to skip it (that would drop the only place it runs).
+        got = self.expect(0, "Linux lanes run it",
+                          **self.linux_only_fixture_kwargs(non_linux="  --skip probe_runs_on_a_real_linux_file"))
+        self.assertNotIn("ci.yml", got.stderr)
 
     def test_this_repository_covers_every_live_infra_test_in_every_lane(self):
         got = run_guard(REPO)
