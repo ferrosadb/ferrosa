@@ -14,8 +14,14 @@ use std::fmt;
 /// Errors that can occur across Ferrosa crates.
 ///
 /// `#[non_exhaustive]` allows adding variants without semver breakage.
+
+
+
 #[derive(Debug)]
 #[non_exhaustive]
+
+
+
 pub enum Error {
     /// I/O error (disk, network, S3).
     Io(std::io::Error),
@@ -81,6 +87,19 @@ pub enum Error {
         consistency: String,
         required: usize,
         alive: usize,
+    },
+    /// A read or scan was asked for a table that is not registered on this
+    /// node — present in the catalog but absent from storage (timing, a partial
+    /// DDL broadcast, the D8 keyspace/database mapping race), or dropped here.
+    ///
+    /// A typed signal, never string-matched, for the same reason as
+    /// [`Error::ReadTimeout`]: the scan contract has to keep *table-absent*
+    /// distinguishable from *table-empty* (`Ok`, zero rows), and a front end
+    /// maps this to the protocol's undefined-relation class (`42P01` /
+    /// `3D000`) instead of an empty result set.
+    NoSuchTable {
+        /// The table as `keyspace.table`, for the message and that mapping.
+        table: String,
     },
 }
 
@@ -184,6 +203,9 @@ impl fmt::Display for Error {
                 f,
                 "unavailable: CL={consistency}, required={required}, alive={alive}"
             ),
+            // Same wording as the engine's `require_table` refusal, so a log
+            // line reads the same whichever helper raised it.
+            Error::NoSuchTable { table } => write!(f, "table not registered: {table}"),
         }
     }
 }
