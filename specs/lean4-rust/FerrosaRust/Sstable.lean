@@ -22,7 +22,6 @@ set_option maxRecDepth 2048
 noncomputable section
 
 namespace ferrosa_sstable
-def core.error.Erased (Self : Type _) : Type := sorry
 
 /-- [core::cell::RefCell]
     Source: '/rustc/library/core/src/cell.rs', lines 852:0-852:29
@@ -159,7 +158,7 @@ def std.thread.local.LocalKey (T : Type _) : Type := sorry
 @[reducible, rust_trait_impl "core::convert::From<Box<@>, &'0 str>"]
 def Box.Insts.CoreConvertFromShared0Str : core.convert.From (Dyn (fun _dyn =>
   core.error.Error _dyn)) Str := {
-  sorry
+  «from» := sorry
 }
 
 /-- [alloc::fmt::format]:

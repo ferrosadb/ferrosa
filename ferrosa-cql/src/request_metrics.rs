@@ -36,7 +36,7 @@ impl RequestKind {
         }
     }
 
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Query => "query",
             Self::Prepare => "prepare",
@@ -64,7 +64,7 @@ pub enum Outcome {
 impl Outcome {
     const ALL: [Outcome; 3] = [Self::Ok, Self::Error, Self::Cancelled];
 
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Ok => "ok",
             Self::Error => "error",
@@ -132,6 +132,18 @@ impl RequestMetrics {
             started: Instant::now(),
             finished: false,
         }
+    }
+
+    /// Record one request that was refused at admission rather than executed.
+    ///
+    /// A rejection is a request with a known outcome and (near-)zero latency, but
+    /// it never enters the in-flight set and has no work to time, so it must not
+    /// go through [`Self::start`]/[`RequestTimer`]. Counting it here keeps the
+    /// exported `outcome="error"` series honest: without it a node shedding
+    /// thousands of requests reports zero errors, because the only other place a
+    /// finished request is counted is the timer that never ran.
+    pub fn record_rejection(&self, kind: RequestKind) {
+        self.record(kind, Outcome::Error, Duration::ZERO);
     }
 
     /// Record one finished request (outcome, latency). Does not touch the in-flight
@@ -261,6 +273,11 @@ static GLOBAL: RequestMetrics = RequestMetrics::new();
 /// Begin timing a request in the process-wide metrics.
 pub fn start(kind: RequestKind) -> RequestTimer<'static> {
     GLOBAL.start(kind)
+}
+
+/// Record a request refused at admission in the process-wide metrics.
+pub fn record_rejection(kind: RequestKind) {
+    GLOBAL.record_rejection(kind);
 }
 
 /// Append the process-wide request metrics to `out`.
@@ -425,6 +442,53 @@ mod tests {
                 "ferrosa_cql_requests_total{kind=\"execute\",outcome=\"error\"}"
             ),
             Some(1.0)
+        );
+    }
+
+    /// A request refused at admission is a FINISHED request that failed, and the
+    /// error metric is the only place an operator can see that it happened.
+    ///
+    /// The connection handler rejects a request when the per-connection in-flight
+    /// limit is reached, replying ERROR(Overloaded("request backpressure")). That
+    /// rejection never goes through a [`RequestTimer`] — there is no work to time —
+    /// so before this test the only signal was the ERROR frame itself, and
+    /// `ferrosa_cql_requests_total{outcome="error"}` stayed at 0 through a run
+    /// that produced tens of thousands of client-visible errors.
+    ///
+    /// RED as written: `record_rejection` does not exist yet, so this fails to
+    /// compile against the shipped API — the accounting it asks for is absent.
+    /// The assertion is deliberately at the metric level (the same series an
+    /// operator scrapes), not on a counter field, so it cannot be satisfied by
+    /// bookkeeping that is never exported.
+    #[test]
+    fn a_request_refused_at_admission_is_counted_as_an_error() {
+        let m = RequestMetrics::new();
+
+        m.record_rejection(RequestKind::Execute);
+
+        let text = render(&m);
+        assert_eq!(
+            sample(
+                &text,
+                "ferrosa_cql_requests_total{kind=\"execute\",outcome=\"error\"}"
+            ),
+            Some(1.0),
+            "a rejected request must be visible as an error, or an operator cannot \
+             tell a healthy node from one shedding load"
+        );
+        // A rejection never entered the in-flight set, so it must not perturb the
+        // gauge it never occupied.
+        assert_eq!(
+            sample(&text, "ferrosa_cql_requests_in_flight{kind=\"execute\"}"),
+            Some(0.0)
+        );
+        // It also must not be filed as a success.
+        assert_eq!(
+            sample(
+                &text,
+                "ferrosa_cql_requests_total{kind=\"execute\",outcome=\"ok\"}"
+            ),
+            Some(0.0)
         );
     }
 

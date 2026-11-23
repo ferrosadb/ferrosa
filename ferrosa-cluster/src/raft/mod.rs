@@ -692,3 +692,4 @@ mod tests {
 
 pub(crate) mod recovery_journal;
 pub(crate) mod recovery_session;
+pub(crate) mod repair_snapshot;

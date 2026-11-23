@@ -37,6 +37,7 @@ import Ferrosa.Sql.TableLock
 import Ferrosa.Sql.SimpleSplit
 import Ferrosa.Sql.Dml
 import Ferrosa.Cql.V5Framing
+import Ferrosa.Cql.RequestAccounting
 import Ferrosa.Storage.SyncHealth
 
 #check Ferrosa.Sql.Expr.legacy_compare_agrees
@@ -99,6 +100,9 @@ import Ferrosa.Storage.SyncHealth
 #check Ferrosa.Cql.V5Framing.Envelope.envelope_decode_ignores_the_flag
 #check Ferrosa.Cql.V5Framing.Envelope.envelope_old_corrupts_whenever_flagged
 #check Ferrosa.Cql.V5Framing.Envelope.envelope_old_is_harmless_only_when_unflagged
+#check Ferrosa.Cql.RequestAccounting.old_loses_the_shed_request
+#check Ferrosa.Cql.RequestAccounting.new_accounts_for_the_shed_request
+#check Ferrosa.Cql.RequestAccounting.shed_lands_in_the_error_series
 #check Ferrosa.Storage.SyncHealth.force_old_keeps_refusing
 #check Ferrosa.Storage.SyncHealth.force_new_is_a_sync
 #check Ferrosa.Storage.SyncHealth.completed_sync_clears_the_clock

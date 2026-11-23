@@ -2797,7 +2797,9 @@ fn message_family_for_kind(kind: u16) -> MessageFamily {
             | MsgType::RaftVoteResponse
             | MsgType::RaftPreVote
             | MsgType::RaftPreVoteResponse
-            | MsgType::RaftInstallSnapshot,
+            | MsgType::RaftInstallSnapshot
+            | MsgType::RaftRepairSnapshotRequest
+            | MsgType::RaftRepairSnapshotResponse,
         ) => MessageFamily::Raft,
         Ok(
             MsgType::MutationForward

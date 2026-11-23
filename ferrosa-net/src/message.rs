@@ -180,6 +180,13 @@ pub enum Message {
     RaftPreVote(Bytes),
     RaftPreVoteResponse(Bytes),
     RaftInstallSnapshot(Bytes),
+    /// A quarantined node asks a healthy peer for a committed snapshot that
+    /// covers its repair target. Sent only to a peer advertising
+    /// [`crate::handshake::CAP_RAFT_REPAIR_SNAPSHOT`].
+    RaftRepairSnapshotRequest(Bytes),
+    /// Reply to [`Message::RaftRepairSnapshotRequest`]: the snapshot, or a
+    /// named refusal.
+    RaftRepairSnapshotResponse(Bytes),
 
     // Data — opaque payloads
     MutationForward(Bytes),
@@ -412,6 +419,8 @@ impl Message {
             Self::RaftPreVote(_) => MsgType::RaftPreVote,
             Self::RaftPreVoteResponse(_) => MsgType::RaftPreVoteResponse,
             Self::RaftInstallSnapshot(_) => MsgType::RaftInstallSnapshot,
+            Self::RaftRepairSnapshotRequest(_) => MsgType::RaftRepairSnapshotRequest,
+            Self::RaftRepairSnapshotResponse(_) => MsgType::RaftRepairSnapshotResponse,
             Self::MutationForward(_) => MsgType::MutationForward,
             Self::MutationAck(_) => MsgType::MutationAck,
             Self::ReadRequest(_) => MsgType::ReadRequest,
@@ -609,6 +618,8 @@ impl Message {
             | Self::RaftPreVote(b)
             | Self::RaftPreVoteResponse(b)
             | Self::RaftInstallSnapshot(b)
+            | Self::RaftRepairSnapshotRequest(b)
+            | Self::RaftRepairSnapshotResponse(b)
             | Self::MutationForward(b)
             | Self::MutationAck(b)
             | Self::ReadRequest(b)
@@ -838,6 +849,12 @@ impl Message {
             MsgType::RaftVoteResponse => Self::RaftVoteResponse(body.split_to(body.remaining())),
             MsgType::RaftInstallSnapshot => {
                 Self::RaftInstallSnapshot(body.split_to(body.remaining()))
+            }
+            MsgType::RaftRepairSnapshotRequest => {
+                Self::RaftRepairSnapshotRequest(body.split_to(body.remaining()))
+            }
+            MsgType::RaftRepairSnapshotResponse => {
+                Self::RaftRepairSnapshotResponse(body.split_to(body.remaining()))
             }
             MsgType::MutationForward => Self::MutationForward(body.split_to(body.remaining())),
             MsgType::MutationAck => Self::MutationAck(body.split_to(body.remaining())),
@@ -1427,6 +1444,14 @@ mod tests {
             (
                 MsgType::RaftInstallSnapshot,
                 Message::RaftInstallSnapshot(Bytes::from_static(b"snapshot-bytes")),
+            ),
+            (
+                MsgType::RaftRepairSnapshotRequest,
+                Message::RaftRepairSnapshotRequest(Bytes::from_static(b"repair-request")),
+            ),
+            (
+                MsgType::RaftRepairSnapshotResponse,
+                Message::RaftRepairSnapshotResponse(Bytes::from_static(b"repair-snapshot")),
             ),
         ];
 

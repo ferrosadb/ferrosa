@@ -31,6 +31,7 @@ mod operator;
 mod pair;
 mod peer_events;
 mod peer_plan;
+mod raft_repair;
 mod token;
 
 pub use cluster::bootstrap_silent_failure_counts;
