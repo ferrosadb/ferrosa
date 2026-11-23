@@ -84,6 +84,72 @@ pub fn build_replicated_index(
 /// sufficient and provides deterministic backpressure.
 pub(crate) const FORMING_DDL_QUEUE_CAPACITY: usize = 128;
 
+/// How long a DDL that arrives while this node is forming its Raft group waits
+/// for the group to publish the replicated path before it is refused.
+///
+/// A node lists its peers (`system.peers`) as soon as they connect, but it only
+/// publishes [`DdlPath::Cluster`] once a Raft leader is elected. A client that
+/// treats "both peers listed" as ready therefore sends its first DDL into that
+/// window. Measured: about half a second when the members start together, two
+/// to three seconds when one starts a second late (forge t_0cfbb511). The bound
+/// is several times the worst observed window and well under the formation
+/// deadline (30 s by default), after which the node degrades and the path
+/// changes anyway. Expiry is the evidence that formation is stuck: it is never a
+/// reason to widen the bound.
+pub const FORMING_DDL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Re-check interval while a DDL waits out formation.
+const FORMING_DDL_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// The DDL path a statement must run on, waiting out cluster formation.
+///
+/// Returns the live path at once unless it is [`DdlPath::Forming`]. While it is
+/// forming, waits up to `bound` for the formation task to publish the outcome
+/// (normally [`DdlPath::Cluster`]), then returns that. A DDL must never be run
+/// on the forming path: it can neither commit there nor be told truthfully what
+/// happened to it.
+///
+/// Fails with [`ClusterError::DdlFormationInProgress`] when formation is still
+/// running at `bound`: the DDL was not applied anywhere and the client must
+/// retry. Both edges are logged — a wait that ended in a published path at
+/// INFO, a refusal at WARN — so a slow formation shows up next to the DDL it
+/// held.
+pub async fn load_settled(
+    swap: &arc_swap::ArcSwap<DdlPath>,
+    bound: std::time::Duration,
+) -> Result<Arc<DdlPath>> {
+    let started = tokio::time::Instant::now();
+    let deadline = started + bound;
+    let mut path = swap.load_full();
+    while matches!(*path, DdlPath::Forming { .. }) {
+        if tokio::time::Instant::now() >= deadline {
+            let waited_ms = started.elapsed().as_millis() as u64;
+            let bound_ms = bound.as_millis() as u64;
+            tracing::warn!(
+                waited_ms,
+                bound_ms,
+                "DDL refused: this node is still forming its Raft group (no leader \
+                 elected) after the DDL formation wait; the DDL was not applied"
+            );
+            return Err(ClusterError::DdlFormationInProgress {
+                waited_ms,
+                bound_ms,
+            });
+        }
+        tokio::time::sleep(FORMING_DDL_POLL).await;
+        path = swap.load_full();
+    }
+    let waited = started.elapsed();
+    if waited >= FORMING_DDL_POLL {
+        tracing::info!(
+            waited_ms = waited.as_millis() as u64,
+            path = path.kind(),
+            "DDL waited for cluster formation to publish the DDL path"
+        );
+    }
+    Ok(path)
+}
+
 /// The active DDL path. Swapped atomically via `ArcSwap` when
 /// the deployment mode changes (standalone → pair → cluster).
 /// The relay a committed DDL uses to tell the OTHER data centers.
@@ -1359,6 +1425,64 @@ impl ferrosa_net::rpc::handler::RpcHandler for ClusterDdlForwardHandler {
     }
 }
 
+/// [`ClusterDdlForwardHandler`] registered the moment a node enters cluster
+/// mode, before its Raft instance exists.
+///
+/// A forwarded DDL must never meet the pair-mode `PairDdlForwardHandler` on a
+/// node that has left pair mode: that handler applies the DDL to the local
+/// schema only and acks with an empty payload, which the forwarder reads as a
+/// committed DDL. The client is told CREATE succeeded while the change exists on
+/// the one node that handled it and in no Raft log (forge t_0cfbb511, measured:
+/// keyspace readable on the leader only). The real handler used to be
+/// registered only after the leader's own topology wait, while followers
+/// publish their Cluster path, and start forwarding, as soon as theirs ends.
+/// Registering this one at the transition closes that window: until the Raft
+/// instance is published a forward waits for it ([`LazyRaft::get`], bounded),
+/// then goes through Raft like any other.
+///
+/// [`LazyRaft::get`]: crate::raft::handlers::LazyRaft
+pub(crate) struct LazyClusterDdlForwardHandler {
+    raft: crate::raft::handlers::LazyRaft,
+    peer_manager: Arc<PeerManager>,
+    node_map: Arc<RwLock<HashMap<u64, Uuid>>>,
+}
+
+impl LazyClusterDdlForwardHandler {
+    pub(crate) fn new(
+        raft: crate::raft::handlers::LazyRaft,
+        peer_manager: Arc<PeerManager>,
+        node_map: Arc<RwLock<HashMap<u64, Uuid>>>,
+    ) -> Self {
+        Self {
+            raft,
+            peer_manager,
+            node_map,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ferrosa_net::rpc::handler::RpcHandler for LazyClusterDdlForwardHandler {
+    async fn handle(
+        &self,
+        from: ferrosa_net::rpc::handler::PeerId,
+        msg: Message,
+    ) -> Option<Message> {
+        let Some(raft) = self.raft.get().await else {
+            tracing::error!(
+                from_host = %from.0,
+                "refused a forwarded DDL: this node is in cluster mode but its Raft \
+                 instance never started; nothing was applied, the forwarder gets no ack \
+                 and must retry"
+            );
+            return None;
+        };
+        ClusterDdlForwardHandler::new(raft, self.peer_manager.clone(), self.node_map.clone())
+            .handle(from, msg)
+            .await
+    }
+}
+
 /// True for the refusal a node gives while no leader is known: it has just
 /// stepped down (or never led) and the election has not finished.
 pub(crate) fn is_election_window_rejection(error: &ClusterError) -> bool {
@@ -2233,6 +2357,90 @@ mod tests {
             DdlOperation::CreateKeyspace(ks) => assert_eq!(ks.name, "should_queue"),
             other => panic!("expected CreateKeyspace, got: {other:?}"),
         }
+    }
+
+    /// A path that is not forming is returned at once: no wait, no log.
+    #[tokio::test]
+    async fn load_settled_returns_a_non_forming_path_immediately() {
+        let swap = arc_swap::ArcSwap::from_pointee(DdlPath::Unavailable);
+        let started = std::time::Instant::now();
+        let path = load_settled(&swap, std::time::Duration::from_secs(5))
+            .await
+            .expect("a non-forming path is returned");
+        assert_eq!(path.kind(), "unavailable");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "a non-forming path must not wait: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A DDL that arrives while the node is forming waits for the formation
+    /// task to publish the path, then runs on THAT path — never on `Forming`,
+    /// where it used to be refused with a false "peer lost" (forge t_0cfbb511).
+    #[tokio::test]
+    async fn load_settled_waits_for_formation_to_publish_the_path() {
+        let (queue, _rx) = tokio::sync::mpsc::channel(1);
+        let swap = Arc::new(arc_swap::ArcSwap::from_pointee(DdlPath::Forming { queue }));
+        let publisher = Arc::clone(&swap);
+        let publish_after = std::time::Duration::from_millis(150);
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(publish_after).await;
+            // Stand-in for the formation task publishing its outcome.
+            publisher.store(Arc::new(DdlPath::Unavailable));
+        });
+        let started = std::time::Instant::now();
+        let path = load_settled(&swap, std::time::Duration::from_secs(10))
+            .await
+            .expect("formation published within the bound");
+        assert_eq!(path.kind(), "unavailable", "must return the published path");
+        assert!(
+            started.elapsed() >= publish_after,
+            "must not return before the path was published: {:?}",
+            started.elapsed()
+        );
+        task.await.expect("publisher task");
+    }
+
+    /// Formation that does not publish within the bound fails the DDL loudly
+    /// and retryably, naming formation as the cause and saying nothing was
+    /// applied. It never hangs past the bound.
+    #[tokio::test]
+    async fn load_settled_refuses_with_a_formation_error_after_the_bound() {
+        let (queue, mut rx) = tokio::sync::mpsc::channel(1);
+        let swap = arc_swap::ArcSwap::from_pointee(DdlPath::Forming { queue });
+        let bound = std::time::Duration::from_millis(100);
+        let started = std::time::Instant::now();
+        let Err(err) = load_settled(&swap, bound).await else {
+            panic!("formation never published, yet a path was returned");
+        };
+        let elapsed = started.elapsed();
+        match &err {
+            ClusterError::DdlFormationInProgress {
+                waited_ms,
+                bound_ms,
+            } => {
+                assert_eq!(*bound_ms, 100);
+                assert!(*waited_ms >= 100, "waited only {waited_ms}ms");
+            }
+            other => panic!("expected DdlFormationInProgress, got {other:?}"),
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the wait must end at its bound, took {elapsed:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("formation in progress"), "got: {msg}");
+        assert!(msg.contains("not applied"), "got: {msg}");
+        assert!(msg.contains("retry"), "got: {msg}");
+        assert!(
+            !msg.contains("peer lost"),
+            "must not report a false cause: {msg}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a refused DDL must not also be queued for a later silent replay"
+        );
     }
 
     #[tokio::test]

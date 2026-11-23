@@ -601,7 +601,9 @@ started and was not deleted appears exactly once, in storage (token) order
 statement is planned into a `TableMetadata` (`ddl.rs`) and applied through the
 same `ferrosa_cluster::ddl_path::DdlPath` the CQL router uses, via `ClusterDdl`
 (direct when standalone, coordinator in pair mode, Raft-replicated in a
-cluster). Keys: one primary-key column is the partition key; a composite key is
+cluster). A DDL that arrives while the node is still forming its cluster waits
+for the replicated path (bounded, `ddl_path::load_settled`) instead of being
+refused (ferrosa-cluster CL-88). Keys: one primary-key column is the partition key; a composite key is
 the first column as partition key and the rest as ascending clustering columns.
 Types go through `pg_types::cql_type_for_pg_name`; an unmapped type is `42704`
 naming it; `json`/`jsonb` create a CQL `jsonb` column (T-161a, D11).

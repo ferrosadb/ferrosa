@@ -417,8 +417,14 @@ build; the codec's own cost is its delta against `none`.
 - `DdlPath::kind()` / `ModeController::ddl_path_kind()` name the live DDL path
   (`direct`, `pair`, `cluster`, `forming`, `unavailable`). The mode reads
   `cluster` from the start of `transition_to_cluster`, while DDL stays `forming`
-  until the Raft-backed path is published. A CREATE in this window returns a
-  retriable formation error and cannot acknowledge a local-only schema change.
+  until the Raft-backed path is published. A DDL in this window waits for the
+  publication (`ddl_path::load_settled`, bounded by `FORMING_DDL_WAIT`, 10 s) and
+  then runs on the published path; if formation does not finish in time it gets
+  the retriable `DdlFormationInProgress` error, never "peer lost", and cannot
+  acknowledge a local-only schema change. The cluster DDL forward handler
+  (`LazyClusterDdlForwardHandler`) replaces the pair-mode one at the start of
+  the transition, so a leader still in its topology wait proposes a forwarded
+  DDL through Raft instead of applying it locally (CL-88).
   Existing formation queues are retained. Declared cluster admission and
   readiness wait for `ddl_path == "cluster"` as well as membership/leadership
   (the path is also exposed on `/api/cluster/status`; CQL-T467ci-01).

@@ -61,6 +61,18 @@ pub enum ClusterError {
         /// How long the proposal was awaited before giving up.
         elapsed_ms: u64,
     },
+    /// A DDL arrived while this node was forming its Raft group and no leader
+    /// was elected within the DDL formation wait.
+    ///
+    /// The DDL was not applied anywhere: it never left this node. Distinct from
+    /// a degraded pair's "peer lost" (an operator must act) — formation is
+    /// expected to finish on its own, so the client retries (forge t_0cfbb511).
+    DdlFormationInProgress {
+        /// How long the DDL waited for formation.
+        waited_ms: u64,
+        /// The wait bound that expired.
+        bound_ms: u64,
+    },
     /// Attempted mode transition that is not allowed.
     ModeTransitionRejected(String),
     /// Replication to peer failed.
@@ -139,6 +151,15 @@ impl fmt::Display for ClusterError {
                 "DDL proposal not agreed: {operation} was accepted by the Raft leader but \
                  was not committed within {timeout_ms}ms (waited {elapsed_ms}ms, quorum \
                  required={required}, alive={alive}); the DDL is unconfirmed, retry it"
+            ),
+            Self::DdlFormationInProgress {
+                waited_ms,
+                bound_ms,
+            } => write!(
+                f,
+                "DDL unavailable: cluster formation in progress, no Raft leader elected \
+                 within {bound_ms}ms (waited {waited_ms}ms); the DDL was not applied, \
+                 retry it"
             ),
             Self::ModeTransitionRejected(reason) => write!(f, "mode transition rejected: {reason}"),
             Self::ReplicationFailed(reason) => write!(f, "replication failed: {reason}"),

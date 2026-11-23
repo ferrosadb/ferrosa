@@ -233,6 +233,7 @@ cluster-wide and severities run high. Several entries are *evidence* gaps
 | CL-85 | **A keyed index read materialized each replica's matches.** Each replica answered with one `IndexReadInPartitionResponse` holding every match. | Coordinator and replica memory scaled with the matches in the partition. | 7 | 4 | 6 | 168 → 14 | **Fixed (440914d2).** `coordinate_index_read_in_partition_stream` merges one row per replica by clustering. Remote replicas get `IndexReadInPartitionStreamRequest` (0x6A, gated by `CAP_INDEX_PARTITION_STREAM`) answered with ADR-020 stream frames; a peer without the bit gets the global index stream cut at the next partition and cancelled; legacy layouts unchanged. Tests: `tests/keyed_index_read_stream.rs` (10 001 rows over internode; capability fallback). Open: a replica failing mid-stream now fails the read instead of being covered by CL (t_db728529). |
 | CL-86 | **A pair write paid its two device flushes in series.** `PairCoordinator::coordinate_write_with` applied the mutation and fsynced the primary's commit log, and only then sent it to the secondary, which fsynced again before acking (per-write `force_commit_log_sync` since 5aaa72db, 2026-10-29). | Write latency was the SUM of two fsyncs plus a round trip. On a disk shared with other writers that put sequential p99 at 137 ms and a probe at 384 ms on CI (run 44390667223), past the `bulk_write_stability` bounds (100 ms / 300 ms) that guard the Raft-starvation fix. | 6 | 7 | 5 | 210 → 42 | **Fixed:** the local apply and the replica round trip run concurrently (`tokio::join!`); the write is still acknowledged only after both are durable, and a failure on either side is returned as before. A single mutation has no atomicity to tear, so the secondary may apply it before the primary's sync lands, the same unknown outcome a timed-out write already has. Test: `tests/bulk_write_stability.rs::replication_proceeds_while_the_primary_sync_is_blocked` (holds the primary's real flush mutex; RED: the secondary never received the row within 5 s). Quiet-disk sequential: 119 → 163 writes/s, p99 26.5 → 9.8 ms. **Batches (fixed):** `WritePath::write_batch` sent every mutation of a pair batch through `coordinate_write_with` in turn, N serial durable round trips, and applied it one mutation at a time on both nodes; the atomic path was test-only and `PairBatchForward` had no handler. Now `coordinate_batch_returning` applies the batch with `write_atomic_batch` while sending it to the secondary as one `PairBatchForward`, which `PairBatchForwardHandler` applies the same way (test `a_pair_batch_reaches_the_secondary_whole`; RED: the secondary logged 134 of 402 B and stalled). **Overlap probe hop (fixed):** the 2-5 ms that overlapping writes paid on the primary-to-secondary hop was Nagle on the dialed socket, ferrosa-net NET-21. **Residual:** every acknowledged pair write still waits for at least one device flush per node, so the absolute-latency bounds in `bulk_write_stability` fail when another process saturates the same disk (local reproduction: sequential p99 426 ms, probe p99 950 ms, all of it inside `fdatasync`); the staged write-set path (`WritePath` staged batches) still replicates one mutation at a time, because batching it would hold the whole write-set in memory. |
 | CL-87 | **A quarantined Raft group never recovered** (t_6f2ba27a) | A node restarted with an apply group interrupted mid-effect prepared a repair (`RepairPreparationState::Prepared`) and nothing consumed it, so it stayed at `waiting_for="consensus_runtime"` forever: never ready, never voting, holding no fresh metadata. | 7 | 3 | 5 | 105 → 21 | Fixed: the repair installer (`controller/raft_repair.rs`, overview "Repair installation") pulls a committed snapshot covering `max(floor, committed target)` from a capability-advertising same-DC peer, refuses one that would orphan local rows, installs and fsyncs it, purges the log, records `SnapshotSynced`, lifts the fence, releases admission at the prepared epoch and restarts the group. Retryable failures back off with edge logging; a non-retryable refusal sets `Failed` and stays loud. **Residual:** a partially applied `DROP TABLE` is always refused (no drop markers in snapshots). Tests: `a_prepared_repair_installs_a_peer_cut_and_restarts_the_group`, `a_repair_installs_a_covering_peer_snapshot_durably`, `a_repair_refuses_a_snapshot_below_its_minimum_and_changes_nothing`, `a_repair_refuses_a_snapshot_that_would_orphan_local_rows`, `a_quarantined_node_never_serves_its_own_state`, `an_installation_that_does_not_cover_the_committed_target_stays_quarantined`, `a_repair_takes_the_retired_log_handles_without_lifting_the_fence`, and the 3-process `ferrosa/tests/raft_repair_process.rs`. |
+| CL-88 | **The first DDL on a fresh cluster was refused, or acknowledged on one node only** (t_0cfbb511) | A client that saw all peers in `system.peers` (they appear before any leader exists) sent CREATE KEYSPACE while its node was still `Forming`. (1) The CQL router answered `Forming` like a lost pair peer: an immediate `DDL unavailable: peer lost`, nothing applied. (2) A follower that had published Cluster forwarded its DDL to a leader still inside its topology wait, which held the pair-mode `PairDdlForwardHandler`. That handler applied the DDL to the leader's local schema only and acked empty, read by the forwarder as committed: the client was told CREATE succeeded, the keyspace existed on the leader alone and in no Raft log. | 8 | 7 | 4 | 224 → 32 | **Fixed.** See the CL-88 section. Tests: real 3-process `ferrosa/tests/formation_late_node_first_ddl_process.rs` (late-node delay sweep 0-3 s; RED 18/18 before, 0/30 after), `ddl_path::tests::load_settled_*`, `router::tests::forming_ddl_tests::*`. |
 
 ## CL-77 — acknowledged DDL before Raft path publication
 
@@ -364,3 +365,55 @@ garbage length prefix and aborted the process on a 64 PiB allocation.
 **Rule.** Never regenerate these fixtures to make a test pass; a new field in
 any bincode-encoded Raft type goes in a trailing extension (as
 `SnapshotExtension` does) or out of the encoding.
+
+## CL-88 — the first DDL on a fresh cluster (2026-11-22, t_0cfbb511)
+
+**Symptom.** A fresh three-node cluster with one node starting about a second
+late: the first CREATE KEYSPACE failed with `DDL unavailable: peer lost`, or
+succeeded and was then not visible on the node that ran it. Seen in the
+coordinator microVM e2e; reproduced on loopback processes with no VM, so the
+VM network path is not involved.
+
+**Race 1: `Forming` answered as "peer lost".** `system.peers` lists a peer as
+soon as it connects, before any leader is elected, so a client that waits for
+its peers sends DDL inside the `Forming` window (0.4-0.6 s on loopback, 2-3 s
+when a member starts late). The router matched `Unavailable | Forming` together
+and returned the degraded-pair refusal: a false cause, no wait, nothing
+applied. `ddl_path::load_settled` now waits for the formation task to publish
+the path (bounded by `FORMING_DDL_WAIT`, 10 s, polling every 20 ms, an INFO
+line when it waited) and runs the DDL on what was published. A wait that
+expires returns `ClusterError::DdlFormationInProgress`, logged at WARN, which
+says formation is in progress, the DDL was not applied, and to retry. CQL
+(all 20 DDL sites), Postgres DDL and graph DDL use it. A path still `Forming`
+after the wait (unreachable in practice) is refused with its own message, never
+"peer lost". `Unavailable` keeps the pair message, which is true there.
+
+**Race 2: a leader with the pair DDL handler.** `transition_to_cluster`
+registered `ClusterDdlForwardHandler` only after the leader's own initial
+topology wait; followers publish Cluster and forward as soon as theirs ends.
+In that gap a node that passed through pair mode still held
+`PairDdlForwardHandler`, which on a pair secondary applies locally and acks
+with an empty payload, and `forward_ddl_to_leader` reads an empty ack as legacy
+success. Measured: the DDL reported success and the keyspace was readable on the
+leader only (`nodes that can read it: [2]`). `LazyClusterDdlForwardHandler` now
+replaces the pair handler at the start of the transition, beside the other
+`LazyRaft` handlers; a forward that arrives before Raft is published waits for
+it (`LazyRaft::get`, bounded) and goes through Raft, and one that finds no Raft
+gets no ack, so the forwarder retries.
+
+**Evidence.** `formation_late_node_first_ddl_process` starts a star (node0
+seedless, node2 at once, node1 after the swept delay), polls node0's
+`system.peers` every 20 ms, sends CREATE KEYSPACE and CREATE TABLE at QUORUM,
+and reads the table on every node. Odd runs give the highest host id, and so
+the Raft lead, to the late node. Before: 18/18 failed with `peer lost` (3 runs
+x 6 delays). Race 1 fixed alone: 17/18 failed, DDL ok but keyspace on the
+leader only. Both fixed: 0/30 failed (5 runs x 6 delays). Sabotage: restoring
+the plain load gives 6/6 refused; restoring the late handler registration gives
+6/6 acknowledged-but-leader-only.
+
+**Residual.** An empty `PairDdlAck` is still read as success on the cluster
+forward path, for mixed-version compatibility (t_9727eb8c); the `Forming` queue
+is no longer fed by the router, and `DdlPath::execute` on `Forming` both queues
+and errors (t_619efe68). There is no Lean model of path publication during
+formation (t_ab502d7a).
+

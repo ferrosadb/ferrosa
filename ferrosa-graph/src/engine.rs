@@ -544,8 +544,8 @@ impl GraphSchemaCoordinator for ClusterGraphSchemaCoordinator {
         columns: Vec<ferrosa_schema::metadata::column::ColumnMetadata>,
         _storage: &Arc<StorageEngine>,
     ) -> Result<()> {
-        self.ddl_path
-            .load()
+        settled_ddl_path(&self.ddl_path)
+            .await?
             .execute(ferrosa_cluster::pair::ddl::DdlOperation::AlterTable {
                 keyspace: keyspace.into(),
                 table: table.into(),
@@ -561,8 +561,8 @@ impl GraphSchemaCoordinator for ClusterGraphSchemaCoordinator {
         &self,
         index: ferrosa_schema::metadata::index::IndexMetadata,
     ) -> Result<()> {
-        self.ddl_path
-            .load()
+        settled_ddl_path(&self.ddl_path)
+            .await?
             .execute(ferrosa_cluster::pair::ddl::DdlOperation::CreateIndex(index))
             .await
             .map_err(|error| GraphError::Validation(format!("cluster DDL CreateIndex: {error}")))
@@ -571,7 +571,7 @@ impl GraphSchemaCoordinator for ClusterGraphSchemaCoordinator {
         &self,
         ks: ferrosa_schema::metadata::keyspace::KeyspaceMetadata,
     ) -> Result<()> {
-        let guard = self.ddl_path.load();
+        let guard = settled_ddl_path(&self.ddl_path).await?;
         guard
             .execute(ferrosa_cluster::pair::ddl::DdlOperation::CreateKeyspace(ks))
             .await
@@ -582,7 +582,7 @@ impl GraphSchemaCoordinator for ClusterGraphSchemaCoordinator {
         &self,
         table: ferrosa_schema::metadata::table::TableMetadata,
     ) -> Result<()> {
-        let guard = self.ddl_path.load();
+        let guard = settled_ddl_path(&self.ddl_path).await?;
         guard
             .execute(ferrosa_cluster::pair::ddl::DdlOperation::CreateTable(
                 Box::new(table),
@@ -590,6 +590,18 @@ impl GraphSchemaCoordinator for ClusterGraphSchemaCoordinator {
             .await
             .map_err(|e| GraphError::Validation(format!("cluster DDL CreateTable: {e}")))
     }
+}
+
+/// The DDL path to run on, with cluster formation waited out (bounded).
+///
+/// A forming path can neither commit a DDL nor report truthfully what happened
+/// to it, so DDL never runs on one (forge t_0cfbb511).
+async fn settled_ddl_path(
+    swap: &ArcSwap<ferrosa_cluster::ddl_path::DdlPath>,
+) -> Result<Arc<ferrosa_cluster::ddl_path::DdlPath>> {
+    ferrosa_cluster::ddl_path::load_settled(swap, ferrosa_cluster::ddl_path::FORMING_DDL_WAIT)
+        .await
+        .map_err(GraphError::from)
 }
 
 /// Composite configuration for the graph engine.
