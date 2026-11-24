@@ -61,6 +61,14 @@ PR #667 (the OOM burndown) records one more accepted growth on this pin: `ferros
 `Vec<u8>` fields need serde's `u8` instances, which name `Serialize`/`Deserialize` (Step 3 again).
 The same PR closes 427 reds, sparql alone 422.
 
+PR #675 (the red-ledger audit) records one more accepted growth on this pin: `red-ledger`
+`sorry.declaration` 3 -> 4. That crate is a pure data table — a `&'static str` constant per ledger
+row — and the audit made the discharged side machine-readable for the first time, so the table grew
+from 113 rows to 465. No proof weakened and no red was added: the extra hole is Aeneas's accounting
+for a larger static table in a crate that has no generics, no `unsafe` and no proof obligations. The
+alternative was to leave the 352 `.met` rows unexported, which is what let a stale model survive
+undetected, so the ceiling is raised deliberately here rather than silently.
+
 Step 3's opaque cut was implemented and measured before this pin (aeneas branch
 `feat/trait-group-cut`, `b8e5e200`, not pinned). Cutting the format-side serde traits and
 emitting the rest in dependency order removes the unknown identifiers, but costs a hole per cut

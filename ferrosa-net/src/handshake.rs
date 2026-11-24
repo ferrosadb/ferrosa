@@ -89,9 +89,16 @@ pub const CAP_PURGED_READ: u32 = 1 << 9;
 /// would drop the whole connection.
 pub const CAP_INDEX_PARTITION_STREAM: u32 = 1 << 10;
 
+/// The node serves `MsgType::RaftRepairSnapshotRequest`: it hands a
+/// quarantined peer a committed snapshot covering that peer's repair target,
+/// building a newer one when its current snapshot is too old. A peer without
+/// the bit is never asked; an unknown type byte would drop the connection.
+pub const CAP_RAFT_REPAIR_SNAPSHOT: u32 = 1 << 11;
+
 /// Every capability this build understands, advertised in its Handshake and
 /// HandshakeAck.
 pub const LOCAL_CAPABILITIES: u32 = CAP_PAIR_AUTHORITY
+    | CAP_RAFT_REPAIR_SNAPSHOT
     | CAP_PURGED_READ
     | CAP_INDEX_PARTITION_STREAM
     | CAP_RPC_ERROR_REPLY

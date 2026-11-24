@@ -1068,6 +1068,11 @@ impl LazyRaft {
         (tx, Self { rx })
     }
 
+    /// The Raft instance if it is already running, without waiting.
+    pub(crate) fn current(&self) -> Option<Arc<super::FerrosRaft>> {
+        self.rx.borrow().clone()
+    }
+
     /// Wait for the Raft instance to be initialized, retrying with backoff.
     ///
     /// Makes up to 3 attempts with 5-second backoff between retries (total

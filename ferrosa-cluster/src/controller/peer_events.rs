@@ -623,6 +623,19 @@ impl PeerEventListener for ModeController {
     fn on_peer_suspected(&self, peer: PeerId) {
         let (host_id, _addr) = peer;
         tracing::warn!(peer = %host_id, "peer suspected dead (not transitioning)");
+        // Three missed heartbeats is the watchdog's evidence that the transport
+        // is gone, so a peer it declared dead is no longer a connected peer.
+        // Leaving it in the live view made `refuse_promotion_over_a_connected_peer`
+        // refuse an operator promotion of the surviving pair member ("still
+        // connected") until the lanes failed — nightly smoke run 43549692347.
+        // `Topology/Pair.lean` admits `Step.promote1` only while the peer is
+        // down, and `on_peer_recovered` re-adds a missing peer. No mode
+        // transition: a suspect is not a confirmed outage.
+        self.connected_peers.rcu(|current| {
+            let mut next = (**current).clone();
+            next.retain(|(id, _)| *id != host_id);
+            next
+        });
     }
 
     fn on_peer_recovered(&self, peer_id: uuid::Uuid) {

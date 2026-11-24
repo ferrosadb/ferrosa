@@ -337,6 +337,11 @@ before opening its writer and consumes the challenge once. Wrong peers,
 malformed messages, replayed grants and legacy `RoleSwap` cannot promote.
 Timeout/cancellation after withdrawal leaves the sender fenced. The same
 handoff gate drains admitted writes and DDL and is retained across re-pairing.
+Before the authority exchange the primary pushes its schema and requires an ack
+naming the version it pushed; a `Bulk` lane that is still reconnecting has not
+carried that request, so the push waits for the redial inside the switchover
+timeout instead of reporting the peer unconfirmed, and a peer that never
+answers still refuses the handoff.
 Reconnect takes this gate before choosing or installing a role; a busy transfer
 or admitted write defers reconnect without consuming operator promotion state.
 Mixed-version handoff fails with an upgrade error. Replica promotion remains an
@@ -456,7 +461,40 @@ Retries retain the same scope and failed-owner history. While it is fenced,
 ordinary group starts/publication and global Pair retirement refuse; unrelated
 group registration remains available. The returned observations are quiescence
 and log-position evidence, not a storage-adoption or healthy-state receipt.
-There is no fault-clear or replacement-release operation in this prerequisite.
+Only the retirement that fenced a group lifts it: `release_retired_log` hands
+the retired owners' log handles to the repair while the fence stands, and
+`finish_recovery` lifts the fence once the repair is durable.
 
 
-Recovery sessions retain a durable pre-effect guard beside each Raft group directory. The guard is armed before an apply group's physical effects and settles once they all complete, so a restart after completed applies replays the un-snapshotted log tail as normal. Only a group interrupted mid-effect, or one whose apply failed or panicked, is an unsafe restart. After an unsafe restart, native startup keeps admission closed, drains that group’s actual state-machine owner, and records the retirement scope plus committed and purged bounds for repair preparation. Repeated peer discovery retains that session rather than reopening its files. Preparation does not authorize data installation, Core replacement, or healthy admission; verified physical-data installation and the corresponding release path remain unfinished.
+Recovery sessions retain a durable pre-effect guard beside each Raft group directory. The guard is armed before an apply group's physical effects and settles once they all complete, so a restart after completed applies replays the un-snapshotted log tail as normal. Only a group interrupted mid-effect, or one whose apply failed or panicked, is an unsafe restart. After an unsafe restart, native startup keeps admission closed, drains that group’s actual state-machine owner, and records the retirement scope plus committed and purged bounds for repair preparation. Repeated peer discovery retains that session rather than reopening its files. Preparation alone does not authorize data installation, Core replacement, or healthy admission.
+
+### Repair installation (t_6f2ba27a)
+
+A prepared repair is completed by `controller/raft_repair.rs`. The design source
+is `specs/lean4/Ferrosa/Raft/Quarantine.lean`.
+
+1. **Fetch.** A driver task asks each same-DC peer advertising
+   `CAP_RAFT_REPAIR_SNAPSHOT` for a committed snapshot through at least
+   `max(required_snapshot_index, committed_target.index)`, so no entry this
+   node may have half-applied is replayed. A peer serves only while its own
+   admission admits (`raft/repair_snapshot.rs`); when its current snapshot is
+   too old it triggers one and waits a bounded time. Retries back off to 30 s
+   and log only the edges of a failing streak.
+2. **Verify and install.** At the target index the cut's leader must match
+   the target. `FerrosStateMachine::install_repair_snapshot` refuses a cut that
+   omits a local table holding rows (no lost durable data; checked against the
+   live schema, since the install machine starts empty), then applies it as an
+   authoritative install, fsyncs `state-machine.snapshot.bin` and raises the
+   durable watermark.
+3. **Leave quarantine.** The local log is purged through the cut (and the purge
+   point checked, since a purge can defer), the journal records `SnapshotSynced`
+   (`RecoverySession::repair_installed`), the fence is lifted, the `local-raft`
+   admission fault is released at the prepared epoch, and the cluster transition
+   is re-driven, starting Raft from the installed snapshot.
+
+A crash before the journal write restarts quarantined and prepares again from
+the larger purge point; a crash after it starts healthy. A refusal that retrying
+cannot fix (orphaned local rows) moves the preparation to `Failed` and the group
+stays quarantined, loudly. **Known limit:** a partially applied `DROP TABLE` is
+always refused this way, because snapshots carry no drop markers; that node
+needs an operator decision.

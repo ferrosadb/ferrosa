@@ -11561,6 +11561,37 @@ fn materialize_delete(
     Ok((table_id, decorated_key, row, timestamp))
 }
 
+// ── DDL: path selection ──────────────────────────────────────────────────
+
+/// The DDL path a statement runs on, with cluster formation waited out.
+///
+/// Every DDL route loads its path here. A node lists its peers before it has a
+/// Raft leader, so a client that treats "peers listed" as ready sends its first
+/// DDL while the node is still forming. That DDL used to be answered at once with
+/// the degraded-pair "DDL unavailable: peer lost" — a false cause, never applied
+/// (forge t_0cfbb511). It now waits, bounded, for formation to publish the
+/// replicated path, and fails with an honest, retryable error if it does not.
+async fn settled_ddl_path(
+    swap: &arc_swap::ArcSwap<DdlPath>,
+) -> Result<std::sync::Arc<DdlPath>, CqlError> {
+    ferrosa_cluster::ddl_path::load_settled(swap, ferrosa_cluster::ddl_path::FORMING_DDL_WAIT)
+        .await
+        .map_err(CqlError::from)
+}
+
+/// Refusal for a DDL whose settled path is still `Forming`.
+///
+/// [`settled_ddl_path`] never returns a forming path, so a route reaching this
+/// arm means that contract broke. Fail the statement loudly rather than report
+/// a cause that is not true.
+fn ddl_path_still_forming() -> CqlError {
+    tracing::error!("DDL routed on a Forming path after the formation wait; refusing it");
+    CqlError::ServerError(
+        "DDL unavailable: cluster formation in progress; the DDL was not applied, retry it"
+            .to_string(),
+    )
+}
+
 // ── DDL: Keyspace ────────────────────────────────────────────────────────
 
 async fn route_create_keyspace(
@@ -11626,8 +11657,8 @@ async fn route_create_keyspace(
     // agreement — has to be rejected here, before replication, on every DdlPath.
     ferrosa_schema::validation::validate_keyspace(&ks_meta)?;
 
-    let ddl_guard = state.ddl_path.load();
-    let ddl = &**ddl_guard;
+    let ddl_guard = settled_ddl_path(&state.ddl_path).await?;
+    let ddl = &*ddl_guard;
     let actually_created = match ddl {
         DdlPath::Direct { .. } => {
             let event_sender = state.event_sender.clone();
@@ -11668,11 +11699,12 @@ async fn route_create_keyspace(
             ddl.execute(op).await.map_err(CqlError::from)?;
             true
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
         }
+        DdlPath::Forming { .. } => return Err(ddl_path_still_forming()),
     };
 
     if actually_created {
@@ -11722,8 +11754,8 @@ async fn route_alter_keyspace(
         durable_writes: s.durable_writes,
     };
 
-    let ddl_guard = state.ddl_path.load();
-    let ddl = &**ddl_guard;
+    let ddl_guard = settled_ddl_path(&state.ddl_path).await?;
+    let ddl = &*ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
             let name = s.name.clone();
@@ -11747,11 +11779,12 @@ async fn route_alter_keyspace(
             };
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
         }
+        DdlPath::Forming { .. } => return Err(ddl_path_still_forming()),
     }
 
     Ok(result::encode_schema_change(
@@ -11782,8 +11815,8 @@ async fn route_drop_keyspace(
         ));
     }
 
-    let ddl_guard = state.ddl_path.load();
-    let ddl = &**ddl_guard;
+    let ddl_guard = settled_ddl_path(&state.ddl_path).await?;
+    let ddl = &*ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
             // Collect tables before drop so we can unregister from storage.
@@ -11857,11 +11890,12 @@ async fn route_drop_keyspace(
             let op = DdlOperation::DropKeyspace(s.name.clone());
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
         }
+        DdlPath::Forming { .. } => return Err(ddl_path_still_forming()),
     }
 
     emit_schema_change(
@@ -11981,8 +12015,8 @@ async fn route_create_table(
     // Raft) sees the statement.
     state.schema.check_create_table_jsonb(&table_meta)?;
 
-    let ddl_guard = state.ddl_path.load();
-    let ddl = &**ddl_guard;
+    let ddl_guard = settled_ddl_path(&state.ddl_path).await?;
+    let ddl = &*ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
             let event_sender = state.event_sender.clone();
@@ -12069,11 +12103,12 @@ async fn route_create_table(
             // Auto-create cascade tables after primary table is created.
             create_cascade_tables_if_needed(state, &table_meta)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
         }
+        DdlPath::Forming { .. } => return Err(ddl_path_still_forming()),
     }
 
     // Durability barrier — the last thing before the acknowledgement.
@@ -12408,8 +12443,8 @@ async fn route_alter_table(
         .schema
         .check_alter_table_jsonb(ks, &s.table, &updates)?;
 
-    let ddl_guard = state.ddl_path.load();
-    let ddl = &**ddl_guard;
+    let ddl_guard = settled_ddl_path(&state.ddl_path).await?;
+    let ddl = &*ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
             let keyspace = ks.to_string();
@@ -12485,11 +12520,12 @@ async fn route_alter_table(
             };
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
         }
+        DdlPath::Forming { .. } => return Err(ddl_path_still_forming()),
     }
 
     persist_registry_snapshot_before_ack(state, &s.table)?;
@@ -12538,8 +12574,8 @@ async fn route_drop_table(
         ));
     }
 
-    let ddl_guard = state.ddl_path.load();
-    let ddl = &**ddl_guard;
+    let ddl_guard = settled_ddl_path(&state.ddl_path).await?;
+    let ddl = &*ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
             let tid = TableId::new(ks, &s.table);
@@ -12597,11 +12633,12 @@ async fn route_drop_table(
             };
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
         }
+        DdlPath::Forming { .. } => return Err(ddl_path_still_forming()),
     }
 
     persist_registry_snapshot_before_ack(state, &s.table)?;
@@ -13149,8 +13186,8 @@ async fn route_create_index(
         options: options_map,
     };
 
-    let ddl_guard = state.ddl_path.load();
-    let ddl = &**ddl_guard;
+    let ddl_guard = settled_ddl_path(&state.ddl_path).await?;
+    let ddl = &*ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
             let mut index_meta = index_meta.clone();
@@ -13250,11 +13287,12 @@ async fn route_create_index(
             let op = DdlOperation::CreateIndex(index_meta.clone());
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
         }
+        DdlPath::Forming { .. } => return Err(ddl_path_still_forming()),
     }
 
     wire_created_index(state, &index_meta, vector_method)?;
@@ -13553,8 +13591,8 @@ async fn route_drop_index(
         &Resource::Table(ks.to_string(), table_name.clone()),
     )?;
 
-    let ddl_guard = state.ddl_path.load();
-    let ddl = &**ddl_guard;
+    let ddl_guard = settled_ddl_path(&state.ddl_path).await?;
+    let ddl = &*ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
             let index_name = s.name.clone();
@@ -13619,11 +13657,12 @@ async fn route_drop_index(
             };
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
         }
+        DdlPath::Forming { .. } => return Err(ddl_path_still_forming()),
     }
 
     // Schema-change events use the owning TABLE target so clients refresh its
@@ -13722,8 +13761,8 @@ async fn route_create_role(
         scram: None,
     };
 
-    let ddl_guard = state.ddl_path.load();
-    let ddl = &**ddl_guard;
+    let ddl_guard = settled_ddl_path(&state.ddl_path).await?;
+    let ddl = &*ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
             let name = s.name.clone();
@@ -13776,11 +13815,12 @@ async fn route_create_role(
                 _ => unreachable!("matched in outer match"),
             }
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
         }
+        DdlPath::Forming { .. } => return Err(ddl_path_still_forming()),
     }
 
     Ok(result::encode_void())
@@ -13803,8 +13843,8 @@ async fn route_alter_role(
         ));
     }
 
-    let ddl_guard = state.ddl_path.load();
-    let ddl = &**ddl_guard;
+    let ddl_guard = settled_ddl_path(&state.ddl_path).await?;
+    let ddl = &*ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
             let name = s.name.clone();
@@ -13867,11 +13907,12 @@ async fn route_alter_role(
                 _ => unreachable!("matched in outer match"),
             }
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
         }
+        DdlPath::Forming { .. } => return Err(ddl_path_still_forming()),
     }
 
     Ok(result::encode_void())
@@ -13887,8 +13928,8 @@ async fn route_drop_role(
         .schema
         .check_permission(ctx.auth, Permission::Drop, &Resource::Role(s.name.clone()))?;
 
-    let ddl_guard = state.ddl_path.load();
-    let ddl = &**ddl_guard;
+    let ddl_guard = settled_ddl_path(&state.ddl_path).await?;
+    let ddl = &*ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
             let name = s.name.clone();
@@ -13917,11 +13958,12 @@ async fn route_drop_role(
             let op = DdlOperation::DropRole(s.name.clone());
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
         }
+        DdlPath::Forming { .. } => return Err(ddl_path_still_forming()),
     }
 
     Ok(result::encode_void())
@@ -14126,8 +14168,8 @@ async fn route_grant(
     let resource = ast_resource_to_schema(&s.resource, ctx.current_keyspace)?;
     let perms = parse_permissions(&s.permissions)?;
 
-    let ddl_guard = state.ddl_path.load();
-    let ddl = &**ddl_guard;
+    let ddl_guard = settled_ddl_path(&state.ddl_path).await?;
+    let ddl = &*ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
             let role = s.role.clone();
@@ -14162,11 +14204,12 @@ async fn route_grant(
             });
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
         }
+        DdlPath::Forming { .. } => return Err(ddl_path_still_forming()),
     }
 
     Ok(result::encode_void())
@@ -14187,8 +14230,8 @@ async fn route_revoke(
     let resource = ast_resource_to_schema(&s.resource, ctx.current_keyspace)?;
     let perms = parse_permissions(&s.permissions)?;
 
-    let ddl_guard = state.ddl_path.load();
-    let ddl = &**ddl_guard;
+    let ddl_guard = settled_ddl_path(&state.ddl_path).await?;
+    let ddl = &*ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
             let role = s.role.clone();
@@ -14233,11 +14276,12 @@ async fn route_revoke(
                 ddl.execute(op).await.map_err(CqlError::from)?;
             }
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
         }
+        DdlPath::Forming { .. } => return Err(ddl_path_still_forming()),
     }
 
     Ok(result::encode_void())
@@ -14286,8 +14330,8 @@ async fn route_grant_role(
         }
     };
 
-    let ddl_guard = state.ddl_path.load();
-    let ddl = &**ddl_guard;
+    let ddl_guard = settled_ddl_path(&state.ddl_path).await?;
+    let ddl = &*ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
             run_direct_schema_change(state, ctx.auth, move |core, auth| {
@@ -14304,11 +14348,12 @@ async fn route_grant_role(
         DdlPath::Cluster { .. } => {
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
         }
+        DdlPath::Forming { .. } => return Err(ddl_path_still_forming()),
     }
 
     Ok(result::encode_void())
@@ -16631,8 +16676,8 @@ async fn route_create_type(
         ));
     }
 
-    let ddl_guard = state.ddl_path.load();
-    let ddl = &**ddl_guard;
+    let ddl_guard = settled_ddl_path(&state.ddl_path).await?;
+    let ddl = &*ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
             let job_keyspace = ks.clone();
@@ -16666,11 +16711,12 @@ async fn route_create_type(
             let op = DdlOperation::CreateType(udt);
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
         }
+        DdlPath::Forming { .. } => return Err(ddl_path_still_forming()),
     }
 
     Ok(result::encode_schema_change(
@@ -16778,8 +16824,8 @@ async fn route_drop_type(
         ));
     }
 
-    let ddl_guard = state.ddl_path.load();
-    let ddl = &**ddl_guard;
+    let ddl_guard = settled_ddl_path(&state.ddl_path).await?;
+    let ddl = &*ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
             let job_keyspace = ks.clone();
@@ -16819,11 +16865,12 @@ async fn route_drop_type(
             };
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
         }
+        DdlPath::Forming { .. } => return Err(ddl_path_still_forming()),
     }
 
     Ok(result::encode_schema_change(
@@ -17081,8 +17128,8 @@ async fn route_create_function(
         body: stored_body,
     };
 
-    let ddl_guard = state.ddl_path.load();
-    let ddl = &**ddl_guard;
+    let ddl_guard = settled_ddl_path(&state.ddl_path).await?;
+    let ddl = &*ddl_guard;
     if !matches!(ddl, DdlPath::Direct { .. }) {
         compile_function_component(state, &ks, &name, &func_meta.arg_types, &wasm_bytes)?;
     }
@@ -17169,11 +17216,12 @@ async fn route_create_function(
             let op = DdlOperation::CreateFunction(func_meta);
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
         }
+        DdlPath::Forming { .. } => return Err(ddl_path_still_forming()),
     }
 
     Ok(result::encode_schema_change_with_args(
@@ -17268,8 +17316,8 @@ async fn route_drop_function(
         ));
     }
 
-    let ddl_guard = state.ddl_path.load();
-    let ddl = &**ddl_guard;
+    let ddl_guard = settled_ddl_path(&state.ddl_path).await?;
+    let ddl = &*ddl_guard;
     if !matches!(ddl, DdlPath::Direct { .. }) {
         state
             .udf_executor
@@ -17324,11 +17372,12 @@ async fn route_drop_function(
             };
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
         }
+        DdlPath::Forming { .. } => return Err(ddl_path_still_forming()),
     }
 
     Ok(result::encode_schema_change_with_args(
@@ -17440,8 +17489,8 @@ async fn route_create_aggregate(
         Ok(metadata)
     };
 
-    let ddl_guard = state.ddl_path.load();
-    let ddl = &**ddl_guard;
+    let ddl_guard = settled_ddl_path(&state.ddl_path).await?;
+    let ddl = &*ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
             let keyspace = ks.clone();
@@ -17508,11 +17557,12 @@ async fn route_create_aggregate(
                 _ => unreachable!("matched in outer match"),
             }
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
         }
+        DdlPath::Forming { .. } => return Err(ddl_path_still_forming()),
     }
 
     Ok(result::encode_schema_change_with_args(
@@ -17608,8 +17658,8 @@ async fn route_drop_aggregate(
         ));
     }
 
-    let ddl_guard = state.ddl_path.load();
-    let ddl = &**ddl_guard;
+    let ddl_guard = settled_ddl_path(&state.ddl_path).await?;
+    let ddl = &*ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
             let keyspace = ks.clone();
@@ -17657,11 +17707,12 @@ async fn route_drop_aggregate(
             };
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
         }
+        DdlPath::Forming { .. } => return Err(ddl_path_still_forming()),
     }
 
     Ok(result::encode_schema_change_with_args(
@@ -18064,6 +18115,7 @@ fn term_has_udf_call(term: &Term) -> bool {
 #[cfg(test)]
 mod tests {
     mod conditional_schema_tests;
+    mod forming_ddl_tests;
     use super::*;
     use crate::virtual_tables::active_queries::ActiveQueriesTable;
     use crate::virtual_tables::connections::ConnectionsTable;

@@ -176,6 +176,8 @@ mod tests {
             MsgType::RaftVote as u8,
             MsgType::RaftVoteResponse as u8,
             MsgType::RaftInstallSnapshot as u8,
+            MsgType::RaftRepairSnapshotRequest as u8,
+            MsgType::RaftRepairSnapshotResponse as u8,
             MsgType::MutationForward as u8,
             MsgType::MutationAck as u8,
             MsgType::ReadRequest as u8,

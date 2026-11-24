@@ -127,6 +127,34 @@ pub enum ApplyError {
     Other(String),
 }
 
+/// **A replayed schema effect is a no-op, not a failure.**
+///
+/// `Ferrosa/Raft/Partial.lean` proves `every_prepublication_effect_is_idempotent` over
+/// `prePublicationEffects`, with `idem e = .same` for every member — "the second application does
+/// not make the state worse". The type, function and aggregate effects were not in that list, and
+/// they were not idempotent: `create_type_internal` returns `TypeExists` when the name is present
+/// (`ferrosa-schema/src/registry.rs:1830-1835`), and `drop_type_internal` returns `TypeNotFound`
+/// when it is absent. Because the arms below turn any schema error into `ApplyError::Other`, whose
+/// `fences_replica()` is `true`, a replay latched the machine.
+///
+/// Replay is not hypothetical: it is what a node does on boot when the effect landed before the
+/// entry published, so a single replayed DDL entry made a node permanently unable to apply.
+///
+/// This returns `true` for "the schema is already in the state this effect asked for", which is
+/// exactly `.same`. It is deliberately narrow — only the two errors that mean "already applied" are
+/// absorbed. Every other schema error still fences.
+fn schema_already_reflects(result: &ferrosa_schema::Result<()>) -> bool {
+    matches!(
+        result,
+        Err(ferrosa_schema::SchemaError::TypeExists(..))
+            | Err(ferrosa_schema::SchemaError::TypeNotFound(..))
+            | Err(ferrosa_schema::SchemaError::FunctionExists(..))
+            | Err(ferrosa_schema::SchemaError::FunctionNotFound(..))
+            | Err(ferrosa_schema::SchemaError::AggregateExists(..))
+            | Err(ferrosa_schema::SchemaError::AggregateNotFound(..))
+    )
+}
+
 impl ApplyError {
     fn unregister(
         keyspace: String,
@@ -504,6 +532,41 @@ impl std::fmt::Display for RecoveryError {
 
 impl std::error::Error for RecoveryError {}
 
+/// Why a repair could not install a peer's snapshot.
+#[derive(Debug)]
+pub(crate) enum RepairInstallError {
+    /// The cut does not reach the repair's minimum index; a later or other
+    /// peer's snapshot may.
+    Insufficient(String),
+    /// The bytes did not decode or carried no log position.
+    Invalid(String),
+    /// Installing would discard or orphan durable local data. Retrying the
+    /// same repair cannot resolve it, so the node stays quarantined.
+    Refused(String),
+    /// Applying or persisting failed locally.
+    Local(String),
+}
+
+impl RepairInstallError {
+    /// Whether another attempt, perhaps from another peer, could succeed.
+    pub(crate) fn is_retryable(&self) -> bool {
+        matches!(self, Self::Insufficient(_) | Self::Invalid(_))
+    }
+}
+
+impl std::fmt::Display for RepairInstallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Insufficient(reason) => write!(f, "insufficient repair snapshot: {reason}"),
+            Self::Invalid(reason) => write!(f, "invalid repair snapshot: {reason}"),
+            Self::Refused(reason) => write!(f, "repair refused: {reason}"),
+            Self::Local(reason) => write!(f, "repair install failed locally: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for RepairInstallError {}
+
 /// A local file supplies a durable metadata cut, not the ordering of an
 /// already-registered physical incarnation against retained committed entries.
 #[derive(Clone, Copy)]
@@ -513,7 +576,8 @@ enum SnapshotSource {
 }
 
 /// The current-snapshot slot one live state machine shares with its builders.
-type SharedSnapshotSlot = Arc<parking_lot::RwLock<Option<(SnapshotMeta<u64, BasicNode>, Vec<u8>)>>>;
+pub(crate) type SharedSnapshotSlot =
+    Arc<parking_lot::RwLock<Option<(SnapshotMeta<u64, BasicNode>, Vec<u8>)>>>;
 
 struct CompletedApply {
     state: RaftState,
@@ -604,6 +668,13 @@ impl FerrosStateMachine {
         expected: &Arc<super::quarantine::RecoveryAdmission>,
     ) -> bool {
         std::sync::Arc::ptr_eq(&self.recovery_admission, expected)
+    }
+
+    /// The slot this machine and its builders publish snapshots into, shared
+    /// so a repair server can read the committed cut after the machine has
+    /// moved into Raft.
+    pub(crate) fn snapshot_slot(&self) -> SharedSnapshotSlot {
+        Arc::clone(&self.current_snapshot)
     }
 
     pub(crate) fn physical_lifecycle(&self) -> Arc<super::physical_apply::PhysicalApplyLifecycle> {
@@ -1020,6 +1091,21 @@ impl FerrosStateMachine {
         sm.recovery_session = Some(Arc::new(
             super::recovery_session::RecoverySession::for_snapshot(&snapshot_path),
         ));
+        sm.snapshot_path = Some(snapshot_path);
+        sm
+    }
+
+    /// A state machine for a repair install that shares the repair's open
+    /// recovery session. Opening a second session would contend for the
+    /// journal lease the repair already holds.
+    pub(crate) fn for_repair(
+        schema: Arc<Schema>,
+        engine: Arc<StorageEngine>,
+        snapshot_path: PathBuf,
+        session: Arc<super::recovery_session::RecoverySession>,
+    ) -> Self {
+        let mut sm = Self::with_side_effects(schema, engine);
+        sm.recovery_session = Some(session);
         sm.snapshot_path = Some(snapshot_path);
         sm
     }
@@ -1498,6 +1584,68 @@ impl FerrosStateMachine {
                 .and_then(|dir| dir.sync_all())
                 .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
         }
+        Ok(())
+    }
+
+    /// Adopt a peer's committed snapshot as this quarantined node's state.
+    ///
+    /// This is the repair's install step, run on a fresh machine for the
+    /// group while Raft is not running, so nothing else applies concurrently.
+    /// It checks the cut before touching anything:
+    ///
+    /// * `last_log_id` must reach `minimum`, the index at or above which
+    ///   nothing this node half-applied lies. A shorter cut is retryable.
+    /// * No table this node holds rows for may be absent from the cut. The
+    ///   fresh machine's own state is empty, so the comparison is against the
+    ///   live schema, which is what the node actually holds. Absence is
+    ///   ambiguous without a drop marker, so the node refuses rather than
+    ///   orphan the rows (obligation 4: no lost durable data).
+    ///
+    /// Only then does it apply the snapshot to the schema and engine as an
+    /// authoritative install, so a same-name table with another incarnation
+    /// is retired. The cut covers this node's committed target, which is
+    /// the chronology a persisted startup snapshot lacks. Finally it fsyncs
+    /// `state-machine.snapshot.bin` and raises the durable watermark. The
+    /// caller records the repair in the journal only after this returns.
+    pub(crate) fn install_repair_snapshot(
+        &mut self,
+        meta: &SnapshotMeta<u64, BasicNode>,
+        bytes: &[u8],
+        minimum: u64,
+    ) -> Result<(), RepairInstallError> {
+        let Some(installed) = meta.last_log_id else {
+            return Err(RepairInstallError::Invalid(
+                "the snapshot carries no log position".into(),
+            ));
+        };
+        if installed.index < minimum {
+            return Err(RepairInstallError::Insufficient(format!(
+                "snapshot through {installed} is below the repair minimum {minimum}"
+            )));
+        }
+        let data = decode_snapshot(bytes)
+            .map_err(|error| RepairInstallError::Invalid(error.to_string()))?;
+        if let Some(schema) = &self.schema {
+            let held: BTreeMap<(String, String), TableMetadata> = schema
+                .snapshot()
+                .tables
+                .iter()
+                .map(|(name, table)| (name.clone(), table.clone()))
+                .collect();
+            let absent = tables_absent_from_snapshot(&held, &data.state.tables);
+            self.refuse_ambiguous_snapshot_drops(&absent, meta.last_log_id)
+                .map_err(|error| RepairInstallError::Refused(error.to_string()))?;
+        }
+        self.apply_snapshot_data_from(meta, bytes, SnapshotSource::Installed)
+            .map_err(|error| RepairInstallError::Local(error.to_string()))?;
+        if let Some(path) = &self.snapshot_path {
+            Self::persist_snapshot_to_disk(path, meta, bytes)
+                .map_err(|error| RepairInstallError::Local(error.to_string()))?;
+        }
+        self.publish_snapshot(meta.clone(), bytes.to_vec());
+        self.mark_durably_applied(meta.last_log_id);
+        self.physical_lifecycle.applied(self.last_applied);
+        tracing::info!(%installed, minimum, "Raft repair installed a peer snapshot");
         Ok(())
     }
 
@@ -2123,11 +2271,14 @@ impl FerrosStateMachine {
                     });
                 }
                 if let Some(schema) = &self.schema {
-                    if let Err(e) = schema.create_type_internal(&udt) {
-                        tracing::error!(%e, "Raft apply: schema.create_type_internal failed");
-                        apply_errors.push(ApplyError::Other(format!(
-                            "schema.create_type_internal failed: {e}"
-                        )));
+                    let result = schema.create_type_internal(&udt);
+                    if !schema_already_reflects(&result) {
+                        if let Err(e) = result {
+                            tracing::error!(%e, "Raft apply: schema.create_type_internal failed");
+                            apply_errors.push(ApplyError::Other(format!(
+                                "schema.create_type_internal failed: {e}"
+                            )));
+                        }
                     }
                 }
             }
@@ -2144,11 +2295,14 @@ impl FerrosStateMachine {
                     });
                 }
                 if let Some(schema) = &self.schema {
-                    if let Err(e) = schema.drop_type_internal(&keyspace, &name) {
-                        tracing::error!(%e, "Raft apply: schema.drop_type_internal failed");
-                        apply_errors.push(ApplyError::Other(format!(
-                            "schema.drop_type_internal failed: {e}"
-                        )));
+                    let result = schema.drop_type_internal(&keyspace, &name);
+                    if !schema_already_reflects(&result) {
+                        if let Err(e) = result {
+                            tracing::error!(%e, "Raft apply: schema.drop_type_internal failed");
+                            apply_errors.push(ApplyError::Other(format!(
+                                "schema.drop_type_internal failed: {e}"
+                            )));
+                        }
                     }
                 }
             }
@@ -2172,11 +2326,14 @@ impl FerrosStateMachine {
                     });
                 }
                 if let Some(schema) = &self.schema {
-                    if let Err(e) = schema.create_function_internal(&func) {
-                        tracing::error!(%e, "Raft apply: schema.create_function_internal failed");
-                        apply_errors.push(ApplyError::Other(format!(
-                            "schema.create_function_internal failed: {e}"
-                        )));
+                    let result = schema.create_function_internal(&func);
+                    if !schema_already_reflects(&result) {
+                        if let Err(e) = result {
+                            tracing::error!(%e, "Raft apply: schema.create_function_internal failed");
+                            apply_errors.push(ApplyError::Other(format!(
+                                "schema.create_function_internal failed: {e}"
+                            )));
+                        }
                     }
                 }
             }
@@ -2199,11 +2356,14 @@ impl FerrosStateMachine {
                     });
                 }
                 if let Some(schema) = &self.schema {
-                    if let Err(e) = schema.drop_function_internal(&keyspace, &name, &arg_types) {
-                        tracing::error!(%e, "Raft apply: schema.drop_function_internal failed");
-                        apply_errors.push(ApplyError::Other(format!(
-                            "schema.drop_function_internal failed: {e}"
-                        )));
+                    let result = schema.drop_function_internal(&keyspace, &name, &arg_types);
+                    if !schema_already_reflects(&result) {
+                        if let Err(e) = result {
+                            tracing::error!(%e, "Raft apply: schema.drop_function_internal failed");
+                            apply_errors.push(ApplyError::Other(format!(
+                                "schema.drop_function_internal failed: {e}"
+                            )));
+                        }
                     }
                 }
             }
@@ -2220,11 +2380,14 @@ impl FerrosStateMachine {
                     .entry(key)
                     .or_insert_with(|| agg.clone());
                 if let Some(schema) = &self.schema {
-                    if let Err(e) = schema.create_aggregate_internal(&agg) {
-                        tracing::error!(%e, "Raft apply: schema.create_aggregate_internal failed");
-                        apply_errors.push(ApplyError::Other(format!(
-                            "schema.create_aggregate_internal failed: {e}"
-                        )));
+                    let result = schema.create_aggregate_internal(&agg);
+                    if !schema_already_reflects(&result) {
+                        if let Err(e) = result {
+                            tracing::error!(%e, "Raft apply: schema.create_aggregate_internal failed");
+                            apply_errors.push(ApplyError::Other(format!(
+                                "schema.create_aggregate_internal failed: {e}"
+                            )));
+                        }
                     }
                 }
             }
@@ -2236,11 +2399,14 @@ impl FerrosStateMachine {
                 let key = (keyspace.clone(), name.clone(), arg_types.clone());
                 self.state.aggregates.remove(&key);
                 if let Some(schema) = &self.schema {
-                    if let Err(e) = schema.drop_aggregate_internal(&keyspace, &name, &arg_types) {
-                        tracing::error!(%e, "Raft apply: schema.drop_aggregate_internal failed");
-                        apply_errors.push(ApplyError::Other(format!(
-                            "schema.drop_aggregate_internal failed: {e}"
-                        )));
+                    let result = schema.drop_aggregate_internal(&keyspace, &name, &arg_types);
+                    if !schema_already_reflects(&result) {
+                        if let Err(e) = result {
+                            tracing::error!(%e, "Raft apply: schema.drop_aggregate_internal failed");
+                            apply_errors.push(ApplyError::Other(format!(
+                                "schema.drop_aggregate_internal failed: {e}"
+                            )));
+                        }
                     }
                 }
             }
@@ -4458,6 +4624,133 @@ mod tests {
             .contains_key(&(incoming.keyspace, incoming.name)));
     }
 
+    /// A healthy peer's snapshot through index 2: keyspace `repair_ks`, table
+    /// `repair_ks.repaired`.
+    async fn peer_snapshot() -> (SnapshotMeta<u64, BasicNode>, Vec<u8>) {
+        let mut peer = FerrosStateMachine::new();
+        peer.apply(vec![
+            make_entry(1, 1, RaftOp::CreateKeyspace(simple_keyspace("repair_ks"))),
+            make_entry(
+                1,
+                2,
+                RaftOp::CreateTable(Box::new(simple_table("repair_ks", "repaired"))),
+            ),
+        ])
+        .await
+        .unwrap();
+        let snapshot = peer.build_snapshot().await.unwrap();
+        (snapshot.meta, snapshot.snapshot.into_inner())
+    }
+
+    fn repair_machine(
+        dir: &std::path::Path,
+    ) -> (
+        FerrosStateMachine,
+        Arc<ferrosa_schema::Schema>,
+        Arc<StorageEngine>,
+        PathBuf,
+    ) {
+        let engine = test_engine(dir);
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let path = dir.join("dc-a").join("state-machine.snapshot.bin");
+        let sm = FerrosStateMachine::with_side_effects_and_snapshot_path(
+            Arc::clone(&schema),
+            Arc::clone(&engine),
+            path.clone(),
+        );
+        (sm, schema, engine, path)
+    }
+
+    /// The quarantined node adopts a verified peer cut: the schema, the engine
+    /// and the durable snapshot file all move to it together.
+    #[tokio::test]
+    async fn a_repair_installs_a_covering_peer_snapshot_durably() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sm, schema, engine, path) = repair_machine(dir.path());
+        let (meta, bytes) = peer_snapshot().await;
+        sm.install_repair_snapshot(&meta, &bytes, 2)
+            .expect("a snapshot at the minimum index installs");
+        assert_eq!(sm.last_applied_index(), Some(2));
+        assert!(schema
+            .snapshot()
+            .tables
+            .contains_key(&("repair_ks".into(), "repaired".into())));
+        assert!(engine
+            .table_schema(&TableId::new("repair_ks", "repaired"))
+            .is_some());
+        let persisted: PersistedSnapshot =
+            bincode::deserialize(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted.meta.last_log_id, meta.last_log_id);
+    }
+
+    /// A cut that does not reach what this node may have half-applied is no
+    /// repair at all, and installing it must change nothing.
+    #[tokio::test]
+    async fn a_repair_refuses_a_snapshot_below_its_minimum_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sm, schema, engine, path) = repair_machine(dir.path());
+        let (meta, bytes) = peer_snapshot().await;
+        let error = sm.install_repair_snapshot(&meta, &bytes, 3).unwrap_err();
+        assert!(
+            error.is_retryable(),
+            "a newer cut may come from another attempt: {error}"
+        );
+        assert!(!schema
+            .snapshot()
+            .tables
+            .contains_key(&("repair_ks".into(), "repaired".into())));
+        assert!(engine
+            .table_schema(&TableId::new("repair_ks", "repaired"))
+            .is_none());
+        assert!(!path.exists());
+    }
+
+    /// Obligation 4, no lost durable data: a local table holding rows that the
+    /// peer cut does not name is preserved, and the repair refuses loudly.
+    #[tokio::test]
+    async fn a_repair_refuses_a_snapshot_that_would_orphan_local_rows() {
+        use ferrosa_common::{DecoratedKey, PartitionKey};
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sm, schema, engine, path) = repair_machine(dir.path());
+        let local = simple_table("local_ks", "only_here");
+        schema
+            .create_keyspace_internal(simple_keyspace("local_ks"))
+            .unwrap();
+        schema.create_table_internal(local.clone()).unwrap();
+        engine.register_table(local.to_storage_schema()).unwrap();
+        let tid = TableId::new("local_ks", "only_here");
+        let key = DecoratedKey::new(PartitionKey::new(b"durable-local-row".to_vec()));
+        engine
+            .write(
+                &tid,
+                &key,
+                std::sync::Arc::new(ferrosa_sstable::types::Row {
+                    clustering: vec![],
+                    cells: vec![],
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
+                }),
+                1,
+            )
+            .unwrap();
+        engine.flush(&tid).unwrap();
+
+        let (meta, bytes) = peer_snapshot().await;
+        let error = sm.install_repair_snapshot(&meta, &bytes, 2).unwrap_err();
+        assert!(
+            !error.is_retryable(),
+            "local rows need a decision, not a retry: {error}"
+        );
+        assert!(error.to_string().contains("local_ks.only_here"), "{error}");
+        assert!(schema
+            .snapshot()
+            .tables
+            .contains_key(&("local_ks".into(), "only_here".into())));
+        assert!(engine.read(&tid, &key).unwrap().is_some());
+        assert!(!path.exists());
+    }
+
     /// Every apply group that finished is complete on disk, so a restart whose
     /// snapshot lags those groups replays them from the log as before. Only a
     /// group interrupted mid-effect leaves the node quarantined. Before the
@@ -6048,6 +6341,100 @@ mod tests {
             .unwrap();
 
         assert!(sm2.state().approved_nodes.contains(&host_id));
+    }
+
+    /// **A replayed `CreateType` must not latch the node.**
+    ///
+    /// `Ferrosa/Raft/Partial.lean` proves `every_prepublication_effect_is_idempotent` over
+    /// `prePublicationEffects`, and that list names six effects: create_keyspace_internal,
+    /// create_table_internal, apply_snapshot, register_table, unregister_table, engine.write.
+    /// `create_type_internal` is not among them — and it is *not* idempotent:
+    /// `ferrosa-schema/src/registry.rs:1830-1835` returns `SchemaError::TypeExists` when the name is
+    /// present, which this module turns into `ApplyError::Other` (`:2128`), whose `fences_replica()`
+    /// is `true` (`:163`). So a replay latches the machine.
+    ///
+    /// Replay is exactly what a crash between a durable effect and publication produces, and what a
+    /// restarted node runs on boot — so one replayed DDL entry makes a node permanently unable to
+    /// apply, which is the failure the latch's own `.failing` row records.
+    #[tokio::test]
+    async fn a_replayed_create_type_does_not_latch_the_node() {
+        use ferrosa_common::CqlType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let mut sm =
+            FerrosStateMachine::with_side_effects(Arc::clone(&schema), Arc::clone(&engine));
+
+        let udt = UserTypeMetadata {
+            keyspace: "ks".to_string(),
+            name: "address".to_string(),
+            fields: vec![("street".to_string(), CqlType::Varchar)],
+        };
+
+        sm.apply(vec![
+            make_entry(1, 1, RaftOp::CreateKeyspace(simple_keyspace("ks"))),
+            make_entry(1, 2, RaftOp::CreateType(udt.clone())),
+        ])
+        .await
+        .expect("the first application must succeed");
+        assert!(
+            sm.apply_failure.is_none(),
+            "the first CreateType must not latch: {:?}",
+            sm.apply_failure
+        );
+
+        // Replay the same entry, as a restart or a post-crash replay would.
+        let replay = sm
+            .apply(vec![make_entry(1, 2, RaftOp::CreateType(udt))])
+            .await;
+
+        assert!(
+            replay.is_ok(),
+            "a replayed CreateType latched the node: {replay:?}"
+        );
+        assert!(
+            sm.apply_failure.is_none(),
+            "a replayed CreateType left the node latched, so it can never apply again: {:?}",
+            sm.apply_failure
+        );
+    }
+
+    /// **A genuine schema failure still latches.** The companion of
+    /// `a_replayed_create_type_does_not_latch_the_node`: absorbing "already applied" must not absorb
+    /// "cannot apply". A `CreateType` whose keyspace does not exist is a real divergence — replicas
+    /// would hold different type sets — so it must still fence the replica, exactly as
+    /// `ApplyError::Other` does.
+    #[tokio::test]
+    async fn a_create_type_for_a_missing_keyspace_still_latches() {
+        use ferrosa_common::CqlType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let mut sm =
+            FerrosStateMachine::with_side_effects(Arc::clone(&schema), Arc::clone(&engine));
+
+        let udt = UserTypeMetadata {
+            keyspace: "no_such_keyspace".to_string(),
+            name: "orphan".to_string(),
+            fields: vec![("f".to_string(), CqlType::Varchar)],
+        };
+
+        let outcome = sm
+            .apply(vec![make_entry(1, 1, RaftOp::CreateType(udt))])
+            .await;
+
+        assert!(
+            outcome.is_err(),
+            "a CreateType against a missing keyspace must not publish as applied: {outcome:?}"
+        );
+        assert!(
+            sm.apply_failure.is_some(),
+            "a genuine schema divergence must still latch the replica"
+        );
     }
 
     #[tokio::test]

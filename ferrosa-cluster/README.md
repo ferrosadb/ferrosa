@@ -417,8 +417,14 @@ build; the codec's own cost is its delta against `none`.
 - `DdlPath::kind()` / `ModeController::ddl_path_kind()` name the live DDL path
   (`direct`, `pair`, `cluster`, `forming`, `unavailable`). The mode reads
   `cluster` from the start of `transition_to_cluster`, while DDL stays `forming`
-  until the Raft-backed path is published. A CREATE in this window returns a
-  retriable formation error and cannot acknowledge a local-only schema change.
+  until the Raft-backed path is published. A DDL in this window waits for the
+  publication (`ddl_path::load_settled`, bounded by `FORMING_DDL_WAIT`, 10 s) and
+  then runs on the published path; if formation does not finish in time it gets
+  the retriable `DdlFormationInProgress` error, never "peer lost", and cannot
+  acknowledge a local-only schema change. The cluster DDL forward handler
+  (`LazyClusterDdlForwardHandler`) replaces the pair-mode one at the start of
+  the transition, so a leader still in its topology wait proposes a forwarded
+  DDL through Raft instead of applying it locally (CL-88).
   Existing formation queues are retained. Declared cluster admission and
   readiness wait for `ddl_path == "cluster"` as well as membership/leadership
   (the path is also exposed on `/api/cluster/status`; CQL-T467ci-01).
@@ -483,6 +489,13 @@ build; the codec's own cost is its delta against `none`.
   heartbeat to lagging followers; `INSTALLSNAPSHOT_PUSHES_TOTAL`.
 - `snapshot_transport.rs` — snapshots travel on `Lane::Bulk` (not `Lane::Raft`),
   3 MiB chunks, 60 s per-chunk timeout.
+- `repair_snapshot.rs` + `controller/raft_repair.rs` — the repair installer
+  (t_6f2ba27a). A node whose group was quarantined by an interrupted apply pulls
+  a committed snapshot covering its committed target from a same-DC peer
+  advertising `CAP_RAFT_REPAIR_SNAPSHOT`, installs and fsyncs it (refusing one
+  that would orphan local rows), purges its log, records `SnapshotSynced`, lifts
+  the fence, releases admission and restarts the group. Peers refuse while their
+  own admission is closed. A partially applied `DROP TABLE` stays refused.
 - `multi_dc_apply.rs` / `group_id.rs` — per-DC Raft groups (UUID-v5 group ids),
   HLC reorder buffer + applied-txn ledger for cross-DC Accord apply (ADR-015).
 - `raft_forward.rs` — forward client writes / membership updates to the leader.
@@ -802,7 +815,12 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   keyspaces and tables (inserting, replacing a stale definition, dropping what
   the primary dropped), verifies, adopts the primary's schema version and acks
   with it (CL-33). Switchover refuses until the peer confirms that version and
-  no rejoin data replay is running or failed (`CatchUpGate`, CL-34).
+  no rejoin data replay is running or failed (`CatchUpGate`, CL-34). A lane
+  that is still reconnecting has not carried the request, so the schema push
+  waits for it inside `SWITCHOVER_TIMEOUT` rather than reading the refusal as
+  "unconfirmed"; a lane that never comes up still refuses the handoff
+  (`push_admits_only_on_the_pushed_version`,
+  `push_refuses_when_every_attempt_is_a_reconnecting_lane`).
   `ModeController::choose_pair_role` gives `Primary` to the **lowest** host_id
   (`local_host_id <= peer_host_id`). A node with no `FERROSA_HOST_ID` generates
   a random UUID on first boot, so any deployment that needs a predictable

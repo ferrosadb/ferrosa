@@ -436,6 +436,17 @@ and do not retry a write timeout for a non-idempotent statement, and a DDL that
 was never confirmed must be retried, never treated as done. The statement stays
 out of the success path — an unconfirmed DDL is always an error.
 
+### A DDL sent while the node is forming
+
+Every DDL site reads the DDL path through `settled_ddl_path`, which waits up to
+`ddl_path::FORMING_DDL_WAIT` (10 s) for formation to publish the replicated path
+and runs the statement there (t_0cfbb511, ferrosa-cluster CL-88). Before, a DDL
+in the `Forming` window was refused at once with "DDL unavailable: peer lost",
+which is false: no peer was lost. If formation does not finish within the bound
+the client gets a `ServerError` naming formation, saying the DDL was not applied
+and should be retried. "peer lost" is now only the answer for `Unavailable`, a
+pair whose peer is gone. Test: `router::tests::forming_ddl_tests`.
+
 ## Specs
 
 - [Architecture overview](specs/overview.md) — module map, invariants, position
