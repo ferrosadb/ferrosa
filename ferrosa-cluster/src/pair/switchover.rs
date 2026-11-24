@@ -5,11 +5,12 @@
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
 use ferrosa_net::codec::Lane;
+use ferrosa_net::error::NetError;
 use ferrosa_net::message::Message;
 use ferrosa_net::peer::PeerManager;
 use ferrosa_net::rpc::handler::{PeerId, RpcHandler};
@@ -19,6 +20,26 @@ use crate::pair::PairRole;
 
 /// Timeout for switchover RPC.
 const SWITCHOVER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the schema push keeps waiting for a `Bulk` lane that is still
+/// reconnecting before it reports the peer unconfirmed.
+///
+/// A peer that has just restarted redials its lanes on a 1-30 s ladder, and
+/// the switchover fires about a second after the peer returns, so the first
+/// send is routinely refused with `Reconnecting` while the lane is 10-20 ms
+/// from being ready. The budget bounds that wait rather than removing the
+/// gate: a lane that never comes up still fails the switchover.
+const SCHEMA_PUSH_RETRY_BUDGET: Duration = SWITCHOVER_TIMEOUT;
+
+/// Pause between attempts while the lane is reconnecting.
+const SCHEMA_PUSH_RETRY_INTERVAL: Duration = Duration::from_millis(20);
+
+/// One wording for every way the push can fail before the peer answers.
+fn schema_push_failed(peer_host_id: Uuid, e: NetError) -> ClusterError {
+    ClusterError::ModeTransitionRejected(format!(
+        "peer schema unconfirmed: pushing the schema to {peer_host_id} failed ({e})"
+    ))
+}
 
 /// Progress of the data catch-up a promoted primary replays to a rejoined
 /// peer. A switchover must not hand the primary role to a peer whose replay
@@ -78,23 +99,59 @@ pub async fn push_schema_and_confirm(
     peer_host_id: Uuid,
     schema: &ferrosa_schema::Schema,
 ) -> Result<()> {
+    push_schema_and_confirm_with(
+        peer_host_id,
+        schema,
+        SCHEMA_PUSH_RETRY_BUDGET,
+        |message| async {
+            peer_manager
+                .send_with_timeout(peer_host_id, message, Lane::Bulk, SWITCHOVER_TIMEOUT)
+                .await
+        },
+    )
+    .await
+}
+
+/// The send half of [`push_schema_and_confirm`], with the transport injected.
+///
+/// A peer that has just restarted still has its lanes in the reconnect ladder,
+/// so the first send can be refused with `Reconnecting` before the request
+/// leaves this process. The refusal is not an answer from the peer, so the
+/// push waits for the lane inside a fixed budget instead of reporting the
+/// switchover unconfirmable; once an attempt reaches the peer, its reply
+/// decides, exactly as before. The injected sender exists so this bounded
+/// wait can be exercised without a socket.
+pub(crate) async fn push_schema_and_confirm_with<'a, F, Fut>(
+    peer_host_id: Uuid,
+    schema: &ferrosa_schema::Schema,
+    budget: Duration,
+    mut send: F,
+) -> Result<()>
+where
+    F: FnMut(Message) -> Fut,
+    Fut: std::future::Future<Output = ferrosa_net::error::Result<Message>> + 'a,
+{
     let snapshot = schema.snapshot();
     let wire = crate::pair::ddl::WireSchemaSnapshot::from_snapshot(&snapshot);
     let body = serde_json::to_vec(&wire)
         .map_err(|e| ClusterError::Internal(format!("serialize schema snapshot: {e}")))?;
-    let resp = peer_manager
-        .send_with_timeout(
-            peer_host_id,
-            Message::PairSchemaSync(bytes::Bytes::from(body)),
-            Lane::Bulk,
-            SWITCHOVER_TIMEOUT,
-        )
-        .await
-        .map_err(|e| {
-            ClusterError::ModeTransitionRejected(format!(
-                "peer schema unconfirmed: pushing the schema to {peer_host_id} failed ({e})"
-            ))
-        })?;
+    let deadline = Instant::now() + budget;
+    let resp = loop {
+        match send(Message::PairSchemaSync(bytes::Bytes::from(body.clone()))).await {
+            Ok(resp) => break resp,
+            // The lane refused the request before it left this process, so the
+            // peer has not answered: wait for the redial instead of reading
+            // the refusal as "schema unconfirmed".
+            Err(NetError::Reconnecting) => {
+                let now = Instant::now();
+                let Some(remaining) = deadline.checked_duration_since(now) else {
+                    return Err(schema_push_failed(peer_host_id, NetError::Reconnecting));
+                };
+                tokio::time::sleep(SCHEMA_PUSH_RETRY_INTERVAL.min(remaining)).await;
+            }
+            Err(e) => return Err(schema_push_failed(peer_host_id, e)),
+        }
+    };
     match resp {
         Message::PairDdlAck(version) if version.as_ref() == snapshot.version.as_bytes() => Ok(()),
         Message::PairDdlAck(version) => Err(ClusterError::ModeTransitionRejected(format!(
@@ -307,5 +364,141 @@ impl RpcHandler for RoleSwapHandler {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use ferrosa_net::error::NetError;
+
+    fn test_schema() -> Arc<ferrosa_schema::Schema> {
+        use ferrosa_schema::{
+            AuthMethod, DeploymentMode as SchemaDeploymentMode, LogAuditSink, PasswordHasher,
+            PasswordPolicy, RateLimitConfig, SchemaConfig,
+        };
+        let config = SchemaConfig {
+            hasher: PasswordHasher::default(),
+            password_policy: PasswordPolicy::permissive(),
+            auth_method: AuthMethod::Password,
+            rate_limit: RateLimitConfig::default(),
+            audit_sink: Box::new(LogAuditSink),
+            secrets: Box::new(ferrosa_schema::EnvSecretsProvider),
+            mode: SchemaDeploymentMode::Development,
+        };
+        Arc::new(ferrosa_schema::Schema::new(config).unwrap())
+    }
+
+    fn converged_ack(schema: &ferrosa_schema::Schema) -> Message {
+        let version = schema.snapshot().version;
+        Message::PairDdlAck(bytes::Bytes::copy_from_slice(version.as_bytes()))
+    }
+
+    /// The nightly smoke's Phase 5: the rejoined peer is milliseconds away from
+    /// a ready `Bulk` lane when the switchover's schema push arrives. The
+    /// refusal is transport ("lane is reconnecting"), not an answer from the
+    /// peer, so the push waits for the lane instead of failing the handoff.
+    #[tokio::test]
+    async fn a_reconnecting_lane_is_waited_out_rather_than_failing_the_switchover() {
+        let schema = test_schema();
+        let ack = converged_ack(&schema);
+        let attempts = AtomicUsize::new(0);
+        let result = push_schema_and_confirm_with(
+            Uuid::nil(),
+            &schema,
+            Duration::from_millis(500),
+            |_message| {
+                let attempt = attempts.fetch_add(1, AtomicOrdering::SeqCst);
+                let ack = ack.clone();
+                async move {
+                    if attempt < 2 {
+                        Err(NetError::Reconnecting)
+                    } else {
+                        Ok(ack)
+                    }
+                }
+            },
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "expected the retry to reach the peer: {result:?}"
+        );
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 3);
+    }
+
+    /// The wait is bounded: a peer whose lane never comes up is still
+    /// unconfirmed, so the switchover refuses rather than being handed a
+    /// primary that cannot acknowledge its schema.
+    #[tokio::test]
+    async fn a_lane_that_never_comes_up_still_refuses_the_switchover() {
+        let schema = test_schema();
+        let started = Instant::now();
+        let result = push_schema_and_confirm_with(
+            Uuid::nil(),
+            &schema,
+            Duration::from_millis(120),
+            |_message| async { Err::<Message, _>(NetError::Reconnecting) },
+        )
+        .await;
+        let err = result.expect_err("a peer that never becomes reachable is unconfirmed");
+        assert!(format!("{err}").contains("lane is reconnecting"), "{err}");
+        assert!(
+            started.elapsed() >= Duration::from_millis(120),
+            "gave up after {:?}, before the budget was spent",
+            started.elapsed()
+        );
+    }
+
+    /// Only a lane that never carried the request is retried. A send that
+    /// reached the transport and failed (timeout, I/O) is an answer about the
+    /// peer, and repeating it would multiply the switchover's latency.
+    #[tokio::test]
+    async fn a_delivered_failure_is_not_retried() {
+        let schema = test_schema();
+        let attempts = AtomicUsize::new(0);
+        let result = push_schema_and_confirm_with(
+            Uuid::nil(),
+            &schema,
+            Duration::from_millis(500),
+            |_message| {
+                attempts.fetch_add(1, AtomicOrdering::SeqCst);
+                async { Err::<Message, _>(NetError::Timeout("peer did not answer".into())) }
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            attempts.load(AtomicOrdering::SeqCst),
+            1,
+            "a send that carried the request must not be repeated"
+        );
+    }
+
+    /// The confirmation gate does not move: an ack naming another schema
+    /// version still refuses the switchover.
+    #[tokio::test]
+    async fn a_stale_ack_still_refuses_the_switchover() {
+        let schema = test_schema();
+        let result = push_schema_and_confirm_with(
+            Uuid::nil(),
+            &schema,
+            Duration::from_millis(500),
+            |_message| async {
+                Ok::<Message, NetError>(Message::PairDdlAck(bytes::Bytes::from_static(
+                    b"stale-version",
+                )))
+            },
+        )
+        .await;
+        let err = result.expect_err("an ack naming another version is not confirmation");
+        assert!(
+            format!("{err}").contains("without reporting convergence"),
+            "{err}"
+        );
     }
 }
