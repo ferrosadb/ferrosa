@@ -14872,6 +14872,67 @@ impl StorageEngine {
         Ok(missing)
     }
 
+    /// Writes `gen`'s eviction marker and deletes its components, holding the
+    /// generation's guard (the one compaction's retirement and S3 rehydration
+    /// take) across a re-check that the generation is still in the table.
+    /// Returns the bytes reclaimed, or None when nothing was evicted (logged).
+    ///
+    /// The candidate came from a manifest snapshot taken at pass start, and the
+    /// store check before this awaits. Compaction can retire the generation in
+    /// between; its objects stay in the store until GC, so the check still
+    /// passes. Marking it then left an orphan `<gen>.evicted` that the next
+    /// start refused over ("not in the manifest"), production 2026-11-16 (ST-114).
+    fn evict_live_generation(
+        table_dir: &std::path::Path,
+        table_id: &str,
+        gen: &str,
+        record: &crate::eviction_marker::EvictionRecord,
+    ) -> Option<u64> {
+        let slot = crate::generation_guard::slot(table_dir, gen);
+        let state = slot.lock();
+        match Self::data_db_present(table_dir, gen) {
+            Ok(true) if !state.is_retired() => {}
+            Ok(_) => {
+                tracing::info!(
+                    table = table_id,
+                    sstable = gen,
+                    retired_by_compaction = state.is_retired(),
+                    "s3-sync: generation left the table during the eviction pass \
+                     (compaction retired it); not evicting or marking it"
+                );
+                return None;
+            }
+            Err(e) => {
+                tracing::error!(
+                    table = table_id,
+                    sstable = gen,
+                    error = %e,
+                    "s3-sync: cannot confirm the generation is still local; not evicting it (retried next sync)"
+                );
+                return None;
+            }
+        }
+        if let Err(e) = Self::record_eviction(table_dir, gen, record) {
+            tracing::error!(
+                table = table_id,
+                sstable = gen,
+                error = %e,
+                "s3-sync: could not durably record eviction; keeping the local copy"
+            );
+            return None;
+        }
+        Some(Self::delete_sstable_components(table_dir, gen))
+    }
+
+    /// True while `gen`'s `Data.db`, the discovery key that retirement moves
+    /// first, is present in the flat or the directory layout. A probe error is
+    /// returned, never read as "absent" or "present".
+    fn data_db_present(table_dir: &std::path::Path, gen: &str) -> std::io::Result<bool> {
+        let flat = table_dir.join(format!("{gen}-Data.db"));
+        let nested = table_dir.join(gen).join(format!("{gen}-Data.db"));
+        Ok(flat.try_exists()? || nested.try_exists()?)
+    }
+
     async fn enforce_uploaded_sstable_cache_limit(
         &self,
         manifest: &crate::manifest::Manifest,
@@ -15011,16 +15072,11 @@ impl StorageEngine {
                     crate::eviction_marker::SOURCE_EVICTOR,
                 )
             };
-            if let Err(e) = Self::record_eviction(&table_dir, &sstable_id, &record) {
-                tracing::error!(
-                    table = table_id,
-                    sstable = sstable_id,
-                    error = %e,
-                    "s3-sync: could not durably record eviction; keeping the local copy"
-                );
+            let Some(reclaimed) =
+                Self::evict_live_generation(&table_dir, &table_id, &sstable_id, &record)
+            else {
                 continue;
-            }
-            let reclaimed = Self::delete_sstable_components(&table_dir, &sstable_id);
+            };
             total_bytes = total_bytes.saturating_sub(size);
             projected_available = projected_available.saturating_add(reclaimed);
             evicted += 1;
@@ -17239,6 +17295,7 @@ mod flush_panic_recovery;
 mod tests {
     include!("engine_wiring_tests.rs");
     include!("engine_evicted_ranged_tests.rs");
+    include!("engine_evictor_retire_race_tests.rs");
     include!("engine_outage_tests.rs");
     include!("engine_finalize_offload_tests.rs");
     include!("rrd_segment_tests.rs");
