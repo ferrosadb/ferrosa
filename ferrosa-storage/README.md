@@ -767,7 +767,11 @@ controls already passed before the fix (`tests/count_payload_alloc.rs`).
   boot preload. The registry-owned `schema.json` is a discriminated, bounded,
   crash-safe document; the engine's standalone recovery list is written to the
   separate `storage-schema.json`, so a flush can never replace registry state
-  with an incompatible array. Concurrent registration is compare-and-install: a late schema
+  with an incompatible array. A flush rewrites `storage-schema.json` only when
+  a table was registered, dropped or altered since the last completed write
+  (a change generation; FMEA ST-114), so a maintenance `flush_all` no longer
+  rewrites it once per table, and a table dropped during `flush_all` is
+  skipped and logged instead of failing the pass. Concurrent registration is compare-and-install: a late schema
   replay merges declarations into the winning store instead of replacing its
   live memtable. Replaying an already-registered declaration is a no-op only
   when its column and index type agree; it preserves unflushed memtable
