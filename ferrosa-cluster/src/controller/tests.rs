@@ -5901,6 +5901,10 @@ struct HeldReplicaWrite {
     started: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
     storage: Arc<StorageEngine>,
+    /// The rejoin catch-up replays the primary's log through this same handler.
+    /// Only forwards sent after the test arms the hold are the ones it means to
+    /// block; catch-up runs to completion first.
+    armed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct HeldPairDdl {
@@ -6037,8 +6041,10 @@ impl RpcHandler for HeldReplicaWrite {
             panic!("write fixture")
         };
         let mutation = crate::pair::coordinator::decode_mutation(&body).unwrap();
-        self.started.notify_one();
-        self.release.notified().await;
+        if self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+            self.started.notify_one();
+            self.release.notified().await;
+        }
         for row in mutation.rows {
             self.storage
                 .write(
@@ -6052,6 +6058,27 @@ impl RpcHandler for HeldReplicaWrite {
         self.storage.force_commit_log_sync().unwrap();
         Some(Message::PairWriteAck(bytes::Bytes::new()))
     }
+}
+
+/// Wait for the rejoin catch-up to finish: a switchover is refused while it
+/// runs, by design, so a test asserting handoff behaviour starts from a
+/// caught-up pair.
+async fn wait_for_pair_catch_up(controller: &ModeController) {
+    // The rejoin path waits up to 200 ms for the peer connection before it
+    // starts catching up, so an immediate check would see an idle gate before
+    // the replay it is supposed to wait for has even begun.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    for _ in 0..300 {
+        let ready = {
+            let ctx = controller.pair_context.lock();
+            ctx.as_ref().map(|c| c.catch_up.ready().is_ok())
+        };
+        if ready == Some(true) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("rejoin catch-up never completed");
 }
 
 #[tokio::test]
@@ -6074,15 +6101,19 @@ async fn switchover_drains_admitted_writes_before_granting_the_peer_authority() 
     let peer = start_switchover_peer(peer_id, sync, peer_role).await;
     let started = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     peer.registry.register(
         MsgType::PairWriteForward,
         Arc::new(HeldReplicaWrite {
             started: started.clone(),
             release: release.clone(),
             storage: peer_storage.clone(),
+            armed: armed.clone(),
         }),
     );
     let controller = primary_paired_with(peer_id, &peer, storage, schema).await;
+    wait_for_pair_catch_up(&controller).await;
+    armed.store(true, std::sync::atomic::Ordering::SeqCst);
     let coordinator = match &**controller.write_path.load() {
         WritePath::Pair(coordinator) => coordinator.clone(),
         _ => panic!("pair fixture"),

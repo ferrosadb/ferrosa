@@ -47,8 +47,15 @@ async fn replay_commit_log_to_peer(
     tracing::info!(count = mutations.len(), "replaying data to rejoined peer");
     for mutation in &mutations {
         let body = encode_mutation(mutation);
+        // Bounded per mutation: a peer that stops answering must fail the
+        // catch-up, not hold the switchover gate open forever.
         match pm
-            .send(peer_host_id, Message::PairWriteForward(body), Lane::Data)
+            .send_with_timeout(
+                peer_host_id,
+                Message::PairWriteForward(body),
+                Lane::Data,
+                std::time::Duration::from_secs(5),
+            )
             .await
         {
             Ok(Message::PairWriteAck(_)) => {}
