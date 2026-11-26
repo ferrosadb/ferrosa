@@ -279,4 +279,54 @@ theorem push_refuses_a_delivered_failure :
   simp [pushWithin]
 
 
+/-! ## Data catch-up on rejoin: a schema sync alone leaves the returning node short
+
+  Rejoining a pair ran two steps and applied one. `send_schema_sync_to_peer` settles *which
+  tables exist*; only the commit-log replay gives the returning node the *rows* this primary
+  acknowledged while it was down. The docker smoke's Phase 5 is the witness: node2 promoted,
+  took `failover1`, node1 rejoined and took the primary role back, and node1 answered
+  `SELECT v FROM smoke_test.kv WHERE k = 'failover1'` with zero rows. No role was wrong; the
+  returning node's store simply never learned the write.
+
+  The model is presence-only. Values resolve last-write-wins per cell, so a key that is absent
+  returns no row at all — which is exactly the read the smoke performs.
+-/
+
+/-- The keys a node can serve. -/
+abbrev Keys := List Nat
+
+/-- What the returning node holds when the rejoin syncs the schema and stops there:
+    whatever it held before it went down. -/
+def storeAfterSchemaOnlySync (before : Keys) : Keys := before
+
+/-- What it holds when the primary also replays its commit log. -/
+def storeAfterReplay (before committed : Keys) : Keys := before ++ committed
+
+/-- **A schema-only rejoin drops a write the primary acknowledged.** A node that was down
+    while its peer committed `k` returns holding its old store, so `k` is absent — the
+    zero-row read, and the reason Phase 5 failed. -/
+theorem schema_only_rejoin_drops_a_committed_write :
+    ∃ (before committed : Keys) (k : Nat),
+      k ∈ committed ∧ k ∉ storeAfterSchemaOnlySync before := by
+  exact ⟨[], [7], 7, by simp, by simp [storeAfterSchemaOnlySync]⟩
+
+/-- **A rejoin that replays the commit log keeps every committed write.** -/
+theorem replay_on_rejoin_keeps_every_committed_write
+    (before committed : Keys) (k : Nat) (hk : k ∈ committed) :
+    k ∈ storeAfterReplay before committed := by
+  simp [storeAfterReplay, hk]
+
+/-- **Catch-up leaves the returning store equal to the union of what it had and what the
+    primary committed** — membership, key by key, for every key and every starting state. -/
+theorem catch_up_makes_the_stores_agree (before committed : Keys) (k : Nat) :
+    (k ∈ storeAfterReplay before committed) = (k ∈ before ∨ k ∈ committed) := by
+  simp [storeAfterReplay, List.mem_append]
+
+/-- **The switchover read the smoke performs succeeds after catch-up**, for the key the old
+    primary acknowledged during the failover. -/
+theorem switchover_after_catch_up_serves_the_failover_key :
+    (7 : Nat) ∈ storeAfterReplay [] [7] := by
+  simp [storeAfterReplay]
+
+
 end Ferrosa.Topology.Pair

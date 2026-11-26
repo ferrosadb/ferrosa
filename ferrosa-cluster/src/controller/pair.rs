@@ -69,6 +69,28 @@ async fn replay_commit_log_to_peer(
     true
 }
 
+/// Bring a rejoined peer up to date. Schema first: replayed cells are
+/// positional, so they are only meaningful against the same table layout. Then
+/// the local commit log, which is the only copy of everything this node
+/// committed while the peer was away. Returns `true` only when both steps were
+/// acknowledged.
+async fn catch_up_rejoined_peer(
+    storage: &ferrosa_storage::StorageEngine,
+    pm: &ferrosa_net::peer::PeerManager,
+    peer_host_id: Uuid,
+    schema: &ferrosa_schema::Schema,
+) -> bool {
+    if !send_schema_sync_to_peer(pm, peer_host_id, schema).await {
+        tracing::warn!("schema catch-up unconfirmed; not replaying data, catch-up FAILED");
+        return false;
+    }
+    // Force sync commit log to disk before replay.
+    if let Err(e) = storage.force_commit_log_sync() {
+        tracing::warn!(%e, "failed to force commit log sync before catch-up replay");
+    }
+    replay_commit_log_to_peer(storage, pm, peer_host_id).await
+}
+
 impl ModeController {
     fn choose_pair_role(
         &self,
@@ -432,44 +454,48 @@ impl ModeController {
                 // their unversioned grants cannot distinguish stale authority.
                 // Schema before mutation replay: replayed cells are positional,
                 // so they are only meaningful against the same table layout.
-                if !send_schema_sync_to_peer(&pm, peer_host_id, &schema).await {
-                    tracing::warn!(
-                        "schema catch-up unconfirmed; not replaying data, catch-up FAILED"
-                    );
-                    catch_up.fail();
-                    return;
-                }
-
-                // Force sync commit log to disk before replay.
-                if let Err(e) = storage.force_commit_log_sync() {
-                    tracing::warn!(%e, "failed to force commit log sync before catch-up replay");
-                }
-
-                if replay_commit_log_to_peer(&storage, &pm, peer_host_id).await {
+                if catch_up_rejoined_peer(&storage, &pm, peer_host_id, &schema).await {
                     catch_up.complete();
                 } else {
                     catch_up.fail();
                 }
             });
         } else if role == PairRole::Primary {
-            // Normal pair rejoin (no force-promote): primary sends schema snapshot so
-            // the secondary catches up on any schema changes made while it was offline.
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let pm = peer_manager;
-                let schema = self.schema.clone();
-                handle.spawn(async move {
-                    // Retry schema sync until peer's handler is ready.
-                    for _attempt in 0..10 {
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                        if pm.has_peer(peer_host_id) {
-                            send_schema_sync_to_peer(&pm, peer_host_id, &schema).await;
-                            return;
-                        }
-                    }
-                    // Final attempt even if peer not confirmed
-                    send_schema_sync_to_peer(&pm, peer_host_id, &schema).await;
-                });
+            // Normal pair rejoin (no force-promote). The returning node is stale in
+            // two ways, not one: it missed schema changes *and* every mutation this
+            // primary committed while it was down. Syncing only the schema leaves it
+            // data-stale while looking healthy, and the first switchover hands the
+            // primary role to a node that is missing acknowledged writes -- which is
+            // what docker-smoke's Phase 5 caught. `catch_up` is held across the
+            // replay for the same reason it is on the promoted path: a switchover
+            // must not promote a peer that is still catching up.
+            let pm = peer_manager;
+            let storage = self.storage.clone();
+            let schema = self.schema.clone();
+            let catch_up = catch_up.clone();
+            // Transition code also runs from contexts with no async runtime (unit
+            // tests driving state transitions directly). There, nothing can be
+            // scheduled and nothing should be: leave the gate as the caller set it.
+            if tokio::runtime::Handle::try_current().is_err() {
+                tracing::debug!("no async runtime; rejoin catch-up not scheduled");
+                return;
             }
+            catch_up.begin();
+            self.spawn_tracked(async move {
+                // Retry until peer's handler is ready, then one last attempt even if
+                // the connection was never confirmed.
+                for _attempt in 0..10 {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    if pm.has_peer(peer_host_id) {
+                        break;
+                    }
+                }
+                if catch_up_rejoined_peer(&storage, &pm, peer_host_id, &schema).await {
+                    catch_up.complete();
+                } else {
+                    catch_up.fail();
+                }
+            });
         }
     }
 }
