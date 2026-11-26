@@ -5525,6 +5525,27 @@ impl StorageEngine {
         })
     }
 
+    /// The read-contract counterpart of [`Self::require_table`]: a table that is
+    /// not registered on this node is an error, not an empty result.
+    ///
+    /// A range scan returns a stream rather than a `Result`, so the error rides
+    /// as that stream's single item and the scan ends. `table_state` returning
+    /// `None` is the *table-absent* case; a registered table with no rows takes
+    /// the `Some` arm and legitimately yields nothing, which is the distinction
+    /// the contract exists to preserve.
+    ///
+    /// See `specs/todo/postgres-frontend/todo/storage-scan-fail-loud.md`.
+    fn missing_table_scan(
+        table_id: &TableId,
+    ) -> std::pin::Pin<
+        Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Arc<Partition>>> + Send>,
+    > {
+        let error = ferrosa_common::Error::NoSuchTable {
+            table: table_id.to_string(),
+        };
+        Box::pin(futures::stream::once(async move { Err(error) }))
+    }
+
     /// Run one index DDL `ddl` on `state`'s store, which rotates its memtable
     /// (see `TableStore::flush_applying_catalog_edit`), then do the engine's
     /// post-flush bookkeeping for that rotation's flush like any other flush.
@@ -10906,8 +10927,9 @@ impl StorageEngine {
     /// Projection-aware variant of `range_iter`. Only the cells whose
     /// ordinals are in `wanted` are decoded; SSTable cells outside
     /// the projection are byte-skipped via
-    /// `range_merger::merger_for_projected_sources`. Returns an
-    /// empty stream when the table is not registered.
+    /// `range_merger::merger_for_projected_sources`. An unregistered
+    /// table is `Err(NoSuchTable)` as the stream's only item; a
+    /// registered table with no rows yields an empty stream.
     pub fn range_iter_projected(
         &self,
         table_id: &TableId,
@@ -10925,7 +10947,7 @@ impl StorageEngine {
                     .store
                     .range_iter_projected(wanted, partition_limit, start, end)
             }
-            None => Box::pin(futures::stream::empty()),
+            None => Self::missing_table_scan(table_id),
         }
     }
 
@@ -10935,9 +10957,10 @@ impl StorageEngine {
     /// the per-source k-way merge in
     /// `crate::range_merger::RangeMerger`.
     ///
-    /// Returns `Ok` with an empty stream when the table is not
-    /// registered (matches the semantics of `read_range_limited_rows`,
-    /// which returns Ok(vec![])).
+    /// Returns an `Err(NoSuchTable)` as the stream's only item when the
+    /// table is not registered — the fail-loud half of the scan
+    /// contract. A registered table with no rows yields an empty
+    /// stream, so table-absent and table-empty stay distinct.
     pub fn range_iter(
         &self,
         table_id: &TableId,
@@ -10951,7 +10974,7 @@ impl StorageEngine {
                 state.note_foreground_read();
                 state.store.range_iter(start, end)
             }
-            None => Box::pin(futures::stream::empty()),
+            None => Self::missing_table_scan(table_id),
         }
     }
 
@@ -10973,7 +10996,7 @@ impl StorageEngine {
                 state.note_foreground_read();
                 state.store.range_iter_fragmented(start, end)
             }
-            None => Box::pin(futures::stream::empty()),
+            None => Self::missing_table_scan(table_id),
         }
     }
 
@@ -10995,7 +11018,7 @@ impl StorageEngine {
                     .store
                     .range_iter_projected_fragmented(wanted, start, end)
             }
-            None => Box::pin(futures::stream::empty()),
+            None => Self::missing_table_scan(table_id),
         }
     }
 
