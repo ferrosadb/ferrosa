@@ -2819,6 +2819,10 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
         storage.clone(),
     ));
     registry.register(ferrosa_net::codec::MsgType::PairCatchUp, catchup_handler);
+    let digest_handler = Arc::new(ferrosa_cluster::pair::catchup::PairLogDigestHandler::new(
+        storage.clone(),
+    ));
+    registry.register(ferrosa_net::codec::MsgType::PairLogDigest, digest_handler);
 
     // Register MutationForwardHandler for cluster mode write forwarding
     let mutation_fwd_handler = Arc::new(ferrosa_cluster::MutationForwardHandler::new(

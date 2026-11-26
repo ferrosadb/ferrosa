@@ -5914,6 +5914,18 @@ struct HeldPairDdl {
     inner: Arc<dyn RpcHandler>,
 }
 
+/// Declines the log digest, so the rejoining primary replays its whole log.
+struct DigestDeclines;
+
+#[async_trait::async_trait]
+impl RpcHandler for DigestDeclines {
+    async fn handle(&self, _from: PeerId, _message: Message) -> Option<Message> {
+        Some(Message::PairLogDigestResponse(bytes::Bytes::from(vec![
+            1u8,
+        ])))
+    }
+}
+
 #[async_trait::async_trait]
 impl RpcHandler for HeldPairDdl {
     async fn handle(&self, from: PeerId, message: Message) -> Option<Message> {
@@ -5941,7 +5953,24 @@ async fn switchover_drains_admitted_ddl_before_schema_confirmation_and_grant() {
         peer_role.clone(),
     ));
     let peer = start_switchover_peer(peer_id, sync, peer_role).await;
+    // The rejoin replays the log into the peer before anything else. Give the
+    // fixture a replica that applies and acks, and a digest that declines, so
+    // that replay runs in full instead of stalling on an unanswered message.
+    peer.registry.register(
+        MsgType::PairWriteForward,
+        Arc::new(HeldReplicaWrite {
+            started: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+            storage: peer_storage.clone(),
+            armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }),
+    );
+    peer.registry
+        .register(MsgType::PairLogDigest, Arc::new(DigestDeclines));
     let controller = primary_paired_with(peer_id, &peer, storage, schema).await;
+    // The rejoin replays the log before anything else; a switchover attempted
+    // during that replay is refused, which is not what this test is about.
+    wait_for_pair_catch_up(&controller).await;
     let pm = match &**controller.peer_manager.load() {
         Some(pm) => pm.clone(),
         None => panic!("peer fixture"),
@@ -6081,25 +6110,29 @@ async fn settle_pending_catch_up(controller: &ModeController) {
     panic!("rejoin catch-up never completed");
 }
 
-/// Wait for the rejoin catch-up to finish: a switchover is refused while it
-/// runs, by design, so a test asserting handoff behaviour starts from a
-/// caught-up pair.
+/// Wait for the rejoin catch-up to finish. A switchover is refused while it
+/// runs, by design, so a test that asserts handoff behaviour has to start from
+/// a caught-up pair.
 async fn wait_for_pair_catch_up(controller: &ModeController) {
     // The rejoin path waits up to 200 ms for the peer connection before it
     // starts catching up, so an immediate check would see an idle gate before
     // the replay it is supposed to wait for has even begun.
     tokio::time::sleep(Duration::from_millis(400)).await;
     for _ in 0..300 {
-        let ready = {
+        let pending = {
             let ctx = controller.pair_context.lock();
-            ctx.as_ref().map(|c| c.catch_up.ready().is_ok())
+            ctx.as_ref().map(|c| c.catch_up.pending())
         };
-        if ready == Some(true) {
+        if pending != Some(true) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("rejoin catch-up never completed");
+    let last = {
+        let ctx = controller.pair_context.lock();
+        ctx.as_ref().map(|c| format!("{:?}", c.catch_up.ready()))
+    };
+    panic!("rejoin catch-up never completed: {last:?}");
 }
 
 #[tokio::test]
@@ -6132,6 +6165,8 @@ async fn switchover_drains_admitted_writes_before_granting_the_peer_authority() 
             armed: armed.clone(),
         }),
     );
+    peer.registry
+        .register(MsgType::PairLogDigest, Arc::new(DigestDeclines));
     let controller = primary_paired_with(peer_id, &peer, storage, schema).await;
     wait_for_pair_catch_up(&controller).await;
     armed.store(true, std::sync::atomic::Ordering::SeqCst);

@@ -194,6 +194,11 @@ impl PairNode {
         ));
         registry.register(MsgType::PairCatchUp, catchup_handler);
 
+        let digest_handler = Arc::new(crate::pair::catchup::PairLogDigestHandler::new(
+            self.storage.clone(),
+        ));
+        registry.register(MsgType::PairLogDigest, digest_handler);
+
         let role_swap_handler = Arc::new(crate::pair::switchover::RoleSwapHandler::durable(
             self.local_host_id,
             self.peer_host_id,
