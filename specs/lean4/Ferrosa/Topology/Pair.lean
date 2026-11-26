@@ -329,4 +329,74 @@ theorem switchover_after_catch_up_serves_the_failover_key :
   simp [storeAfterReplay]
 
 
+/-! ## Digest-guided rejoin: send the peer only what it lacks
+
+  The full replay is correct but pays for the whole retained log on every rejoin,
+  including the mutations the returning node already has on disk. Rather than
+  inventing a position cursor — which would have to survive concurrent forwards
+  whose order the peer does not share — the rejoining node reports the mutation
+  ids in its own log, and the primary skips exactly those. The exchange is
+  unordered by construction: what matters is set membership, not position.
+-/
+
+/-- Replay only the mutations the peer's digest says it lacks. -/
+def replayMissing : Keys → Keys → Keys
+  | _has, [] => []
+  | has, k :: ks =>
+      if k ∈ has then replayMissing has ks else k :: replayMissing has ks
+
+/-- **Nothing is invented.** A digest-guided replay sends only keys the primary
+    committed; it cannot conjure a write the primary never made. -/
+theorem replay_missing_is_a_subset (has committed : Keys) :
+    ∀ k, k ∈ replayMissing has committed → k ∈ committed := by
+  induction committed with
+  | nil =>
+      intro k hk
+      simp [replayMissing] at hk
+  | cons c cs ih =>
+      intro k hk
+      by_cases hc : c ∈ has
+      · simp [replayMissing, hc] at hk
+        exact List.mem_cons_of_mem c (ih k hk)
+      · simp [replayMissing, hc] at hk
+        rcases hk with rfl | hk'
+        · simp
+        · exact List.mem_cons_of_mem c (ih k hk')
+
+/-- **Nothing is dropped.** Every committed key the peer lacks is replayed. -/
+theorem replay_missing_covers_what_the_peer_lacks (has committed : Keys) :
+    ∀ k, k ∈ committed → k ∉ has → k ∈ replayMissing has committed := by
+  induction committed with
+  | nil =>
+      intro k hk _
+      simp at hk
+  | cons c cs ih =>
+      intro k hk hnot
+      rcases List.mem_cons.mp hk with rfl | hk'
+      · simp [replayMissing, hnot]
+      · by_cases hc : c ∈ has
+        · simp [replayMissing, hc]
+          exact ih k hk' hnot
+        · simp [replayMissing, hc]
+          exact Or.inr (ih k hk' hnot)
+
+/-- **The peer ends up holding every committed write**, either because it was
+    already durable there before the rejoin or because the replay carried it. -/
+theorem digest_replay_keeps_every_committed_write (has committed : Keys) :
+    ∀ k, k ∈ committed → k ∈ has ∨ k ∈ replayMissing has committed := by
+  intro k hk
+  by_cases h : k ∈ has
+  · exact Or.inl h
+  · exact Or.inr (replay_missing_covers_what_the_peer_lacks has committed k hk h)
+
+/-- **A declined digest is the full replay.** With nothing reported as held,
+    the replay is exactly the committed log — the fallback stays correct. -/
+theorem no_digest_replays_the_whole_log (committed : Keys) :
+    replayMissing [] committed = committed := by
+  induction committed with
+  | nil => rfl
+  | cons c cs ih =>
+      simp [replayMissing, ih]
+
+
 end Ferrosa.Topology.Pair

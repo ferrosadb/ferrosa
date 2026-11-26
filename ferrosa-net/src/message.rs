@@ -282,6 +282,10 @@ pub enum Message {
     PairAuthority(Bytes),
     PairWriteForward(Bytes),
     PairWriteAck(Bytes),
+    /// Ask a pair peer which mutation ids its own commit log holds.
+    PairLogDigest(Bytes),
+    /// Reply to [`Self::PairLogDigest`].
+    PairLogDigestResponse(Bytes),
     PairCatchUp {
         last_segment_id: u64,
         last_offset: u32,
@@ -456,6 +460,8 @@ impl Message {
             Self::SstableStreamEnd(_) => MsgType::SstableStreamEnd,
             Self::PairWriteForward(_) => MsgType::PairWriteForward,
             Self::PairWriteAck(_) => MsgType::PairWriteAck,
+            Self::PairLogDigest(_) => MsgType::PairLogDigest,
+            Self::PairLogDigestResponse(_) => MsgType::PairLogDigestResponse,
             Self::PairCatchUp { .. } => MsgType::PairCatchUp,
             Self::PairCatchUpResponse(_) => MsgType::PairCatchUpResponse,
             Self::RoleSwap { .. } => MsgType::RoleSwap,
@@ -656,6 +662,8 @@ impl Message {
             | Self::PairAuthority(b)
             | Self::PairWriteForward(b)
             | Self::PairWriteAck(b)
+            | Self::PairLogDigest(b)
+            | Self::PairLogDigestResponse(b)
             | Self::PairCatchUpResponse(b)
             | Self::PairSchemaSync(b)
             | Self::PairDdlForward(b)
@@ -929,6 +937,10 @@ impl Message {
             MsgType::SstableStreamEnd => Self::SstableStreamEnd(body.split_to(body.remaining())),
             MsgType::PairWriteForward => Self::PairWriteForward(body.split_to(body.remaining())),
             MsgType::PairWriteAck => Self::PairWriteAck(body.split_to(body.remaining())),
+            MsgType::PairLogDigest => Self::PairLogDigest(body.split_to(body.remaining())),
+            MsgType::PairLogDigestResponse => {
+                Self::PairLogDigestResponse(body.split_to(body.remaining()))
+            }
             MsgType::PairCatchUpResponse => {
                 Self::PairCatchUpResponse(body.split_to(body.remaining()))
             }

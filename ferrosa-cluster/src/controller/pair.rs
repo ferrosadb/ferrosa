@@ -24,10 +24,15 @@ use super::{ClusterStateHolder, ModeController, PairContext};
 
 /// Replay the local commit log to a rejoined peer. Returns `true` only when
 /// every mutation was acknowledged by the peer.
+///
+/// `peer_has` is the peer's own log digest: mutations in it are already
+/// durable there, so they are skipped. Passing `None` (no digest available)
+/// replays the whole log, which is always correct and merely larger.
 async fn replay_commit_log_to_peer(
     storage: &ferrosa_storage::StorageEngine,
     pm: &ferrosa_net::peer::PeerManager,
     peer_host_id: Uuid,
+    peer_has: Option<&std::collections::HashSet<[u8; 16]>>,
 ) -> bool {
     let position = CommitLogPosition {
         segment_id: 0,
@@ -40,8 +45,15 @@ async fn replay_commit_log_to_peer(
             return false;
         }
     };
+    let mutations: Vec<_> = match peer_has {
+        Some(has) => mutations
+            .into_iter()
+            .filter(|m| !has.contains(&m.mutation_id))
+            .collect(),
+        None => mutations,
+    };
     if mutations.is_empty() {
-        tracing::info!("no data to replay for catch-up");
+        tracing::info!("peer already holds every mutation in the retained log");
         return true;
     }
     tracing::info!(count = mutations.len(), "replaying data to rejoined peer");
@@ -100,15 +112,50 @@ async fn catch_up_rejoined_peer(
         tracing::warn!("schema catch-up unconfirmed; not replaying data, catch-up FAILED");
         return CatchUpOutcome::SchemaUnconfirmed;
     }
-    // Force sync commit log to disk before replay.
-    if let Err(e) = storage.force_commit_log_sync() {
-        tracing::warn!(%e, "failed to force commit log sync before catch-up replay");
-    }
-    if replay_commit_log_to_peer(storage, pm, peer_host_id).await {
+    if catch_up_replay_data(storage, pm, peer_host_id).await {
         CatchUpOutcome::Complete
     } else {
         CatchUpOutcome::ReplayFailed
     }
+}
+
+/// The data half of catch-up: digest what the peer already holds, replay the
+/// rest. Split from the schema step because the rejoin path engages its
+/// switchover gate only once the peer is schema-current.
+async fn catch_up_replay_data(
+    storage: &ferrosa_storage::StorageEngine,
+    pm: &ferrosa_net::peer::PeerManager,
+    peer_host_id: Uuid,
+) -> bool {
+    // Force sync commit log to disk before replay.
+    if let Err(e) = storage.force_commit_log_sync() {
+        tracing::warn!(%e, "failed to force commit log sync before catch-up replay");
+    }
+    // Ask what the peer already holds before sending anything: after a short
+    // bounce its log still has almost everything, and re-sending it costs a
+    // round trip per mutation. A peer that cannot answer (log larger than the
+    // digest limit, unreadable log, older build) simply gets the full replay.
+    let digest = match crate::pair::catchup::request_log_digest(
+        pm,
+        peer_host_id,
+        crate::pair::catchup::DEFAULT_DIGEST_LIMIT,
+    )
+    .await
+    {
+        Ok(digest) => digest,
+        Err(e) => {
+            tracing::warn!(%e, "log digest request failed; replaying the full log");
+            None
+        }
+    };
+    match &digest {
+        Some(ids) => tracing::info!(
+            peer_holds = ids.len(),
+            "catch-up digest received; replaying only what the peer lacks"
+        ),
+        None => tracing::info!("no digest from peer; replaying the full retained log"),
+    }
+    replay_commit_log_to_peer(storage, pm, peer_host_id, digest.as_ref()).await
 }
 
 impl ModeController {
@@ -500,20 +547,35 @@ impl ModeController {
                 tracing::debug!("no async runtime; rejoin catch-up not scheduled");
                 return;
             }
-            catch_up.begin();
             self.spawn_tracked(async move {
-                // Retry until peer's handler is ready, then one last attempt even if
-                // the connection was never confirmed.
+                // Wait for the rejoin connection before doing anything: a peer
+                // that never shows up has nothing to catch up.
                 for _attempt in 0..10 {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     if pm.has_peer(peer_host_id) {
                         break;
                     }
                 }
-                match catch_up_rejoined_peer(&storage, &pm, peer_host_id, &schema).await {
-                    CatchUpOutcome::Complete => catch_up.complete(),
-                    CatchUpOutcome::SchemaUnconfirmed => catch_up.fail_schema(),
-                    CatchUpOutcome::ReplayFailed => catch_up.fail(),
+                if !pm.has_peer(peer_host_id) {
+                    tracing::debug!("rejoined peer never became reachable; catch-up skipped");
+                    return;
+                }
+                // Schema first. If the peer will not take the schema snapshot,
+                // nothing is replayed and the gate is never engaged: a peer that
+                // cannot accept the sync is not one a switchover can promote.
+                if !send_schema_sync_to_peer(&pm, peer_host_id, &schema).await {
+                    tracing::warn!("schema catch-up unconfirmed; data replay not attempted");
+                    catch_up.fail_schema();
+                    return;
+                }
+                // From here the peer is reachable and schema-current, and the
+                // replay is the only step left that a switchover must not jump
+                // ahead of. Hold the gate for exactly that window.
+                catch_up.begin();
+                if catch_up_replay_data(&storage, &pm, peer_host_id).await {
+                    catch_up.complete();
+                } else {
+                    catch_up.fail();
                 }
             });
         }

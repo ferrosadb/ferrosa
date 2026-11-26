@@ -175,6 +175,13 @@ pub enum MsgType {
     PairDissolve = 0x4A,
     /// Reply to [`MsgType::PairDissolve`]: done, or a named refusal.
     PairDissolveAck = 0x4B,
+    /// Ask a peer which mutations its own commit log already holds, so a
+    /// rejoining node is sent only the ones it is missing instead of the
+    /// primary's whole retained log. See `ferrosa_cluster::pair::catchup`.
+    PairLogDigest = 0x4F,
+    /// Reply to [`MsgType::PairLogDigest`]: the peer's mutation ids, or a
+    /// status saying the log is too large and a full replay is required.
+    PairLogDigestResponse = 0x53,
     // Batchlog
     BatchlogWrite = 0x50,
     BatchlogDelete = 0x51,
@@ -350,6 +357,8 @@ impl TryFrom<u8> for MsgType {
             0x49 => Ok(Self::PairBatchAck),
             0x4A => Ok(Self::PairDissolve),
             0x4B => Ok(Self::PairDissolveAck),
+            0x4F => Ok(Self::PairLogDigest),
+            0x53 => Ok(Self::PairLogDigestResponse),
             0x50 => Ok(Self::BatchlogWrite),
             0x51 => Ok(Self::BatchlogDelete),
             0x52 => Ok(Self::BatchlogReplay),
