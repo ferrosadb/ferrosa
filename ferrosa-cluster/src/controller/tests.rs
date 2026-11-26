@@ -5920,7 +5920,9 @@ struct DigestDeclines;
 #[async_trait::async_trait]
 impl RpcHandler for DigestDeclines {
     async fn handle(&self, _from: PeerId, _message: Message) -> Option<Message> {
-        Some(Message::PairLogDigestResponse(bytes::Bytes::from(vec![1u8])))
+        Some(Message::PairLogDigestResponse(bytes::Bytes::from(vec![
+            1u8,
+        ])))
     }
 }
 
@@ -5963,7 +5965,8 @@ async fn switchover_drains_admitted_ddl_before_schema_confirmation_and_grant() {
             armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }),
     );
-    peer.registry.register(MsgType::PairLogDigest, Arc::new(DigestDeclines));
+    peer.registry
+        .register(MsgType::PairLogDigest, Arc::new(DigestDeclines));
     let controller = primary_paired_with(peer_id, &peer, storage, schema).await;
     // The rejoin replays the log before anything else; a switchover attempted
     // during that replay is refused, which is not what this test is about.
@@ -6162,7 +6165,8 @@ async fn switchover_drains_admitted_writes_before_granting_the_peer_authority() 
             armed: armed.clone(),
         }),
     );
-    peer.registry.register(MsgType::PairLogDigest, Arc::new(DigestDeclines));
+    peer.registry
+        .register(MsgType::PairLogDigest, Arc::new(DigestDeclines));
     let controller = primary_paired_with(peer_id, &peer, storage, schema).await;
     wait_for_pair_catch_up(&controller).await;
     armed.store(true, std::sync::atomic::Ordering::SeqCst);
