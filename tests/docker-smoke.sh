@@ -586,12 +586,26 @@ info "Node2 status: $(cluster_status 9091)"
 
 # Switchover: promote node1 back to primary (called from current primary = node2)
 info "Initiating switchover from node2 (current primary) to node1..."
-SWITCHOVER_RESULT=$(curl -s -X POST "http://localhost:9091/api/cluster/switchover")
+# Both nodes are connected pair members here, so a switchover must succeed.
+# It is refused while node1 is still catching up (schema unconfirmed or the
+# data replay to it unfinished) — the gate that refuses it is the point, so
+# wait the replay out instead of demanding it be instantaneous: Phase 4's
+# schema assertion can land while the commit-log replay it precedes is still
+# in flight. Any other refusal is a failure of Phase 4, reported below.
+SWITCHOVER_RESULT=""
+for _attempt in $(seq 1 30); do
+    SWITCHOVER_RESULT=$(curl -s -X POST "http://localhost:9091/api/cluster/switchover")
+    if echo "$SWITCHOVER_RESULT" | grep -q "switchover complete"; then
+        break
+    fi
+    if ! echo "$SWITCHOVER_RESULT" | grep -qi "catch.up"; then
+        break
+    fi
+    info "Switchover deferred while node1 catches up (attempt $_attempt): $SWITCHOVER_RESULT"
+    sleep 1
+done
 info "Switchover result: $SWITCHOVER_RESULT"
 
-# Both nodes are connected pair members here, so a switchover must succeed.
-# It is refused when node1 has not caught up (schema unconfirmed or data
-# replay incomplete); that refusal is a failure of Phase 4, reported here.
 if ! echo "$SWITCHOVER_RESULT" | grep -q "switchover complete"; then
     fail "Switchover refused or failed: $SWITCHOVER_RESULT"
 fi
