@@ -81,21 +81,34 @@ async fn replay_commit_log_to_peer(
 /// the local commit log, which is the only copy of everything this node
 /// committed while the peer was away. Returns `true` only when both steps were
 /// acknowledged.
+/// Where a rejoin catch-up stopped, so the switchover refusal can name the step
+/// that failed rather than reporting a generic "peer is missing writes".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatchUpOutcome {
+    Complete,
+    SchemaUnconfirmed,
+    ReplayFailed,
+}
+
 async fn catch_up_rejoined_peer(
     storage: &ferrosa_storage::StorageEngine,
     pm: &ferrosa_net::peer::PeerManager,
     peer_host_id: Uuid,
     schema: &ferrosa_schema::Schema,
-) -> bool {
+) -> CatchUpOutcome {
     if !send_schema_sync_to_peer(pm, peer_host_id, schema).await {
         tracing::warn!("schema catch-up unconfirmed; not replaying data, catch-up FAILED");
-        return false;
+        return CatchUpOutcome::SchemaUnconfirmed;
     }
     // Force sync commit log to disk before replay.
     if let Err(e) = storage.force_commit_log_sync() {
         tracing::warn!(%e, "failed to force commit log sync before catch-up replay");
     }
-    replay_commit_log_to_peer(storage, pm, peer_host_id).await
+    if replay_commit_log_to_peer(storage, pm, peer_host_id).await {
+        CatchUpOutcome::Complete
+    } else {
+        CatchUpOutcome::ReplayFailed
+    }
 }
 
 impl ModeController {
@@ -461,10 +474,10 @@ impl ModeController {
                 // their unversioned grants cannot distinguish stale authority.
                 // Schema before mutation replay: replayed cells are positional,
                 // so they are only meaningful against the same table layout.
-                if catch_up_rejoined_peer(&storage, &pm, peer_host_id, &schema).await {
-                    catch_up.complete();
-                } else {
-                    catch_up.fail();
+                match catch_up_rejoined_peer(&storage, &pm, peer_host_id, &schema).await {
+                    CatchUpOutcome::Complete => catch_up.complete(),
+                    CatchUpOutcome::SchemaUnconfirmed => catch_up.fail_schema(),
+                    CatchUpOutcome::ReplayFailed => catch_up.fail(),
                 }
             });
         } else if role == PairRole::Primary {
@@ -497,10 +510,10 @@ impl ModeController {
                         break;
                     }
                 }
-                if catch_up_rejoined_peer(&storage, &pm, peer_host_id, &schema).await {
-                    catch_up.complete();
-                } else {
-                    catch_up.fail();
+                match catch_up_rejoined_peer(&storage, &pm, peer_host_id, &schema).await {
+                    CatchUpOutcome::Complete => catch_up.complete(),
+                    CatchUpOutcome::SchemaUnconfirmed => catch_up.fail_schema(),
+                    CatchUpOutcome::ReplayFailed => catch_up.fail(),
                 }
             });
         }

@@ -5318,6 +5318,7 @@ async fn primary_paired_with(
     assert_eq!(controller.role(), Some(PairRole::Primary));
     for _ in 0..100 {
         if pm.has_peer(peer_id) {
+            settle_pending_catch_up(&controller).await;
             return controller;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -6058,6 +6059,26 @@ impl RpcHandler for HeldReplicaWrite {
         self.storage.force_commit_log_sync().unwrap();
         Some(Message::PairWriteAck(bytes::Bytes::new()))
     }
+}
+
+/// The primary starts the rejoin catch-up as soon as the reverse connection
+/// appears, and a switchover during that window is refused by design. Fixtures
+/// that hand off straight after pairing settle it first.
+async fn settle_pending_catch_up(controller: &ModeController) {
+    // Give the rejoin path its own connection wait before asking about the gate,
+    // or this returns during the gap before the replay has started.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    for _ in 0..300 {
+        let settled = {
+            let ctx = controller.pair_context.lock();
+            ctx.as_ref().map(|c| !c.catch_up.pending())
+        };
+        if settled != Some(false) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("rejoin catch-up never completed");
 }
 
 /// Wait for the rejoin catch-up to finish: a switchover is refused while it
