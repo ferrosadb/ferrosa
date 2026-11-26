@@ -359,9 +359,8 @@ theorem replay_missing_is_a_subset (has committed : Keys) :
       · simp [replayMissing, hc] at hk
         exact List.mem_cons_of_mem c (ih k hk)
       · simp [replayMissing, hc] at hk
-        rcases hk with rfl | hk'
-        · simp
-        · exact List.mem_cons_of_mem c (ih k hk')
+        exact hk.elim (fun h => by simp [h])
+          (fun h => List.mem_cons_of_mem c (ih k h))
 
 /-- **Nothing is dropped.** Every committed key the peer lacks is replayed. -/
 theorem replay_missing_covers_what_the_peer_lacks (has committed : Keys) :
@@ -372,13 +371,14 @@ theorem replay_missing_covers_what_the_peer_lacks (has committed : Keys) :
       simp at hk
   | cons c cs ih =>
       intro k hk hnot
-      rcases List.mem_cons.mp hk with rfl | hk'
-      · simp [replayMissing, hnot]
-      · by_cases hc : c ∈ has
-        · simp [replayMissing, hc]
-          exact ih k hk' hnot
-        · simp [replayMissing, hc]
-          exact Or.inr (ih k hk' hnot)
+      exact (List.mem_cons.mp hk).elim
+        (fun h => by subst h; simp [replayMissing, hnot])
+        (fun hk' => by
+          by_cases hc : c ∈ has
+          · simp [replayMissing, hc]
+            exact ih k hk' hnot
+          · simp [replayMissing, hc]
+            exact Or.inr (ih k hk' hnot))
 
 /-- **The peer ends up holding every committed write**, either because it was
     already durable there before the rejoin or because the replay carried it. -/
