@@ -14,12 +14,16 @@
 # tracks removing it — never silence the whole check.
 yanked = "deny"
 ignore = [
-    # quick-xml 0.37 via object_store 0.11 (the S3 client). Reachable only
-    # through object_store's XML parsing of responses from the operator-configured
-    # S3/R2 endpoint. The fix needs object_store >= 0.14, a trait redesign of
-    # ThrottledStore and StatsStore, tracked as t_573d5dfe for the next release.
-    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.37 pinned by object_store 0.11; migration is t_573d5dfe" },
-    { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.37 pinned by object_store 0.11; migration is t_573d5dfe" },
+    # RUSTSEC-2026-0194 / -0195 (quick-xml 0.37) were ignored here because our
+    # arrow-rs fork's object_store pinned quick-xml 0.37. That pin is now 0.41,
+    # so the ignores are gone with it. The advisories were never about
+    # object_store itself -- which is why the object_store >= 0.14 /
+    # ThrottledStore redesign (t_573d5dfe) turned out not to be needed for them.
+    #
+    # NOTE: this is a version-graph claim, not a `cargo deny check` result --
+    # cargo-deny is not installed on the machine that made this change. Confirm
+    # with `cargo deny check advisories` in CI; if it still fires, the ignore
+    # entries need restoring and this comment is the thing that was wrong.
     # Marvin timing attack in rsa: no patched release exists. Only the
     # ferrosa-jepsen test harness reaches it, through russh's ssh client.
     { id = "RUSTSEC-2023-0071", reason = "rsa via russh in the jepsen harness only, no fix upstream; t_53aee440" },

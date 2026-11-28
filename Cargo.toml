@@ -53,7 +53,7 @@ exclude = ["ferrosa-jsonb-conformance"]
 # `098874df` (branch `ferrosa/no-chrono`) is `ecb9efa3` plus one commit that
 # replaces chrono with jiff in openraft's instant display and `since` macro:
 # RUSTSEC-2026-0543 marks every chrono release unmaintained.
-openraft = { git = "https://github.com/ferrosadb/openraft.git", rev = "098874df" }
+openraft = { git = "https://github.com/ferrosadb/openraft.git", rev = "04d8455c" }
 
 # chrono and humantime are unmaintained (RUSTSEC-2026-0543, RUSTSEC-2026-0542)
 # and every object_store release requires both. The ferrosadb/arrow-rs fork's
@@ -61,7 +61,7 @@ openraft = { git = "https://github.com/ferrosadb/openraft.git", rev = "098874df"
 # replaced by jiff and humantime's duration grammar ported in-crate; date
 # parsing, SigV4 signing and duration text are checked byte-for-byte against
 # the original crates in its tests.
-object_store = { git = "https://github.com/ferrosadb/arrow-rs.git", rev = "8d32810b" }
+object_store = { git = "https://github.com/ferrosadb/arrow-rs.git", rev = "67a46d0a" }
 
 # The scylla driver (ferrosa-jepsen) and scylla-cql (ferrosa-cql tests) require
 # chrono in every release. The ferrosadb/scylla-rust-driver fork's
