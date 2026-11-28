@@ -31,8 +31,10 @@
 //!
 //! Correctness: every plaintext seed password derives both the CQL password
 //! hash and the SCRAM verifier required by the Postgres listener.
-//! Last revised: 2026-09-16.
-//! Last changed: made seeded roles usable over Postgres and restart-safe.
+//! Callers must seed only after a SUCCESSFUL replay of `system_auth.roles`;
+//! seeding over an unread store recreates `ferrosa_admin` (t_95557f4c).
+//! Last revised: 2026-11-27.
+//! Last changed: logged creation of the published-default admin loudly.
 
 use std::collections::HashSet;
 
@@ -236,6 +238,19 @@ pub fn seed_default_roles_with_config(
     let admin_created = seed_role_if_absent(schema, SEED_ADMIN_USER, &admin_pw, true)?;
     let graph_created = seed_role_if_absent(schema, SEED_GRAPH_ENGINE_USER, &service_pw, false)?;
     let app_created = seed_role_if_absent(schema, SEED_APP_READER_USER, &service_pw, false)?;
+
+    // The published default is kept for development compatibility, but its
+    // creation must never pass quietly: it is a credential anyone can read.
+    // Callers seed only after a SUCCESSFUL replay of system_auth.roles, so
+    // this fires only on a genuinely fresh auth store (t_95557f4c).
+    if admin_created && admin_pw == SEED_ADMIN_PASSWORD {
+        warn!(
+            role = SEED_ADMIN_USER,
+            "seeded ferrosa_admin with the PUBLISHED default password because \
+             FERROSA_SEED_ADMIN_PASSWORD is unset; anyone who knows the default can log in \
+             as superuser until it is rotated"
+        );
+    }
 
     // In production mode, print generated credentials to stderr so operators
     // can record them. Only emit when the role was actually created.
