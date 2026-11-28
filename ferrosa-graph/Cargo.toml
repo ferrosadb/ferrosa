@@ -24,10 +24,20 @@ axum = "0.8"
 # `-no-provider`: every TLS config is built by ferrosa-net::tls with the one
 # crypto provider the process uses; `RustlsConfig::from_config` never picks a
 # provider on its own.
-axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
+# axum-server 0.9, and `tls-rustls-ring` not `tls-rustls-no-provider`.
+#
+# In 0.8, tls-rustls-no-provider declared `rustls` WITHOUT default-features =
+# false, so rustls' defaults (which include aws_lc_rs) applied — the feature did
+# not do what its name says, and every binary linked two C crypto libraries
+# beside ferrosa's ring. 0.9 declares rustls with default-features = false and
+# makes the provider an explicit choice.
+axum-server = { version = "0.9", features = ["tls-rustls-ring"] }
 ferrosa-net = { path = "../ferrosa-net" }
-rustls = { version = "0.23", features = ["ring"] }
-tokio-rustls = "0.26"
+# default-features = false is the load-bearing part. rustls' defaults are
+# ["aws_lc_rs", "logging", "std", "tls12"], so `features = ["ring"]` alone ADDS
+# ring without removing the aws-lc-rs C library — and both end up linked.
+rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12", "ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
 base64 = "0.22"
 futures = "0.3"
 parking_lot = "0.12"

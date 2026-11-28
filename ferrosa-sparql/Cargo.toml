@@ -29,7 +29,14 @@ futures = "0.3"
 axum = "0.8"
 # HTTPS (t_d5d122ba): TLS configs come from ferrosa-net's shared builder, so the
 # provider-less axum-server feature is used.
-axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
+# axum-server 0.9, and `tls-rustls-ring` not `tls-rustls-no-provider`.
+#
+# In 0.8, tls-rustls-no-provider declared `rustls` WITHOUT default-features =
+# false, so rustls' defaults (which include aws_lc_rs) applied — the feature did
+# not do what its name says, and every binary linked two C crypto libraries
+# beside ferrosa's ring. 0.9 declares rustls with default-features = false and
+# makes the provider an explicit choice.
+axum-server = { version = "0.9", features = ["tls-rustls-ring"] }
 ferrosa-net = { path = "../ferrosa-net" }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 tower-http = { version = "0.6", features = ["catch-panic", "limit"] }
