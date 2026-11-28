@@ -438,7 +438,10 @@ build; the codec's own cost is its delta against `none`.
 - `SystemTableLoader` reconstructs durable schema/auth state during cold
   start. Persisted `system_auth.roles` rows replace fresh-process bootstrap
   roles before missing seed roles are created, so rotated hashes survive both
-  graceful and commit-log recovery paths.
+  graceful and commit-log recovery paths. `bootstrap_roles` is the startup
+  sequence (replay, seed, repair): a replay that fails stops it before anything
+  is seeded, and `main` refuses to start (exit 65). Seed roles it creates are
+  persisted to `system_auth.roles` immediately (CL-89, t_95557f4c).
 - `SledLogStore` — sled-backed log + meta trees, legacy-format migration, log
   inspection/reset tooling. An open retries a transient directory lock under
   `LockRetryPolicy::DEFAULT` (main's 10 attempts, 50 ms apart, about 490 ms) —

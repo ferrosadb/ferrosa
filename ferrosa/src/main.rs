@@ -2704,28 +2704,35 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
     if storage_auth_enabled {
         let loader =
             ferrosa_cluster::system_table_loader::SystemTableLoader::new(Arc::clone(&storage));
-        match loader.replay_roles_into_schema(&schema) {
-            Ok(count) if count > 0 => {
-                tracing::info!(count, "replayed persisted roles from system_auth")
-            }
-            Ok(_) => {}
-            Err(e) => tracing::warn!(%e, "failed to replay persisted roles"),
-        }
-
-        // Seed only after both schema.json and system_auth.roles have been
-        // restored. A fresh registry always contains the built-in cassandra
-        // role; seeding before recovery recreated the other defaults on every
-        // start and let a stale bootstrap hash win after an unclean shutdown.
+        // Replay system_auth.roles, then seed only the default roles that are
+        // genuinely absent, then repair default-password seed rows
+        // (t_d0e5e6e5). Seeding runs only after both schema.json and
+        // system_auth.roles were restored, and only when the replay
+        // SUCCEEDED: a replay that failed used to be a WARN followed by
+        // seeding, which recreated ferrosa_admin with the seed env or the
+        // published default over the stored credential (t_95557f4c). An
+        // unreadable auth store now stops the node before any listener binds.
         let seed_config = ferrosa_schema::auth::bootstrap::SeedConfig::from_env();
-        ferrosa_schema::auth::bootstrap::seed_default_roles_with_config(&schema, &seed_config)?;
-        // Repair seed-role rows a pre-fix CREATE ROLE IF NOT EXISTS persisted
-        // with a client's well-known password (t_d0e5e6e5). Runs before
-        // `enforce_production_requirements`, which still refuses a default
-        // superuser password this cannot repair. Each repair logs itself.
-        let repair = loader.repair_default_credential_rows(&schema, &seed_config)?;
-        if repair != Default::default() {
+        let report = match loader.bootstrap_roles(&schema, &seed_config) {
+            Ok(report) => report,
+            Err(
+                error @ ferrosa_cluster::system_table_loader::RoleBootstrapError::Unreadable(_),
+            ) => {
+                let reason = error.to_string();
+                eprintln!("FATAL: {reason}");
+                lifecycle::fatal_exit(lifecycle::EXIT_AUTH_STORE_UNREADABLE, &reason);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if report.replayed > 0 {
+            tracing::info!(
+                count = report.replayed,
+                "replayed persisted roles from system_auth"
+            );
+        }
+        if report.repair != Default::default() {
             tracing::warn!(
-                ?repair,
+                repair = ?report.repair,
                 "repaired default-password seed-role rows at startup"
             );
         }

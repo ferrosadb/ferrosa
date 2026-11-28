@@ -5,8 +5,10 @@
 //! Raft state (Raft wins on conflict).
 //! Correctness: persisted system rows are decoded fail-loud and replayed before
 //! callers create missing bootstrap state.
-//! Last revised: 2026-09-16.
-//! Last changed: restored authoritative role hashes from system_auth.roles.
+//! A failed role replay is fatal to the startup role bootstrap: seeding runs
+//! only after every persisted role was restored (t_95557f4c).
+//! Last revised: 2026-11-27.
+//! Last changed: added bootstrap_roles; seeded roles are persisted at creation.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -35,6 +37,55 @@ pub struct CredentialRepairReport {
     /// Service roles whose default-password row had LOGIN disabled.
     pub logins_disabled: Vec<String>,
 }
+
+/// The roles `seed_default_roles_with_config` creates when absent.
+const SEED_ROLE_NAMES: [&str; 3] = [
+    SEED_ADMIN_USER,
+    SEED_GRAPH_ENGINE_USER,
+    SEED_APP_READER_USER,
+];
+
+/// What [`SystemTableLoader::bootstrap_roles`] did at startup.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RoleBootstrapReport {
+    /// Persisted roles restored from `system_auth.roles`.
+    pub replayed: usize,
+    /// `ferrosa_admin` was absent after a successful replay and was seeded.
+    pub admin_seeded: bool,
+    /// At least one service role was absent after a successful replay and
+    /// was seeded.
+    pub service_seeded: bool,
+    /// Default-password seed rows the repair pass changed.
+    pub repair: CredentialRepairReport,
+}
+
+/// Why [`SystemTableLoader::bootstrap_roles`] stopped.
+#[derive(Debug)]
+pub enum RoleBootstrapError {
+    /// The persisted roles could not be read or restored. Nothing was seeded
+    /// and nothing was written; the node must not serve.
+    Unreadable(FerrosaError),
+    /// Seeding or repairing the default roles failed after a successful
+    /// replay.
+    Seed(Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl std::fmt::Display for RoleBootstrapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreadable(cause) => write!(
+                f,
+                "refusing to start: the persisted roles in system_auth.roles could not be \
+                 read ({cause}). Seeding default roles over an auth store that was not read \
+                 would overwrite the stored credentials, so nothing was seeded or written. \
+                 Repair or restore the data directory, then restart (t_95557f4c)"
+            ),
+            Self::Seed(cause) => write!(f, "seed-role bootstrap failed: {cause}"),
+        }
+    }
+}
+
+impl std::error::Error for RoleBootstrapError {}
 
 /// Whether `role`'s stored hash verifies against `password`.
 ///
@@ -100,8 +151,19 @@ impl SystemTableLoader {
     }
 
     /// Load authoritative role records from system_auth.roles.
+    ///
+    /// An unregistered `system_auth.roles` is an error, not an empty table:
+    /// the engine's walk over an unknown table yields nothing, which would
+    /// read as "no roles persisted yet" and invite seeding over a store that
+    /// was never consulted (t_95557f4c).
     pub fn load_roles(&self) -> ferrosa_common::Result<Vec<RoleMetadata>> {
         let tid = TableId::new("system_auth", "roles");
+        if self.engine.table_schema(&tid).is_none() {
+            return Err(FerrosaError::InvalidData(format!(
+                "{tid} is not registered with the storage engine, so its persisted roles \
+                 cannot be read"
+            )));
+        }
         let mut roles = Vec::new();
 
         self.walk_all_partitions(&tid, |partition| {
@@ -193,6 +255,78 @@ impl SystemTableLoader {
             })?;
         }
         Ok(count)
+    }
+
+    /// The node's startup role sequence: restore every persisted role from
+    /// `system_auth.roles`, then seed the default roles that are genuinely
+    /// absent, then repair default-password seed rows.
+    ///
+    /// Seeding runs ONLY after the replay succeeded. A replay that fails
+    /// (an undecodable row, a storage read error, an unregistered table)
+    /// returns [`RoleBootstrapError::Unreadable`] before anything is seeded
+    /// or written: with the persisted roles missing from the registry,
+    /// `ferrosa_admin` would look absent and the seed would persist a fresh
+    /// row, carrying `FERROSA_SEED_ADMIN_PASSWORD` or the published default,
+    /// over the operator's stored credential (t_95557f4c). A successful
+    /// replay of zero roles is the fresh-data-dir case, where seeding is
+    /// intended.
+    pub fn bootstrap_roles(
+        &self,
+        schema: &Schema,
+        config: &SeedConfig,
+    ) -> Result<RoleBootstrapReport, RoleBootstrapError> {
+        let replayed = self
+            .replay_roles_into_schema(schema)
+            .map_err(RoleBootstrapError::Unreadable)?;
+        let absent: Vec<&str> = {
+            let snap = schema.snapshot();
+            SEED_ROLE_NAMES
+                .into_iter()
+                .filter(|name| !snap.roles.contains_key(*name))
+                .collect()
+        };
+        let seeded =
+            ferrosa_schema::auth::bootstrap::seed_default_roles_with_config(schema, config)
+                .map_err(|e| RoleBootstrapError::Seed(Box::new(e)))?;
+        self.persist_seeded_roles(schema, &absent)
+            .map_err(|e| RoleBootstrapError::Seed(Box::new(e)))?;
+        let repair = self
+            .repair_default_credential_rows(schema, config)
+            .map_err(|e| RoleBootstrapError::Seed(Box::new(e)))?;
+        Ok(RoleBootstrapReport {
+            replayed,
+            admin_seeded: seeded.admin_password.is_some(),
+            service_seeded: seeded.service_password.is_some(),
+            repair,
+        })
+    }
+
+    /// Persist the rows of the seed roles this start created.
+    ///
+    /// Seeding only touches the in-memory registry. Without this, a seeded
+    /// role's sole durable copy was whatever `schema.json` happened to be
+    /// written next (a clean shutdown, or an unrelated DDL barrier), so a
+    /// crash before that left nothing, and the next start seeded again from
+    /// whatever `FERROSA_SEED_ADMIN_PASSWORD` that process carried, or the
+    /// published default (t_95557f4c). Writing the row at creation makes the
+    /// seeded credential authoritative from its first start.
+    fn persist_seeded_roles(
+        &self,
+        schema: &Schema,
+        created: &[&str],
+    ) -> ferrosa_common::Result<()> {
+        let writer = crate::system_table_writer::SystemTableWriter::new(Arc::clone(&self.engine));
+        let snap = schema.snapshot();
+        for name in created {
+            let role = snap.roles.get(*name).cloned().ok_or_else(|| {
+                FerrosaError::InvalidData(format!("seed role {name} is missing after seeding"))
+            })?;
+            writer
+                .apply(SystemTableMutation::RoleCreated(role))
+                .map_err(|e| FerrosaError::InvalidData(format!("persist seed role {name}: {e}")))?;
+            tracing::info!(role = %name, "persisted seed role to system_auth.roles");
+        }
+        Ok(())
     }
 
     /// Repair seed-role rows that a pre-fix cluster persisted with a client's
@@ -1849,14 +1983,177 @@ mod tests {
         engine: &Arc<StorageEngine>,
         config: &SeedConfig,
     ) -> (Schema, CredentialRepairReport) {
+        let (schema, report) = boot_roles(engine, config);
+        (schema, report.unwrap().repair)
+    }
+
+    /// [`SystemTableLoader::bootstrap_roles`] on a fresh process schema, the
+    /// call `main` makes at startup.
+    fn boot_roles(
+        engine: &Arc<StorageEngine>,
+        config: &SeedConfig,
+    ) -> (Schema, Result<RoleBootstrapReport, RoleBootstrapError>) {
         let schema = fast_schema();
-        let loader = SystemTableLoader::new(Arc::clone(engine));
-        loader.replay_roles_into_schema(&schema).unwrap();
-        ferrosa_schema::auth::bootstrap::seed_default_roles_with_config(&schema, config).unwrap();
-        let report = loader
-            .repair_default_credential_rows(&schema, config)
-            .unwrap();
+        let report = SystemTableLoader::new(Arc::clone(engine)).bootstrap_roles(&schema, config);
         (schema, report)
+    }
+
+    // -- t_95557f4c: a failed role replay must never fall through to seeding --
+
+    const OPERATOR_ADMIN_PASSWORD: &str = "operator-admin-secret-9555"; // pragma: allowlist secret
+
+    fn dev_config(admin_password: Option<&str>) -> SeedConfig {
+        SeedConfig::from_parts(
+            ferrosa_schema::DeploymentMode::Development,
+            admin_password.map(str::to_string),
+        )
+    }
+
+    /// A row in system_auth.roles whose is_superuser cell is not a boolean.
+    fn write_undecodable_role(engine: &Arc<StorageEngine>, name: &str) {
+        let (key, mut row, ts) = ferrosa_schema::system::persistence::role_to_row(&RoleMetadata {
+            name: name.to_string(),
+            is_superuser: false,
+            can_login: true,
+            salted_hash: None,
+            member_of: Default::default(),
+            scram: None,
+        });
+        row.cells[0] = (
+            ROLES_COL_IS_SUPERUSER,
+            ferrosa_common::CellValue::live(vec![7], ts),
+        );
+        engine
+            .write(
+                &TableId::new("system_auth", "roles"),
+                &key,
+                Arc::new(row),
+                ts,
+            )
+            .unwrap();
+    }
+
+    fn admin_hash(engine: &Arc<StorageEngine>) -> String {
+        persisted(engine, SEED_ADMIN_USER).salted_hash.unwrap()
+    }
+
+    #[test]
+    fn fresh_store_seeds_the_admin_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let config = dev_config(Some(OPERATOR_ADMIN_PASSWORD));
+
+        let (first, report) = boot_roles(&engine, &config);
+        let report = report.unwrap();
+        assert_eq!(report.replayed, 0, "a fresh store has no persisted roles");
+        assert!(report.admin_seeded, "a fresh store seeds ferrosa_admin");
+        assert!(first
+            .authenticate(SEED_ADMIN_USER, OPERATOR_ADMIN_PASSWORD)
+            .is_ok());
+        let stored = admin_hash(&engine);
+        assert_eq!(
+            first
+                .snapshot()
+                .roles
+                .get(SEED_ADMIN_USER)
+                .and_then(|r| r.salted_hash.clone()),
+            Some(stored.clone()),
+            "the seeded admin is persisted to system_auth.roles when it is created"
+        );
+        for service in [SEED_GRAPH_ENGINE_USER, SEED_APP_READER_USER] {
+            persisted(&engine, service);
+        }
+
+        let (second, report) = boot_roles(&engine, &config);
+        let report = report.unwrap();
+        assert!(report.replayed >= 1, "the restart replays the stored admin");
+        assert!(!report.admin_seeded, "the second start seeds nothing");
+        assert_eq!(
+            second
+                .snapshot()
+                .roles
+                .get(SEED_ADMIN_USER)
+                .and_then(|r| r.salted_hash.clone()),
+            Some(stored.clone()),
+            "the registry holds the stored admin hash, not a fresh one"
+        );
+        assert_eq!(admin_hash(&engine), stored);
+    }
+
+    #[test]
+    fn intact_store_restart_keeps_the_admin_with_and_without_the_seed_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        write_role_row(&engine, SEED_ADMIN_USER, OPERATOR_ADMIN_PASSWORD, true);
+        let stored = admin_hash(&engine);
+
+        for config in [dev_config(Some(OPERATOR_ADMIN_PASSWORD)), dev_config(None)] {
+            let (schema, report) = boot_roles(&engine, &config);
+            let report = report.unwrap();
+            assert!(!report.admin_seeded, "persisted admin: nothing seeded");
+            assert!(schema
+                .authenticate(SEED_ADMIN_USER, OPERATOR_ADMIN_PASSWORD)
+                .is_ok());
+            assert!(
+                schema
+                    .authenticate(SEED_ADMIN_USER, SEED_ADMIN_PASSWORD)
+                    .is_err(),
+                "the published default must not authenticate"
+            );
+            assert_eq!(admin_hash(&engine), stored, "stored admin row unchanged");
+        }
+    }
+
+    #[test]
+    fn undecodable_role_row_refuses_bootstrap_and_seeds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        write_role_row(&engine, SEED_ADMIN_USER, OPERATOR_ADMIN_PASSWORD, true);
+        write_undecodable_role(&engine, "corrupt_role");
+
+        let (schema, report) = boot_roles(&engine, &dev_config(None));
+        let error = report.expect_err("an unreadable role store must refuse the bootstrap");
+        assert!(
+            matches!(error, RoleBootstrapError::Unreadable(_)),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("system_auth.roles"), "{message}");
+        assert!(
+            message.contains("role corrupt_role has invalid is_superuser encoding"),
+            "{message}"
+        );
+        assert!(
+            !schema.snapshot().roles.contains_key(SEED_ADMIN_USER),
+            "nothing may be seeded over an unreadable auth store"
+        );
+        assert!(schema
+            .authenticate(SEED_ADMIN_USER, SEED_ADMIN_PASSWORD)
+            .is_err());
+    }
+
+    #[test]
+    fn unregistered_roles_table_is_unreadable_not_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        // No register_system_tables(): the walk would see an empty table.
+
+        let (schema, report) = boot_roles(&engine, &dev_config(None));
+        let error = report.expect_err("an unregistered roles table must not read as fresh");
+        assert!(
+            matches!(error, RoleBootstrapError::Unreadable(_)),
+            "{error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("system_auth.roles is not registered"),
+            "{error}"
+        );
+        assert!(!schema.snapshot().roles.contains_key(SEED_ADMIN_USER));
     }
 
     /// Records every event's level and message so a test can assert that a
