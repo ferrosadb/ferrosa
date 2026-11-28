@@ -53,7 +53,7 @@ exclude = ["ferrosa-jsonb-conformance"]
 # `098874df` (branch `ferrosa/no-chrono`) is `ecb9efa3` plus one commit that
 # replaces chrono with jiff in openraft's instant display and `since` macro:
 # RUSTSEC-2026-0543 marks every chrono release unmaintained.
-openraft = { git = "https://github.com/ferrosadb/openraft.git", rev = "098874df" }
+openraft = { git = "https://github.com/ferrosadb/openraft.git", rev = "330cc687" }
 
 # chrono and humantime are unmaintained (RUSTSEC-2026-0543, RUSTSEC-2026-0542)
 # and every object_store release requires both. The ferrosadb/arrow-rs fork's
