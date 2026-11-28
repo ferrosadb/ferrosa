@@ -50,6 +50,7 @@ pub struct CatchUpGate(AtomicU8);
 const CATCH_UP_NOT_PENDING: u8 = 0;
 const CATCH_UP_IN_PROGRESS: u8 = 1;
 const CATCH_UP_FAILED: u8 = 2;
+const CATCH_UP_FAILED_SCHEMA: u8 = 3;
 
 impl CatchUpGate {
     /// A replay to the peer has started.
@@ -68,6 +69,18 @@ impl CatchUpGate {
         self.0.store(CATCH_UP_FAILED, Ordering::SeqCst);
     }
 
+    /// Whether a replay is running right now. Distinct from `ready`, which is
+    /// also `Err` for a replay that already failed.
+    pub fn pending(&self) -> bool {
+        self.0.load(Ordering::SeqCst) == CATCH_UP_IN_PROGRESS
+    }
+
+    /// Catch-up stopped before the replay: the peer never confirmed the
+    /// primary's schema, so nothing was replayed at all.
+    pub fn fail_schema(&self) {
+        self.0.store(CATCH_UP_FAILED_SCHEMA, Ordering::SeqCst);
+    }
+
     /// `Ok` when no catch-up is outstanding.
     pub fn ready(&self) -> Result<()> {
         match self.0.load(Ordering::SeqCst) {
@@ -75,6 +88,11 @@ impl CatchUpGate {
             CATCH_UP_IN_PROGRESS => Err(ClusterError::ModeTransitionRejected(
                 "switchover refused: the data catch-up replay to the peer is still running; \
                  retry when the log shows `catch-up replay complete`"
+                    .into(),
+            )),
+            CATCH_UP_FAILED_SCHEMA => Err(ClusterError::ModeTransitionRejected(
+                "switchover refused: the peer's schema could not be confirmed, so the rejoin \
+                 replay never ran and the peer is missing writes; reconnect it to rerun catch-up"
                     .into(),
             )),
             _ => Err(ClusterError::ModeTransitionRejected(
