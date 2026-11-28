@@ -24,8 +24,10 @@ snap = "1"
 zstd = "0.14.3"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
-rustls = { version = "0.23", features = ["ring"] }
-tokio-rustls = "0.26"
+# default-features = false: rustls's defaults include `aws_lc_rs`, so
+# `features = ["ring"]` alone adds ring without removing the C provider.
+rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12", "ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 

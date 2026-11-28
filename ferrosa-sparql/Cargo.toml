@@ -29,7 +29,14 @@ futures = "0.3"
 axum = "0.8"
 # HTTPS (t_d5d122ba): TLS configs come from ferrosa-net's shared builder, so the
 # provider-less axum-server feature is used.
-axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
+# axum-server 0.9, and `tls-rustls-ring` not `tls-rustls-no-provider`.
+#
+# In 0.8, tls-rustls-no-provider declared `rustls` WITHOUT default-features =
+# false, so rustls' defaults (which include aws_lc_rs) applied — the feature did
+# not do what its name says, and every binary linked two C crypto libraries
+# beside ferrosa's ring. 0.9 declares rustls with default-features = false and
+# makes the provider an explicit choice.
+axum-server = { version = "0.9", features = ["tls-rustls-ring"] }
 ferrosa-net = { path = "../ferrosa-net" }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 tower-http = { version = "0.6", features = ["catch-panic", "limit"] }
@@ -54,8 +61,8 @@ uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
 rcgen = "0.14"
-rustls = { version = "0.23", features = ["ring"] }
-tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12", "ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
 # Scrapes the executor's own WARN line out of an in-process subscriber, so the
 # object-index fallback can be shown to still announce that it is scanning.
 tracing-subscriber = { version = "0.3", features = ["fmt"] }

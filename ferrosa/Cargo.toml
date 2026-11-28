@@ -23,7 +23,14 @@ arc-swap = "1.7"
 axum = { version = "0.8", features = ["ws"] }
 # HTTPS for the web console (t_d5d122ba). TLS configs come from
 # ferrosa-net::tls, so the provider-less feature is used.
-axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
+# axum-server 0.9, and `tls-rustls-ring` not `tls-rustls-no-provider`.
+#
+# In 0.8, tls-rustls-no-provider declared `rustls` WITHOUT default-features =
+# false, so rustls' defaults (which include aws_lc_rs) applied — the feature did
+# not do what its name says, and every binary linked two C crypto libraries
+# beside ferrosa's ring. 0.9 declares rustls with default-features = false and
+# makes the provider an explicit choice.
+axum-server = { version = "0.9", features = ["tls-rustls-ring"] }
 base64 = "0.22"
 ferrosa-cdc = { path = "../ferrosa-cdc" }
 ferrosa-cluster = { path = "../ferrosa-cluster" }
@@ -60,8 +67,13 @@ tracing-appender = "0.2"
 # in rustls-webpki 0.102 — a diagnostics dependency must not ship known
 # vulnerabilities. default-features off so the SDK installs no panic handler
 # without being asked; `panic` is opted into here.
+# `rustls-no-provider`, not `rustls`. sentry's `rustls` feature pulls reqwest
+# with rustls, and reqwest reaches hyper-rustls, whose DEFAULT features include
+# `aws-lc-rs` — a second C crypto library beside the ring the rest of the
+# workspace uses. The no-provider variant takes the provider from the binary
+# instead, which is the one ferrosa-net installs.
 sentry = { version = "0.49", default-features = false, features = [
-    "backtrace", "contexts", "panic", "reqwest", "rustls",
+    "backtrace", "contexts", "panic", "reqwest", "rustls-no-provider",
 ] }
 sentry-tracing = "0.49"
 uuid = { version = "1", features = ["v4"] }
@@ -88,6 +100,43 @@ otel = [
 # `live-infra-tests` (test-only) and `ferrosa-cluster/sprint-03-engine-transfer`
 # (in-progress). Used by release artifacts and the published Docker image.
 full = ["otel", "flight", "ferrosa-cql/asc-udf", "plpgsql-compile"]
+
+# Everything a database is, and nothing that exists to compile code on the host.
+#
+# The appliance runs on a 352 MB board, where the full set costs more than it
+# buys: asc-udf embeds QuickJS, wasmtime and binaryen to compile AssemblyScript
+# on the database host; flight and otel are an endpoint and an exporter stack a
+# single-purpose device does not serve; plpgsql-compile does on-device
+# compilation for the same reason asc-udf does.
+#
+# graph, cql and sql are non-optional dependencies and stay compiled — this is
+# purely subtractive. It exists as a named feature rather than CI passing
+# `--no-default-features` so the intent is reviewable: `default` being empty
+# says nothing about which crates are unconditional, and a reader cannot tell
+# from a bare flag what was deliberately excluded.
+embed = []
+
+# What `embed` does NOT remove, and why — stated so nobody assumes otherwise:
+#
+#   wasmtime   Not gated on asc-udf. ferrosa-udf uses it as the UDF *runtime*
+#              (executor.rs, sandbox.rs, convert.rs), so embedded WebAssembly
+#              user functions still work. Only the AssemblyScript *compiler*
+#              (rquickjs + wit-*) goes away with asc-udf. Dropping wasmtime would
+#              mean dropping UDF execution, which is a product decision, not a
+#              feature flag.
+#   ring       TLS. rustls's providers are both C; ring is the audited one, and
+#              it is already linked by ferrosa-postgres/net/sparql.
+#
+# So `embed` is "a database without on-host compilation", not "no wasm".
+#
+# Measured, production graph with --no-dev-dependencies:
+#
+#   --features ferrosa/full    1812 dependency nodes
+#   --features ferrosa/embed   1453   (-359, -20% of the graph)
+#   <default>                  1453   (identical: embed adds nothing back)
+#
+# The 359 are QuickJS, the wit toolchain, flight and the OTLP exporter stack —
+# all reachable only through `full`.
 # D13: compile PL/pgSQL functions in process (needs FERROSA_ASC_BUNDLE at run time).
 plpgsql-compile = ["ferrosa-postgres/plpgsql-compile"]
 # Enables jemalloc's heap profiler with libunwind, which avoids the default

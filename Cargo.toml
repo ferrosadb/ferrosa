@@ -108,6 +108,26 @@ debug = "line-tables-only"
 split-debuginfo = "off"
 strip = "none"
 
+# Release assets: smaller AND faster, which the obvious knobs do not do together.
+#
+# `lto = "fat"` inlines across crates and `codegen-units = 1` gives the optimiser
+# one scope instead of sixteen; both remove dead code and improve runtime, and
+# cost only build time. They are the rare settings that pay in both currencies.
+#
+# opt-level is deliberately NOT overridden. "s" and "z" shrink the binary by
+# making hot paths slower, and a database that is small but slow is the wrong
+# trade — the appliance needs the queries fast more than it needs the file small.
+#
+# panic stays unwind: ferrosa-postgres calls catch_unwind on production paths
+# (storage_provider.rs:864, result_stream.rs:315), so "abort" would be a compile
+# error there rather than an optimisation.
+[profile.asset]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+debug = false
+
 # Profiling artifacts retain full DWARF while keeping release optimizations.
 # Release publishing still strips its binaries explicitly; this profile is for
 # diagnostic images and must never be used for the production release path.

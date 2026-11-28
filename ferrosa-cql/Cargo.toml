@@ -43,8 +43,11 @@ serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec", "rt"] }
-rustls = { version = "0.23", features = ["ring"] }
-tokio-rustls = "0.26"
+# default-features = false is the load-bearing part. rustls' defaults are
+# ["aws_lc_rs", "logging", "std", "tls12"], so `features = ["ring"]` alone ADDS
+# ring without removing the aws-lc-rs C library — and both end up linked.
+rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12", "ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
 tracing = "0.1"
 snap = "1"
 socket2 = "0.6"
