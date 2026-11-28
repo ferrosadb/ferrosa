@@ -13,7 +13,7 @@ use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
 use bytes::BytesMut;
 use ferrosa_schema::Schema;
 use ferrosa_storage::StorageEngine;
-use rand::RngCore;
+use rand::Rng;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -74,7 +74,7 @@ pub struct QueryContext {
 /// character RFC 5802 forbids in a nonce).
 fn random_server_nonce() -> String {
     let mut bytes = [0u8; 18];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     STANDARD_NO_PAD.encode(bytes)
 }
 

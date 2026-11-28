@@ -13,7 +13,7 @@
 //! identical fields so the conversion is a field-for-field copy.
 
 use hmac::{Hmac, Mac};
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -78,7 +78,7 @@ pub fn derive(password: &str, salt: &[u8], iterations: u32) -> ScramCredential {
 /// path of `CREATE ROLE` / `ALTER ROLE` at password-set time.
 pub fn derive_with_random_salt(password: &str) -> ScramCredential {
     let mut salt = [0u8; SALT_LEN];
-    rand::thread_rng().fill_bytes(&mut salt);
+    rand::rng().fill_bytes(&mut salt);
     derive(password, &salt, DEFAULT_ITERATIONS)
 }
 
