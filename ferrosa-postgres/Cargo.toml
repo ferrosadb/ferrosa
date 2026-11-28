@@ -54,7 +54,9 @@ ferrosa-net = { path = "../ferrosa-net" }
 # `protocol::envelope_capnp`), so no second codegen path exists. `capnp` is the
 # runtime reader/builder for those generated types.
 capnp = "0.25"
-tokio-rustls = "0.26"
+# default-features = false: tokio-rustls defaults include aws_lc_rs, which is a
+# C library. Its own defaults are re-enabled below; only the provider changes.
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
 # DDL (T-132a): `CREATE TABLE` runs through the SAME `DdlPath` the CQL router
 # uses (direct / pair / Raft-replicated cluster), so there is one schema-change
 # path. `ClusterDdl` in `ddl.rs` is the only user of these three crates.
@@ -82,7 +84,10 @@ indexmap = { version = "2", features = ["serde"] }
 proptest = "1"
 uuid = { version = "1", features = ["v4"] }
 rcgen = "0.14"
-rustls = { version = "0.23", features = ["ring"] }
+# default-features = false is the load-bearing part: rustls's defaults include
+# `aws_lc_rs`, so `features = ["ring"]` alone ADDS ring to the defaults rather
+# than replacing the provider — and both C libraries end up linked.
+rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12", "ring"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tokio-postgres = "0.7"
 tempfile = "3"

@@ -39,7 +39,19 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-russh = "0.65"
+# ring, not aws-lc-rs.
+#
+# russh defaults to aws-lc-rs, which is a C library (AWS's BoringSSL fork) and
+# compiles ~500 C translation units per target. ring is also C, but it is
+# already in this workspace's graph via ferrosa-postgres, ferrosa-net and
+# ferrosa-sparql, so choosing it here links ONE audited crypto library instead of
+# two — and russh's own docs say either is supported: "enable at least one of
+# `aws-lc-rs` or `ring`".
+#
+# default-features = false drops the aws-lc-rs default, then everything else that
+# was default is re-enabled explicitly, so this is a provider swap and not a
+# quiet loss of flate2 or rsa.
+russh = { version = "0.65", default-features = false, features = ["flate2", "rsa", "ring"] }
 rand = "0.10"
 dirs-next = "2"
 scylla = "1.5.0"
