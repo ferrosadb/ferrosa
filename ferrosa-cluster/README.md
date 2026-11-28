@@ -417,8 +417,14 @@ build; the codec's own cost is its delta against `none`.
 - `DdlPath::kind()` / `ModeController::ddl_path_kind()` name the live DDL path
   (`direct`, `pair`, `cluster`, `forming`, `unavailable`). The mode reads
   `cluster` from the start of `transition_to_cluster`, while DDL stays `forming`
-  until the Raft-backed path is published. A CREATE in this window returns a
-  retriable formation error and cannot acknowledge a local-only schema change.
+  until the Raft-backed path is published. A DDL in this window waits for the
+  publication (`ddl_path::load_settled`, bounded by `FORMING_DDL_WAIT`, 10 s) and
+  then runs on the published path; if formation does not finish in time it gets
+  the retriable `DdlFormationInProgress` error, never "peer lost", and cannot
+  acknowledge a local-only schema change. The cluster DDL forward handler
+  (`LazyClusterDdlForwardHandler`) replaces the pair-mode one at the start of
+  the transition, so a leader still in its topology wait proposes a forwarded
+  DDL through Raft instead of applying it locally (CL-88).
   Existing formation queues are retained. Declared cluster admission and
   readiness wait for `ddl_path == "cluster"` as well as membership/leadership
   (the path is also exposed on `/api/cluster/status`; CQL-T467ci-01).
@@ -432,7 +438,10 @@ build; the codec's own cost is its delta against `none`.
 - `SystemTableLoader` reconstructs durable schema/auth state during cold
   start. Persisted `system_auth.roles` rows replace fresh-process bootstrap
   roles before missing seed roles are created, so rotated hashes survive both
-  graceful and commit-log recovery paths.
+  graceful and commit-log recovery paths. `bootstrap_roles` is the startup
+  sequence (replay, seed, repair): a replay that fails stops it before anything
+  is seeded, and `main` refuses to start (exit 65). Seed roles it creates are
+  persisted to `system_auth.roles` immediately (CL-89, t_95557f4c).
 - `SledLogStore` — sled-backed log + meta trees, legacy-format migration, log
   inspection/reset tooling. An open retries a transient directory lock under
   `LockRetryPolicy::DEFAULT` (main's 10 attempts, 50 ms apart, about 490 ms) —
@@ -809,7 +818,12 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   keyspaces and tables (inserting, replacing a stale definition, dropping what
   the primary dropped), verifies, adopts the primary's schema version and acks
   with it (CL-33). Switchover refuses until the peer confirms that version and
-  no rejoin data replay is running or failed (`CatchUpGate`, CL-34).
+  no rejoin data replay is running or failed (`CatchUpGate`, CL-34). A lane
+  that is still reconnecting has not carried the request, so the schema push
+  waits for it inside `SWITCHOVER_TIMEOUT` rather than reading the refusal as
+  "unconfirmed"; a lane that never comes up still refuses the handoff
+  (`push_admits_only_on_the_pushed_version`,
+  `push_refuses_when_every_attempt_is_a_reconnecting_lane`).
   `ModeController::choose_pair_role` gives `Primary` to the **lowest** host_id
   (`local_host_id <= peer_host_id`). A node with no `FERROSA_HOST_ID` generates
   a random UUID on first boot, so any deployment that needs a predictable

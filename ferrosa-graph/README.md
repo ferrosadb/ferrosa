@@ -247,7 +247,9 @@ use those same stored endpoint keys.
 - **Cluster-aware DDL** — adjacency keyspace/table creation routes through the
   same `DdlPath` regular CQL `CREATE TABLE` uses, so every replica registers the
   system table (`ClusterGraphSchemaCoordinator`); a local coordinator is the
-  single-node default.
+  single-node default. During cluster formation the DDL waits, bounded, for the
+  replicated path to be published (`ddl_path::load_settled`, ferrosa-cluster
+  CL-88) rather than being refused.
 
 ## How it works
 

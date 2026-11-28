@@ -109,6 +109,16 @@ pub struct ClusterDdl {
     path: Arc<ArcSwap<DdlPath>>,
 }
 
+/// The DDL path to run on, with cluster formation waited out (bounded).
+///
+/// A forming path can neither commit a DDL nor report truthfully what happened
+/// to it, so DDL never runs on one (forge t_0cfbb511).
+async fn settled(path: &ArcSwap<DdlPath>) -> Result<Arc<DdlPath>, String> {
+    ferrosa_cluster::ddl_path::load_settled(path, ferrosa_cluster::ddl_path::FORMING_DDL_WAIT)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 impl ClusterDdl {
     pub fn new(path: Arc<ArcSwap<DdlPath>>) -> Self {
         Self { path }
@@ -118,14 +128,14 @@ impl ClusterDdl {
 #[async_trait]
 impl DdlExecutor for ClusterDdl {
     async fn create_table(&self, table: TableMetadata) -> Result<(), String> {
-        let path = self.path.load_full();
+        let path = settled(&self.path).await?;
         path.execute(DdlOperation::CreateTable(Box::new(table)))
             .await
             .map_err(|e| e.to_string())
     }
 
     async fn drop_table(&self, keyspace: &str, table: &str) -> Result<(), String> {
-        let path = self.path.load_full();
+        let path = settled(&self.path).await?;
         path.execute(DdlOperation::DropTable {
             keyspace: keyspace.to_string(),
             table: table.to_string(),
@@ -140,7 +150,7 @@ impl DdlExecutor for ClusterDdl {
         table: &str,
         updates: TableUpdates,
     ) -> Result<(), String> {
-        let path = self.path.load_full();
+        let path = settled(&self.path).await?;
         path.execute(DdlOperation::AlterTable {
             keyspace: keyspace.to_string(),
             table: table.to_string(),
@@ -154,7 +164,7 @@ impl DdlExecutor for ClusterDdl {
         &self,
         function: ferrosa_schema::UserFunctionMetadata,
     ) -> Result<(), String> {
-        let path = self.path.load_full();
+        let path = settled(&self.path).await?;
         path.execute(DdlOperation::CreateFunction(function))
             .await
             .map_err(|e| e.to_string())
@@ -166,7 +176,7 @@ impl DdlExecutor for ClusterDdl {
         name: &str,
         arg_types: Vec<CqlType>,
     ) -> Result<(), String> {
-        let path = self.path.load_full();
+        let path = settled(&self.path).await?;
         path.execute(DdlOperation::DropFunction {
             keyspace: keyspace.to_string(),
             name: name.to_string(),
@@ -183,7 +193,7 @@ impl DdlExecutor for ClusterDdl {
         name: &str,
         columns: &[String],
     ) -> Result<(), String> {
-        let path = self.path.load_full();
+        let path = settled(&self.path).await?;
         // Schema agreement is not replica build readiness. Until the pair /
         // cluster protocol supplies that evidence, refuse rather than vouch
         // for remote read sources using just this node's tracker.
@@ -239,7 +249,7 @@ impl DdlExecutor for ClusterDdl {
 
 impl ClusterDdl {
     async fn drop_index_now(&self, keyspace: &str, table: &str, name: &str) -> Result<(), String> {
-        let path = self.path.load_full();
+        let path = settled(&self.path).await?;
         path.execute(DdlOperation::DropIndex {
             keyspace: keyspace.to_string(),
             table: table.to_string(),

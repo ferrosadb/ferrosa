@@ -166,6 +166,11 @@ pub fn panic_payload<'a>(info: &'a std::panic::PanicHookInfo<'_>) -> &'a str {
         .unwrap_or("non-string panic payload")
 }
 
+/// Exit code when the persisted roles in `system_auth.roles` cannot be read at
+/// startup (`EX_DATAERR`). The node refuses to serve rather than seed default
+/// roles over an auth store it could not read (t_95557f4c).
+pub const EXIT_AUTH_STORE_UNREADABLE: i32 = 65;
+
 /// Log `reason`, flush the buffered log, write `ferrosa exiting code=N
 /// reason=...` synchronously, and exit with `code`. The replacement for every
 /// `std::process::exit` in the binary.

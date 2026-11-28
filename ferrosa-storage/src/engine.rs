@@ -1649,6 +1649,9 @@ pub struct StorageEngine {
     /// Serializes replay retention/application with flush position capture,
     /// memtable rotation and checkpoint/discard. Ordinary writes remain concurrent.
     recovery_checkpoint_gate: parking_lot::RwLock<()>,
+    /// Whether `storage-schema.json` lags the registered table schemas; see
+    /// [`StorageSchemaPersistState`].
+    storage_schema: StorageSchemaPersistState,
     /// `new` does not replay: pre-existing WAL requires reopening with `open`.
     unreplayed_wal_on_creation: bool,
     /// Mutations startup replay wrote to disk instead of a memtable because no
@@ -1995,6 +1998,82 @@ impl Serialize for StorageSchemaView<'_> {
         }
         sequence.end()
     }
+}
+
+/// A test seam run inside the `storage-schema.json` write, before the file is
+/// touched: it stands in for the write's fsync cost, or fails it.
+#[cfg(test)]
+type StorageSchemaWriteHook = Arc<dyn Fn() -> ferrosa_common::Result<()> + Send + Sync>;
+
+/// Dirty tracking for `storage-schema.json`, the storage-side copy of every
+/// registered table schema.
+///
+/// Every flush used to rewrite the whole file under its exclusive lock with
+/// two fsyncs, schema changed or not. A maintenance `flush_all` of N dirty
+/// tables was N full rewrites, and DDL, which needs its own rewrite before it
+/// is acknowledged, queued behind them: on a disk where an fsync costs about
+/// 600 ms, eight parallel CREATE TABLEs plus one tick ran past the driver's
+/// 30 s request timeout (t_c4079a01).
+///
+/// Now a write happens only when the schemas changed since the last write
+/// that completed. `generation` counts changes; `persisted` is the generation
+/// the file on disk holds. Ordering is what keeps an acknowledged DDL from
+/// ever outrunning the file:
+///
+/// - a change publishes the new table map or schema FIRST, then bumps
+///   `generation` (`note_change`);
+/// - a writer reads `generation` FIRST, then loads the table map, so every
+///   change it counts is in what it serializes;
+/// - `persisted` advances only after the atomic rename and both fsyncs
+///   succeeded. A failed write leaves the file marked stale, and the next
+///   flush or DDL rewrites it.
+///
+/// The `persisted` mutex also serializes writers, so a write of an older map
+/// can never land after a newer one.
+struct StorageSchemaPersistState {
+    generation: AtomicU64,
+    persisted: parking_lot::Mutex<u64>,
+    /// Completed writes, for tests and diagnostics.
+    writes: AtomicU64,
+    #[cfg(test)]
+    write_hook: parking_lot::Mutex<Option<StorageSchemaWriteHook>>,
+}
+
+impl Default for StorageSchemaPersistState {
+    /// Starts stale: the first flush after a start writes the file, as every
+    /// flush did before.
+    fn default() -> Self {
+        Self {
+            generation: AtomicU64::new(1),
+            persisted: parking_lot::Mutex::new(0),
+            writes: AtomicU64::new(0),
+            #[cfg(test)]
+            write_hook: parking_lot::Mutex::new(None),
+        }
+    }
+}
+
+impl StorageSchemaPersistState {
+    /// Record that what `StorageSchemaView` serializes changed. Call only
+    /// AFTER the change is published.
+    fn note_change(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Whether `a` and `b` serialize to the same `storage-schema.json` entry.
+/// `TableSchema` has no `PartialEq`; comparing what the file would hold is
+/// the definition that matters here.
+fn same_table_schema(a: &TableSchema, b: &TableSchema) -> ferrosa_common::Result<bool> {
+    let encode = |schema: &TableSchema| {
+        serde_json::to_value(schema).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "cannot encode table schema {}.{}: {e}",
+                schema.keyspace, schema.table
+            ))
+        })
+    };
+    Ok(encode(a)? == encode(b)?)
 }
 
 enum LocalTableSchemas {
@@ -3730,6 +3809,7 @@ impl StorageEngine {
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
             recovery_checkpoint_gate: parking_lot::RwLock::new(()),
+            storage_schema: StorageSchemaPersistState::default(),
             pending_replay_admission: parking_lot::Mutex::new(Vec::new()),
             unreplayed_wal_on_creation,
             set_aside_status,
@@ -4015,6 +4095,7 @@ impl StorageEngine {
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
             recovery_checkpoint_gate: parking_lot::RwLock::new(()),
+            storage_schema: StorageSchemaPersistState::default(),
             pending_replay_admission: parking_lot::Mutex::new(Vec::new()),
             unreplayed_wal_on_creation,
             set_aside_status,
@@ -4321,6 +4402,7 @@ impl StorageEngine {
             deferred_replay_mutations,
             unreplayed_wal_on_creation: false,
             recovery_checkpoint_gate: parking_lot::RwLock::new(()),
+            storage_schema: StorageSchemaPersistState::default(),
             pending_replay_admission: parking_lot::Mutex::new(
                 pending_mutations
                     .iter()
@@ -5458,8 +5540,8 @@ impl StorageEngine {
         let cl_position = **state.last_commit_log_position.load();
         let (result, outcome) = ddl(&state.store)?;
         // A rotation of an empty memtable flushed nothing, so there is nothing
-        // to account for; `flush` itself is what persists the local schema
-        // file on every call, and a DDL is not a flush request.
+        // to account for. An index DDL changes no table schema, so the local
+        // schema file has nothing new to record either.
         if outcome == FlushOutcome::Published {
             self.finish_flush(table_id, state, cl_position, outcome)?;
         }
@@ -5734,6 +5816,7 @@ impl StorageEngine {
                 // one and its directory is swept by `build_table_state`.
                 self.clear_compaction_retry_state(&table_id);
                 if let Some(state) = remove_table(&self.tables, &table_id)? {
+                    self.storage_schema.note_change();
                     state.store.retire();
                 }
                 self.remove_time_series_consolidator(&table_id);
@@ -5807,6 +5890,7 @@ impl StorageEngine {
         if !install_table_if_absent(&self.tables, table_id, &Arc::new(state))? {
             return Ok(false);
         }
+        self.storage_schema.note_change();
         crate::metrics::register_write_admission_pressure(table_id.to_string(), &metric_gauge);
         Ok(true)
     }
@@ -5900,10 +5984,20 @@ impl StorageEngine {
         // old ordinals can still be put after the swap.
         let cl_position = **state.last_commit_log_position.load();
         let pressure_notify = Arc::clone(&state.write_pressure_notify);
+        // CREATE TABLE runs this as its durability barrier with the schema it
+        // just registered; that changes nothing on disk and must not cost a
+        // second snapshot write.
+        let schema_changed = !same_table_schema(&state.schema(), &new_schema)?;
         let outcome = state
             .store
-            .flush_and_update_schema(new_schema, move || pressure_notify.notify_waiters())?;
-        self.finish_flush(table_id, &state, cl_position, outcome)?;
+            .flush_and_update_schema(new_schema, move || pressure_notify.notify_waiters());
+        // Marked even when the rotation failed: whether the new schema was
+        // published is not knowable here, and a needless rewrite is cheap
+        // where a missed one leaves the file behind an acknowledged ALTER.
+        if schema_changed {
+            self.storage_schema.note_change();
+        }
+        self.finish_flush(table_id, &state, cl_position, outcome?)?;
         self.remove_time_series_consolidator(table_id);
         self.install_time_series_consolidator(table_id.clone(), time_series_handle);
         Ok(())
@@ -6026,6 +6120,7 @@ impl StorageEngine {
                 .retire_checked(crate::store::MEMTABLE_SEAL_DEADLINE)?;
         }
         if let Some(state) = remove_table(&self.tables, table_id)? {
+            self.storage_schema.note_change();
             if state.in_write_soft_zone.swap(false, Ordering::Relaxed) {
                 self.soft_pressure_table_count
                     .fetch_sub(1, Ordering::Relaxed);
@@ -6147,13 +6242,52 @@ impl StorageEngine {
 
     /// Persists storage-private table registrations separately from the
     /// registry-owned `schema.json`.
+    ///
+    /// Writes only when a table was registered, unregistered or altered since
+    /// the last write that completed; see [`StorageSchemaPersistState`] for
+    /// why that cannot leave an acknowledged DDL off the disk.
     fn persist_storage_schema_locally(&self) -> ferrosa_common::Result<()> {
+        let mut persisted = self.storage_schema.persisted.lock();
+        // The generation BEFORE the table map: a change bumps it only after
+        // publishing, so every change counted here is in the map below.
+        let generation = self.storage_schema.generation.load(Ordering::Acquire);
+        if *persisted == generation {
+            return Ok(());
+        }
+        #[cfg(test)]
+        self.run_storage_schema_write_hook()?;
         let tables = self.tables.load();
         crate::schema_snapshot::persist_bounded_json(
             &self.config.data_dir,
             "storage-schema.json",
             &StorageSchemaView(&tables),
-        )
+        )?;
+        // Only now, after the rename and both fsyncs: a failed write above
+        // returned with the file still marked stale.
+        *persisted = generation;
+        self.storage_schema.writes.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            generation,
+            tables = tables.len(),
+            "persisted storage-schema.json"
+        );
+        Ok(())
+    }
+
+    /// Completed `storage-schema.json` writes since this engine started.
+    pub fn storage_schema_write_count(&self) -> u64 {
+        self.storage_schema.writes.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn set_storage_schema_write_hook(&self, hook: Option<StorageSchemaWriteHook>) {
+        *self.storage_schema.write_hook.lock() = hook;
+    }
+
+    #[cfg(test)]
+    fn run_storage_schema_write_hook(&self) -> ferrosa_common::Result<()> {
+        let hook = self.storage_schema.write_hook.lock().clone();
+        hook.map_or(Ok(()), |hook| hook())
     }
 
     /// Loads table schemas from the authoritative `schema.json`, or from the
@@ -12026,7 +12160,8 @@ impl StorageEngine {
         }
 
         // Persist registered table schemas so the next restart can recover without
-        // re-running S3 bootstrap (BUG-022).
+        // re-running S3 bootstrap (BUG-022). A no-op unless a table was
+        // registered, dropped or altered since the last write (t_c4079a01).
         self.persist_storage_schema_locally()?;
 
         Ok(())
@@ -12392,6 +12527,13 @@ impl StorageEngine {
     ///
     /// Used before S3 schema persistence to ensure data and metadata
     /// stay in sync.  Equivalent to Cassandra's SNAPSHOT flush reason.
+    ///
+    /// A table dropped after the pass listed it is skipped and logged, not a
+    /// failure of the pass (t_4c80c7e3): failing used to skip the schema
+    /// persist that follows and mark the node not ready, over a table that
+    /// no longer exists. Any other flush error still fails the pass. The pass
+    /// ends by saving `storage-schema.json` if it is stale, so a drop is
+    /// recorded even when no remaining table needed a flush.
     pub fn flush_all(&self) -> ferrosa_common::Result<()> {
         let tables = self.tables.load();
         let to_flush: Vec<TableId> = tables
@@ -12402,9 +12544,18 @@ impl StorageEngine {
         drop(tables);
 
         for table_id in to_flush {
-            self.flush(&table_id)?;
+            if let Err(error) = self.flush(&table_id) {
+                if self.tables.load().contains_key(&table_id) {
+                    return Err(error);
+                }
+                tracing::info!(
+                    table = %table_id,
+                    %error,
+                    "table dropped during flush_all; skipped, the rest of the pass continues"
+                );
+            }
         }
-        Ok(())
+        self.persist_storage_schema_locally()
     }
 
     /// Polls for completed compaction results, uploads the output SSTable to S3,
@@ -14872,6 +15023,67 @@ impl StorageEngine {
         Ok(missing)
     }
 
+    /// Writes `gen`'s eviction marker and deletes its components, holding the
+    /// generation's guard (the one compaction's retirement and S3 rehydration
+    /// take) across a re-check that the generation is still in the table.
+    /// Returns the bytes reclaimed, or None when nothing was evicted (logged).
+    ///
+    /// The candidate came from a manifest snapshot taken at pass start, and the
+    /// store check before this awaits. Compaction can retire the generation in
+    /// between; its objects stay in the store until GC, so the check still
+    /// passes. Marking it then left an orphan `<gen>.evicted` that the next
+    /// start refused over ("not in the manifest"), production 2026-11-16 (ST-114).
+    fn evict_live_generation(
+        table_dir: &std::path::Path,
+        table_id: &str,
+        gen: &str,
+        record: &crate::eviction_marker::EvictionRecord,
+    ) -> Option<u64> {
+        let slot = crate::generation_guard::slot(table_dir, gen);
+        let state = slot.lock();
+        match Self::data_db_present(table_dir, gen) {
+            Ok(true) if !state.is_retired() => {}
+            Ok(_) => {
+                tracing::info!(
+                    table = table_id,
+                    sstable = gen,
+                    retired_by_compaction = state.is_retired(),
+                    "s3-sync: generation left the table during the eviction pass \
+                     (compaction retired it); not evicting or marking it"
+                );
+                return None;
+            }
+            Err(e) => {
+                tracing::error!(
+                    table = table_id,
+                    sstable = gen,
+                    error = %e,
+                    "s3-sync: cannot confirm the generation is still local; not evicting it (retried next sync)"
+                );
+                return None;
+            }
+        }
+        if let Err(e) = Self::record_eviction(table_dir, gen, record) {
+            tracing::error!(
+                table = table_id,
+                sstable = gen,
+                error = %e,
+                "s3-sync: could not durably record eviction; keeping the local copy"
+            );
+            return None;
+        }
+        Some(Self::delete_sstable_components(table_dir, gen))
+    }
+
+    /// True while `gen`'s `Data.db`, the discovery key that retirement moves
+    /// first, is present in the flat or the directory layout. A probe error is
+    /// returned, never read as "absent" or "present".
+    fn data_db_present(table_dir: &std::path::Path, gen: &str) -> std::io::Result<bool> {
+        let flat = table_dir.join(format!("{gen}-Data.db"));
+        let nested = table_dir.join(gen).join(format!("{gen}-Data.db"));
+        Ok(flat.try_exists()? || nested.try_exists()?)
+    }
+
     async fn enforce_uploaded_sstable_cache_limit(
         &self,
         manifest: &crate::manifest::Manifest,
@@ -15011,16 +15223,11 @@ impl StorageEngine {
                     crate::eviction_marker::SOURCE_EVICTOR,
                 )
             };
-            if let Err(e) = Self::record_eviction(&table_dir, &sstable_id, &record) {
-                tracing::error!(
-                    table = table_id,
-                    sstable = sstable_id,
-                    error = %e,
-                    "s3-sync: could not durably record eviction; keeping the local copy"
-                );
+            let Some(reclaimed) =
+                Self::evict_live_generation(&table_dir, &table_id, &sstable_id, &record)
+            else {
                 continue;
-            }
-            let reclaimed = Self::delete_sstable_components(&table_dir, &sstable_id);
+            };
             total_bytes = total_bytes.saturating_sub(size);
             projected_available = projected_available.saturating_add(reclaimed);
             evicted += 1;
@@ -16937,6 +17144,7 @@ impl StorageEngine {
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
             recovery_checkpoint_gate: parking_lot::RwLock::new(()),
+            storage_schema: StorageSchemaPersistState::default(),
             pending_replay_admission: parking_lot::Mutex::new(Vec::new()),
             unreplayed_wal_on_creation,
             set_aside_status,
@@ -17239,6 +17447,7 @@ mod flush_panic_recovery;
 mod tests {
     include!("engine_wiring_tests.rs");
     include!("engine_evicted_ranged_tests.rs");
+    include!("engine_evictor_retire_race_tests.rs");
     include!("engine_outage_tests.rs");
     include!("engine_finalize_offload_tests.rs");
     include!("rrd_segment_tests.rs");
@@ -41840,5 +42049,339 @@ mod failure_tally_tests {
 
         assert_eq!(tally.count(), 3);
         assert_eq!(tally.first(), Some("t1 generation 3: gone"));
+    }
+}
+
+/// `storage-schema.json` is rewritten only when the registered schemas
+/// changed, and never lags an acknowledged DDL (t_c4079a01, t_4c80c7e3).
+#[cfg(test)]
+mod storage_schema_persist_tests {
+    use super::*;
+    use ferrosa_common::cell::CellValue;
+    use ferrosa_common::schema::ColumnDefinition;
+    use ferrosa_sstable::types::{DeletionTime, LivenessInfo};
+    use std::time::Duration;
+
+    const UTF8: &str = "org.apache.cassandra.db.marshal.UTF8Type";
+
+    fn schema(table: &str, regular: &[&str]) -> TableSchema {
+        TableSchema {
+            keyspace: "persist_ks".to_string(),
+            table: table.to_string(),
+            key_type: UTF8.to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: regular
+                .iter()
+                .map(|name| ColumnDefinition {
+                    name: (*name).to_string(),
+                    type_name: UTF8.to_string(),
+                })
+                .collect(),
+            extensions: Default::default(),
+        }
+    }
+
+    fn tid(table: &str) -> TableId {
+        TableId::new("persist_ks", table)
+    }
+
+    fn engine_at(dir: &Path) -> StorageEngine {
+        StorageEngine::new(StorageEngineConfig::test_config(dir), None).unwrap()
+    }
+
+    fn write_row(engine: &StorageEngine, table: &str, key: &str, ts: i64) {
+        let row = Row {
+            clustering: vec![0x00, 0x00, 0x00, 0x01],
+            cells: vec![(0, CellValue::live(b"v".to_vec(), ts))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(ts),
+        };
+        let key = DecoratedKey::new(PartitionKey::new(key.as_bytes().to_vec()));
+        engine.write(&tid(table), &key, Arc::new(row), ts).unwrap();
+    }
+
+    /// The table names `storage-schema.json` holds for `persist_ks`, sorted.
+    fn tables_on_disk(dir: &Path) -> Vec<String> {
+        let schemas: Vec<TableSchema> =
+            crate::schema_snapshot::load_bounded_json(dir, "storage-schema.json")
+                .unwrap()
+                .expect("storage-schema.json must exist");
+        let mut names: Vec<String> = schemas
+            .into_iter()
+            .filter(|s| s.keyspace == "persist_ks")
+            .map(|s| s.table)
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The CREATE TABLE engine path (`route_create_table`, direct mode):
+    /// register, then the `update_table_schema` durability barrier. Its
+    /// return is the point the client is acknowledged.
+    fn create_table(engine: &StorageEngine, table: &str) -> ferrosa_common::Result<()> {
+        engine.register_table(schema(table, &["val"]))?;
+        engine.update_table_schema(&tid(table), schema(table, &["val"]))
+    }
+
+    /// An engine with table `a` registered and the file written, so the
+    /// schema is clean.
+    fn clean_engine(dir: &Path) -> StorageEngine {
+        let engine = engine_at(dir);
+        create_table(&engine, "a").unwrap();
+        write_row(&engine, "a", "k0", 1_000);
+        engine.flush(&tid("a")).unwrap();
+        assert_eq!(tables_on_disk(dir), vec!["a"]);
+        engine
+    }
+
+    #[test]
+    fn a_flush_with_no_schema_change_writes_no_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = clean_engine(dir.path());
+        create_table(&engine, "b").unwrap();
+        engine.flush_all().unwrap();
+        let before = engine.storage_schema_write_count();
+
+        for i in 0..5 {
+            write_row(&engine, "a", &format!("k{i}"), 2_000 + i);
+            write_row(&engine, "b", &format!("k{i}"), 2_000 + i);
+            engine.flush(&tid("a")).unwrap();
+            engine.flush_all().unwrap();
+            engine.flush_if_needed().unwrap();
+        }
+
+        assert_eq!(
+            engine.storage_schema_write_count(),
+            before,
+            "flushes with no schema change must not rewrite storage-schema.json"
+        );
+    }
+
+    #[test]
+    fn a_ddl_then_flushes_writes_the_snapshot_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = clean_engine(dir.path());
+        let before = engine.storage_schema_write_count();
+
+        engine.register_table(schema("b", &["val"])).unwrap();
+        for i in 0..3 {
+            write_row(&engine, "a", &format!("k{i}"), 3_000 + i);
+            write_row(&engine, "b", &format!("k{i}"), 3_000 + i);
+            engine.flush_all().unwrap();
+        }
+
+        assert_eq!(engine.storage_schema_write_count(), before + 1);
+        assert_eq!(tables_on_disk(dir.path()), vec!["a", "b"]);
+    }
+
+    /// A kill between a DDL's acknowledgement and the next flush keeps the
+    /// table, and an ALTER's new column, on restart. The engine is dropped
+    /// with no flush and no shutdown, as the recovery tests above do.
+    #[test]
+    fn a_crash_after_ddl_ack_and_before_any_flush_recovers_the_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine = clean_engine(dir.path());
+            create_table(&engine, "b").unwrap();
+            engine
+                .update_table_schema(&tid("a"), schema("a", &["val", "added"]))
+                .unwrap();
+            write_row(&engine, "b", "unflushed", 4_000);
+            engine.force_commit_log_sync().unwrap();
+            drop(engine);
+        }
+        assert_eq!(tables_on_disk(dir.path()), vec!["a", "b"]);
+
+        let (engine, pending) =
+            StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.replay_mutations(pending).unwrap();
+        let a = engine.table_state(&tid("a")).expect("table a recovered");
+        let regular: Vec<String> = a
+            .schema()
+            .regular_columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        assert_eq!(
+            regular,
+            vec!["val", "added"],
+            "the acknowledged ALTER survives"
+        );
+        assert!(
+            engine.table_state(&tid("b")).is_some(),
+            "the acknowledged CREATE TABLE survives"
+        );
+        let key = DecoratedKey::new(PartitionKey::new(b"unflushed".to_vec()));
+        assert!(engine.read(&tid("b"), &key).unwrap().is_some());
+    }
+
+    /// A write that fails leaves the file stale: the DDL is refused, and the
+    /// next flush rewrites the file. Clearing the marker before the write
+    /// would lose the change for good.
+    #[test]
+    fn a_failed_snapshot_write_is_retried_by_the_next_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = clean_engine(dir.path());
+        let failures = Arc::new(AtomicU64::new(1));
+        let left = Arc::clone(&failures);
+        engine.set_storage_schema_write_hook(Some(Arc::new(move || {
+            if left
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(ferrosa_common::Error::Io(std::io::Error::other(
+                    "injected fsync failure",
+                )));
+            }
+            Ok(())
+        })));
+
+        assert!(
+            create_table(&engine, "b").is_err(),
+            "a CREATE whose snapshot write failed must not be acknowledged"
+        );
+        assert_eq!(failures.load(Ordering::Acquire), 0, "the failure fired");
+        assert_eq!(tables_on_disk(dir.path()), vec!["a"]);
+
+        write_row(&engine, "a", "k-retry", 5_000);
+        engine.flush(&tid("a")).unwrap();
+        assert_eq!(tables_on_disk(dir.path()), vec!["a", "b"]);
+    }
+
+    /// t_4c80c7e3: a table dropped while `flush_all` runs is skipped, the
+    /// other tables still flush, and the file is saved without the dropped
+    /// table. The pass used to fail, which skipped the schema save and
+    /// marked the node not ready.
+    #[test]
+    fn a_table_dropped_during_flush_all_is_skipped_and_the_pass_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(clean_engine(dir.path()));
+        create_table(&engine, "b").unwrap();
+        create_table(&engine, "c").unwrap();
+        for table in ["a", "b", "c"] {
+            write_row(&engine, table, "dirty", 6_000);
+        }
+
+        let dropper = Arc::clone(&engine);
+        RECOVERY_FLUSH_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                dropper.unregister_table(&tid("b")).unwrap();
+            }))
+        });
+        engine
+            .flush_all()
+            .expect("a table dropped mid-pass must not fail the pass");
+
+        for table in ["a", "c"] {
+            assert_eq!(
+                engine
+                    .table_state(&tid(table))
+                    .unwrap()
+                    .store
+                    .memtable_size(),
+                0,
+                "{table} flushed"
+            );
+        }
+        assert_eq!(tables_on_disk(dir.path()), vec!["a", "c"]);
+    }
+
+    /// Parallel CREATE TABLEs beside busy flushers spend a bounded share of
+    /// their latency on snapshot writes.
+    ///
+    /// Each snapshot write costs `FSYNC` on one shared disk (the hook), as
+    /// on the CI host where an fsync is about 600 ms. The flushers stand in
+    /// for the maintenance tick's `flush_all`, the periodic and urgent
+    /// flushes, and index DDL rotations. Every flush used to rewrite the
+    /// file, so the serial CREATEs queued behind the flushers' writes on the
+    /// disk and on the recovery gate a flush holds through its write. Now a
+    /// flush writes only when the schema changed, and each CREATE costs one
+    /// write.
+    ///
+    /// The bound is on the injected disk time the burst consumed, not the
+    /// wall clock: the wall clock also carries the real flushes' own I/O
+    /// under whatever load the test runs beside (16 s in a full parallel
+    /// `cargo test` run against 1.3-2.9 s alone), which is not what this
+    /// test measures (t_7ab1606f). On a dev Mac the burst took 8.3-9.0 s
+    /// before the fix and 1.3-2.9 s after, with 100 ms per write.
+    #[test]
+    fn parallel_creates_beside_flushers_spend_bounded_time_on_snapshot_writes() {
+        const FSYNC: Duration = Duration::from_millis(50);
+        const FLUSH_EVERY: Duration = Duration::from_millis(25);
+        const FLUSHERS: usize = 4;
+        const CREATES: usize = 8;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(clean_engine(dir.path()));
+        for f in 0..FLUSHERS {
+            create_table(&engine, &format!("flusher_{f}")).unwrap();
+        }
+        let disk = Arc::new(parking_lot::Mutex::new(()));
+        let disk_writes = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&disk_writes);
+        engine.set_storage_schema_write_hook(Some(Arc::new(move || {
+            let _queue = disk.lock();
+            std::thread::sleep(FSYNC);
+            counted.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        })));
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flushers: Vec<_> = (0..FLUSHERS)
+            .map(|f| {
+                let engine = Arc::clone(&engine);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let table = format!("flusher_{f}");
+                    let mut ts = 10_000;
+                    while !stop.load(Ordering::Acquire) {
+                        ts += 1;
+                        write_row(&engine, &table, "k", ts);
+                        engine.flush(&tid(&table)).unwrap();
+                        std::thread::sleep(FLUSH_EVERY);
+                    }
+                })
+            })
+            .collect();
+        // Let every flusher get going before the DDL burst.
+        std::thread::sleep(FLUSH_EVERY * 4);
+
+        // DDL runs one at a time under the schema lifecycle fence.
+        let fence = Arc::new(parking_lot::Mutex::new(()));
+        let started = Instant::now();
+        let writes_before = disk_writes.load(Ordering::Acquire);
+        let creates: Vec<_> = (0..CREATES)
+            .map(|i| {
+                let engine = Arc::clone(&engine);
+                let fence = Arc::clone(&fence);
+                std::thread::spawn(move || {
+                    let _fence = fence.lock();
+                    create_table(&engine, &format!("created_{i}")).unwrap();
+                })
+            })
+            .collect();
+        for create in creates {
+            create.join().unwrap();
+        }
+        let writes = disk_writes.load(Ordering::Acquire) - writes_before;
+        let elapsed = started.elapsed();
+        stop.store(true, Ordering::Release);
+        for flusher in flushers {
+            flusher.join().unwrap();
+        }
+
+        // One write per CREATE, and as much again for a write already on
+        // the disk when a CREATE arrives.
+        let disk_time = FSYNC * writes as u32;
+        let bound = FSYNC * (2 * CREATES as u32);
+        assert!(
+            disk_time <= bound,
+            "{CREATES} serial CREATEs beside {FLUSHERS} flushers took {elapsed:?}, of which \
+             {disk_time:?} ({writes} writes) on snapshot writes; bound {bound:?}"
+        );
     }
 }

@@ -437,7 +437,7 @@ jobs:
           # is how this step once ran 9,740 tests and failed six of them.
           cargo nextest run --all-features --workspace --lib --tests \
             --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
-            -E 'not binary(accord_apply_decode_residency) and not binary(commit_guarantee_replica_process) and not binary(data_center_process) and not binary(data_dir_lock_process) and not binary(drop_table_replica_process) and not binary(jsonb_first_class_cluster_process) and not binary(pg_public_keyspace_rf_process) and not binary(pg_select_cluster_read_process) and not binary(pg_txn_value_process) and not binary(raft_repair_process)' \
+            -E 'not binary(accord_apply_decode_residency) and not binary(commit_guarantee_replica_process) and not binary(data_center_process) and not binary(data_dir_lock_process) and not binary(drop_table_replica_process) and not binary(formation_late_node_first_ddl_process) and not binary(jsonb_first_class_cluster_process) and not binary(pg_public_keyspace_rf_process) and not binary(pg_select_cluster_read_process) and not binary(pg_txn_value_process) and not binary(raft_repair_process) and not binary(role_replay_failure_process)' \
             -- --skip ::slow:: --skip accord::perf --skip conflict_index_residency_projection_absolute \
                --skip apply_writeset_peak_stays_within_the_input_size \
                --skip apply_writeset_borrowed_does_not_hold_the_decoded_batch_resident \
@@ -463,6 +463,7 @@ jobs:
                --skip real_typed_edges_paged_scan_delivers_every_distinct_row \
                --skip count_range_metadata_merger_dedups_real_typed_edges_sstables \
                --skip promote_dir_fsync_lazyfs_crash_loses_neither_copy \
+               --skip first_ddl_after_formation_with_a_late_node_succeeds_and_is_visible \
 
       - name: Run the real-process cluster harnesses (isolated)
         # Every `ferrosa/tests/*_process.rs` binary: each spawns real `ferrosa`
@@ -488,7 +489,7 @@ jobs:
         run: |
           cargo nextest run --all-features --workspace --lib --tests \
             --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
-            -E 'package(ferrosa) and (binary(commit_guarantee_replica_process) or binary(data_center_process) or binary(data_dir_lock_process) or binary(drop_table_replica_process) or binary(jsonb_first_class_cluster_process) or binary(pg_public_keyspace_rf_process) or binary(pg_select_cluster_read_process) or binary(pg_txn_value_process) or binary(raft_repair_process))'
+            -E 'package(ferrosa) and (binary(commit_guarantee_replica_process) or binary(data_center_process) or binary(data_dir_lock_process) or binary(drop_table_replica_process) or binary(formation_late_node_first_ddl_process) or binary(jsonb_first_class_cluster_process) or binary(pg_public_keyspace_rf_process) or binary(pg_select_cluster_read_process) or binary(pg_txn_value_process) or binary(raft_repair_process) or binary(role_replay_failure_process))'
 
   # ── Stage 2a': Differential oracle vs real PostgreSQL ──────────────
   # The `test` job above skips `differential_oracle` because it has no
